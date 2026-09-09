@@ -18,6 +18,9 @@ use tempfile::TempDir;
 mod http_fixture;
 use http_fixture::Server;
 
+#[path = "unix_bootstrap/candidate.rs"]
+mod candidate;
+
 struct Fixture {
     root: TempDir,
     executable: PathBuf,
@@ -108,7 +111,7 @@ impl Fixture {
             .tempdir()
             .unwrap();
         fs::create_dir(root.path().join("commands")).unwrap();
-        for command in ["uname", "nvidia-smi"] {
+        for command in ["uname", "nvidia-smi", "system_profiler"] {
             symlink(&self.executable, root.path().join("commands").join(command)).unwrap();
         }
         root
@@ -123,6 +126,20 @@ impl Fixture {
         caps: Option<&str>,
         missing: bool,
     ) -> Output {
+        self.command(host, server, version, os, backend, caps, missing)
+            .output()
+            .unwrap()
+    }
+    fn command(
+        &self,
+        host: &Path,
+        server: &Server,
+        version: &str,
+        os: &str,
+        backend: &str,
+        caps: Option<&str>,
+        missing: bool,
+    ) -> Command {
         let path = format!(
             "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
             host.join(".local/bin").display(),
@@ -150,6 +167,7 @@ impl Fixture {
                 if os == "Darwin" { "arm64" } else { "x86_64" },
             )
             .env_remove("FIXTURE_GPU_CAPABILITIES")
+            .env_remove("FIXTURE_METAL_INFO")
             .env_remove("FIXTURE_MISSING_CUDA");
         if let Some(caps) = caps {
             command.env("FIXTURE_GPU_CAPABILITIES", caps);
@@ -157,7 +175,47 @@ impl Fixture {
         if missing {
             command.env("FIXTURE_MISSING_CUDA", "1");
         }
-        command.output().unwrap()
+        command
+    }
+}
+
+#[test]
+fn macos_without_metal_installs_cpu_and_explicit_gpu_fails_before_download() {
+    let mut fixture = Fixture::new("1.2.3");
+    fixture.asset("1.2.3", "macos-aarch64-cpu", false, false);
+    let server = Server::new(fixture.assets.clone());
+    for backend in ["auto", "cpu", "metal"] {
+        let host = fixture.host();
+        let output = fixture
+            .command(
+                host.path(),
+                &server,
+                "1.2.3",
+                "Darwin",
+                backend,
+                None,
+                false,
+            )
+            .env("FIXTURE_METAL_INFO", r#"{"SPDisplaysDataType":[]}"#)
+            .output()
+            .unwrap();
+        if backend == "metal" {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Metal requires a supported GPU")
+            );
+            assert!(!host.path().join(".local/bin/ferrum").exists());
+        } else {
+            success(&output);
+            let installed = fs::read_link(host.path().join(".local/bin/ferrum")).unwrap();
+            assert!(installed.to_str().unwrap().contains("/1.2.3-cpu-"));
+            let startup = Command::new(installed).arg("--version").output().unwrap();
+            success(&startup);
+            assert_eq!(
+                String::from_utf8(startup.stdout).unwrap().trim(),
+                "ferrum 1.2.3"
+            );
+        }
     }
 }
 

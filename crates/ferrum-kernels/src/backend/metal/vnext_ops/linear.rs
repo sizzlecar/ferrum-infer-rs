@@ -21,6 +21,9 @@ use ferrum_interfaces::vnext::{
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
 use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
+use crate::gguf_blocks::GgufBlockFormat;
+
+use super::native_blocks::{bind_native_block, MetalNativeBlockPipelines};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -59,13 +62,17 @@ const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
 const LINEAR_DENSE_F32_KERNEL: &str = "vnext_linear_dense_f32";
 const LINEAR_Q8_0_F32_KERNEL: &str = "vnext_linear_q8_0_f32";
 const SWIGLU_KERNEL: &str = "vnext_swiglu_f16";
-const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
+pub(super) const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
+    GgufBlockFormat::Q3K.format_id(),
     Q4_K_FORMAT_ID,
     Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID,
     Q8_0_FORMAT_ID,
+    GgufBlockFormat::Iq3S.format_id(),
+    GgufBlockFormat::Iq4Nl.format_id(),
+    GgufBlockFormat::Iq4Xs.format_id(),
 ];
-const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID];
+const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = ALL_LINEAR_QUANTIZATION_FORMATS;
 
 pub(super) struct MetalLinearPipelines {
     dense: ComputePipelineState,
@@ -79,6 +86,7 @@ pub(super) struct MetalLinearPipelines {
     q8_0: ComputePipelineState,
     q8_0_f32: ComputePipelineState,
     swiglu: ComputePipelineState,
+    native: MetalNativeBlockPipelines,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +136,7 @@ impl MetalLinearPipelines {
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
             q8_0_f32: pipeline(LINEAR_Q8_0_F32_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
+            native: MetalNativeBlockPipelines::new(device)?,
         })
     }
 
@@ -165,6 +174,9 @@ impl MetalLinearPipelines {
             (LinearPhysicalFormat::Q8_0, false) => {
                 (&self.q8_0, LinearDispatchKind::CooperativeGemv)
             }
+            (LinearPhysicalFormat::Native(_), _) => {
+                (&self.native.linear_f16, LinearDispatchKind::CooperativeGemv)
+            }
         }
     }
 
@@ -174,7 +186,9 @@ impl MetalLinearPipelines {
             LinearPhysicalFormat::Q4K => Some(&self.q4_k_gemv_f32),
             LinearPhysicalFormat::Q6K => Some(&self.q6_k_gemv_f32),
             LinearPhysicalFormat::Q8_0 => Some(&self.q8_0_f32),
-            LinearPhysicalFormat::Q5K => None,
+            LinearPhysicalFormat::Q5K | LinearPhysicalFormat::Native(_) => {
+                Some(&self.native.linear_f32)
+            }
         }
     }
 }
@@ -506,6 +520,7 @@ fn linear_provider_descriptor(
         implementation_fingerprint(&[
             include_str!("linear.rs").as_bytes(),
             SHADER_SOURCE.as_bytes(),
+            super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
             include_str!("../q4_k_gemv_v2.metal").as_bytes(),
             include_str!("../q5_k_gemv.metal").as_bytes(),
             include_str!("../q6_k_gemv.metal").as_bytes(),
@@ -522,6 +537,17 @@ enum LinearPhysicalFormat {
     Q5K,
     Q6K,
     Q8_0,
+    Native(GgufBlockFormat),
+}
+
+impl LinearPhysicalFormat {
+    fn native_block(self, activation_type: ElementType) -> Option<GgufBlockFormat> {
+        match self {
+            Self::Native(format) => Some(format),
+            Self::Q5K if activation_type == ElementType::F32 => Some(GgufBlockFormat::Q5K),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1268,9 +1294,6 @@ fn linear_launch_typed(
     if !matches!(activation_type, ElementType::F16 | ElementType::F32) {
         return Err("Metal linear activation ABI supports only F16 or F32".to_owned());
     }
-    if activation_type == ElementType::F32 && part.format == LinearPhysicalFormat::Q5K {
-        return Err("Metal F32 linear does not advertise a Q5_K kernel".to_owned());
-    }
     Ok(LinearLaunch {
         input_region,
         weight_region: part.region,
@@ -1415,12 +1438,29 @@ pub(super) fn dispatch_linear(
         &regions[launch.output_region],
         launch.output_offset_bytes,
     );
+    bind_linear_params(
+        encoder,
+        launch.params,
+        launch.format,
+        launch.activation_type,
+    );
+    dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+}
+
+fn bind_linear_params(
+    encoder: &ComputeCommandEncoderRef,
+    params: LinearParams,
+    format: LinearPhysicalFormat,
+    activation_type: ElementType,
+) {
     encoder.set_bytes(
         3,
         std::mem::size_of::<LinearParams>() as u64,
-        &launch.params as *const _ as *const c_void,
+        &params as *const _ as *const c_void,
     );
-    dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+    if let Some(format) = format.native_block(activation_type) {
+        bind_native_block(encoder, format, 4);
+    }
 }
 
 fn dispatch_linear_grid(
@@ -1834,18 +1874,12 @@ fn prepare_leaf_part(
             {
                 return Err("Metal quantized linear physical ABI differs".to_owned());
             }
-            let format = match (
-                spec.format_id.as_str(),
-                spec.logical_values_per_block,
-                spec.bytes_per_block,
-            ) {
-                (Q4_K_FORMAT_ID, 256, 144) => LinearPhysicalFormat::Q4K,
-                (Q5_K_FORMAT_ID, 256, 176) => LinearPhysicalFormat::Q5K,
-                (Q6_K_FORMAT_ID, 256, 210) => LinearPhysicalFormat::Q6K,
-                (Q8_0_FORMAT_ID, 32, 34) => LinearPhysicalFormat::Q8_0,
-                _ => {
-                    return Err("Metal linear does not support this quantized block ABI".to_owned())
-                }
+            let format = match GgufBlockFormat::from_spec(spec)? {
+                GgufBlockFormat::Q4K => LinearPhysicalFormat::Q4K,
+                GgufBlockFormat::Q5K => LinearPhysicalFormat::Q5K,
+                GgufBlockFormat::Q6K => LinearPhysicalFormat::Q6K,
+                GgufBlockFormat::Q8_0 => LinearPhysicalFormat::Q8_0,
+                native => LinearPhysicalFormat::Native(native),
             };
             let blocks_per_row = in_features / u64::from(spec.logical_values_per_block);
             let metadata = component_metadata(components, *component)?;
@@ -1979,6 +2013,9 @@ fn validate_swiglu_participant(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod native_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3039,11 +3076,7 @@ mod tests {
         encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);
         encoder.set_buffer(2, Some(output), output_offset_bytes);
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<LinearParams>() as u64,
-            &params as *const _ as *const c_void,
-        );
+        bind_linear_params(encoder, params, format, ElementType::F16);
         dispatch_linear_grid(encoder, params, dispatch_kind);
     }
 }

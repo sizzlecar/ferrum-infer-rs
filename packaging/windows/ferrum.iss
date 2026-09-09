@@ -14,6 +14,18 @@
 #ifndef LauncherPath
   #error LauncherPath must name the stable native Ferrum launcher
 #endif
+#ifndef Backend
+  #define Backend "cuda-sm89"
+#endif
+#if Backend == "cpu"
+  #define BackendLabel "CPU"
+  #define BackendDescription "CPU inference without NVIDIA driver or CUDA runtime requirements."
+#elif Backend == "cuda-sm89"
+  #define BackendLabel "CUDA sm89"
+  #define BackendDescription "Inference for NVIDIA CUDA compute capability 8.9 (sm89)."
+#else
+  #error Backend must be cpu or cuda-sm89
+#endif
 #if !FileExists(LauncherPath)
   #error LauncherPath does not exist
 #endif
@@ -33,11 +45,11 @@
 [Setup]
 ; Keep this ID stable across upgrades. This is one installation per user.
 AppId=Ferrum.CLI.Windows
-AppName=Ferrum (CUDA sm89)
+AppName=Ferrum ({#BackendLabel})
 AppVersion={#AppVersion}
 AppPublisher=Ferrum
 AppPublisherURL=https://github.com/sizzlecar/ferrum-infer-rs
-AppComments=Command-line inference for NVIDIA CUDA compute capability 8.9 (sm89).
+AppComments={#BackendDescription}
 DefaultDirName={localappdata}\Programs\Ferrum
 DisableDirPage=yes
 DisableProgramGroupPage=yes
@@ -46,17 +58,17 @@ ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0
 UninstallDisplayIcon={app}\ferrum.exe
-UninstallDisplayName=Ferrum (CUDA sm89)
+UninstallDisplayName=Ferrum ({#BackendLabel})
 ChangesEnvironment=yes
 SetupMutex=Ferrum.CLI.Windows.Setup
 ; Never stop or restart a user's inference process automatically.
 CloseApplications=no
 RestartApplications=no
 OutputDir={#PayloadDir}\..\installer
-OutputBaseFilename=ferrum-{#AppVersion}-windows-x86_64-cuda-sm89-setup
+OutputBaseFilename=ferrum-{#AppVersion}-windows-x86_64-{#Backend}-setup
 VersionInfoVersion={#AppVersion}
-VersionInfoProductName=Ferrum (CUDA sm89)
-VersionInfoDescription=Ferrum current-user installer (Windows x86_64, CUDA sm89)
+VersionInfoProductName=Ferrum ({#BackendLabel})
+VersionInfoDescription=Ferrum current-user installer (Windows x86_64, {#BackendLabel})
 VersionInfoProductTextVersion={#AppVersion}
 Compression=lzma2
 SolidCompression=yes
@@ -73,7 +85,7 @@ Source: "{#PayloadDir}\ferrum-portable.json"; DestDir: "{app}\versions\{#Version
 Source: "{#PayloadDir}\licenses\*"; DestDir: "{app}\versions\{#VersionDir}\licenses"; Flags: onlyifdoesntexist
 
 [Messages]
-FinishedLabel=Ferrum (CUDA sm89) is installed.%n%nOpen a new terminal to use ferrum run or ferrum serve. Models are selected separately with the command-line options.
+FinishedLabel=Ferrum ({#BackendLabel}) is installed.%n%nOpen a new terminal to use ferrum run or ferrum serve. Models are selected separately with the command-line options.
 
 [Code]
 const

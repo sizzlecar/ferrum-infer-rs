@@ -81,6 +81,7 @@ struct Distribution {
     target: String,
     assets: Vec<AcceptedAsset>,
 }
+type Distributions = BTreeMap<(Backend, String), Distribution>;
 
 pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     validate_repo(&args.repo)?;
@@ -131,17 +132,30 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
             }
         }
         if distributions
-            .insert(distribution.backend, distribution)
+            .insert(
+                (distribution.backend, distribution.target.clone()),
+                distribution,
+            )
             .is_some()
         {
-            return Err("multiple distribution archives declare the same backend".into());
+            return Err(
+                "multiple distribution archives declare the same backend and target".into(),
+            );
         }
     }
-    // These are the product's three formal distributions, not a model matrix.
-    if distributions.keys().copied().collect::<BTreeSet<_>>()
-        != BTreeSet::from([Backend::Cpu, Backend::Metal, Backend::Cuda])
+    // These are the Unix products selected by the installer. CPU is required on
+    // each supported platform independently of its accelerated package.
+    if distributions.keys().cloned().collect::<BTreeSet<_>>()
+        != BTreeSet::from([
+            (Backend::Cpu, "x86_64-unknown-linux-gnu".into()),
+            (Backend::Cpu, "aarch64-apple-darwin".into()),
+            (Backend::Metal, "aarch64-apple-darwin".into()),
+            (Backend::Cuda, "x86_64-unknown-linux-gnu".into()),
+        ])
     {
-        return Err("formal distribution inventory must include CPU, Metal and CUDA".into());
+        return Err(
+            "formal distribution inventory requires Linux CPU/CUDA and macOS CPU/Metal".into(),
+        );
     }
     let tasks: PreparedTasks = read(&args.tasks)?;
     validate_tasks(&plan, &schedule, &tasks, &distributions, &args.version)?;
@@ -174,7 +188,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &plan,
         &text(&document["provenance"], "release_base_tag")?,
         &args.version,
-        &distributions[&Backend::Metal].binary_sha256,
+        &distributions[&(Backend::Metal, "aarch64-apple-darwin".into())].binary_sha256,
     )
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
@@ -454,7 +468,7 @@ fn validate_tasks(
     plan: &Plan,
     schedule: &ModelTaskSchedule,
     tasks: &PreparedTasks,
-    distributions: &BTreeMap<Backend, Distribution>,
+    distributions: &Distributions,
     version: &str,
 ) -> Result<(), String> {
     if tasks.schema_version != 1
@@ -475,8 +489,12 @@ fn validate_tasks(
             .find(|run| run.profile.id == expected.profile.id)
             .ok_or("unexpected model task")?;
         let binary = distributions
-            .get(&expected.profile.target.backend)
-            .ok_or("model task has no declared distribution")?;
+            .values()
+            .find(|distribution| {
+                distribution.backend == expected.profile.target.backend
+                    && distribution.binary_sha256 == expected.binary_sha256
+            })
+            .ok_or("model task has no matching staged bytes for its backend")?;
         if expected.profile != run.profile
             || expected.version != version
             || expected.binary_sha256 != binary.binary_sha256
@@ -509,7 +527,7 @@ impl<'a> VerifiedModels<'a> {
     }
 }
 fn verify_installations(
-    distributions: &BTreeMap<Backend, Distribution>,
+    distributions: &Distributions,
     installations: &[installation::InstallationReport],
     models: &VerifiedModels<'_>,
     version: &str,
@@ -519,10 +537,11 @@ fn verify_installations(
     for report in installations {
         let backend: Backend = serde_json::from_value(Value::String(report.backend.clone()))
             .map_err(|_| "invalid installation backend")?;
+        let identity = (backend, report.target_triple.clone());
         let expected = distributions
-            .get(&backend)
+            .get(&identity)
             .ok_or("unexpected installation report")?;
-        if !seen.insert(backend)
+        if !seen.insert(identity)
             || report.version != version
             || report.candidate_sha != candidate
             || report.asset_name != expected.name
@@ -571,7 +590,7 @@ fn verify_installations(
             installation::verify_runtime(report)?;
         }
     }
-    if seen != distributions.keys().copied().collect() {
+    if seen != distributions.keys().cloned().collect() {
         return Err("a declared distribution is missing installation evidence".into());
     }
     Ok(())

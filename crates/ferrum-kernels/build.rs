@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[path = "build_support/host.rs"]
 mod host;
 use host::HostTools;
+#[path = "build_support/gguf.rs"]
+mod gguf;
 
 use ferrum_native_ops::{
     legacy_signature_matches_without_numeric_line, load_manifest,
@@ -84,6 +86,7 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/gated_delta_rule.cu",
     "kernels/linear_attention.cu",
     "kernels/vnext_causal_attention.cu",
+    gguf::KERNEL,
     "kernels/mxfp4_marlin_prepare.cu",
     "kernels/gpt_oss_attention.cu",
     "kernels/gpt_oss_moe.cu",
@@ -1272,6 +1275,9 @@ fn core_ptx_signature(kernel: &str, flags: &[String]) -> String {
     lines.extend(flags.iter().map(|f| format!("flag={f}")));
     lines.push(file_fingerprint(kernel));
     lines.extend(CORE_PTX_HEADERS.iter().map(|p| file_fingerprint(p)));
+    if kernel == gguf::KERNEL {
+        lines.extend(gguf::INPUTS.iter().map(|path| file_fingerprint(path)));
+    }
     lines.join("\n")
 }
 
@@ -1286,6 +1292,13 @@ fn content_core_ptx_signature(kernel: &str, flags: &[String]) -> String {
             .iter()
             .map(|path| sha256_file_fingerprint(Path::new(path))),
     );
+    if kernel == gguf::KERNEL {
+        lines.extend(
+            gguf::INPUTS
+                .iter()
+                .map(|path| sha256_file_fingerprint(Path::new(path))),
+        );
+    }
     lines.join("\n")
 }
 
@@ -1344,6 +1357,10 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+    for path in gguf::INPUTS {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    gguf::write_tables(out_dir);
 
     let cuda_root = cuda_root_from_env();
     let cuda_include = cuda_root.as_ref().map(|root| root.join("include"));
@@ -1396,6 +1413,21 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
 
     for kernel in CORE_PTX_KERNELS {
         let start = Instant::now();
+        let mut flags = flags.clone();
+        // Exact dequantization, residual sums and token selection must retain
+        // IEEE subnormals and division rounding. Include this policy in both
+        // the cache identity and the actual compiler invocation.
+        let precise_math = matches!(
+            *kernel,
+            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+        );
+        if precise_math {
+            flags.retain(|flag| flag != "--use_fast_math");
+            flags.push("--fmad=false".into());
+        }
+        if *kernel == gguf::KERNEL {
+            flags.push(format!("-I{}", out_dir.display()));
+        }
         let legacy_signature = core_ptx_signature(kernel, &flags);
         let content_signature = content_core_ptx_signature(kernel, &flags);
         let signature = cuda_native_input_signature(&content_signature);
@@ -1465,8 +1497,15 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     .arg("-Ikernels")
                     .arg("--expt-relaxed-constexpr")
                     .arg("-std=c++17")
-                    .arg("-O3")
-                    .arg("--use_fast_math");
+                    .arg("-O3");
+                if precise_math {
+                    command.arg("--fmad=false");
+                } else {
+                    command.arg("--use_fast_math");
+                }
+                if *kernel == gguf::KERNEL {
+                    command.arg(format!("-I{}", out_dir.display()));
+                }
                 command.args(environment_option);
                 if let Some(cuda_include) = &cuda_include {
                     command.arg(format!("-I{}", cuda_include.display()));

@@ -235,7 +235,6 @@ fn abi_features_and_raw_audit_format_must_match_the_declared_backend() {
 fn platform_and_backend_mismatches_cannot_generate_manifests() {
     for (backend, target, text) in [
         (Backend::Cuda, "aarch64-apple-darwin", OTOOL),
-        (Backend::Cpu, "x86_64-apple-darwin", OTOOL),
         (Backend::Metal, "aarch64-unknown-linux-gnu", LDD),
         (Backend::Cuda, "x86_64-pc-windows-msvc", LDD),
         (Backend::Cpu, "x86_64-linux-unknown-gnu", LDD),
@@ -277,10 +276,61 @@ fn platform_classification_does_not_pin_architecture_or_environment() {
             audit::Format::Ldd,
         ),
         (Backend::Metal, "x86_64-apple-darwin", audit::Format::Otool),
+        (Backend::Cpu, "aarch64-apple-darwin", audit::Format::Otool),
+        (Backend::Cpu, "x86_64-apple-darwin", audit::Format::Otool),
     ] {
         let mut input = abi(backend);
         input.target_triple = target.into();
         assert_eq!(validate_abi(&input).unwrap(), expected);
+    }
+}
+
+#[test]
+fn cpu_assets_use_native_platform_audits_without_gpu_runtime_dependencies() {
+    let cpu_otool = OTOOL
+        .lines()
+        .filter(|line| !line.contains("Metal.framework"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cpu = abi(Backend::Cpu);
+    cpu.target_triple = "aarch64-apple-darwin".into();
+    let manifests = generate_manifests(
+        &candidate("1.2.3"),
+        &cpu,
+        "cpu.tar.gz",
+        b"archive",
+        b"binary",
+        "dependencies.txt",
+        &cpu_otool,
+    )
+    .unwrap();
+    assert_eq!(manifests.abi["backend"], "cpu");
+    assert_eq!(
+        manifests.dependency["unresolved_runtime_libraries"],
+        json!([])
+    );
+    let error = generate_manifests(
+        &candidate("1.2.3"),
+        &cpu,
+        "cpu.tar.gz",
+        b"archive",
+        b"binary",
+        "dependencies.txt",
+        OTOOL,
+    )
+    .unwrap_err();
+    assert!(error.contains("GPU runtime"), "{error}");
+    for library in [
+        "libcuda.so.1",
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libnccl.so.2",
+    ] {
+        let text = format!("{LDD}\t{library} => /usr/lib/{library} (0x00001234)\n");
+        assert!(generate(Backend::Cpu, &text)
+            .unwrap_err()
+            .contains("GPU runtime"));
+        generate(Backend::Cuda, &text).unwrap();
     }
 }
 

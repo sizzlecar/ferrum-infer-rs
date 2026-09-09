@@ -10,6 +10,7 @@
 //! - `pull`: Download a model from HuggingFace
 //! - `list`: List downloaded models
 
+mod backend_selection;
 pub mod commands;
 pub mod config;
 pub mod gpu_devices;

@@ -653,6 +653,7 @@ struct CausalAttentionShape {
     kv_features: u64,
     rope_dim: u64,
     rope_frequency_denominator: u64,
+    rope_pair_offset: u64,
     maximum_context_tokens: u64,
     epsilon: f32,
     rope_theta: f32,
@@ -1017,6 +1018,12 @@ impl CausalAttentionShape {
             kv_features: unsigned_attribute(attributes, "kv_features")?,
             rope_dim,
             rope_frequency_denominator,
+            // The standard contract rotates a prefix; proportional Gemma
+            // semantics pad frequencies before rotating the complete head.
+            rope_pair_offset: match semantics {
+                CausalAttentionSemantics::Standard => rope_dim / 2,
+                CausalAttentionSemantics::Gemma4 => head_dim / 2,
+            },
             maximum_context_tokens: unsigned_attribute(attributes, "maximum_context_tokens")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
             rope_theta: rational_attribute(attributes, "rope_theta")?,
@@ -1246,6 +1253,10 @@ impl CausalAttentionShape {
                 self.rope_frequency_denominator,
                 "causal attention RoPE frequency denominator",
             )?,
+            rope_pair_offset: checked_i32(
+                self.rope_pair_offset,
+                "causal attention RoPE pair offset",
+            )?,
             epsilon: self.epsilon,
             rope_theta: self.rope_theta,
             attention_scale: self.attention_scale,
@@ -1271,6 +1282,7 @@ struct CudaCausalAttentionShape {
     kv_features: i32,
     rope_dim: i32,
     rope_frequency_denominator: i32,
+    rope_pair_offset: i32,
     epsilon: f32,
     rope_theta: f32,
     attention_scale: f32,
@@ -2065,6 +2077,7 @@ fn encode_attention(
                 .u64(shape.kv_features)
                 .u64(shape.rope_dim)
                 .u64(shape.rope_frequency_denominator)
+                .u64(shape.rope_pair_offset)
                 .u64(shape.maximum_context_tokens)
                 .f32(shape.epsilon)
                 .f32(shape.rope_theta)
@@ -2941,6 +2954,7 @@ fn launch_prepare(
         shape.head_dim,
         shape.rope_dim,
         shape.rope_frequency_denominator,
+        shape.rope_pair_offset,
         shape.query_projection_features,
         query_head_stride,
         shape.kv_features,
@@ -4024,7 +4038,7 @@ mod tests {
     use super::*;
     use ferrum_interfaces::vnext::CanonicalRational;
 
-    fn attributes(output_gate: bool) -> BTreeMap<AttributeId, SemanticValue> {
+    pub(super) fn attributes(output_gate: bool) -> BTreeMap<AttributeId, SemanticValue> {
         BTreeMap::from([
             (
                 AttributeId::new("hidden_size").unwrap(),
@@ -4089,7 +4103,7 @@ mod tests {
         ])
     }
 
-    fn gemma4_attributes(full_attention: bool) -> BTreeMap<AttributeId, SemanticValue> {
+    pub(super) fn gemma4_attributes(full_attention: bool) -> BTreeMap<AttributeId, SemanticValue> {
         let (key_value_heads, head_dim, rope_dim, rope_denominator, rope_theta, window, k_eq_v) =
             if full_attention {
                 (1, 512, 128, 512, 1_000_000, 0, true)
@@ -4195,6 +4209,7 @@ mod tests {
             kv_features,
             rope_dim: head_dim,
             rope_frequency_denominator: head_dim,
+            rope_pair_offset: head_dim / 2,
             maximum_context_tokens,
             epsilon: 1e-6,
             rope_theta: 10_000.0,
@@ -5080,15 +5095,33 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_cuda_source_carries_frequency_vnorm_window_and_512_fallback_contracts() {
-        let source = include_str!("../../../../../kernels/vnext_causal_attention.cu");
-        assert!(source.contains("#define VNEXT_MAX_HEAD_CHUNKS 16"));
-        assert!(source.contains("rope_frequency_denominator"));
-        assert!(source.contains("value_rms_norm"));
-        assert!(source.contains("absolute_position - sliding_window + 1"));
-        assert!(source.contains("const float attention_scale"));
-        assert!(source.contains("const int neox_half = head_dim / 2"));
-        assert!(source.contains("const int high = pair + neox_half"));
-        assert!(source.contains("dim < neox_half + half_rope"));
+    fn partial_rope_geometry_preserves_the_declared_attention_semantics() {
+        let standard = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
+        assert_eq!(standard.head_dim, 128);
+        assert_eq!(standard.rope_dim, 64);
+        assert_eq!(standard.cuda_shape().unwrap().rope_pair_offset, 32);
+        assert_eq!(
+            standard.cuda_shape().unwrap().rope_frequency_denominator,
+            64
+        );
+        let proportional = CausalAttentionShape::from_attributes_for(
+            &gemma4_attributes(true),
+            CausalAttentionSemantics::Gemma4,
+        )
+        .unwrap();
+        assert_eq!(proportional.head_dim, 512);
+        assert_eq!(proportional.rope_dim, 128);
+        assert_eq!(proportional.cuda_shape().unwrap().rope_pair_offset, 256);
+        assert_eq!(
+            proportional
+                .cuda_shape()
+                .unwrap()
+                .rope_frequency_denominator,
+            512
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "causal_attention_rotary_tests.rs"]
+mod rotary_tests;

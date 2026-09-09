@@ -299,6 +299,8 @@ fn metadata_consumes_current_staging_schema_and_rejects_wrong_entry_or_platform(
         .contains("ferrum archive entry"));
     abi = original_abi.clone();
     abi["target_triple"] = json!("aarch64-apple-darwin");
+    validate_metadata(&abi, &original_version, &fixture.args(false)).unwrap();
+    abi["target_triple"] = json!("x86_64-pc-windows-msvc");
     assert!(
         validate_metadata(&abi, &original_version, &fixture.args(false))
             .unwrap_err()

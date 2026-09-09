@@ -31,7 +31,9 @@ use ferrum_interfaces::vnext::{
     RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
     TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
-use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
+use ferrum_quantization::gguf::ferrum_to_gguf_with_arch;
+#[cfg(test)]
+use ferrum_quantization::gguf::{block_quantization_format, GgmlDType};
 use ferrum_quantization::{
     BlockFp8SafetensorsSource, CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
     GptqMarlinSafetensorsSource, SafetensorsArchive, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
@@ -2972,46 +2974,32 @@ fn append_gguf_weights(
             }
             continue;
         };
-        let dimensions = info
-            .shape
-            .dims()
-            .iter()
-            .map(|dimension| *dimension as u64)
-            .collect::<Vec<_>>();
+        let dimensions = info.dimensions.clone();
         output.push(FamilyWeight {
             layer_index,
             expert_index: None,
             role: spec.role.clone(),
             external_name,
             dimensions,
-            source_encoding: gguf_source_encoding(info.ggml_dtype)?,
+            source_encoding: gguf_source_encoding(&info.encoding)?,
         });
     }
     Ok(())
 }
 
-fn gguf_source_encoding(dtype: GgmlDType) -> Result<FamilyWeightSourceEncoding, String> {
-    if let Some(format_id) = block_quantization_format(dtype) {
-        return Ok(FamilyWeightSourceEncoding::BlockQuantized(
-            BlockQuantizationSpec {
-                format_id: format_id
-                    .to_owned()
-                    .try_into()
-                    .map_err(|error: VNextError| error.to_string())?,
-                logical_values_per_block: u32::try_from(dtype.block_size())
-                    .map_err(|_| "GGUF logical block width exceeds u32".to_owned())?,
-                bytes_per_block: u32::try_from(dtype.type_size())
-                    .map_err(|_| "GGUF physical block size exceeds u32".to_owned())?,
-            },
-        ));
+fn gguf_source_encoding(encoding: &WeightEncoding) -> Result<FamilyWeightSourceEncoding, String> {
+    match encoding {
+        WeightEncoding::Dense { element_type } => Ok(FamilyWeightSourceEncoding::Dense {
+            element_type: *element_type,
+        }),
+        WeightEncoding::BlockQuantized(spec) => {
+            spec.validate().map_err(|error| error.to_string())?;
+            Ok(FamilyWeightSourceEncoding::BlockQuantized(spec.clone()))
+        }
+        _ => Err(format!(
+            "unsupported Qwen3.5 GGUF source encoding {encoding:?}"
+        )),
     }
-    let element_type = match dtype {
-        GgmlDType::F16 => ElementType::F16,
-        GgmlDType::BF16 => ElementType::Bf16,
-        GgmlDType::F32 => ElementType::F32,
-        _ => return Err(format!("unsupported Qwen3.5 GGUF tensor dtype {dtype:?}")),
-    };
-    Ok(FamilyWeightSourceEncoding::Dense { element_type })
 }
 
 fn data_type_to_element_type(dtype: DataType) -> Result<ElementType, String> {

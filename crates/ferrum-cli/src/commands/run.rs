@@ -450,8 +450,9 @@ struct CollectedRunGeneration {
 }
 
 impl CollectedRunGeneration {
-    fn from_response(response: InferenceResponse) -> Self {
-        Self {
+    fn from_response(response: InferenceResponse) -> Result<Self> {
+        require_run_terminal_reason(Some(response.finish_reason))?;
+        Ok(Self {
             request_id: response.request_id.to_string(),
             raw_text: response.text,
             finish_reason: Some(response.finish_reason),
@@ -464,7 +465,19 @@ impl CollectedRunGeneration {
                 .collect(),
             chunk_count: 1,
             execution_evidence: response.execution_evidence,
-        }
+        })
+    }
+}
+
+fn require_run_terminal_reason(reason: Option<FinishReason>) -> Result<()> {
+    match reason {
+        Some(FinishReason::Error) => Err(FerrumError::model(
+            "Generation failed (finish_reason=error)",
+        )),
+        None => Err(FerrumError::internal(
+            "Generation stream ended without a terminal finish reason",
+        )),
+        Some(_) => Ok(()),
     }
 }
 
@@ -596,6 +609,7 @@ async fn collect_run_stream(
             }
         }
     }
+    require_run_terminal_reason(finish_reason)?;
     Ok(CollectedRunGeneration {
         request_id: request_id.unwrap_or_else(|| expected_request_id.to_string()),
         raw_text,
@@ -690,6 +704,7 @@ async fn collect_run_text_stream(
         }
     }
     clear_first_token_indicator(&mut first_token_indicator);
+    require_run_terminal_reason(finish_reason)?;
     if let Some(delta) = output.finish(&raw_text)? {
         print!("{delta}");
         io::stdout().flush().ok();
@@ -1150,7 +1165,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // utils::setup_logging whitelists them at INFO level.
     eprintln!(
         "{}",
-        "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
+        "Loading model weights... (30s+ for >10 GB models)".dimmed()
     );
     let load_start = std::time::Instant::now();
     engine_config.sampling.default_params = build_sampling_params(&cmd);
@@ -1379,7 +1394,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             OutputFormat::Text => engine
                 .infer(request)
                 .await
-                .map(CollectedRunGeneration::from_response),
+                .and_then(CollectedRunGeneration::from_response),
             OutputFormat::Jsonl => match engine.infer_stream(request).await {
                 Ok(stream) => {
                     collect_run_stream(
@@ -2516,48 +2531,7 @@ fn discover_run_tokenizer_path(source_path: &Path) -> Option<PathBuf> {
 }
 
 pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
-    match backend.trim().to_lowercase().as_str() {
-        "cpu" => Ok(ferrum_types::Device::CPU),
-        "metal" => {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                return Ok(ferrum_types::Device::Metal);
-            }
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
-            {
-                Err(FerrumError::config(
-                    "requested backend 'metal' but this ferrum binary was not built with Metal support; use --backend auto/cpu or build with the metal feature",
-                ))
-            }
-        }
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                return Ok(ferrum_types::Device::CUDA(0));
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(FerrumError::config(
-                    "requested backend 'cuda' but this ferrum binary was not built with CUDA support; use --backend auto/cpu or build with the cuda feature",
-                ))
-            }
-        }
-        "auto" => {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                return Ok(ferrum_types::Device::Metal);
-            }
-            #[cfg(feature = "cuda")]
-            {
-                return Ok(ferrum_types::Device::CUDA(0));
-            }
-            #[allow(unreachable_code)]
-            Ok(ferrum_types::Device::CPU)
-        }
-        other => Err(FerrumError::config(format!(
-            "unknown backend {other:?}; expected one of: auto, cpu, metal, cuda"
-        ))),
-    }
+    crate::backend_selection::select_device(backend)
 }
 
 fn build_chat_prompt(
@@ -3980,6 +3954,90 @@ mod tests {
             assert_eq!(usage.prompt_tokens, 7);
             assert_eq!(usage.completion_tokens, 2);
         }
+    }
+
+    #[tokio::test]
+    async fn run_collectors_reject_failed_or_truncated_generation() {
+        let request_id = RequestId(Uuid::new_v4());
+        for terminal in [
+            Some(FinishReason::Error),
+            None,
+            Some(FinishReason::EOS),
+            Some(FinishReason::Stop),
+            Some(FinishReason::Length),
+        ] {
+            for text_output in [false, true] {
+                let chunks = [("partial", None), ("", terminal)]
+                    .into_iter()
+                    .map(|(text, finish_reason)| {
+                        Ok(StreamChunk {
+                            request_id: request_id.clone(),
+                            text: text.into(),
+                            token: None,
+                            finish_reason,
+                            usage: None,
+                            created_at: Utc::now(),
+                            metadata: HashMap::new(),
+                            api_response: None,
+                            execution_evidence: None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+                let result = if text_output {
+                    collect_run_text_stream(
+                        stream,
+                        false,
+                        RunStreamOutput::new(ModelOutputProtocol::Text, false),
+                        0,
+                        &request_id,
+                        false,
+                        false,
+                    )
+                    .await
+                } else {
+                    collect_run_stream(
+                        stream,
+                        false,
+                        true,
+                        0,
+                        "session",
+                        0,
+                        &request_id.to_string(),
+                    )
+                    .await
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    matches!(
+                        terminal,
+                        Some(FinishReason::EOS | FinishReason::Stop | FinishReason::Length)
+                    ),
+                    "terminal={terminal:?}, text_output={text_output}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_one_shot_response_rejects_engine_error_after_partial_output() {
+        let mut response = InferenceResponse {
+            request_id: RequestId(Uuid::new_v4()),
+            text: "partial output before failure".into(),
+            tokens: vec![TokenId::new(1)],
+            finish_reason: FinishReason::Error,
+            usage: TokenUsage::new(7, 1),
+            latency_ms: 1,
+            created_at: Utc::now(),
+            metadata: HashMap::new(),
+            api_response: None,
+            execution_evidence: None,
+        };
+        assert!(CollectedRunGeneration::from_response(response.clone()).is_err());
+        response.finish_reason = FinishReason::Length;
+        let collected = CollectedRunGeneration::from_response(response).unwrap();
+        assert_eq!(collected.raw_text, "partial output before failure");
+        assert_eq!(collected.token_count, 1);
     }
 
     #[test]

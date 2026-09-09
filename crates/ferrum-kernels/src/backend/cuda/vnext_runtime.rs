@@ -1952,6 +1952,15 @@ impl fmt::Debug for CudaDeviceRuntime {
 }
 
 impl CudaDeviceRuntime {
+    /// Check native driver/context availability before selecting this backend.
+    /// This does not load operators, allocate model resources or require the
+    /// optional Candle compatibility backend.
+    pub fn probe_device(ordinal: usize) -> Result<(), CudaDeviceRuntimeError> {
+        CudaContext::new(ordinal)
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
+    }
+
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(

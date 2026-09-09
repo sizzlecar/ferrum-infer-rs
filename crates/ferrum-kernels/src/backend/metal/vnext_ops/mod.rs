@@ -43,6 +43,7 @@ mod causal_attention;
 mod gated_delta_attention;
 mod linear;
 mod moe;
+mod native_blocks;
 #[cfg(test)]
 mod numerical_tolerance;
 mod primitives;
@@ -113,6 +114,7 @@ pub fn metal_vnext_runtime_config(
             include_str!("primitives.metal").as_bytes(),
             include_str!("linear.rs").as_bytes(),
             include_str!("linear.metal").as_bytes(),
+            native_blocks::FINGERPRINT_SOURCE.as_bytes(),
             include_str!("moe.rs").as_bytes(),
             include_str!("moe.metal").as_bytes(),
             include_str!("gated_delta_attention.rs").as_bytes(),

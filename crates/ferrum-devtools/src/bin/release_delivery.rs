@@ -14,6 +14,8 @@ mod local;
 mod performance;
 #[path = "release_delivery/portable.rs"]
 mod portable;
+#[path = "release_delivery/public_entry.rs"]
+mod public_entry;
 #[path = "release_delivery/public_install.rs"]
 mod public_install;
 #[path = "release_delivery/publish.rs"]
@@ -43,10 +45,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
-    /// Package or inspect a Windows CUDA portable ZIP; no publication gate.
+    /// Package or inspect a Windows CPU/CUDA portable ZIP; no publication gate.
     Portable(portable::PortableArgs),
     Inspect(installation::InspectArgs),
     Installed(public_install::InstalledArgs),
+    Entry(public_entry::EntryArgs),
     Gate {
         #[command(flatten)]
         inputs: gate::GateArgs,
@@ -70,6 +73,7 @@ async fn run(action: Action) -> Result<(), String> {
     match action {
         Action::Portable(args) => portable::execute(args).await,
         Action::Installed(args) => public_install::verify(args).await,
+        Action::Entry(args) => public_entry::verify(args).await,
         Action::Gate { inputs, output } => {
             let accepted = gate::verify(inputs).await?;
             let mut file = std::fs::OpenOptions::new()

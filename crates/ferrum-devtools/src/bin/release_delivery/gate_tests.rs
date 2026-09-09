@@ -72,9 +72,9 @@ fn make_plan(task: &ExpectedModelRun) -> Plan {
 fn plan_document(plan: &Plan) -> Value {
     json!({"schema_version":2,"stage":"release","provenance":{"candidate":"a".repeat(40)},"plan":plan,"model_tasks":model_task_schedule(plan)})
 }
-fn distributions() -> BTreeMap<Backend, Distribution> {
+fn distributions() -> Distributions {
     BTreeMap::from([(
-        Backend::Cuda,
+        (Backend::Cuda, "x86_64-unknown-linux-gnu".into()),
         Distribution {
             backend: Backend::Cuda,
             name: "fixture.tar.gz".into(),

@@ -5,7 +5,7 @@ use ferrum_interfaces::vnext::{
     WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
     WeightLayoutId, WeightSchema, WeightTensorSpec,
 };
-use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
+use ferrum_quantization::gguf::ferrum_to_gguf_with_arch;
 use ferrum_quantization::{
     GgufWeightComponentSource, SafetensorsArchive, GPTQ_MARLIN_INT4_FORMAT_ID,
 };
@@ -633,12 +633,7 @@ fn load_gguf_tensor(
         .file()
         .tensor_info(&external_name)
         .ok_or_else(|| format!("Qwen3 MoE GGUF is missing required tensor {external_name:?}"))?;
-    let dimensions = info
-        .shape
-        .dims()
-        .iter()
-        .map(|dimension| *dimension as u64)
-        .collect::<Vec<_>>();
+    let dimensions = info.dimensions.clone();
     if dimensions != logical_dimensions {
         return Err(format!(
             "Qwen3 MoE GGUF tensor {external_name:?} has dimensions {dimensions:?}, expected exactly {logical_dimensions:?}"
@@ -647,34 +642,23 @@ fn load_gguf_tensor(
     Ok(Qwen3MoeGgufTensor {
         external_name,
         dimensions,
-        encoding: gguf_encoding(info.ggml_dtype)?,
+        encoding: gguf_encoding(&info.encoding)?,
     })
 }
 
-fn gguf_encoding(dtype: GgmlDType) -> Result<Qwen3MoeGgufEncoding, String> {
-    if let Some(format_id) = block_quantization_format(dtype) {
-        return Ok(Qwen3MoeGgufEncoding::BlockQuantized(
-            BlockQuantizationSpec {
-                format_id: format_id
-                    .to_owned()
-                    .try_into()
-                    .map_err(|error: VNextError| error.to_string())?,
-                logical_values_per_block: u32::try_from(dtype.block_size())
-                    .map_err(|_| "GGUF logical block width exceeds u32".to_owned())?,
-                bytes_per_block: u32::try_from(dtype.type_size())
-                    .map_err(|_| "GGUF physical block size exceeds u32".to_owned())?,
-            },
-        ));
+fn gguf_encoding(encoding: &WeightEncoding) -> Result<Qwen3MoeGgufEncoding, String> {
+    match encoding {
+        WeightEncoding::Dense { element_type } => Ok(Qwen3MoeGgufEncoding::Dense {
+            source_element_type: *element_type,
+        }),
+        WeightEncoding::BlockQuantized(spec) => {
+            spec.validate().map_err(|error| error.to_string())?;
+            Ok(Qwen3MoeGgufEncoding::BlockQuantized(spec.clone()))
+        }
+        _ => Err(format!(
+            "unsupported Qwen3 MoE GGUF source encoding {encoding:?}"
+        )),
     }
-    let source_element_type = match dtype {
-        GgmlDType::F16 => ElementType::F16,
-        GgmlDType::BF16 => ElementType::Bf16,
-        GgmlDType::F32 => ElementType::F32,
-        _ => return Err(format!("unsupported Qwen3 MoE GGUF tensor dtype {dtype:?}")),
-    };
-    Ok(Qwen3MoeGgufEncoding::Dense {
-        source_element_type,
-    })
 }
 
 fn validate_gguf_tensors(
@@ -1644,9 +1628,11 @@ mod tests {
                         || (external_name.starts_with("blk.0.")
                             && external_name.ends_with(".ffn_down_exps.weight"))
                     {
-                        gguf_encoding(GgmlDType::Q4K).unwrap()
+                        gguf_encoding(&ferrum_quantization::gguf::gguf_weight_encoding(12).unwrap())
+                            .unwrap()
                     } else if external_name.ends_with(".ffn_down_exps.weight") {
-                        gguf_encoding(GgmlDType::Q6K).unwrap()
+                        gguf_encoding(&ferrum_quantization::gguf::gguf_weight_encoding(14).unwrap())
+                            .unwrap()
                     } else if external_name.ends_with(".ffn_gate_inp.weight") {
                         Qwen3MoeGgufEncoding::Dense {
                             source_element_type: ElementType::F32,

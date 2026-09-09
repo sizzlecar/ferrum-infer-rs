@@ -22,6 +22,12 @@ fn main() {
             Ok(value) => println!("{value}"),
             Err(_) => process::exit(1),
         },
+        "system_profiler" => println!(
+            "{}",
+            env::var("FIXTURE_METAL_INFO").unwrap_or_else(|_| {
+                r#"{"SPDisplaysDataType":[{"spdisplays_mtlgpufamilysupport":"spdisplays_metal3"}]}"#.into()
+            })
+        ),
         _ => {
             if argv.get(1).map(String::as_str) == Some("--version-session") {
                 for line in io::stdin().lock().lines() {

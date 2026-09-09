@@ -41,8 +41,8 @@ use super::{
     f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
     provider_failure, rational_attribute, shared_binding_region, shared_full_region,
     shared_scratch_region, shared_token_region, token_binding_is_packed, unsigned_attribute,
-    DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
-    Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, VALUE_ALIGNMENT_BYTES, VNEXT_KV_PAGE_BYTES,
+    DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, VALUE_ALIGNMENT_BYTES,
+    VNEXT_KV_PAGE_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("causal_attention.metal");
@@ -327,17 +327,13 @@ impl MetalCausalPagedAttentionProvider {
             estimator_id,
             storage_bindings().map_err(contract_error)?,
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
-            &[
-                Q4_K_FORMAT_ID,
-                Q5_K_FORMAT_ID,
-                Q6_K_FORMAT_ID,
-                Q8_0_FORMAT_ID,
-            ],
+            super::linear::ALL_LINEAR_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("causal_attention.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 include_str!("linear.rs").as_bytes(),
                 include_str!("linear.metal").as_bytes(),
+                super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
                 provider_id.as_bytes(),

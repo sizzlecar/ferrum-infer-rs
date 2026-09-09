@@ -276,15 +276,15 @@ const CANDLE_DTYPES: &[(u32, GgmlDType)] = &[
     (30, GgmlDType::BF16),
 ];
 
-struct BlockAbi {
+pub(super) struct BlockAbi {
     name: String,
-    format: Option<&'static str>,
-    values: u64,
-    bytes: u64,
+    pub(super) format: Option<&'static str>,
+    pub(super) values: u64,
+    pub(super) bytes: u64,
     candle_dtype_available: bool,
 }
 
-fn block_abi(code: u32) -> Result<BlockAbi> {
+pub(super) fn block_abi(code: u32) -> Result<BlockAbi> {
     if let Some((_, dtype)) = CANDLE_DTYPES.iter().find(|(id, _)| *id == code) {
         return Ok(BlockAbi {
             name: format!("{dtype:?}"),

@@ -24,6 +24,21 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn cpu() -> Self {
+        let mut fixture = Self::new();
+        fixture.spec.manifest.backend = Backend::Cpu;
+        fixture.spec.manifest.cuda_compute_capability.clear();
+        fixture.spec.manifest.cargo_features.clear();
+        fixture
+            .spec
+            .manifest
+            .files
+            .retain(|file| file.role != Role::CudaRuntime);
+        fixture.spec.sources.remove("cudart64_12.dll");
+        fixture.archive = fixture.root.path().join("ferrum-windows-x86_64-cpu.zip");
+        fixture
+    }
+
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
@@ -116,25 +131,80 @@ impl Fixture {
     }
 }
 
+#[test]
+fn cpu_payload_roundtrips_without_cuda_runtime_files() {
+    let fixture = Fixture::cpu();
+    let receipt = fixture.pack();
+    fs::create_dir(&fixture.extracted()).unwrap();
+    extract(&fixture.archive, &receipt, &fixture.extracted()).unwrap();
+    assert_eq!(receipt.manifest.backend, Backend::Cpu);
+    assert!(fixture.extracted().join("ferrum.exe").is_file());
+    assert!(fixture.extracted().join("vcruntime140.dll").is_file());
+    assert!(!fixture.extracted().join("cudart64_12.dll").exists());
+}
+
+#[test]
+fn cpu_payload_rejects_gpu_build_identity_and_cuda_runtime_inputs() {
+    let fixture = Fixture::cpu();
+    for feature in ["cuda", "metal", "vllm-moe-marlin", "vllm-paged-attn-v2"] {
+        let mut manifest = fixture.spec.manifest.clone();
+        manifest.cargo_features.push(feature.into());
+        assert!(
+            validate(&manifest).is_err(),
+            "accepted GPU feature {feature}"
+        );
+    }
+    let mut manifest = fixture.spec.manifest.clone();
+    manifest.cuda_compute_capability = "89".into();
+    assert!(validate(&manifest).is_err());
+    let mut manifest = fixture.spec.manifest.clone();
+    manifest.files.push(
+        Fixture::new()
+            .spec
+            .manifest
+            .files
+            .into_iter()
+            .find(|file| file.role == Role::CudaRuntime)
+            .unwrap(),
+    );
+    assert!(validate(&manifest).is_err());
+    manifest = fixture.spec.manifest.clone();
+    manifest.backend = Backend::Cuda;
+    assert!(validate(&manifest).is_err());
+}
+
 // Reuse the real ZIP producer with structural PE fixtures. These tests verify
 // asset/receipt binding and never execute or claim a working installer or GPU.
 fn staged_fixture() -> Fixture {
-    let mut fixture = Fixture::new();
-    fixture.archive = fixture
-        .root
-        .path()
-        .join("ferrum-windows-x86_64-cuda-sm89.zip");
+    staged_fixture_backend(Backend::Cuda)
+}
+
+fn staged_fixture_backend(backend: Backend) -> Fixture {
+    let mut fixture = if backend == Backend::Cpu {
+        Fixture::cpu()
+    } else {
+        Fixture::new()
+    };
+    let suffix = if backend == Backend::Cpu {
+        "cpu"
+    } else {
+        "cuda-sm89"
+    };
+    let archive_name = format!("ferrum-windows-x86_64-{suffix}.zip");
+    fixture.archive = fixture.root.path().join(&archive_name);
     fixture.receipt = fixture
         .root
         .path()
-        .join("ferrum-windows-x86_64-cuda-sm89.zip.receipt.json");
-    fixture
-        .spec
-        .manifest
-        .cargo_features
-        .extend(["vllm-moe-marlin".into(), "vllm-paged-attn-v2".into()]);
+        .join(format!("{archive_name}.receipt.json"));
+    if backend == Backend::Cuda {
+        fixture
+            .spec
+            .manifest
+            .cargo_features
+            .extend(["vllm-moe-marlin".into(), "vllm-paged-attn-v2".into()]);
+    }
     let receipt = fixture.pack();
-    let inspection = Inspection {
+    let mut inspection = Inspection {
         schema_version: 1,
         status: "not_run".into(),
         scope: "archive_bytes_and_startup_only".into(),
@@ -147,16 +217,45 @@ fn staged_fixture() -> Fixture {
         observations: vec![],
         error: None,
     };
+    if backend == Backend::Cpu {
+        // Synthetic receipt observations exercise evidence binding only; the
+        // PE fixture is never executed. Native package QA is a separate flow.
+        inspection.status = "passed".into();
+        inspection.startup_directory = Some(fixture.extracted());
+        inspection.startup_environment = BTreeMap::from([
+            ("SystemRoot".into(), "C:\\Windows".into()),
+            ("WINDIR".into(), "C:\\Windows".into()),
+            ("PATH".into(), "C:\\Windows\\System32".into()),
+        ]);
+        inspection.observations = [
+            vec!["--version"],
+            vec!["--help"],
+            vec!["run", "--help"],
+            vec!["serve", "--help"],
+        ]
+        .into_iter()
+        .map(|args| Observation {
+            stdout: if args == ["--version"] {
+                "ferrum 2.3.4".into()
+            } else {
+                "fixture help".into()
+            },
+            arguments: args.into_iter().map(str::to_owned).collect(),
+            exit_code: Some(0),
+            stderr: String::new(),
+        })
+        .collect();
+    }
     fs::write(
         fixture.root.path().join("portable.staging-inspection.json"),
         serde_json::to_vec(&inspection).unwrap(),
     )
     .unwrap();
     let launcher = "ferrum-windows-launcher-v1.exe";
-    let setup = "ferrum-2.3.4-windows-x86_64-cuda-sm89-setup.exe";
+    let setup = format!("ferrum-2.3.4-windows-x86_64-{suffix}-setup.exe");
     fs::write(fixture.root.path().join(launcher), pe(false)).unwrap();
     fs::write(
-        fixture.root.path().join(setup),
+        fixture.root.path().join(&setup),
         b"opaque installer byte identity fixture",
     )
     .unwrap();
@@ -173,10 +272,10 @@ fn staged_fixture() -> Fixture {
     let stage = serde_json::json!({
         "schema_version":1,"version":"2.3.4","candidate_sha":"a".repeat(40),
         "candidate_tag":"v2.3.4-rc.7","staging_label":"run-17-2","workflow_run_id":17,"workflow_run_attempt":2,
-        "scope":"staged_bytes_only","binary_sha256":inspection.receipt.manifest.files[0].sha256,
+        "scope":if backend == Backend::Cpu { "staged_bytes_and_startup" } else { "staged_bytes_only" },"binary_sha256":inspection.receipt.manifest.files[0].sha256,
         "launcher_sha256":installation::sha256(&fixture.root.path().join(launcher)).unwrap(),
         "manifest_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&fixture.spec.manifest).unwrap())),
-        "archive":identity("ferrum-windows-x86_64-cuda-sm89.zip"),"setup":identity(setup),"launcher":identity(launcher)
+        "archive":identity(&archive_name),"setup":identity(&setup),"launcher":identity(launcher)
     });
     fs::write(
         fixture.root.path().join("windows-staging.json"),
@@ -192,14 +291,68 @@ fn staged_fixture() -> Fixture {
 fn accept_staged(
     fixture: &Fixture,
 ) -> Result<super::super::gate::windows_assets::VerifiedWindows, String> {
-    super::super::gate::windows_assets::verify(
+    super::super::gate::windows_assets::verify_one(
         fixture.root.path(),
+        Backend::Cuda,
         "2.3.4",
         &"a".repeat(40),
         17,
         "v2.3.3",
         "owner/repo",
     )
+}
+
+#[test]
+fn windows_release_requires_cpu_startup_and_the_shared_stable_launcher() {
+    let cuda = staged_fixture();
+    let accept = || {
+        super::super::gate::windows_assets::verify(
+            cuda.root.path(),
+            "2.3.4",
+            &"a".repeat(40),
+            17,
+            "v2.3.3",
+            "owner/repo",
+        )
+    };
+    assert!(
+        accept().is_err(),
+        "accepted a release without the CPU package"
+    );
+    let cpu = staged_fixture_backend(Backend::Cpu);
+    let cpu_dir = cuda.root.path().join("cpu");
+    fs::create_dir(&cpu_dir).unwrap();
+    for entry in fs::read_dir(cpu.root.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), cpu_dir.join(entry.file_name())).unwrap();
+        }
+    }
+    let release = accept().unwrap();
+    assert!(release
+        .assets
+        .iter()
+        .any(|asset| asset.name == "ferrum-windows-x86_64-cpu.zip"));
+    assert!(release
+        .assets
+        .iter()
+        .any(|asset| asset.name == "ferrum-2.3.4-windows-x86_64-cpu-setup.exe"));
+    let launcher: Vec<_> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name == "ferrum-windows-launcher-v1.exe")
+        .collect();
+    assert_eq!(launcher.len(), 1);
+    let path = cpu_dir.join("portable.staging-inspection.json");
+    let mut report: Inspection = read(&path).unwrap();
+    report.status = "not_run".into();
+    report.observations.clear();
+    report.startup_directory = None;
+    report.startup_environment.clear();
+    fs::write(path, serde_json::to_vec(&report).unwrap()).unwrap();
+    assert!(accept()
+        .unwrap_err()
+        .contains("CPU assets require executed startup"));
 }
 
 #[test]

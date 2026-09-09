@@ -7,7 +7,7 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_types::{FerrumError, Result};
 
-use super::{GgmlDType, GgufFile};
+use super::{GgmlDType, GgufFile, NativeGgufFile};
 use crate::safetensors_archive::transcode_dense_bytes;
 
 /// Schema-addressed, mmap-backed GGUF source for vNext static weights.
@@ -16,7 +16,7 @@ use crate::safetensors_archive::transcode_dense_bytes;
 /// when their type matches the schema and materialized on a cold-path source
 /// request when the typed execution plan requires another floating-point type.
 pub struct GgufWeightComponentSource {
-    file: Arc<GgufFile>,
+    file: Arc<NativeGgufFile>,
     source_file: String,
 }
 
@@ -34,7 +34,7 @@ impl GgufWeightComponentSource {
                 ))
             })?
             .to_owned();
-        let file = GgufFile::open(path).map_err(|error| {
+        let file = NativeGgufFile::open(path).map_err(|error| {
             FerrumError::model(format!(
                 "open vNext GGUF source {}: {error}",
                 path.display()
@@ -46,7 +46,7 @@ impl GgufWeightComponentSource {
         })
     }
 
-    pub fn file(&self) -> &GgufFile {
+    pub fn file(&self) -> &NativeGgufFile {
         &self.file
     }
 
@@ -81,56 +81,46 @@ impl WeightComponentSource for GgufWeightComponentSource {
 
         let (element_type, payload_bytes) = match &component.encoding {
             WeightEncoding::Dense { element_type } => {
-                let actual = dense_element_type(info.ggml_dtype).ok_or_else(|| {
-                    invalid_component(
+                let WeightEncoding::Dense {
+                    element_type: actual,
+                } = &info.encoding
+                else {
+                    return Err(invalid_component(
                         component,
                         format!(
-                            "GGUF dtype {:?} is quantized but the schema declares dense bytes",
-                            info.ggml_dtype
+                            "GGUF type {} is quantized but the schema declares dense bytes",
+                            info.ggml_type
                         ),
-                    )
-                })?;
-                let dimensions = info
-                    .shape
-                    .dims()
-                    .iter()
-                    .map(|dimension| *dimension as u64)
-                    .collect::<Vec<_>>();
-                if dimensions != component.dimensions {
+                    ));
+                };
+                let dimensions = &info.dimensions;
+                if dimensions != &component.dimensions {
                     return Err(invalid_component(
                         component,
                         format!(
                             "GGUF dense tensor dimensions differ: source_dtype={:?} dimensions={dimensions:?}",
-                            info.ggml_dtype,
+                            info.ggml_type,
                         ),
                     ));
                 }
                 let materialized =
-                    transcode_dense_bytes(bytes, actual, *element_type, external_name, None)?;
+                    transcode_dense_bytes(bytes, *actual, *element_type, external_name, None)?;
                 (*element_type, materialized)
             }
             WeightEncoding::BlockQuantized(spec) => {
                 spec.validate()?;
-                let actual_format =
-                    block_quantization_format(info.ggml_dtype).ok_or_else(|| {
-                        invalid_component(
-                            component,
-                            format!(
-                            "GGUF dtype {:?} is not a supported fixed-block quantization format",
-                            info.ggml_dtype
+                let WeightEncoding::BlockQuantized(actual) = &info.encoding else {
+                    return Err(invalid_component(
+                        component,
+                        format!(
+                            "GGUF type {} is not a fixed-block quantization format",
+                            info.ggml_type
                         ),
-                        )
-                    })?;
-                let logical_elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
-                    invalid_component(component, "GGUF tensor element count exceeds u64")
-                })?;
+                    ));
+                };
+                let logical_elements = info.elements;
                 let block_width = u64::from(spec.logical_values_per_block);
-                let mut physical_dimensions = info
-                    .shape
-                    .dims()
-                    .iter()
-                    .map(|dimension| *dimension as u64)
-                    .collect::<Vec<_>>();
+                let mut physical_dimensions = info.dimensions.clone();
                 let innermost = physical_dimensions.last_mut().ok_or_else(|| {
                     invalid_component(
                         component,
@@ -146,19 +136,15 @@ impl WeightComponentSource for GgufWeightComponentSource {
                     ));
                 }
                 *innermost /= block_width;
-                if actual_format != spec.format_id.as_str()
-                    || info.ggml_dtype.block_size() != spec.logical_values_per_block as usize
-                    || info.ggml_dtype.type_size() != spec.bytes_per_block as usize
+                if actual != spec
                     || !logical_elements.is_multiple_of(block_width)
                     || physical_dimensions != component.dimensions
                 {
                     return Err(invalid_component(
                         component,
                         format!(
-                            "GGUF block ABI differs: dtype={:?} format={actual_format} values_per_block={} bytes_per_block={} logical_elements={logical_elements} physical_dimensions={physical_dimensions:?}",
-                            info.ggml_dtype,
-                            info.ggml_dtype.block_size(),
-                            info.ggml_dtype.type_size(),
+                            "GGUF block ABI differs: file_type={} encoding={actual:?} logical_elements={logical_elements} physical_dimensions={physical_dimensions:?}",
+                            info.ggml_type,
                         ),
                     ));
                 }
@@ -215,12 +201,10 @@ unsafe impl StableHostMemory for GgufFile {
     }
 }
 
-fn dense_element_type(dtype: GgmlDType) -> Option<ElementType> {
-    match dtype {
-        GgmlDType::F16 => Some(ElementType::F16),
-        GgmlDType::BF16 => Some(ElementType::Bf16),
-        GgmlDType::F32 => Some(ElementType::F32),
-        _ => None,
+// SAFETY: NativeGgufFile owns the same immutable mapping lifetime contract.
+unsafe impl StableHostMemory for NativeGgufFile {
+    fn stable_bytes(&self) -> &[u8] {
+        self.mmap_bytes()
     }
 }
 

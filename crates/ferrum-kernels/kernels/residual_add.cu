@@ -50,3 +50,17 @@ extern "C" __global__ void residual_add_f32(
         output[idx] = a[idx] + b[idx];
     }
 }
+
+// The output may alias the F32 residual input, as declared by the vNext
+// contract. Do not apply restrict to either pointer in this variant.
+extern "C" __global__ void vnext_residual_add_f32_f16(
+    const float* residual,
+    const __half* update,
+    float* output,
+    const int n
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < static_cast<unsigned int>(n)) {
+        output[idx] = residual[idx] + __half2float(update[idx]);
+    }
+}

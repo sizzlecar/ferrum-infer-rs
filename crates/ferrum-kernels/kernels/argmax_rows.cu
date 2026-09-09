@@ -193,9 +193,10 @@ extern "C" __global__ void argmax_rows_f16_masked(
 // penalty is active, one block first creates a private penalized row in the
 // invocation-scoped scratch supplied by the provider contract. The common
 // no-penalty path reads logits directly and performs no scratch traffic.
-extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
-    const __half* __restrict__ logits,
-    __half* __restrict__ scratch,
+template<typename Logit>
+__device__ void vnext_masked_argmax_preserving_logits(
+    const Logit* __restrict__ logits,
+    Logit* __restrict__ scratch,
     int n,
     const signed char* __restrict__ valid,
     int mask_len,
@@ -211,7 +212,7 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
     unsigned int repetition_end = min(repetition_offsets[1], (unsigned int)repetition_capacity);
     const float penalty = repetition_penalty[0];
     const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
-    const __half* selection_logits = logits;
+    const Logit* selection_logits = logits;
 
     if (apply_penalty) {
         for (int token = tid; token < n; token += block_size) {
@@ -225,11 +226,11 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
             if (token >= (unsigned int)n) {
                 continue;
             }
-            float value = __half2float(scratch[token]);
+            float value = static_cast<float>(scratch[token]);
             if (!isfinite(value)) {
                 continue;
             }
-            scratch[token] = __float2half_rn(value > 0.0f ? value / penalty : value * penalty);
+            scratch[token] = static_cast<Logit>(value > 0.0f ? value / penalty : value * penalty);
         }
         __syncthreads();
         selection_logits = scratch;
@@ -241,7 +242,7 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
         if (token >= mask_len || valid[token] == 0) {
             continue;
         }
-        const float value = __half2float(selection_logits[token]);
+        const float value = static_cast<float>(selection_logits[token]);
         if (!isfinite(value)) {
             continue;
         }
@@ -289,4 +290,36 @@ extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
             out_idx[0] = local_idx;
         }
     }
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
+    const __half* __restrict__ logits,
+    __half* __restrict__ scratch,
+    int n,
+    const signed char* __restrict__ valid,
+    int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty,
+    int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
+}
+
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f32(
+    const float* __restrict__ logits,
+    float* __restrict__ scratch,
+    int n,
+    const signed char* __restrict__ valid,
+    int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty,
+    int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    vnext_masked_argmax_preserving_logits(logits, scratch, n, valid, mask_len,
+        repetition_offsets, repetition_token_ids, repetition_penalty, repetition_capacity, out_idx);
 }

@@ -18,6 +18,7 @@ use std::{
 pub enum Channel {
     Cargo,
     Homebrew,
+    Bootstrap,
 }
 #[derive(Debug, Args)]
 pub struct InstalledArgs {

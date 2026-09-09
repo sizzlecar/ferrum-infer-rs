@@ -243,7 +243,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
     }
 }
 
-fn runtime_policy(runtime: &ReferenceDeviceRuntime) -> ResolvedRuntimePolicy {
+fn runtime_policy<R: DeviceRuntime>(runtime: &R) -> ResolvedRuntimePolicy {
     ResolvedRuntimePolicy::new(
         "runtime-policy.reference.l1",
         ContractVersion::new(1, 0),
@@ -279,12 +279,12 @@ fn tiny_work() -> (TokenSpanWork, ResourceWorkShape) {
     (span, work)
 }
 
-fn admit_sequence(
-    resources: &Arc<PlanRuntimeResources<ReferenceDeviceRuntime>>,
+fn admit_sequence<R: DeviceRuntime>(
+    resources: &Arc<PlanRuntimeResources<R>>,
     work: &ResourceWorkShape,
     run_id: &str,
     request_id: &str,
-) -> Arc<AdmittedSequenceResources<ReferenceDeviceRuntime>> {
+) -> Arc<AdmittedSequenceResources<R>> {
     let request = RequestResourceAdmissionRequest::new(
         work.clone(),
         AdmissionFitPolicy::ImmediateOnly,
@@ -334,11 +334,11 @@ fn admit_sequence(
         .expect("bounded sequence backing maintenance must converge")
 }
 
-fn begin_step(
-    batch: &ExecutionBatchParticipants<ReferenceDeviceRuntime>,
-    lane: &Arc<ExecutionLane<ReferenceDeviceRuntime>>,
+fn begin_step<R: DeviceRuntime>(
+    batch: &ExecutionBatchParticipants<R>,
+    lane: &Arc<ExecutionLane<R>>,
     spans: &[TokenSpanWork],
-) -> Arc<StepResourceLease<ReferenceDeviceRuntime>> {
+) -> Arc<StepResourceLease<R>> {
     let request = StepResourceAdmissionRequest::new(
         batch.bind_work_shape(spans.to_vec()).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
@@ -361,11 +361,11 @@ fn begin_step(
         .expect("bounded step backing maintenance must converge")
 }
 
-fn prepare_wave(
+fn prepare_wave<R: DeviceRuntime>(
     plan: &ExecutionPlan,
-    step: &Arc<StepResourceLease<ReferenceDeviceRuntime>>,
+    step: &Arc<StepResourceLease<R>>,
     spans: &[TokenSpanWork],
-) -> PreparedStepSubmissionWave<ReferenceDeviceRuntime> {
+) -> PreparedStepSubmissionWave<R> {
     let requests = plan
         .payload()
         .nodes()
@@ -452,7 +452,7 @@ fn build_mixed_reference_fixture() -> MixedReferenceFixture {
         .unwrap();
     let program_fingerprint = family.program().fingerprint().unwrap();
     let composition = ReferenceVNextComposition::create(id("device.reference.l1.mixed")).unwrap();
-    let policy = runtime_policy(composition.runtime());
+    let policy = runtime_policy(composition.runtime().as_ref());
     let input_tensor = ProgramTensorSpec {
         dimensions: vec![MIXED_ROWS, IN_FEATURES],
         element_type: ElementType::F16,
@@ -879,6 +879,55 @@ fn execute_reference_batch(
 
 #[test]
 fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
+    let composition = ReferenceVNextComposition::create(id("device.reference.l1.0")).unwrap();
+    tiny_safetensors_runtime(
+        composition.runtime(),
+        composition.registry(),
+        composition.weight_materializers(),
+        composition.weight_materializer_id(),
+        composition.catalog(),
+        |runtime| {
+            let snapshot = runtime.snapshot();
+            assert!(snapshot.allocations >= 2);
+            assert!(snapshot.live_allocations >= 2);
+            assert!(snapshot.submissions >= 2);
+            assert!(snapshot.commands >= 2);
+            assert_eq!(snapshot.dense_linear_launches, 2);
+            assert_eq!(snapshot.readback_bytes, 4);
+        },
+        |runtime| assert_eq!(runtime.snapshot().live_allocations, 0),
+    );
+}
+
+#[test]
+fn tiny_real_safetensors_executes_through_cpu_vnext_runtime() {
+    use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+    let composition = CpuVNextComposition::create(id("device.cpu.l1.0"), 64 << 20).unwrap();
+    let (runtime, registry, materializers, materializer_id, catalog) =
+        composition.into_parts().unwrap();
+    tiny_safetensors_runtime(
+        &runtime,
+        &registry,
+        &materializers,
+        &materializer_id,
+        &catalog,
+        |runtime| {
+            assert!(runtime.resident_bytes() > 8);
+            assert!(runtime.peak_resident_bytes() <= runtime.descriptor().total_memory_bytes);
+        },
+        |runtime| assert_eq!(runtime.resident_bytes(), 0),
+    );
+}
+
+fn tiny_safetensors_runtime<R: DeviceRuntime>(
+    runtime: &Arc<R>,
+    registry: &OperationRuntimeRegistry<R>,
+    materializers: &WeightMaterializerRegistry,
+    materializer_id: &WeightMaterializerId,
+    catalog: &CapabilityCatalog,
+    inspect_live: impl FnOnce(&R),
+    inspect_closed: impl FnOnce(&R),
+) {
     let model_dir = tempfile::tempdir().unwrap();
     let weight_values = [2.0_f32, 1.0, -1.0, 3.0];
     let weight_bytes = weight_values
@@ -906,8 +955,7 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         )
         .unwrap();
     let program_fingerprint = family.program().fingerprint().unwrap();
-    let composition = ReferenceVNextComposition::create(id("device.reference.l1.0")).unwrap();
-    let policy = runtime_policy(composition.runtime());
+    let policy = runtime_policy(runtime.as_ref());
     let input_tensor = ProgramTensorSpec {
         dimensions: vec![ROWS, IN_FEATURES],
         element_type: ElementType::F16,
@@ -918,14 +966,14 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         (id("value.reference.input.tokens"), input_tensor),
     ]))
     .unwrap();
-    options.require_weight_materializer(composition.weight_materializer_id().clone());
+    options.require_weight_materializer(materializer_id.clone());
     assert!(options.retain_completion_value(id("value.reference.output.tokens")));
     let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
         &family,
-        composition.catalog(),
+        catalog,
         &policy,
-        &composition.registry().planning(),
-        composition.weight_materializers(),
+        &registry.planning(),
+        materializers,
         &options,
     )
     .unwrap();
@@ -938,13 +986,10 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
     assert!(matches!(fixed_node.work(), NodeWorkContract::Fixed));
     assert!(matches!(token_node.work(), NodeWorkContract::Tokens { .. }));
     assert_eq!(token_node.work().token_projections().len(), 2);
-    let providers = composition.registry().bind_plan(executable).unwrap();
+    let providers = registry.bind_plan(executable).unwrap();
 
     let provisioned = plan
-        .provision_static(
-            Arc::clone(composition.runtime()),
-            id("request.reference.l1.provision"),
-        )
+        .provision_static(Arc::clone(runtime), id("request.reference.l1.provision"))
         .unwrap();
     let permit = match provisioned.into_provisioning() {
         StaticProvisioning::Required(permit) => permit,
@@ -955,7 +1000,7 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         id("run.reference.l1.provision"),
         id("transaction.reference.l1.provision"),
     );
-    let driver = RuntimeResourceDriver::new(Arc::clone(composition.runtime())).unwrap();
+    let driver = RuntimeResourceDriver::new(Arc::clone(runtime)).unwrap();
     let reserved = ResourceTransaction::begin(driver, identity, permit)
         .unwrap()
         .reserve()
@@ -1075,13 +1120,7 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
         .collect::<Vec<_>>();
     assert_eq!(output_values, vec![1.0, -7.5]);
-    let snapshot = composition.runtime().snapshot();
-    assert!(snapshot.allocations >= 2);
-    assert!(snapshot.live_allocations >= 2);
-    assert!(snapshot.submissions >= 2);
-    assert!(snapshot.commands >= 2);
-    assert_eq!(snapshot.dense_linear_launches, 2);
-    assert_eq!(snapshot.readback_bytes, 4);
+    inspect_live(runtime.as_ref());
 
     drop(receipt);
     drop(handle);
@@ -1107,8 +1146,7 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         Err(error) => panic!("reference L1 runtime close failed: {:?}", error.failure()),
     };
     assert_eq!(close_receipt.released_static_resources(), 1);
-    let closed_snapshot = composition.runtime().snapshot();
-    assert_eq!(closed_snapshot.live_allocations, 0);
+    inspect_closed(runtime.as_ref());
 }
 
 #[test]

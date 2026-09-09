@@ -25,6 +25,9 @@ cudarc = { version = "0.19", default-features = false, features = ["std", "drive
 metal = { version = "0.31", optional = true }
 libc = "0.2"
 
+[dev-dependencies]
+libloading = "0.8.9"
+
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 # NCCL is unavailable on native Windows. Keep the existing CUDA feature
 # set on other targets while Windows uses the single-device backend.

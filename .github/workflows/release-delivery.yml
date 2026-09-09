@@ -216,10 +216,14 @@ jobs:
               --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-$backend" \
               --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
           done
-          abi_args=()
-          for abi in "$RUNNER_TEMP/staged/"*.abi.json; do abi_args+=(--abi "$abi"); done
+          # Model runners execute Linux CPU/CUDA and macOS Metal. The separate
+          # macOS CPU artifact has its own native installation report.
           target/debug/examples/model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
-            --version "$VERSION" "${abi_args[@]}" --output-dir "$RUNNER_TEMP/tasks"
+            --version "$VERSION" \
+            --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64.tar.gz.abi.json" \
+            --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
+            --abi "$RUNNER_TEMP/staged/ferrum-macos-aarch64.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -568,6 +572,10 @@ jobs:
           path: ${{ runner.temp }}/installation
       - uses: actions/download-artifact@v4
         with:
+          name: installation-macos-cpu
+          path: ${{ runner.temp }}/installation
+      - uses: actions/download-artifact@v4
+        with:
           name: contract-checks
           path: ${{ runner.temp }}/contracts
       # Optional cached package checkpoints only save work. The publisher still
@@ -688,8 +696,87 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  install-bootstrap-unix:
+    needs: [prepare, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux
+          - runner: macos-14
+            platform: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the controller before invoking the public installer
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Verify deployed script and execute the README download pipeline
+        run: |
+          target/debug/release_delivery entry \
+            --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
+            --output "$RUNNER_TEMP/public-entry.json"
+          curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+          target/debug/release_delivery installed --channel bootstrap --version "$VERSION" \
+            --binary "$HOME/.local/bin/ferrum" --output "$RUNNER_TEMP/public-bootstrap-auto.json"
+          curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cpu
+          target/debug/release_delivery installed --channel bootstrap --version "$VERSION" \
+            --binary "$HOME/.local/bin/ferrum" --output "$RUNNER_TEMP/public-bootstrap-cpu.json"
+          target/debug/release_delivery entry \
+            --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
+            --output "$RUNNER_TEMP/public-entry-after.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-bootstrap-${{ matrix.platform }}
+          path: ${{ runner.temp }}/public-*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  install-bootstrap-windows:
+    needs: [prepare, publish]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CPU controller before invoking the public installer
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Execute the README pipeline in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $controller = Join-Path $env:GITHUB_WORKSPACE 'target/debug/release_delivery.exe'
+          & $controller entry --url https://ferrum.pandaailabs.com/install.ps1 --expected-script scripts/install.ps1 --output "$env:RUNNER_TEMP/public-entry.json"
+          if ($LASTEXITCODE -ne 0) { throw 'The public PowerShell script differs from the release candidate' }
+          irm https://ferrum.pandaailabs.com/install.ps1 | iex
+          $binary = (Get-Command ferrum -CommandType Application -ErrorAction Stop).Path
+          & $controller installed --channel bootstrap --version $env:VERSION --binary $binary --output "$env:RUNNER_TEMP/public-bootstrap-auto.json"
+          if ($LASTEXITCODE -ne 0) { throw 'The publicly installed Windows program failed startup checks' }
+          & $controller entry --url https://ferrum.pandaailabs.com/install.ps1 --expected-script scripts/install.ps1 --output "$env:RUNNER_TEMP/public-entry-after.json"
+          if ($LASTEXITCODE -ne 0) { throw 'The public PowerShell script changed during installation' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-bootstrap-windows
+          path: ${{ runner.temp }}/public-*.json
+          if-no-files-found: error
+          retention-days: 30
+
   complete:
-    needs: [prepare, publish, install-cargo, install-homebrew]
+    needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-windows]
     if: always() && needs.prepare.outputs.active == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -699,8 +786,12 @@ jobs:
           PUBLISH: ${{ needs.publish.result }}
           CARGO_INSTALL: ${{ needs.install-cargo.result }}
           BREW_INSTALL: ${{ needs.install-homebrew.result }}
+          UNIX_BOOTSTRAP: ${{ needs.install-bootstrap-unix.result }}
+          WINDOWS_BOOTSTRAP: ${{ needs.install-bootstrap-windows.result }}
         run: |
           test "$PUBLISH" = success
           test "$CARGO_INSTALL" = success
           test "$BREW_INSTALL" = success
-          echo 'Formal release delivered; published Cargo and Homebrew programs passed startup checks.' >> "$GITHUB_STEP_SUMMARY"
+          test "$UNIX_BOOTSTRAP" = success
+          test "$WINDOWS_BOOTSTRAP" = success
+          echo 'Formal release delivered; Cargo, Homebrew and the public Windows/Linux/macOS installer entrypoints passed installation/startup checks.' >> "$GITHUB_STEP_SUMMARY"

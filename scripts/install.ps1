@@ -1,12 +1,12 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Installs the official Ferrum Windows x64 CUDA sm89 release for the current user.
+Installs the official Ferrum Windows x64 release for the current user.
 .PARAMETER Version
 Optional formal version, for example 0.8.9. The default is the latest formal release.
 #>
 [CmdletBinding()]
-param([string]$Version = '')
+param([string]$Version = '', [ValidateSet('auto','cpu','cuda')][string]$Backend = 'auto')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -20,14 +20,15 @@ function ConvertTo-FerrumVersion {
 }
 
 function Select-FerrumRelease {
-    param([Parameter(Mandatory=$true)][object]$Release, [string]$RequestedVersion = '')
+    param([Parameter(Mandatory=$true)][object]$Release, [string]$RequestedVersion = '', [ValidateSet('cpu','cuda')][string]$SelectedBackend = 'cuda')
     if ($Release.draft -isnot [bool] -or $Release.prerelease -isnot [bool] -or $Release.draft -or $Release.prerelease) {
         throw 'Ferrum installation requires a published formal release.'
     }
     $resolved = ConvertTo-FerrumVersion -Value ([string]$Release.tag_name)
     if ([string]$Release.tag_name -cne ('v'+$resolved)) { throw 'Release tag is not canonical.' }
     if ($RequestedVersion -and $resolved -cne (ConvertTo-FerrumVersion -Value $RequestedVersion)) { throw 'Release version does not match the request.' }
-    $name = 'ferrum-'+$resolved+'-windows-x86_64-cuda-sm89-setup.exe'
+    $suffix = if ($SelectedBackend -eq 'cpu') { 'cpu' } else { 'cuda-sm89' }
+    $name = 'ferrum-'+$resolved+'-windows-x86_64-'+$suffix+'-setup.exe'
     $selected = @()
     foreach ($assetName in @($name, ($name+'.sha256'))) {
         $matchingAssets = @($Release.assets | Where-Object { [string]$_.name -ceq $assetName })
@@ -172,6 +173,32 @@ function Get-FerrumWindowsArchitecture {
     }
 }
 
+function Resolve-FerrumBackend {
+    param([ValidateSet('auto','cpu','cuda')][string]$RequestedBackend = 'auto', [string]$Architecture, [string]$GpuCsv = '', [string]$ProbeError = '')
+    if ($Architecture -cne 'X64') { throw 'This installer supports native Windows x64 only.' }
+    if ($RequestedBackend -eq 'cpu') { return 'cpu' }
+    try {
+        if ($ProbeError) { throw $ProbeError }
+        Assert-FerrumHardware -Architecture $Architecture -GpuCsv $GpuCsv
+        return 'cuda'
+    } catch {
+        if ($RequestedBackend -eq 'cuda') { throw }
+        Write-Host ('A compatible CUDA device is unavailable: '+$_.Exception.Message)
+        Write-Host 'Selecting the CPU package. NVIDIA drivers and CUDA Toolkit are not required.'
+        return 'cpu'
+    }
+}
+
+function Get-FerrumNvidiaSmiCandidates {
+    # WOW64 redirects System32 and the ProgramFiles special folder to their
+    # 32-bit counterparts. Probe the native driver tools from either shell.
+    $systemDirectory = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { 'Sysnative' } else { 'System32' }
+    Join-Path ([Environment]::GetFolderPath('Windows')) ($systemDirectory+'\nvidia-smi.exe')
+    $programFiles = [Environment]::GetEnvironmentVariable('ProgramW6432', 'Process')
+    if (-not $programFiles) { $programFiles = [Environment]::GetFolderPath('ProgramFiles') }
+    Join-Path $programFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+}
+
 function Add-FerrumProcessPath {
     param([Parameter(Mandatory=$true)][string]$Directory)
     if (-not [IO.Directory]::Exists($Directory) -or $Directory.Contains(';')) { throw 'Installed Ferrum directory is not a usable PATH entry.' }
@@ -200,7 +227,7 @@ function Confirm-FerrumCommand {
 }
 
 function Install-FerrumSetup {
-    param([Parameter(Mandatory=$true)][string]$SetupPath, [Parameter(Mandatory=$true)][string]$Sha256, [Parameter(Mandatory=$true)][string]$ExpectedVersion)
+    param([Parameter(Mandatory=$true)][string]$SetupPath, [Parameter(Mandatory=$true)][string]$Sha256, [Parameter(Mandatory=$true)][string]$ExpectedVersion, [ValidateSet('cpu','cuda')][string]$SelectedBackend = 'cuda')
     $expected = ConvertTo-FerrumVersion -Value $ExpectedVersion
     Write-Host 'Verifying the downloaded installer...'
     Confirm-FerrumFile -Path $SetupPath -Sha256 $Sha256
@@ -211,27 +238,34 @@ function Install-FerrumSetup {
     if ($result.stdout.Trim() -cne ('ferrum '+$expected)) { throw 'Installed Ferrum version does not match the selected release.' }
     Add-FerrumProcessPath -Directory ([IO.Path]::GetDirectoryName($installed))
     Confirm-FerrumCommand -Program $installed
-    Write-Host ('Installed Ferrum '+$expected+' (Windows x64, CUDA sm89).')
+    $label = if ($SelectedBackend -eq 'cpu') { 'CPU' } else { 'CUDA sm89' }
+    Write-Host ('Installed Ferrum '+$expected+' (Windows x64, '+$label+').')
     Write-Host 'Ready in this terminal. Example (downloads the model on first use): ferrum run qwen3:0.6b'
     Write-Host 'To select another model, see: ferrum run --help'
 }
 
 function Install-FerrumRelease {
-    param([string]$RequestedVersion = '')
+    param([string]$RequestedVersion = '', [ValidateSet('auto','cpu','cuda')][string]$RequestedBackend = 'auto')
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'This installer requires Windows.' }
     $architecture = Get-FerrumWindowsArchitecture
     if ($architecture -cne 'X64') { throw 'This installer supports native Windows x64 only.' }
-    $candidates = @((Join-Path ([Environment]::GetFolderPath('System')) 'nvidia-smi.exe'), (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))
-    $smi = @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
-    if ($smi.Count -eq 0) { throw 'NVIDIA driver tools were not found. Install the NVIDIA driver: https://www.nvidia.com/drivers/ . CUDA Toolkit is not required.' }
-    $gpu = Invoke-FerrumProcess -Program $smi[0] -Arguments @('-i','0','--query-gpu=compute_cap,driver_version','--format=csv,noheader,nounits')
-    Assert-FerrumHardware -Architecture $architecture -GpuCsv $gpu.stdout
+    $gpuCsv = ''; $probeError = ''
+    if ($RequestedBackend -ne 'cpu') {
+        try {
+            $candidates = @(Get-FerrumNvidiaSmiCandidates)
+            $smi = @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)
+            if ($smi.Count -eq 0) { throw 'NVIDIA driver tools were not found.' }
+            $gpu = Invoke-FerrumProcess -Program $smi[0] -Arguments @('-i','0','--query-gpu=compute_cap,driver_version','--format=csv,noheader,nounits')
+            $gpuCsv = $gpu.stdout
+        } catch { $probeError = $_.Exception.Message }
+    }
+    $selectedBackend = Resolve-FerrumBackend -RequestedBackend $RequestedBackend -Architecture $architecture -GpuCsv $gpuCsv -ProbeError $probeError
     $endpoint = 'https://api.github.com/repos/sizzlecar/ferrum-infer-rs/releases/latest'
     if ($RequestedVersion) { $endpoint = 'https://api.github.com/repos/sizzlecar/ferrum-infer-rs/releases/tags/v'+(ConvertTo-FerrumVersion -Value $RequestedVersion) }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Write-Host 'Looking up the Ferrum release...'
     $release = Invoke-RestMethod -Uri $endpoint -Headers @{Accept='application/vnd.github+json';'User-Agent'='Ferrum-Windows-Installer'}
-    $selected = Select-FerrumRelease -Release $release -RequestedVersion $RequestedVersion
+    $selected = Select-FerrumRelease -Release $release -RequestedVersion $RequestedVersion -SelectedBackend $selectedBackend
     $temporary = Join-Path ([IO.Path]::GetTempPath()) ('Ferrum-install-'+[Guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($temporary)
     try {
@@ -242,9 +276,9 @@ function Install-FerrumRelease {
         $checksumPath = Join-Path $temporary $selected.checksum.name
         if ((Get-Item -LiteralPath $checksumPath).Length -gt 4096) { throw 'Installer checksum file is unexpectedly large.' }
         $sha = ConvertFrom-FerrumChecksum -Text ([IO.File]::ReadAllText($checksumPath)) -AssetName $selected.setup.name
-        Install-FerrumSetup -SetupPath (Join-Path $temporary $selected.setup.name) -Sha256 $sha -ExpectedVersion $selected.version
+        Install-FerrumSetup -SetupPath (Join-Path $temporary $selected.setup.name) -Sha256 $sha -ExpectedVersion $selected.version -SelectedBackend $selectedBackend
     } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
 }
 
 # Dot-sourcing exposes the same product functions for Rust-driven contract tests.
-if ($MyInvocation.InvocationName -ne '.') { Install-FerrumRelease -RequestedVersion $Version }
+if ($MyInvocation.InvocationName -ne '.') { Install-FerrumRelease -RequestedVersion $Version -RequestedBackend $Backend }
