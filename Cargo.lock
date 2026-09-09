@@ -1526,6 +1526,7 @@ dependencies = [
  "float8 0.7.0",
  "half",
  "libc",
+ "libloading 0.8.9",
  "metal 0.31.0",
  "rayon",
  "serde",

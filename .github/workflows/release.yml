@@ -180,7 +180,7 @@ jobs:
           asset="ferrum-linux-x86_64.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
-          cp LICENSE dist/LICENSE
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
           cp README.md dist/README.md
           tar -C dist -czf "$asset" ferrum LICENSE README.md
           ./target/release/examples/release_candidate manifest \
@@ -325,7 +325,7 @@ jobs:
           asset="ferrum-macos-aarch64.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
-          cp LICENSE dist/LICENSE
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
           cp README.md dist/README.md
           tar -C dist -czf "$asset" ferrum LICENSE README.md
           ./target/release/examples/release_candidate manifest \

@@ -207,7 +207,7 @@ jobs:
           asset="ferrum-linux-x86_64-cuda-sm89.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
-          cp LICENSE dist/LICENSE
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist/LICENSE
           cp README.md dist/README.md
           cat > dist/CUDA-BUILD.txt <<EOF
           Ferrum v${VERSION} CUDA release binary
@@ -561,6 +561,7 @@ jobs:
             Add-PayloadFile $name 'msvc_runtime' (Join-Path $crt $name) 'licenses/Microsoft-VC-Runtime-2015-2022-License.docx'
           }
           Add-PayloadFile 'licenses/Ferrum.txt' 'license' 'LICENSE' $null
+          Add-PayloadFile 'licenses/ggml.txt' 'license' 'crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml' $null
           Add-PayloadFile 'licenses/CUDA.txt' 'license' $cudaLicense $null
           Add-PayloadFile 'licenses/Microsoft-VC-Runtime-2015-2022-License.docx' 'license' $vcLicense $null
           Add-PayloadFile 'licenses/Apache-2.0.txt' 'license' 'native-operators/licenses/Apache-2.0.txt' $null
