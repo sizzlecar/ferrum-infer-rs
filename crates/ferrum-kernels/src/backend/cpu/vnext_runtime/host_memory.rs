@@ -3,9 +3,9 @@ use super::CpuRuntimeError;
 /// Hardware/process capacity for the existing typed runtime memory policy.
 /// Provider allocations are separately charged against its admitted ceiling.
 pub(crate) fn host_memory_capacity() -> Result<u64, CpuRuntimeError> {
-    let mut bytes = platform_capacity()?;
+    let bytes = platform_capacity()?;
     #[cfg(unix)]
-    {
+    let bytes = {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         // SAFETY: getrlimit initializes the complete output on success.
         if unsafe { libc::getrlimit(libc::RLIMIT_AS, limit.as_mut_ptr()) } != 0 {
@@ -16,13 +16,13 @@ pub(crate) fn host_memory_capacity() -> Result<u64, CpuRuntimeError> {
         }
         let limit = unsafe { limit.assume_init() };
         if limit.rlim_cur != libc::RLIM_INFINITY {
-            bytes = bytes.min(limit.rlim_cur as u64);
+            bytes.min(limit.rlim_cur as u64)
+        } else {
+            bytes
         }
-    }
+    };
     #[cfg(target_os = "linux")]
-    {
-        bytes = linux_cgroup_capacity(bytes)?;
-    }
+    let bytes = linux_cgroup_capacity(bytes)?;
     if bytes == 0 || bytes > usize::MAX as u64 {
         return Err(CpuRuntimeError::new(
             "CPU memory capacity is zero or exceeds the process address space",
