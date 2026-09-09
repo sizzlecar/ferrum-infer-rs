@@ -1605,7 +1605,10 @@ mod tests {
             }));
         drop(archive);
 
-        let prepared = super::super::prepare_from_model_dir(&output).unwrap();
+        let prepared = crate::vnext::test_support::prepare_product_fixture(
+            super::super::define_from_model_dir(&output).unwrap(),
+        )
+        .unwrap();
         assert_eq!(prepared.descriptor().architecture(), "gpt_oss");
         assert_eq!(prepared.descriptor().hidden_size(), 256);
         assert_eq!(prepared.descriptor().layer_count(), 2);

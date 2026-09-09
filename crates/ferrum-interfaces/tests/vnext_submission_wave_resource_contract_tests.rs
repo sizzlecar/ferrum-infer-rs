@@ -1,6 +1,7 @@
 #[path = "vnext_resource_contract/support.rs"]
 mod resource_support;
 mod vnext_core_contract;
+use vnext_core_contract::PrepareFixture;
 
 use ferrum_interfaces::model_executor::{
     ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
@@ -19,7 +20,7 @@ fn sequential_scratch_plan_with_policy(
 ) {
     let registration = TypedFamilyRegistration::new(core::SequentialScratchFamily);
     let family = registration
-        .prepare(&serde_json::json!({"width": 4}))
+        .prepare_fixture(&serde_json::json!({"width": 4}))
         .unwrap();
     let catalog = core::catalog();
     let descriptor = catalog.providers_for(&core::id("operation.main")).unwrap()[0].clone();

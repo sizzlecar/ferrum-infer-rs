@@ -75,6 +75,10 @@ pub struct ServeCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
+    /// Numerical execution profile: auto or an exact family profile ID.
+    #[arg(long, value_name = "PROFILE")]
+    pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
+
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
@@ -379,6 +383,7 @@ async fn execute_with_compatibility(
         port,
         tts_slots,
         backend,
+        numerical_profile,
         gpu_devices,
         layer_split_pipeline_mode,
         spec_draft,
@@ -555,16 +560,17 @@ async fn execute_with_compatibility(
     let requested_model = product_input.requested_model.clone();
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
-    let product_engine_config = product_input.engine_config;
+    let mut product_engine_config = product_input.engine_config;
+    product_engine_config.numerical_execution =
+        config.resolve_numerical_execution(numerical_profile.as_ref());
     let model_sources = product_input.model_sources;
-    let prepared_model = model_sources
-        .as_ref()
-        .map(crate::source_resolver::prepare_registered_product_model)
-        .transpose()?
-        .flatten();
-    let vnext_plan_owns_context_capacity = prepared_model.is_some();
-    let model_chat_template = match prepared_model.as_deref() {
-        Some(prepared) => Some(crate::source_resolver::load_prepared_product_chat_template(
+    let defined_model = crate::source_resolver::define_registered_product_model(
+        model_sources.as_ref(),
+        &product_engine_config.numerical_execution,
+    )?;
+    let vnext_plan_owns_context_capacity = defined_model.is_some();
+    let model_chat_template = match defined_model.as_deref() {
+        Some(prepared) => Some(crate::source_resolver::load_defined_product_chat_template(
             prepared,
         )?),
         None => match model_sources.as_deref() {
@@ -572,10 +578,10 @@ async fn execute_with_compatibility(
             None => crate::source_resolver::load_model_chat_template(&source.local_path),
         },
     };
-    let product_source_identity = prepared_model
+    let product_source_identity = defined_model
         .as_deref()
         .map(|prepared| {
-            crate::source_resolver::prepared_product_source_identity(
+            crate::source_resolver::defined_product_source_identity(
                 prepared,
                 &requested_model,
                 &model_id,
@@ -724,7 +730,7 @@ async fn execute_with_compatibility(
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
-    let model_definition: Option<ferrum_models::ModelDefinition> = if prepared_model.is_some() {
+    let model_definition: Option<ferrum_models::ModelDefinition> = if defined_model.is_some() {
         None
     } else if let Some(sources) = model_sources.as_deref() {
         let mut config_manager = ferrum_models::ConfigManager::new();
@@ -742,7 +748,7 @@ async fn execute_with_compatibility(
     // gets the layer count from ModelDefinition; the GGUF path reads it
     // from the file header — without this the placeholder plan
     // (`layers=auto`) reaches the engine and is rejected.
-    let model_layer_count = if let Some(prepared) = prepared_model.as_ref() {
+    let model_layer_count = if let Some(prepared) = defined_model.as_ref() {
         Some(prepared.descriptor().layer_count())
     } else if let Some(definition) = model_definition.as_ref() {
         Some(definition.num_hidden_layers)
@@ -924,14 +930,14 @@ async fn execute_with_compatibility(
     non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     materialized_runtime_keys.sort();
     materialized_runtime_keys.dedup();
-    let typed_model_capabilities = prepared_model
+    let typed_model_capabilities = defined_model
         .as_ref()
-        .map(|prepared| prepared.model_capabilities())
+        .map(|defined| defined.model_capabilities(&product_engine_config.numerical_execution))
         .transpose()?;
     let startup_auto_config = startup_auto_config(
         &device,
         typed_model_capabilities,
-        if prepared_model.is_some() {
+        if defined_model.is_some() {
             ferrum_types::ExecutionResourceAuthority::PlanRuntime
         } else {
             ferrum_types::ExecutionResourceAuthority::LegacyEngine
@@ -948,6 +954,7 @@ async fn execute_with_compatibility(
     write_startup_config_artifacts(
         &startup_auto_config,
         product_source_identity.as_ref(),
+        &product_engine_config.numerical_execution,
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
     )?;
@@ -1115,9 +1122,9 @@ async fn execute_with_compatibility(
             }
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                Arc::from(match (prepared_model, model_sources) {
+                Arc::from(match (defined_model, model_sources) {
                     (Some(prepared), _) => {
-                        ferrum_engine::create_prepared_product_engine(engine_config, prepared)
+                        ferrum_engine::create_defined_product_engine(engine_config, prepared)
                             .await?
                     }
                     (None, Some(sources)) => {
@@ -1806,6 +1813,7 @@ fn effective_served_model_names(
 pub(crate) fn write_startup_config_artifacts(
     auto_config: &ResolvedFerrumConfig,
     resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    numerical_execution: &ferrum_types::NumericalExecutionPolicy,
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -1815,6 +1823,7 @@ pub(crate) fn write_startup_config_artifacts(
                 .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
         }
         let mut document = auto_config.effective_config_document();
+        document["numerical_execution"] = serde_json::json!({ "requested": numerical_execution });
         if let Some(evidence) = resolution_evidence {
             let object = document.as_object_mut().ok_or_else(|| {
                 ferrum_types::FerrumError::serialization(

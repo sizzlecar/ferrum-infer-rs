@@ -126,7 +126,7 @@ fn runtime_implementation_authority_contract(plan: &ExecutionPlan, passed: &mut 
     );
 
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let catalog = catalog();
     let policy = policy();

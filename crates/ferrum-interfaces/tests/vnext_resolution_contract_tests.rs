@@ -279,19 +279,22 @@ fn decision_source(field: ResolutionField) -> ResolutionDecisionSource {
         ResolutionField::RuntimePreset
         | ResolutionField::RuntimeMemory
         | ResolutionField::Admission => ResolutionDecisionSource::RuntimePreset,
-        ResolutionField::ExecutionPlan => ResolutionDecisionSource::Planner,
+        ResolutionField::ExecutionPlan | ResolutionField::NumericalExecution => {
+            ResolutionDecisionSource::Planner
+        }
         ResolutionField::Sampling | ResolutionField::Stop | ResolutionField::StructuredOutput => {
             ResolutionDecisionSource::ProductDefault
         }
     }
 }
 
-const RESOLUTION_FIELDS: [ResolutionField; 20] = [
+const RESOLUTION_FIELDS: [ResolutionField; 21] = [
     ResolutionField::OriginalSources,
     ResolutionField::ResolvedSources,
     ResolutionField::Config,
     ResolutionField::ExternalMetadata,
     ResolutionField::Family,
+    ResolutionField::NumericalExecution,
     ResolutionField::WeightSchema,
     ResolutionField::WeightFormat,
     ResolutionField::Tokenizer,
@@ -423,6 +426,24 @@ fn upstream_provenance(index: usize) -> ResolutionSourceProvenance {
     }
 }
 
+fn numerical_resolution(fixture: &PlanFixture) -> NumericalProfileResolution {
+    let definition = fixture
+        .registry
+        .registration
+        .define(fixture.family.canonical_config())
+        .unwrap();
+    NumericalProfileResolution::from_static_plan(
+        NumericalExecutionPolicy::Auto,
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        &fixture.plan,
+        vec![],
+    )
+    .unwrap()
+}
+
 fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
     let config_sha = bytes_sha256(RESOLUTION_CONFIG_BYTES);
     assert_eq!(config_sha, fixture.family.config_fingerprint());
@@ -508,6 +529,7 @@ fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
         },
         external_metadata_id: id("metadata.synthetic"),
         prepared_family: fixture.family.clone(),
+        numerical_execution: numerical_resolution(fixture),
         tokenizer: TokenizerDescriptor {
             tokenizer_id: id("tokenizer.synthetic"),
             source_file: "tokenizer.json".to_owned(),
@@ -544,8 +566,171 @@ fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
     }
 }
 
+#[test]
+fn numerical_resolution_rejects_wrong_request_candidate_prefix_and_static_plan() {
+    let fixture = plan_fixture(0);
+    let definition = fixture
+        .registry
+        .registration
+        .define(fixture.family.canonical_config())
+        .unwrap();
+    let explicit = NumericalExecutionPolicy::Require(fixture.family.numerical_profile().id.clone());
+    assert!(NumericalProfileResolution::from_static_plan(
+        explicit.clone(),
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        &fixture.plan,
+        vec![],
+    )
+    .is_ok());
+    assert!(NumericalProfileResolution::from_static_plan(
+        NumericalExecutionPolicy::Require(NumericalProfileId::new("fixture.unknown").unwrap()),
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        &fixture.plan,
+        vec![],
+    )
+    .is_err());
+    assert!(NumericalProfileResolution::from_static_plan(
+        explicit.clone(),
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        &fixture.plan,
+        vec![NumericalProfileRejection {
+            profile_id: fixture.family.numerical_profile().id.clone(),
+            stage: NumericalProfileRejectionStage::ProgramCompilation,
+            reason: "cannot reject the selected candidate".to_owned(),
+        }],
+    )
+    .is_err());
+    assert!(NumericalProfileResolution::from_static_plan(
+        explicit,
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &policy(8192),
+        &fixture.plan,
+        vec![],
+    )
+    .is_err());
+}
+
+#[test]
+fn numerical_policy_is_bound_to_external_context_even_for_self_consistent_wire() {
+    let fixture = plan_fixture(0);
+    let auto_resolution = numerical_resolution(&fixture);
+    let mut explicit_inputs = resolved_inputs(&fixture);
+    let definition = fixture
+        .registry
+        .registration
+        .define(fixture.family.canonical_config())
+        .unwrap();
+    explicit_inputs.numerical_execution = NumericalProfileResolution::from_static_plan(
+        NumericalExecutionPolicy::Require(fixture.family.numerical_profile().id.clone()),
+        &definition,
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        &fixture.plan,
+        vec![],
+    )
+    .unwrap();
+    let explicit = resolved_evidence_for_inputs(explicit_inputs);
+    let explicit_context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &explicit.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+        &explicit.inputs.numerical_execution,
+    );
+    let explicit_plan =
+        ResolvedModelPlan::new(explicit.inputs, explicit.bindings, &explicit_context).unwrap();
+    let bytes = explicit_plan.to_json().unwrap();
+    assert_eq!(
+        ResolvedModelPlan::from_json_validated(&bytes, &explicit_context).unwrap(),
+        explicit_plan
+    );
+
+    // Even correct raw evidence and freshly computed plan hashes cannot change
+    // the caller's externally supplied numerical request.
+    let auto_context_with_explicit_evidence = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &explicit.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+        &auto_resolution,
+    );
+    assert!(
+        ResolvedModelPlan::from_json_validated(&bytes, &auto_context_with_explicit_evidence)
+            .unwrap_err()
+            .to_string()
+            .contains("validation_context.numerical_execution")
+    );
+
+    let auto = resolved_evidence(&fixture);
+    let auto_context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &auto.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+        &auto_resolution,
+    );
+    let auto_plan = ResolvedModelPlan::new(auto.inputs, auto.bindings, &auto_context).unwrap();
+    assert_eq!(auto_plan.execution_plan(), explicit_plan.execution_plan());
+    assert_ne!(auto_plan.fingerprint(), explicit_plan.fingerprint());
+
+    for (field, replacement) in [
+        ("requested", json!({"require": "fixture.f32"})),
+        ("selected_profile", json!("fixture.other")),
+        ("selected_version", json!({"major": 2, "minor": 0})),
+        ("qualification_version", json!({"major": 2, "minor": 0})),
+        ("profile_fingerprint", json!(sha('0'))),
+    ] {
+        let mut wire = serde_json::to_value(&auto_plan).unwrap();
+        wire["parts"]["numerical_execution"][field] = replacement;
+        assert!(ResolvedModelPlan::from_json_validated(
+            &serde_json::to_vec(&wire).unwrap(),
+            &auto_context
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("validation_context.numerical_execution"));
+    }
+    for version in [None, Some(json!(1))] {
+        let mut old = serde_json::to_value(&auto_plan).unwrap();
+        match version {
+            None => {
+                old.as_object_mut().unwrap().remove("wire_version");
+            }
+            Some(version) => old["wire_version"] = version,
+        }
+        assert!(ResolvedModelPlan::decode_untrusted(&serde_json::to_vec(&old).unwrap()).is_err());
+    }
+    let mut missing = serde_json::to_value(&auto_plan).unwrap();
+    missing["parts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("numerical_execution");
+    assert!(ResolvedModelPlan::decode_untrusted(&serde_json::to_vec(&missing).unwrap()).is_err());
+}
+
 fn fixture_resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Value {
     match field {
+        ResolutionField::NumericalExecution => {
+            serde_json::to_value(&inputs.numerical_execution).unwrap()
+        }
         ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources).unwrap(),
         ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources).unwrap(),
         ResolutionField::Config => serde_json::to_value(&inputs.config).unwrap(),
@@ -640,7 +825,18 @@ impl ModelFamilyProvider for DuplicateMetadataFamily {
         unreachable!("identity-only adversarial registration")
     }
 
-    fn semantic_program(&self, _config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        _config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        unreachable!("identity-only adversarial registration")
+    }
+
+    fn semantic_program(
+        &self,
+        _config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         unreachable!("identity-only adversarial registration")
     }
 
@@ -776,6 +972,7 @@ fn resolved_model_plan_closes_all_contract_links() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let plan = ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &context).unwrap();
     let restored =
@@ -871,6 +1068,7 @@ fn resolved_model_plan_requires_trusted_completion_retention() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -888,6 +1086,7 @@ fn resolved_model_plan_requires_trusted_completion_retention() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     )
     .with_completion_retention(retention);
     let plan =
@@ -948,6 +1147,7 @@ fn locked_file_provenance_cannot_cross_source_roles() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let error = ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &context)
         .err()
@@ -973,6 +1173,7 @@ fn resolved_stop_alias_requires_exact_product_owned_policy() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let error =
         ResolvedModelPlan::new(missing.inputs, missing.bindings, &missing_context).unwrap_err();
@@ -994,6 +1195,7 @@ fn resolved_stop_alias_requires_exact_product_owned_policy() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let plan = ResolvedModelPlan::new(exact.inputs, exact.bindings, &exact_context).unwrap();
     assert_eq!(
@@ -1021,6 +1223,7 @@ fn resolved_stop_alias_requires_exact_product_owned_policy() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let error = ResolvedModelPlan::new(broad.inputs, broad.bindings, &broad_context).unwrap_err();
     assert!(matches!(
@@ -1043,6 +1246,7 @@ fn resolved_model_plan_initial_construction_requires_verified_evidence_context()
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1070,6 +1274,7 @@ fn resolved_model_plan_initial_construction_requires_verified_evidence_context()
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &extra_context).is_err());
 }
@@ -1085,6 +1290,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let plan = ResolvedModelPlan::new(evidence.inputs.clone(), evidence.bindings.clone(), &context)
         .unwrap();
@@ -1108,6 +1314,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(
         ResolvedModelPlan::from_json_validated(&plan.to_json().unwrap(), &wrong_bytes_context,)
@@ -1136,6 +1343,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::from_json_validated(
         &plan.to_json().unwrap(),
@@ -1181,6 +1389,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1209,6 +1418,7 @@ fn resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(
         ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &missing_locked_context,)
@@ -1254,6 +1464,7 @@ fn resolved_source_parser_identity_and_determinism_are_enforced() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let plan = ResolvedModelPlan::new(evidence.inputs.clone(), evidence.bindings.clone(), &context)
         .unwrap();
@@ -1274,6 +1485,7 @@ fn resolved_source_parser_identity_and_determinism_are_enforced() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::from_json_validated(
         &plan.to_json().unwrap(),
@@ -1317,6 +1529,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let plan = ResolvedModelPlan::new(evidence.inputs.clone(), evidence.bindings.clone(), &context)
         .unwrap();
@@ -1335,6 +1548,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1355,6 +1569,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1372,6 +1587,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         &wrong_device,
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1388,6 +1604,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         wrong_catalog.device(),
         &wrong_catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(ResolvedModelPlan::new(
         evidence.inputs.clone(),
@@ -1404,6 +1621,7 @@ fn resolved_external_device_catalog_runtime_and_node_resolution_are_exact() {
         fixture.catalog.device(),
         &fixture.catalog,
         &wrong_runtime,
+        &numerical_resolution(&fixture),
     );
     assert!(
         ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &wrong_runtime_context,)
@@ -1427,6 +1645,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(matches!(
         ResolvedModelPlan::new(unknown.inputs, unknown.bindings, &unknown_context),
@@ -1445,6 +1664,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(matches!(
         ResolvedModelPlan::new(
@@ -1469,6 +1689,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(matches!(
         ResolvedModelPlan::new(alias.inputs, alias.bindings, &alias_context),
@@ -1488,6 +1709,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     assert!(matches!(
         ResolvedModelPlan::new(
@@ -1510,6 +1732,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
         fixture.catalog.device(),
         &fixture.catalog,
         &fixture.policy,
+        &numerical_resolution(&fixture),
     );
     let trusted =
         ResolvedModelPlan::new(duplicate.inputs, duplicate.bindings, &trusted_context).unwrap();

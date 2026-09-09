@@ -1706,10 +1706,16 @@ mod tests {
         let family_id = ModelFamilyId::new(super::super::FAMILY_ID).unwrap();
         let gguf_schema = gguf.weight_schema(&semantic).unwrap();
         gguf_schema.validate(&family_id).unwrap();
+        let profiles = super::super::program::numerical_profiles(&family_id, &semantic).unwrap();
+        let profile = &profiles.profiles()[0];
         let gptq_program =
-            super::super::program::build_semantic_program(&family_id, &semantic, &gptq).unwrap();
+            super::super::program::build_semantic_program(&family_id, &semantic, &gptq, profile)
+                .unwrap();
         let gguf_program =
-            super::super::program::build_semantic_program(&family_id, &semantic, &gguf).unwrap();
+            super::super::program::build_semantic_program(&family_id, &semantic, &gguf, profile)
+                .unwrap();
+        profile.validate_program(&gptq_program).unwrap();
+        profile.validate_program(&gguf_program).unwrap();
 
         assert_eq!(gguf_program, gptq_program);
         assert_eq!(
@@ -1893,9 +1899,13 @@ mod tests {
         let family_id = ModelFamilyId::new(super::super::FAMILY_ID).unwrap();
         mixed_schema.validate(&family_id).unwrap();
         assert_eq!(dense_schema.tensors, mixed_schema.tensors);
+        let profiles = super::super::program::numerical_profiles(&family_id, &semantic).unwrap();
+        let profile = &profiles.profiles()[0];
         assert_eq!(
-            super::super::program::build_semantic_program(&family_id, &semantic, &dense).unwrap(),
-            super::super::program::build_semantic_program(&family_id, &semantic, &mixed).unwrap()
+            super::super::program::build_semantic_program(&family_id, &semantic, &dense, profile)
+                .unwrap(),
+            super::super::program::build_semantic_program(&family_id, &semantic, &mixed, profile)
+                .unwrap()
         );
         for (dense, mixed) in dense_schema.components.iter().zip(&mixed_schema.components) {
             if dense.id != layer_component_id(1, ROUTER_ROLE).unwrap() {
@@ -2003,7 +2013,10 @@ mod tests {
             .unwrap()
             .into_required()
             .unwrap();
-        let prepared = registered.prepare_from_sources(sources).unwrap();
+        let prepared = crate::vnext::test_support::prepare_product_fixture(
+            registered.define_from_sources(sources).unwrap(),
+        )
+        .unwrap();
         let router_id = layer_component_id(0, ROUTER_ROLE).unwrap();
         let router = prepared
             .family()
@@ -2051,9 +2064,13 @@ mod tests {
         let schema = manifest.weight_schema(&semantic).unwrap();
         let family_id = ModelFamilyId::new(super::super::FAMILY_ID).unwrap();
         schema.validate(&family_id).unwrap();
-        let program =
-            super::super::program::build_semantic_program(&family_id, &semantic, &manifest)
-                .unwrap();
+        let profiles = super::super::program::numerical_profiles(&family_id, &semantic).unwrap();
+        let profile = &profiles.profiles()[0];
+        let program = super::super::program::build_semantic_program(
+            &family_id, &semantic, &manifest, profile,
+        )
+        .unwrap();
+        profile.validate_program(&program).unwrap();
 
         let moe = program
             .blocks()

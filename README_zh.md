@@ -241,6 +241,8 @@ native-operator set，因此受支持的安装路径是预编译 CUDA tarball �
 - 产品入口：`ferrum-cli`、`ferrum-server`、`ferrum-tokenizer`
 - 验证：`ferrum-bench-core`、`ferrum-testkit`
 
+开发接口说明：[数值执行策略](docs/numerical-execution.zh.md)。其中新增的 CLI 选项尚未包含在 v0.8.9 发布资产中。
+
 ## License
 
 MIT

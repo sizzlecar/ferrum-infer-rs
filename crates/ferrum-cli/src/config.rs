@@ -13,6 +13,10 @@ use tokio::fs;
 /// CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CliConfig {
+    /// Requested numerical execution policy; explicit CLI selection takes precedence.
+    #[serde(default)]
+    pub numerical_execution: ferrum_types::NumericalExecutionPolicy,
+
     /// Server configuration
     pub server: ServerCliConfig,
 
@@ -640,6 +644,12 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
+    pub fn resolve_numerical_execution(
+        &self,
+        cli: Option<&ferrum_types::NumericalExecutionPolicy>,
+    ) -> ferrum_types::NumericalExecutionPolicy {
+        cli.unwrap_or(&self.numerical_execution).clone()
+    }
     /// Load configuration from file, falling back to typed defaults when the
     /// optional file does not exist. Loading config must not mutate the
     /// caller's current directory.
@@ -818,6 +828,110 @@ impl Default for DevConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{Parser, Subcommand};
+
+    #[derive(Parser)]
+    struct NumericalCli {
+        #[command(subcommand)]
+        command: NumericalCommand,
+    }
+
+    #[derive(Subcommand)]
+    enum NumericalCommand {
+        Run(crate::commands::run::RunCommand),
+        Serve(crate::commands::serve::ServeCommand),
+        Bench(crate::commands::bench::BenchCommand),
+    }
+
+    impl NumericalCommand {
+        fn policy(&self) -> Option<&ferrum_types::NumericalExecutionPolicy> {
+            match self {
+                Self::Run(command) => command.numerical_profile.as_ref(),
+                Self::Serve(command) => command.numerical_profile.as_ref(),
+                Self::Bench(command) => command.numerical_profile.as_ref(),
+            }
+        }
+    }
+
+    #[test]
+    fn numerical_cli_selection_overrides_config_in_every_model_entrypoint() {
+        let configured = "qwen3_5.f32-master".parse().unwrap();
+        let config = CliConfig {
+            numerical_execution: configured,
+            ..CliConfig::default()
+        };
+        for entrypoint in ["run", "serve", "bench"] {
+            let inherited =
+                NumericalCli::try_parse_from(["ferrum", entrypoint, "fixture"]).unwrap();
+            assert_eq!(
+                config.resolve_numerical_execution(inherited.command.policy()),
+                config.numerical_execution,
+            );
+            for selected in ["auto", "qwen3_5.f16"] {
+                let cli = NumericalCli::try_parse_from([
+                    "ferrum",
+                    entrypoint,
+                    "fixture",
+                    "--numerical-profile",
+                    selected,
+                ])
+                .unwrap();
+                assert_eq!(
+                    config.resolve_numerical_execution(cli.command.policy()),
+                    selected.parse().unwrap(),
+                );
+            }
+            assert!(NumericalCli::try_parse_from([
+                "ferrum",
+                entrypoint,
+                "fixture",
+                "--numerical-profile",
+                "invalid profile",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn numerical_config_roundtrip_and_legacy_defaults_preserve_policy() {
+        let mut config = CliConfig::default();
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("numerical_execution");
+        assert_eq!(
+            serde_json::from_value::<CliConfig>(legacy)
+                .unwrap()
+                .numerical_execution,
+            ferrum_types::NumericalExecutionPolicy::Auto,
+        );
+        for policy in ["auto", "qwen3_5.f32-master"] {
+            config.numerical_execution = policy.parse().unwrap();
+            let text = toml::to_string(&config).unwrap();
+            assert_eq!(
+                toml::from_str::<CliConfig>(&text)
+                    .unwrap()
+                    .numerical_execution,
+                config.numerical_execution,
+            );
+        }
+    }
+
+    #[test]
+    fn numerical_request_cannot_be_silently_ignored_by_unregistered_sources() {
+        assert!(crate::source_resolver::define_registered_product_model(
+            None,
+            &ferrum_types::NumericalExecutionPolicy::Auto,
+        )
+        .unwrap()
+        .is_none());
+        assert!(crate::source_resolver::define_registered_product_model(
+            None,
+            &"qwen3_5.f16".parse().unwrap(),
+        )
+        .is_err());
+    }
     use ferrum_types::RuntimeConfigEffect;
 
     #[tokio::test]

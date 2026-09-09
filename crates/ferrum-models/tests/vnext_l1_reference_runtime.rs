@@ -119,7 +119,40 @@ impl ModelFamilyProvider for TinyDenseFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        _config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        let profile_id = NumericalProfileId::new("reference.f16").unwrap();
+        FamilyNumericalProfiles::new(
+            self.family_id(),
+            ContractVersion::new(1, 0),
+            vec![NumericalExecutionProfile {
+                id: profile_id.clone(),
+                family_id: self.family_id().clone(),
+                version: ContractVersion::new(1, 0),
+                primary_activation: id("value.reference.output.fixed"),
+                boundaries: BTreeMap::from([
+                    (id("value.reference.output.fixed"), ElementType::F16),
+                    (id("value.reference.output.tokens"), ElementType::F16),
+                ]),
+                states: vec![],
+                operations: vec![NumericalOperationContract {
+                    operation_id: id(DENSE_LINEAR_OPERATION_ID),
+                    version: ContractVersion::new(1, 0),
+                    multiplication_type: Some(ElementType::F32),
+                    accumulation_type: Some(ElementType::F32),
+                }],
+            }],
+            vec![profile_id],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
             vec![
@@ -408,11 +441,14 @@ fn build_mixed_reference_fixture() -> MixedReferenceFixture {
     let weight_source = SafetensorsArchive::open(model_dir.path()).unwrap();
 
     let family = TypedFamilyRegistration::new(TinyDenseFamily)
-        .prepare(&json!({
-            "rows": MIXED_ROWS,
-            "in_features": IN_FEATURES,
-            "out_features": OUT_FEATURES
-        }))
+        .prepare_with_profile(
+            &json!({
+                "rows": MIXED_ROWS,
+                "in_features": IN_FEATURES,
+                "out_features": OUT_FEATURES
+            }),
+            &NumericalProfileId::new("reference.f16").unwrap(),
+        )
         .unwrap();
     let program_fingerprint = family.program().fingerprint().unwrap();
     let composition = ReferenceVNextComposition::create(id("device.reference.l1.mixed")).unwrap();
@@ -860,11 +896,14 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
     let weight_source = SafetensorsArchive::open(model_dir.path()).unwrap();
 
     let family = TypedFamilyRegistration::new(TinyDenseFamily)
-        .prepare(&json!({
-            "rows": ROWS,
-            "in_features": IN_FEATURES,
-            "out_features": OUT_FEATURES
-        }))
+        .prepare_with_profile(
+            &json!({
+                "rows": ROWS,
+                "in_features": IN_FEATURES,
+                "out_features": OUT_FEATURES
+            }),
+            &NumericalProfileId::new("reference.f16").unwrap(),
+        )
         .unwrap();
     let program_fingerprint = family.program().fingerprint().unwrap();
     let composition = ReferenceVNextComposition::create(id("device.reference.l1.0")).unwrap();

@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    ExternalModelMetadataId, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
-    ModelProgram, ModelSemanticMetadata, PreparedModelFamily, TypedFamilyRegistration, VNextError,
-    WeightComponentSource, WeightSchema,
+    ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId, ModelFamilyProvider,
+    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NumericalExecutionProfile,
+    PreparedModelFamily, TypedFamilyRegistration, VNextError, WeightComponentSource, WeightSchema,
 };
 use ferrum_quantization::{CompressedTensorsMarlinSafetensorsSource, SafetensorsArchive};
 use ferrum_types::{DataType, ModelOutputProtocol};
@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use super::{
     hf_metadata::parse_hf_model_semantic_metadata_with_external_template,
-    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+    CausalLanguageModelDescriptor, DefinedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
 };
 
@@ -33,6 +33,7 @@ use weights::Gemma4WeightManifest;
 
 pub const FAMILY_ID: &str = "family.gemma4_unified.text";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Gemma4UnifiedForConditionalGeneration";
+pub const NUMERICAL_PROFILE_ID: &str = "gemma4_unified.f16";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gemma4FamilyConfig {
@@ -122,8 +123,20 @@ impl ModelFamilyProvider for Gemma4FamilyProvider {
         config.weights.weight_schema(&config.semantic)
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
-        program::build_semantic_program(&self.family_id, &config.semantic, &config.weights)
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        program::numerical_profiles(&self.family_id, &config.semantic)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        self.numerical_profiles(config)?.resolve(&profile.id)?;
+        program::build_semantic_program(&self.family_id, &config.semantic, &config.weights, profile)
     }
 
     fn semantic_metadata(
@@ -146,14 +159,14 @@ pub(super) fn validate_semantic_config(
     Gemma4SemanticConfig::validate_semantic_source(raw).map_err(ferrum_types::FerrumError::model)
 }
 
-pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+pub fn define_from_model_dir(model_dir: &Path) -> ferrum_types::Result<DefinedProductionModel> {
     let sources = Arc::new(super::open_registered_colocated_safetensors(model_dir)?);
-    prepare_from_sources(sources)
+    define_from_sources(sources)
 }
 
-pub(super) fn prepare_from_sources(
+pub(super) fn define_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
-) -> ferrum_types::Result<PreparedProductionModel> {
+) -> ferrum_types::Result<DefinedProductionModel> {
     let tokenizer_config = sources.tokenizer_config_json().ok_or_else(|| {
         ferrum_types::FerrumError::model("Gemma 4 source missing tokenizer_config.json")
     })?;
@@ -200,7 +213,7 @@ fn finish_preparation<W>(
     sources: Arc<ProductionModelSourceBundle>,
     weights: W,
     config: Gemma4FamilyConfig,
-) -> ferrum_types::Result<PreparedProductionModel>
+) -> ferrum_types::Result<DefinedProductionModel>
 where
     W: WeightComponentSource + 'static,
 {
@@ -209,12 +222,13 @@ where
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     let provider = Gemma4FamilyProvider::new()
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    let family = TypedFamilyRegistration::new(provider)
-        .prepare(&raw)
-        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    Ok(PreparedProductionModel::new(
-        family, weights, descriptor, sources,
-    ))
+    DefinedProductionModel::new(
+        TypedFamilyRegistration::new(provider),
+        &raw,
+        weights,
+        descriptor,
+        sources,
+    )
 }
 
 fn production_descriptor(

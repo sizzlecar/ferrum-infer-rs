@@ -18,12 +18,13 @@ impl ModelFamilyRegistry for TestModelRegistry {
     }
 }
 
-pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 20] = [
+pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 21] = [
     ResolutionField::OriginalSources,
     ResolutionField::ResolvedSources,
     ResolutionField::Config,
     ResolutionField::ExternalMetadata,
     ResolutionField::Family,
+    ResolutionField::NumericalExecution,
     ResolutionField::WeightSchema,
     ResolutionField::WeightFormat,
     ResolutionField::Tokenizer,
@@ -59,7 +60,9 @@ pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSou
         ResolutionField::RuntimePreset
         | ResolutionField::RuntimeMemory
         | ResolutionField::Admission => ResolutionDecisionSource::RuntimePreset,
-        ResolutionField::ExecutionPlan => ResolutionDecisionSource::Planner,
+        ResolutionField::ExecutionPlan | ResolutionField::NumericalExecution => {
+            ResolutionDecisionSource::Planner
+        }
         ResolutionField::Sampling | ResolutionField::Stop | ResolutionField::StructuredOutput => {
             ResolutionDecisionSource::ProductDefault
         }
@@ -68,6 +71,9 @@ pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSou
 
 pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Value {
     match field {
+        ResolutionField::NumericalExecution => {
+            serde_json::to_value(&inputs.numerical_execution).unwrap()
+        }
         ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources).unwrap(),
         ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources).unwrap(),
         ResolutionField::Config => serde_json::to_value(&inputs.config).unwrap(),
@@ -313,7 +319,10 @@ fn resolved_model_plan_with_zero_state_and_policy(
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
     let raw_config = test_raw_config(state_profile);
-    let family = model_registry.registration.prepare(&raw_config).unwrap();
+    let family = model_registry
+        .registration
+        .prepare_fixture(&raw_config)
+        .unwrap();
     let resolutions = vec![
         node_resolution_with_state_profile(
             &family,
@@ -369,7 +378,22 @@ fn resolved_model_plan_with_zero_state_and_policy(
             },
         ],
     };
+    let definition = model_registry
+        .registration
+        .define(family.canonical_config())
+        .unwrap();
+    let numerical_execution = NumericalProfileResolution::from_static_plan(
+        NumericalExecutionPolicy::Auto,
+        &definition,
+        &family,
+        &catalog,
+        runtime_policy,
+        &plan,
+        vec![],
+    )
+    .unwrap();
     let inputs = ResolvedModelPlanInputs {
+        numerical_execution: numerical_execution.clone(),
         original_sources: OriginalModelSources {
             semantic: original_source.clone(),
             tokenizer: original_source.clone(),
@@ -463,6 +487,7 @@ fn resolved_model_plan_with_zero_state_and_policy(
         catalog.device(),
         &catalog,
         runtime_policy,
+        &numerical_execution,
     )
     .with_completion_retention(completion_retention);
     (
@@ -499,7 +524,7 @@ fn plan_for_registry_with_zero_state_and_policy(
 ) -> ExecutionPlan {
     let raw_config = test_raw_config(state_profile);
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&raw_config)
+        .prepare_fixture(&raw_config)
         .unwrap();
     let completion_retention = if retain_determinism_outputs {
         CompletionRetentionSpec::for_determinism_outputs(&family).unwrap()
@@ -1204,7 +1229,7 @@ pub(crate) fn revalidate_plan_for_registry(
     registry: &OperationRuntimeRegistry<TestRuntime>,
 ) -> ExecutionPlan {
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let catalog = catalog();
     let runtime_policy = policy();

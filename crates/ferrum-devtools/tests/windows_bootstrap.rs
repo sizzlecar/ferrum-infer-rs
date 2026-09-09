@@ -4,19 +4,44 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
+
+#[path = "support/http_fixture.rs"]
+mod http_fixture;
+use http_fixture::Server;
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
 fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output {
+    powershell_in("System32", body, environment)
+}
+
+fn powershell_in(
+    system_directory: &str,
+    body: &str,
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/install.ps1")
         .canonicalize()
         .unwrap();
+    invoke_powershell_in(
+        system_directory,
+        &format!(". {}; {body}", quote(script.to_str().unwrap())),
+        environment,
+    )
+}
+
+fn invoke_powershell_in(
+    system_directory: &str,
+    body: &str,
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        .join(system_directory)
+        .join("WindowsPowerShell/v1.0/powershell.exe");
     Command::new(program)
         // Load the repository's unsigned script only in this test process,
         // independently of the invoking shell's execution policy.
@@ -28,8 +53,7 @@ fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output 
             "-Command",
         ])
         .arg(format!(
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); . {}; {body}",
-            quote(script.to_str().unwrap())
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); {body}"
         ))
         .envs(environment.iter().copied())
         // Let Windows PowerShell build its own module paths. A PowerShell 7
@@ -37,6 +61,231 @@ fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output 
         .env_remove("PSModulePath")
         .output()
         .unwrap()
+}
+
+#[test]
+fn downloaded_bootstrap_pipeline_executes_native_detection_and_rejects_missing_driver() {
+    // Serve unmodified candidate bytes and execute the README's IRM/IEX pipeline.
+    // Only the external driver-file lookup is replaced. This proves startup and
+    // no-driver rejection, not a complete installation from the public website.
+    let script =
+        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1")).unwrap();
+    let server = Server::new(BTreeMap::from([("/install.ps1".into(), script)]));
+    let body = format!(
+        r#"
+        $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Architecture -Unique)
+        function Test-Path {{ param($LiteralPath, $PathType); return $false }}
+        $failure = $null
+        try {{ irm {url} | iex }}
+        catch {{ $failure = [ordered]@{{message=$_.Exception.Message; error_id=$_.FullyQualifiedErrorId; cpu=$cpu; process_bits=([IntPtr]::Size*8)}} }}
+        if ($null -eq $failure) {{ throw 'installer unexpectedly succeeded without driver tools' }}
+        $failure | ConvertTo-Json -Compress
+        "#,
+        url = quote(&format!("{}/install.ps1", server.url)),
+    );
+    let system_root = std::env::var_os("SystemRoot").unwrap();
+    for directory in ["System32", "SysWOW64"] {
+        if directory == "SysWOW64"
+            && !Path::new(&system_root)
+                .join(directory)
+                .join("WindowsPowerShell/v1.0/powershell.exe")
+                .is_file()
+        {
+            continue;
+        }
+        let output = invoke_powershell_in(directory, &body, &[]);
+        require_success(&output);
+        let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = observed["message"].as_str().unwrap();
+        if observed["cpu"] == json!([9]) {
+            assert!(
+                message.contains("NVIDIA driver tools were not found"),
+                "{observed}"
+            );
+        } else {
+            assert!(message.contains("native Windows x64 only"), "{observed}");
+        }
+        if directory == "SysWOW64" {
+            assert_eq!(observed["process_bits"], 32);
+        }
+    }
+}
+
+#[test]
+fn downloaded_bootstrap_pipeline_reports_http_failure() {
+    let server = Server::new(BTreeMap::new());
+    let output = invoke_powershell_in(
+        "System32",
+        &format!(
+            "irm {} | iex",
+            quote(&format!("{}/install.ps1", server.url))
+        ),
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "a missing download must fail the pipeline"
+    );
+}
+
+#[test]
+fn download_stream_preserves_bytes_and_reports_progress_before_completion() {
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = Server::new(BTreeMap::from([("/setup.exe".into(), payload.clone())]));
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("download 中文.exe");
+    let receipt = temp.path().join("progress.json");
+    let body = format!(
+        r#"
+        $events = [Collections.Generic.List[object]]::new()
+        function Write-Progress {{
+            param($Id, $Activity, $Status, $PercentComplete, [switch]$Completed)
+            $events.Add([ordered]@{{percent=$PercentComplete; completed=$Completed.IsPresent}})
+        }}
+        Invoke-FerrumDownload -Uri {url} -Destination {destination} -ExpectedSize {size}
+        [IO.File]::WriteAllText({receipt}, (ConvertTo-Json -InputObject @($events.ToArray()) -Compress))
+        "#,
+        url = quote(&format!("{}/setup.exe", server.url)),
+        destination = quote(destination.to_str().unwrap()),
+        size = payload.len(),
+        receipt = quote(receipt.to_str().unwrap()),
+    );
+    let output = powershell(&body, &[]);
+    require_success(&output);
+    assert_eq!(fs::read(destination).unwrap(), payload);
+    let events: Vec<Value> = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(events.first().unwrap()["percent"], 0);
+    assert!(events.iter().any(|event| event["percent"]
+        .as_u64()
+        .is_some_and(|percent| percent > 0 && percent < 100)));
+    assert!(events.iter().any(|event| event["percent"] == 100));
+    assert_eq!(events.last().unwrap()["completed"], true);
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("Downloading download 中文.exe"), "{log}");
+    assert!(
+        log.contains("Downloaded download 中文.exe (2097152 bytes)"),
+        "{log}"
+    );
+}
+
+#[test]
+fn download_http_and_size_failures_do_not_leave_an_installable_payload() {
+    let server = Server::responses(BTreeMap::from([
+        ("/setup.exe".into(), b"payload".to_vec().into()),
+        (
+            "/truncated.exe".into(),
+            http_fixture::Response {
+                body: b"partial".to_vec(),
+                declared_length: Some(128),
+            },
+        ),
+        (
+            "/too-large.exe".into(),
+            http_fixture::Response {
+                body: b"larger than expected".to_vec(),
+                declared_length: None,
+            },
+        ),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("setup.exe");
+    for (path, size) in [
+        ("/missing.exe", 7),
+        ("/setup.exe", 8),
+        ("/truncated.exe", 128),
+        ("/too-large.exe", 7),
+    ] {
+        let output = powershell(
+            &format!(
+                "Invoke-FerrumDownload -Uri {} -Destination {} -ExpectedSize {size}",
+                quote(&format!("{}{path}", server.url)),
+                quote(destination.to_str().unwrap()),
+            ),
+            &[],
+        );
+        assert!(!output.status.success());
+        assert!(!destination.exists());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Downloaded setup.exe"));
+    }
+    fs::write(&destination, b"existing user file").unwrap();
+    let output = powershell(
+        &format!(
+            "Invoke-FerrumDownload -Uri {} -Destination {} -ExpectedSize 7",
+            quote(&format!("{}/setup.exe", server.url)),
+            quote(destination.to_str().unwrap()),
+        ),
+        &[],
+    );
+    assert!(!output.status.success());
+    assert_eq!(fs::read(destination).unwrap(), b"existing user file");
+}
+
+#[test]
+fn bootstrap_detects_native_architecture_in_windows_powershell_and_wow64() {
+    // An independent OS query is the oracle; process bitness is deliberately
+    // different in SysWOW64. Do not assume the CI host's CPU architecture.
+    let body = r#"
+        $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Architecture -Unique)
+        [ordered]@{architecture=(Get-FerrumWindowsArchitecture); cpu=$cpu; process_bits=([IntPtr]::Size*8)} | ConvertTo-Json -Compress
+    "#;
+    let output = powershell(body, &[]);
+    require_success(&output);
+    let native: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = match native["cpu"].as_array().unwrap().as_slice() {
+        [value] => match value.as_u64().unwrap() {
+            0 => "X86",
+            5 => "Arm",
+            9 => "X64",
+            12 => "Arm64",
+            other => panic!("unsupported processor architecture {other}"),
+        },
+        other => panic!("inconsistent processor architectures {other:?}"),
+    };
+    assert_eq!(native["architecture"], expected);
+
+    // Parent-process environment overrides must not change native detection.
+    let overridden = powershell(
+        "Get-FerrumWindowsArchitecture",
+        &[
+            ("PROCESSOR_ARCHITECTURE", "unknown"),
+            ("PROCESSOR_ARCHITEW6432", "unknown"),
+        ],
+    );
+    require_success(&overridden);
+    assert_eq!(
+        String::from_utf8(overridden.stdout).unwrap().trim(),
+        expected
+    );
+
+    if expected == "X64" {
+        let output = powershell_in("SysWOW64", body, &[]);
+        require_success(&output);
+        let wow64: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(wow64["process_bits"], 32);
+        assert_eq!(wow64["architecture"], native["architecture"]);
+    }
+}
+
+#[test]
+fn bootstrap_startup_reaches_gpu_probe_after_real_architecture_detection() {
+    // Exercise the install entrypoint, stopping at the first hardware probe.
+    // The only replaced boundaries are driver-file lookup and process launch;
+    // no network request or installer execution is needed for this regression.
+    let output = powershell(
+        r#"
+        $architecture = Get-FerrumWindowsArchitecture
+        function Test-Path { param($LiteralPath, $PathType); return $true }
+        function Invoke-FerrumProcess { param($Program, $Arguments); throw 'fixture: reached GPU probe' }
+        try { Install-FerrumRelease; throw 'startup did not stop at hardware detection' }
+        catch {
+            $expected = if ($architecture -eq 'X64') { 'fixture: reached GPU probe' } else { 'This installer supports native Windows x64 only.' }
+            if ($_.Exception.Message -cne $expected) { throw }
+            $architecture
+        }
+        "#,
+        &[],
+    );
+    require_success(&output);
 }
 
 fn require_success(output: &std::process::Output) {

@@ -117,12 +117,13 @@ pub(crate) fn plan_resolutions_with_mode(
         .collect()
 }
 
-pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 20] = [
+pub(crate) const RESOLUTION_FIELDS: [ResolutionField; 21] = [
     ResolutionField::OriginalSources,
     ResolutionField::ResolvedSources,
     ResolutionField::Config,
     ResolutionField::ExternalMetadata,
     ResolutionField::Family,
+    ResolutionField::NumericalExecution,
     ResolutionField::WeightSchema,
     ResolutionField::WeightFormat,
     ResolutionField::Tokenizer,
@@ -158,7 +159,9 @@ pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSou
         ResolutionField::RuntimePreset
         | ResolutionField::RuntimeMemory
         | ResolutionField::Admission => ResolutionDecisionSource::RuntimePreset,
-        ResolutionField::ExecutionPlan => ResolutionDecisionSource::Planner,
+        ResolutionField::ExecutionPlan | ResolutionField::NumericalExecution => {
+            ResolutionDecisionSource::Planner
+        }
         ResolutionField::Sampling | ResolutionField::Stop | ResolutionField::StructuredOutput => {
             ResolutionDecisionSource::ProductDefault
         }
@@ -167,6 +170,9 @@ pub(crate) fn resolution_source(field: ResolutionField) -> ResolutionDecisionSou
 
 pub(crate) fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Value {
     match field {
+        ResolutionField::NumericalExecution => {
+            serde_json::to_value(&inputs.numerical_execution).unwrap()
+        }
         ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources).unwrap(),
         ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources).unwrap(),
         ResolutionField::Config => serde_json::to_value(&inputs.config).unwrap(),
@@ -233,7 +239,7 @@ pub(crate) fn resolved_model_plan_with_mode(
     let registry = EventModelRegistry::new();
     let family = registry
         .registration
-        .prepare(&json!({"width": 4, "no_static": no_static}))
+        .prepare_fixture(&json!({"width": 4, "no_static": no_static}))
         .unwrap();
     let catalog = catalog();
     let runtime = policy();
@@ -278,7 +284,22 @@ pub(crate) fn resolved_model_plan_with_mode(
             },
         ],
     };
+    let definition = registry
+        .registration
+        .define(family.canonical_config())
+        .unwrap();
+    let numerical_execution = NumericalProfileResolution::from_static_plan(
+        NumericalExecutionPolicy::Auto,
+        &definition,
+        &family,
+        &catalog,
+        &runtime,
+        &plan,
+        vec![],
+    )
+    .unwrap();
     let inputs = ResolvedModelPlanInputs {
+        numerical_execution: numerical_execution.clone(),
         original_sources: OriginalModelSources {
             semantic: original_source.clone(),
             tokenizer: original_source.clone(),
@@ -373,6 +394,7 @@ pub(crate) fn resolved_model_plan_with_mode(
         catalog.device(),
         &catalog,
         &runtime,
+        &numerical_execution,
     );
     ResolvedModelPlan::new(inputs, bindings, &context).unwrap()
 }

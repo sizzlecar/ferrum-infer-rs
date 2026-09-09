@@ -327,7 +327,7 @@ mod cuda {
     };
     use ferrum_models::vnext::{
         open_registered_colocated_safetensors, resolve_registered_model_from_sources,
-        PreparedProductionModel,
+        DefinedProductionModel,
     };
     use ferrum_types::{Device, EngineConfig, ModelId};
     use serde::{Deserialize, Serialize};
@@ -625,16 +625,14 @@ mod cuda {
                         binding.key
                     ))
                 })?;
-            let prepared = registration
-                .prepare_from_sources(sources)
-                .map_err(|error| {
-                    FerrumError::model(format!(
-                        "cannot prepare registered vNext model {}: {error}",
-                        binding.key
-                    ))
-                })?;
-            let capabilities = prepared.model_capabilities()?;
-            let dtype = prepared.descriptor().execution_dtype().to_string();
+            let prepared = registration.define_from_sources(sources).map_err(|error| {
+                FerrumError::model(format!(
+                    "cannot prepare registered vNext model {}: {error}",
+                    binding.key
+                ))
+            })?;
+            let capabilities =
+                prepared.model_capabilities(&ferrum_types::NumericalExecutionPolicy::Auto)?;
             let quantization = capabilities
                 .quantization
                 .unwrap_or_else(|| "none".to_owned());
@@ -665,6 +663,7 @@ mod cuda {
                 Some(_) => {}
             }
             let plan = collector.resolved_model_plan().clone();
+            let dtype = collector.model_info().dtype.to_string();
             collector.prepare().await.map_err(|error| {
                 FerrumError::backend(format!(
                     "cannot prepare CUDA determinism collector for {}: {error}",
@@ -779,7 +778,7 @@ mod cuda {
 
     fn determinism_engine_config(
         binding: &ModelBinding,
-        prepared: &PreparedProductionModel,
+        prepared: &DefinedProductionModel,
     ) -> EngineConfig {
         let mut engine = EngineConfig::default();
         engine.model.model_id = ModelId::new(binding.key.clone());

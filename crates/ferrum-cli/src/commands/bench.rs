@@ -50,6 +50,10 @@ pub struct BenchCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
+    /// Numerical execution profile: auto or an exact family profile ID.
+    #[arg(long, value_name = "PROFILE")]
+    pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
+
     /// Prompt to use
     #[arg(long, default_value = "Explain the theory of relativity in detail.")]
     pub prompt: String,
@@ -139,12 +143,13 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.numerical_execution =
+        config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     let model_sources = product_input.model_sources;
-    let prepared_model = model_sources
-        .as_ref()
-        .map(crate::source_resolver::prepare_registered_product_model)
-        .transpose()?
-        .flatten();
+    let defined_model = crate::source_resolver::define_registered_product_model(
+        model_sources.as_ref(),
+        &engine_config.numerical_execution,
+    )?;
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 
@@ -188,9 +193,9 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = match (prepared_model, model_sources) {
+    let engine = match (defined_model, model_sources) {
         (Some(prepared), _) => {
-            ferrum_engine::create_prepared_product_engine(engine_config, prepared).await?
+            ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
         }
         (None, Some(sources)) => {
             ferrum_engine::create_product_engine(engine_config, sources).await?
@@ -687,6 +692,7 @@ mod tests {
             rounds: 3,
             max_tokens: 4,
             backend: "cpu".to_string(),
+            numerical_profile: None,
             prompt: "hello".to_string(),
             concurrency: 2,
             long_context: false,

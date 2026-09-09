@@ -833,10 +833,10 @@ fn load_product_chat_template_source(
     }
 }
 
-pub fn load_prepared_product_chat_template(
-    prepared: &ferrum_models::vnext::PreparedProductionModel,
+pub fn load_defined_product_chat_template(
+    prepared: &ferrum_models::vnext::DefinedProductionModel,
 ) -> Result<ModelChatTemplate> {
-    let metadata = &prepared.family().metadata().template;
+    let metadata = &prepared.definition().metadata().template;
     let mut selected = load_product_chat_template_source(prepared.sources(), &metadata.source_file)
         .ok_or_else(|| {
             FerrumError::model(format!(
@@ -1222,23 +1222,35 @@ pub struct ProductEngineInput {
     pub autosized: bool,
 }
 
-/// Prepare a migrated typed family exactly once at the product composition
-/// boundary. Explicit legacy registrations return `None`; unknown metadata is
-/// rejected by the model registry instead of gaining an implicit fallback.
-pub fn prepare_registered_product_model(
-    sources: &Arc<ProductionModelSourceBundle>,
-) -> Result<Option<Arc<ferrum_models::vnext::PreparedProductionModel>>> {
-    match ferrum_models::vnext::resolve_registered_model_from_sources(sources)? {
-        ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => registration
-            .prepare_from_sources(Arc::clone(sources))
-            .map(Arc::new)
-            .map(Some),
-        ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered { .. } => Ok(None),
+/// Define a migrated family before device composition. Explicit numerical
+/// requests must name a declared profile; legacy sources cannot ignore them.
+pub fn define_registered_product_model(
+    sources: Option<&Arc<ProductionModelSourceBundle>>,
+    policy: &ferrum_types::NumericalExecutionPolicy,
+) -> Result<Option<Arc<ferrum_models::vnext::DefinedProductionModel>>> {
+    if let Some(sources) = sources {
+        if let ferrum_models::vnext::ProductionModelRegistration::Registered(registration) =
+            ferrum_models::vnext::resolve_registered_model_from_sources(sources)?
+        {
+            let defined = registration.define_from_sources(Arc::clone(sources))?;
+            defined
+                .definition()
+                .numerical_profiles()
+                .candidates(policy)
+                .map_err(|error| FerrumError::config(error.to_string()))?;
+            return Ok(Some(Arc::new(defined)));
+        }
     }
+    if let ferrum_types::NumericalExecutionPolicy::Require(profile) = policy {
+        return Err(FerrumError::unsupported(format!(
+            "numerical profile {profile} requires a registered vNext model package"
+        )));
+    }
+    Ok(None)
 }
 
-pub fn prepared_product_source_identity(
-    prepared: &ferrum_models::vnext::PreparedProductionModel,
+pub fn defined_product_source_identity(
+    prepared: &ferrum_models::vnext::DefinedProductionModel,
     requested_model: &str,
     resolved_model: &str,
     selected_template: Option<&ModelChatTemplate>,

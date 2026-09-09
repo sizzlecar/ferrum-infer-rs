@@ -158,7 +158,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
             && revalidated_impostor != plan,
     );
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let catalog = catalog();
     let runtime_policy = policy();
