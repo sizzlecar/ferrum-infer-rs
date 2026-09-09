@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 
 pub(crate) mod cache;
+mod gguf_repository;
 use cache::{CacheRequirements, CachedModel};
 
 /// Small, release-supported starter models used by CLI guidance. These are
@@ -1184,9 +1185,9 @@ enum DownloadArtifacts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductSourceComposition {
+enum ProductSourceComposition<'a> {
     ResolveColocated,
-    ResolveWithExplicitTokenizer,
+    ResolveWithExplicitTokenizer(&'a Path),
     DeferUntilExplicitSemantic,
 }
 
@@ -1324,7 +1325,7 @@ async fn resolve_model_source_internal(
     cache_dir: &Path,
     download: DownloadPolicy,
     autosize: Option<(AutoSizeProfile, f32)>,
-    source_composition: ProductSourceComposition,
+    source_composition: ProductSourceComposition<'_>,
     download_artifacts: DownloadArtifacts,
 ) -> Result<Resolved> {
     let defer_colocated_product_sources =
@@ -1333,13 +1334,17 @@ async fn resolve_model_source_internal(
         source_composition != ProductSourceComposition::ResolveColocated;
     let cache_requirements = match source_composition {
         ProductSourceComposition::DeferUntilExplicitSemantic => CacheRequirements::WeightsOnly,
-        ProductSourceComposition::ResolveWithExplicitTokenizer => {
+        ProductSourceComposition::ResolveWithExplicitTokenizer(_) => {
             CacheRequirements::ExplicitTokenizer
         }
         ProductSourceComposition::ResolveColocated => match download_artifacts {
             DownloadArtifacts::RootSafetensors => CacheRequirements::Product,
             DownloadArtifacts::Repository => CacheRequirements::Repository,
         },
+    };
+    let tokenizer_override = match source_composition {
+        ProductSourceComposition::ResolveWithExplicitTokenizer(path) => Some(path),
+        _ => None,
     };
     // 1. Curated GGUF alias. Resolve this before the general HF alias table:
     // a GGUF alias names one exact file, not a safetensors repository.
@@ -1370,45 +1375,15 @@ async fn resolve_model_source_internal(
         let (model_sources, metadata_from_cache) = if defer_colocated_product_sources {
             (None, true)
         } else {
-            let metadata_repo = tokenizer_sibling_repo(&repo).ok_or_else(|| {
-                FerrumError::model(format!(
-                    "GGUF repository '{repo}' has no semantic/tokenizer source"
-                ))
-            })?;
-            let (metadata_root, metadata_from_cache) =
-                match find_cached_product_metadata(cache_dir, &metadata_repo)? {
-                    Some(path) => (path, true),
-                    None if download == DownloadPolicy::AutoDownload => {
-                        let downloader =
-                            ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
-                        let path = downloader
-                            .download_sidecar_files(&metadata_repo, None, &PRODUCT_SOURCE_FILES)
-                            .await?;
-                        if !is_complete_product_metadata_snapshot(&path)? {
-                            return Err(FerrumError::model(format!(
-                                "semantic/tokenizer source '{metadata_repo}' did not provide config.json and tokenizer.json"
-                            )));
-                        }
-                        (path, false)
-                    }
-                    None => {
-                        return Err(FerrumError::model(format!(
-                            "semantic/tokenizer source '{metadata_repo}' for GGUF alias '{model}' is not cached and DownloadPolicy::NoDownload is set"
-                        )))
-                    }
-                };
-            let metadata_original = repository_source(metadata_repo);
-            let sources = Arc::new(open_registered_product_sources(
-                &metadata_root,
-                &metadata_root,
-                ProductionWeightArtifact::gguf_file(&local_path),
-                OriginalModelSources {
-                    semantic: metadata_original.clone(),
-                    tokenizer: metadata_original,
-                    weights: repository_source(&repo),
-                },
-            )?);
-            (Some(sources), metadata_from_cache)
+            gguf_repository::resolve_metadata(
+                model,
+                repository_source(&repo),
+                &local_path,
+                cache_dir,
+                download,
+                tokenizer_override,
+            )
+            .await?
         };
         return Ok(finalize_resolution(
             ResolvedModelSource {
@@ -1504,7 +1479,7 @@ async fn resolve_model_source_internal(
         CachedModel::Ready(source) => (Some(source), None),
         CachedModel::Missing(reason) => (None, reason),
     };
-    if let Some(source) = cached {
+    if let Some(mut source) = cached {
         if let Some(pin) = &pinned {
             pin.verify_snapshot(&source.local_path)?;
         }
@@ -1513,10 +1488,40 @@ async fn resolve_model_source_internal(
             revision: revision.map(str::to_owned),
             cache_dir: Some(cache_dir.display().to_string()),
         };
-        let model_sources = if defer_repository_product_sources {
+        let model_sources = if source.format == ModelFormat::GGUF && tokenizer_override.is_some() {
+            let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
+                model,
+                original_product_source(&original_source, &source.local_path)?,
+                &source.local_path,
+                cache_dir,
+                download,
+                tokenizer_override,
+            )
+            .await?;
+            source.from_cache &= metadata_from_cache;
+            sources
+        } else if defer_repository_product_sources {
             None
         } else {
-            open_colocated_product_sources(&source, &original_source)?
+            let colocated = open_colocated_product_sources(&source, &original_source)?;
+            if source.format == ModelFormat::GGUF
+                && colocated.is_none()
+                && direct_gguf_requires_typed_product_sources(&source.local_path)
+            {
+                let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
+                    model,
+                    original_product_source(&original_source, &source.local_path)?,
+                    &source.local_path,
+                    cache_dir,
+                    download,
+                    None,
+                )
+                .await?;
+                source.from_cache &= metadata_from_cache;
+                sources
+            } else {
+                colocated
+            }
         };
         return Ok(finalize_resolution(
             source,
@@ -1608,8 +1613,8 @@ pub async fn resolve_model_source_with_product_sources(
         autosize,
         if source_args.semantic_source.is_some() {
             ProductSourceComposition::DeferUntilExplicitSemantic
-        } else if source_args.tokenizer_source.is_some() {
-            ProductSourceComposition::ResolveWithExplicitTokenizer
+        } else if let Some(tokenizer) = &source_args.tokenizer_source {
+            ProductSourceComposition::ResolveWithExplicitTokenizer(tokenizer)
         } else {
             ProductSourceComposition::ResolveColocated
         },
@@ -2381,6 +2386,98 @@ mod tests {
             Path::new(&filename).file_stem().unwrap().to_string_lossy()
         );
         let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[tokio::test]
+    async fn cached_typed_gguf_repository_resolves_independent_roles_and_tokenizer_override() {
+        use candle_core::quantized::gguf_file::{self, Value};
+        let cache = tempfile::tempdir().unwrap();
+        let repo = "unsloth/Qwen3.5-4B-GGUF";
+        let semantic_repo = "Qwen/Qwen3.5-4B";
+        let revision = "a".repeat(40);
+        let semantic_revision = "b".repeat(40);
+        let snapshot = cache
+            .path()
+            .join("hub/models--unsloth--Qwen3.5-4B-GGUF/snapshots")
+            .join(&revision);
+        let semantic = cache
+            .path()
+            .join("hub/models--Qwen--Qwen3.5-4B/snapshots")
+            .join(&semantic_revision);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(&semantic).unwrap();
+        let gguf = snapshot.join("model.gguf");
+        let mut file = std::fs::File::create(&gguf).unwrap();
+        gguf_file::write(
+            &mut file,
+            &[("general.architecture", &Value::String("qwen35".into()))],
+            &[],
+        )
+        .unwrap();
+        drop(file);
+        std::fs::write(semantic.join("config.json"), qwen35_semantic_config(false)).unwrap();
+        std::fs::write(semantic.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(
+            semantic.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture-template"}"#,
+        )
+        .unwrap();
+        for request in [repo.to_owned(), format!("{repo}@{revision}")] {
+            let product = resolve_model_source_with_product_sources(
+                &request,
+                cache.path(),
+                DownloadPolicy::NoDownload,
+                None,
+                &ProductSourceArgs::default(),
+            )
+            .await
+            .unwrap()
+            .into_product_engine_input();
+            let sources = product.model_sources.unwrap();
+            assert_eq!(sources.weights().path(), gguf.canonicalize().unwrap());
+            assert_eq!(sources.semantic_root(), semantic.canonicalize().unwrap());
+            assert_eq!(sources.tokenizer_root(), semantic.canonicalize().unwrap());
+            assert_eq!(sources.original_sources().semantic.location, semantic_repo);
+            assert_eq!(sources.original_sources().weights.location, repo);
+            assert_eq!(
+                sources
+                    .original_sources()
+                    .weights
+                    .requested_revision
+                    .as_deref(),
+                request.contains('@').then_some(revision.as_str())
+            );
+        }
+        let tokenizer = cache.path().join("explicit-tokenizer");
+        std::fs::create_dir(&tokenizer).unwrap();
+        std::fs::rename(
+            semantic.join("tokenizer.json"),
+            tokenizer.join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::rename(
+            semantic.join("tokenizer_config.json"),
+            tokenizer.join("tokenizer_config.json"),
+        )
+        .unwrap();
+        let product = resolve_model_source_with_product_sources(
+            repo,
+            cache.path(),
+            DownloadPolicy::NoDownload,
+            None,
+            &ProductSourceArgs {
+                semantic_source: None,
+                tokenizer_source: Some(tokenizer.clone()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_product_engine_input();
+        let sources = product.model_sources.unwrap();
+        assert_eq!(sources.semantic_root(), semantic.canonicalize().unwrap());
+        assert_eq!(sources.tokenizer_root(), tokenizer.canonicalize().unwrap());
+        assert!(!snapshot.join("config.json").exists());
+        assert!(!semantic.join("tokenizer.json").exists());
     }
 
     #[test]
