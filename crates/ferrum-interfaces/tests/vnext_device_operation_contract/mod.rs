@@ -4,6 +4,9 @@
 )]
 
 pub(crate) use ferrum_interfaces::vnext::*;
+#[path = "../vnext_numerical_fixture/mod.rs"]
+mod numerical_fixture;
+pub(crate) use numerical_fixture::*;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
@@ -283,7 +286,10 @@ impl ModelFamilyProvider for TestFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
         if config.token_scaled_state && !config.zero_state {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: "token-scaled test state requires the state binding".to_owned(),
@@ -294,11 +300,7 @@ impl ModelFamilyProvider for TestFamily {
                 reason: "recurrent test state requires token-scaled KV state".to_owned(),
             });
         }
-        let mut main_inputs = vec![id("value.input"), id("value.weight")];
-        let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
         let mut states = if config.zero_state {
-            main_inputs.push(id("value.state"));
-            tail_inputs.push(id("value.state"));
             vec![StateSpec {
                 id: id("state.device-operation"),
                 value_id: id("value.state"),
@@ -322,8 +324,6 @@ impl ModelFamilyProvider for TestFamily {
             Vec::new()
         };
         if config.recurrent_state {
-            main_inputs.push(id("value.recurrent-state"));
-            tail_inputs.push(id("value.recurrent-state"));
             states.push(StateSpec {
                 id: id("state.device-operation.recurrent"),
                 value_id: id("value.recurrent-state"),
@@ -337,6 +337,30 @@ impl ModelFamilyProvider for TestFamily {
                 initialization: StateInitialization::Zero,
             });
         }
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.intermediate", "value.output"],
+            &["operation.main"],
+            states,
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        let mut main_inputs = vec![id("value.input"), id("value.weight")];
+        let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
+        if config.zero_state {
+            main_inputs.push(id("value.state"));
+            tail_inputs.push(id("value.state"));
+        }
+        if config.recurrent_state {
+            main_inputs.push(id("value.recurrent-state"));
+            tail_inputs.push(id("value.recurrent-state"));
+        }
+        let states = profile.states.clone();
         let main_work = if config.token_scaled_state {
             ProgramNodeWorkSpec::tokens(id("value.input"), 0)
         } else {
@@ -1063,7 +1087,7 @@ pub(crate) fn resolved_tensor_for(element_type: ElementType) -> ResolvedTensorSp
 
 fn resolved_weight() -> ResolvedWeightBinding {
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
 }

@@ -111,7 +111,39 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
         Ok(schema)
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        let profile_id = NumericalProfileId::new("fixture.f32").unwrap();
+        let mut state = fixture_byte_state(config.width);
+        state.id = id("state.recurrent");
+        FamilyNumericalProfiles::new(
+            self.family_id(),
+            ContractVersion::new(1, 0),
+            vec![NumericalExecutionProfile {
+                id: profile_id.clone(),
+                family_id: self.family_id().clone(),
+                version: ContractVersion::new(1, 0),
+                primary_activation: id("value.output"),
+                boundaries: BTreeMap::from([(id("value.output"), ElementType::F32)]),
+                states: self.recurrent.then_some(state).into_iter().collect(),
+                operations: vec![NumericalOperationContract {
+                    operation_id: self.operation_id.clone(),
+                    version: self.required_version,
+                    multiplication_type: None,
+                    accumulation_type: None,
+                }],
+            }],
+            vec![profile_id],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         let auxiliary_value: ProgramValueId = if self.recurrent {
             id("value.state")
         } else {
@@ -184,7 +216,7 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
 
 fn prepare(provider: SyntheticExtensionFamily) -> PreparedModelFamily {
     TypedFamilyRegistration::new(provider)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap()
 }
 

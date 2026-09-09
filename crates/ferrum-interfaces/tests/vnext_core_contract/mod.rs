@@ -26,6 +26,10 @@ pub(crate) fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
+#[path = "../vnext_numerical_fixture/mod.rs"]
+mod numerical_fixture;
+pub(crate) use numerical_fixture::*;
+
 pub(crate) fn resource_work(sequence_token_counts: &[usize]) -> ResourceWorkShape {
     ResourceWorkShape::from_token_spans(
         sequence_token_counts
@@ -179,7 +183,23 @@ impl ModelFamilyProvider for TestFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.output"],
+            &["operation.main"],
+            vec![fixture_byte_state(config.width)],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
@@ -338,8 +358,19 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
         Ok(schema)
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
-        TestFamily.semantic_program(config)
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        TestFamily.numerical_profiles(config)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        TestFamily.semantic_program(config, profile)
     }
 
     fn semantic_metadata(
@@ -389,8 +420,19 @@ impl ModelFamilyProvider for FixedSchemaFamily {
         Ok(self.schema.clone())
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
-        TestFamily.semantic_program(config)
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        TestFamily.numerical_profiles(config)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        TestFamily.semantic_program(config, profile)
     }
 
     fn semantic_metadata(
@@ -413,7 +455,12 @@ impl TestRegistry {
     }
 
     pub(crate) fn prepare(&self) -> PreparedModelFamily {
-        self.registration.prepare(&json!({"width": 4})).unwrap()
+        self.registration
+            .prepare_with_profile(
+                &json!({"width": 4}),
+                &NumericalProfileId::new("fixture.f32").unwrap(),
+            )
+            .unwrap()
     }
 }
 
@@ -463,7 +510,23 @@ impl ModelFamilyProvider for SequentialScratchFamily {
         TestFamily.weight_schema(config)
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.intermediate", "value.output"],
+            &["operation.main"],
+            vec![fixture_byte_state(config.width)],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
@@ -1624,7 +1687,48 @@ impl ModelFamilyProvider for GraphFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        let (outputs, operations, states): (&[&str], &[&str], Vec<StateSpec>) =
+            match config.scenario.as_str() {
+                "alias" => (&["value.alias"], &["operation.graph.alias"], vec![]),
+                "alias_late_consumer" => (
+                    &["value.alias", "value.late"],
+                    &["operation.graph.alias", "operation.graph.consume"],
+                    vec![],
+                ),
+                "alias_terminal_intermediate" => (
+                    &["value.intermediate", "value.alias"],
+                    &["operation.graph.alias", "operation.graph.consume"],
+                    vec![],
+                ),
+                "state_chain" => (
+                    &[
+                        "value.state-read.0",
+                        "value.state-rw.0",
+                        "value.state-rw.1",
+                        "value.state-read.1",
+                    ],
+                    &["operation.graph.state-read", "operation.graph.state-rw"],
+                    vec![graph_state_spec()],
+                ),
+                "state_read_only" => (
+                    &["value.state-read.0", "value.state-read.1"],
+                    &["operation.graph.state-read"],
+                    vec![graph_state_spec()],
+                ),
+                _ => unreachable!(),
+            };
+        fixture_f32_profiles(self.family_id(), outputs, operations, states)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         let node = |node_id: &str, operation_id: &str, output: &str, state: bool| ProgramNode {
             id: id(node_id),
             operation_id: id(operation_id),

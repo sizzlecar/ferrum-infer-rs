@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
-    ModelArtifactSourceRole, ModelConfigFingerprint, OperationRuntimeRegistry,
+    ModelArtifactSourceRole, ModelConfigFingerprint, NumericalProfileRejection,
+    NumericalProfileRejectionStage, NumericalProfileResolution, OperationRuntimeRegistry,
     ProgramPlanCompilation, RationalValue, ResolutionArtifactId, ResolutionDecisionBinding,
     ResolutionDecisionSource, ResolutionField, ResolutionFingerprint, ResolutionReasonId,
     ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
@@ -16,67 +17,143 @@ use ferrum_interfaces::vnext::{
     TokenizerDescriptor, TokenizerId, TriStatePolicy, WeightMaterializerRegistry,
     WeightMaterializerSelection, JSON_RESOLUTION_SOURCE_PARSER,
 };
-use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
-use ferrum_models::{VNextExecutorConfig, VNextModelExecutor};
+use ferrum_models::vnext::{
+    DefinedProductionModel, PreparedProductionModel, ProductionModelFamilyRegistry,
+};
+use ferrum_models::{VNextExecutorConfig, VNextModelExecutor, VNextRuntimeComposition};
 use ferrum_types::{EngineConfig, FerrumError, ModelInfo, ResponseFormat, Result, SamplingParams};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-const PRODUCT_COMPOSITION_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const PRODUCT_COMPOSITION_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const PRODUCT_COMPOSITION_PRODUCER: &str = "ferrum.product-composition";
 const DEFAULT_SAMPLER_SEED: u64 = 42;
 
 pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     engine: &EngineConfig,
-    prepared: &PreparedProductionModel,
-    model_info: ModelInfo,
+    defined: &DefinedProductionModel,
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
+    select_materializer: impl Fn(
+        &ferrum_interfaces::vnext::PreparedModelFamily,
+    ) -> std::result::Result<
+        WeightMaterializerSelection,
+        ferrum_interfaces::vnext::VNextError,
+    >,
 ) -> Result<VNextModelExecutor<R>> {
-    VNextModelExecutor::from_runtime_composition(
-        prepared,
-        model_info,
+    create_vnext_executor_with_configuration(
         engine,
+        defined,
         runtime,
         operation_registry,
         weight_materializers,
-        weight_materializer_selection,
         catalog,
-        |prepared, runtime, catalog, compilation| {
-            resolve_model_plan(engine, prepared, catalog, runtime, compilation)
-        },
+        select_materializer,
+        |info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_vnext_executor_with_config<R: DeviceRuntime>(
+pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
     engine: &EngineConfig,
-    prepared: &PreparedProductionModel,
-    model_info: ModelInfo,
-    executor_config: VNextExecutorConfig,
+    defined: &DefinedProductionModel,
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
+    select_materializer: impl Fn(
+        &ferrum_interfaces::vnext::PreparedModelFamily,
+    ) -> std::result::Result<
+        WeightMaterializerSelection,
+        ferrum_interfaces::vnext::VNextError,
+    >,
+    executor_config: impl Fn(&ModelInfo, &R) -> Result<VNextExecutorConfig>,
 ) -> Result<VNextModelExecutor<R>> {
-    VNextModelExecutor::from_runtime_composition_with_config(
-        prepared,
-        model_info,
-        engine,
-        executor_config,
-        runtime,
-        operation_registry,
-        weight_materializers,
-        weight_materializer_selection,
-        catalog,
-        |prepared, runtime, catalog, compilation| {
-            resolve_model_plan(engine, prepared, catalog, runtime, compilation)
-        },
-    )
+    let composition =
+        VNextRuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
+    let candidates = defined
+        .definition()
+        .numerical_profiles()
+        .candidates(&engine.numerical_execution)
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+    let mut rejected = Vec::new();
+    for profile in candidates {
+        let prepared = match defined.prepare(&profile.id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                rejected.push(NumericalProfileRejection {
+                    profile_id: profile.id.clone(),
+                    stage: NumericalProfileRejectionStage::FamilyPreparation,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let model_info =
+            prepared.model_info(engine.model.model_id.clone(), engine.backend.device.clone());
+        let config = executor_config(&model_info, composition.runtime())?;
+        let materializer = match select_materializer(prepared.family()) {
+            Ok(selection) => selection,
+            Err(error) => {
+                rejected.push(NumericalProfileRejection {
+                    profile_id: profile.id.clone(),
+                    stage: NumericalProfileRejectionStage::WeightMaterializer,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let compiled =
+            match composition.compile_model(&prepared, model_info, engine, config, materializer) {
+                Ok(compiled) => compiled,
+                Err(error) => {
+                    rejected.push(NumericalProfileRejection {
+                        profile_id: profile.id.clone(),
+                        stage: NumericalProfileRejectionStage::ProgramCompilation,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+        tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
+            numerical_profile = %profile.id, rejected_numerical_profiles = ?rejected,
+            family_id = %prepared.family().family_id(),
+            "Selected numerical profile using the complete static program");
+        return compiled.initialize(|prepared, runtime, catalog, compilation| {
+            let numerical_execution = NumericalProfileResolution::from_static_plan(
+                engine.numerical_execution.clone(),
+                defined.definition(),
+                prepared.family(),
+                catalog,
+                runtime,
+                compilation.executable().execution_plan(),
+                rejected,
+            )
+            .map_err(|error| FerrumError::model(error.to_string()))?;
+            resolve_model_plan(
+                engine,
+                prepared,
+                catalog,
+                runtime,
+                compilation,
+                &numerical_execution,
+            )
+        });
+    }
+    Err(FerrumError::unsupported(format!(
+        "no declared numerical profile satisfies {:?}: {}",
+        engine.numerical_execution,
+        rejected
+            .iter()
+            .map(|rejection| format!(
+                "{} ({:?}): {}",
+                rejection.profile_id, rejection.stage, rejection.reason
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )))
 }
 
 fn resolve_model_plan(
@@ -85,6 +162,7 @@ fn resolve_model_plan(
     catalog: &CapabilityCatalog,
     runtime: &ResolvedRuntimePolicy,
     compilation: &ProgramPlanCompilation,
+    numerical_execution: &NumericalProfileResolution,
 ) -> Result<ResolvedModelPlan> {
     let sources = prepared.sources();
     let config_sha256 = sources
@@ -132,6 +210,7 @@ fn resolve_model_plan(
         },
         external_metadata_id: family.external_metadata_id().clone(),
         prepared_family: family.clone(),
+        numerical_execution: numerical_execution.clone(),
         tokenizer: TokenizerDescriptor {
             tokenizer_id: TokenizerId::new("tokenizer.huggingface.json")
                 .map_err(|error| FerrumError::tokenizer(error.to_string()))?,
@@ -157,6 +236,7 @@ fn resolve_model_plan(
         catalog.device(),
         catalog,
         runtime,
+        numerical_execution,
     )
     .with_completion_retention(compilation.completion_retention().clone());
     ResolvedModelPlan::new(inputs, bindings, &context)
@@ -326,7 +406,10 @@ fn resolution_evidence(
         ResolutionField::RuntimeMemory,
         ResolutionField::Admission,
     ];
-    const PLANNER_FIELDS: &[ResolutionField] = &[ResolutionField::ExecutionPlan];
+    const PLANNER_FIELDS: &[ResolutionField] = &[
+        ResolutionField::ExecutionPlan,
+        ResolutionField::NumericalExecution,
+    ];
     const DEFAULT_FIELDS: &[ResolutionField] = &[
         ResolutionField::Sampling,
         ResolutionField::Stop,
@@ -406,6 +489,7 @@ fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) ->
         ResolutionField::Config => serde_json::to_value(&inputs.config),
         ResolutionField::ExternalMetadata => serde_json::to_value(&inputs.external_metadata_id),
         ResolutionField::Family => serde_json::to_value(inputs.prepared_family.family_id()),
+        ResolutionField::NumericalExecution => serde_json::to_value(&inputs.numerical_execution),
         ResolutionField::WeightSchema => {
             serde_json::to_value(inputs.prepared_family.weight_schema())
         }

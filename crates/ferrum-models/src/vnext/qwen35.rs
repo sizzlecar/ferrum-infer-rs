@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
-    ElementType, ExternalModelMetadataId, GatedDeltaDecayParameterization,
+    ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, GatedDeltaDecayParameterization,
     GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
-    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightComponentBinding,
-    PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode,
-    ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec,
-    QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
+    ModelProgram, ModelSemanticMetadata, NodeId, NumericalExecutionProfile, OperationId,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
+    ProgramValueId, QuantizationFormatId, QuantizationGrouping, QuantizationPacking,
+    QuantizationSpec, QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
     StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
@@ -53,13 +53,15 @@ use crate::qwen35_weights::{
 use super::{
     hf_metadata::{is_hf_template_source, parse_hf_model_semantic_metadata},
     weight_layout::{contiguous_or_reshaped_binding, dense_or_reshaped_layout},
-    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+    CausalLanguageModelDescriptor, DefinedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
 };
 
 pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
+mod numerical;
+pub use numerical::{F16_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID};
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
 const PACKED_LINEAR_ATTN_QKVZBA_ROLE: &str = "linear_attn_qkvzba";
@@ -233,8 +235,7 @@ impl OperationSelection {
     }
 }
 
-/// The activation ABI is selected once from the typed physical package.
-/// It must never be inferred later from a backend name or hidden runtime flag.
+/// Operations implementing the family's explicitly selected numerical ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Qwen35OperationProfile {
     token_embedding: OperationSelection,
@@ -247,6 +248,15 @@ struct Qwen35OperationProfile {
     final_norm: OperationSelection,
     logits: OperationSelection,
     argmax: OperationSelection,
+}
+
+/// Physical values/order supplied by a source adapter. These two source ABIs
+/// differ even when their tensors have equal shapes and element types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecurrentWeightAbi {
+    LogRateGrouped,
+    NegativeRateInterleaved,
 }
 
 impl Qwen35OperationProfile {
@@ -288,13 +298,14 @@ impl Qwen35OperationProfile {
         argmax: OperationSelection::new(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, 1, 0),
     };
 
-    const fn for_weight_format(weight_format: FamilyWeightFormat) -> Self {
-        match weight_format {
-            FamilyWeightFormat::SafetensorsDense
-            | FamilyWeightFormat::SafetensorsGptqMarlin
-            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin
-            | FamilyWeightFormat::SafetensorsBlockFp8 => Self::F16,
-            FamilyWeightFormat::GgufNative => Self::F32_MASTER,
+    fn for_profile(profile: &NumericalExecutionProfile) -> Result<Self, VNextError> {
+        match profile.id.as_str() {
+            F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
+            F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
+            _ => Err(invalid_config(
+                "numerical_profile",
+                "unknown Qwen3.5 numerical profile",
+            )),
         }
     }
 }
@@ -308,6 +319,7 @@ pub struct Qwen35FamilyConfig {
     rms_norm_epsilon: CanonicalRational,
     metadata: ModelSemanticMetadata,
     weight_format: FamilyWeightFormat,
+    recurrent_weight_abi: RecurrentWeightAbi,
     weights: Vec<FamilyWeight>,
 }
 
@@ -720,9 +732,20 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         }
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        numerical::profiles(&self.family_id, config)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         let text = Self::text_config(config)?;
-        let operations = Qwen35OperationProfile::for_weight_format(config.weight_format);
+        let operations = Qwen35OperationProfile::for_profile(profile)?;
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
             if is_moe_source_role(&weight.role) {
@@ -807,7 +830,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             ]),
         });
 
-        let mut states = Vec::new();
+        let states = profile.states.clone();
         for (layer_index, layer_type) in text.layer_types.iter().copied().enumerate() {
             let attention_output = value_id(format!("value.layer.{layer_index}.attention"))?;
             let input_norm = required_weight(config, Some(layer_index as u32), "input_layernorm")?;
@@ -838,50 +861,17 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     let conv_value = value_id(format!("value.state.layer.{layer_index}.conv"))?;
                     let delta_value = value_id(format!("value.state.layer.{layer_index}.delta"))?;
                     attention_inputs.extend([conv_value.clone(), delta_value.clone()]);
-                    states.push(StateSpec {
-                        id: state_id(format!("state.layer.{layer_index}.conv"))?,
-                        value_id: conv_value,
-                        tensor: tensor_spec(
-                            text.recurrent_conv_state_shape()
-                                .map_err(|reason| invalid_config("states.conv", reason))?
-                                .into_iter()
-                                .map(|extent| extent as u64)
-                                .collect(),
-                            ElementType::F16,
-                        ),
-                        lifetime: StateLifetime::Sequence,
-                        capacity_demand: StateCapacityDemand::FixedPerScope,
-                        initialization: StateInitialization::Zero,
-                    });
-                    states.push(StateSpec {
-                        id: state_id(format!("state.layer.{layer_index}.delta"))?,
-                        value_id: delta_value,
-                        tensor: tensor_spec(
-                            text.recurrent_delta_state_shape()
-                                .map_err(|reason| invalid_config("states.delta", reason))?
-                                .into_iter()
-                                .map(|extent| extent as u64)
-                                .collect(),
-                            data_type_to_element_type(text.mamba_ssm_dtype)
-                                .map_err(|reason| invalid_config("states.delta.dtype", reason))?,
-                        ),
-                        lifetime: StateLifetime::Sequence,
-                        capacity_demand: StateCapacityDemand::FixedPerScope,
-                        initialization: StateInitialization::Zero,
-                    });
-                    let (decay_parameterization, value_head_mapping) = match config.weight_format {
-                        FamilyWeightFormat::SafetensorsDense
-                        | FamilyWeightFormat::SafetensorsGptqMarlin
-                        | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin
-                        | FamilyWeightFormat::SafetensorsBlockFp8 => (
-                            GatedDeltaDecayParameterization::LogRate,
-                            GatedDeltaValueHeadMapping::GroupedByKeyHead,
-                        ),
-                        FamilyWeightFormat::GgufNative => (
-                            GatedDeltaDecayParameterization::NegativeRate,
-                            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
-                        ),
-                    };
+                    let (decay_parameterization, value_head_mapping) =
+                        match config.recurrent_weight_abi {
+                            RecurrentWeightAbi::LogRateGrouped => (
+                                GatedDeltaDecayParameterization::LogRate,
+                                GatedDeltaValueHeadMapping::GroupedByKeyHead,
+                            ),
+                            RecurrentWeightAbi::NegativeRateInterleaved => (
+                                GatedDeltaDecayParameterization::NegativeRate,
+                                GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+                            ),
+                        };
                     (
                         operations.linear_attention.id,
                         operations.linear_attention.version,
@@ -943,24 +933,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         )?)?);
                     }
                     let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
-                    let kv_dimensions =
-                        vec![2, text.num_key_value_heads as u64, text.head_dim as u64];
-                    let kv_bytes_per_token = kv_dimensions.iter().product::<u64>() * 2;
                     attention_inputs.push(kv_value.clone());
-                    states.push(StateSpec {
-                        id: state_id(format!("state.layer.{layer_index}.kv"))?,
-                        value_id: kv_value,
-                        tensor: tensor_spec(kv_dimensions, ElementType::F16),
-                        lifetime: StateLifetime::Sequence,
-                        capacity_demand: StateCapacityDemand::TokenScaled {
-                            bytes_per_token: kv_bytes_per_token,
-                            maximum_tokens: config.max_position_embeddings,
-                        },
-                        // The attention provider writes each valid KV slot before
-                        // that slot can be read; clearing unused block capacity is
-                        // unnecessary work on the decode path.
-                        initialization: StateInitialization::None,
-                    });
                     (
                         operations.causal_attention.id,
                         operations.causal_attention.version,
@@ -2637,14 +2610,14 @@ fn gguf_component_layout(
     }
 }
 
-pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+pub fn define_from_model_dir(model_dir: &Path) -> ferrum_types::Result<DefinedProductionModel> {
     let sources = Arc::new(super::open_registered_colocated_safetensors(model_dir)?);
-    prepare_from_sources(sources)
+    define_from_sources(sources)
 }
 
-pub(super) fn prepare_from_sources(
+pub(super) fn define_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
-) -> ferrum_types::Result<PreparedProductionModel> {
+) -> ferrum_types::Result<DefinedProductionModel> {
     preflight_semantic_config(sources.config_json()).map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
         ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
@@ -2684,21 +2657,32 @@ fn finish_preparation<W>(
     sources: Arc<ProductionModelSourceBundle>,
     weights: W,
     config: Qwen35FamilyConfig,
-) -> ferrum_types::Result<PreparedProductionModel>
+) -> ferrum_types::Result<DefinedProductionModel>
 where
     W: WeightComponentSource + 'static,
 {
-    let descriptor = production_descriptor(&config).map_err(ferrum_types::FerrumError::model)?;
+    let mut descriptor =
+        production_descriptor(&config).map_err(ferrum_types::FerrumError::model)?;
+    let text = Qwen35FamilyProvider::text_config(&config)
+        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
+    if let Some(moe) = &text.moe {
+        descriptor = descriptor.with_moe(
+            moe.num_experts as u64,
+            moe.num_experts_per_tok as u64,
+            moe.moe_intermediate_size as u64,
+        )?;
+    }
     let raw = serde_json::to_value(config)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     let provider = Qwen35FamilyProvider::new()
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    let family = TypedFamilyRegistration::new(provider)
-        .prepare(&raw)
-        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    Ok(PreparedProductionModel::new(
-        family, weights, descriptor, sources,
-    ))
+    DefinedProductionModel::new(
+        TypedFamilyRegistration::new(provider),
+        &raw,
+        weights,
+        descriptor,
+        sources,
+    )
 }
 
 fn production_descriptor(
@@ -2817,6 +2801,7 @@ fn load_safetensors_family_config(
         max_position_embeddings,
         rms_norm_epsilon,
         metadata,
+        recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
         weight_format: match text
             .quantization
             .as_ref()
@@ -2951,6 +2936,7 @@ fn load_gguf_family_config(
         max_position_embeddings,
         rms_norm_epsilon,
         metadata,
+        recurrent_weight_abi: RecurrentWeightAbi::NegativeRateInterleaved,
         weight_format: FamilyWeightFormat::GgufNative,
         weights,
     })
@@ -4399,6 +4385,18 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 
 #[cfg(test)]
 mod tests {
+    use crate::vnext::test_support::{prepare_product_fixture, PrepareFamilyFixture};
+    use crate::vnext::PreparedProductionModel;
+
+    fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+        prepare_product_fixture(define_from_model_dir(model_dir)?)
+    }
+
+    fn prepare_from_sources(
+        sources: Arc<ProductionModelSourceBundle>,
+    ) -> ferrum_types::Result<PreparedProductionModel> {
+        prepare_product_fixture(define_from_sources(sources)?)
+    }
     use std::borrow::Cow;
     use std::collections::HashMap;
     use std::fs::{File, OpenOptions};
@@ -6092,7 +6090,7 @@ mod tests {
     fn compiles_block_fp8_source_grid_into_independent_composite_leaves() {
         let config = test_block_fp8_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .unwrap();
         let schema = prepared.weight_schema();
 
@@ -6147,7 +6145,9 @@ mod tests {
     #[test]
     fn materializes_real_qwen35_dense_block_fp8_family_into_marlin_fp8_schema() {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap())
+            .prepare_fixture(
+                &serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap(),
+            )
             .unwrap();
         let source_schema = prepared.weight_schema();
         let denominator = QuantizedProviderAttributionDenominator::from_prepared_family(&prepared)
@@ -6381,10 +6381,10 @@ mod tests {
         assert_eq!(qwen38_text, qwen36_text);
 
         let qwen38 = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(qwen38_config).unwrap())
+            .prepare_fixture(&serde_json::to_value(qwen38_config).unwrap())
             .unwrap();
         let qwen36 = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(qwen36_config).unwrap())
+            .prepare_fixture(&serde_json::to_value(qwen36_config).unwrap())
             .unwrap();
         assert_eq!(
             qwen38.weight_schema().fingerprint().unwrap(),
@@ -6438,7 +6438,7 @@ mod tests {
     #[test]
     fn qwen38_block_fp8_program_matches_standard_operation_contracts() {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(test_block_fp8_config()).unwrap())
+            .prepare_fixture(&serde_json::to_value(test_block_fp8_config()).unwrap())
             .unwrap();
         let program = prepared.program();
         let contracts = [
@@ -6522,7 +6522,7 @@ mod tests {
         scale_inv.dimensions[1] += 1;
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("mismatched block-FP8 scale grid must fail before runtime");
         let VNextError::InvalidModelConfig {
             family_id,
@@ -6550,7 +6550,7 @@ mod tests {
         };
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("a non-excluded projection without its FP8 sidecar must fail closed");
         let VNextError::InvalidModelConfig { field, reason, .. } = error else {
             panic!("expected typed invalid-model-config rejection, got {error}")
@@ -6590,7 +6590,7 @@ mod tests {
         };
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("a typed dense exclusion must reject an extra FP8 source pair");
         let VNextError::InvalidModelConfig { field, reason, .. } = error else {
             panic!("expected typed invalid-model-config rejection, got {error}")
@@ -6616,7 +6616,7 @@ mod tests {
         synchronize_test_block_fp8_exclusions(&mut config);
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("a block-FP8 recipe without an execution pair must fail closed");
         let VNextError::InvalidModelConfig { field, reason, .. } = error else {
             panic!("expected typed invalid-model-config rejection, got {error}")
@@ -6646,7 +6646,7 @@ mod tests {
             }
 
             let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-                .prepare(&serde_json::to_value(config).unwrap())
+                .prepare_fixture(&serde_json::to_value(config).unwrap())
                 .expect_err("FP8 value/scale dtype drift must fail closed");
             let VNextError::InvalidModelConfig { field, reason, .. } = error else {
                 panic!("expected typed invalid-model-config rejection, got {error}")
@@ -6683,7 +6683,7 @@ mod tests {
             .expect("bad-recipe pointer exists in the fixed base fixture") = replacement;
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("mismatched block-FP8 metadata must fail before runtime");
         let VNextError::InvalidModelConfig {
             family_id,
@@ -7029,6 +7029,7 @@ mod tests {
             max_position_embeddings: 128,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsDense,
+            recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
             weights,
         }
     }
@@ -7174,6 +7175,7 @@ mod tests {
             max_position_embeddings,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
+            recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
             weights,
         };
         synchronize_test_block_fp8_exclusions(&mut config);
@@ -7290,6 +7292,7 @@ mod tests {
             };
         }
         config.weight_format = FamilyWeightFormat::GgufNative;
+        config.recurrent_weight_abi = RecurrentWeightAbi::NegativeRateInterleaved;
         config
     }
 
@@ -7385,6 +7388,7 @@ mod tests {
             max_position_embeddings: 128,
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::GgufNative,
+            recurrent_weight_abi: RecurrentWeightAbi::NegativeRateInterleaved,
             weights,
         }
     }
@@ -7512,6 +7516,7 @@ mod tests {
         )
         .unwrap();
         config.weight_format = FamilyWeightFormat::SafetensorsGptqMarlin;
+        config.recurrent_weight_abi = RecurrentWeightAbi::LogRateGrouped;
         config.weights = weights;
         config
     }
@@ -7576,7 +7581,7 @@ mod tests {
     fn builds_aggregate_gptq_moe_expert_stacks_in_numeric_order() {
         let config = test_moe_gptq_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(&config).unwrap())
+            .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
         let schema = prepared.weight_schema();
         assert_eq!(
@@ -7673,7 +7678,7 @@ mod tests {
         let mut config = test_moe_block_fp8_config();
         config.weights.reverse();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(&config).unwrap())
+            .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
         let schema = prepared.weight_schema();
         assert_eq!(
@@ -7814,7 +7819,7 @@ mod tests {
             }
 
             let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-                .prepare(&serde_json::to_value(config).unwrap())
+                .prepare_fixture(&serde_json::to_value(config).unwrap())
                 .expect_err("block-FP8 MoE source drift must fail before allocation");
             let VNextError::InvalidModelConfig { field, reason, .. } = error else {
                 panic!("expected typed invalid-model-config rejection, got {error}")
@@ -7853,7 +7858,7 @@ mod tests {
         assert_eq!(swapped, 2);
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("expert index must remain bound to its checkpoint tensor name");
         assert!(error.to_string().contains("manifest"), "{error}");
     }
@@ -7873,7 +7878,7 @@ mod tests {
         });
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .expect_err("GPTQ MoE must reject multiple routed weight representations");
         assert!(
             error.to_string().contains("mixes canonical per-expert"),
@@ -7887,7 +7892,7 @@ mod tests {
         let descriptor = production_descriptor(&config).unwrap();
         assert_eq!(descriptor.architecture(), "qwen3_5_moe");
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(&config).unwrap())
+            .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
         assert_eq!(
             crate::vnext::moe_capabilities_from_program(&prepared).unwrap(),
@@ -7997,7 +8002,7 @@ mod tests {
                 .unwrap()
                 .is_moe();
             let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-                .prepare(&serde_json::to_value(config).unwrap())
+                .prepare_fixture(&serde_json::to_value(config).unwrap())
                 .unwrap();
             let operation_ids = prepared.program().blocks()[0]
                 .nodes
@@ -8057,10 +8062,139 @@ mod tests {
     }
 
     #[test]
+    fn same_native_quantized_source_prepares_explicit_f16_and_f32_master_graphs() {
+        use ferrum_interfaces::vnext::{NumericalExecutionPolicy, NumericalProfileId};
+        let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
+        let mut config = test_dense_gguf_config();
+        for weight in config
+            .weights
+            .iter_mut()
+            .filter(|weight| weight.role == "mlp_down")
+        {
+            weight.source_encoding =
+                FamilyWeightSourceEncoding::BlockQuantized(BlockQuantizationSpec {
+                    format_id: QuantizationFormatId::new(
+                        block_quantization_format(GgmlDType::Q8_0).unwrap(),
+                    )
+                    .unwrap(),
+                    logical_values_per_block: 32,
+                    bytes_per_block: 34,
+                });
+        }
+        let raw = serde_json::to_value(config).unwrap();
+        let definition = registration.define(&raw).unwrap();
+        let f16_id = NumericalProfileId::new(F16_NUMERICAL_PROFILE_ID).unwrap();
+        let f32_id = NumericalProfileId::new(F32_MASTER_NUMERICAL_PROFILE_ID).unwrap();
+        let f16 = registration.prepare(&definition, &f16_id).unwrap();
+        let f32 = registration.prepare(&definition, &f32_id).unwrap();
+        assert_eq!(f16.weight_schema(), f32.weight_schema());
+        assert_eq!(
+            f16.weight_schema().components,
+            definition.weight_schema().components
+        );
+        assert_eq!(f16.canonical_config(), f32.canonical_config());
+        assert_eq!(f16.config_fingerprint(), f32.config_fingerprint());
+        assert_ne!(
+            f16.program().fingerprint().unwrap(),
+            f32.program().fingerprint().unwrap()
+        );
+        assert_ne!(f16.fingerprint().unwrap(), f32.fingerprint().unwrap());
+        assert_eq!(
+            f16.numerical_profile().activation_type().unwrap(),
+            ElementType::F16
+        );
+        assert_eq!(
+            f32.numerical_profile().activation_type().unwrap(),
+            ElementType::F32
+        );
+        // F32-master retains F16 FFN/KV/conv plus FP32 delta state, as before.
+        assert_eq!(f16.program().states(), f32.program().states());
+        for profile in [f16.numerical_profile(), f32.numerical_profile()] {
+            assert_eq!(
+                profile.boundaries[&value_id("value.layer.0.mlp").unwrap()],
+                ElementType::F16
+            );
+            assert_eq!(
+                profile.boundaries[&value_id("value.output.greedy_token").unwrap()],
+                ElementType::U32
+            );
+        }
+        let catalog = definition.numerical_profiles();
+        assert_eq!(
+            catalog
+                .candidates(&NumericalExecutionPolicy::Auto)
+                .unwrap()
+                .iter()
+                .map(|p| &p.id)
+                .collect::<Vec<_>>(),
+            [&f32_id]
+        );
+        assert_eq!(
+            catalog
+                .candidates(&NumericalExecutionPolicy::Require(f16_id.clone()))
+                .unwrap()[0]
+                .id,
+            f16_id
+        );
+    }
+
+    #[test]
+    fn container_alone_does_not_change_the_numerical_contract() {
+        use ferrum_interfaces::vnext::NumericalExecutionPolicy;
+        let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
+        for abi in [
+            RecurrentWeightAbi::LogRateGrouped,
+            RecurrentWeightAbi::NegativeRateInterleaved,
+        ] {
+            let mut config = test_config();
+            config.recurrent_weight_abi = abi;
+            let safetensors = registration
+                .define(&serde_json::to_value(&config).unwrap())
+                .unwrap();
+            config.weight_format = FamilyWeightFormat::GgufNative;
+            // Each container has its own source names. Keep encoding, shape,
+            // roles and recurrent parameterization identical across adapters.
+            for weight in &mut config.weights {
+                weight.external_name =
+                    ferrum_to_gguf_with_arch("qwen35", &weight.external_name).unwrap();
+            }
+            let gguf = registration
+                .define(&serde_json::to_value(&config).unwrap())
+                .unwrap();
+            assert_ne!(
+                gguf.weight_schema().format_id,
+                safetensors.weight_schema().format_id
+            );
+            assert_eq!(gguf.numerical_profiles(), safetensors.numerical_profiles());
+            for candidate in gguf
+                .numerical_profiles()
+                .candidates(&NumericalExecutionPolicy::Auto)
+                .unwrap()
+            {
+                let first = registration.prepare(&gguf, &candidate.id).unwrap();
+                let second = registration.prepare(&safetensors, &candidate.id).unwrap();
+                // Source-specific packing and normalization bindings remain
+                // distinct; the operation/state precision contracts do not.
+                assert_eq!(first.numerical_profile(), second.numerical_profile());
+                assert_eq!(first.program().states(), second.program().states());
+                let operations = |program: &ModelProgram| {
+                    program
+                        .blocks()
+                        .iter()
+                        .flat_map(|block| &block.nodes)
+                        .map(|node| (node.operation_id.clone(), node.required_version))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(operations(first.program()), operations(second.program()));
+            }
+        }
+    }
+
+    #[test]
     fn dense_gguf_program_uses_the_f32_master_operation_profile() {
         let config = test_dense_gguf_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(config).unwrap())
+            .prepare_fixture(&serde_json::to_value(config).unwrap())
             .unwrap();
         let operation_ids = prepared.program().blocks()[0]
             .nodes
@@ -8117,13 +8251,13 @@ mod tests {
             .unwrap();
             let raw = serde_json::to_value(&config).unwrap();
             let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-                .prepare(&raw)
+                .prepare_fixture(&raw)
                 .unwrap();
             assert_eq!(prepared.metadata().template, config.metadata.template);
             config.metadata.template.source_file = "unregistered.jinja".into();
             assert!(
                 TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-                    .prepare(&serde_json::to_value(&config).unwrap())
+                    .prepare_fixture(&serde_json::to_value(&config).unwrap())
                     .is_err()
             );
         }
@@ -8152,7 +8286,7 @@ mod tests {
         );
         let raw = serde_json::to_value(&config).unwrap();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&raw)
+            .prepare_fixture(&raw)
             .unwrap();
         assert_eq!(
             crate::vnext::moe_capabilities_from_program(&prepared).unwrap(),
@@ -8512,7 +8646,7 @@ mod tests {
             .dimensions
             .swap(0, 1);
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(malformed).unwrap())
+            .prepare_fixture(&serde_json::to_value(malformed).unwrap())
             .expect_err("same-element axis drift must fail before backend allocation");
         assert!(error.to_string().contains("dimensions"), "{error}");
     }
@@ -8524,7 +8658,7 @@ mod tests {
         let raw = serde_json::to_value(config).unwrap();
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&raw)
+            .prepare_fixture(&raw)
             .expect_err("F16 temporal state must fail before provider selection");
 
         assert!(error.to_string().contains("mamba_ssm_dtype"), "{error}");
@@ -8535,7 +8669,7 @@ mod tests {
     fn linear_attention_semantic_inputs_match_the_standard_contract() {
         let config = test_config();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
-            .prepare(&serde_json::to_value(&config).unwrap())
+            .prepare_fixture(&serde_json::to_value(&config).unwrap())
             .unwrap();
         let program = prepared.program();
         let node = program.blocks()[0]
@@ -8793,7 +8927,32 @@ mod tests {
             )
             .unwrap(),
         );
-        let prepared = prepare_from_sources(sources).unwrap();
+        let defined = define_from_sources(sources).unwrap();
+        let policy = ferrum_interfaces::vnext::NumericalExecutionPolicy::Auto;
+        let startup = defined.model_capabilities(&policy).unwrap();
+        let prepared = defined
+            .prepare(&F32_MASTER_NUMERICAL_PROFILE_ID.parse().unwrap())
+            .unwrap();
+        let f16 = defined
+            .prepare(&F16_NUMERICAL_PROFILE_ID.parse().unwrap())
+            .unwrap();
+        assert!(Arc::ptr_eq(prepared.weight_source(), f16.weight_source()));
+        assert!(Arc::ptr_eq(prepared.sources(), f16.sources()));
+        assert_eq!(
+            prepared.family().weight_schema(),
+            f16.family().weight_schema()
+        );
+        assert_eq!(
+            prepared.family().config_fingerprint(),
+            f16.family().config_fingerprint()
+        );
+        assert_ne!(
+            prepared.family().program().fingerprint().unwrap(),
+            f16.family().program().fingerprint().unwrap()
+        );
+        assert_eq!(prepared.descriptor().execution_dtype(), DataType::FP32);
+        assert_eq!(f16.descriptor().execution_dtype(), DataType::FP16);
+        assert_eq!(startup, prepared.model_capabilities().unwrap());
         let schema = prepared.family().weight_schema();
         assert_eq!(schema.format_id.as_str(), "weight-format.gguf.native-block");
         assert!(schema

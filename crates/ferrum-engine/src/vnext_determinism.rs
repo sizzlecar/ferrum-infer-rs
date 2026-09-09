@@ -11,7 +11,7 @@ use ferrum_interfaces::ModelExecutor;
 use ferrum_kernels::backend::cuda::{
     vnext_ops::CudaVNextComposition, vnext_runtime::CudaDeviceRuntime,
 };
-use ferrum_models::vnext::PreparedProductionModel;
+use ferrum_models::vnext::DefinedProductionModel;
 use ferrum_models::{VNextDeterminismExecutionSpec, VNextExecutorConfig, VNextModelExecutor};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result};
 
@@ -32,6 +32,10 @@ impl CudaVNextDeterminismCollector {
         self.executor.resolved_plan()
     }
 
+    pub fn model_info(&self) -> &ferrum_types::ModelInfo {
+        self.executor.info()
+    }
+
     pub fn capability_catalog(&self) -> &CapabilityCatalog {
         self.executor.capability_catalog()
     }
@@ -46,34 +50,27 @@ impl CudaVNextDeterminismCollector {
 
 pub fn create_cuda_vnext_determinism_collector(
     engine: &EngineConfig,
-    prepared: &PreparedProductionModel,
+    defined: &DefinedProductionModel,
     ordinal: usize,
 ) -> Result<CudaVNextDeterminismCollector> {
-    let device = Device::CUDA(ordinal);
-    let model_info = prepared.model_info(engine.model.model_id.clone(), device);
     let device_id = DeviceId::new(format!("device.cuda.{ordinal}"))
         .map_err(|error| FerrumError::device(error.to_string()))?;
     let composition = CudaVNextComposition::create(
         ordinal,
         device_id,
         engine.runtime.attention_execution_policy,
-        prepared.family(),
     )
     .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
-    let (runtime, operation_registry, weight_materializers, weight_materializer_selection, catalog) =
-        composition.into_parts();
-    let executor_config =
-        VNextExecutorConfig::for_determinism_collection(engine, &model_info, runtime.as_ref())?;
-    let executor = crate::product_composition::create_vnext_executor_with_config(
+    let (runtime, operation_registry, weight_materializers, catalog) = composition.into_parts();
+    let executor = crate::product_composition::create_vnext_executor_with_configuration(
         engine,
-        prepared,
-        model_info,
-        executor_config,
+        defined,
         runtime,
         operation_registry,
         weight_materializers,
-        weight_materializer_selection,
         catalog,
+        ferrum_kernels::backend::cuda::vnext_ops::cuda_weight_materializer_selection,
+        |info, runtime| VNextExecutorConfig::for_determinism_collection(engine, info, runtime),
     )?;
     Ok(CudaVNextDeterminismCollector::new(executor))
 }

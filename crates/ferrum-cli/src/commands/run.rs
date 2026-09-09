@@ -755,6 +755,10 @@ pub struct RunCommand {
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
+    /// Numerical execution profile: auto or an exact family profile ID.
+    #[arg(long, value_name = "PROFILE")]
+    pub numerical_profile: Option<ferrum_types::NumericalExecutionPolicy>,
+
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
     #[arg(long, value_name = "IDS")]
@@ -1075,18 +1079,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    engine_config.numerical_execution =
+        config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
     let model_sources = product_input.model_sources;
-    let prepared_model = model_sources
-        .as_ref()
-        .map(crate::source_resolver::prepare_registered_product_model)
-        .transpose()?
-        .flatten();
-    let model_definition_for_config = if prepared_model.is_none() {
+    let defined_model = crate::source_resolver::define_registered_product_model(
+        model_sources.as_ref(),
+        &engine_config.numerical_execution,
+    )?;
+    let model_definition_for_config = if defined_model.is_none() {
         load_run_model_definition(&source, model_sources.as_deref()).await?
     } else {
         None
     };
-    let model_layer_count = prepared_model
+    let model_layer_count = defined_model
         .as_ref()
         .map(|prepared| prepared.descriptor().layer_count())
         .or_else(|| {
@@ -1104,8 +1109,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
         }
     }
-    let model_chat_template = match prepared_model.as_deref() {
-        Some(prepared) => Some(crate::source_resolver::load_prepared_product_chat_template(
+    let model_chat_template = match defined_model.as_deref() {
+        Some(prepared) => Some(crate::source_resolver::load_defined_product_chat_template(
             prepared,
         )?),
         None => match model_sources.as_deref() {
@@ -1113,10 +1118,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             None => crate::source_resolver::load_model_chat_template(&source.local_path),
         },
     };
-    let product_source_identity = prepared_model
+    let product_source_identity = defined_model
         .as_deref()
         .map(|prepared| {
-            crate::source_resolver::prepared_product_source_identity(
+            crate::source_resolver::defined_product_source_identity(
                 prepared,
                 &requested_model,
                 &model_id,
@@ -1149,7 +1154,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let load_start = std::time::Instant::now();
     engine_config.sampling.default_params = build_sampling_params(&cmd);
-    if let Some(prepared) = prepared_model.as_deref() {
+    if let Some(prepared) = defined_model.as_deref() {
         engine_config.sampling.default_params.model_output_protocol =
             prepared.descriptor().output_protocol();
     }
@@ -1175,14 +1180,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     )?;
     let effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
-    let typed_model_capabilities = prepared_model
+    let typed_model_capabilities = defined_model
         .as_ref()
-        .map(|prepared| prepared.model_capabilities())
+        .map(|defined| defined.model_capabilities(&engine_config.numerical_execution))
         .transpose()?;
     let startup_auto_config = run_startup_auto_config(
         &device,
         typed_model_capabilities,
-        if prepared_model.is_some() {
+        if defined_model.is_some() {
             ferrum_types::ExecutionResourceAuthority::PlanRuntime
         } else {
             ferrum_types::ExecutionResourceAuthority::LegacyEngine
@@ -1199,6 +1204,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     crate::commands::serve::write_startup_config_artifacts(
         &startup_auto_config,
         product_source_identity.as_ref(),
+        &engine_config.numerical_execution,
         cmd.effective_config_json.as_deref(),
         cmd.decision_trace_jsonl.as_deref(),
     )?;
@@ -1230,9 +1236,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = match (prepared_model, model_sources) {
+    let engine = match (defined_model, model_sources) {
         (Some(prepared), _) => {
-            ferrum_engine::create_prepared_product_engine(engine_config, prepared).await?
+            ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
         }
         (None, Some(sources)) => {
             ferrum_engine::create_product_engine(engine_config, sources).await?
@@ -2891,6 +2897,7 @@ mod tests {
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
+            numerical_profile: None,
             gpu_devices: None,
             layer_split_pipeline_mode: None,
             prompt: None,

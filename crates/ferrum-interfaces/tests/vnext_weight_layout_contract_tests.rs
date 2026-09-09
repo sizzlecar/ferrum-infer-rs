@@ -1033,13 +1033,13 @@ fn weight_schema_order_is_normalized_before_fingerprinting() {
         reverse: false,
         reverse_sources: false,
     })
-    .prepare(&json!({"width": 4}))
+    .prepare_fixture(&json!({"width": 4}))
     .unwrap();
     let reversed = TypedFamilyRegistration::new(OrderedSchemaFamily {
         reverse: true,
         reverse_sources: false,
     })
-    .prepare(&json!({"width": 4}))
+    .prepare_fixture(&json!({"width": 4}))
     .unwrap();
     assert_eq!(canonical.weight_schema(), reversed.weight_schema());
     assert_eq!(
@@ -1065,7 +1065,7 @@ fn weight_schema_order_is_normalized_before_fingerprinting() {
         reverse: false,
         reverse_sources: true,
     })
-    .prepare(&json!({"width": 4}))
+    .prepare_fixture(&json!({"width": 4}))
     .unwrap();
     assert_ne!(canonical.weight_schema(), source_reversed.weight_schema());
     assert_ne!(
@@ -1292,7 +1292,7 @@ fn physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_
         .is_err());
     assert!(
         TypedFamilyRegistration::new(FixedSchemaFamily { schema: too_deep })
-            .prepare(&json!({"width": 4}))
+            .prepare_fixture(&json!({"width": 4}))
             .is_err()
     );
 

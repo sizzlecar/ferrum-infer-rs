@@ -1,10 +1,12 @@
 use ferrum_interfaces::vnext::*;
+mod vnext_numerical_fixture;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use vnext_numerical_fixture::*;
 
 fn id<T>(value: impl Into<String>) -> T
 where
@@ -134,7 +136,23 @@ impl ModelFamilyProvider for TestFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.output"],
+            &["operation.model-wire-test"],
+            vec![fixture_byte_state(config.width)],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
@@ -208,7 +226,7 @@ impl TestRegistry {
 
     fn prepare(&self) -> PreparedModelFamily {
         self.registration
-            .prepare(&json!({
+            .prepare_fixture(&json!({
                 "model_type": "metadata.model-wire-test",
                 "width": 4
             }))
@@ -338,7 +356,18 @@ impl ModelFamilyProvider for DuplicateExternalFamily {
         unreachable!("identity-only adversarial registration")
     }
 
-    fn semantic_program(&self, _config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        _config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        unreachable!("identity-only adversarial registration")
+    }
+
+    fn semantic_program(
+        &self,
+        _config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         unreachable!("identity-only adversarial registration")
     }
 
@@ -396,7 +425,18 @@ impl ModelFamilyProvider for ChangingFamily {
         unreachable!("changed raw input must fail before schema construction")
     }
 
-    fn semantic_program(&self, _config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        _config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        unreachable!("changed raw input must fail before numerical profile construction")
+    }
+
+    fn semantic_program(
+        &self,
+        _config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         unreachable!("changed raw input must fail before program construction")
     }
 
@@ -512,14 +552,33 @@ impl ModelFamilyProvider for OneShotFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
-        TestFamily.semantic_program(&TestConfig {
-            model_type: config.model_type.clone(),
-            width: config.width,
-            block_size: default_block_size(),
-            quantization_config: None,
-            weight_layout: None,
-        })
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.output"],
+            &["operation.model-wire-test"],
+            vec![fixture_byte_state(config.width)],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        TestFamily.semantic_program(
+            &TestConfig {
+                model_type: config.model_type.clone(),
+                width: config.width,
+                block_size: default_block_size(),
+                quantization_config: None,
+                weight_layout: None,
+            },
+            profile,
+        )
     }
 
     fn semantic_metadata(
@@ -585,8 +644,19 @@ impl ModelFamilyProvider for AliasedFamily {
         TestFamily.weight_schema(config)
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
-        TestFamily.semantic_program(config)
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        TestFamily.numerical_profiles(config)
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
+        TestFamily.semantic_program(config, profile)
     }
 
     fn semantic_metadata(
@@ -645,7 +715,7 @@ impl ModelFamilyRegistry for DuplicateRegistry {
 fn typed_family_config_and_registry_identity_fail_closed() {
     let registration = TypedFamilyRegistration::new(TestFamily);
     let defaulted = registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4
         }))
@@ -653,7 +723,7 @@ fn typed_family_config_and_registry_identity_fail_closed() {
     assert_eq!(defaulted.canonical_config()["block_size"], json!(128));
 
     let explicit = registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "block_size": 64
@@ -661,32 +731,32 @@ fn typed_family_config_and_registry_identity_fail_closed() {
         .unwrap();
     assert_eq!(explicit.canonical_config()["block_size"], json!(64));
 
-    assert!(registration.prepare(&json!({"width": 4})).is_err());
+    assert!(registration.prepare_fixture(&json!({"width": 4})).is_err());
     assert!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.some-other-family",
             "width": 4
         }))
         .is_err());
     assert!(TypedFamilyRegistration::new(ChangingFamily)
-        .prepare(&json!({"value": 1}))
+        .prepare_fixture(&json!({"value": 1}))
         .is_err());
     assert!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "caller_override": true
         }))
         .is_err());
     assert!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "quantization_config": {"method": "int4", "caller_override": true}
         }))
         .is_err());
     assert!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "weight_layout": {"kind": "dense", "caller_override": true}
@@ -726,7 +796,7 @@ fn typed_config_is_serialized_once_and_signed_external_identity_is_replayed() {
     let prepared = TypedFamilyRegistration::new(OneShotFamily {
         serialize_calls: Arc::clone(&serialize_calls),
     })
-    .prepare(&json!({
+    .prepare_fixture(&json!({
         "model_type": "metadata.model-wire-test",
         "width": 4
     }))
@@ -737,7 +807,7 @@ fn typed_config_is_serialized_once_and_signed_external_identity_is_replayed() {
     let registry = AliasedRegistry::new();
     let prepared = registry
         .registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4
         }))
@@ -882,35 +952,35 @@ fn prepared_model_family_wire_proof_line() {
 
     let registration = TypedFamilyRegistration::new(TestFamily);
     let defaulted = registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4
         }))
         .unwrap();
     check!(defaulted.canonical_config()["block_size"] == json!(128));
-    check!(registration.prepare(&json!({"width": 4})).is_err());
+    check!(registration.prepare_fixture(&json!({"width": 4})).is_err());
     check!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.some-other-family",
             "width": 4
         }))
         .is_err());
     check!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "caller_override": true
         }))
         .is_err());
     check!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "quantization_config": {"method": "int4", "caller_override": true}
         }))
         .is_err());
     check!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "weight_layout": {"kind": "dense", "caller_override": true}
@@ -933,21 +1003,21 @@ fn prepared_model_family_wire_proof_line() {
         Err(VNextError::AmbiguousModelFamilyRegistration { .. })
     ));
     check!(registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4,
             "block_size": 64
         }))
         .is_ok());
     check!(TypedFamilyRegistration::new(ChangingFamily)
-        .prepare(&json!({"value": 1}))
+        .prepare_fixture(&json!({"value": 1}))
         .is_err());
 
     let serialize_calls = Arc::new(AtomicUsize::new(0));
     let one_shot = TypedFamilyRegistration::new(OneShotFamily {
         serialize_calls: Arc::clone(&serialize_calls),
     })
-    .prepare(&json!({
+    .prepare_fixture(&json!({
         "model_type": "metadata.model-wire-test",
         "width": 4
     }))
@@ -960,7 +1030,7 @@ fn prepared_model_family_wire_proof_line() {
     let aliased_registry = AliasedRegistry::new();
     let aliased = aliased_registry
         .registration
-        .prepare(&json!({
+        .prepare_fixture(&json!({
             "model_type": "metadata.model-wire-test",
             "width": 4
         }))
