@@ -123,6 +123,7 @@ fn select(
             ));
         }
         verify_model_options(&task,&json!({"profile_id":task.profile.id,"model":task.profile.model,"backend":backend.name(),
+            "gguf_file":task.profile.gguf.as_ref().map(|gguf|&gguf.filename),
             "stop_prompt":task.stop_prompt,"checks":task.checks,"max_tokens":task.max_tokens,
             "context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),
             "max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),
@@ -163,6 +164,9 @@ fn runner_arguments(
         "--stop-prompt".into(),
         task.stop_prompt.clone().into(),
     ];
+    if let Some(gguf) = &task.profile.gguf {
+        words.extend(["--gguf-file".into(), gguf.filename.clone().into()]);
+    }
     if let Some(capacity) = &task.runtime_capacity {
         words.extend([
             "--context-tokens".into(),

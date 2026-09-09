@@ -190,6 +190,9 @@ pub(super) fn run_backend(value: &Value) -> Option<Backend> {
 
 fn expected_errors(expected: &ExpectedModelRun) -> Vec<String> {
     let mut errors = Vec::new();
+    if let Err(error) = super::model_sources::validate_profile_sources(&expected.profile) {
+        errors.push(error);
+    }
     for (field, value) in [
         ("profile.id", expected.profile.id.as_str()),
         ("profile.model", expected.profile.model.as_str()),
@@ -270,6 +273,12 @@ pub fn verify_model_options(
     options: &Value,
 ) -> Result<(), Vec<String>> {
     let mut errors = expected_errors(expected);
+    require(
+        &mut errors,
+        options["gguf_file"]
+            == serde_json::json!(expected.profile.gguf.as_ref().map(|gguf| &gguf.filename)),
+        "options.gguf_file differs from the expected task",
+    );
     for (field, value) in [
         ("profile_id", expected.profile.id.as_str()),
         ("model", expected.profile.model.as_str()),
@@ -460,8 +469,8 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
     }
     for name in ["run-basic", "serve-startup"] {
         if let Some(case) = recorded.get(name) {
-            if let Err(error) = super::model_sources::verify_pinned_source(
-                &expected.profile.model,
+            if let Err(error) = super::model_sources::verify_profile_source(
+                &expected.profile,
                 &case["evidence"]["source_identity"],
             ) {
                 errors.push(format!("{name}: {error}"));

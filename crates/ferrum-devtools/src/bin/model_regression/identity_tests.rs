@@ -59,6 +59,60 @@ fn pinned_source_capture_requires_the_same_process_configuration() {
 }
 
 #[test]
+fn selected_gguf_is_forwarded_to_both_entrypoints() {
+    let mut selected = args("cuda");
+    selected.model = format!("quantizer/model@{}", "a".repeat(40));
+    selected.gguf_file = Some("weights/model.gguf".into());
+    for entrypoint in ["run", "serve"] {
+        assert!(selected
+            .common_args(entrypoint)
+            .windows(2)
+            .any(|args| args == ["--gguf-file", "weights/model.gguf"]));
+        assert!(!args("cuda")
+            .common_args(entrypoint)
+            .iter()
+            .any(|arg| arg == "--gguf-file"));
+    }
+}
+
+#[test]
+fn every_gguf_child_config_must_match_retained_task_metadata_expectations() {
+    let mut selected = args("cuda");
+    selected.model = format!("quantizer/model@{}", "a".repeat(40));
+    selected.gguf_file = Some("model.gguf".into());
+    selected.source_expectation = Some(ferrum_bench_core::release_regression::GgufSourceProfile {
+        filename: "model.gguf".into(),
+        semantic_source: format!("author/model@{}", "b".repeat(40)),
+        tokenizer_source: None,
+    });
+    let mut identity = json!({"schema_version":1,"requested_model":selected.model,"resolved_model":"quantizer/model",
+        "original_sources":{},"resolved_sources":{}});
+    for (role, repo, revision, file) in [
+        ("weights", "quantizer/model", "a".repeat(40), "model.gguf"),
+        ("semantic", "author/model", "b".repeat(40), "config.json"),
+        (
+            "tokenizer",
+            "author/model",
+            "b".repeat(40),
+            "tokenizer.json",
+        ),
+    ] {
+        identity["original_sources"][role] = json!({"kind":"repository","location":repo,
+            "requested_revision":if role=="weights"{Some(&revision)}else{None}});
+        identity["resolved_sources"][role] = json!({"canonical_location":repo,"resolved_revision":revision,
+            "files":[{"relative_path":file,"size_bytes":16,"sha256":"c".repeat(64)}]});
+    }
+    validate_source_config(&selected, &json!({"resolution_evidence":identity})).unwrap();
+    for role in ["semantic", "tokenizer"] {
+        let mut changed = identity.clone();
+        changed["resolved_sources"][role]["resolved_revision"] = json!("d".repeat(40));
+        assert!(
+            validate_source_config(&selected, &json!({"resolution_evidence":changed})).is_err()
+        );
+    }
+}
+
+#[test]
 fn actual_run_and_serve_backend_representations_match_requested_backend() {
     for (expected, run_backend, serve_backend) in [
         ("cpu", "CPU", "cpu"),

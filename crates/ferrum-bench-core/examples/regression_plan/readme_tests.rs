@@ -27,6 +27,7 @@ fn input(impact: Impact) -> PlanInput {
         stage: Stage::Release,
         impact,
         profiles: vec![ModelProfile {
+            gguf: None,
             reasoning_protocol: ModelReasoningProtocol::PromptOpened,
             id: "quick-start".into(),
             model: "fixture/dense".into(),

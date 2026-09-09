@@ -288,13 +288,8 @@ impl ProductionModelSourceBundle {
             .iter()
             .filter(|file| {
                 file.relative_path.ends_with(".safetensors")
+                    // A GGUF artifact contributes exactly its one selected file.
                     || self.weights.is_gguf()
-                        && self
-                            .weights
-                            .path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            == Some(file.relative_path.as_str())
             })
             .try_fold(0_u64, |total, file| {
                 total.checked_add(file.size_bytes).ok_or_else(|| {
@@ -414,16 +409,26 @@ fn fingerprint_weight_artifact(
 ) -> Result<Vec<FileFingerprint>> {
     match artifact {
         ProductionWeightArtifact::GgufFile(path) => {
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| FerrumError::model("GGUF source file name is not UTF-8"))?;
-            fingerprint_file(
-                path.parent()
-                    .ok_or_else(|| FerrumError::model("GGUF source has no parent"))?,
-                file_name,
-            )
-            .map(|file| vec![file])
+            let parent = path
+                .parent()
+                .ok_or_else(|| FerrumError::model("GGUF source has no parent"))?;
+            // Repository evidence must distinguish subdirectories containing
+            // the same basename. Preserve the snapshot path before LFS resolution.
+            let root = if huggingface_snapshot_identity(path).is_some() {
+                path.ancestors()
+                    .find(|root| huggingface_snapshot_root_identity(root).is_some())
+                    .unwrap_or(parent)
+            } else {
+                parent
+            };
+            let relative = path.strip_prefix(root).map_err(|error| {
+                FerrumError::model(format!("GGUF artifact is outside its source root: {error}"))
+            })?;
+            let name = relative
+                .to_str()
+                .ok_or_else(|| FerrumError::model("GGUF source file name is not UTF-8"))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            fingerprint_file(root, &name).map(|file| vec![file])
         }
         ProductionWeightArtifact::SafetensorsDirectory(root) => {
             let mut relative_paths = std::fs::read_dir(root)

@@ -406,6 +406,9 @@ pub(super) fn runner_command(
         "--stop-prompt".into(),
         task.stop_prompt.clone(),
     ];
+    if let Some(gguf) = &task.profile.gguf {
+        words.extend(["--gguf-file".into(), gguf.filename.clone()]);
+    }
     if let Some(capacity) = &task.runtime_capacity {
         words.extend([
             "--context-tokens".into(),

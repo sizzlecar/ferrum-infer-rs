@@ -237,6 +237,7 @@ fn expected() -> ExpectedPerformanceRun {
     ExpectedPerformanceRun {
         schema_version: 1,
         profile: ModelProfile {
+            gguf: None,
             id: "declared-profile".into(),
             model: "fixture:model".into(),
             available: true,

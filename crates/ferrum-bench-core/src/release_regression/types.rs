@@ -154,9 +154,23 @@ pub struct ModelProfile {
     pub reasoning_protocol: ModelReasoningProtocol,
     pub id: String,
     pub model: String,
+    /// Exact GGUF artifact and independently pinned metadata expected from the product.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gguf: Option<GgufSourceProfile>,
     pub target: ExecutionTarget,
     pub available: bool,
     pub estimate: Option<CostEstimate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GgufSourceProfile {
+    pub filename: String,
+    /// owner/repository@40-hex-commit; checked against observed resolution.
+    pub semantic_source: String,
+    /// Defaults to semantic_source when both metadata roles share a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

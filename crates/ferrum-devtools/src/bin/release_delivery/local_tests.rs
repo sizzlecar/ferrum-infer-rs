@@ -9,6 +9,7 @@ use ferrum_types::ModelOutputProtocol;
 fn task(backend: Backend, id: &str) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            gguf: None,
             reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: id.into(),
             model: "org/model".into(),
@@ -121,7 +122,12 @@ fn local_selection_retains_other_backends_and_rejects_unsupported_tasks() {
 fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     let directory = tempfile::tempdir().unwrap();
     let input = args(directory.path());
-    let expected = task(Backend::Metal, "metal");
+    let mut expected = task(Backend::Metal, "metal");
+    expected.profile.gguf = Some(ferrum_bench_core::release_regression::GgufSourceProfile {
+        filename: "weights/model.gguf".into(),
+        semantic_source: format!("author/model@{}", "a".repeat(40)),
+        tokenizer_source: None,
+    });
     let words = runner_arguments(
         &input,
         &expected,
@@ -136,6 +142,7 @@ fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     };
     assert_eq!(after("--backend"), Some("metal"));
     assert_eq!(after("--model"), Some(expected.profile.model.as_str()));
+    assert_eq!(after("--gguf-file"), Some("weights/model.gguf"));
     assert_eq!(after("--stop-prompt"), Some(expected.stop_prompt.as_str()));
     assert_eq!(after("--checks"), Some("basic,tools"));
     assert_eq!(after("--max-tokens"), Some("512"));

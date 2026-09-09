@@ -13,6 +13,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
     let profiles: Vec<_> = [Backend::Metal, Backend::Cuda]
         .into_iter()
         .map(|backend| ModelProfile {
+            gguf: None,
             reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: format!("quick-{backend:?}"),
             model: format!("public-{backend:?}:small"),

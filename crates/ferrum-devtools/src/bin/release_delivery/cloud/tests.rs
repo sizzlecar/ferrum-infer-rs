@@ -31,6 +31,7 @@ pub(crate) fn args() -> ExecuteArgs {
 fn task(backend: Backend, id: &str) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            gguf: None,
             reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: id.into(),
             model: "org/model".into(),
@@ -147,7 +148,15 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
         context_tokens: 2048,
         max_num_seqs: 1,
     });
+    task.profile.gguf = Some(ferrum_bench_core::release_regression::GgufSourceProfile {
+        filename: "weights/model.gguf".into(),
+        semantic_source: format!("author/model@{}", "a".repeat(40)),
+        tokenizer_source: None,
+    });
     let words = ssh::runner_command(&task, "/workspace/release", "task", "report", 1800);
+    assert!(words
+        .windows(2)
+        .any(|pair| pair == ["--gguf-file", "weights/model.gguf"]));
     for (flag, value) in [("--context-tokens", "2048"), ("--max-num-seqs", "1")] {
         assert!(words
             .windows(2)
