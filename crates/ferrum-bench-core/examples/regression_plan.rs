@@ -641,6 +641,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         // A branch with the same short name must not change the verified base.
         repo.git(&["branch", "v1.2.3", &candidate]);
         let profile = ModelProfile {
+            gguf: None,
             id: "quick-start".into(),
             model: "fixture".into(),
             target: ExecutionTarget {
@@ -814,6 +815,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
             rationale: "Reviewed the installation description.".into(),
         };
         let profile = ModelProfile {
+            gguf: None,
             id: "quick-start".into(),
             model: "fixture".into(),
             target: ExecutionTarget {

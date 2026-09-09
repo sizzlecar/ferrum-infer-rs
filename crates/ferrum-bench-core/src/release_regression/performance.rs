@@ -328,6 +328,7 @@ mod tests {
     use super::*;
     fn profile() -> ModelProfile {
         ModelProfile {
+            gguf: None,
             reasoning_protocol: ferrum_types::ModelReasoningProtocol::None,
             id: "declared-dense".into(),
             model: "fixture:gguf-q4".into(),

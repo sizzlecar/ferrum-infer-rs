@@ -33,6 +33,13 @@ struct Args {
     /// Release alias, Hugging Face repository, local directory, or GGUF file.
     #[arg(long)]
     model: String,
+    /// Exact GGUF artifact; --model must name an immutable HF repository revision.
+    #[arg(long)]
+    gguf_file: Option<String>,
+    /// Retained from the prepared task once, then applied to every child process.
+    #[arg(skip)]
+    #[serde(skip)]
+    source_expectation: Option<ferrum_bench_core::release_regression::GgufSourceProfile>,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
     /// Link this execution to a prepared model task. Its configuration is checked before loading.
@@ -94,6 +101,9 @@ impl Args {
 
     fn common_args(&self, entrypoint: &str) -> Vec<String> {
         let mut args = vec![entrypoint.into(), self.model.clone()];
+        if let Some(filename) = &self.gguf_file {
+            args.extend(["--gguf-file".into(), filename.clone()]);
+        }
         if !self.use_default_backend {
             args.extend(["--backend".into(), self.backend.clone()]);
         }
@@ -234,6 +244,7 @@ async fn main() -> Result<()> {
         })
         .transpose()?;
     if let Some(expected) = &expected {
+        args.source_expectation = expected.profile.gguf.clone();
         if args.profile_id.is_none() {
             args.profile_id = Some(expected.profile.id.clone());
         }
@@ -244,6 +255,13 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)?;
     }
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
+    if let Some(filename) = &args.gguf_file {
+        ferrum_bench_core::release_regression::model_sources::validate_gguf_selection(
+            &args.model,
+            filename,
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
     ensure!(
         !args.stop_prompt.trim().is_empty(),
         "--stop-prompt must not be empty"

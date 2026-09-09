@@ -4,6 +4,21 @@ use crate::{devices::*, ids::ModelId, FerrumError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Portable repository-relative path shared by GGUF selection and its evidence.
+pub fn validate_gguf_filename(path: &str) -> Result<()> {
+    let valid = path.to_ascii_lowercase().ends_with(".gguf")
+        && !path.chars().any(|c| {
+            c.is_control() || matches!(c, '\\' | '%' | '?' | '#' | ':' | '*' | '<' | '>' | '|')
+        })
+        && path
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | "..") && !part.ends_with([' ', '.']));
+    if !valid {
+        return Err(FerrumError::config("--gguf-file must be a portable repository-relative .gguf path without URL metacharacters"));
+    }
+    Ok(())
+}
+
 /// Model type enumeration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelType {

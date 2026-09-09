@@ -18,6 +18,7 @@ fn target(
 
 fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
     ModelProfile {
+        gguf: None,
         reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
         id: id.into(),
         model: format!("fixture/{id}"),

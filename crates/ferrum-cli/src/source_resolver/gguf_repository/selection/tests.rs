@@ -74,6 +74,14 @@ async fn explicit_filename_selects_one_cached_quantization_and_respects_revision
         assert_eq!(sources.tokenizer_root(), semantic.canonicalize().unwrap());
         assert_eq!(sources.original_sources().weights.location, repo);
         assert_eq!(
+            sources.resolved_sources().weights.files[0].relative_path,
+            filename
+        );
+        assert_eq!(
+            sources.weight_payload_bytes().unwrap(),
+            std::fs::metadata(&expected).unwrap().len()
+        );
+        assert_eq!(
             sources
                 .original_sources()
                 .weights

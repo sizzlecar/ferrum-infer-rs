@@ -6,6 +6,7 @@ use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
 use sha2::{Digest, Sha256};
 fn profile() -> ModelProfile {
     ModelProfile {
+        gguf: None,
         id: "legacy-metal".into(),
         model: "llama3.1:8b-q4_k_m".into(),
         target: ExecutionTarget {

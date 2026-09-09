@@ -188,6 +188,7 @@ fn cuda_tasks(
             );
         }
         verify_model_options(&task,&json!({"profile_id":task.profile.id,"model":task.profile.model,"backend":"cuda",
+            "gguf_file":task.profile.gguf.as_ref().map(|gguf|&gguf.filename),
             "stop_prompt":task.stop_prompt,"disable_thinking":task.disable_thinking,"use_default_backend":task.use_default_backend,
             "context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),
             "max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),

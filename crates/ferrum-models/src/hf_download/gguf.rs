@@ -1,19 +1,6 @@
 use super::{selection, FerrumError, HfFileInfo, Result};
 
-/// Validate the same portable relative GGUF path for cache and remote access.
-pub fn validate_gguf_filename(path: &str) -> Result<()> {
-    let valid = path.to_ascii_lowercase().ends_with(".gguf")
-        && !path.chars().any(|c| {
-            c.is_control() || matches!(c, '\\' | '%' | '?' | '#' | ':' | '*' | '<' | '>' | '|')
-        })
-        && path
-            .split('/')
-            .all(|part| !matches!(part, "" | "." | "..") && !part.ends_with([' ', '.']));
-    if !valid {
-        return Err(FerrumError::config("--gguf-file must be a portable repository-relative .gguf path without URL metacharacters"));
-    }
-    Ok(())
-}
+pub use ferrum_types::validate_gguf_filename;
 
 pub(super) fn selected_file<'a>(files: &'a [HfFileInfo], filename: &str) -> Result<&'a HfFileInfo> {
     let mut selected = files.iter().filter(|file| {

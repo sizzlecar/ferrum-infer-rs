@@ -203,6 +203,26 @@ metadata or the GGUF's declared source repository. `run` and `serve` also accept
 A bare repository reuses one unambiguous cached GGUF; without a cached selection,
 choose an exact file instead of downloading every quantization.
 
+The model runner also forwards `--gguf-file FILE` to both entrypoints and requires
+an immutable `--model` pin with this option. A prepared `ModelProfile` can declare
+the selected artifact and separate metadata expectations:
+
+```json
+"gguf": {
+  "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+  "semantic_source": "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+}
+```
+
+An optional `tokenizer_source` is another pinned repository; when omitted it uses
+the semantic expectation. Local and cloud task runners forward the filename and
+reject unpinned expectations before executing tasks. The report verifier checks
+the actual weight file, all three repository revisions, and their observed file
+fingerprints from `run` and `serve`. Metadata expectations assert what the product
+resolved; they do not override source selection. If upstream metadata changes,
+the task fails. A standalone probe without a prepared profile records and validates
+metadata identities but does not claim that their revisions were fixed in advance.
+
 A stop probe derives an internal boundary from actual reasoning or final text.
 Baseline and replay keep the same prompt, mode and budget; checks require the
 exact nonempty prefix, no stop leakage and fewer generated tokens. If the default

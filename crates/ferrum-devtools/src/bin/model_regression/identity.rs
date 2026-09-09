@@ -3,7 +3,7 @@
 use super::Args;
 use anyhow::{ensure, Context, Result};
 use ferrum_bench_core::release_regression::model_sources::{
-    pinned_hf_source, verify_pinned_source,
+    pinned_hf_source, verify_pinned_gguf_source, verify_pinned_source,
 };
 use serde_json::Value;
 
@@ -14,6 +14,15 @@ pub(super) fn requires_source_evidence(args: &Args) -> Result<bool> {
 }
 
 pub(super) fn validate_source_config(args: &Args, config: &Value) -> Result<()> {
+    if let Some(filename) = &args.gguf_file {
+        return verify_pinned_gguf_source(
+            &args.model,
+            filename,
+            args.source_expectation.as_ref(),
+            &config["resolution_evidence"],
+        )
+        .map_err(anyhow::Error::msg);
+    }
     verify_pinned_source(&args.model, &config["resolution_evidence"]).map_err(anyhow::Error::msg)
 }
 

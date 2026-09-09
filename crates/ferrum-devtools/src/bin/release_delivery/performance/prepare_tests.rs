@@ -8,6 +8,7 @@ use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
 
 fn profile() -> ModelProfile {
     ModelProfile {
+        gguf: None,
         id: "legacy-metal".into(),
         model: "fixture:gguf".into(),
         reasoning_protocol: ModelReasoningProtocol::None,

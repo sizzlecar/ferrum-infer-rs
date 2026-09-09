@@ -6,6 +6,7 @@ use serde_json::json;
 fn task(id: &str, backend: Backend, checks: Vec<ModelCheck>) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            gguf: None,
             reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: id.into(),
             model: format!("fixture/{id}"),
@@ -170,6 +171,7 @@ impl ReportFixture {
                 "target": expected.profile.target, "binary_sha256": expected.binary_sha256,
                 "options": {
                     "profile_id": expected.profile.id, "model": expected.profile.model,
+                    "gguf_file": expected.profile.gguf.as_ref().map(|gguf|&gguf.filename),
                     "backend": backend_name(expected.profile.target.backend), "checks": expected.checks,
                     "disable_thinking": expected.disable_thinking, "use_default_backend": expected.use_default_backend,
                     "max_tokens": expected.max_tokens, "reasoning_alias_replay": expected.reasoning_alias_replay,
@@ -362,6 +364,62 @@ fn checks_have_strict_round_trip_names() {
     }
     for text in ["", "Basic", " basic", "serve-basic", "all"] {
         assert!(text.parse::<ModelCheck>().is_err());
+    }
+}
+
+#[test]
+fn gguf_task_binds_selected_file_and_each_observed_metadata_revision() {
+    let mut expected = task("gguf", Backend::Metal, vec![ModelCheck::Basic]);
+    expected.profile.model = format!("quantizer/model@{}", "a".repeat(40));
+    expected.profile.gguf = Some(super::super::GgufSourceProfile {
+        filename: "weights/model.gguf".into(),
+        semantic_source: format!("author/model@{}", "b".repeat(40)),
+        tokenizer_source: None,
+    });
+    let mut identity = json!({"schema_version":1,"requested_model":expected.profile.model,
+        "resolved_model":"quantizer/model","original_sources":{},"resolved_sources":{}});
+    for (role, repo, revision, file) in [
+        (
+            "weights",
+            "quantizer/model",
+            "a".repeat(40),
+            "weights/model.gguf",
+        ),
+        ("semantic", "author/model", "b".repeat(40), "config.json"),
+        (
+            "tokenizer",
+            "author/model",
+            "b".repeat(40),
+            "tokenizer.json",
+        ),
+    ] {
+        identity["original_sources"][role] = json!({"kind":"repository","location":repo,
+            "requested_revision":if role=="weights"{Some(&revision)}else{None}});
+        identity["resolved_sources"][role] = json!({"canonical_location":repo,"resolved_revision":revision,
+            "files":[{"relative_path":file,"size_bytes":16,"sha256":"c".repeat(64)}]});
+    }
+    let mut valid = ReportFixture::passed(&expected);
+    for name in ["run-basic", "serve-startup"] {
+        valid.case_mut(name)["evidence"]["source_identity"] = identity.clone();
+    }
+    verify_model_report(&expected, &valid.value).unwrap();
+    for name in ["run-basic", "serve-startup"] {
+        for role in ["weights", "semantic", "tokenizer"] {
+            let mut changed = ReportFixture {
+                value: valid.value.clone(),
+            };
+            changed.case_mut(name)["evidence"]["source_identity"]["resolved_sources"][role]
+                ["resolved_revision"] = json!("d".repeat(40));
+            rejected(&expected, &changed, "immutable revision");
+        }
+    }
+    let mut wrong_file = valid.value["options"].clone();
+    wrong_file["gguf_file"] = json!("other/model.gguf");
+    assert!(verify_model_options(&expected, &wrong_file).is_err());
+    for model in ["author/model", "author/model@main", "/cache/model"] {
+        let mut unpinned = expected.clone();
+        unpinned.profile.gguf.as_mut().unwrap().semantic_source = model.into();
+        assert!(verify_model_options(&unpinned, &valid.value["options"]).is_err());
     }
 }
 

@@ -3,6 +3,7 @@ use ferrum_types::ModelOutputProtocol;
 
 fn profile(id: &str, backend: Backend) -> ModelProfile {
     ModelProfile {
+        gguf: None,
         reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
         id: id.into(),
         model: "fixture/shared-model".into(),
