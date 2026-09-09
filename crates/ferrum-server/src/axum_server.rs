@@ -3434,13 +3434,19 @@ fn convert_chat_request_with_template_model_and_default(
         .unwrap_or(ModelOutputProtocol::Text);
     let output_contract = EffectiveChatOutputContract::resolve(request);
     let output_budget = ChatOutputBudget::resolve(request);
+    let tool_call_protocol = model_template
+        .map(|template| template.tool_call_protocol)
+        .unwrap_or_default();
+    let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
+    let native_tool_call_contract = api_chat.requires_native_tool_call();
     // Harmony tool calls own their complete channel/message/call envelope.
     // Applying the generic tool-argument JSON grammar at token zero would
     // mask that envelope and force the model to emit bare arguments instead.
-    let forced_response_format = (model_output_protocol != ModelOutputProtocol::HarmonyGptOss)
+    let forced_response_format = (model_output_protocol != ModelOutputProtocol::HarmonyGptOss
+        && !native_tool_call_contract)
         .then(|| forced_tool_choice_response_format(request))
         .flatten();
-    let hard_tool_call_contract = forced_response_format.is_some();
+    let hard_tool_call_contract = forced_response_format.is_some() || native_tool_call_contract;
     let requested_response_format = output_contract
         .accepts_requested_response_format()
         .then(|| requested_response_format_for_sampling(request))
@@ -3489,10 +3495,6 @@ fn convert_chat_request_with_template_model_and_default(
     };
     let prompt = rendered_prompt.text;
     let prompt_opened_thinking = rendered_prompt.reasoning_prefill;
-    let tool_call_protocol = model_template
-        .map(|template| template.tool_call_protocol)
-        .unwrap_or_default();
-    let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
     let mut metadata = HashMap::new();
     metadata.insert(
         PROMPT_OPENED_REASONING_METADATA_KEY.to_string(),
@@ -3562,7 +3564,8 @@ fn convert_chat_request_with_template_model_and_default(
             serde_json::json!(forbidden),
         );
     }
-    let structured_output = !matches!(response_format, ferrum_types::ResponseFormat::Text);
+    let structured_output =
+        !matches!(response_format, ferrum_types::ResponseFormat::Text) || native_tool_call_contract;
     let structured_output_after_reasoning = structured_output
         && model_output_protocol == ModelOutputProtocol::Text
         && (prompt_opened_thinking || model_generated_thinking);
@@ -12565,6 +12568,47 @@ mod tests {
                 );
             }
             ref other => panic!("expected forced tool json schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forced_native_tool_choice_preserves_xml_framing_with_a_tool_only_grammar() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{{ tools | tojson }}</tools>Use <tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "native-tool-fixture",
+        );
+        for choice in [
+            json!({"type":"function","function":{"name":"calc"}}),
+            json!("required"),
+        ] {
+            let request: ChatCompletionsRequest = serde_json::from_value(json!({
+                "model":"served-alias","messages":[{"role":"user","content":"Use the selected tool."}],
+                "tools":[
+                    {"type":"function","function":{"name":"calc","parameters":{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}}},
+                    {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}
+                ],
+                "tool_choice":choice
+            })).unwrap();
+            validate_chat_request(&request).unwrap();
+            let internal =
+                convert_chat_request_with_template_model(&request, "served-alias", Some(&template))
+                    .unwrap();
+            assert!(internal.requires_structured_output());
+            assert_eq!(
+                internal.sampling_params.response_format,
+                ferrum_types::ResponseFormat::Text
+            );
+            assert!(internal.prompt.contains("<function=name>"));
+            let Some(ferrum_types::ApiRequest::Chat(chat)) = &internal.api_request else {
+                panic!("chat contract")
+            };
+            assert!(chat.requires_native_tool_call());
+            assert!(chat.allows_tool_name("calc"));
+            assert_eq!(chat.allows_tool_name("lookup"), choice == json!("required"));
+            assert_eq!(
+                internal.sampling_params.structured_output_start,
+                StructuredOutputStart::Immediate
+            );
         }
     }
 

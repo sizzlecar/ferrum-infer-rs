@@ -669,7 +669,6 @@ impl SequenceState {
         model_vocab_size: Option<usize>,
         shared_structured_factory: Option<&StructuredOutputFactory>,
     ) -> Result<Self> {
-        use ferrum_types::ResponseFormat;
         request.sampling_params.validate()?;
         if request.sampling_params.tfs.is_some()
             || request.sampling_params.typical_p.is_some()
@@ -685,10 +684,7 @@ impl SequenceState {
             .seed
             .map(SamplingRng::seeded)
             .unwrap_or_else(SamplingRng::from_entropy);
-        let needs_structured_output = !matches!(
-            request.sampling_params.response_format,
-            ResponseFormat::Text
-        );
+        let needs_structured_output = request.requires_structured_output();
         let local_structured_factory = match (
             needs_structured_output,
             shared_structured_factory,

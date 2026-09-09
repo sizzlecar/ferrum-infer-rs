@@ -1,5 +1,6 @@
 //! A single grammar owns reasoning, protocol framing, and either a final
-//! schema value or an explicit automatic tool call. Tokens may span rules.
+//! schema value or an explicit tool call. Required native calls have no final
+//! answer branch. Tokens may span rules.
 use super::*;
 use ferrum_types::{ApiChatRequest, ModelOutputProtocol};
 
@@ -49,7 +50,7 @@ enum Domain {
 pub(super) struct ComposedState {
     plan: Arc<Plan>,
     initial_matcher: Matcher,
-    final_validator: Arc<jsonschema::Validator>,
+    final_validator: Option<Arc<jsonschema::Validator>>,
     wire: Vec<u8>,
     token_ends: Vec<usize>,
     domain: Domain,
@@ -237,7 +238,11 @@ pub(super) fn compile(
         protocol,
     )?;
     let matcher = cached_matcher(factory, compiled.grammar)?;
-    let final_validator = cached_final_validator(factory, response_format)?;
+    let final_validator = if chat.requires_native_tool_call() {
+        None
+    } else {
+        Some(cached_final_validator(factory, response_format)?)
+    };
     let mut composed = ComposedState {
         plan: Arc::new(compiled.plan),
         initial_matcher: matcher.deep_clone(),
@@ -367,9 +372,10 @@ pub(super) fn classify(
         .to_string();
     // The union has already accepted a complete root. Prefer semantic final
     // schema membership even when the tool branch supplied its generation path.
-    let branch = if serde_json::from_str::<serde_json::Value>(&payload)
-        .is_ok_and(|value| composed.final_validator.is_valid(&value))
-    {
+    let branch = if composed.final_validator.as_ref().is_some_and(|validator| {
+        serde_json::from_str::<serde_json::Value>(&payload)
+            .is_ok_and(|value| validator.is_valid(&value))
+    }) {
         ferrum_types::StructuredOutputBranch::Final
     } else {
         ferrum_types::StructuredOutputBranch::ToolCall

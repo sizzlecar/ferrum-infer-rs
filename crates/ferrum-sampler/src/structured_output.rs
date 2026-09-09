@@ -228,8 +228,9 @@ impl StructuredOutputFactory {
         output_protocol: ferrum_types::ModelOutputProtocol,
     ) -> Result<Option<StructuredOutputProcessor>> {
         if let Some(chat) = chat_request.filter(|chat| {
-            chat.automatic_tools_with_hard_response_format()
-                && !matches!(response_format, ResponseFormat::Text)
+            (chat.automatic_tools_with_hard_response_format()
+                && !matches!(response_format, ResponseFormat::Text))
+                || chat.requires_native_tool_call()
         }) {
             return auto_tools::compile(
                 self,

@@ -303,6 +303,145 @@ fn xml_envelope_keeps_raw_parameters_and_allows_multiple_complete_calls() {
 }
 
 #[test]
+fn forced_native_calls_mask_bare_arguments_and_unselected_names() {
+    use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
+    let tokenizer = Arc::new(PacketTokenizer::new(&[]));
+    let mut chat = request(ApiToolCallProtocol::FunctionParameterXml);
+    let mut other = chat.tools[0].clone();
+    other.function.name = "clock".into();
+    chat.tools.push(other);
+    chat.response_format = None;
+    for choice in [
+        ApiToolChoice::Function {
+            tool_type: "function".into(),
+            function: ApiToolChoiceFunction {
+                name: "weather".into(),
+            },
+        },
+        ApiToolChoice::Mode("required".into()),
+    ] {
+        let named = matches!(&choice, ApiToolChoice::Function { .. });
+        chat.tool_choice = Some(choice);
+        let processor = StructuredOutputFactory::new(tokenizer.clone())
+            .unwrap()
+            .create_processor_with_chat_contract(
+                &ResponseFormat::Text,
+                &StructuredOutputStart::Immediate,
+                512,
+                &tokenizer.terminals(),
+                &[],
+                Some(&chat),
+                ModelOutputProtocol::Text,
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated = Vec::new();
+        let mut logits = vec![0.0; tokenizer.vocab_size()];
+        processor
+            .mask_logits_with_terminals(
+                &mut logits,
+                &generated,
+                &tokenizer.terminals(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(!logits[b'{' as usize].is_finite());
+        assert!(!logits[EOS as usize].is_finite());
+        append(
+            &processor,
+            &tokenizer,
+            &mut generated,
+            "<tool_call><function=",
+        );
+        logits.fill(0.0);
+        processor
+            .mask_logits_with_terminals(
+                &mut logits,
+                &generated,
+                &tokenizer.terminals(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(logits[b'w' as usize].is_finite());
+        assert_eq!(logits[b'c' as usize].is_finite(), !named);
+        assert!(!logits[b'z' as usize].is_finite());
+        append(
+            &processor,
+            &tokenizer,
+            &mut generated,
+            "weather><parameter=city>Paris</parameter></function>",
+        );
+        assert!(!processor.is_accepting(&generated).unwrap());
+        append(&processor, &tokenizer, &mut generated, "</tool_call>");
+        assert!(processor.is_accepting(&generated).unwrap());
+        let (branch, payload) = processor
+            .classified_result_with_terminals(&generated, &tokenizer.terminals())
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch, StructuredOutputBranch::ToolCall);
+        assert_eq!(
+            payload,
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"
+        );
+    }
+}
+
+#[test]
+fn forced_native_call_preserves_merged_reasoning_boundary_and_rejects_missing_selection() {
+    use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
+    let tokenizer = Arc::new(PacketTokenizer::new(&[
+        "</think><tool_call><function=weather>",
+    ]));
+    let mut chat = request(ApiToolCallProtocol::FunctionParameterXml);
+    chat.response_format = None;
+    chat.tool_choice = Some(ApiToolChoice::Function {
+        tool_type: "function".into(),
+        function: ApiToolChoiceFunction {
+            name: "weather".into(),
+        },
+    });
+    let factory = StructuredOutputFactory::new(tokenizer.clone()).unwrap();
+    let processor = factory
+        .create_processor_with_chat_contract(
+            &ResponseFormat::Text,
+            &StructuredOutputStart::AfterDelimiter("</think>".into()),
+            512,
+            &tokenizer.terminals(),
+            &[],
+            Some(&chat),
+            ModelOutputProtocol::Text,
+        )
+        .unwrap()
+        .unwrap();
+    let mut generated = Vec::new();
+    append(&processor,&tokenizer,&mut generated,"Choose the weather tool.</think><tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>");
+    let (branch, payload) = processor
+        .classified_result_with_terminals(&generated, &tokenizer.terminals())
+        .unwrap()
+        .unwrap();
+    assert_eq!(branch, StructuredOutputBranch::ToolCall);
+    assert!(payload.starts_with("<tool_call>"));
+    assert!(!payload.contains("Choose"));
+    chat.tool_choice = Some(ApiToolChoice::Function {
+        tool_type: "function".into(),
+        function: ApiToolChoiceFunction {
+            name: "undeclared".into(),
+        },
+    });
+    assert!(factory
+        .create_processor_with_chat_contract(
+            &ResponseFormat::Text,
+            &StructuredOutputStart::Immediate,
+            512,
+            &tokenizer.terminals(),
+            &[],
+            Some(&chat),
+            ModelOutputProtocol::Text
+        )
+        .is_err());
+}
+
+#[test]
 fn reasoning_budget_forces_closure_without_weakening_final_schema() {
     let tokenizer = Arc::new(PacketTokenizer::new(&[
         "</think>{\"ok\":true}",
