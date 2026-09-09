@@ -40,6 +40,41 @@ impl CudaNativeBlockKernels {
         })
     }
 
+    pub(super) fn embedding(
+        &self,
+        stream: &CudaStream,
+        tokens: u64,
+        weight: u64,
+        output: u64,
+        part: &weights::MatrixPart,
+        count: u32,
+        activation: ferrum_interfaces::vnext::ElementType,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        use ferrum_interfaces::vnext::ElementType;
+        let elements = embedding_elements(part, count)?;
+        let function = match activation {
+            ElementType::F16 => &self.embedding_f16,
+            ElementType::F32 => &self.embedding_f32,
+            _ => {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "unsupported embedding dtype",
+                ))
+            }
+        };
+        let [format, values, bytes] = part.format.parameters();
+        let parameters = [count, part.columns, part.rows, format, values, bytes];
+        let mut launch = stream.launch_builder(function);
+        launch.arg(&tokens).arg(&weight).arg(&output);
+        for parameter in &parameters {
+            launch.arg(parameter);
+        }
+        // SAFETY: The provider retains the complete table and exact token and
+        // output spans. The kernel guards the element count and invalid IDs.
+        unsafe { launch.launch(LaunchConfig::for_num_elems(elements)) }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("native embedding launch", error))
+    }
+
     pub(super) fn linear(
         &self,
         stream: &CudaStream,
@@ -100,6 +135,22 @@ impl CudaNativeBlockKernels {
         .map(|_| ())
         .map_err(|error| CudaDeviceRuntimeError::driver("native matrix linear launch", error))
     }
+}
+
+pub(super) fn embedding_elements(
+    part: &weights::MatrixPart,
+    count: u32,
+) -> Result<u32, CudaDeviceRuntimeError> {
+    let [_, values, _] = part.format.parameters();
+    if part.output_offset != 0 || part.rows == 0 || part.columns % values != 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "native embedding requires a complete row-aligned vocabulary table",
+        ));
+    }
+    count
+        .checked_mul(part.columns)
+        .filter(|&n| n != 0)
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("native embedding launch extent overflows"))
 }
 
 #[cfg(test)]

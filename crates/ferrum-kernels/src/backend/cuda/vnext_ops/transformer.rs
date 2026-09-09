@@ -1235,7 +1235,7 @@ pub(super) fn weightless_provider_descriptor(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn provider_descriptor_with_formats(
+pub(super) fn provider_descriptor_with_formats(
     runtime: &CudaDeviceRuntime,
     contract: &dyn OperationContract,
     provider_id: &str,
@@ -4485,7 +4485,7 @@ fn contiguous_binding_region(
         .map_err(|error| error.to_string())
 }
 
-fn ensure_invocation(
+pub(super) fn ensure_invocation(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     operation_id: &str,
 ) -> Result<(), String> {

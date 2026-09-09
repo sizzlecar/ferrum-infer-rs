@@ -56,8 +56,14 @@ use super::vnext_runtime::{
 };
 
 mod native_blocks;
+mod native_io;
 mod selection;
 mod transformer;
+use ferrum_interfaces::vnext::{
+    last_token_dense_linear_f32_contract, token_embedding_f32_master_contract,
+    LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
+};
+use native_io::TokenPrecision;
 use selection::ArgmaxPrecision;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
@@ -98,6 +104,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
+        include_str!("vnext_ops/native_io.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
@@ -173,7 +180,9 @@ pub fn cuda_vnext_runtime_config(
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+        TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+        LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
@@ -346,7 +355,9 @@ pub fn cuda_vnext_operation_registry(
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
+        Box::new(token_embedding_f32_master_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
+        Box::new(last_token_dense_linear_f32_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
@@ -380,7 +391,9 @@ pub fn cuda_vnext_operation_registry(
     };
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
+        Box::new(CudaTokenEmbeddingProvider::new_f32(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
+        Box::new(CudaLastTokenDenseLinearProvider::new_f32(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new_f32(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
@@ -620,50 +633,40 @@ pub fn cuda_native_operator_catalog_input(
 pub struct CudaTokenEmbeddingProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    native: native_blocks::CudaNativeBlockKernels,
+    precision: TokenPrecision,
 }
 
 impl CudaTokenEmbeddingProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = token_embedding_contract().map_err(contract_error)?;
-        let capability =
-            CapabilityId::new(TOKEN_EMBEDDING_F16_CAPABILITY_ID).map_err(contract_error)?;
-        if !runtime.descriptor().capabilities.contains(&capability) {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA runtime does not advertise the token embedding capability",
-            ));
-        }
+        Self::with_precision(runtime, TokenPrecision::F16)
+    }
 
-        let provider_fingerprint = implementation_fingerprint(&[
-            include_str!("vnext_ops.rs").as_bytes(),
-            crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
-            EMBEDDING_FUNCTION_NAME.as_bytes(),
-        ]);
-        let estimator_fingerprint = implementation_fingerprint(&[
-            include_str!("vnext_ops.rs").as_bytes(),
-            TOKEN_EMBEDDING_ESTIMATOR_ID.as_bytes(),
-        ]);
-        let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(TOKEN_EMBEDDING_PROVIDER_ID).map_err(contract_error)?,
-            contract.descriptor().id.clone(),
-            contract
-                .descriptor()
-                .fingerprint()
-                .map_err(contract_error)?,
-            provider_fingerprint,
-            ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
-            contract.descriptor().version,
-            runtime.descriptor().id.clone(),
-            BTreeSet::from([capability]),
-            BTreeSet::from([
-                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
-            ]),
-            BTreeSet::new(),
-            contiguous_bindings(),
-            TOKEN_EMBEDDING_ESTIMATOR_ID,
-            ContractVersion::new(1, 0),
-            estimator_fingerprint,
-        )
-        .map_err(contract_error)?;
+    pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, TokenPrecision::F32)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: TokenPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let (contract, provider, capability, estimator) = match precision {
+            TokenPrecision::F16 => (
+                token_embedding_contract(),
+                TOKEN_EMBEDDING_PROVIDER_ID,
+                TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+                TOKEN_EMBEDDING_ESTIMATOR_ID,
+            ),
+            TokenPrecision::F32 => (
+                token_embedding_f32_master_contract(),
+                "provider.cuda.token_embedding.f32-master",
+                TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
+                "resource-estimator.cuda.token_embedding.f32-master",
+            ),
+        };
+        let contract = contract.map_err(contract_error)?;
+        let descriptor =
+            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP.to_owned()))
@@ -674,6 +677,8 @@ impl CudaTokenEmbeddingProvider {
         Ok(Self {
             descriptor,
             function,
+            native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
+            precision,
         })
     }
 }
@@ -687,7 +692,7 @@ impl OperationResourceEstimator for CudaTokenEmbeddingProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != TOKEN_EMBEDDING_OPERATION_ID
+        if request.operation().id.as_str() != self.precision.embedding_operation()
             || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
         {
             return Err(VNextError::InvalidExecutionPlan {
@@ -723,36 +728,68 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_token_embedding(
-            &self.function,
-            self.descriptor.provider_implementation_fingerprint(),
-            invocation,
-        )
-        .map(EncodedDeviceOperation::compute)
-        .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
+        let encoded =
+            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
+                native_io::encode_embedding(
+                    self.descriptor.provider_implementation_fingerprint(),
+                    &self.native,
+                    self.precision,
+                    invocation,
+                )
+            } else {
+                encode_token_embedding(
+                    &self.function,
+                    self.descriptor.provider_implementation_fingerprint(),
+                    invocation,
+                )
+            };
+        encoded
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
     }
 }
 
 pub struct CudaLastTokenDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
+    native: native_blocks::CudaNativeBlockKernels,
+    precision: TokenPrecision,
 }
 
 impl CudaLastTokenDenseLinearProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = last_token_dense_linear_contract().map_err(contract_error)?;
-        let descriptor = transformer::provider_descriptor(
-            runtime,
-            &contract,
-            LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID,
-            LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-            LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID,
-            transformer::contiguous_bindings(2),
-            implementation_fingerprint(&[
-                include_str!("vnext_ops.rs").as_bytes(),
-                LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID.as_bytes(),
-            ]),
-        )?;
-        Ok(Self { descriptor })
+        Self::with_precision(runtime, TokenPrecision::F16)
+    }
+
+    pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, TokenPrecision::F32)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: TokenPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let (contract, provider, capability, estimator) = match precision {
+            TokenPrecision::F16 => (
+                last_token_dense_linear_contract(),
+                LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID,
+                LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+                LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID,
+            ),
+            TokenPrecision::F32 => (
+                last_token_dense_linear_f32_contract(),
+                "provider.cuda.last_token_dense_linear.f32.native",
+                LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+                "resource-estimator.cuda.last_token_dense_linear.f32.native",
+            ),
+        };
+        let contract = contract.map_err(contract_error)?;
+        let descriptor =
+            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+        Ok(Self {
+            descriptor,
+            native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
+            precision,
+        })
     }
 }
 
@@ -768,7 +805,7 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
         transformer::ensure_estimator_request(
             &self.descriptor,
             &request,
-            LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+            self.precision.projection_operation(),
         )?;
         Ok(transformer::estimate(
             &self.descriptor,
@@ -794,14 +831,25 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_last_token_dense_linear(
-            self.descriptor.provider_implementation_fingerprint(),
-            invocation,
-        )
-        .map(EncodedDeviceOperation::compute)
-        .map_err(|message| {
-            provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
-        })
+        let encoded =
+            if self.precision == TokenPrecision::F32 || native_io::requires_native(&invocation) {
+                native_io::encode_projection(
+                    self.descriptor.provider_implementation_fingerprint(),
+                    &self.native,
+                    self.precision,
+                    invocation,
+                )
+            } else {
+                encode_last_token_dense_linear(
+                    self.descriptor.provider_implementation_fingerprint(),
+                    invocation,
+                )
+            };
+        encoded
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| {
+                provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
+            })
     }
 }
 
@@ -1175,6 +1223,7 @@ fn encode_last_token_dense_linear(
             output,
             hidden_size,
             out_features,
+            ElementType::F16,
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
@@ -1258,14 +1307,15 @@ fn validate_last_token_dense_linear_signature(
     output: &ResolvedValueBinding,
     hidden_size: u64,
     out_features: u64,
+    activation: ElementType,
 ) -> Result<(), String> {
     let contiguous = |binding: &ResolvedValueBinding| {
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
     let input_dimensions = input.tensor().dimensions();
-    if input.tensor().element_type() != ElementType::F16
+    if input.tensor().element_type() != activation
         || weight.tensor().element_type() != ElementType::F16
-        || output.tensor().element_type() != ElementType::F16
+        || output.tensor().element_type() != activation
         || input_dimensions.len() != 2
         || input_dimensions[0] == 0
         || input_dimensions[1] != hidden_size
@@ -1317,7 +1367,14 @@ fn encode_token_embedding(
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        validate_signature(token_ids, table, output, vocabulary_size, hidden_size)?;
+        validate_signature(
+            token_ids,
+            table,
+            output,
+            vocabulary_size,
+            hidden_size,
+            ElementType::F16,
+        )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
         let token_count = token_range.immediate_tokens();
@@ -1464,6 +1521,7 @@ fn validate_signature(
     output: &ResolvedValueBinding,
     vocabulary_size: u64,
     hidden_size: u64,
+    activation: ElementType,
 ) -> Result<u64, String> {
     let token_dimensions = token_ids.tensor().dimensions();
     let table_dimensions = table.tensor().dimensions();
@@ -1473,7 +1531,7 @@ fn validate_signature(
     };
     if token_ids.tensor().element_type() != ElementType::U32
         || table.tensor().element_type() != ElementType::F16
-        || output.tensor().element_type() != ElementType::F16
+        || output.tensor().element_type() != activation
         || token_dimensions.len() != 1
         || table_dimensions != [vocabulary_size, hidden_size]
         || output_dimensions != [token_dimensions[0], hidden_size]
