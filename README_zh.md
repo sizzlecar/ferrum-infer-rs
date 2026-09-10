@@ -7,11 +7,15 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-> Rust 原生 LLM 推理，用于 OpenAI 兼容的本地与私有服务。
+# 用一个二进制文件提供大模型服务。
 
-**一个二进制，无需 Python runtime，支持 Apple Silicon Metal 与 NVIDIA CUDA 加速。**
+Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。
 
 [English](README.md)
+
+## 愿景
+
+让高性能大模型服务的部署与运维更简单。
 
 ## 快速开始
 

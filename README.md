@@ -7,11 +7,15 @@
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-> Rust-native LLM inference for OpenAI-compatible local and private serving.
+# Serve LLMs with a single binary.
 
-**One binary. No Python runtime. Apple Silicon Metal and NVIDIA CUDA acceleration.**
+A Rust-native LLM serving engine. One binary, no Python runtime.
 
 [中文说明](README_zh.md)
+
+## Vision
+
+Make high-performance LLM serving simple to deploy and operate.
 
 ## Quick Start
 
