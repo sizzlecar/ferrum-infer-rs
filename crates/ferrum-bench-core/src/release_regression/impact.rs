@@ -254,6 +254,10 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "known crate's top-level Cargo integration-test target",
         ));
     }
+    if component == "ferrum-kernels" && relative == "tests/compressed_tensors_marlin_eq/guards.rs" {
+        return Some((vec![Validation],
+            "guarded device fixture imported by the Marlin Cargo integration target; production importers retain their independent impact"));
+    }
     if (component == "ferrum-native-ops" && relative == "src/coff_tests.rs")
         || (component == "ferrum-native-ops-builder"
             && matches!(

@@ -492,10 +492,12 @@ jobs:
           BACKEND: ${{ matrix.backend }}
         run: |
           features="$BACKEND"
+          targets=(--lib)
           if [[ "$BACKEND" == cuda ]]; then
             features="cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+            targets+=(--test compressed_tensors_marlin_eq)
           fi
-          cargo test --locked -p ferrum-kernels --lib --features "$features" \
+          cargo test --locked -p ferrum-kernels "${targets[@]}" --features "$features" \
             --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"
           cargo run --locked -p ferrum-devtools --bin contract_checks -- \
             --backend "$BACKEND" --artifacts "$RUNNER_TEMP/device-contract-artifacts.jsonl" \
