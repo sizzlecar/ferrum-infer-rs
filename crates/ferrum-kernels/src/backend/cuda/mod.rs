@@ -4099,6 +4099,9 @@ impl crate::backend::BackendKvDtype<crate::backend::KvFp16> for CudaBackend {
 }
 
 #[cfg(test)]
+mod submission_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
