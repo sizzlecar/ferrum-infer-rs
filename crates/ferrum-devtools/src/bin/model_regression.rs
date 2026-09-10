@@ -362,6 +362,9 @@ async fn main() -> Result<()> {
     if args.checks.contains(&Check::Length) {
         record(&mut report, "run-length", cases::run_length(&args)).await?;
     }
+    if args.checks.contains(&Check::State) {
+        record(&mut report, "run-state", cases::run_state(&args)).await?;
+    }
     if args.checks.contains(&Check::Observability) {
         record(
             &mut report,
@@ -378,6 +381,9 @@ async fn main() -> Result<()> {
             report.record("serve-startup", started.elapsed(), Ok(startup_evidence))?;
             for check in &args.checks {
                 match check {
+                    Check::State => {
+                        record(&mut report, "serve-state", cases::serve_state(&server)).await?
+                    }
                     Check::Observability => {
                         record(
                             &mut report,

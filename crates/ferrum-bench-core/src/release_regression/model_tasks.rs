@@ -28,6 +28,7 @@ pub enum ModelCheck {
     Reasoning,
     Length,
     Observability,
+    State,
 }
 
 impl fmt::Display for ModelCheck {
@@ -41,6 +42,7 @@ impl fmt::Display for ModelCheck {
             Self::Reasoning => "reasoning",
             Self::Length => "length",
             Self::Observability => "observability",
+            Self::State => "state",
         })
     }
 }
@@ -58,6 +60,7 @@ impl FromStr for ModelCheck {
             "reasoning" => Ok(Self::Reasoning),
             "length" => Ok(Self::Length),
             "observability" => Ok(Self::Observability),
+            "state" => Ok(Self::State),
             _ => Err(format!("unknown model check {value:?}")),
         }
     }
@@ -74,6 +77,7 @@ impl ModelCheck {
             Self::Reasoning => &["run-reasoning", "serve-reasoning"],
             Self::Length => &["run-length", "serve-length"],
             Self::Observability => &["run-observability", "serve-observability"],
+            Self::State => &["run-state", "serve-state"],
         }
     }
 }
@@ -471,7 +475,12 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             format!("missing required model case {name}"),
         );
     }
-    for name in ["run-basic", "run-observability", "serve-startup"] {
+    for name in [
+        "run-basic",
+        "run-observability",
+        "run-state",
+        "serve-startup",
+    ] {
         if let Some(case) = recorded.get(name) {
             if let Err(error) = super::model_sources::verify_profile_source(
                 &expected.profile,
@@ -508,6 +517,7 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             }
         }
         if expected.checks.contains(&ModelCheck::Reasoning)
+            || expected.checks.contains(&ModelCheck::State)
             || (expected.profile.reasoning_protocol == ModelReasoningProtocol::None
                 && expected.checks.contains(&ModelCheck::Basic))
         {
@@ -540,10 +550,12 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
         "run-reasoning",
         "run-length",
         "run-observability",
+        "run-state",
     ] {
         if let Some(case) = recorded.get(name) {
             let ready = &case["evidence"]["ready"];
             if name == "run-reasoning"
+                || name == "run-state"
                 || (name == "run-basic"
                     && expected.profile.reasoning_protocol == ModelReasoningProtocol::None)
             {
@@ -588,6 +600,35 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
                         expected.max_tokens,
                     )
                 });
+            if let Err(error) = result {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+    }
+    for name in ["run-state", "serve-state"] {
+        if let Some(case) = recorded.get(name) {
+            let result = if name == "run-state" {
+                case["evidence"]["records"]
+                    .as_array()
+                    .ok_or_else(|| "state run has no actual records".to_string())
+                    .and_then(|records| {
+                        super::model_state::verify_run(
+                            records,
+                            expected.profile.reasoning_protocol,
+                            expected.max_tokens,
+                        )
+                    })
+            } else {
+                serde_json::from_value(case["evidence"]["state"].clone())
+                    .map_err(|error| format!("invalid state evidence: {error}"))
+                    .and_then(|evidence| {
+                        super::model_state::verify_serve(
+                            &evidence,
+                            expected.profile.reasoning_protocol,
+                            expected.max_tokens,
+                        )
+                    })
+            };
             if let Err(error) = result {
                 errors.push(format!("{name}: {error}"));
             }

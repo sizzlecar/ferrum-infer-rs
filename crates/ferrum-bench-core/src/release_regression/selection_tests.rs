@@ -1600,7 +1600,7 @@ fn structured_masking_keeps_its_real_contract_and_actual_http_validity_sample() 
 }
 
 #[test]
-fn protocol_bindings_cannot_substitute_for_unimplemented_device_state() {
+fn protocol_bindings_cannot_substitute_for_state_integration() {
     let target = text_target("bf16", Backend::Cuda);
     let mut request = input(
         Stage::PullRequest,
@@ -1613,9 +1613,11 @@ fn protocol_bindings_cannot_substitute_for_unimplemented_device_state() {
         ChangeArea::Termination,
     ];
     request.checks = super::super::contracts::contract_check_descriptors();
-    request
-        .checks
-        .extend(super::super::model_schedule::model_check_descriptors());
+    request.checks.extend(
+        super::super::model_schedule::model_check_descriptors()
+            .into_iter()
+            .filter(|check| check.behavior != Behavior::ArchitectureState),
+    );
     let result = plan(&request).unwrap();
     let schedule = super::super::model_schedule::model_task_schedule(&result);
     for behavior in [
@@ -1636,7 +1638,11 @@ fn protocol_bindings_cannot_substitute_for_unimplemented_device_state() {
             assert!(result
                 .gaps
                 .contains(&Gap::UnassignedCheck { obligation: index }));
-            assert!(schedule.unsupported_obligations.contains(&index));
+            // The runner can schedule its dedicated state probe, but merely
+            // having protocol registrations cannot fill the plan's state gap.
+            assert!(schedule.runs.iter().any(|run| run
+                .checks
+                .contains(&super::super::model_tasks::ModelCheck::State)));
         } else {
             // Dedicated protocol checks are implementations, not evidence that
             // they ran or that another device-state obligation was satisfied.
