@@ -10,6 +10,9 @@ use std::{collections::BTreeMap, fs, path::Path, process::Command};
 mod http_fixture;
 use http_fixture::Server;
 
+#[path = "windows_bootstrap/installed.rs"]
+mod installed;
+
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
