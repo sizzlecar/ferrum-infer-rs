@@ -5,7 +5,7 @@ use std::{
     net::TcpListener,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -15,6 +15,7 @@ pub struct Server {
     pub url: String,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    requests: Arc<Mutex<Vec<String>>>,
 }
 
 pub struct Response {
@@ -46,6 +47,8 @@ impl Server {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let signal = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
         let worker = thread::spawn(move || {
             while !signal.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -67,6 +70,7 @@ impl Server {
                         }
                         let text = String::from_utf8_lossy(&request);
                         let path = text.split_whitespace().nth(1).unwrap();
+                        observed.lock().unwrap().push(path.to_owned());
                         let (status, body, length) = assets
                             .get(path)
                             .map(|response| {
@@ -93,7 +97,12 @@ impl Server {
             url,
             stop,
             thread: Some(worker),
+            requests,
         }
+    }
+
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 impl Drop for Server {
@@ -133,6 +142,7 @@ fn http_server_waits_for_fragmented_request_and_returns_complete_body() {
         response,
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture"
     );
+    assert_eq!(server.requests(), ["/asset"]);
 }
 
 #[test]
@@ -142,6 +152,7 @@ fn http_server_failure_propagates_without_panicking_again_during_unwind() {
             url: String::new(),
             stop: Arc::new(AtomicBool::new(false)),
             thread: Some(thread::spawn(|| panic!("server failure"))),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
     let failure = std::panic::catch_unwind(|| drop(failed_server())).unwrap_err();

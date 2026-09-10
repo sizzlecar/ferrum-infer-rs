@@ -177,7 +177,8 @@ curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
 ```
 
-使用脚本安装后，重新执行原安装命令即可升级。脚本保留已有版本目录，将入口切换到
+使用脚本安装后，重新执行原安装命令即可升级。同版本、同后端已安装且校验通过时，
+脚本只获取很小的发布校验文件，跳过安装包下载。脚本保留已有版本目录，将入口切换到
 校验后的新版二进制。正在运行的会话继续使用原版本，新启动的会话使用新版本；已有服务
 可在需要更新时自行重启。模型和配置会保留。
 
