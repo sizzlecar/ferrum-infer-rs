@@ -33,6 +33,16 @@ was publicly released. `--stage pull_request` uses the PR base instead;
 Output files must be new. Git endpoints and the catalog digest identify planning
 inputs; neither proves correctness.
 
+The catalog's optional `release_performance` policy defaults to
+`{"mode":"required"}`. A release may explicitly use
+`{"mode":"deferred","reason":"..."}` to schedule comparative measurements after
+publication. The planner retains those measurements in `deferred_performance`,
+and the release gate verifies that the reason matches the candidate's committed
+catalog. This applies only to release performance scheduling: numerical, model,
+protocol, capacity and installation checks remain required, and PR/nightly
+planning is unchanged. Deferred measurements are not passing evidence; existing
+failures and inconclusive results retain their original status.
+
 The CLI compares Cargo inputs from those Git revisions. It narrows only the
 manifest/lock changes that exactly match a coordinated version update produced
 by the release preparer. Those paths retain build scope and release baseline

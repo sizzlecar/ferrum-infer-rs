@@ -30,6 +30,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
+        release_performance: Default::default(),
         stage,
         impact: Impact {
             areas: Vec::new(),
@@ -2369,4 +2370,87 @@ fn submission_latency_sample_never_narrows_an_independent_kernel_requirement() {
             assert_eq!(obligation.entrypoints, ENTRYPOINTS);
         }
     }
+}
+
+#[test]
+fn release_performance_deferral_preserves_every_correctness_obligation() {
+    let target = text_target("bf16", Backend::Cuda);
+    let mut request = input(
+        Stage::Release,
+        vec![target.clone()],
+        vec![profile("quick", target)],
+    );
+    request.quick_start_profile_ids.push("quick".into());
+    request.impact.areas.push(ChangeArea::BackendSubmission);
+    let required = plan(&request).unwrap();
+    let performance: Vec<_> = required
+        .obligations
+        .iter()
+        .filter(|o| o.layer == EvidenceLayer::Performance)
+        .cloned()
+        .collect();
+    let correctness: Vec<_> = required
+        .obligations
+        .iter()
+        .filter(|o| o.layer != EvidenceLayer::Performance)
+        .map(|o| (o.behavior, o.layer, o.scope.clone(), o.entrypoints.clone()))
+        .collect();
+    assert!(!performance.is_empty());
+    assert!(correctness
+        .iter()
+        .any(|o| o.1 == EvidenceLayer::BackendNumerics));
+    request.release_performance = ReleasePerformancePolicy::Deferred {
+        reason: "Complete measurements after the usability release".into(),
+    };
+    let deferred = plan(&request).unwrap();
+    deferred.validate_performance_deferral().unwrap();
+    let actual: Vec<_> = deferred
+        .obligations
+        .iter()
+        .map(|o| (o.behavior, o.layer, o.scope.clone(), o.entrypoints.clone()))
+        .collect();
+    assert_eq!(actual, correctness);
+    let deferred_obligations = &deferred.deferred_performance.as_ref().unwrap().obligations;
+    assert_eq!(deferred_obligations.len(), performance.len());
+    for (actual, expected) in deferred_obligations.iter().zip(&performance) {
+        assert_eq!(
+            (
+                actual.behavior,
+                actual.layer,
+                &actual.scope,
+                &actual.entrypoints
+            ),
+            (
+                expected.behavior,
+                expected.layer,
+                &expected.scope,
+                &expected.entrypoints
+            )
+        );
+    }
+    assert!(
+        super::super::performance::performance_task_schedule(&deferred)
+            .runs
+            .is_empty()
+    );
+    assert!(
+        deferred
+            .gaps
+            .iter()
+            .any(|gap| matches!(gap, Gap::UnassignedCheck { .. })),
+        "missing correctness checkers must remain gaps"
+    );
+    let mut invalid = deferred.clone();
+    invalid.deferred_performance.as_mut().unwrap().obligations[0].layer =
+        EvidenceLayer::BackendNumerics;
+    assert!(invalid.validate_performance_deferral().is_err());
+    request.stage = Stage::PullRequest;
+    let pr = plan(&request).unwrap();
+    assert!(pr.deferred_performance.is_none());
+    assert!(pr
+        .obligations
+        .iter()
+        .any(|o| o.layer == EvidenceLayer::Performance));
+    request.release_performance = ReleasePerformancePolicy::Deferred { reason: " ".into() };
+    assert!(plan(&request).is_err());
 }

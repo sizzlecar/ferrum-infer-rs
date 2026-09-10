@@ -293,6 +293,9 @@ pub struct CheckDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct PlanInput {
     pub stage: Stage,
+    /// Release scheduling only; correctness layers cannot be deferred by this policy.
+    #[serde(default)]
+    pub release_performance: ReleasePerformancePolicy,
     pub impact: Impact,
     pub profiles: Vec<ModelProfile>,
     pub quick_start_profile_ids: Vec<String>,
@@ -368,10 +371,53 @@ pub struct Plan {
     pub stage: Stage,
     pub impact: Impact,
     pub obligations: Vec<Obligation>,
+    /// Explicitly postponed measurements, never passing execution evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_performance: Option<DeferredPerformance>,
     pub selected: Vec<SelectedProfile>,
     pub omitted: Vec<OmittedProfile>,
     pub gaps: Vec<Gap>,
     pub cost: PlanCost,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReleasePerformancePolicy {
+    #[default]
+    Required,
+    Deferred {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredPerformance {
+    pub reason: String,
+    pub obligations: Vec<Obligation>,
+}
+
+impl Plan {
+    pub fn validate_performance_deferral(&self) -> Result<(), String> {
+        if let Some(deferred) = &self.deferred_performance {
+            if self.stage != Stage::Release
+                || deferred.reason.trim().is_empty()
+                || deferred.reason.trim() != deferred.reason
+                || deferred.obligations.is_empty()
+                || deferred
+                    .obligations
+                    .iter()
+                    .any(|o| o.layer != EvidenceLayer::Performance)
+                || self
+                    .obligations
+                    .iter()
+                    .any(|o| o.layer == EvidenceLayer::Performance)
+            {
+                return Err("performance deferral must retain only performance obligations with an explicit release reason".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
