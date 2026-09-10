@@ -1,4 +1,4 @@
-use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DevicePtr, DeviceRepr};
+use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DeviceRepr};
 use std::{fmt::Debug, sync::Arc};
 
 /// Guard both sides while preserving the launcher's vector-load alignment.
@@ -25,10 +25,6 @@ impl<T: DeviceRepr + Copy + PartialEq + Debug> Guarded<T> {
     pub fn view_mut(&mut self) -> CudaViewMut<'_, T> {
         self.storage
             .slice_mut(self.padding..self.padding + self.count)
-    }
-
-    pub fn pointer(&self, stream: &Arc<CudaStream>) -> u64 {
-        self.storage.device_ptr(stream).0 + (self.padding * std::mem::size_of::<T>()) as u64
     }
 
     pub fn read(&self, stream: &Arc<CudaStream>) -> Vec<T> {

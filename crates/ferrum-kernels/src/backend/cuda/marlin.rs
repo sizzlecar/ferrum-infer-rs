@@ -1983,7 +1983,7 @@ mod tests {
         let scales_device: CudaSlice<u8> = stream.clone_htod(&packed_scales).unwrap();
         let prepared_bias = prepare_mxfp4_marlin_bias(&bias, EXPERTS, n);
         let bias_device: CudaSlice<bf16> = stream.clone_htod(&prepared_bias).unwrap();
-        let output_device =
+        let mut output_device =
             Guarded::new(stream, &vec![bf16::NAN; ROWS * n], bf16::from_f32(-117.0));
         let sms = usize::try_from(
             context
@@ -1991,7 +1991,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let reduce_device = Guarded::new(
+        let mut reduce_device = Guarded::new(
             stream,
             &vec![0.0_f32; sms * 4 * MOE_BLOCK_SIZE * 256],
             -117.0_f32,
@@ -2006,16 +2006,19 @@ mod tests {
         let padded_device: CudaSlice<i32> = stream
             .clone_htod(&[(EXPERTS * MOE_BLOCK_SIZE) as i32])
             .unwrap();
-        let workspace = Guarded::new(stream, &vec![0_i32; n.div_ceil(128) * sms * 4], -117_i32);
+        let mut workspace = Guarded::new(stream, &vec![0_i32; n.div_ceil(128) * sms * 4], -117_i32);
 
         {
+            let mut output_view = output_device.view_mut();
+            let mut reduce_view = reduce_device.view_mut();
+            let mut workspace_view = workspace.view_mut();
             let (a, _a_guard) = input_device.device_ptr(stream);
             let (b, _b_guard) = weight_device.device_ptr(stream);
-            let c = output_device.pointer(stream);
-            let c_tmp = reduce_device.pointer(stream);
+            let (c, _c_guard) = output_view.device_ptr_mut(stream);
+            let (c_tmp, _c_tmp_guard) = reduce_view.device_ptr_mut(stream);
             let (bias, _bias_guard) = bias_device.device_ptr(stream);
             let (scales, _scales_guard) = scales_device.device_ptr(stream);
-            let workspace = workspace.pointer(stream);
+            let (workspace, _workspace_guard) = workspace_view.device_ptr_mut(stream);
             let (sorted, _sorted_guard) = sorted_device.device_ptr(stream);
             let (experts, _experts_guard) = expert_device.device_ptr(stream);
             let (padded, _padded_guard) = padded_device.device_ptr(stream);
@@ -3151,7 +3154,7 @@ mod tests {
                 .clone_htod(&packed_scales)
                 .expect("upload packed FP8 scales");
             // Atomic output accumulation requires zero initialization.
-            let output_device =
+            let mut output_device =
                 Guarded::new(&stream, &vec![f16::ZERO; batch * n], f16::from_f32(-117.0));
 
             // One active expert owns one 16-row block. Actual token ids occupy
@@ -3169,15 +3172,17 @@ mod tests {
             let num_tokens_past_padded_device: CudaSlice<i32> = stream
                 .clone_htod(&[i32::try_from(MOE_BLOCK_SIZE).unwrap()])
                 .expect("upload padded token count");
-            let workspace =
+            let mut workspace =
                 Guarded::new(&stream, &vec![0_i32; n.div_ceil(128) * sms * 4], -117_i32);
 
             {
+                let mut output_view = output_device.view_mut();
+                let mut workspace_view = workspace.view_mut();
                 let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
                 let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
-                let output_pointer = output_device.pointer(&stream);
+                let (output_pointer, _output_guard) = output_view.device_ptr_mut(&stream);
                 let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
-                let workspace_pointer = workspace.pointer(&stream);
+                let (workspace_pointer, _workspace_guard) = workspace_view.device_ptr_mut(&stream);
                 let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
                 let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
                 let (padded_pointer, _padded_guard) =
