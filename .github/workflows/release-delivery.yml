@@ -344,9 +344,12 @@ jobs:
               args+=("--$role-version" "$(jq -er --arg role "$role" '.[$role + "_version"]' "$task")"
                 "--$role-sha256" "$(jq -er --arg role "$role" '.[$role + "_sha256"]' "$task")")
             done
-            for field in input_tokens output_tokens measured_requests warmup_requests repeats seed max_model_len; do
+            for field in input_tokens output_tokens measured_requests warmup_requests repeats seed max_model_len concurrency; do
               args+=("--${field//_/-}" "$(jq -er --arg field "$field" '.policy.workload[$field]' "$task")")
             done
+            if jq -e '.policy.workload.max_num_batched_tokens != null' "$task" >/dev/null; then
+              args+=(--max-num-batched-tokens "$(jq -er '.policy.workload.max_num_batched_tokens' "$task")")
+            fi
             for field in runtime_memory_budget_bytes startup_timeout_secs request_timeout_secs task_timeout_secs; do
               args+=("--${field//_/-}" "$(jq -er --arg field "$field" '.policy[$field]' "$task")")
             done

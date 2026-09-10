@@ -71,6 +71,8 @@ fn policy() -> PerformancePolicy {
             repeats: 3,
             seed: 7,
             max_model_len: 128,
+            concurrency: 1,
+            max_num_batched_tokens: None,
         },
         limits: Limits {
             ttft_max_relative_increase: 0.1,
@@ -242,6 +244,44 @@ fn fixture_other_input(root: &Path) -> PerformancePrepareArgs {
         source_selector: root.join("source.json"),
         output_dir: root.join("other-tasks"),
     }
+}
+
+#[tokio::test]
+async fn prepare_vnext_binds_semantic_source_and_concurrent_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let args = fixture(root.path());
+    let mut plan = plan();
+    let profile = &mut plan.selected[0].profile;
+    profile.target.execution_path = "production-plan-runtime".into();
+    plan.obligations[0].scope = ObligationScope::Profile {
+        profile_id: profile.id.clone(),
+        target: profile.target.clone(),
+    };
+    plan.obligations[0].checkers = performance_check_descriptors(&[profile.target.clone()])
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    write_json(&args.plan, &document(plan)).unwrap();
+    let mut concurrent = policy();
+    concurrent.workload.concurrency = 2;
+    concurrent.workload.max_num_batched_tokens = Some(64);
+    write_json(&args.policy, &concurrent).unwrap();
+    snapshot(
+        root.path(),
+        "owner/tokenizer",
+        'd',
+        &[("config.json", b"{}")],
+    );
+    prepare(args).await.unwrap();
+    let task: ExpectedPerformanceRun =
+        read_json(&root.path().join("tasks/legacy-metal/expected-task.json")).unwrap();
+    assert_eq!(
+        task.profile.target.execution_path,
+        "production-plan-runtime"
+    );
+    assert_eq!(task.policy, concurrent);
+    assert!(task.source.sidecars.contains_key("config.json"));
+    task.validate().unwrap();
 }
 #[test]
 fn prepare_ignores_saved_schedule_and_rejects_missing_or_unsupported_real_assignment() {

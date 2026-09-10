@@ -266,6 +266,8 @@ fn expected() -> ExpectedPerformanceRun {
                 repeats: 3,
                 seed: 7,
                 max_model_len: 128,
+                concurrency: 1,
+                max_num_batched_tokens: None,
             },
             limits: Limits {
                 ttft_max_relative_increase: 0.1,

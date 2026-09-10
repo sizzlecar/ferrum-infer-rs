@@ -99,7 +99,7 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
     if report.model != "release-perf"
         || report.backend != "metal"
         || report.scenario != Scenario::ClosedLoop
-        || report.concurrency != Some(1)
+        || report.concurrency != Some(workload.concurrency)
         || report.request_rate.is_some()
         || report.n_prompt != workload.input_tokens
         || report.n_gen != workload.output_tokens
@@ -370,6 +370,7 @@ fn relative(before: &BenchReport, after: &BenchReport) -> Result<TimingChanges, 
 }
 
 fn validate_settings(workload: &Workload, limits: &Limits) -> Result<(), String> {
+    workload.validate()?;
     if workload.repeats < 3
         || workload.input_tokens == 0
         || workload.output_tokens < 2
@@ -387,6 +388,74 @@ fn validate_settings(workload: &Workload, limits: &Limits) -> Result<(), String>
     Ok(())
 }
 
+/// Bench arrays share completion order, which changes under concurrency. Bind
+/// content and rendered lengths to the original request index within each repeat.
+fn ordered_inputs(report: &BenchReport) -> Result<Vec<Vec<(u32, Option<u32>)>>, String> {
+    let content = report
+        .actual_input_tokens_per_request
+        .as_ref()
+        .ok_or("missing content lengths")?;
+    let rendered = report
+        .server_input_tokens_per_request
+        .as_ref()
+        .ok_or("missing rendered lengths")?;
+    let values: Vec<Vec<_>> = content
+        .iter()
+        .zip(rendered)
+        .map(|(a, b)| a.iter().copied().zip(b.iter().copied()).collect())
+        .collect();
+    let Some(records) = &report.request_records else {
+        if report.concurrency != Some(1) {
+            return Err(
+                "concurrent performance measurements require per-request correlation".into(),
+            );
+        }
+        return Ok(values);
+    };
+    if records.len() != values.len() {
+        return Err("request correlation repeat count differs from measured observations".into());
+    }
+    records
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(repeat, (records, values))| {
+            if records.len() != values.len() {
+                return Err("incomplete request correlation observations".into());
+            }
+            let mut ordered = vec![None; values.len()];
+            for (record, value) in records.iter().zip(values) {
+                let id = &record.correlation;
+                if Some(&id.benchmark_run_id) != report.benchmark_run_id.as_ref()
+                    || Some(&id.cell_id) != report.cell_id.as_ref()
+                    || id.repeat_index as usize != repeat
+                    || id.phase != ferrum_bench_core::BenchmarkPhase::Measured
+                    || ferrum_bench_core::BenchmarkRequestCorrelation::new(
+                        id.benchmark_run_id.clone(),
+                        id.cell_id.clone(),
+                        id.repeat_index,
+                        id.phase,
+                        id.request_index,
+                    )
+                    .is_err()
+                {
+                    return Err("request correlation differs from measured run/cell/repeat".into());
+                }
+                let slot = ordered
+                    .get_mut(id.request_index as usize)
+                    .ok_or("request correlation index exceeds measured workload")?;
+                if slot.replace(value).is_some() {
+                    return Err("duplicate measured request correlation index".into());
+                }
+            }
+            ordered
+                .into_iter()
+                .map(|v| v.ok_or("missing measured request correlation index".into()))
+                .collect()
+        })
+        .collect()
+}
+
 fn validate_pair(first: &BenchReport, second: &BenchReport) -> Result<(), String> {
     if second.env.hw_id != first.env.hw_id
         || second.env.driver != first.env.driver
@@ -399,8 +468,7 @@ fn validate_pair(first: &BenchReport, second: &BenchReport) -> Result<(), String
         || second.env.ferrum_env != first.env.ferrum_env
         || serde_json::to_value(&second.env.runtime_config).map_err(|e| e.to_string())?
             != serde_json::to_value(&first.env.runtime_config).map_err(|e| e.to_string())?
-        || second.actual_input_tokens_per_request != first.actual_input_tokens_per_request
-        || second.server_input_tokens_per_request != first.server_input_tokens_per_request
+        || ordered_inputs(second)? != ordered_inputs(first)?
         || second
             .repeat_metrics
             .iter()
@@ -501,6 +569,8 @@ mod tests {
             repeats: 3,
             seed: 7,
             max_model_len: 128,
+            concurrency: 1,
+            max_num_batched_tokens: None,
         }
     }
     fn limits() -> Limits {
@@ -682,3 +752,7 @@ mod tests {
         assert!(compare(&base, &base, &base, &w, &limits()).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;

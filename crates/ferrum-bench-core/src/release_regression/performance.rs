@@ -1,5 +1,5 @@
 //! Registration and path-independent inputs for the implemented same-host
-//! legacy Metal HTTP latency comparison. A scheduled task is not a measured pass.
+//! Metal HTTP latency comparison. A scheduled task is not a measured pass.
 use super::types::*;
 use ferrum_types::ModelOutputProtocol;
 use serde::{Deserialize, Serialize};
@@ -18,10 +18,25 @@ pub struct Workload {
     pub repeats: u32,
     pub seed: u64,
     pub max_model_len: u32,
+    #[serde(default = "single_concurrency")]
+    pub concurrency: u32,
+    /// Omitted by older contracts, which used the context limit as the batch budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_batched_tokens: Option<u32>,
+}
+pub fn single_concurrency() -> u32 {
+    1
 }
 impl Workload {
+    pub fn batched_tokens(&self) -> u32 {
+        self.max_num_batched_tokens.unwrap_or(self.max_model_len)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.input_tokens == 0
+            || self.concurrency == 0
+            || self.measured_requests < self.concurrency
+            || self.batched_tokens() == 0
             || self.output_tokens < 2
             || self.measured_requests == 0
             || self.warmup_requests == 0
@@ -163,8 +178,7 @@ impl ExpectedPerformanceRun {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1 || !supported_profile(&self.profile) {
             return Err(
-                "performance task requires an available declared legacy Metal GGUF/Text profile"
-                    .into(),
+                "performance task requires an available declared Metal GGUF/Text profile".into(),
             );
         }
         for version in [
@@ -195,6 +209,11 @@ impl ExpectedPerformanceRun {
             return Err("performance task must bind distinct plan obligations".into());
         }
         self.policy.validate()?;
+        if self.profile.target.execution_path == "production-plan-runtime"
+            && !self.source.sidecars.contains_key("config.json")
+        {
+            return Err("vNext performance source must pin config.json for model semantics".into());
+        }
         self.source.validate()
     }
 }
@@ -224,7 +243,10 @@ fn concrete(value: &str) -> bool {
 /// This is the implemented runner's reach, not a claim that these targets ran.
 pub fn supports_target(target: &ExecutionTarget) -> bool {
     target.backend == Backend::Metal
-        && target.execution_path == "legacy-model-executor"
+        && matches!(
+            target.execution_path.as_str(),
+            "legacy-model-executor" | "production-plan-runtime"
+        )
         && target.protocol == ModelOutputProtocol::Text
         && concrete(&target.architecture)
         && concrete(&target.precision)
@@ -248,8 +270,13 @@ fn descriptor(target: &ExecutionTarget) -> Option<CheckDescriptor> {
     // is not an execution result or a source/performance correctness criterion.
     let identity =
         serde_json::to_vec(target).expect("execution target contains serializable fields");
+    let prefix = if target.execution_path == "production-plan-runtime" {
+        "release-performance.metal-vnext-http"
+    } else {
+        PERFORMANCE_CHECK_PREFIX
+    };
     Some(CheckDescriptor {
-        id: format!("{PERFORMANCE_CHECK_PREFIX}.{:x}", Sha256::digest(identity)),
+        id: format!("{prefix}.{:x}", Sha256::digest(identity)),
         behavior: Behavior::Performance,
         layer: EvidenceLayer::Performance,
         entrypoints: vec![Entrypoint::ServeStream],
@@ -362,6 +389,8 @@ mod tests {
                     repeats: 3,
                     seed: 7,
                     max_model_len: 128,
+                    concurrency: 1,
+                    max_num_batched_tokens: None,
                 },
                 limits: Limits {
                     ttft_max_relative_increase: 0.1,
@@ -408,16 +437,20 @@ mod tests {
         replay.validate().unwrap();
     }
     #[test]
-    fn descriptor_only_registers_actual_metal_legacy_gguf_text_inventory() {
+    fn descriptor_only_registers_implemented_metal_gguf_text_paths() {
         let base = profile().target;
-        let mut candidates = vec![base.clone()];
+        let vnext = ExecutionTarget {
+            execution_path: "production-plan-runtime".into(),
+            ..base.clone()
+        };
+        let mut candidates = vec![base.clone(), vnext.clone()];
         for target in [
             ExecutionTarget {
                 backend: Backend::Cuda,
                 ..base.clone()
             },
             ExecutionTarget {
-                execution_path: "production-plan-runtime".into(),
+                execution_path: "unimplemented-executor".into(),
                 ..base.clone()
             },
             ExecutionTarget {
@@ -445,7 +478,10 @@ mod tests {
             candidates.push(target);
         }
         let result = performance_check_descriptors(&candidates);
-        assert_eq!(result, performance_check_descriptors(&[base.clone(), base]));
+        assert_eq!(
+            result,
+            performance_check_descriptors(&[base.clone(), base, vnext])
+        );
         assert!(performance_check_descriptors(&[]).is_empty());
         assert_eq!(result[0].behavior, Behavior::Performance);
         assert_eq!(result[0].entrypoints, [Entrypoint::ServeStream]);

@@ -364,6 +364,23 @@ usage stays null; older reports omit the field. Release latency comparisons
 require observed server input lengths, verify their context budget and totals,
 and require the same rendered lengths for baseline and candidate.
 
+The same-host Metal latency runner supports both the legacy executor and vNext
+GGUF execution. For vNext, pin `config.json` alongside the tokenizer and template;
+both servers receive the same explicit semantic and tokenizer sources. Health
+observations before and after measurement must show the registered backend,
+context, active-sequence and scheduled-token limits, and an unchanged execution
+plan. The candidate must also report its actual automatic numerical selection.
+A published baseline without that field retains an unknown named profile; this
+comparison does not assert that its numerical policy matches the candidate.
+
+`policy.workload.concurrency` defaults to one, and
+`policy.workload.max_num_batched_tokens` defaults to the context limit when omitted.
+Concurrent measurements bind prompt lengths by request correlation, since requests
+can finish in a different order. A throughput summary is retained, but the current
+gate compares latency only. The observed memory ceiling and static residency are
+capacity checks, not a peak-memory regression measurement. CUDA reference-engine
+comparisons require a separate executable binding and remain unsupported here.
+
 Configure release latency limits in
 [`policy.limits`](../.github/release-performance.json) before starting a release.
 The shared Mac temporarily allows 30% TTFT and 20% time-per-output-token
