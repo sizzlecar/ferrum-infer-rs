@@ -1,8 +1,10 @@
-//! Exact device lifecycle assertions. GPU tests require their device and fail
+//! Exact device lifecycle and operator assertions. GPU tests require their device and fail
 //! when it is unavailable; CPU execution cannot stand in for an accelerator.
 use super::contracts::{verify_contract_report, ContractGroup, ContractReport, ContractTest};
 use super::{Backend, Behavior, CheckDescriptor, EvidenceLayer, ExecutionTarget, ObligationScope};
 use serde::{Deserialize, Serialize};
+#[path = "backend_contracts/numerical.rs"]
+mod numerical;
 
 const PATH: &str = "production-plan-runtime";
 
@@ -54,7 +56,7 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             ],
         ),
     };
-    vec![ContractGroup {
+    let mut groups = vec![ContractGroup {
         id: checker_id(backend),
         behavior: Behavior::SubmissionCompletion,
         entrypoints: Vec::new(),
@@ -67,11 +69,13 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 name: format!("{module}::{name}"),
             })
             .collect(),
-    }]
+    }];
+    groups.extend(numerical::groups(backend));
+    groups
 }
 
-/// One representative anchors a model-independent device execution route. No
-/// descriptor is generated for legacy execution or an unimplemented backend.
+/// One representative anchors a model-independent device execution route.
+/// Numerical descriptors additionally require their exact supported target.
 pub fn check_descriptors(targets: &[ExecutionTarget]) -> Vec<CheckDescriptor> {
     [Backend::Cpu, Backend::Metal, Backend::Cuda]
         .into_iter()
@@ -93,6 +97,7 @@ pub fn check_descriptors(targets: &[ExecutionTarget]) -> Vec<CheckDescriptor> {
                 target: Some(target.clone()),
             })
         })
+        .chain(numerical::descriptors(targets))
         .collect()
 }
 
@@ -109,12 +114,27 @@ pub struct VerifiedBackendContracts {
 }
 impl VerifiedBackendContracts {
     pub fn covers(&self, obligation: &super::Obligation) -> bool {
-        obligation.layer == EvidenceLayer::BackendNumerics
-            && obligation.behavior == Behavior::SubmissionCompletion
-            && obligation.scope == submission_scope(self.backend)
-            && obligation.entrypoints.is_empty()
-            && obligation.checkers == [checker_id(self.backend)]
+        expected_checker(self.backend, obligation).is_some_and(|id| obligation.checkers == [id])
     }
+}
+
+fn expected_checker(backend: Backend, obligation: &super::Obligation) -> Option<String> {
+    if obligation.layer != EvidenceLayer::BackendNumerics || !obligation.entrypoints.is_empty() {
+        return None;
+    }
+    if obligation.behavior == Behavior::SubmissionCompletion
+        && obligation.scope == submission_scope(backend)
+    {
+        Some(checker_id(backend))
+    } else {
+        numerical::expected_checker(backend, obligation)
+    }
+}
+
+pub fn required_backend(obligation: &super::Obligation) -> Option<Backend> {
+    [Backend::Cpu, Backend::Metal, Backend::Cuda]
+        .into_iter()
+        .find(|backend| expected_checker(*backend, obligation).is_some())
 }
 
 /// CI provenance is verified by the delivery consumer, independently of this
@@ -253,5 +273,61 @@ mod tests {
         };
         obligation.behavior = Behavior::KernelNumerics;
         assert!(!receipt.covers(&obligation));
+    }
+
+    #[test]
+    fn native_numerical_receipts_require_the_operator_suite_and_exact_target_scope() {
+        let backend = Backend::Cuda;
+        let target = ExecutionTarget {
+            architecture: "qwen3_5_dense_hybrid".into(),
+            protocol: ferrum_types::ModelOutputProtocol::Text,
+            precision: "gguf-mixed-4bit".into(),
+            backend,
+            execution_path: PATH.into(),
+        };
+        let descriptors = check_descriptors(std::slice::from_ref(&target));
+        let report = report_fixture(backend);
+        let receipt = verify_report(backend, &report).unwrap();
+        for behavior in [Behavior::KernelNumerics, Behavior::KernelBoundaries] {
+            let descriptor = descriptors.iter().find(|d| d.behavior == behavior).unwrap();
+            let mut obligation = super::super::Obligation {
+                behavior,
+                layer: EvidenceLayer::BackendNumerics,
+                scope: ObligationScope::Target {
+                    target: target.clone(),
+                },
+                checkers: vec![descriptor.id.clone()],
+                entrypoints: Vec::new(),
+                reason: "native operator evidence".into(),
+            };
+            assert_eq!(required_backend(&obligation), Some(backend));
+            assert!(receipt.covers(&obligation));
+            let mut other = target.clone();
+            other.precision = "block-fp8-e4m3".into();
+            obligation.scope = ObligationScope::Target { target: other };
+            assert!(!receipt.covers(&obligation));
+            assert_eq!(required_backend(&obligation), None);
+            obligation.scope = ObligationScope::Target {
+                target: target.clone(),
+            };
+            obligation.entrypoints.push(super::super::Entrypoint::Run);
+            assert!(!receipt.covers(&obligation));
+        }
+        let mut submission_only = report.clone();
+        submission_only
+            .execution
+            .groups
+            .retain(|group| group.behavior == Behavior::SubmissionCompletion);
+        assert!(verify_report(backend, &submission_only).is_err());
+        let mut missing_oracle = report;
+        missing_oracle
+            .execution
+            .groups
+            .iter_mut()
+            .find(|group| group.behavior == Behavior::KernelNumerics)
+            .unwrap()
+            .tests[0]
+            .execution = None;
+        assert!(verify_report(backend, &missing_oracle).is_err());
     }
 }

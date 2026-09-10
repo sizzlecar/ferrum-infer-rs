@@ -25,10 +25,7 @@ const CPU_KV_STATE_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 
 #[test]
 fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
-    let Some(device) = Device::system_default() else {
-        eprintln!("no Metal device; skipping causal-attention conformance");
-        return;
-    };
+    let device = Device::system_default().expect("causal-attention conformance requires Metal");
     let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
     assert_eq!(pipelines.prepare.thread_execution_width(), SIMD_THREADS);
     assert_eq!(pipelines.attention.thread_execution_width(), SIMD_THREADS);
@@ -445,10 +442,8 @@ fn run_prefill_cpu_case(
 ) {
     let context = prefix + tokens;
 
-    let Some(device) = Device::system_default() else {
-        eprintln!("no Metal device; skipping tiled causal-attention conformance");
-        return;
-    };
+    let device =
+        Device::system_default().expect("tiled causal-attention conformance requires Metal");
     let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
     let query_features = query_heads * head_dim;
@@ -580,10 +575,7 @@ fn run_decode_cpu_case(
     context: usize,
     expected_kind: AttentionDispatchKind,
 ) {
-    let Some(device) = Device::system_default() else {
-        eprintln!("no Metal device; skipping decode conformance");
-        return;
-    };
+    let device = Device::system_default().expect("decode conformance requires Metal");
     let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
     let query_features = query_heads * head_dim;

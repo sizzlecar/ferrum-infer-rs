@@ -2130,10 +2130,7 @@ mod tests {
 
     #[test]
     fn native_linear_formats_match_cpu_oracles_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping linear conformance");
-            return;
-        };
+        let device = Device::system_default().expect("linear conformance requires Metal");
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let rows = 2_usize;
@@ -2228,10 +2225,7 @@ mod tests {
 
     #[test]
     fn shared_k_quant_gemv_honors_batch_offsets_strides_and_tail_rows() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping shared k-quant GEMV ABI test");
-            return;
-        };
+        let device = Device::system_default().expect("K-quant GEMV conformance requires Metal");
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let rows = 3_usize;
@@ -2336,10 +2330,7 @@ mod tests {
 
     #[test]
     fn shared_quantized_tiled_gemm_matches_prefill_shape_and_preserves_output_guards() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping shared K-quant GEMM ABI test");
-            return;
-        };
+        let device = Device::system_default().expect("K-quant GEMM conformance requires Metal");
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let rows = 17_usize;
@@ -2568,10 +2559,7 @@ mod tests {
 
     #[test]
     fn native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping dense SwiGLU conformance");
-            return;
-        };
+        let device = Device::system_default().expect("SwiGLU conformance requires Metal");
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let rows = 2_usize;
@@ -2801,10 +2789,8 @@ mod tests {
 
     #[test]
     fn native_last_token_q6k_f32_linear_preserves_f32_head_boundary_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping F32 last-token linear conformance");
-            return;
-        };
+        let device =
+            Device::system_default().expect("F32 last-token linear conformance requires Metal");
         let pipelines = MetalLinearPipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let rows = 3_usize;

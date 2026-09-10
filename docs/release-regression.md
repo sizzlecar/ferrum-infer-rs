@@ -82,8 +82,16 @@ Pass that file to `contract_checks --backend cpu|metal|cuda --artifacts PATH
 executes it, including tests normally ignored by the workspace suite. A missing
 GPU fails its registered device tests. CI uploads the report and raw harness
 logs; the release consumer also verifies the actual successful producer job and
-execution step. These receipts cover vNext submission/completion only and cannot
-be substituted for another backend, legacy execution or kernel numerical checks.
+execution step. Submission receipts cannot substitute for numerical execution.
+
+The device registry also runs the native dense-hybrid operator suites: block
+decoding, embedding, linear/SwiGLU, precision and residual boundaries, recurrent
+state carry, and paged attention. These assertions use the existing independent
+CPU references and error bounds, with offset/tail/state guards. Their descriptors
+are limited to the tested native GGUF paths and the CPU/Metal dense SafeTensors
+path. They do not cover CUDA Marlin formats, MoE, legacy operators, or whole-model
+state correctness. Repeated assertions shared by numerical and boundary groups
+execute once; both groups still require every registered assertion to succeed.
 
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported

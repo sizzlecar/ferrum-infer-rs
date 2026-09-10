@@ -14,7 +14,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(about = "Execute exact registered Rust contracts; a skipped or missing test cannot pass")]
 struct Args {
-    /// Run device submission assertions instead of the shared CPU contract suite.
+    /// Run device correctness assertions instead of the shared CPU contract suite.
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: Option<String>,
     /// JSONL from a completed cargo test --no-run --message-format=json build.
