@@ -452,11 +452,22 @@ async fn ci_fixture_with_windows(
     result
 }
 
-#[tokio::test]
-async fn windows_assets_require_the_latest_successful_staging_attempt() {
+fn windows_ci_job() -> Value {
     let mut windows = ci_job();
     windows["id"] = json!(23);
     windows["name"] = json!("stage-cuda / Stage Windows x86_64 CUDA sm89");
+    windows["started_at"] = json!("2026-01-01T00:00:00Z");
+    windows["completed_at"] = json!("2026-01-01T00:01:00Z");
+    windows["steps"] = json!([{
+        "name":"Upload staged assets", "number":1, "status":"completed", "conclusion":"success",
+        "started_at":"2026-01-01T00:00:30Z", "completed_at":"2026-01-01T00:01:00Z"
+    }]);
+    windows
+}
+
+#[tokio::test]
+async fn windows_assets_require_the_latest_successful_staging_attempt() {
+    let windows = windows_ci_job();
     ci_fixture_with_windows(
         ci_run(),
         vec![ci_job(), windows.clone()],
@@ -488,6 +499,52 @@ async fn windows_assets_require_the_latest_successful_staging_attempt() {
     );
     assert!(
         ci_fixture_with_windows(ci_run(), vec![ci_job()], 200, true, Some(2))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn windows_staging_reuses_retry_clones_but_rejects_new_executions() {
+    let original = windows_ci_job();
+    let mut cloned = original.clone();
+    cloned["id"] = json!(24);
+    cloned["run_attempt"] = json!(3);
+    let mut run = ci_run();
+    run["run_attempt"] = json!(3);
+    ci_fixture_with_windows(
+        run.clone(),
+        vec![ci_job(), original.clone(), cloned.clone()],
+        200,
+        true,
+        Some(2),
+    )
+    .await
+    .unwrap();
+    for (field, value) in [
+        ("started_at", json!("2026-01-01T00:00:01Z")),
+        ("completed_at", json!("2026-01-01T00:01:01Z")),
+        ("steps", json!([])),
+        ("conclusion", json!("failure")),
+        ("status", json!("in_progress")),
+    ] {
+        let mut changed = cloned.clone();
+        changed[field] = value;
+        assert!(
+            ci_fixture_with_windows(
+                run.clone(),
+                vec![ci_job(), original.clone(), changed],
+                200,
+                true,
+                Some(2),
+            )
+            .await
+            .is_err(),
+            "accepted changed {field}"
+        );
+    }
+    assert!(
+        ci_fixture_with_windows(run, vec![ci_job(), cloned], 200, true, Some(2),)
             .await
             .is_err()
     );

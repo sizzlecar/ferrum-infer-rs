@@ -21,6 +21,57 @@ use http_fixture::Server;
 #[path = "unix_bootstrap/candidate.rs"]
 mod candidate;
 
+#[test]
+fn cdn_transfer_fallback_replaces_partial_bytes_and_propagates_failure() {
+    let payload = b"official release payload";
+    let server = Server::responses(BTreeMap::from([
+        ("/official".into(), payload.to_vec().into()),
+        (
+            "/partial".into(),
+            http_fixture::Response {
+                body: b"partial".to_vec(),
+                declared_length: Some(payload.len()),
+            },
+        ),
+    ]));
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh"))
+            .unwrap();
+    // Load actual product functions; only the top-level installation call is omitted.
+    let functions = source.strip_suffix("main \"$@\"\n").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("asset");
+    for (first, second, success) in [
+        ("/missing", "/official", true),
+        ("/partial", "/official", true),
+        ("/official", "/missing", true),
+        ("/missing", "/missing", false),
+    ] {
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                &format!("{functions}\nprotocols='=http,https'\ndownload \"$1\" \"$2\" \"$3\""),
+                "installer-test",
+            ])
+            .arg(format!("{}{first}", server.url))
+            .arg(&destination)
+            .arg(format!("{}{second}", server.url))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), success, "{output:?}");
+        if success {
+            assert_eq!(fs::read(&destination).unwrap(), payload);
+            fs::remove_file(&destination).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("retrying the official GitHub"),
+            first != "/official"
+        );
+    }
+}
+
 struct Fixture {
     root: TempDir,
     executable: PathBuf,

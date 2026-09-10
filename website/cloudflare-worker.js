@@ -123,12 +123,12 @@ const pages = {
     vision: "Make high-performance LLM serving simple to deploy and operate.",
     primary: "View on GitHub",
     secondary: "Start locally",
-    proof: ["MIT licensed", "Metal + CUDA", "Run + OpenAI-compatible serve"],
+    proof: ["MIT licensed", "CPU + Metal + CUDA", "Run + OpenAI-compatible serve"],
     featureTitle: "The direct path from model to API",
     featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
     cards: [
       ["Rust-native product", "A single CLI and server binary with no Python runtime in the supported prebuilt release path."],
-      ["Two accelerator backends", "Apple Silicon uses Metal and GGUF; NVIDIA sm89 uses CUDA with GPTQ or safetensors models."],
+      ["CPU and GPU inference", "Run GGUF models on CPU, Apple Silicon Metal, or supported NVIDIA CUDA GPUs. The installer detects available hardware."],
       ["OpenAI-compatible", "Chat Completions, streaming usage, Responses text, function tools, and structured output."],
       ["Explicit model choice", "Ferrum never silently selects a model. Every run and server starts from a model you named."],
       ["Server controls", "Continuous batching, paged KV cache, prefix cache, session cache, and typed admission controls."],
@@ -183,12 +183,12 @@ const pages = {
     vision: "让高性能大模型服务的部署与运维更简单。",
     primary: "查看 GitHub",
     secondary: "开始使用",
-    proof: ["MIT 开源", "Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
+    proof: ["MIT 开源", "CPU + Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
     featureTitle: "从模型直接到 API",
     featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
     cards: [
       ["Rust 原生产品", "受支持的预编译发布路径只有一个 CLI/Server 二进制，不依赖 Python runtime。"],
-      ["两种加速后端", "Apple Silicon 使用 Metal 与 GGUF；NVIDIA sm89 使用 CUDA 与 GPTQ/safetensors。"],
+      ["CPU 与 GPU 推理", "GGUF 模型可使用 CPU、Apple Silicon Metal 或受支持的 NVIDIA CUDA 显卡。安装脚本会检测可用硬件。"],
       ["OpenAI 兼容", "支持 Chat Completions、streaming usage、Responses 文本、函数工具与结构化输出。"],
       ["明确选择模型", "Ferrum 不会静默选择默认模型；每次 run 与 serve 都从你明确指定的模型开始。"],
       ["服务端能力", "支持 continuous batching、paged KV cache、prefix cache、session cache 与 typed admission。"],
@@ -308,7 +308,7 @@ function render(page) {
 <span class="comment"># Linux x86_64 · Terminal</span>
 <span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
 
-<span class="comment"># Windows x64 · NVIDIA CUDA sm89 · PowerShell</span>
+<span class="comment"># Windows x64 · PowerShell</span>
 <span class="command">irm https://ferrum.pandaailabs.com/install.ps1 | iex</span></pre></div>
       <p class="note">${page.runtimeNote}</p>
       <p class="note">${page.upgradeNote}</p>
@@ -321,17 +321,11 @@ function render(page) {
 <span class="comment"># Linux x86_64 · NVIDIA CUDA sm89</span>
 <span class="command">brew install sizzlecar/ferrum/ferrum-cuda</span></pre></details>
       <p class="note">${page.note}</p>
-      <div class="code-shell"><div class="code-top"><span>${page.firstRunTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># macOS Metal</span>
+      <div class="code-shell"><div class="code-top"><span>${page.firstRunTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># Ferrum 0.9.0+ · macOS / Linux / Windows</span>
 ferrum doctor qwen3.5:4b-q4_k_m
 ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 
-<span class="comment"># Linux CUDA</span>
-ferrum doctor qwen3.5:4b
-ferrum run qwen3.5:4b --disable-thinking
-
-<span class="comment"># Windows CUDA · 6 GB VRAM</span>
-ferrum doctor Qwen/Qwen3.5-2B
-ferrum run Qwen/Qwen3.5-2B --kv-capacity 2048 --max-model-len 2048 --max-num-seqs 1 --max-tokens 512</pre></div>
+ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000</pre></div>
     </div></section>
     <section><div class="wrap split">
       <div><div class="section-head"><h2>${page.platformTitle}</h2><p>${page.platformLead}</p></div><a class="button" href="${REPOSITORY}/blob/main/docs/openai-api-compatibility.md">OpenAI API contract</a></div>
@@ -374,6 +368,30 @@ function installerResponse(request, source) {
 export default {
   async fetch(request) {
     const { pathname } = new URL(request.url);
+    if (pathname.startsWith("/downloads/")) {
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        return new Response("Method Not Allowed\n", { status: 405, headers: { allow: "GET, HEAD" } });
+      }
+      const asset = pathname.match(/^\/downloads\/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\/ferrum-[A-Za-z0-9._-]+)$/);
+      if (!asset) return new Response("Not Found\n", { status: 404 });
+      const headers = new Headers();
+      for (const name of ["range", "if-range", "if-none-match", "if-modified-since"]) {
+        if (request.headers.has(name)) headers.set(name, request.headers.get(name));
+      }
+      // Cloudflare's fetch cache streams large immutable release objects. Do not
+      // buffer or tee installer bodies into the Worker's limited memory.
+      const options = {
+        method: request.method,
+        headers,
+        cf: { cacheEverything: true, cacheTtlByStatus: { "200-299": 31536000, "400-599": -1 } },
+      };
+      const mirrored = await fetch(`https://ferrum-downloads.pandaailabs.com/${asset[1]}`, { ...options, redirect: "manual" });
+      if (mirrored.status !== 404) return mirrored;
+      await mirrored.body?.cancel();
+      // Newly published versions work before an optional R2 mirror is populated.
+      // Resolve GitHub's asset redirect at the edge, keeping downloads on the CDN.
+      return fetch(`${REPOSITORY}/releases/download/${asset[1]}`, { ...options, redirect: "follow" });
+    }
     if (pathname === "/install.sh") {
       return installerResponse(request, shellInstaller);
     }

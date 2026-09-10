@@ -29,7 +29,7 @@ The installer verifies release checksums and adds `~/.local/bin` to your shell's
 PATH. Open a new terminal afterward. [Homebrew and manual installation](#installation)
 are also available.
 
-Windows x64 with an NVIDIA sm89 GPU is supported starting with **0.8.9**.
+Windows x64 supports CPU inference and compatible NVIDIA sm89 GPUs.
 Install from PowerShell:
 
 ```powershell
@@ -38,6 +38,10 @@ irm https://ferrum.pandaailabs.com/install.ps1 | iex
 
 The script verifies the setup checksum, installs for the current user, and adds
 Ferrum to PATH, including the current PowerShell session.
+
+Installers select CPU when a supported GPU is unavailable. Package downloads use
+Cloudflare CDN, retain SHA256 verification, and fall back to GitHub if needed.
+Running the same command again installs the latest formal release.
 
 Inspect the installed binary before downloading weights:
 

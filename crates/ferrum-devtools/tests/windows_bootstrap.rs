@@ -229,6 +229,54 @@ fn download_http_and_size_failures_do_not_leave_an_installable_payload() {
 }
 
 #[test]
+fn cdn_download_falls_back_after_http_or_partial_transfer_failure() {
+    let payload = b"verified official release bytes";
+    let server = Server::responses(BTreeMap::from([
+        ("/official.exe".into(), payload.to_vec().into()),
+        (
+            "/partial.exe".into(),
+            http_fixture::Response {
+                body: b"partial".to_vec(),
+                declared_length: Some(payload.len()),
+            },
+        ),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("setup.exe");
+    for first in ["/missing.exe", "/partial.exe", "/official.exe"] {
+        let output = powershell(
+            &format!(
+                "Invoke-FerrumDownloadWithFallback -Uri {} -FallbackUri {} -Destination {} -ExpectedSize {}",
+                quote(&format!("{}{first}", server.url)),
+                quote(&format!("{}/official.exe", server.url)),
+                quote(destination.to_str().unwrap()),
+                payload.len(),
+            ),
+            &[],
+        );
+        require_success(&output);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).contains("Retrying the official GitHub"),
+            first != "/official.exe"
+        );
+        fs::remove_file(&destination).unwrap();
+    }
+    let output = powershell(
+        &format!(
+            "Invoke-FerrumDownloadWithFallback -Uri {} -FallbackUri {} -Destination {} -ExpectedSize {}",
+            quote(&format!("{}/missing.exe", server.url)),
+            quote(&format!("{}/partial.exe", server.url)),
+            quote(destination.to_str().unwrap()),
+            payload.len(),
+        ),
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(!destination.exists());
+}
+
+#[test]
 fn bootstrap_detects_native_architecture_in_windows_powershell_and_wow64() {
     // An independent OS query is the oracle; process bitness is deliberately
     // different in SysWOW64. Do not assume the CI host's CPU architecture.
@@ -360,6 +408,17 @@ fn bootstrap_selects_same_release_setup_and_rejects_missing_or_foreign_assets() 
     require_success(&result);
     let selected: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(selected["version"], "2.3.4");
+    for asset in ["setup", "checksum"] {
+        let name = selected[asset]["name"].as_str().unwrap();
+        assert_eq!(
+            selected[asset]["cdn_url"],
+            format!("https://ferrum.pandaailabs.com/downloads/v2.3.4/{name}")
+        );
+        assert_eq!(
+            selected[asset]["url"],
+            format!("https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v2.3.4/{name}")
+        );
+    }
     assert_eq!(
         selected["setup"]["name"],
         "ferrum-2.3.4-windows-x86_64-cuda-sm89-setup.exe"
