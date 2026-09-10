@@ -3,9 +3,11 @@
 #include <cuda_fp16.h>
 
 extern "C" __global__ void residual_add_f16(
-    const __half* __restrict__ a,
+    // The vNext residual and recurrent providers permit output to alias a.
+    // Do not promise the compiler that these two pointers are disjoint.
+    const __half* a,
     const __half* __restrict__ b,
-    __half* __restrict__ output,
+    __half* output,
     const int n
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;

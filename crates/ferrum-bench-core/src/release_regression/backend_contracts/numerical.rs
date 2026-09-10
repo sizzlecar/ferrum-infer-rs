@@ -1,4 +1,4 @@
-//! Native dense-hybrid operator conformance. These fixtures exercise the
+//! Dense-hybrid operator conformance. These fixtures exercise the
 //! installed launchers and independent CPU references, including state carry
 //! and guarded writes. They do not certify Marlin, MoE or legacy operators.
 use super::super::contracts::{ContractGroup, ContractTest};
@@ -15,7 +15,7 @@ fn supported(target: &ExecutionTarget) -> bool {
     }
     match (target.backend, target.precision.as_str()) {
         (Backend::Cpu | Backend::Metal, "safetensors-bf16-f32" | "gguf-q4_k_m") => true,
-        (Backend::Cuda, "gguf-q4_k_m") => true,
+        (Backend::Cuda, "safetensors-bf16-f32" | "gguf-q4_k_m") => true,
         (Backend::Cuda | Backend::Metal, "gguf-mixed-4bit") => true,
         _ => false,
     }
@@ -104,6 +104,12 @@ fn names(backend: Backend) -> Vec<String> {
                 "master_rms_norm_matches_f64_with_half_weights_on_cuda",
                 "master_residual_preserves_f32_and_declared_inplace_alias_on_cuda",
             ]),
+            ("transformer::f16_tests", &[
+                "cublas_swiglu_preserves_stage_oracles_offsets_and_tail_rows_on_cuda",
+                "f16_residual_preserves_rounding_alias_and_tail_guards_on_cuda",
+                "f16_embedding_preserves_ids_offsets_and_output_guards_on_cuda",
+                "planar_gated_activations_match_f64_and_preserve_guards_on_cuda",
+            ]),
             ("transformer::attention::native_projection::tests", &[
                 "native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on_cuda",
                 "native_attention_projection_accounts_for_partitions_and_cuda_row_capacity",
@@ -113,7 +119,7 @@ fn names(backend: Backend) -> Vec<String> {
                 "recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on_cuda",
             ]),
             ("transformer::causal_attention::numerical_tests", &[
-                "causal_master_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda",
+                "causal_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda",
                 "causal_master_preserves_f32_hidden_and_both_residual_alias_modes_on_cuda",
             ]),
             ("transformer::causal_attention::rotary_tests", &[

@@ -393,23 +393,28 @@ fn exercise(
 
 #[test]
 #[ignore = "requires an actual CUDA device"]
-fn causal_master_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda() {
+fn causal_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda() {
     let runtime = runtime();
-    let provider = CudaCausalPagedAttentionProvider::new_f32_master(
-        &runtime,
-        runtime.attention_execution_policy(),
-    )
-    .unwrap();
     let stream = runtime.context().default_stream();
-    for (width, prefix) in [(6, 3), (128, 62)] {
-        for gate in [false, true] {
-            let shape = shape(width, gate);
-            let split = exercise(&stream, &provider.functions, shape, prefix, &[3, 1]);
-            let whole = exercise(&stream, &provider.functions, shape, prefix, &[4]);
-            assert_eq!(
-                split, whole,
-                "prefill/decode outputs and KV state differ: {shape:?}"
-            );
+    for provider in [
+        CudaCausalPagedAttentionProvider::new_f32_master(
+            &runtime,
+            runtime.attention_execution_policy(),
+        )
+        .unwrap(),
+        CudaCausalPagedAttentionProvider::new(&runtime, runtime.attention_execution_policy())
+            .unwrap(),
+    ] {
+        for (width, prefix) in [(6, 3), (128, 62)] {
+            for gate in [false, true] {
+                let shape = shape(width, gate);
+                let split = exercise(&stream, &provider.functions, shape, prefix, &[3, 1]);
+                let whole = exercise(&stream, &provider.functions, shape, prefix, &[4]);
+                assert_eq!(
+                    split, whole,
+                    "prefill/decode outputs and KV state differ: {shape:?}"
+                );
+            }
         }
     }
 }

@@ -92,9 +92,11 @@ execution step. Submission receipts cannot substitute for numerical execution.
 The device registry also runs the native dense-hybrid operator suites: block
 decoding, embedding, linear/SwiGLU, precision and residual boundaries, recurrent
 state carry, and paged attention. These assertions use the existing independent
-CPU references and error bounds, with offset/tail/state guards. Their descriptors
-are limited to the tested native GGUF paths and the CPU/Metal dense SafeTensors
-path. They do not cover CUDA Marlin formats, MoE, legacy operators, or whole-model
+CPU references and error bounds, with offset/tail/state guards. The assertions
+also cover the CUDA dense F16 cuBLAS projection/SwiGLU path, dense embedding,
+residual rounding and aliasing, and F16/F32-master attention state carry. Their
+descriptors are limited to the tested native GGUF and dense SafeTensors paths.
+They do not cover entire CUDA Marlin paths, MoE, legacy operators, or whole-model
 state correctness. Repeated assertions shared by numerical and boundary groups
 execute once; both groups still require every registered assertion to succeed.
 The CUDA registry additionally executes the existing symmetric/asymmetric INT4
