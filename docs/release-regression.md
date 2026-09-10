@@ -74,6 +74,11 @@ model's state behavior. Device submission groups separately execute the exact
 CPU, Metal and CUDA Rust tests on their respective backends. CUDA includes
 stateful on-demand capture, rejection, eviction and stale-reference assertions;
 Metal includes ordered transfer/readback and failure before submission.
+The independent legacy CUDA check uploads before context creation, queues GEMM,
+device copies and scaling without intermediate waits, then checks the completion
+event before host readback. It also verifies guarded output regions and reuse of
+the allocations by a subsequent context. Its receipt covers legacy submission
+completion, not vNext graph capture or complete operator numerical coverage.
 
 For a local device check, build the kernel test harness with the required backend
 features and retain Cargo's completed `--no-run --message-format=json` output.
