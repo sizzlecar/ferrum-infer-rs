@@ -3,12 +3,13 @@
 use super::super::{performance, submission};
 use chrono::{DateTime, FixedOffset};
 use ferrum_bench_core::release_regression::{
+    backend_contracts::{self, BackendContractReport, VerifiedBackendContracts},
     performance::{
         performance_check_descriptors, performance_task_schedule, ExpectedPerformanceRun,
         PerformancePolicy,
     },
     submission::SubmissionConfig,
-    Behavior, EvidenceLayer, Obligation, Plan,
+    Backend, Behavior, EvidenceLayer, Obligation, Plan,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +25,7 @@ use std::{
 const SUBMISSION_JOB: &str = "Quality / GPU runtime (metal)";
 const SUBMISSION_EXECUTE: &str = "Require MetalContext submission and completion outputs";
 const SUBMISSION_UPLOAD: &str = "Save raw numerical evidence";
+const DEVICE_EXECUTE: &str = "Execute required device submission contracts";
 const PERFORMANCE_JOB: &str = "Metal release models";
 const PERFORMANCE_PREPARE: &str = "Prepare registered performance tasks";
 const PERFORMANCE_REGISTER: &str = "Save registered performance tasks";
@@ -38,22 +40,49 @@ const JSON_LIMIT: u64 = 4 * 1024 * 1024;
 #[derive(Default)]
 pub(super) struct CiEvidence {
     submission: Option<submission::VerifiedSubmission>,
+    device_contracts: Vec<VerifiedBackendContracts>,
     // Keep the actual verified obligation, so evidence cannot be rebound later.
     performance: BTreeMap<usize, Obligation>,
 }
 impl CiEvidence {
     pub(super) fn covers(&self, index: usize, obligation: &Obligation) -> bool {
         match obligation.layer {
-            EvidenceLayer::BackendNumerics => self.submission.as_ref().is_some_and(|verified| {
-                obligation.behavior == Behavior::SubmissionCompletion
-                    && obligation.scope == verified.scope()
-                    && obligation.entrypoints.is_empty()
-                    && obligation.checkers == [verified.checker_id()]
-            }),
+            EvidenceLayer::BackendNumerics => {
+                self.submission.as_ref().is_some_and(|verified| {
+                    obligation.behavior == Behavior::SubmissionCompletion
+                        && obligation.scope == verified.scope()
+                        && obligation.entrypoints.is_empty()
+                        && obligation.checkers == [verified.checker_id()]
+                }) || self
+                    .device_contracts
+                    .iter()
+                    .any(|verified| verified.covers(obligation))
+            }
             EvidenceLayer::Performance => self.performance.get(&index) == Some(obligation),
             _ => false,
         }
     }
+}
+
+fn device_producer(backend: Backend) -> (&'static str, &'static str) {
+    match backend {
+        Backend::Cpu => ("backend-numerics-cpu", "Quality / CPU (Linux)"),
+        Backend::Metal => ("backend-numerics-metal", "Quality / GPU runtime (metal)"),
+        Backend::Cuda => ("backend-numerics-cuda", "Quality / GPU runtime (cuda)"),
+    }
+}
+
+fn required_devices(obligations: &[Obligation]) -> Vec<Backend> {
+    [Backend::Cpu, Backend::Metal, Backend::Cuda]
+        .into_iter()
+        .filter(|backend| {
+            obligations.iter().any(|obligation| {
+                obligation.layer == EvidenceLayer::BackendNumerics
+                    && obligation.behavior == Behavior::SubmissionCompletion
+                    && obligation.scope == backend_contracts::submission_scope(*backend)
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -585,13 +614,16 @@ async fn load_inner(
     metal_binary_sha: &str,
 ) -> Result<CiEvidence, String> {
     let needs_submission = plan.obligations.iter().any(|o| {
-        o.layer == EvidenceLayer::BackendNumerics && o.behavior == Behavior::SubmissionCompletion
+        o.layer == EvidenceLayer::BackendNumerics
+            && o.behavior == Behavior::SubmissionCompletion
+            && o.scope == ferrum_bench_core::release_regression::submission::submission_scope()
     });
+    let devices = required_devices(&plan.obligations);
     let schedule = performance_task_schedule(plan);
     if !schedule.unsupported_obligations.is_empty() {
         return Err("release performance schedule contains unsupported obligations".into());
     }
-    if !needs_submission && schedule.runs.is_empty() {
+    if !needs_submission && devices.is_empty() && schedule.runs.is_empty() {
         return Ok(CiEvidence::default());
     }
     let github = Github {
@@ -651,6 +683,34 @@ async fn load_inner(
         );
         evidence.submission = Some(verified);
         consumed.push(raw);
+    }
+    for backend in devices {
+        let (name, job) = device_producer(backend);
+        // Legacy Metal and vNext device assertions share the same immutable
+        // producer archive. Reuse it without accepting one route for the other.
+        if !consumed.iter().any(|raw| raw.metadata["name"] == name) {
+            consumed.push(
+                artifact(
+                    &github, &run, &inventory, &jobs, name, job, run_id, candidate,
+                )
+                .await?,
+            );
+        }
+        let raw = consumed
+            .iter()
+            .find(|raw| raw.metadata["name"] == name)
+            .unwrap();
+        uploaded_during(
+            &raw.metadata,
+            &raw.producer,
+            DEVICE_EXECUTE,
+            SUBMISSION_UPLOAD,
+        )?;
+        let report: BackendContractReport =
+            super::read(&raw.directory.path().join("contracts.json"))?;
+        evidence
+            .device_contracts
+            .push(backend_contracts::verify_report(backend, &report)?);
     }
     if !schedule.runs.is_empty() {
         let registered = artifact(

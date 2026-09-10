@@ -194,6 +194,11 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
     for descriptor in model_check_descriptors()
         .into_iter()
         .chain(contract_check_descriptors())
+        .chain(
+            ferrum_bench_core::release_regression::backend_contracts::check_descriptors(
+                &input.required_targets,
+            ),
+        )
         .chain(distribution_check_descriptors())
         .chain(submission_check_descriptors(&input.required_targets))
         .chain(performance_check_descriptors(&input.required_targets))

@@ -220,10 +220,11 @@ fn descriptors_preserve_actual_entrypoints_and_leave_unimplemented_groups_unboun
             .unwrap();
         assert!(!descriptor.entrypoints.contains(&Entrypoint::Run));
     }
-    assert!(!descriptors.iter().any(|descriptor| matches!(
-        descriptor.behavior,
-        Behavior::KernelNumerics | Behavior::KernelBoundaries | Behavior::ArchitectureState
-    )));
+    // Typed preparation/state/layout contracts now have CPU assertions. They
+    // still cannot certify actual backend kernel numerical outputs.
+    assert!(!descriptors
+        .iter()
+        .any(|descriptor| descriptor.behavior == Behavior::KernelNumerics));
 }
 
 #[test]

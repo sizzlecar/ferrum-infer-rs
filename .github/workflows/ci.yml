@@ -117,6 +117,9 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.scope == 'code'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -223,6 +226,37 @@ jobs:
           path: |
             ${{ runner.temp }}/contract-checks.json
             ${{ runner.temp }}/contract-checks.logs/
+          retention-days: 14
+
+      - name: Execute required device submission contracts
+        run: |
+          mkdir -p "$RUNNER_TEMP/backend-numerics"
+          cargo run --locked -p ferrum-devtools --bin contract_checks -- \
+            --backend cpu --artifacts "$RUNNER_TEMP/contract-artifacts.jsonl" \
+            --output "$RUNNER_TEMP/backend-numerics/contracts.json"
+
+      - name: Record numerical evidence producer
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          job_id=$(jq -er --arg suffix "CPU (Linux)" \
+            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          mkdir -p "$RUNNER_TEMP/backend-numerics"
+          jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
+            '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
+            > "$RUNNER_TEMP/backend-numerics/ci-origin.json"
+
+      - name: Save raw numerical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: backend-numerics-cpu
+          if-no-files-found: error
+          path: ${{ runner.temp }}/backend-numerics/
           retention-days: 14
 
       # --all-targets does not include doctests.
@@ -453,6 +487,20 @@ jobs:
             --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/submission.json"
 
+      - name: Execute required device submission contracts
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          features="$BACKEND"
+          if [[ "$BACKEND" == cuda ]]; then
+            features="cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+          fi
+          cargo test --locked -p ferrum-kernels --lib --features "$features" \
+            --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"
+          cargo run --locked -p ferrum-devtools --bin contract_checks -- \
+            --backend "$BACKEND" --artifacts "$RUNNER_TEMP/device-contract-artifacts.jsonl" \
+            --output "$RUNNER_TEMP/backend-numerics/contracts.json"
+
       - name: Record numerical evidence producer
         if: always()
         env:
@@ -475,7 +523,7 @@ jobs:
           overwrite: true
           name: backend-numerics-${{ matrix.backend }}
           if-no-files-found: error
-          path: ${{ runner.temp }}/backend-numerics/*.json
+          path: ${{ runner.temp }}/backend-numerics/
           retention-days: 14
 
   windows:

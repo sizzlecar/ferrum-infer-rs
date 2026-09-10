@@ -67,6 +67,24 @@ allocate GPUs. Existing CPU, Metal and CUDA checks retain their required outcome
 requires the [real-device numerical lane](backend-numerics.md); the initial
 RMSNorm checks do not satisfy the entire kernel or architecture obligation set.
 
+The CPU contract registry executes preparation and wire identity checks, declared
+state/operation boundaries, physical layout limits, and reference CPU recurrent
+arithmetic. These shared assertions do not certify GPU arithmetic or a complete
+model's state behavior. Device submission groups separately execute the exact
+CPU, Metal and CUDA Rust tests on their respective backends. CUDA includes
+stateful on-demand capture, rejection, eviction and stale-reference assertions;
+Metal includes ordered transfer/readback and failure before submission.
+
+For a local device check, build the kernel test harness with the required backend
+features and retain Cargo's completed `--no-run --message-format=json` output.
+Pass that file to `contract_checks --backend cpu|metal|cuda --artifacts PATH
+--output PATH`. The checker verifies that every registered assertion exists and
+executes it, including tests normally ignored by the workspace suite. A missing
+GPU fails its registered device tests. CI uploads the report and raw harness
+logs; the release consumer also verifies the actual successful producer job and
+execution step. These receipts cover vNext submission/completion only and cannot
+be substituted for another backend, legacy execution or kernel numerical checks.
+
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported
 coverage gap, selected and omitted profile, and unknown estimate. The current
