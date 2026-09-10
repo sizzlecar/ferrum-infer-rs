@@ -293,6 +293,8 @@ jobs:
             > "$RUNNER_TEMP/ci-origin.json"
           cp "$RUNNER_TEMP/ci-origin.json" "$RUNNER_TEMP/performance-tasks/ci-origin.json"
           if [ "$(jq '.performance_tasks.runs | length' "$RUNNER_TEMP/plan/release-plan.json")" = 0 ]; then
+            jq '{status: (if .plan.deferred_performance == null then "not_required" else "deferred" end), deferred_performance: .plan.deferred_performance}' \
+              "$RUNNER_TEMP/plan/release-plan.json" > "$RUNNER_TEMP/performance-tasks/scheduling.json"
             echo 'active=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi

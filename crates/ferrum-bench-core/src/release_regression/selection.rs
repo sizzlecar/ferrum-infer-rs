@@ -558,10 +558,15 @@ fn record_cost(plan: &mut Plan) -> Result<(), String> {
 /// Plan coverage from declared capabilities and complete change impact. Gaps are
 /// retained for review; a successful return means a plan was made, not a release passed.
 pub fn plan(input: &PlanInput) -> Result<Plan, String> {
+    if matches!(&input.release_performance, ReleasePerformancePolicy::Deferred { reason } if !nonblank(reason))
+    {
+        return Err("deferred release performance requires a nonblank, unpadded reason".into());
+    }
     let mut result = Plan {
         stage: input.stage,
         impact: input.impact.clone(),
         obligations: Vec::new(),
+        deferred_performance: None,
         selected: Vec::new(),
         omitted: Vec::new(),
         gaps: Vec::new(),
@@ -781,6 +786,22 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                         "declared reasoning capability; runtime must verify the loaded capability and its matching positive or absence observation");
                 }
             }
+        }
+    }
+
+    if let (Stage::Release, ReleasePerformancePolicy::Deferred { reason }) =
+        (input.stage, &input.release_performance)
+    {
+        let (deferred, required): (Vec<_>, Vec<_>) = result
+            .obligations
+            .drain(..)
+            .partition(|o| o.layer == EvidenceLayer::Performance);
+        result.obligations = required;
+        if !deferred.is_empty() {
+            result.deferred_performance = Some(DeferredPerformance {
+                reason: reason.clone(),
+                obligations: deferred,
+            });
         }
     }
 

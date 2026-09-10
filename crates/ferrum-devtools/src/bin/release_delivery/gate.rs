@@ -13,7 +13,7 @@ use ferrum_bench_core::{
             verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_FUNCTIONAL_CAPACITY,
         },
         Backend, Behavior, CheckDescriptor, EvidenceLayer, Gap, Obligation, ObligationScope, Plan,
-        Stage,
+        ReleasePerformancePolicy, Stage,
     },
 };
 use serde::Deserialize;
@@ -110,6 +110,35 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         .map_err(|_| "cannot resolve publication workspace")?;
     if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != candidate {
         return Err("workspace HEAD does not match the plan candidate".into());
+    }
+    if plan.deferred_performance.is_some() {
+        let catalog = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "cat-file",
+                "blob",
+                &format!("{candidate}:docs/release-regression-catalog.json"),
+            ])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|_| "cannot read candidate release performance policy")?;
+        if !catalog.status.success()
+            || text(&document["provenance"], "catalog_sha256")?
+                != format!("{:x}", Sha256::digest(&catalog.stdout))
+        {
+            return Err(
+                "deferred performance plan must use the candidate's committed catalog".into(),
+            );
+        }
+        let catalog: Value = serde_json::from_slice(&catalog.stdout)
+            .map_err(|_| "invalid candidate release catalog")?;
+        verify_performance_policy(&plan, &catalog)?;
     }
     // The candidate's reachable base can be older than today's main releases.
     // Reject a historical downgrade before any public channel can be mutated.
@@ -266,6 +295,7 @@ fn release_plan(document: &Value) -> Result<(Plan, String, ModelTaskSchedule), S
     }
     let plan: Plan = serde_json::from_value(document["plan"].clone())
         .map_err(|e| format!("invalid typed release plan: {e}"))?;
+    plan.validate_performance_deferral()?;
     let candidate = text(&document["provenance"], "candidate")?;
     if !hex(&candidate, 40) || plan.stage != Stage::Release {
         return Err("release plan has invalid candidate or stage".into());
@@ -300,6 +330,30 @@ fn release_plan(document: &Value) -> Result<(Plan, String, ModelTaskSchedule), S
         return Err("plan model schedule is stale, unsupported or empty".into());
     }
     Ok((plan, candidate, schedule))
+}
+
+fn verify_performance_policy(plan: &Plan, catalog: &Value) -> Result<(), String> {
+    plan.validate_performance_deferral()?;
+    let Some(deferred) = &plan.deferred_performance else {
+        return Ok(());
+    };
+    let policy: ReleasePerformancePolicy = catalog
+        .get("release_performance")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| "invalid committed release performance policy")?
+        .unwrap_or_default();
+    if policy
+        != (ReleasePerformancePolicy::Deferred {
+            reason: deferred.reason.clone(),
+        })
+    {
+        return Err(
+            "performance deferral differs from the candidate's committed release policy".into(),
+        );
+    }
+    Ok(())
 }
 
 async fn distribution(path: &Path, version: &str, candidate: &str) -> Result<Distribution, String> {

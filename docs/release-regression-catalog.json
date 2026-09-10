@@ -1,4 +1,8 @@
 {
+  "release_performance": {
+    "mode": "deferred",
+    "reason": "Prioritize correct installation and first use for this release; complete comparative performance measurements after release. Numerical correctness, model behavior, capacity safety and installation remain required."
+  },
   "profiles": [
     {
       "id": "quick-start-metal",

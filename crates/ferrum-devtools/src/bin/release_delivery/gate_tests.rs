@@ -38,6 +38,7 @@ fn task() -> ExpectedModelRun {
 }
 fn make_plan(task: &ExpectedModelRun) -> Plan {
     Plan {
+        deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
             areas: vec![],
@@ -785,4 +786,38 @@ async fn unknown_published_inventory_is_never_treated_as_no_previous_release() {
             .await
             .is_err());
     }
+}
+
+#[test]
+fn performance_deferral_requires_the_committed_policy_and_cannot_hide_correctness() {
+    use ferrum_bench_core::release_regression::DeferredPerformance;
+    let mut plan = make_plan(&task());
+    let mut performance = plan.obligations[0].clone();
+    performance.behavior = Behavior::Performance;
+    performance.layer = EvidenceLayer::Performance;
+    let reason = "Complete comparison after the usability release";
+    plan.deferred_performance = Some(DeferredPerformance {
+        reason: reason.into(),
+        obligations: vec![performance],
+    });
+    assert!(verify_performance_policy(&plan, &json!({})).is_err());
+    assert!(
+        verify_performance_policy(&plan, &json!({"release_performance":{"mode":"required"}}))
+            .is_err()
+    );
+    let catalog = json!({"release_performance":{"mode":"deferred","reason":reason}});
+    verify_performance_policy(&plan, &catalog).unwrap();
+    release_plan(&plan_document(&plan)).unwrap();
+    assert!(verify_performance_policy(
+        &plan,
+        &json!({"release_performance":{"mode":"deferred","reason":"unrelated reason"}})
+    )
+    .is_err());
+    plan.deferred_performance
+        .as_mut()
+        .unwrap()
+        .obligations
+        .push(plan.obligations[0].clone());
+    assert!(verify_performance_policy(&plan, &catalog).is_err());
+    assert!(release_plan(&plan_document(&plan)).is_err());
 }

@@ -174,7 +174,11 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
     for key in input.keys() {
         if !matches!(
             key.as_str(),
-            "profiles" | "quick_start_profile_ids" | "required_targets" | "checks"
+            "profiles"
+                | "quick_start_profile_ids"
+                | "required_targets"
+                | "checks"
+                | "release_performance"
         ) {
             return Err(format!("unknown catalog field {key:?}"));
         }
@@ -219,10 +223,10 @@ fn render_summary(document: &Value) -> String {
     let count = |key: &str| plan[key].as_array().map_or(0, Vec::len);
     format!(
         "## Regression plan\n\nPlanning only; no model or GPU execution is certified.\n\n\
-         Stage: `{}`. Required behaviors: {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
+         Stage: `{}`. Required behaviors: {}. Deferred performance measurements (not passed): {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
          Missing estimates remain unknown. Review scope, selections and gaps before allocating hardware.\n\n\
          <details><summary>Complete plan and provenance</summary>\n\n```json\n{}\n```\n\n</details>\n",
-        document["stage"].as_str().unwrap_or("unknown"), count("obligations"), count("selected"), count("gaps"),
+        document["stage"].as_str().unwrap_or("unknown"), count("obligations"), plan["deferred_performance"]["obligations"].as_array().map_or(0, Vec::len), count("selected"), count("gaps"),
         serde_json::to_string_pretty(document).expect("JSON value serializes")
     )
 }

@@ -46,6 +46,7 @@ fn selected(profile: ModelProfile, obligations: Vec<usize>) -> SelectedProfile {
 
 fn make_plan(obligations: Vec<Obligation>, selected: Vec<SelectedProfile>) -> Plan {
     Plan {
+        deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
             areas: Vec::new(),
@@ -221,6 +222,7 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
     )));
     let owner = profile("selected", Backend::Cpu);
     let input = PlanInput {
+        release_performance: Default::default(),
         stage: Stage::Release,
         impact: Impact {
             areas: Vec::new(),
@@ -304,6 +306,7 @@ fn reasoning_schedule_rejects_unknown_or_wrong_capability_owners() {
         let mut owner = profile("wrong-owner", Backend::Cpu);
         owner.reasoning_protocol = capability;
         let mut plan = Plan {
+            deferred_performance: None,
             stage: Stage::PullRequest,
             impact: Impact {
                 areas: vec![],
