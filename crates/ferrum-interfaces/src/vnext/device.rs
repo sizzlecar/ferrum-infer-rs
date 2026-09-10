@@ -13,13 +13,17 @@ use ferrum_types::AttentionExecutionPolicy;
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
-    ReusableExecutionBucketId, StaticWeightTransformPlan, VNextError, WeightComponentPayload,
-    WeightComponentSegments, WeightComponentSpec,
+    ReusableExecutionBucketId, ReusableExecutionCatalogLifetime, StaticWeightTransformPlan,
+    VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
 /// executable preparation lifecycle.
 pub const DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID: &str = "capability.device.reusable_execution.v1";
+/// A runtime may extend its bounded executable cache between completed real
+/// submissions. This capability does not grant mutation of the model plan.
+pub const DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID: &str =
+    "capability.device.reusable_execution.on_demand.v1";
 /// Backend-neutral declaration that a composition can compile a native
 /// invocation-adaptive attention provider.
 pub const DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID: &str =
@@ -855,6 +859,7 @@ pub struct DeviceReusableExecutionObservation {
     cache_hit_segments: u64,
     cached_rejected_segments: u64,
     capture_rejected_segments: u64,
+    warmup_required_segments: u64,
     quiescence_deferred_segments: u64,
     capacity_deferred_segments: u64,
     outside_preparation_segments: u64,
@@ -891,6 +896,10 @@ impl DeviceReusableExecutionObservation {
 
     pub fn observe_quiescence_deferred_segment(&mut self) {
         self.quiescence_deferred_segments = self.quiescence_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_warmup_required_segment(&mut self) {
+        self.warmup_required_segments = self.warmup_required_segments.saturating_add(1);
     }
 
     pub fn observe_capacity_deferred_segment(&mut self) {
@@ -944,6 +953,10 @@ impl DeviceReusableExecutionObservation {
         self.quiescence_deferred_segments
     }
 
+    pub const fn warmup_required_segments(self) -> u64 {
+        self.warmup_required_segments
+    }
+
     pub const fn capacity_deferred_segments(self) -> u64 {
         self.capacity_deferred_segments
     }
@@ -986,6 +999,8 @@ pub struct DeviceReusableExecutionTrim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeviceReusableExecutionPlan {
     maximum_executables: usize,
+    #[serde(skip_serializing_if = "ReusableExecutionCatalogLifetime::is_startup_sealed")]
+    catalog_lifetime: ReusableExecutionCatalogLifetime,
 }
 
 impl DeviceReusableExecutionPlan {
@@ -997,7 +1012,18 @@ impl DeviceReusableExecutionPlan {
         }
         Ok(Self {
             maximum_executables,
+            catalog_lifetime: ReusableExecutionCatalogLifetime::StartupSealed,
         })
+    }
+
+    pub fn on_demand(maximum_executables: usize) -> Result<Self, super::VNextError> {
+        let mut plan = Self::new(maximum_executables)?;
+        plan.catalog_lifetime = ReusableExecutionCatalogLifetime::OnDemandBounded;
+        Ok(plan)
+    }
+
+    pub const fn catalog_lifetime(self) -> ReusableExecutionCatalogLifetime {
+        self.catalog_lifetime
     }
 
     pub const fn maximum_executables(self) -> usize {
@@ -1256,6 +1282,7 @@ pub enum DeviceReusableExecutionProgramGapReason {
     ReusableAddressScopeConflict,
     CaptureRejected,
     CachedCaptureRejected,
+    WarmupRequired,
     QuiescenceDeferred,
     CapacityDeferred,
     Evicted,
@@ -1271,6 +1298,7 @@ impl DeviceReusableExecutionProgramGapReason {
             Self::ReusableAddressScopeConflict => "reusable_address_scope_conflict",
             Self::CaptureRejected => "capture_rejected",
             Self::CachedCaptureRejected => "cached_capture_rejected",
+            Self::WarmupRequired => "warmup_required",
             Self::QuiescenceDeferred => "quiescence_deferred",
             Self::CapacityDeferred => "capacity_deferred",
             Self::Evicted => "evicted",
@@ -1568,11 +1596,12 @@ pub enum DeviceReusableExecutionPreparationState {
     Ready,
 }
 
-/// Backend receipt for the explicit configure -> prepare -> seal lifecycle.
+/// Backend receipt for the configured preparation lifecycle.
 ///
-/// Captures happen only between `Preparing` and `Ready`. Once sealed, a
-/// backend must replay a resident executable or use eager execution; it must
-/// not compile new work on a product request.
+/// Startup preparation transitions through `Preparing` to sealed `Ready`.
+/// On-demand preparation starts `Ready` with an empty bounded cache and may
+/// prepare recurring real work after its warmup completes. The device plan
+/// declares which lifecycle applies; readiness alone does not authorize capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeviceReusableExecutionPreparation {
     state: DeviceReusableExecutionPreparationState,

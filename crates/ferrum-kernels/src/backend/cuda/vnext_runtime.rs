@@ -3657,6 +3657,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             for _ in 0..preparation.quiescence_deferred_segments() {
                 replay_observation.observe_quiescence_deferred_segment();
             }
+            for _ in 0..preparation.warmup_required_segments() {
+                replay_observation.observe_warmup_required_segment();
+            }
             for _ in 0..preparation.capacity_deferred_segments() {
                 replay_observation.observe_capacity_deferred_segment();
             }
@@ -4192,6 +4195,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
 }
 
 #[cfg(test)]
+mod on_demand_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "vllm-marlin")]
@@ -4516,7 +4522,7 @@ mod tests {
         assert_eq!(transfers[2].destination_offset_bytes, group_capacity);
     }
 
-    fn command(operation: &'static str) -> CudaDeviceCommand {
+    pub(super) fn command(operation: &'static str) -> CudaDeviceCommand {
         CudaDeviceCommand {
             runtime_instance: 1,
             operation,

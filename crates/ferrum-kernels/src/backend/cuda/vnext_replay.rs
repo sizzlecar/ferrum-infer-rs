@@ -27,7 +27,7 @@ use ferrum_interfaces::vnext::{
 use sha2::{Digest, Sha256};
 
 use crate::backend::reusable_execution::{
-    discover_reusable_segments, plan_bounded_reusable_execution,
+    discover_reusable_segments, plan_bounded_reusable_execution, warmup::DemandWarmup,
     ReusableExecutionPreparationTracker,
 };
 
@@ -843,6 +843,7 @@ pub(crate) struct CudaExecutableCache {
     rejected: HashMap<CudaExecutableSegmentKey, u64>,
     programs: HashMap<DeviceReusableExecutionProgramId, CudaExecutableProgram>,
     preparation: ReusableExecutionPreparationTracker,
+    warmup: DemandWarmup<CudaExecutableSegmentKey>,
     clock: u64,
 }
 
@@ -1052,6 +1053,7 @@ pub(crate) struct CudaExecutablePreparation {
     capture_rejected_segments: usize,
     cached_rejected_segments: usize,
     quiescence_deferred_segments: usize,
+    warmup_required_segments: usize,
     capacity_deferred_segments: usize,
     outside_preparation_segments: usize,
     evicted_segments: usize,
@@ -1083,6 +1085,10 @@ impl CudaExecutablePreparation {
         self.quiescence_deferred_segments
     }
 
+    pub(crate) fn warmup_required_segments(&self) -> usize {
+        self.warmup_required_segments
+    }
+
     pub(crate) fn capacity_deferred_segments(&self) -> usize {
         self.capacity_deferred_segments
     }
@@ -1110,6 +1116,7 @@ impl CudaExecutableCache {
             rejected: HashMap::new(),
             programs: HashMap::new(),
             preparation: ReusableExecutionPreparationTracker::default(),
+            warmup: DemandWarmup::default(),
             clock: 0,
         }
     }
@@ -1204,6 +1211,25 @@ impl CudaExecutableCache {
             }
             return Ok(report);
         }
+        let warmup_required = if self.preparation.is_on_demand() {
+            let missing = candidates
+                .iter()
+                .filter(|candidate| {
+                    !self.entries.contains_key(&candidate.key)
+                        && !self.rejected.contains_key(&candidate.key)
+                })
+                .map(|candidate| candidate.key)
+                .collect::<Vec<_>>();
+            self.warmup.required(
+                &missing,
+                self.preparation
+                    .maximum_executables()
+                    .expect("configured cache capacity"),
+                capture_allowed,
+            )
+        } else {
+            Default::default()
+        };
         if !capture_allowed {
             report.quiescence_deferred_segments = candidates
                 .len()
@@ -1221,8 +1247,17 @@ impl CudaExecutableCache {
             return Ok(report);
         }
 
+        report.warmup_required_segments = warmup_required.len();
+        for key in &warmup_required {
+            report.candidate_gaps.insert(
+                *key,
+                DeviceReusableExecutionProgramGapReason::WarmupRequired,
+            );
+        }
+
         let candidate_keys = candidates
             .iter()
+            .filter(|candidate| !warmup_required.contains(&candidate.key))
             .map(|candidate| candidate.key)
             .collect::<Vec<_>>();
         let resident_last_used = self
@@ -1247,6 +1282,16 @@ impl CudaExecutableCache {
             );
         }
 
+        // During live serving, release quiescent LRU victims before allocating
+        // replacements. Otherwise the transient old-plus-new graph inventory
+        // could exceed the resolved executable capacity.
+        if self.preparation.is_on_demand() {
+            for key in plan.required_evictions(plan.admitted_misses().len()) {
+                if self.evict_entry_and_update_programs(*key)? {
+                    report.evicted_segments += 1;
+                }
+            }
+        }
         let mut captured = Vec::with_capacity(plan.admitted_misses().len());
         for key in plan.admitted_misses().iter().copied() {
             let candidate = candidates
@@ -1563,10 +1608,41 @@ impl CudaExecutableCache {
         if let Some(current) = self.programs.get(capture.program_id()) {
             current.validate_monotonic_update(&program)?;
         }
-        // The catalog is private while preparation is open. A validated
-        // replacement can only retain existing resident identities or fill
-        // previously typed gaps. Explicit eviction creates its own tombstone.
+        // Preserve resident identities across updates. With on-demand work,
+        // do not retain an unbounded history of empty program tombstones.
+        if self.preparation.is_on_demand() && program.segments.is_empty() {
+            self.programs.remove(capture.program_id());
+            return Ok(());
+        }
         self.programs.insert(capture.program_id().clone(), program);
+        if self.preparation.is_on_demand() {
+            let capacity = self
+                .preparation
+                .maximum_executables()
+                .expect("configured cache capacity");
+            while self.programs.len() > capacity {
+                let victim = self
+                    .programs
+                    .iter()
+                    .filter(|(id, _)| *id != capture.program_id())
+                    .min_by_key(|(id, program)| {
+                        (
+                            program
+                                .segments
+                                .iter()
+                                .filter_map(|segment| {
+                                    self.entries.get(&segment.key).map(|entry| entry.last_used)
+                                })
+                                .max()
+                                .unwrap_or(0),
+                            *id,
+                        )
+                    })
+                    .map(|(id, _)| id.clone())
+                    .expect("capacity overflow has another program");
+                self.programs.remove(&victim);
+            }
+        }
         Ok(())
     }
 

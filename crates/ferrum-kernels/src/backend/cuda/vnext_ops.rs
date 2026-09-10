@@ -28,7 +28,8 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CONSTANT_SCALE_F16_CAPABILITY_ID,
     DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID,
-    DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
@@ -101,6 +102,8 @@ pub fn cuda_vnext_runtime_config(
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
+        include_str!("../reusable_execution.rs").as_bytes(),
+        include_str!("../reusable_execution/warmup.rs").as_bytes(),
         include_str!("vnext_ops.rs").as_bytes(),
         include_str!("vnext_ops/selection.rs").as_bytes(),
         include_str!("vnext_ops/transformer.rs").as_bytes(),
@@ -210,6 +213,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+        DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)

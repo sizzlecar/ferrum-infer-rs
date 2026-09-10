@@ -228,6 +228,10 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION") {
             self.backend.enable_reusable_execution = parse_presence_bool(value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION_PREPARATION")
+        {
+            self.backend.reusable_execution_capture.preparation = value.parse()?;
+        }
         if let Some(value) =
             runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS")
         {
@@ -780,7 +784,56 @@ pub const MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH: usize = 32;
 pub const DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH: usize =
     MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH;
 
-/// Product policy for reusable-execution startup capture.
+/// When a supported backend prepares reusable device programs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReusableExecutionPreparationMode {
+    /// Select on-demand preparation when declared by the runtime, otherwise startup.
+    #[default]
+    Auto,
+    /// Prepare and validate the configured matrix before accepting requests.
+    Startup,
+    /// Warm up with ordinary requests, then capture recurring shapes within the budget.
+    OnDemand,
+}
+
+impl ReusableExecutionPreparationMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Startup => "startup",
+            Self::OnDemand => "on_demand",
+        }
+    }
+
+    pub fn resolve(self, on_demand_supported: bool) -> Result<Self, String> {
+        match (self, on_demand_supported) {
+            (Self::Auto, true) => Ok(Self::OnDemand),
+            (Self::Auto, false) => Ok(Self::Startup),
+            (Self::OnDemand, false) => Err(
+                "runtime.reusable_execution_preparation=on_demand requires a runtime declaring on-demand reusable execution support".to_owned(),
+            ),
+            (mode, _) => Ok(mode),
+        }
+    }
+}
+
+impl std::str::FromStr for ReusableExecutionPreparationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            "startup" => Ok(Self::Startup),
+            "on_demand" => Ok(Self::OnDemand),
+            _ => {
+                Err("reusable execution preparation must be auto, startup, or on_demand".to_owned())
+            }
+        }
+    }
+}
+
+/// Product policy for bounded reusable-execution capture.
 ///
 /// `None` requests an automatically resolved exact-width matrix. Explicit
 /// widths let operators bound startup work deliberately; widths omitted from
@@ -792,6 +845,8 @@ pub const DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH: usize =
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReusableExecutionCaptureConfig {
+    /// Preparation lifecycle, resolved from declared device capabilities.
+    pub preparation: ReusableExecutionPreparationMode,
     /// Exact concurrent decode widths to prepare. `None` selects automatic
     /// resolution from the admitted runtime capacity.
     pub exact_decode_widths: Option<Vec<usize>>,
@@ -803,6 +858,7 @@ pub struct ReusableExecutionCaptureConfig {
 impl Default for ReusableExecutionCaptureConfig {
     fn default() -> Self {
         Self {
+            preparation: ReusableExecutionPreparationMode::default(),
             exact_decode_widths: None,
             maximum_automatic_exact_decode_width: DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,
         }

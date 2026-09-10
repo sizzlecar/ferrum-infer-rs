@@ -805,7 +805,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             ))
                         }
                     };
-                let catalog = match self.reusable_execution_catalog.get() {
+                let catalog_snapshot = self.reusable_execution_catalog.read().clone();
+                let catalog = match catalog_snapshot.as_deref() {
                     Some(catalog) if catalog.lane_epoch == self.lane.reusable_execution_epoch() => {
                         catalog
                     }

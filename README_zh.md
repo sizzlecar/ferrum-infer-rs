@@ -113,6 +113,19 @@ macOS 和 Linux 示例使用 `--disable-thinking`，让首次回答简短直接�
 `ferrum doctor <MODEL>` 会解析模型来源并打印下一条 `run`、`serve` 命令，
 不会下载模型或启动推理引擎。
 
+vNext 的 `run` 和 `serve` 共用工作目录下 `ferrum.toml` 中的可选设置：
+
+```toml
+[runtime]
+reusable_execution_preparation = "auto" # auto、startup、on_demand
+```
+
+`auto` 在声明支持的运行时（目前为 CUDA）使用有容量上限的按需准备：
+新形状先普通执行，后续再次出现时才准备并复用设备程序，因此首次使用的延迟可能高于稳定运行时。
+`startup` 在服务就绪前预备配置指定的形状；其他后端保持原有行为，显式指定不支持的
+`on_demand` 会报错。设置 `reusable_execution = false` 可关闭设备程序准备。
+这些选项不改变请求准入、排队或模型数值策略。
+
 ## 功能
 
 - 一个 Rust 二进制同时提供 `ferrum run` 和 `ferrum serve`。

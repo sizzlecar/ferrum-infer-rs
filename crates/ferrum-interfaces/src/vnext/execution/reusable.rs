@@ -430,13 +430,24 @@ pub enum ReusableExecutionCatalogMissPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ReusableExecutionCatalogLifetime {
     StartupSealed,
+    /// Publish only programs encountered by real work, within the resolved
+    /// executable capacity. A miss remains eligible for ordinary execution.
+    OnDemandBounded,
 }
 
-/// Fully resolved, fingerprinted logical startup-capture contract.
+impl ReusableExecutionCatalogLifetime {
+    pub const fn is_startup_sealed(&self) -> bool {
+        matches!(self, Self::StartupSealed)
+    }
+}
+
+/// Fully resolved, fingerprinted logical capture contract.
 ///
 /// Physical catalog receipts remain authoritative for what was actually made
-/// resident. Runtime contexts producing another pages/topology identity use
-/// the explicit catalog-miss policy.
+/// resident. Startup-sealed mode executes the declared cases before readiness.
+/// On-demand mode uses that inventory to bound executable capacity and admits
+/// exact recurring shapes within the immutable workspace plan. Runtime contexts
+/// producing another pages/topology identity use the explicit catalog-miss policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReusableExecutionProgramPolicy {
@@ -462,6 +473,19 @@ struct ReusableExecutionProgramPolicyWire {
 }
 
 impl ReusableExecutionProgramPolicy {
+    /// Keep the same exact shape and workspace contract without executing its
+    /// cases before readiness. Warmup and capture consume successive real
+    /// submissions; validation must never replay a user's state transition.
+    pub fn exact_on_demand(
+        programs: Vec<ReusableExecutionProgramSpec>,
+    ) -> Result<Self, VNextError> {
+        let mut policy = Self::exact_startup_sealed(1, 1, 1, programs)?;
+        policy.catalog_lifetime = ReusableExecutionCatalogLifetime::OnDemandBounded;
+        policy.replay_validation_passes = 0;
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn exact_startup_sealed(
         warmup_passes: u32,
         capture_passes: u32,
@@ -505,10 +529,18 @@ impl ReusableExecutionProgramPolicy {
     fn validate(&self) -> Result<(), VNextError> {
         if self.shape_semantics != ReusableExecutionProgramShapeSemantics::Exact
             || self.catalog_miss_policy != ReusableExecutionCatalogMissPolicy::EagerFallback
-            || self.catalog_lifetime != ReusableExecutionCatalogLifetime::StartupSealed
             || self.warmup_passes == 0
             || self.capture_passes == 0
-            || self.replay_validation_passes == 0
+            || match self.catalog_lifetime {
+                ReusableExecutionCatalogLifetime::StartupSealed => {
+                    self.replay_validation_passes == 0
+                }
+                ReusableExecutionCatalogLifetime::OnDemandBounded => {
+                    self.warmup_passes != 1
+                        || self.capture_passes != 1
+                        || self.replay_validation_passes != 0
+                }
+            }
             || self.programs.is_empty()
             || self.programs.len() > MAX_REUSABLE_EXECUTION_PROGRAM_SHAPES
         {
@@ -1154,6 +1186,33 @@ mod tests {
             program_policy.programs(),
             &[prerequisite, final_prefill, decode_1, decode_4]
         );
+    }
+
+    #[test]
+    fn on_demand_policy_preserves_exact_shapes_without_replaying_user_transitions() {
+        let shapes = vec![program(
+            "uniform-query",
+            ReusableExecutionProgramShape::uniform_decode(3, 1).unwrap(),
+        )];
+        let startup =
+            ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, shapes.clone()).unwrap();
+        let demand = ReusableExecutionProgramPolicy::exact_on_demand(shapes).unwrap();
+        assert_eq!(startup.programs(), demand.programs());
+        let value = serde_json::to_value(&demand).unwrap();
+        assert_ne!(serde_json::to_value(&startup).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<ReusableExecutionProgramPolicy>(value.clone()).unwrap(),
+            demand
+        );
+        for field in [
+            "warmup_passes",
+            "capture_passes",
+            "replay_validation_passes",
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = serde_json::json!(2);
+            assert!(serde_json::from_value::<ReusableExecutionProgramPolicy>(invalid).is_err());
+        }
     }
 
     #[test]
