@@ -2278,6 +2278,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Metal device"]
     fn mixed_q4k_q6k_routed_down_kernels_match_dequantized_cpu() {
         const EXPERTS: usize = 2;
         const TOKENS: usize = 2;
@@ -2285,10 +2286,7 @@ mod tests {
         const HIDDEN: usize = 256;
         const INTERMEDIATE: usize = 256;
 
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping routed MoE kernel conformance");
-            return;
-        };
+        let device = Device::system_default().expect("required Metal routed MoE device");
         let cpu = CandleDevice::Cpu;
         let quantized_stack = |seed: usize, rows: usize, columns: usize, dtype: GgmlDType| {
             let mut bytes = Vec::new();
