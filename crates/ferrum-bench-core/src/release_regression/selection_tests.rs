@@ -1659,6 +1659,14 @@ fn isolated_backend_change_keeps_its_forward_numerics_and_performance_unbound() 
     for (path, expected) in [
         ("crates/ferrum-kernels/src/backend/cpu.rs", Backend::Cpu),
         (
+            "crates/ferrum-kernels/src/backend/cpu/vnext_ops.rs",
+            Backend::Cpu,
+        ),
+        (
+            "crates/ferrum-kernels/src/backend/cpu/vnext_runtime.rs",
+            Backend::Cpu,
+        ),
+        (
             "crates/ferrum-kernels/src/backend/metal/mod.rs",
             Backend::Metal,
         ),
@@ -1836,13 +1844,20 @@ fn backend_path_union_and_unknown_or_shared_kernel_reach_remain_conservative() {
     let mut observed = numerical_targets(&result);
     observed.sort();
     assert_eq!(observed, [Backend::Metal, Backend::Cuda]);
+    let cpu = "crates/ferrum-kernels/src/backend/cpu/vnext_runtime.rs";
+    request.impact =
+        super::super::analyze_paths([cpu, "crates/ferrum-kernels/src/backend/cuda/mod.rs"]);
+    let result = plan(&request).unwrap();
+    let mut observed = numerical_targets(&result);
+    observed.sort();
+    assert_eq!(observed, [Backend::Cpu, Backend::Cuda]);
     for shared in [
         "crates/ferrum-kernels/src/backend/traits.rs",
         "crates/ferrum-kernels/src/backend/unreviewed/ops.rs",
         "crates/ferrum-kernels/src/metal/ops.rs",
         "unknown-runtime/forward.rs",
     ] {
-        request.impact = super::super::analyze_paths([metal, shared]);
+        request.impact = super::super::analyze_paths([cpu, metal, shared]);
         let result = plan(&request).unwrap();
         let mut observed = numerical_targets(&result);
         observed.sort();

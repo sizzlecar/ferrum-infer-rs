@@ -167,6 +167,43 @@ fn old_reviews_for_unchanged_readmes_are_inert() {
 }
 
 #[test]
+fn runtime_preparation_review_retains_device_and_model_execution_requirements() {
+    use ferrum_bench_core::release_regression::{Behavior, EvidenceLayer};
+
+    let before = "Run the model.";
+    let after = "Choose automatic, startup or on-demand device preparation.";
+    let mut reviewed = review("README.md", before, after);
+    reviewed.areas = vec![ChangeArea::BackendSubmission];
+    reviewed.rationale =
+        "Reviewed when device programs are prepared and unsupported requests fail.".into();
+    let mut impact = analyze_paths(["README.md"]);
+    apply_reviews(&mut impact, &[reviewed], |_| {
+        Ok((before.as_bytes().to_vec(), after.as_bytes().to_vec()))
+    })
+    .unwrap();
+    assert!(!impact.product_contract_changed);
+    let plan = plan(&input(impact)).unwrap();
+    for (behavior, layer) in [
+        (
+            Behavior::SubmissionCompletion,
+            EvidenceLayer::BackendNumerics,
+        ),
+        (Behavior::ModelLoad, EvidenceLayer::ModelRuntime),
+        (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+    ] {
+        let (index, _) = plan
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| obligation.behavior == behavior && obligation.layer == layer)
+            .expect("review retains the affected execution obligation");
+        assert!(plan
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+    }
+}
+
+#[test]
 fn malformed_or_broad_review_configuration_is_rejected() {
     let good = serde_json::to_value(review("README.md", "old", "new")).unwrap();
     let mut invalid = Vec::new();
