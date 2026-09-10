@@ -25,7 +25,7 @@ use std::{
 const SUBMISSION_JOB: &str = "Quality / GPU runtime (metal)";
 const SUBMISSION_EXECUTE: &str = "Require MetalContext submission and completion outputs";
 const SUBMISSION_UPLOAD: &str = "Save raw numerical evidence";
-const DEVICE_EXECUTE: &str = "Execute required device submission contracts";
+const DEVICE_EXECUTE: &str = "Execute required device correctness contracts";
 const PERFORMANCE_JOB: &str = "Metal release models";
 const PERFORMANCE_PREPARE: &str = "Prepare registered performance tasks";
 const PERFORMANCE_REGISTER: &str = "Save registered performance tasks";
@@ -76,11 +76,9 @@ fn required_devices(obligations: &[Obligation]) -> Vec<Backend> {
     [Backend::Cpu, Backend::Metal, Backend::Cuda]
         .into_iter()
         .filter(|backend| {
-            obligations.iter().any(|obligation| {
-                obligation.layer == EvidenceLayer::BackendNumerics
-                    && obligation.behavior == Behavior::SubmissionCompletion
-                    && obligation.scope == backend_contracts::submission_scope(*backend)
-            })
+            obligations
+                .iter()
+                .any(|obligation| backend_contracts::required_backend(obligation) == Some(*backend))
         })
         .collect()
 }

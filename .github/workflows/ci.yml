@@ -228,7 +228,7 @@ jobs:
             ${{ runner.temp }}/contract-checks.logs/
           retention-days: 14
 
-      - name: Execute required device submission contracts
+      - name: Execute required device correctness contracts
         run: |
           mkdir -p "$RUNNER_TEMP/backend-numerics"
           cargo run --locked -p ferrum-devtools --bin contract_checks -- \
@@ -487,7 +487,7 @@ jobs:
             --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/submission.json"
 
-      - name: Execute required device submission contracts
+      - name: Execute required device correctness contracts
         env:
           BACKEND: ${{ matrix.backend }}
         run: |

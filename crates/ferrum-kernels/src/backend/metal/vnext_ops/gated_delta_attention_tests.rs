@@ -176,10 +176,7 @@ fn qwen35_attention_shape() -> AttentionShape {
 }
 
 fn assert_recurrent_conformance(semantics: TestSemantics) {
-    let Some(device) = Device::system_default() else {
-        eprintln!("no Metal device; skipping gated-delta conformance");
-        return;
-    };
+    let device = Device::system_default().expect("gated-delta conformance requires Metal");
     let pipelines = MetalGatedDeltaPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
 
@@ -456,10 +453,7 @@ fn chunked_c64_matches_recurrent_oracle_and_non_aligned_state_continuity() {
     const CHUNK_TOKENS: usize = 145;
     const STATE_SENTINEL: f32 = 73.25;
 
-    let Some(device) = Device::system_default() else {
-        eprintln!("no Metal device; skipping chunked gated-delta conformance");
-        return;
-    };
+    let device = Device::system_default().expect("chunked gated-delta conformance requires Metal");
     let pipelines = MetalGatedDeltaPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
     for (key_heads, value_heads, key_dim, value_dim) in

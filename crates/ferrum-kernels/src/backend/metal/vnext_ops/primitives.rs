@@ -1796,10 +1796,26 @@ mod tests {
 
     #[test]
     fn q4_k_token_embedding_matches_cpu_for_f16_and_f32_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping Q4_K token-embedding conformance");
-            return;
-        };
+        let device = Device::system_default().expect("token-embedding conformance requires Metal");
+        assert_quantized_token_embedding(&device, EmbeddingPhysicalFormat::Q4K, GgmlDType::Q4K);
+    }
+
+    #[test]
+    fn q6_k_and_q8_token_embeddings_preserve_float_boundaries_on_real_metal() {
+        let device = Device::system_default().expect("token-embedding conformance requires Metal");
+        for (format, dtype) in [
+            (EmbeddingPhysicalFormat::Q6K, GgmlDType::Q6K),
+            (EmbeddingPhysicalFormat::Q8_0, GgmlDType::Q8_0),
+        ] {
+            assert_quantized_token_embedding(&device, format, dtype);
+        }
+    }
+
+    fn assert_quantized_token_embedding(
+        device: &Device,
+        format: EmbeddingPhysicalFormat,
+        dtype: GgmlDType,
+    ) {
         let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
         let vocabulary = 3_usize;
@@ -1809,7 +1825,7 @@ mod tests {
             .collect::<Vec<_>>();
         let cpu = CandleDevice::Cpu;
         let table = Tensor::from_vec(raw_table, (vocabulary, hidden), &cpu).unwrap();
-        let quantized = QTensor::quantize(&table, GgmlDType::Q4K).unwrap();
+        let quantized = QTensor::quantize(&table, dtype).unwrap();
         let reference = quantized
             .dequantize(&cpu)
             .unwrap()
@@ -1832,7 +1848,7 @@ mod tests {
         dispatch_raw_embedding(
             &pipelines,
             encoder,
-            EmbeddingPhysicalFormat::Q4K,
+            format,
             &table_buffer,
             &token_buffer,
             &f16_output,
@@ -1841,7 +1857,7 @@ mod tests {
         dispatch_raw_embedding_f32(
             &pipelines,
             encoder,
-            EmbeddingPhysicalFormat::Q4K,
+            format,
             &table_buffer,
             &token_buffer,
             &f32_output,
@@ -1860,7 +1876,7 @@ mod tests {
             let expected = f16::from_f32(*expected).to_f32();
             assert!(
                 (*observed - expected).abs() <= 0.002,
-                "Q4_K F16 token embedding differs at column {index}: observed={observed} expected={expected}"
+                "{dtype:?} F16 token embedding differs at column {index}: observed={observed} expected={expected}"
             );
         }
         for (index, (observed, expected)) in read_f32(&f32_output, hidden)[..hidden]
@@ -1870,7 +1886,7 @@ mod tests {
         {
             assert!(
                 (*observed - expected).abs() <= 0.00002,
-                "Q4_K F32 token embedding differs at column {index}: observed={observed} expected={expected}"
+                "{dtype:?} F32 token embedding differs at column {index}: observed={observed} expected={expected}"
             );
         }
         assert!(read_f16(&f16_output, hidden * 2)[hidden..]
@@ -1883,10 +1899,7 @@ mod tests {
 
     #[test]
     fn f32_master_primitives_preserve_precision_and_residual_aliasing_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping F32 master primitive conformance");
-            return;
-        };
+        let device = Device::system_default().expect("F32 primitive conformance requires Metal");
         let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
 
@@ -2027,10 +2040,7 @@ mod tests {
 
     #[test]
     fn native_f16_primitives_match_cpu_references_on_real_metal() {
-        let Some(device) = Device::system_default() else {
-            eprintln!("no Metal device; skipping primitive conformance");
-            return;
-        };
+        let device = Device::system_default().expect("F16 primitive conformance requires Metal");
         let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
 

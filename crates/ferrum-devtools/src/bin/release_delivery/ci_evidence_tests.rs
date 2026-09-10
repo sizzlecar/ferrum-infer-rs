@@ -404,6 +404,7 @@ fn vnext_device_contracts_require_their_own_producer_and_actual_execution_step()
             reason: "device lifecycle".into(),
             checkers: backend_contracts::contract_groups(backend)
                 .into_iter()
+                .filter(|group| group.behavior == Behavior::SubmissionCompletion)
                 .map(|group| group.id)
                 .collect(),
         };
