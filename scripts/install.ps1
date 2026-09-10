@@ -243,6 +243,81 @@ function Confirm-FerrumCommand {
     }
 }
 
+function Get-FerrumInstallDirectory {
+    Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Ferrum'
+}
+
+function Test-FerrumInstalledRelease {
+    param([Parameter(Mandatory=$true)][string]$Directory, [Parameter(Mandatory=$true)][object]$Release,
+        [Parameter(Mandatory=$true)][string]$ExpectedVersion, [ValidateSet('cpu','cuda')][string]$SelectedBackend)
+    # The installer already records an immutable payload inventory. Check its
+    # bytes and backend, not just `ferrum --version` (the launcher is shared).
+    try {
+        $pointerPath = Join-Path $Directory 'current.json'
+        $pointerFile = Get-Item -LiteralPath $pointerPath -Force
+        if ($pointerFile.PSIsContainer -or ($pointerFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $pointerFile.Length -gt 4096) { return $false }
+        $pointerText = [IO.File]::ReadAllText($pointerPath)
+        $pointer = $pointerText | ConvertFrom-Json
+        if ($pointer.schema_version -ne 1 -or $pointer.version_dir -cnotmatch ('^'+[regex]::Escape($ExpectedVersion)+'-([0-9a-f]{64})$')) { return $false }
+        $manifestHash = $Matches[1]
+        $versions = Join-Path $Directory 'versions'
+        $payload = Join-Path $versions $pointer.version_dir
+        foreach ($path in @($Directory,$versions,$payload)) {
+            $item = Get-Item -LiteralPath $path -Force
+            if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        }
+        $manifestPath = Join-Path $payload 'ferrum-portable.json'
+        Confirm-FerrumFile -Path $manifestPath -Sha256 $manifestHash
+        $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+        if ($manifest.schema_version -ne 1 -or $manifest.build.version -cne $ExpectedVersion -or
+            $manifest.backend -cne $SelectedBackend -or $manifest.target_triple -cne 'x86_64-pc-windows-msvc') { return $false }
+        if ($SelectedBackend -eq 'cuda' -and $manifest.cuda_compute_capability -cne '89') { return $false }
+        $names = @{'ferrum-portable.json'=$true}
+        foreach ($file in $manifest.files) {
+            $name = [string]$file.path
+            if ($name -cnotmatch '^(?:licenses/)?[A-Za-z0-9][A-Za-z0-9._-]*$' -or $names.ContainsKey($name)) { return $false }
+            $names[$name] = $true
+            $path = Join-Path $payload $name
+            $parent = Get-Item -LiteralPath ([IO.Path]::GetDirectoryName($path)) -Force
+            if (-not $parent.PSIsContainer -or ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+            if ((Get-Item -LiteralPath $path -Force).Length -ne [long]$file.size_bytes) { return $false }
+            Confirm-FerrumFile -Path $path -Sha256 ([string]$file.sha256)
+        }
+        if (-not $names.ContainsKey('ferrum.exe')) { return $false }
+        foreach ($item in Get-ChildItem -LiteralPath $payload -Force) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            if ($item.PSIsContainer) {
+                if ($item.Name -cne 'licenses') { return $false }
+                foreach ($license in Get-ChildItem -LiteralPath $item.FullName -Force) {
+                    if ($license.PSIsContainer -or ($license.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                        -not $names.ContainsKey('licenses/'+$license.Name)) { return $false }
+                }
+            } elseif (-not $names.ContainsKey($item.Name)) { return $false }
+        }
+        $launchers = @($Release.assets | Where-Object { [string]$_.name -ceq 'ferrum-windows-launcher-v1.exe' })
+        if ($launchers.Count -ne 1 -or [string]$launchers[0].digest -cnotmatch '^sha256:([0-9a-f]{64})$') { return $false }
+        $launcherHash = $Matches[1]
+        $program = Join-Path $Directory 'ferrum.exe'
+        if ((Get-Item -LiteralPath $program -Force).Length -ne [long]$launchers[0].size) { return $false }
+        Confirm-FerrumFile -Path $program -Sha256 $launcherHash
+        $result = Invoke-FerrumProcess -Program $program -Arguments @('--version')
+        return $result.stdout.Trim() -ceq ('ferrum '+$ExpectedVersion) -and [IO.File]::ReadAllText($pointerPath) -ceq $pointerText
+    } catch {
+        # Incomplete, changed, older or unsupported layouts take the normal
+        # verified installation path; they must never be called up to date.
+        Write-Verbose ('Existing Ferrum installation could not be reused: '+$_.Exception.Message)
+        return $false
+    }
+}
+
+function Show-FerrumReady {
+    param([Parameter(Mandatory=$true)][string]$Program)
+    Add-FerrumProcessPath -Directory ([IO.Path]::GetDirectoryName($Program))
+    Confirm-FerrumCommand -Program $Program
+    Write-Host 'Ready in this terminal. Example (downloads the model on first use): ferrum run qwen3:0.6b'
+    Write-Host 'To select another model, see: ferrum run --help'
+}
+
 function Install-FerrumSetup {
     param([Parameter(Mandatory=$true)][string]$SetupPath, [Parameter(Mandatory=$true)][string]$Sha256, [Parameter(Mandatory=$true)][string]$ExpectedVersion, [ValidateSet('cpu','cuda')][string]$SelectedBackend = 'cuda')
     $expected = ConvertTo-FerrumVersion -Value $ExpectedVersion
@@ -250,15 +325,12 @@ function Install-FerrumSetup {
     Confirm-FerrumFile -Path $SetupPath -Sha256 $Sha256
     Write-Host 'Installing Ferrum for the current user...'
     $null = Invoke-FerrumProcess -Program $SetupPath -Arguments @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-')
-    $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Ferrum\ferrum.exe'
+    $installed = Join-Path (Get-FerrumInstallDirectory) 'ferrum.exe'
     $result = Invoke-FerrumProcess -Program $installed -Arguments @('--version')
     if ($result.stdout.Trim() -cne ('ferrum '+$expected)) { throw 'Installed Ferrum version does not match the selected release.' }
-    Add-FerrumProcessPath -Directory ([IO.Path]::GetDirectoryName($installed))
-    Confirm-FerrumCommand -Program $installed
     $label = if ($SelectedBackend -eq 'cpu') { 'CPU' } else { 'CUDA sm89' }
     Write-Host ('Installed Ferrum '+$expected+' (Windows x64, '+$label+').')
-    Write-Host 'Ready in this terminal. Example (downloads the model on first use): ferrum run qwen3:0.6b'
-    Write-Host 'To select another model, see: ferrum run --help'
+    Show-FerrumReady -Program $installed
 }
 
 function Install-FerrumRelease {
@@ -283,6 +355,12 @@ function Install-FerrumRelease {
     Write-Host 'Looking up the Ferrum release...'
     $release = Invoke-RestMethod -Uri $endpoint -Headers @{Accept='application/vnd.github+json';'User-Agent'='Ferrum-Windows-Installer'}
     $selected = Select-FerrumRelease -Release $release -RequestedVersion $RequestedVersion -SelectedBackend $selectedBackend
+    $directory = Get-FerrumInstallDirectory
+    if (Test-FerrumInstalledRelease -Directory $directory -Release $release -ExpectedVersion $selected.version -SelectedBackend $selectedBackend) {
+        Write-Host ('Ferrum '+$selected.version+' ('+$selectedBackend+') is already installed and verified. No download is needed.')
+        Show-FerrumReady -Program (Join-Path $directory 'ferrum.exe')
+        return
+    }
     $temporary = Join-Path ([IO.Path]::GetTempPath()) ('Ferrum-install-'+[Guid]::NewGuid().ToString('N'))
     $null = [IO.Directory]::CreateDirectory($temporary)
     try {
