@@ -216,6 +216,12 @@ to `basic`; explicitly select the checks relevant to the release:
 - `stop`: termination behavior through both entrypoints, including stream text.
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
+- `state`: `run` recalls a code, clears history, verifies its absence, and repeats
+  with a different code in the same process. One server interleaves two independent
+  conversations, continues each actual assistant history through both HTTP modes,
+  then verifies that fresh conversations cannot recall either code. This checks
+  observable state continuity and isolation; it does not prove simultaneous GPU
+  execution, physical cache hits or operator arithmetic tolerances.
 - `observability`: real `run`, synchronous HTTP and SSE answers with public
   `--profile-detail debug`, profile and scheduler journals. Verify request IDs,
   backend identity, terminal token usage and closed request ownership against

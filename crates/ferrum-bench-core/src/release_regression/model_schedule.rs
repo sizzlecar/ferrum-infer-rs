@@ -55,6 +55,10 @@ fn capability(behavior: Behavior) -> Option<(ModelCheck, &'static str, &'static 
             ModelCheck::Observability,
             "model-regression.observability.request-lifecycle",
         ),
+        ArchitectureState => (
+            ModelCheck::State,
+            "model-regression.state.conversation-isolation",
+        ),
         StructuredValidity => (
             ModelCheck::Structured,
             "model-regression.structured.validity",
@@ -88,6 +92,7 @@ pub fn model_check_descriptors() -> Vec<CheckDescriptor> {
         Behavior::ReasoningAbsence,
         Behavior::LengthLimit,
         Behavior::Observability,
+        Behavior::ArchitectureState,
         Behavior::StructuredValidity,
         Behavior::ToolSelection,
         Behavior::ToolHandoff,
@@ -237,6 +242,7 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
                 ModelCheck::Length => 5,
                 ModelCheck::AutoToolsJson => 6,
                 ModelCheck::Observability => 7,
+                ModelCheck::State => 8,
             });
             run
         })

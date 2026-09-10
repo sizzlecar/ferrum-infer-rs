@@ -53,6 +53,27 @@ fn model_report_rechecks_observation_journals_instead_of_trusting_pass_labels() 
     }
 }
 
+#[test]
+fn model_report_rechecks_state_histories_reset_and_isolation() {
+    let expected = task("state", Backend::Cpu, vec![ModelCheck::State]);
+    verify_model_report(&expected, &ReportFixture::passed(&expected).value).unwrap();
+    for name in ["run-state", "serve-state"] {
+        let mut missing = ReportFixture::passed(&expected);
+        missing.remove_case(name);
+        assert!(verify_model_report(&expected, &missing.value).is_err());
+        let mut empty = ReportFixture::passed(&expected);
+        empty.case_mut(name)["evidence"] = json!({});
+        assert!(verify_model_report(&expected, &empty.value).is_err());
+    }
+    let mut contaminated = ReportFixture::passed(&expected);
+    contaminated.case_mut("serve-state")["evidence"]["state"]["fresh"][0]["observation"]
+        ["message"]["content"] = json!("cobalt-731");
+    assert!(verify_model_report(&expected, &contaminated.value).is_err());
+    let mut stale = ReportFixture::passed(&expected);
+    stale.case_mut("run-state")["evidence"]["records"][6]["history_epoch"] = json!(0);
+    assert!(verify_model_report(&expected, &stale.value).is_err());
+}
+
 /// Small runner-result fixtures exercise the shared semantic verifier through
 /// its actual report consumer; protocol framing remains covered by runner tests.
 struct ReportFixture {
@@ -90,6 +111,7 @@ impl ReportFixture {
                 ModelCheck::Length => &["run-length", "serve-length"],
                 ModelCheck::AutoToolsJson => &["serve-auto-tools-json"],
                 ModelCheck::Observability => &["run-observability", "serve-observability"],
+                ModelCheck::State => &["run-state", "serve-state"],
             };
             for name in entries {
                 let evidence = match *name {
@@ -116,6 +138,12 @@ impl ReportFixture {
                             })
                             .collect();
                         json!({"ready": ready.clone(), "answers": answers, "prompts": [MEMORY_PROMPT, ARITHMETIC_PROMPT, RECALL_PROMPT]})
+                    }
+                    "run-state" => {
+                        json!({"ready": ready, "records": super::super::model_state::tests::run_fixture()})
+                    }
+                    "serve-state" => {
+                        json!({"state": super::super::model_state::tests::serve_fixture()})
                     }
                     "serve-basic" => {
                         let mut observations = json!({});
@@ -389,6 +417,7 @@ fn checks_have_strict_round_trip_names() {
         ModelCheck::Reasoning,
         ModelCheck::Length,
         ModelCheck::Observability,
+        ModelCheck::State,
     ] {
         let text = check.to_string();
         assert_eq!(text.parse::<ModelCheck>().unwrap(), check);
