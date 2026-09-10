@@ -299,6 +299,9 @@ pub struct PlanInput {
     pub impact: Impact,
     pub profiles: Vec<ModelProfile>,
     pub quick_start_profile_ids: Vec<String>,
+    /// Explicit model commitments for this release, in addition to README examples.
+    #[serde(default)]
+    pub release_profile_ids: Vec<String>,
     /// Advertised execution inventory, not an unconditional full-model matrix.
     pub required_targets: Vec<ExecutionTarget>,
     #[serde(default)]
@@ -332,6 +335,9 @@ pub enum Gap {
     },
     EmptyInventory,
     MissingQuickStart {
+        profile_id: String,
+    },
+    MissingReleaseProfile {
         profile_id: String,
     },
     InvalidTarget {

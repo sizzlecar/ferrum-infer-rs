@@ -222,6 +222,7 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
     )));
     let owner = profile("selected", Backend::Cpu);
     let input = PlanInput {
+        release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,
         impact: Impact {

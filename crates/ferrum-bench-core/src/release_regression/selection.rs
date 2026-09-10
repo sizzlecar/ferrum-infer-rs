@@ -685,6 +685,29 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         }
     }
     if input.stage == Stage::Release {
+        let mut release_ids = BTreeSet::new();
+        for id in &input.release_profile_ids {
+            if !nonblank(id) || !release_ids.insert(id) {
+                return Err("release profile ids must be nonblank and unique".into());
+            }
+            match input.profiles.iter().find(|profile| {
+                &profile.id == id && profile.available && valid_target(&profile.target)
+            }) {
+                Some(profile) => add(
+                    &mut result,
+                    Behavior::ModelForward,
+                    EvidenceLayer::ModelRuntime,
+                    ObligationScope::Profile {
+                        profile_id: id.clone(),
+                        target: profile.target.clone(),
+                    },
+                    "explicit model support commitment for this release",
+                ),
+                None => result.gaps.push(Gap::MissingReleaseProfile {
+                    profile_id: id.clone(),
+                }),
+            }
+        }
         for id in &input.quick_start_profile_ids {
             match input.profiles.iter().find(|profile| {
                 &profile.id == id && profile.available && valid_target(&profile.target)
