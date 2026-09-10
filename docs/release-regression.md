@@ -95,16 +95,21 @@ state carry, and paged attention. These assertions use the existing independent
 CPU references and error bounds, with offset/tail/state guards. The assertions
 also cover the CUDA dense F16 cuBLAS projection/SwiGLU path, dense embedding,
 residual rounding and aliasing, and F16/F32-master attention state carry. Their
-descriptors are limited to the tested native GGUF and dense SafeTensors paths.
-They do not cover entire CUDA Marlin paths, MoE, legacy operators, or whole-model
-state correctness. Repeated assertions shared by numerical and boundary groups
+descriptors cover the tested native GGUF and dense SafeTensors paths. The CUDA
+dense-hybrid CT INT4 and block-FP8 paths additionally require the Marlin matrix
+groups below, the production workspace reset/bounds check, and the exact row
+stitching check used by mixed recurrent projections. They do not cover MoE,
+Gemma/GPT-OSS family-specific providers, legacy operators, or whole-model state
+correctness. Repeated assertions shared by numerical and boundary groups
 execute once; both groups still require every registered assertion to succeed.
 The CUDA registry additionally executes the existing symmetric/asymmetric INT4
 and block-FP8 Marlin matrix references. Outputs start as NaN, and both outputs
 and zero-initialized workspaces have aligned prefix/suffix guards checked after
-execution. Original numerical tolerances are retained. These matrix assertions
-are supplemental evidence; they do not bind an entire Marlin model target or
-certify its remaining providers or MoE routing.
+execution. Original numerical tolerances are retained. The raw and vNext INT4
+launchers share the same deterministic source bytes and independent CPU oracle.
+The vNext wrapper must reject undersized workspaces before writing and reset a
+reused, dirty workspace before each projection. Matrix assertions alone cannot
+certify the remaining providers or MoE routing.
 
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported

@@ -1,6 +1,7 @@
 //! Dense-hybrid operator conformance. These fixtures exercise the
 //! installed launchers and independent CPU references, including state carry
-//! and guarded writes. They do not certify Marlin, MoE or legacy operators.
+//! and guarded writes. Dense Marlin targets also require the matrix groups in
+//! the same verified report. MoE and legacy operators remain separate.
 use super::super::contracts::{ContractGroup, ContractTest};
 use super::super::{
     Backend, Behavior, CheckDescriptor, EvidenceLayer, ExecutionTarget, Obligation, ObligationScope,
@@ -15,7 +16,10 @@ fn supported(target: &ExecutionTarget) -> bool {
     }
     match (target.backend, target.precision.as_str()) {
         (Backend::Cpu | Backend::Metal, "safetensors-bf16-f32" | "gguf-q4_k_m") => true,
-        (Backend::Cuda, "safetensors-bf16-f32" | "gguf-q4_k_m") => true,
+        (
+            Backend::Cuda,
+            "safetensors-bf16-f32" | "gguf-q4_k_m" | "compressed-tensors-int4" | "block-fp8-e4m3",
+        ) => true,
         (Backend::Cuda | Backend::Metal, "gguf-mixed-4bit") => true,
         _ => false,
     }
@@ -109,6 +113,12 @@ fn names(backend: Backend) -> Vec<String> {
                 "f16_residual_preserves_rounding_alias_and_tail_guards_on_cuda",
                 "f16_embedding_preserves_ids_offsets_and_output_guards_on_cuda",
                 "planar_gated_activations_match_f64_and_preserve_guards_on_cuda",
+            ]),
+            ("transformer::marlin_tests", &[
+                "marlin_runtime_resets_reused_workspace_and_preserves_matrix_guards_on_cuda",
+            ]),
+            ("transformer::attention::projection_stitch_tests", &[
+                "segmented_projection_stitch_preserves_rows_offsets_and_unwritten_columns_on_cuda",
             ]),
             ("transformer::attention::native_projection::tests", &[
                 "native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on_cuda",

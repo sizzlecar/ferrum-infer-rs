@@ -3737,6 +3737,8 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
     }
 }
 
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod projection_stitch_tests;
 #[cfg(test)]
 mod recurrent_tests;
 

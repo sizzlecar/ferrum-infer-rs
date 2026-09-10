@@ -72,6 +72,8 @@ mod gpt_oss_attention;
 mod gpt_oss_moe;
 #[cfg(feature = "vllm-marlin")]
 mod marlin_fp8_weights;
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod marlin_tests;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe;
 #[cfg(feature = "vllm-moe-marlin")]
