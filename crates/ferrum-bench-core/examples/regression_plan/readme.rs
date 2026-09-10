@@ -71,6 +71,7 @@ fn validate(reviews: &[ReadmeReview]) -> Result<(), String> {
                 !matches!(
                     area,
                     ChangeArea::Build
+                        | ChangeArea::BackendSubmission
                         | ChangeArea::Template
                         | ChangeArea::Termination
                         | ChangeArea::Structured
@@ -79,7 +80,7 @@ fn validate(reviews: &[ReadmeReview]) -> Result<(), String> {
             })
         {
             return Err(format!(
-                "README review requires distribution/protocol areas for {}",
+                "README review requires distribution, protocol or device submission areas for {}",
                 review.path
             ));
         }
@@ -137,7 +138,7 @@ pub(super) fn apply_reviews(
             .expect("applicable review has a changed path");
         entry.areas = review.areas.clone();
         entry.reason = format!(
-            "content-bound README product review: {}; retain declared distribution/protocol checks; no execution is certified",
+            "content-bound README product review: {}; retain declared product checks; no execution is certified",
             review.rationale
         );
     }

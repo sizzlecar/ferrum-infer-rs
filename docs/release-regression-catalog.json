@@ -463,29 +463,21 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "54d8c1c4b8e8005479d03fb633255f39cddde5be954386ed2113b081bc172d3f",
-      "after_sha256": "3825b8e9eecf85874a6c96d9638aab84b6c311ed0d5f92e01b1ac973398216e2",
+      "before_sha256": "3825b8e9eecf85874a6c96d9638aab84b6c311ed0d5f92e01b1ac973398216e2",
+      "after_sha256": "c81dec6c25681cc0c614a600ed50a80f127ab4429310f9445e3f637226b8be2b",
       "areas": [
-        "build",
-        "template",
-        "termination",
-        "structured",
-        "tools"
+        "backend_submission"
       ],
-      "rationale": "Reviewed distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
+      "rationale": "Reviewed the optional vNext reusable_execution_preparation setting shared by run and serve: capability-based auto selection, bounded on-demand preparation, explicit startup/off behavior and rejection of unsupported requests. The numerical-profile development link explicitly excludes v0.8.9 release assets. This diff changes no installation command or model support inventory. Retain device submission and model execution checks; this review certifies neither successful execution nor performance."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "7204b7d801d7c310698f065bd16a6ad2e05cd566b1f6624caa86eabcb37b0438",
-      "after_sha256": "c552fbb42649c022158bdffe60345dcc34b6978e3fc798e056deb100da1a225e",
+      "before_sha256": "c552fbb42649c022158bdffe60345dcc34b6978e3fc798e056deb100da1a225e",
+      "after_sha256": "c1f65b0a766c8103575cbcf1eb27d43014c031a166acce75a52406a7899c0c98",
       "areas": [
-        "build",
-        "template",
-        "termination",
-        "structured",
-        "tools"
+        "backend_submission"
       ],
-      "rationale": "Reviewed Chinese distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
+      "rationale": "Reviewed the optional vNext reusable_execution_preparation setting shared by run and serve: capability-based auto selection, bounded on-demand preparation, explicit startup/off behavior and rejection of unsupported requests. The numerical-profile development link explicitly excludes v0.8.9 release assets. This diff changes no installation command or model support inventory. Retain device submission and model execution checks; this review certifies neither successful execution nor performance."
     }
   ],
   "release_profile_ids": [

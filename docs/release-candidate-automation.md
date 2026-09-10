@@ -163,6 +163,16 @@ or installation failure. Keep the original run and its evidence artifacts;
 missing or failed evidence blocks publication. Do not restart the whole workflow
 solely to retry an upload.
 
+During development, use the existing CPU, Metal and CUDA hosts for affected
+compilation, unit tests and model checks. Freeze the release source, version,
+binaries and model tasks before renting a GPU for release acceptance. Publish
+the accepted binaries without rebuilding them. Development results remain useful
+regression evidence, but do not certify a different release binary. A manual
+delivery run can use `reuse_cuda_run_id` to reverify a previous delivery run's
+CUDA results against the current binary, runner and tasks; a verified match
+skips the lease. Investigate any mismatch before restarting delivery instead of
+repeatedly renting machines while implementation is still changing.
+
 Current rental limits: one 48 GB sm89 GPU, 300 GiB disk, $0.75/hour maximum,
 $0.004 per transfer GB, three hours per lease, 15 minutes to bootstrap and one
 hour per model task. Storage and transfer still contribute to the bill.

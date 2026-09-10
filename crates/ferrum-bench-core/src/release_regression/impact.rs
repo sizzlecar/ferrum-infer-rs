@@ -77,7 +77,11 @@ pub(super) fn path_backend(path: &str) -> Option<Backend> {
     if relative == "cpu.rs" {
         return Some(Backend::Cpu);
     }
-    for (directory, backend) in [("metal/", Backend::Metal), ("cuda/", Backend::Cuda)] {
+    for (directory, backend) in [
+        ("cpu/", Backend::Cpu),
+        ("metal/", Backend::Metal),
+        ("cuda/", Backend::Cuda),
+    ] {
         if relative
             .strip_prefix(directory)
             .is_some_and(|file| !file.is_empty())
@@ -944,6 +948,14 @@ mod tests {
                 Backend::Cuda,
             ),
             ("crates/ferrum-kernels/src/backend/cpu.rs", Backend::Cpu),
+            (
+                "crates/ferrum-kernels/src/backend/cpu/vnext_ops.rs",
+                Backend::Cpu,
+            ),
+            (
+                "crates/ferrum-kernels/src/backend/cpu/vnext_runtime.rs",
+                Backend::Cpu,
+            ),
         ] {
             assert_eq!(path_backend(path), Some(backend));
             let impact = analyze_paths([path]);
@@ -959,6 +971,8 @@ mod tests {
             "crates/ferrum-kernels/src/backend/another/ops.rs",
             "crates/ferrum-kernels/src/metal/ops.rs",
             "crates/ferrum-kernels/src/backend/metal/../cuda/ops.rs",
+            "crates/ferrum-kernels/src/backend/cpu/../cuda/ops.rs",
+            "crates/ferrum-kernels/src/backend/cpu/",
             "crates/ferrum-models/src/vnext/qwen35.rs",
         ] {
             assert_eq!(path_backend(path), None, "{path}");
