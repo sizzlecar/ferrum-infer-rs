@@ -1794,12 +1794,14 @@ pub use crate::marlin_repack::{
     permute_gptq_qweight_rows, repack_gptq_to_marlin, repack_scales_to_marlin,
 };
 
+#[cfg(all(test, feature = "vllm-moe-marlin"))]
+#[path = "../../../tests/compressed_tensors_marlin_eq/guards.rs"]
+mod test_guards;
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "vllm-moe-marlin")]
-    use super::{
-        configure_vllm_moe_profile_sink, launch_marlin_moe_mxfp4_bf16, launch_marlin_moe_vllm_raw,
-    };
+    use super::{launch_marlin_moe_mxfp4_bf16, launch_marlin_moe_vllm_raw};
     use super::{
         marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
         CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs,
@@ -1822,13 +1824,14 @@ mod tests {
     #[cfg(feature = "vllm-moe-marlin")]
     use cudarc::nvrtc::Ptx;
     #[cfg(feature = "vllm-moe-marlin")]
-    use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
-    #[cfg(feature = "vllm-moe-marlin")]
     use half::{bf16, f16};
     #[cfg(feature = "vllm-moe-marlin")]
     use sha2::{Digest, Sha256};
     #[cfg(feature = "vllm-moe-marlin")]
     use std::sync::Arc;
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    use super::test_guards::Guarded;
 
     fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
         MarlinMoeRawLaunchArgs {
@@ -1980,15 +1983,19 @@ mod tests {
         let scales_device: CudaSlice<u8> = stream.clone_htod(&packed_scales).unwrap();
         let prepared_bias = prepare_mxfp4_marlin_bias(&bias, EXPERTS, n);
         let bias_device: CudaSlice<bf16> = stream.clone_htod(&prepared_bias).unwrap();
-        let mut output_device: CudaSlice<bf16> = stream.alloc_zeros(ROWS * n).unwrap();
+        let output_device =
+            Guarded::new(stream, &vec![bf16::NAN; ROWS * n], bf16::from_f32(-117.0));
         let sms = usize::try_from(
             context
                 .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
                 .unwrap(),
         )
         .unwrap();
-        let mut reduce_device: CudaSlice<f32> =
-            stream.alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256).unwrap();
+        let reduce_device = Guarded::new(
+            stream,
+            &vec![0.0_f32; sms * 4 * MOE_BLOCK_SIZE * 256],
+            -117.0_f32,
+        );
         let mut sorted = vec![ROWS as i32; EXPERTS * MOE_BLOCK_SIZE];
         sorted[0] = 0;
         sorted[1] = 2;
@@ -1999,16 +2006,16 @@ mod tests {
         let padded_device: CudaSlice<i32> = stream
             .clone_htod(&[(EXPERTS * MOE_BLOCK_SIZE) as i32])
             .unwrap();
-        let workspace: CudaSlice<i32> = stream.alloc_zeros(n.div_ceil(128) * sms * 4).unwrap();
+        let workspace = Guarded::new(stream, &vec![0_i32; n.div_ceil(128) * sms * 4], -117_i32);
 
         {
             let (a, _a_guard) = input_device.device_ptr(stream);
             let (b, _b_guard) = weight_device.device_ptr(stream);
-            let (c, _c_guard) = output_device.device_ptr_mut(stream);
-            let (c_tmp, _c_tmp_guard) = reduce_device.device_ptr_mut(stream);
+            let c = output_device.pointer(stream);
+            let c_tmp = reduce_device.pointer(stream);
             let (bias, _bias_guard) = bias_device.device_ptr(stream);
             let (scales, _scales_guard) = scales_device.device_ptr(stream);
-            let (workspace, _workspace_guard) = workspace.device_ptr(stream);
+            let workspace = workspace.pointer(stream);
             let (sorted, _sorted_guard) = sorted_device.device_ptr(stream);
             let (experts, _experts_guard) = expert_device.device_ptr(stream);
             let (padded, _padded_guard) = padded_device.device_ptr(stream);
@@ -2045,7 +2052,9 @@ mod tests {
             stream.synchronize().unwrap();
         }
 
-        let actual = stream.clone_dtoh(&output_device).unwrap();
+        let actual = output_device.read(stream);
+        reduce_device.read(stream);
+        workspace.read(stream);
         let mut maximum_relative_l2 = 0.0_f64;
         for row in 0..ROWS {
             let expected = &reference[row * n..(row + 1) * n];
@@ -2924,33 +2933,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE A6 artifact"]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE artifact"]
     #[cfg(feature = "vllm-moe-marlin")]
-    fn gpt_oss_mxfp4_official_down_two_experts_four_rows_uses_128x64_and_matches_source() {
+    fn gpt_oss_mxfp4_official_down_two_experts_four_rows_preserves_padding_and_matches_source() {
         const N: usize = 2880;
         const LOGICAL_K: usize = 2880;
         const PHYSICAL_K: usize = 2944;
         const ROWS: usize = 4;
-
-        std::env::set_var("FERRUM_VLLM_MOE_LOG_CONFIG", "1");
-        for name in [
-            "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
-            "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
-            "FERRUM_VLLM_MOE_THREAD_K",
-            "FERRUM_VLLM_MOE_THREAD_N",
-        ] {
-            std::env::remove_var(name);
-        }
-        let profile_path = std::env::temp_dir().join(format!(
-            "ferrum-gptoss-down-{}-config.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&profile_path);
-        configure_vllm_moe_profile_sink(&ProfileSinkConfig::enabled(
-            profile_path.clone(),
-            ProfileMetadata::default(),
-        ))
-        .unwrap();
 
         let context = CudaContext::new(0).unwrap();
         let stream = context.default_stream();
@@ -3003,21 +2992,8 @@ mod tests {
             PHYSICAL_K,
         );
 
-        let profile = std::fs::read_to_string(&profile_path).unwrap();
-        let selected = profile
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| {
-                event["event"] == "vllm_moe_config"
-                    && event["shape"]["prob_m"] == ROWS as i64
-                    && event["shape"]["prob_n"] == N as i64
-                    && event["shape"]["prob_k"] == PHYSICAL_K as i64
-            })
-            .expect("native event for official padded down shape");
-        assert_eq!(selected["shape"]["thread_k"], 128);
-        assert_eq!(selected["shape"]["thread_n"], 64);
-        configure_vllm_moe_profile_sink(&ProfileSinkConfig::disabled()).unwrap();
-        let _ = std::fs::remove_file(profile_path);
+        // Correctness depends on the padding and decoded-source result, not
+        // an exact tuning choice or process-global diagnostic initialization.
         eprintln!(
             "FERRUM GPTOSS MXFP4 DOWN E2 M4 PASS: N={N} logical_K={LOGICAL_K} physical_K={PHYSICAL_K} rel_err={relative_l2:.8}"
         );
@@ -3174,9 +3150,9 @@ mod tests {
             let scales_device: CudaSlice<f16> = stream
                 .clone_htod(&packed_scales)
                 .expect("upload packed FP8 scales");
-            let mut output_device: CudaSlice<f16> = stream
-                .alloc_zeros(batch * n)
-                .expect("allocate Marlin-MoE output");
+            // Atomic output accumulation requires zero initialization.
+            let output_device =
+                Guarded::new(&stream, &vec![f16::ZERO; batch * n], f16::from_f32(-117.0));
 
             // One active expert owns one 16-row block. Actual token ids occupy
             // the prefix and every remaining row uses the vLLM sentinel
@@ -3193,16 +3169,15 @@ mod tests {
             let num_tokens_past_padded_device: CudaSlice<i32> = stream
                 .clone_htod(&[i32::try_from(MOE_BLOCK_SIZE).unwrap()])
                 .expect("upload padded token count");
-            let workspace: CudaSlice<i32> = stream
-                .alloc_zeros(n.div_ceil(128) * sms * 4)
-                .expect("allocate Marlin-MoE workspace");
+            let workspace =
+                Guarded::new(&stream, &vec![0_i32; n.div_ceil(128) * sms * 4], -117_i32);
 
             {
                 let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
                 let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
-                let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+                let output_pointer = output_device.pointer(&stream);
                 let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
-                let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+                let workspace_pointer = workspace.pointer(&stream);
                 let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
                 let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
                 let (padded_pointer, _padded_guard) =
@@ -3241,9 +3216,8 @@ mod tests {
                 stream.synchronize().expect("synchronize FP8 Marlin-MoE");
             }
 
-            let actual = stream
-                .clone_dtoh(&output_device)
-                .expect("download FP8 Marlin-MoE output");
+            let actual = output_device.read(&stream);
+            workspace.read(&stream);
             let mut reference_squared = 0.0_f64;
             let mut error_squared = 0.0_f64;
             let mut nan_count = 0_usize;
