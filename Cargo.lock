@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-bench-core"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "clap",
  "ferrum-types",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-cli"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-devtools"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-engine"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-interfaces"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kernels"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "bindgen_cuda",
  "candle-core",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-kv"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-models"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-native-ops"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "ferrum-types",
  "libc",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-native-ops-builder"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "clap",
  "ferrum-native-ops",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-quantization"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "candle-core",
  "ferrum-interfaces",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-sampler"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-scheduler"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-server"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-testkit"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-tokenizer"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "ferrum-types"
-version = "0.8.9"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "libc",

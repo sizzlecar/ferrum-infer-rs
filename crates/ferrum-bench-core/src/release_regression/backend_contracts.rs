@@ -3,6 +3,7 @@
 use super::contracts::{verify_contract_report, ContractGroup, ContractReport, ContractTest};
 use super::{Backend, Behavior, CheckDescriptor, EvidenceLayer, ExecutionTarget, ObligationScope};
 use serde::{Deserialize, Serialize};
+mod compatibility;
 #[path = "backend_contracts/numerical.rs"]
 mod numerical;
 
@@ -93,6 +94,7 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
         });
     }
     groups.extend(numerical::groups(backend));
+    groups.extend(compatibility::groups(backend));
     if backend == Backend::Cuda {
         // Dense Marlin coverage requires these matrices and the numerical
         // group's F16 providers, workspace lifecycle and projection stitching.
@@ -164,6 +166,7 @@ pub fn check_descriptors(targets: &[ExecutionTarget]) -> Vec<CheckDescriptor> {
                 }),
         )
         .chain(numerical::descriptors(targets))
+        .chain(compatibility::descriptors(targets))
         .collect()
 }
 
@@ -199,6 +202,7 @@ fn expected_checker(backend: Backend, obligation: &super::Obligation) -> Option<
         Some(LEGACY_CUDA_CHECK.into())
     } else {
         numerical::expected_checker(backend, obligation)
+            .or_else(|| compatibility::expected_checker(backend, obligation))
     }
 }
 
@@ -229,6 +233,109 @@ mod tests {
         HarnessArtifact,
     };
     use super::*;
+
+    #[test]
+    fn compatibility_receipts_require_route_assertions_and_exact_declared_formats() {
+        let targets = [
+            (
+                "gemma4_dense",
+                Backend::Cuda,
+                "compressed-tensors-w4a16",
+                ferrum_types::ModelOutputProtocol::GemmaThought,
+                PATH,
+            ),
+            (
+                "gpt_oss_moe",
+                Backend::Cuda,
+                "mxfp4",
+                ferrum_types::ModelOutputProtocol::HarmonyGptOss,
+                PATH,
+            ),
+            (
+                "qwen3_5_hybrid_moe",
+                Backend::Cuda,
+                "block-fp8-e4m3",
+                ferrum_types::ModelOutputProtocol::Text,
+                PATH,
+            ),
+            (
+                "qwen3_attention_moe",
+                Backend::Cuda,
+                "gptq-int4",
+                ferrum_types::ModelOutputProtocol::Text,
+                PATH,
+            ),
+            (
+                "qwen3_5_hybrid_moe",
+                Backend::Metal,
+                "gguf-q4_k_s",
+                ferrum_types::ModelOutputProtocol::Text,
+                PATH,
+            ),
+            (
+                "qwen3_attention_moe",
+                Backend::Metal,
+                "gguf-q4_k_m",
+                ferrum_types::ModelOutputProtocol::Text,
+                PATH,
+            ),
+            (
+                "llama_dense",
+                Backend::Metal,
+                "gguf-q4_k_m",
+                ferrum_types::ModelOutputProtocol::Text,
+                super::super::submission::LEGACY_EXECUTION_PATH,
+            ),
+            (
+                "llama_dense",
+                Backend::Cuda,
+                "safetensors-bf16",
+                ferrum_types::ModelOutputProtocol::Text,
+                super::super::submission::LEGACY_EXECUTION_PATH,
+            ),
+        ];
+        for (architecture, backend, precision, protocol, execution_path) in targets {
+            let target = ExecutionTarget {
+                architecture: architecture.into(),
+                backend,
+                precision: precision.into(),
+                protocol,
+                execution_path: execution_path.into(),
+            };
+            let report = report_fixture(backend);
+            let receipt = verify_report(backend, &report).unwrap();
+            let descriptors = compatibility::descriptors(std::slice::from_ref(&target));
+            for behavior in [Behavior::KernelNumerics, Behavior::KernelBoundaries] {
+                let descriptor = descriptors
+                    .iter()
+                    .find(|item| item.behavior == behavior)
+                    .expect("existing route has an explicit operator binding");
+                let mut obligation = super::super::Obligation {
+                    behavior: descriptor.behavior,
+                    layer: descriptor.layer,
+                    scope: ObligationScope::Target {
+                        target: target.clone(),
+                    },
+                    checkers: vec![descriptor.id.clone()],
+                    entrypoints: Vec::new(),
+                    reason: "existing execution route".into(),
+                };
+                assert!(receipt.covers(&obligation));
+                let mut unsupported = target.clone();
+                unsupported.precision = "unregistered-weight-format".into();
+                obligation.scope = ObligationScope::Target {
+                    target: unsupported,
+                };
+                assert!(!receipt.covers(&obligation));
+            }
+            let mut shared_only = report;
+            shared_only
+                .execution
+                .groups
+                .retain(|group| !group.id.contains("existing-routes"));
+            assert!(verify_report(backend, &shared_only).is_err());
+        }
+    }
 
     fn report_fixture(backend: Backend) -> BackendContractReport {
         let observation = CommandObservation {
@@ -512,7 +619,10 @@ mod tests {
                 moe.architecture = "qwen3_5_hybrid_moe".into();
                 obligation.scope = ObligationScope::Target { target: moe };
                 assert!(!receipt.covers(&obligation));
-                assert_eq!(required_backend(&obligation), None);
+                assert_eq!(
+                    required_backend(&obligation),
+                    (precision == "block-fp8-e4m3").then_some(Backend::Cuda)
+                );
             }
         }
         let mut no_matrix = report.clone();

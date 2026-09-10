@@ -284,3 +284,43 @@ fn check_accelerator_tolerance(report: &ferrum_testkit::op_diff::NmseReport, tol
         eprintln!("  {} cuda NMSE: {:.3e}", report.op, n);
     }
 }
+
+// Release bindings reuse these existing fixtures, but require a real device.
+// The backend-specific test name is absent from a CPU-only harness, so a
+// successful CPU reference cannot satisfy an accelerator binding.
+#[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal")))]
+fn required_legacy_operators(backend: ferrum_testkit::op_diff::required::RequiredBackend) {
+    use ferrum_testkit::op_diff::required::run_required;
+    let report = run_required(
+        &RmsNormOp {
+            tokens: 4,
+            dim: 128,
+            eps: 1e-6,
+        },
+        backend,
+        42,
+        NMSE_FP16_TOL,
+    );
+    assert!(report.is_passed(), "required legacy RMSNorm: {report:?}");
+    argmax_rows_spiked();
+    embedding_lookup_small_shape();
+    residual_add_small_shape();
+    fused_add_rms_norm_small_shape();
+    qk_norm_rope_llama_shape_with_offset();
+    activation_bridge_roundtrip();
+    kv_cache_append_small_shape();
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "requires a Metal device"]
+fn required_legacy_metal_operators() {
+    required_legacy_operators(ferrum_testkit::op_diff::required::RequiredBackend::Metal);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn required_legacy_cuda_operators() {
+    required_legacy_operators(ferrum_testkit::op_diff::required::RequiredBackend::Cuda);
+}

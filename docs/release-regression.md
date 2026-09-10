@@ -111,6 +111,25 @@ The vNext wrapper must reject undersized workspaces before writing and reset a
 reused, dirty workspace before each projection. Matrix assertions alone cannot
 certify the remaining providers or MoE routing.
 
+Existing-route compatibility has separate bindings. The complete backend receipt
+still requires the shared native/F16/rotary/workspace checks above. CUDA adds the
+existing MXFP4 and block-FP8 routed matrix references, guarded output/scratch
+regions and native argument/ABI boundaries. Metal adds its existing Q4_K/Q6_K
+routed matrix reference and workspace-layout assertions. Legacy execution adds
+the existing op-diff fixtures for normalization, selection, embedding, residual,
+rotary, activation transfers and KV append; its backend-specific registered
+entrypoint requires an actual accelerator, so a CPU-only harness cannot pass it.
+
+For the vNext numerical-profile migration, the family-specific MoE routing,
+expert kernels and GPT-OSS attention kernels retain their existing arithmetic.
+The affected shared providers are exercised by the shared groups, including the
+Gemma proportional-RoPE and symmetric INT4 cases. The MXFP4/FP8 routed references
+do not establish GPTQ arithmetic: its existing source/repack contracts and
+separate real-model GPTQ regression remain required. These compatibility
+bindings preserve existing declared formats; they do not qualify CUDA MoE GGUF,
+Metal GPT-OSS, additional precision modes, or an entire model's output semantics.
+Real-model `run` and `serve` obligations remain independent of operator receipts.
+
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported
 coverage gap, selected and omitted profile, and unknown estimate. The current
