@@ -1,8 +1,8 @@
 //! Pin only the files consumed by this performance cell; never copy model weights.
 use super::remaining;
 use ferrum_bench_core::release_regression::{
-    performance::{FileDigest, SourceIdentity},
-    Backend, ModelProfile,
+    performance::{supports_target, FileDigest, SourceIdentity},
+    ModelProfile,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,15 +137,11 @@ impl SourceManifest {
         if self.schema_version != 1
             || &self.profile != expected
             || !expected.available
-            || expected.target.backend != Backend::Metal
-            || expected.target.execution_path != "legacy-model-executor"
-            || !expected.target.precision.starts_with("gguf-")
+            || !supports_target(&expected.target)
             || expected.id.trim().is_empty()
             || expected.target.architecture.trim().is_empty()
         {
-            return Err(
-                "performance source differs from the registered legacy Metal GGUF profile".into(),
-            );
+            return Err("performance source differs from the registered Metal GGUF profile".into());
         }
         if !self.gguf.path.is_absolute()
             || self.gguf.path.extension().and_then(|v| v.to_str()) != Some("gguf")
@@ -176,6 +172,9 @@ impl SourceManifest {
         }
         if !names.contains("tokenizer.json") || !names.contains("tokenizer_config.json") {
             return Err("pin tokenizer.json and tokenizer_config.json for benchmark/model tokenizer consistency".into());
+        }
+        if super::runtime::is_plan_runtime(&expected.target) && !names.contains("config.json") {
+            return Err("vNext performance source must pin config.json for model semantics".into());
         }
         Ok(())
     }

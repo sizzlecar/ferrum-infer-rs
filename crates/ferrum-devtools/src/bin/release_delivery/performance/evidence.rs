@@ -2,6 +2,7 @@
 //! these artifacts to trusted CI execution; local model paths are never opened here.
 use super::{
     compare, process, read_json,
+    runtime::{is_plan_runtime, ServerIdentity, ServerRole},
     source::{Bundle, SourceManifest},
     PerformanceArgs, PerformanceReport, Status,
 };
@@ -148,24 +149,27 @@ pub(super) fn verify_evidence(
         canonical.push(binary);
     }
     let mut measurements = Vec::<BenchReport>::new();
-    for (phase, server, sha, version) in [
+    for (phase, server, sha, version, role) in [
         (
             "baseline-a",
             &canonical[0],
             &expected.baseline_sha256,
             &expected.baseline_version,
+            ServerRole::Baseline,
         ),
         (
             "baseline-b",
             &canonical[0],
             &expected.baseline_sha256,
             &expected.baseline_version,
+            ServerRole::Baseline,
         ),
         (
             "candidate",
             &canonical[1],
             &expected.candidate_sha256,
             &expected.candidate_version,
+            ServerRole::Candidate,
         ),
     ] {
         let local = directory.join(phase);
@@ -190,8 +194,23 @@ pub(super) fn verify_evidence(
                 "executed client digest differs from prepared task",
             )?;
         }
-        let health: Value = read_json(&local.join("health.json"))?;
-        process::health_identity(&health, version, args.max_model_len)?;
+        let identity = ServerIdentity {
+            version,
+            target: &expected.profile.target,
+            workload: args.workload(),
+            memory_budget_bytes: args.runtime_memory_budget_bytes,
+            role,
+        };
+        let before: Value = read_json(&local.join("health.json"))?;
+        let after_path = local.join("health-after.json");
+        if is_plan_runtime(identity.target) || args.concurrency > 1 || after_path.exists() {
+            let after: Value = read_json(&after_path)?;
+            identity.verify_after(&before, &after)?;
+        } else {
+            // Earlier single-request legacy contracts observed startup only.
+            // They cannot stand in for a vNext or concurrent measurement.
+            identity.verify(&before)?;
+        }
         let execution: Value = read_json(&local.join("execution.json"))?;
         require(
             execution["server_pid"].as_u64().is_some_and(|pid| pid > 0)
@@ -209,10 +228,15 @@ pub(super) fn verify_evidence(
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| *n > 0)
             .ok_or("missing actual server port")?;
-        let server_args = process::server_arguments(&args, &bundle, port);
+        let server_args = process::server_arguments(&args, &bundle, port, &expected.profile.target);
         let worker_report = format!("{}/{phase}/bench.json", report_dir.trim_end_matches('/'));
-        let client_args =
-            process::client_arguments(&args, &bundle, port, Path::new(&worker_report));
+        let client_args = process::client_arguments(
+            &args,
+            &bundle,
+            port,
+            Path::new(&worker_report),
+            &expected.profile.target,
+        );
         require(
             commands["server"]["program"]
                 == serde_json::to_value(server).map_err(|e| e.to_string())?

@@ -24,6 +24,8 @@ mod evidence;
 mod prepare;
 #[path = "performance/process.rs"]
 mod process;
+#[path = "performance/runtime.rs"]
+mod runtime;
 pub use prepare::{prepare, PerformancePrepareArgs};
 #[path = "performance/source.rs"]
 mod source;
@@ -34,6 +36,7 @@ pub(super) fn verify_evidence(
     evidence::verify_evidence(expected, directory)
 }
 use compare::{ComparisonStatus, Limits, Workload};
+use runtime::{ServerIdentity, ServerRole};
 
 #[derive(Debug, Args, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +79,14 @@ pub struct PerformanceArgs {
     pub seed: u64,
     #[arg(long)]
     pub max_model_len: u32,
+    /// Concurrent HTTP requests and the server's active-sequence ceiling.
+    #[arg(long, default_value_t = 1)]
+    #[serde(default = "ferrum_bench_core::release_regression::performance::single_concurrency")]
+    pub concurrency: u32,
+    /// Scheduled-token budget; defaults to the context limit for older contracts.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_batched_tokens: Option<u32>,
     /// Fixed memory ceiling shared by both servers, instead of changing free-memory autosizing.
     #[arg(long)]
     pub runtime_memory_budget_bytes: u64,
@@ -133,6 +144,8 @@ impl PerformanceArgs {
             repeats: self.repeats,
             seed: self.seed,
             max_model_len: self.max_model_len,
+            concurrency: self.concurrency,
+            max_num_batched_tokens: self.max_num_batched_tokens,
         }
     }
     fn limits(&self) -> Limits {
@@ -142,6 +155,7 @@ impl PerformanceArgs {
         }
     }
     fn validate(&self) -> Result<(), String> {
+        self.workload().validate()?;
         if self.input_tokens == 0
             || self.output_tokens < 2
             || self.measured_requests == 0
@@ -298,24 +312,27 @@ async fn run(
     }
     write_json(&args.report_dir.join("binaries.json"), &binary_observations)?;
     let mut reports = Vec::<BenchReport>::new();
-    for (phase, binary, sha, version) in [
+    for (phase, binary, sha, version, role) in [
         (
             "baseline-a",
             &resolved[0],
             &args.baseline_sha256,
             &args.baseline_version,
+            ServerRole::Baseline,
         ),
         (
             "baseline-b",
             &resolved[0],
             &args.baseline_sha256,
             &args.baseline_version,
+            ServerRole::Baseline,
         ),
         (
             "candidate",
             &resolved[1],
             &args.candidate_sha256,
             &args.candidate_version,
+            ServerRole::Candidate,
         ),
     ] {
         let source_before = source.verify_bundle(&bundle, deadline)?;
@@ -327,7 +344,13 @@ async fn run(
             args,
             binary,
             &resolved[2],
-            version,
+            &ServerIdentity {
+                version,
+                target: &expected.profile.target,
+                workload: args.workload(),
+                memory_budget_bytes: args.runtime_memory_budget_bytes,
+                role,
+            },
             &bundle,
             &phase_dir,
             deadline,

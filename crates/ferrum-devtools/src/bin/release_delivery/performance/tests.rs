@@ -66,6 +66,8 @@ fn args(root: &Path) -> PerformanceArgs {
         repeats: 3,
         seed: 7,
         max_model_len: 2048,
+        concurrency: 1,
+        max_num_batched_tokens: None,
         runtime_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
         startup_timeout_secs: 60,
         request_timeout_secs: 30,
@@ -194,7 +196,13 @@ fn child_commands_bind_same_local_files_and_fixed_generation_workload() {
         gguf: "/fixed/model.gguf".into(),
         tokenizer_dir: "/fixed".into(),
     };
-    let words = process::client_arguments(&input, &bundle, 1234, Path::new("/report/bench.json"));
+    let words = process::client_arguments(
+        &input,
+        &bundle,
+        1234,
+        Path::new("/report/bench.json"),
+        &profile().target,
+    );
     let value = |flag: &str| {
         words
             .windows(2)
@@ -207,7 +215,7 @@ fn child_commands_bind_same_local_files_and_fixed_generation_workload() {
     assert_eq!(value("--target-backend"), Some("metal".into()));
     assert!(words.iter().any(|w| w == "--ignore-eos"));
     assert!(words.iter().any(|w| w == "--fail-on-error"));
-    let server = process::server_arguments(&input, &bundle, 1234);
+    let server = process::server_arguments(&input, &bundle, 1234, &profile().target);
     assert_eq!(server[1], "/fixed/model.gguf");
     assert!(server.iter().any(|w| w == "--runtime-memory-budget-bytes"));
     for flag in [
@@ -218,6 +226,62 @@ fn child_commands_bind_same_local_files_and_fixed_generation_workload() {
         let capacity = server.windows(2).find(|w| w[0] == flag).unwrap();
         assert_eq!(capacity[1], input.max_model_len.to_string().as_str());
     }
+}
+
+#[test]
+fn vnext_commands_bind_semantics_and_concurrency_without_legacy_kv_overrides() {
+    let mut input = args(Path::new("/unused"));
+    input.concurrency = 4;
+    input.max_num_batched_tokens = Some(512);
+    let mut target = profile().target;
+    target.execution_path = "production-plan-runtime".into();
+    let bundle = source::Bundle {
+        gguf: "/fixed/model.gguf".into(),
+        tokenizer_dir: "/fixed".into(),
+    };
+    let server = process::server_arguments(&input, &bundle, 1234, &target);
+    let value = |flag: &str| {
+        server
+            .windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].to_string_lossy().into_owned())
+    };
+    assert_eq!(value("--max-num-seqs").as_deref(), Some("4"));
+    assert_eq!(value("--max-num-batched-tokens").as_deref(), Some("512"));
+    assert_eq!(value("--semantic-source").as_deref(), Some("/fixed"));
+    assert_eq!(value("--tokenizer-source").as_deref(), Some("/fixed"));
+    assert_eq!(value("--kv-dtype"), None);
+    assert_eq!(value("--kv-capacity"), None);
+    let client = process::client_arguments(
+        &input,
+        &bundle,
+        1234,
+        Path::new("/report/bench.json"),
+        &target,
+    );
+    assert_eq!(
+        client.windows(2).find(|w| w[0] == "--concurrency").unwrap()[1],
+        "4"
+    );
+}
+
+#[test]
+fn vnext_source_requires_the_pinned_semantic_config() {
+    let root = tempfile::tempdir().unwrap();
+    let mut source = fixture(root.path());
+    source.profile.target.execution_path = "production-plan-runtime".into();
+    assert!(source
+        .validate(&source.profile, deadline())
+        .unwrap_err()
+        .contains("config.json"));
+    fs::write(source.tokenizer_dir.join("config.json"), b"{}").unwrap();
+    source.sidecars.push(pin("config.json".into(), b"{}"));
+    source.validate(&source.profile, deadline()).unwrap();
+    fs::write(source.tokenizer_dir.join("config.json"), b"[]").unwrap();
+    assert!(source
+        .validate(&source.profile, deadline())
+        .unwrap_err()
+        .contains("digest"));
 }
 
 #[tokio::test]
@@ -235,7 +299,13 @@ async fn failed_server_start_is_invalid_and_reaped_before_return() {
         &input,
         Path::new("/usr/bin/false"),
         Path::new("/usr/bin/false"),
-        "0.8.7",
+        &ServerIdentity {
+            version: "0.8.7",
+            target: &profile().target,
+            workload: input.workload(),
+            memory_budget_bytes: input.runtime_memory_budget_bytes,
+            role: ServerRole::Baseline,
+        },
         &bundle,
         &phase,
         deadline(),
@@ -257,6 +327,10 @@ async fn failed_server_start_is_invalid_and_reaped_before_return() {
 }
 
 fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
+    replay_fixture_with_path(directory, "legacy-model-executor")
+}
+
+fn replay_fixture_with_path(directory: &Path, execution_path: &str) -> ExpectedPerformanceRun {
     use ferrum_bench_core::release_regression::performance::ExpectedPerformanceRun;
     fn mac_wire_arguments(args: Vec<std::ffi::OsString>) -> serde_json::Value {
         json!(args
@@ -281,11 +355,15 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
     input.warmup_requests = 1;
     input.max_model_len = 128;
     let mut source = fixture(directory);
+    source.profile.target.execution_path = execution_path.into();
+    if runtime::is_plan_runtime(&source.profile.target) {
+        source.sidecars.push(pin("config.json".into(), b"{}"));
+    }
     source.gguf.path = "/missing-mac-worker/snapshot/model.gguf".into();
     source.tokenizer_dir = "/missing-mac-worker/tokenizer".into();
     let expected = ExpectedPerformanceRun {
         schema_version: 1,
-        profile: profile(),
+        profile: source.profile.clone(),
         baseline_version: input.baseline_version.clone(),
         baseline_sha256: input.baseline_sha256.clone(),
         candidate_version: input.candidate_version.clone(),
@@ -369,16 +447,35 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
         write_json(&location.join("bench.json"), measurement).unwrap();
         write_json(&location.join("checks.json"),&json!({"source_before":expected.source,"source_after":expected.source,
             "server_sha256_before":sha,"server_sha256_after":sha,"client_sha256_before":input.client_sha256,"client_sha256_after":input.client_sha256})).unwrap();
-        write_json(&location.join("health.json"),&json!({"status":"healthy","version":version,"auto_config":{
+        let mut health = json!({"status":"healthy","version":version,"auto_config":{
             "hardware_capabilities":{"backend":"Metal"},"selected_kv_capacity":input.max_model_len,
             "selected_max_model_len":input.max_model_len,"selected_max_sequences":1,
             "selected_max_batched_tokens":input.max_model_len
-        }})).unwrap();
+        }});
+        if runtime::is_plan_runtime(&expected.profile.target) {
+            health["cache"] = runtime::fixture_health()["cache"].clone();
+            health["auto_config"]["execution_resource_authority"] = json!("plan_runtime");
+            health["auto_config"]["selected_kv_capacity"] = serde_json::Value::Null;
+            let trace = &mut health["cache"]["prefix_cache"];
+            trace["maximum_model_tokens"] = json!(input.max_model_len);
+            trace["runtime_memory_policy"]["maximum_active_sequences"] = json!(input.concurrency);
+            trace["runtime_admission_policy"]["maximum_scheduled_tokens"] =
+                json!(input.workload().batched_tokens());
+            if phase != "candidate" {
+                trace["numerical_execution"] = serde_json::Value::Null;
+            }
+        }
+        write_json(&location.join("health.json"), &health).unwrap();
+        fs::copy(
+            location.join("health.json"),
+            location.join("health-after.json"),
+        )
+        .unwrap();
         write_json(&location.join("execution.json"),&json!({"server_pid":123,"client_exit_code":0,"client_cleanup_completed":true,
             "client_completed_successfully":true,"cleanup_completed":true,"error":null,"cleanup_error":null})).unwrap();
         let worker_report = format!("/missing-mac-worker/reports/{phase}/bench.json");
-        write_json(&location.join("commands.json"),&json!({"port":1234,"server":{"program":path,"args":mac_wire_arguments(process::server_arguments(&input,&bundle,1234))},
-            "client":{"program":input.client_bin,"args":mac_wire_arguments(process::client_arguments(&input,&bundle,1234,Path::new(&worker_report)))}})).unwrap();
+        write_json(&location.join("commands.json"),&json!({"port":1234,"server":{"program":path,"args":mac_wire_arguments(process::server_arguments(&input,&bundle,1234,&expected.profile.target))},
+            "client":{"program":input.client_bin,"args":mac_wire_arguments(process::client_arguments(&input,&bundle,1234,Path::new(&worker_report),&expected.profile.target))}})).unwrap();
     }
     let comparison = compare::compare(
         &baseline,
@@ -391,7 +488,7 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
     let report = PerformanceReport {
         schema_version: 1,
         status: Status::Passed,
-        profile: Some(profile()),
+        profile: Some(expected.profile.clone()),
         comparison: Some(comparison),
         calibration_stable: Some(true),
         completed_phases: vec!["baseline-a".into(), "baseline-b".into(), "candidate".into()],
@@ -425,6 +522,35 @@ fn performance_replay_uses_original_measurements_without_opening_remote_model_pa
     assert!(verify_evidence(&expected, root.path())
         .unwrap_err()
         .contains("raw benchmark"));
+}
+
+#[test]
+fn vnext_replay_binds_candidate_plan_after_measurement_and_preserves_unknown_baseline_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let expected = replay_fixture_with_path(root.path(), "production-plan-runtime");
+    verify_evidence(&expected, root.path()).unwrap();
+    let path = root.path().join("candidate/health-after.json");
+    let mut health: serde_json::Value = read_json(&path).unwrap();
+    health["cache"]["prefix_cache"]["numerical_execution"]["execution_plan_hash"] =
+        json!("0".repeat(64));
+    write_json(&path, &health).unwrap();
+    assert!(verify_evidence(&expected, root.path())
+        .unwrap_err()
+        .contains("numerical"));
+    fs::remove_file(path).unwrap();
+    assert!(verify_evidence(&expected, root.path())
+        .unwrap_err()
+        .contains("health-after.json"));
+}
+
+#[test]
+fn earlier_single_request_legacy_evidence_can_replay_with_startup_health_only() {
+    let root = tempfile::tempdir().unwrap();
+    let expected = replay_fixture(root.path());
+    for phase in ["baseline-a", "baseline-b", "candidate"] {
+        fs::remove_file(root.path().join(phase).join("health-after.json")).unwrap();
+    }
+    verify_evidence(&expected, root.path()).unwrap();
 }
 
 #[test]

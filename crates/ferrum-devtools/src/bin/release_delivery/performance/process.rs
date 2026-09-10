@@ -1,10 +1,14 @@
 //! Child ownership and CLI adaptation; benchmark requests remain in bench-serve.
 #[cfg(unix)]
 use super::{remaining, write_json};
-use super::{source::Bundle, PerformanceArgs};
-#[cfg(any(unix, test))]
-use serde_json::json;
-use serde_json::Value;
+use super::{
+    runtime::{backend_name, is_plan_runtime, ServerIdentity},
+    source::Bundle,
+    PerformanceArgs,
+};
+use ferrum_bench_core::release_regression::ExecutionTarget;
+#[cfg(unix)]
+use serde_json::{json, Value};
 use std::{ffi::OsString, path::Path};
 #[cfg(unix)]
 use std::{fs, net::TcpListener, process::Stdio, time::Duration};
@@ -35,12 +39,13 @@ pub(super) fn server_arguments(
     args: &PerformanceArgs,
     bundle: &Bundle,
     port: u16,
+    target: &ExecutionTarget,
 ) -> Vec<OsString> {
-    vec![
+    let mut command = vec![
         "serve".into(),
         bundle.gguf.as_os_str().into(),
         "--backend".into(),
-        "metal".into(),
+        backend_name(target.backend).into(),
         "--served-model-name".into(),
         "release-perf".into(),
         "--disable-thinking".into(),
@@ -48,28 +53,44 @@ pub(super) fn server_arguments(
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string().into(),
-        "--kv-dtype".into(),
-        "fp16".into(),
-        "--kv-capacity".into(),
-        args.max_model_len.to_string().into(),
+    ];
+    if !is_plan_runtime(target) {
+        command.extend([
+            "--kv-dtype".into(),
+            "fp16".into(),
+            "--kv-capacity".into(),
+            args.max_model_len.to_string().into(),
+        ]);
+    }
+    command.extend([
         "--max-model-len".into(),
         args.max_model_len.to_string().into(),
         "--max-num-seqs".into(),
-        "1".into(),
+        args.concurrency.to_string().into(),
         "--max-num-batched-tokens".into(),
-        args.max_model_len.to_string().into(),
+        args.workload().batched_tokens().to_string().into(),
         "--runtime-memory-budget-bytes".into(),
         args.runtime_memory_budget_bytes.to_string().into(),
         "--disable-prefix-cache".into(),
         "--session-cache".into(),
         "off".into(),
-    ]
+    ]);
+    if is_plan_runtime(target) {
+        command.extend([
+            "--semantic-source".into(),
+            bundle.tokenizer_dir.as_os_str().into(),
+            "--tokenizer-source".into(),
+            bundle.tokenizer_dir.as_os_str().into(),
+        ]);
+    }
+    command
 }
 pub(super) fn client_arguments(
     args: &PerformanceArgs,
     bundle: &Bundle,
     port: u16,
     report: &Path,
+    target: &ExecutionTarget,
 ) -> Vec<OsString> {
     vec![
         "bench-serve".into(),
@@ -80,11 +101,11 @@ pub(super) fn client_arguments(
         "--tokenizer".into(),
         bundle.tokenizer_dir.as_os_str().into(),
         "--target-backend".into(),
-        "metal".into(),
+        backend_name(target.backend).into(),
         "--dataset".into(),
         "random".into(),
         "--concurrency".into(),
-        "1".into(),
+        args.concurrency.to_string().into(),
         "--http-connection-mode".into(),
         "pooled".into(),
         "--random-input-len".into(),
@@ -112,46 +133,11 @@ pub(super) fn client_arguments(
         report.as_os_str().into(),
     ]
 }
-pub(super) fn health_identity(
-    health: &Value,
-    version: &str,
-    max_model_len: u32,
-) -> Result<(), String> {
-    if health["status"] != "healthy"
-        || health["version"].as_str() != Some(version)
-        || !matches!(
-            health["auto_config"]["hardware_capabilities"]["backend"].as_str(),
-            Some("metal" | "Metal")
-        )
-    {
-        return Err(
-            "performance server health omitted/mismatched actual Metal backend or version".into(),
-        );
-    }
-    // The allocator's estimated capacity can exceed the executor's selected
-    // pool. Check the limits actually selected for this fixed workload before
-    // starting any timed requests, and again when replaying archived evidence.
-    for (field, expected) in [
-        ("selected_kv_capacity", max_model_len),
-        ("selected_max_model_len", max_model_len),
-        ("selected_max_sequences", 1),
-        ("selected_max_batched_tokens", max_model_len),
-    ] {
-        let observed = &health["auto_config"][field];
-        if expected == 0 || observed.as_u64() != Some(u64::from(expected)) {
-            return Err(format!(
-                "performance server actual capacity mismatch: {field} expected {expected}, observed {observed}"
-            ));
-        }
-    }
-    Ok(())
-}
 #[cfg(unix)]
 async fn ready(
     group: &mut super::super::local::ProcessGroup,
     port: u16,
-    version: &str,
-    max_model_len: u32,
+    identity: &ServerIdentity<'_>,
     phase: &Path,
     deadline: Instant,
     terminate: &mut tokio::signal::unix::Signal,
@@ -177,7 +163,7 @@ async fn ready(
                 if response.status().is_success() {
                     let health: Value = response.json().await.map_err(|e| e.to_string())?;
                     write_json(&phase.join("health.json"), &health)?;
-                    health_identity(&health, version, max_model_len)?;
+                    identity.verify(&health)?;
                     return Ok(true);
                 }
             }
@@ -199,7 +185,7 @@ pub(super) async fn phase(
     args: &PerformanceArgs,
     binary: &Path,
     client: &Path,
-    version: &str,
+    identity: &ServerIdentity<'_>,
     bundle: &Bundle,
     phase: &Path,
     deadline: Instant,
@@ -211,8 +197,14 @@ pub(super) async fn phase(
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
     let socket = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     let port = socket.local_addr().map_err(|e| e.to_string())?.port();
-    let server_args = server_arguments(args, bundle, port);
-    let bench_args = client_arguments(args, bundle, port, &phase.join("bench.json"));
+    let server_args = server_arguments(args, bundle, port, identity.target);
+    let bench_args = client_arguments(
+        args,
+        bundle,
+        port,
+        &phase.join("bench.json"),
+        identity.target,
+    );
     write_json(
         &phase.join("commands.json"),
         &json!({"port":port,"server":{"program":binary,"args":server_args},"client":{"program":client,"args":bench_args}}),
@@ -247,7 +239,7 @@ pub(super) async fn phase(
             .checked_add(Duration::from_secs(args.startup_timeout_secs))
             .ok_or("startup deadline overflow")?
             .min(deadline);
-        ready(&mut group, port, version, args.max_model_len, phase, startup, &mut terminate, &mut interrupt).await?;
+        ready(&mut group, port, identity, phase, startup, &mut terminate, &mut interrupt).await?;
         let mut bench=clean_command(client,&bundle.tokenizer_dir);
         bench.args(&bench_args).stdin(Stdio::null())
             .stdout(fs::File::create(phase.join("client.stdout.log")).map_err(|e|e.to_string())?)
@@ -277,6 +269,15 @@ pub(super) async fn phase(
                 "performance server exited during benchmark: {status}"
             ));
         }
+        let health: Value = reqwest::Client::builder().no_proxy()
+            .timeout(remaining(deadline)?.min(Duration::from_secs(5)))
+            .build().map_err(|e| e.to_string())?
+            .get(format!("http://127.0.0.1:{port}/health")).send().await
+            .map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?
+            .json().await.map_err(|e| e.to_string())?;
+        write_json(&phase.join("health-after.json"), &health)?;
+        let before: Value = super::read_json(&phase.join("health.json"))?;
+        identity.verify_after(&before, &health)?;
         Ok(())
     }
     .await;
@@ -299,47 +300,10 @@ pub(super) async fn phase(
     _args: &PerformanceArgs,
     _binary: &Path,
     _client: &Path,
-    _version: &str,
+    _identity: &ServerIdentity<'_>,
     _bundle: &Bundle,
     _phase: &Path,
     _deadline: Instant,
 ) -> Result<(), String> {
     Err("Metal performance execution requires Unix process groups".into())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn health() -> Value {
-        json!({"status":"healthy","version":"0.8.7","auto_config":{
-            "hardware_capabilities":{"backend":"Metal"},
-            "selected_kv_capacity":1024,"selected_max_model_len":1024,
-            "selected_max_sequences":1,"selected_max_batched_tokens":1024,
-            "admission":{"kv_capacity_tokens":32768,"max_model_length":1024}
-        }})
-    }
-    #[test]
-    fn health_requires_real_backend_and_registered_version() {
-        let mut value = health();
-        assert!(health_identity(&value, "0.8.7", 1024).is_ok());
-        value["auto_config"]["hardware_capabilities"]["backend"] = json!("Cpu");
-        assert!(health_identity(&value, "0.8.7", 1024).is_err());
-        value["auto_config"]["hardware_capabilities"]["backend"] = json!("Metal");
-        assert!(health_identity(&value, "0.8.8", 1024).is_err());
-    }
-    #[test]
-    fn selected_capacity_must_match_workload_even_when_admission_estimate_is_larger() {
-        for field in [
-            "selected_kv_capacity",
-            "selected_max_model_len",
-            "selected_max_sequences",
-            "selected_max_batched_tokens",
-        ] {
-            for observed in [Value::Null, json!(0), json!(512), json!(4096)] {
-                let mut value = health();
-                value["auto_config"][field] = observed;
-                let error = health_identity(&value, "0.8.7", 1024).unwrap_err();
-                assert!(error.contains(field), "{error}");
-            }
-        }
-    }
 }
