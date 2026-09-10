@@ -31,6 +31,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::raw::c_void;
 
+#[path = "compressed_tensors_marlin_eq/guards.rs"]
+mod guards;
+use guards::Guarded;
+
 const BLOCK_FP8_SOURCE_WEIGHT_FORMAT_ID: &str =
     "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale";
 const BLOCK_FP8_EXACT_PARITY_ARTIFACT_SCHEMA_ID: &str =
@@ -488,23 +492,29 @@ fn run_fixture(context: &std::sync::Arc<CudaContext>, fixture: Fixture) -> (f64,
     let zero_points_device: CudaSlice<i32> = stream
         .clone_htod(&packed_zero_points)
         .expect("upload packed zero points");
-    let mut output_device: CudaSlice<f16> = stream
-        .alloc_zeros(fixture.rows * n)
-        .expect("allocate output");
+    let mut output_device = Guarded::new(
+        &stream,
+        &vec![f16::NAN; fixture.rows * n],
+        f16::from_f32(-117.0),
+    );
     let sms = context
         .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
         .expect("query SM count");
-    let workspace: CudaSlice<i32> = stream
-        .alloc_zeros(usize::try_from(sms).expect("positive SM count"))
-        .expect("allocate workspace");
+    let mut workspace = Guarded::new(
+        &stream,
+        &vec![0_i32; usize::try_from(sms).expect("positive SM count")],
+        0x5a5a1234,
+    );
 
     {
         let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
         let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
         let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
         let (zero_points_pointer, _zero_points_guard) = zero_points_device.device_ptr(&stream);
-        let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
-        let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+        let mut output_view = output_device.view_mut();
+        let mut workspace_view = workspace.view_mut();
+        let (output_pointer, _output_guard) = output_view.device_ptr_mut(&stream);
+        let (workspace_pointer, _workspace_guard) = workspace_view.device_ptr_mut(&stream);
         unsafe {
             launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
                 weight_type: MarlinF16WeightType::U4,
@@ -542,9 +552,8 @@ fn run_fixture(context: &std::sync::Arc<CudaContext>, fixture: Fixture) -> (f64,
         }
         stream.synchronize().expect("Marlin synchronize");
     }
-    let actual = stream
-        .clone_dtoh(&output_device)
-        .expect("download Marlin output");
+    let actual = output_device.read(&stream);
+    workspace.read(&stream);
 
     let mut reference_squared = 0.0_f64;
     let mut error_squared = 0.0_f64;
@@ -777,22 +786,25 @@ fn run_gemma4_symmetric_fixture(
     let scales_device: CudaSlice<f16> = stream
         .clone_htod(&weight.packed_scales)
         .expect("upload Gemma 4 group-32 scales");
-    let mut output_device: CudaSlice<f16> = stream
-        .alloc_zeros(batch * n)
-        .expect("allocate Gemma 4 output");
+    let mut output_device =
+        Guarded::new(&stream, &vec![f16::NAN; batch * n], f16::from_f32(-117.0));
     let sms = context
         .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
         .expect("query SM count");
-    let workspace: CudaSlice<i32> = stream
-        .alloc_zeros(usize::try_from(sms).expect("positive SM count"))
-        .expect("allocate Gemma 4 Marlin workspace");
+    let mut workspace = Guarded::new(
+        &stream,
+        &vec![0_i32; usize::try_from(sms).expect("positive SM count")],
+        0x5a5a1234,
+    );
 
     {
         let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
         let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
         let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
-        let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
-        let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+        let mut output_view = output_device.view_mut();
+        let mut workspace_view = workspace.view_mut();
+        let (output_pointer, _output_guard) = output_view.device_ptr_mut(&stream);
+        let (workspace_pointer, _workspace_guard) = workspace_view.device_ptr_mut(&stream);
         unsafe {
             launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
                 weight_type: MarlinF16WeightType::U4B8,
@@ -831,9 +843,8 @@ fn run_gemma4_symmetric_fixture(
         stream.synchronize().expect("Gemma 4 Marlin synchronize");
     }
 
-    let actual = stream
-        .clone_dtoh(&output_device)
-        .expect("download Gemma 4 output");
+    let actual = output_device.read(&stream);
+    workspace.read(&stream);
     let mut reference_squared = 0.0_f64;
     let mut error_squared = 0.0_f64;
     let mut nan_count = 0_usize;
@@ -1282,21 +1293,25 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             "{case_id} exact group-128 scale transform drifted"
         );
         let input_device: CudaSlice<f16> = stream.clone_htod(&input).expect("upload input");
-        let mut output_device: CudaSlice<f16> =
-            stream.alloc_zeros(batch * n).expect("allocate output");
+        let mut output_device =
+            Guarded::new(&stream, &vec![f16::NAN; batch * n], f16::from_f32(-117.0));
         let sms = context
             .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .expect("query SM count");
-        let workspace: CudaSlice<i32> = stream
-            .alloc_zeros(usize::try_from(sms).expect("positive SM count"))
-            .expect("allocate workspace");
+        let mut workspace = Guarded::new(
+            &stream,
+            &vec![0_i32; usize::try_from(sms).expect("positive SM count")],
+            0x5a5a1234,
+        );
 
         {
             let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
             let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
             let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
-            let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
-            let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+            let mut output_view = output_device.view_mut();
+            let mut workspace_view = workspace.view_mut();
+            let (output_pointer, _output_guard) = output_view.device_ptr_mut(&stream);
+            let (workspace_pointer, _workspace_guard) = workspace_view.device_ptr_mut(&stream);
             unsafe {
                 launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
                     weight_type: MarlinF16WeightType::E4M3Fn,
@@ -1336,9 +1351,8 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             stream.synchronize().expect("Marlin synchronize");
         }
 
-        let actual = stream
-            .clone_dtoh(&output_device)
-            .expect("download Marlin output");
+        let actual = output_device.read(&stream);
+        workspace.read(&stream);
         let mut reference_squared = 0.0_f64;
         let mut error_squared = 0.0_f64;
         let mut nan_count = 0_usize;

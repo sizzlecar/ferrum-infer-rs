@@ -93,6 +93,34 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
         });
     }
     groups.extend(numerical::groups(backend));
+    if backend == Backend::Cuda {
+        // Matrix parity supplements the native suite. It does not bind an
+        // entire Marlin model target until its other providers are covered.
+        let tests: Vec<_> = [
+            "gemma4_symmetric_compressed_tensors_w4a16_matches_two_shapes_and_batches_1_4",
+            "qwen38_compressed_tensors_w4a16_matches_cpu_reference_for_four_fixed_fixtures",
+            "qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases",
+        ]
+        .into_iter()
+        .map(|name| ContractTest {
+            package: "ferrum-kernels".into(),
+            target: "compressed_tensors_marlin_eq".into(),
+            kind: "test".into(),
+            name: name.into(),
+        })
+        .collect();
+        for (suffix, behavior) in [
+            ("numerics", Behavior::KernelNumerics),
+            ("boundaries", Behavior::KernelBoundaries),
+        ] {
+            groups.push(ContractGroup {
+                id: format!("backend-contract.cuda.marlin-matrix-{suffix}"),
+                behavior,
+                entrypoints: Vec::new(),
+                tests: tests.clone(),
+            });
+        }
+    }
     groups
 }
 

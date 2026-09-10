@@ -97,6 +97,12 @@ are limited to the tested native GGUF paths and the CPU/Metal dense SafeTensors
 path. They do not cover CUDA Marlin formats, MoE, legacy operators, or whole-model
 state correctness. Repeated assertions shared by numerical and boundary groups
 execute once; both groups still require every registered assertion to succeed.
+The CUDA registry additionally executes the existing symmetric/asymmetric INT4
+and block-FP8 Marlin matrix references. Outputs start as NaN, and both outputs
+and zero-initialized workspaces have aligned prefix/suffix guards checked after
+execution. Original numerical tolerances are retained. These matrix assertions
+are supplemental evidence; they do not bind an entire Marlin model target or
+certify its remaining providers or MoE routing.
 
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported
