@@ -7,9 +7,8 @@ use super::{
     PerformanceArgs,
 };
 use ferrum_bench_core::release_regression::ExecutionTarget;
-#[cfg(any(unix, test))]
-use serde_json::json;
-use serde_json::Value;
+#[cfg(unix)]
+use serde_json::{json, Value};
 use std::{ffi::OsString, path::Path};
 #[cfg(unix)]
 use std::{fs, net::TcpListener, process::Stdio, time::Duration};
