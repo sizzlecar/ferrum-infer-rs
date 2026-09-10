@@ -65,6 +65,8 @@ use moe_weights::{
 
 mod attention;
 mod causal_attention;
+#[cfg(test)]
+mod f16_tests;
 mod gpt_oss_attention;
 #[cfg(feature = "vllm-moe-marlin")]
 mod gpt_oss_moe;

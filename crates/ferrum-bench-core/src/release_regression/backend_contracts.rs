@@ -446,4 +446,39 @@ mod tests {
             .iter()
             .any(|group| group.id == LEGACY_CUDA_CHECK));
     }
+
+    #[test]
+    fn cuda_dense_float_coverage_requires_the_f16_provider_assertions() {
+        let target = ExecutionTarget {
+            architecture: "qwen3_5_dense_hybrid".into(),
+            protocol: ferrum_types::ModelOutputProtocol::Text,
+            precision: "safetensors-bf16-f32".into(),
+            backend: Backend::Cuda,
+            execution_path: PATH.into(),
+        };
+        let report = report_fixture(Backend::Cuda);
+        let receipt = verify_report(Backend::Cuda, &report).unwrap();
+        let descriptors = check_descriptors(std::slice::from_ref(&target));
+        for behavior in [Behavior::KernelNumerics, Behavior::KernelBoundaries] {
+            let descriptor = descriptors.iter().find(|d| d.behavior == behavior).unwrap();
+            let obligation = super::super::Obligation {
+                behavior: descriptor.behavior,
+                layer: descriptor.layer,
+                scope: ObligationScope::Target {
+                    target: target.clone(),
+                },
+                checkers: vec![descriptor.id.clone()],
+                entrypoints: Vec::new(),
+                reason: "dense F16 provider evidence".into(),
+            };
+            assert!(receipt.covers(&obligation));
+        }
+        let mut native_only = report;
+        for group in &mut native_only.execution.groups {
+            group
+                .tests
+                .retain(|test| !test.binding.name.contains("::f16_tests::"));
+        }
+        assert!(verify_report(Backend::Cuda, &native_only).is_err());
+    }
 }
