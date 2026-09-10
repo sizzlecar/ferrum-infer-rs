@@ -27,6 +27,7 @@ pub enum ModelCheck {
     AutoToolsJson,
     Reasoning,
     Length,
+    Observability,
 }
 
 impl fmt::Display for ModelCheck {
@@ -39,6 +40,7 @@ impl fmt::Display for ModelCheck {
             Self::AutoToolsJson => "auto-tools-json",
             Self::Reasoning => "reasoning",
             Self::Length => "length",
+            Self::Observability => "observability",
         })
     }
 }
@@ -55,6 +57,7 @@ impl FromStr for ModelCheck {
             "auto-tools-json" => Ok(Self::AutoToolsJson),
             "reasoning" => Ok(Self::Reasoning),
             "length" => Ok(Self::Length),
+            "observability" => Ok(Self::Observability),
             _ => Err(format!("unknown model check {value:?}")),
         }
     }
@@ -70,6 +73,7 @@ impl ModelCheck {
             Self::AutoToolsJson => &["serve-auto-tools-json"],
             Self::Reasoning => &["run-reasoning", "serve-reasoning"],
             Self::Length => &["run-length", "serve-length"],
+            Self::Observability => &["run-observability", "serve-observability"],
         }
     }
 }
@@ -467,7 +471,7 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             format!("missing required model case {name}"),
         );
     }
-    for name in ["run-basic", "serve-startup"] {
+    for name in ["run-basic", "run-observability", "serve-startup"] {
         if let Some(case) = recorded.get(name) {
             if let Err(error) = super::model_sources::verify_profile_source(
                 &expected.profile,
@@ -530,7 +534,13 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             "serve-startup version differs from the expected version",
         );
     }
-    for name in ["run-basic", "run-stop", "run-reasoning", "run-length"] {
+    for name in [
+        "run-basic",
+        "run-stop",
+        "run-reasoning",
+        "run-length",
+        "run-observability",
+    ] {
         if let Some(case) = recorded.get(name) {
             let ready = &case["evidence"]["ready"];
             if name == "run-reasoning"
@@ -558,6 +568,29 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
                 run_backend(&ready["backend"]) == Some(expected.profile.target.backend),
                 format!("{name} backend is unobservable or differs from the expected backend"),
             );
+        }
+    }
+    for (name, entrypoints) in [
+        ("run-observability", &[super::Entrypoint::Run][..]),
+        (
+            "serve-observability",
+            &[super::Entrypoint::ServeSync, super::Entrypoint::ServeStream][..],
+        ),
+    ] {
+        if let Some(case) = recorded.get(name) {
+            let result = serde_json::from_value(case["evidence"]["observability"].clone())
+                .map_err(|error| format!("invalid observation journal: {error}"))
+                .and_then(|evidence| {
+                    super::model_observability::verify(
+                        &evidence,
+                        expected.profile.target.backend,
+                        entrypoints,
+                        expected.max_tokens,
+                    )
+                });
+            if let Err(error) = result {
+                errors.push(format!("{name}: {error}"));
+            }
         }
     }
     for name in ["run-stop", "serve-stop"] {

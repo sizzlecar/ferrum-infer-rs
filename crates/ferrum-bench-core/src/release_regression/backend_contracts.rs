@@ -38,6 +38,7 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
                 "upload_owns_source_bytes_and_is_charged_until_submission_finishes",
                 "failure_after_write_returns_failed_quiescent_fence_and_prevents_retry",
                 "foreign_command_is_rejected_before_any_earlier_command_runs",
+                "profiling_preserves_cpu_execution_and_marks_device_clocks_unavailable",
             ],
         ),
         Backend::Metal => (

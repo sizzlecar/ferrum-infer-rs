@@ -51,6 +51,10 @@ fn capability(behavior: Behavior) -> Option<(ModelCheck, &'static str, &'static 
             "model-regression.basic.reasoning-absence",
         ),
         LengthLimit => (ModelCheck::Length, "model-regression.length.limit"),
+        Observability => (
+            ModelCheck::Observability,
+            "model-regression.observability.request-lifecycle",
+        ),
         StructuredValidity => (
             ModelCheck::Structured,
             "model-regression.structured.validity",
@@ -83,6 +87,7 @@ pub fn model_check_descriptors() -> Vec<CheckDescriptor> {
         Behavior::ReasoningBoundaries,
         Behavior::ReasoningAbsence,
         Behavior::LengthLimit,
+        Behavior::Observability,
         Behavior::StructuredValidity,
         Behavior::ToolSelection,
         Behavior::ToolHandoff,
@@ -231,6 +236,7 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
                 ModelCheck::Reasoning => 4,
                 ModelCheck::Length => 5,
                 ModelCheck::AutoToolsJson => 6,
+                ModelCheck::Observability => 7,
             });
             run
         })

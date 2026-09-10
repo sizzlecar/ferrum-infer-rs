@@ -216,6 +216,13 @@ to `basic`; explicitly select the checks relevant to the release:
 - `stop`: termination behavior through both entrypoints, including stream text.
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
+- `observability`: real `run`, synchronous HTTP and SSE answers with public
+  `--profile-detail debug`, profile and scheduler journals. Verify request IDs,
+  backend identity, terminal token usage and closed request ownership against
+  the actual output. Token traces require a diagnostic detail level; `basic`
+  does not produce them. Missing CPU device clocks remain explicitly unavailable
+  and must not prevent generation or be represented as GPU timing. This check
+  does not certify model state arithmetic or measured performance.
 
 For a fixed Hugging Face snapshot, `ferrum run`, `ferrum serve`, `ferrum pull`,
 and the runner accept `OWNER/REPOSITORY@FULL_40_HEX_COMMIT` as the model.

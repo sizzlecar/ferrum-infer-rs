@@ -8,6 +8,7 @@ pub(super) use responses::{responses_stream, responses_sync, Responses};
 
 #[derive(Debug)]
 pub(super) struct Chat {
+    pub response_id: Option<String>,
     pub message: Value,
     pub finish: String,
     pub usage: Value,
@@ -120,6 +121,7 @@ pub(super) fn sync(text: &str) -> Result<Chat> {
         "expected the requested single choice"
     );
     Chat {
+        response_id: body["id"].as_str().map(str::to_owned),
         message: choices[0]["message"].clone(),
         finish: choices[0]["finish_reason"]
             .as_str()
@@ -272,6 +274,7 @@ pub(super) fn stream(text: &str) -> Result<Chat> {
         message["tool_calls"] = json!(calls.into_values().collect::<Vec<_>>());
     }
     Chat {
+        response_id,
         message,
         finish: finish.context("missing terminal choice")?,
         usage: usage.context("missing usage")?,

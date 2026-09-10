@@ -1193,10 +1193,13 @@ fn contract_only_observability_cannot_erase_runtime_or_accept_basic_as_profile_e
     );
     request.impact.areas = vec![ChangeArea::ObservabilityContract, ChangeArea::Observability];
     request.checks = super::super::contracts::contract_check_descriptors();
-    // Existing model checks include Basic, but do not inspect profile sinks.
-    request
-        .checks
-        .extend(super::super::model_schedule::model_check_descriptors());
+    // Basic and protocol checks do not inspect profile sinks. Only the actual
+    // observation runner can provide the separate runtime evidence.
+    request.checks.extend(
+        super::super::model_schedule::model_check_descriptors()
+            .into_iter()
+            .filter(|check| check.behavior != Behavior::Observability),
+    );
     let result = plan(&request).unwrap();
     for target in targets {
         let (index, obligation) = result
@@ -1214,6 +1217,23 @@ fn contract_only_observability_cannot_erase_runtime_or_accept_basic_as_profile_e
             .unwrap();
         assert!(obligation.checkers.is_empty());
         assert!(result
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+    }
+    request.checks.extend(
+        super::super::model_schedule::model_check_descriptors()
+            .into_iter()
+            .filter(|check| check.behavior == Behavior::Observability),
+    );
+    let executable = plan(&request).unwrap();
+    for (index, obligation) in executable.obligations.iter().enumerate().filter(|(_, o)| {
+        o.behavior == Behavior::Observability && o.layer == EvidenceLayer::ModelRuntime
+    }) {
+        assert_eq!(
+            obligation.checkers,
+            ["model-regression.observability.request-lifecycle"]
+        );
+        assert!(!executable
             .gaps
             .contains(&Gap::UnassignedCheck { obligation: index }));
     }

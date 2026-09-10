@@ -63,6 +63,25 @@ fn make_plan(obligations: Vec<Obligation>, selected: Vec<SelectedProfile>) -> Pl
 }
 
 #[test]
+fn observability_schedules_real_run_and_both_http_modes_on_each_required_backend() {
+    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
+        let owner = profile("observed", backend);
+        let mut requirement = obligation(Behavior::Observability, &owner);
+        requirement.scope = ObligationScope::Backend { backend };
+        let plan = make_plan(vec![requirement], vec![selected(owner, vec![0])]);
+        let schedule = model_task_schedule(&plan);
+        assert!(schedule.unsupported_obligations.is_empty());
+        assert_eq!(schedule.runs[0].checks, [ModelCheck::Observability]);
+        assert_eq!(schedule.runs[0].obligations, [0]);
+        assert_eq!(
+            capability(Behavior::Observability).unwrap().2,
+            ALL_ENTRYPOINTS
+        );
+        assert_eq!(plan.gaps, [Gap::ProductContractReview]);
+    }
+}
+
+#[test]
 fn model_schedule_coalesces_behavior_checks_without_claiming_release_approval() {
     let owner = profile("shared", Backend::Cuda);
     let obligations = [

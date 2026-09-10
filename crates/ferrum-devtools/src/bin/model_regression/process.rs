@@ -53,9 +53,27 @@ fn isolate_product_environment(
 }
 
 impl Process {
-    fn spawn(args: &Args, name: &str, argv: Vec<String>, stdin: Option<&str>) -> Result<Self> {
+    fn spawn(args: &Args, name: &str, mut argv: Vec<String>, stdin: Option<&str>) -> Result<Self> {
         let stdout = args.report_dir.join(format!("{name}.stdout.txt"));
         let stderr = args.report_dir.join(format!("{name}.stderr.txt"));
+        if args.checks.contains(&super::Check::Observability)
+            && matches!(argv.first().map(String::as_str), Some("run" | "serve"))
+        {
+            argv.extend([
+                "--profile-detail".into(),
+                "debug".into(),
+                "--profile-jsonl".into(),
+                args.report_dir
+                    .join(format!("{name}.profile.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+                "--scheduler-trace-jsonl".into(),
+                args.report_dir
+                    .join(format!("{name}.scheduler.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ]);
+        }
         let mut command = Command::new(&args.ferrum_bin);
         let removed_environment_keys = isolate_product_environment(
             &mut command,
