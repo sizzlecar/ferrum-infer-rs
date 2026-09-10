@@ -59,7 +59,7 @@ h1 { max-width: 900px; margin: 14px 0 22px; font-size: clamp(3.1rem, 8vw, 6.9rem
 .button.primary:hover { border-color: var(--rust-light); background: var(--rust-light); }
 .proof { display: flex; flex-wrap: wrap; gap: 18px 30px; margin-top: 38px; color: var(--muted); font-size: .93rem; }
 .proof span::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 9px; border-radius: 50%; background: var(--green); }
-section { padding: 68px 0; }
+section { padding: 68px 0; scroll-margin-top: 68px; }
 .section-head { max-width: 760px; margin-bottom: 30px; }
 h2 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.05; letter-spacing: -.045em; }
 .section-head p, .muted { color: var(--muted); }
@@ -69,6 +69,12 @@ h2 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.05; 
 .card p { margin: 0; color: var(--muted); }
 .code-shell { overflow: hidden; border: 1px solid #303840; border-radius: 16px; background: #080a0b; box-shadow: 0 26px 80px rgba(0,0,0,.28); }
 .code-top { display: flex; align-items: center; justify-content: space-between; min-height: 48px; padding: 0 18px; border-bottom: 1px solid #20262b; color: var(--muted); font-size: .82rem; }
+.install-commands { display: grid; gap: 16px; }
+.copy-button { margin: 8px 0 8px 12px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); color: var(--text); font: inherit; cursor: pointer; flex-shrink: 0; }
+.copy-button:hover { border-color: var(--rust); }
+.copy-button:focus-visible { outline: 2px solid var(--rust-light); outline-offset: 3px; }
+.copy-status { color: var(--muted); font-size: .9rem; }
+.copy-status:empty { display: none; }
 .dots { display: flex; gap: 7px; }
 .dots i { display: block; width: 9px; height: 9px; border-radius: 50%; background: #3b434a; }
 pre { margin: 0; padding: 24px; overflow-x: auto; color: #e6e3dc; font: 500 .92rem/1.75 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
@@ -137,6 +143,9 @@ const pages = {
     quickTitle: "From install to first answer",
     quickLead: "Install with one command, then run locally or connect an OpenAI-compatible client.",
     installTitle: "Install",
+    copyLabel: "Copy",
+    copiedLabel: "Copied!",
+    copyFailedLabel: "Copy was blocked by your browser. Select the command and copy it manually.",
     installNote: "Run the command for your system. The installer verifies release checksums and adds Ferrum to your PATH. On macOS and Linux, open a new terminal afterward; PowerShell is ready immediately.",
     upgradeNote: "Upgrade by running the same install command again. Existing sessions keep their current version; new launches use the update.",
     runtimeNote: 'Linux CUDA requires an NVIDIA sm89 GPU, a compatible driver, and CUDA 12.4/NCCL runtimes. Automatic installation falls back to CPU if CUDA cannot start. Windows supports one sm89 GPU (compute capability 8.9) and includes CUDA and VC runtimes; install an <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA driver</a> (551.78 or newer) separately.',
@@ -197,6 +206,9 @@ const pages = {
     quickTitle: "从安装到第一次回答",
     quickLead: "一行命令安装，随后在本地运行模型，或接入 OpenAI 兼容客户端。",
     installTitle: "安装",
+    copyLabel: "复制命令",
+    copiedLabel: "已复制！",
+    copyFailedLabel: "浏览器未允许复制，请选中命令后手动复制。",
     installNote: "执行对应系统的一行命令。安装脚本会校验发布包并自动加入 PATH。macOS 和 Linux 完成后打开新终端；PowerShell 安装后即可使用。",
     upgradeNote: "再次执行同一安装命令即可升级。已有会话继续使用原版本，新启动的会话使用更新后的版本。",
     runtimeNote: 'Linux CUDA 需要 NVIDIA sm89 显卡、兼容驱动及 CUDA 12.4/NCCL 运行库；自动安装在 CUDA 无法启动时回退到 CPU。Windows 支持单张 sm89 显卡（计算能力 8.9），安装包内含 CUDA 与 VC 运行库；需另行安装 551.78 或更新的 <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA 驱动</a>。',
@@ -257,6 +269,11 @@ function render(page) {
   const faq = page.faq.map(([question, answer]) => `<details><summary>${question}</summary><p>${answer}</p></details>`).join("");
   const nav = page.nav.map(([label, href]) => `<a href="${href}">${label}</a>`).join("");
   const proof = page.proof.map((item) => `<span>${item}</span>`).join("");
+  const installCommands = [
+    ["macOS Apple Silicon · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
+    ["Linux x86_64 · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
+    ["Windows x64 · PowerShell", "irm https://ferrum.pandaailabs.com/install.ps1 | iex"],
+  ].map(([platform, command], index) => `<div class="code-shell"><div class="code-top"><span>${platform}</span><button class="copy-button" type="button" data-copy="install-command-${index}" aria-label="${page.copyLabel}: ${platform}" hidden>${page.copyLabel}</button></div><pre><code class="command" id="install-command-${index}">${escapeHtml(command)}</code></pre></div>`).join("");
   return `<!doctype html>
 <html lang="${page.lang}">
 <head>
@@ -295,21 +312,11 @@ function render(page) {
       <div class="actions"><a class="button primary" href="${REPOSITORY}">${page.primary}</a><a class="button" href="#quick-start">${page.secondary}</a></div>
       <div class="proof">${proof}</div>
     </div></header>
-    <section id="features"><div class="wrap">
-      <div class="section-head"><h2>${page.featureTitle}</h2><p>${page.featureLead}</p></div>
-      <div class="grid">${cards}</div>
-    </div></section>
     <section id="quick-start"><div class="wrap">
       <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
       <p class="note">${page.installNote}</p>
-      <div class="code-shell"><div class="code-top"><span>${page.installTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># macOS Apple Silicon · Terminal</span>
-<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
-
-<span class="comment"># Linux x86_64 · Terminal</span>
-<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
-
-<span class="comment"># Windows x64 · PowerShell</span>
-<span class="command">irm https://ferrum.pandaailabs.com/install.ps1 | iex</span></pre></div>
+      <div class="install-commands" aria-label="${page.installTitle}">${installCommands}</div>
+      <p class="copy-status" role="status" aria-live="polite"></p>
       <p class="note">${page.runtimeNote}</p>
       <p class="note">${page.upgradeNote}</p>
       <details><summary>${page.homebrewTitle}</summary><p>${page.homebrewNote}</p><pre><span class="comment"># Homebrew 6</span>
@@ -327,6 +334,10 @@ ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 
 ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000</pre></div>
     </div></section>
+    <section id="features"><div class="wrap">
+      <div class="section-head"><h2>${page.featureTitle}</h2><p>${page.featureLead}</p></div>
+      <div class="grid">${cards}</div>
+    </div></section>
     <section><div class="wrap split">
       <div><div class="section-head"><h2>${page.platformTitle}</h2><p>${page.platformLead}</p></div><a class="button" href="${REPOSITORY}/blob/main/docs/openai-api-compatibility.md">OpenAI API contract</a></div>
       <div class="list">${rows}</div>
@@ -335,6 +346,35 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
     <section><div class="wrap"><div class="cta"><h2>${page.ctaTitle}</h2><div class="actions"><a class="button primary" href="${REPOSITORY}#quick-start">${page.ctaPrimary}</a><a class="button" href="${REPOSITORY}/releases">${page.ctaSecondary}</a></div></div></div></section>
   </main>
   <footer><div class="wrap footer-inner"><span>${page.footer}</span><span><a href="${REPOSITORY}">GitHub</a> · <a href="${REPOSITORY}/blob/main/LICENSE">MIT License</a></span></div></footer>
+  <script>
+    const status = document.querySelector('.copy-status');
+    document.querySelectorAll('[data-copy]').forEach((button) => {
+      button.hidden = false;
+      button.addEventListener('click', async () => {
+        const command = document.getElementById(button.dataset.copy).textContent;
+        let copied = false;
+        try {
+          await navigator.clipboard.writeText(command);
+          copied = true;
+        } catch {
+          const field = document.createElement('textarea');
+          field.value = command;
+          field.style.position = 'fixed';
+          field.style.opacity = '0';
+          field.setAttribute('readonly', '');
+          document.body.appendChild(field);
+          field.select();
+          try { copied = document.execCommand('copy'); } catch {}
+          field.remove();
+          button.focus({ preventScroll: true });
+        }
+        status.textContent = copied ? ${JSON.stringify(page.copiedLabel)} : ${JSON.stringify(page.copyFailedLabel)};
+        button.textContent = copied ? ${JSON.stringify(page.copiedLabel)} : ${JSON.stringify(page.copyLabel)};
+        clearTimeout(button.copyTimer);
+        button.copyTimer = setTimeout(() => { button.textContent = ${JSON.stringify(page.copyLabel)}; }, 2000);
+      });
+    });
+  </script>
 </body>
 </html>`;
 }
