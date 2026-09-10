@@ -13,9 +13,19 @@ pub(crate) async fn run_state(args: &Args) -> Result<Value> {
         stdin.push('\n');
     }
     stdin.push_str("/bye\n");
-    let run = run_chat(args, "run-state", Input::Repl(&stdin), None).await?;
+    // Keep this probe about history/reset/isolation. Default and explicitly
+    // enabled reasoning retain their own basic/reasoning checks and budgets.
+    let run = capture_run(
+        args,
+        "run-state",
+        Input::Repl(&stdin),
+        None,
+        RunCaptureMode::State,
+    )
+    .await?;
     let protocol = serde_json::from_value(run.ready["reasoning_protocol"].clone())?;
-    let evidence = json!({"ready": run.ready, "source_identity": identity::source_evidence(args, "run-state")?, "records": run.records});
+    let evidence = json!({"ready": run.ready, "source_identity": identity::source_evidence(args, "run-state")?,
+        "enable_thinking": false, "records": run.records});
     model_state::verify_run(
         evidence["records"]
             .as_array()
@@ -34,7 +44,9 @@ async fn exchange(
     messages: Vec<Value>,
     stream: bool,
 ) -> Result<StateExchange> {
-    let result = chat(server, name, request(server, messages.clone()), stream).await?;
+    let mut body = request(server, messages.clone());
+    body["chat_template_kwargs"] = json!({"enable_thinking": false});
+    let result = chat(server, name, body, stream).await?;
     Ok(StateExchange {
         observation: observation(&result),
         request_id: result
@@ -102,7 +114,7 @@ pub(crate) async fn serve_state(server: &Server<'_>) -> Result<Value> {
             .map_err(anyhow::Error::msg)
     }
     .await;
-    let evidence = json!({"state": evidence});
+    let evidence = json!({"enable_thinking": false, "state": evidence});
     result.map_err(|error| super::super::case_failure(evidence.clone(), error))?;
     Ok(evidence)
 }

@@ -84,7 +84,11 @@ fn run_deltas(
 #[derive(Clone, Copy)]
 enum RunCaptureMode {
     Natural,
-    Stop { disable_thinking: bool },
+    /// State probes need completed short answers within a fixed context.
+    State,
+    Stop {
+        disable_thinking: bool,
+    },
 }
 
 impl RunCaptureMode {
@@ -106,10 +110,13 @@ async fn capture_run(
     mode: RunCaptureMode,
 ) -> Result<Run> {
     let mut argv = args.common_args("run");
-    if let RunCaptureMode::Stop {
-        disable_thinking: true,
-    } = mode
-    {
+    if matches!(
+        mode,
+        RunCaptureMode::State
+            | RunCaptureMode::Stop {
+                disable_thinking: true
+            }
+    ) {
         if !argv.iter().any(|arg| arg == "--disable-thinking") {
             argv.push("--disable-thinking".into());
         }
