@@ -114,6 +114,7 @@ fn native_response(response: Value) -> Result<Responses> {
     }
     let usage = &response["usage"];
     let chat = Chat {
+        response_id: response["id"].as_str().map(str::to_owned),
         message,
         finish,
         usage: json!({"prompt_tokens": usage["input_tokens"], "completion_tokens": usage["output_tokens"], "total_tokens": usage["total_tokens"]}),

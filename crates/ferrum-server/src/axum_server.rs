@@ -2445,7 +2445,7 @@ async fn handle_chat_completions_stream(
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; chat unavailable".into())
     })?;
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = inference_request.id.to_string();
     let include_stream_usage = openai_request
         .stream_options
         .as_ref()
@@ -3235,7 +3235,7 @@ async fn handle_chat_completions_sync(
                 .cache
                 .update_session(session_context, message.clone(), &CachePolicy::current());
             let response = ChatCompletionsResponse {
-                id: Uuid::new_v4().to_string(),
+                id: replay_request_id,
                 object: "chat.completion".to_string(),
                 created: chrono::Utc::now().timestamp() as u64,
                 model: openai_request.model,
@@ -11177,7 +11177,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), AxumStatusCode::OK);
-        let _ = response_json(response).await;
+        let response_body = response_json(response).await;
 
         let events = read_profile_events(&profile);
         assert_eq!(events.len(), 2, "events: {events:#?}");
@@ -11185,6 +11185,11 @@ mod tests {
             .iter()
             .find(|event| event["phase"] == "chat_completions_sync_complete")
             .expect("sync completion profile event");
+        assert!(response_body["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(response_body["id"], event["request_id"]);
+        assert_eq!(response_body["id"], event["correlation_id"]);
         assert_eq!(
             event["schema_version"],
             OBSERVABILITY_PROFILE_SCHEMA_VERSION
@@ -11407,6 +11412,13 @@ mod tests {
             .iter()
             .find(|event| event["phase"] == "chat_completions_stream_complete")
             .expect("stream completion profile event");
+        let chunks = responses_sse_json_events(&body);
+        assert!(!chunks.is_empty());
+        for chunk in chunks {
+            assert!(chunk["id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(chunk["id"], event["request_id"]);
+            assert_eq!(chunk["id"], event["correlation_id"]);
+        }
         assert_eq!(
             event["schema_version"],
             OBSERVABILITY_PROFILE_SCHEMA_VERSION

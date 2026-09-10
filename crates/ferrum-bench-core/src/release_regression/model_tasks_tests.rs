@@ -32,6 +32,27 @@ fn task(id: &str, backend: Backend, checks: Vec<ModelCheck>) -> ExpectedModelRun
     }
 }
 
+#[test]
+fn model_report_rechecks_observation_journals_instead_of_trusting_pass_labels() {
+    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
+        let expected = task("observed", backend, vec![ModelCheck::Observability]);
+        let valid = ReportFixture::passed(&expected);
+        verify_model_report(&expected, &valid.value).unwrap();
+        for name in ["run-observability", "serve-observability"] {
+            let mut missing = ReportFixture::passed(&expected);
+            missing.remove_case(name);
+            assert!(verify_model_report(&expected, &missing.value).is_err());
+            let mut bad = ReportFixture::passed(&expected);
+            bad.case_mut(name)["evidence"]["observability"]["events"] = json!([]);
+            assert!(verify_model_report(&expected, &bad.value).is_err());
+            let mut bad = ReportFixture::passed(&expected);
+            bad.case_mut(name)["evidence"]["observability"]["requests"][0]["usage"]
+                ["completion_tokens"] = json!(31);
+            assert!(verify_model_report(&expected, &bad.value).is_err());
+        }
+    }
+}
+
 /// Small runner-result fixtures exercise the shared semantic verifier through
 /// its actual report consumer; protocol framing remains covered by runner tests.
 struct ReportFixture {
@@ -68,9 +89,23 @@ impl ReportFixture {
                 ModelCheck::Reasoning => &["run-reasoning", "serve-reasoning"],
                 ModelCheck::Length => &["run-length", "serve-length"],
                 ModelCheck::AutoToolsJson => &["serve-auto-tools-json"],
+                ModelCheck::Observability => &["run-observability", "serve-observability"],
             };
             for name in entries {
                 let evidence = match *name {
+                    "run-observability" | "serve-observability" => {
+                        use super::super::Entrypoint;
+                        let entrypoints = if *name == "run-observability" {
+                            &[Entrypoint::Run][..]
+                        } else {
+                            &[Entrypoint::ServeSync, Entrypoint::ServeStream][..]
+                        };
+                        let observation = super::super::model_observability::tests::report_fixture(
+                            expected.profile.target.backend,
+                            entrypoints,
+                        );
+                        json!({"ready": ready, "observability": observation})
+                    }
                     "run-basic" => {
                         let answers: Vec<_> = ["OK", "42", "cobalt-731"]
                             .into_iter()
@@ -353,6 +388,7 @@ fn checks_have_strict_round_trip_names() {
         ModelCheck::AutoToolsJson,
         ModelCheck::Reasoning,
         ModelCheck::Length,
+        ModelCheck::Observability,
     ] {
         let text = check.to_string();
         assert_eq!(text.parse::<ModelCheck>().unwrap(), check);

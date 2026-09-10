@@ -11,8 +11,9 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit, DeviceClass,
     DeviceCommandBatch, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMode, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState,
+    VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 
@@ -64,14 +65,35 @@ pub struct CpuDeviceFence {
     runtime_instance: u64,
     failure: Option<CpuRuntimeError>,
     attribution: Option<DeviceSubmissionAttribution>,
+    timing_mode: DeviceTimingMode,
 }
 
 impl CpuDeviceFence {
     fn receipt(&self) -> DeviceTerminalReceipt<CpuRuntimeError> {
-        DeviceTerminalReceipt::unprofiled(match &self.failure {
+        let terminal = match &self.failure {
             Some(error) => DeviceTerminal::FailedButQuiescent(error.clone()),
             None => DeviceTerminal::Succeeded,
-        })
+        };
+        // Host execution still produces an exact completion fence. Missing
+        // device clocks are unavailable observations, never a compute failure
+        // or a reason to label a host wall-clock duration as device time.
+        DeviceTerminalReceipt::profiled_with_submission_timing(
+            terminal,
+            if self.timing_mode.completion_enabled() {
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                )
+            } else {
+                DeviceTimingMeasurement::NotRequested
+            },
+            if self.timing_mode.physical_span_attribution_enabled() {
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                )
+            } else {
+                DeviceTimingMeasurement::NotRequested
+            },
+        )
     }
 }
 
@@ -139,6 +161,7 @@ impl CpuDeviceRuntime {
         stream: &mut CpuDeviceStream,
         entries: Vec<(DeviceCommandPhase, Option<u32>, CpuDeviceCommand)>,
         attribution_required: bool,
+        timing_mode: DeviceTimingMode,
     ) -> Result<CpuDeviceFence, DefinitelyNotSubmitted<CpuRuntimeError>> {
         self.validate_stream(stream)
             .map_err(DefinitelyNotSubmitted::new)?;
@@ -198,6 +221,7 @@ impl CpuDeviceRuntime {
             runtime_instance: self.runtime_instance,
             attribution: if failure.is_none() { attribution } else { None },
             failure,
+            timing_mode,
         })
     }
 }
@@ -329,8 +353,8 @@ impl DeviceRuntime for CpuDeviceRuntime {
         stream: &mut Self::Stream,
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        let timing_mode = commands.timing_mode();
         validate_submission_requirements(
-            commands.timing_mode(),
             commands.compute_path_requirement(),
             commands
                 .reusable_execution_capture()
@@ -353,7 +377,7 @@ impl DeviceRuntime for CpuDeviceRuntime {
             })
             .collect::<Result<Vec<_>, CpuRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
-        self.execute_entries(stream, entries, attribution)
+        self.execute_entries(stream, entries, attribution, timing_mode)
     }
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
@@ -443,15 +467,9 @@ impl DeviceRuntime for CpuDeviceRuntime {
 }
 
 fn validate_submission_requirements(
-    timing: DeviceTimingMode,
     path: DeviceComputePathRequirement,
     capture: Option<(u32, &[u32])>,
 ) -> Result<(), CpuRuntimeError> {
-    if timing != DeviceTimingMode::Off {
-        return Err(CpuRuntimeError::new(
-            "CPU runtime does not provide device timing evidence",
-        ));
-    }
     if matches!(
         path,
         DeviceComputePathRequirement::ReplayedOnly

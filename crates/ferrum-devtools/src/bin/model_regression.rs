@@ -53,7 +53,7 @@ struct Args {
     /// A new or empty directory; raw requests, responses and child logs stay here.
     #[arg(long)]
     report_dir: PathBuf,
-    /// Checks: basic, stop, structured, tools, auto-tools-json, reasoning, length.
+    /// Checks: basic, stop, structured, tools, auto-tools-json, reasoning, length, observability.
     /// auto-tools-json exercises Chat Completions and Responses, sync and SSE.
     #[arg(long, value_delimiter = ',', default_value = "basic")]
     checks: Vec<Check>,
@@ -362,6 +362,14 @@ async fn main() -> Result<()> {
     if args.checks.contains(&Check::Length) {
         record(&mut report, "run-length", cases::run_length(&args)).await?;
     }
+    if args.checks.contains(&Check::Observability) {
+        record(
+            &mut report,
+            "run-observability",
+            cases::run_observability(&args),
+        )
+        .await?;
+    }
     let started = Instant::now();
     match process::Server::start(&args).await {
         Ok(server) => {
@@ -370,6 +378,14 @@ async fn main() -> Result<()> {
             report.record("serve-startup", started.elapsed(), Ok(startup_evidence))?;
             for check in &args.checks {
                 match check {
+                    Check::Observability => {
+                        record(
+                            &mut report,
+                            "serve-observability",
+                            cases::serve_observability(&server),
+                        )
+                        .await?
+                    }
                     Check::Basic => {
                         record(&mut report, "serve-basic", cases::serve_basic(&server)).await?
                     }

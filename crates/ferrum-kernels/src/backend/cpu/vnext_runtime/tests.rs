@@ -250,7 +250,12 @@ fn upload_owns_source_bytes_and_is_charged_until_submission_finishes() {
         .is_err());
     let mut stream = runtime.create_stream().unwrap();
     let fence = runtime
-        .execute_entries(&mut stream, entries(vec![command]), true)
+        .execute_entries(
+            &mut stream,
+            entries(vec![command]),
+            true,
+            DeviceTimingMode::Off,
+        )
         .unwrap();
     assert!(runtime
         .wait_fence(&fence)
@@ -278,7 +283,12 @@ fn copies_handle_overlap_and_different_allocations_without_extra_storage() {
         .unwrap();
     let mut stream = runtime.create_stream().unwrap();
     let fence = runtime
-        .execute_entries(&mut stream, entries(vec![overlap, outward, inward]), false)
+        .execute_entries(
+            &mut stream,
+            entries(vec![overlap, outward, inward]),
+            false,
+            DeviceTimingMode::Off,
+        )
         .unwrap();
     assert!(runtime
         .wait_fence(&fence)
@@ -367,7 +377,12 @@ fn failure_after_write_returns_failed_quiescent_fence_and_prevents_retry() {
         let last = runtime.encode_zero(&buffer, 0, 1).unwrap();
         let mut stream = runtime.create_stream().unwrap();
         let fence = runtime
-            .execute_entries(&mut stream, entries(vec![first, failing, last]), true)
+            .execute_entries(
+                &mut stream,
+                entries(vec![first, failing, last]),
+                true,
+                DeviceTimingMode::Off,
+            )
             .unwrap();
         assert!(matches!(
             runtime.wait_fence(&fence).unwrap().terminal(),
@@ -379,7 +394,12 @@ fn failure_after_write_returns_failed_quiescent_fence_and_prevents_retry() {
         assert!(runtime.synchronize(&mut stream).is_err());
         let retry = runtime.encode_zero(&buffer, 0, 1).unwrap();
         assert!(runtime
-            .execute_entries(&mut stream, entries(vec![retry]), false)
+            .execute_entries(
+                &mut stream,
+                entries(vec![retry]),
+                false,
+                DeviceTimingMode::Off
+            )
             .is_err());
         assert_eq!(read(&buffer), [5]);
         assert_eq!(runtime.resident_bytes(), 1);
@@ -399,7 +419,8 @@ fn foreign_command_is_rejected_before_any_earlier_command_runs() {
         .execute_entries(
             &mut stream,
             entries(vec![first_command, second_command]),
-            false
+            false,
+            DeviceTimingMode::Off,
         )
         .is_err());
     assert_eq!(read(&first_buffer), [9]);
@@ -416,13 +437,84 @@ fn foreign_command_is_rejected_before_any_earlier_command_runs() {
         .is_err());
     let command = first.encode_zero(&first_buffer, 0, 1).unwrap();
     let fence = first
-        .execute_entries(&mut stream, entries(vec![command]), false)
+        .execute_entries(
+            &mut stream,
+            entries(vec![command]),
+            false,
+            DeviceTimingMode::Off,
+        )
         .unwrap();
     assert!(matches!(
         second.query_fence(&fence),
         FenceQuery::Indeterminate(_)
     ));
     assert!(second.wait_fence(&fence).is_err());
+}
+
+#[test]
+fn profiling_preserves_cpu_execution_and_marks_device_clocks_unavailable() {
+    for mode in [
+        DeviceTimingMode::Off,
+        DeviceTimingMode::Completion,
+        DeviceTimingMode::Replay,
+        DeviceTimingMode::Kernel,
+        DeviceTimingMode::Verification,
+    ] {
+        for fail in [false, true] {
+            let runtime = runtime(16);
+            let output = buffer(&runtime, &[9]);
+            let command = if fail {
+                CpuDeviceCommand::compute(
+                    "cpu.test.failure",
+                    vec![Box::new(WriteAndFail {
+                        region: output.region(0..1).unwrap(),
+                        panic: false,
+                    })],
+                    DeviceBatchingForm::Scalar,
+                    1,
+                    1,
+                )
+                .unwrap()
+            } else {
+                runtime.encode_zero(&output, 0, 1).unwrap()
+            };
+            let mut stream = runtime.create_stream().unwrap();
+            let fence = runtime
+                .execute_entries(&mut stream, entries(vec![command]), true, mode)
+                .unwrap();
+            let FenceQuery::Terminal(queried) = runtime.query_fence(&fence) else {
+                panic!("synchronous CPU submission must be terminal");
+            };
+            for receipt in [queried, runtime.wait_fence(&fence).unwrap()] {
+                assert_eq!(receipt.terminal().is_succeeded(), !fail);
+                if fail {
+                    assert!(matches!(
+                        receipt.terminal(),
+                        DeviceTerminal::FailedButQuiescent(_)
+                    ));
+                }
+                let unavailable = DeviceTimingUnavailableReason::BackendUnsupported;
+                assert_eq!(
+                    receipt.execution_timing(),
+                    &if mode.completion_enabled() {
+                        DeviceTimingMeasurement::Unavailable(unavailable)
+                    } else {
+                        DeviceTimingMeasurement::NotRequested
+                    }
+                );
+                assert_eq!(
+                    receipt.submission_timing(),
+                    &if mode.physical_span_attribution_enabled() {
+                        DeviceTimingMeasurement::Unavailable(unavailable)
+                    } else {
+                        DeviceTimingMeasurement::NotRequested
+                    }
+                );
+            }
+            assert_eq!(read(&output), [if fail { 5 } else { 0 }]);
+            assert_eq!(runtime.submission_attribution(&fence).is_some(), !fail);
+        }
+    }
 }
 
 #[test]
@@ -433,32 +525,17 @@ fn cpu_requires_host_descriptor_and_rejects_unimplemented_submission_modes() {
         descriptor.class = class;
         assert!(CpuDeviceRuntime::new(descriptor).is_err());
     }
-    assert!(validate_submission_requirements(
-        DeviceTimingMode::Off,
-        DeviceComputePathRequirement::EagerOnly,
-        None
-    )
-    .is_ok());
-    assert!(validate_submission_requirements(
-        DeviceTimingMode::Off,
-        DeviceComputePathRequirement::Adaptive,
-        None
-    )
-    .is_ok());
+    assert!(
+        validate_submission_requirements(DeviceComputePathRequirement::EagerOnly, None).is_ok()
+    );
+    assert!(validate_submission_requirements(DeviceComputePathRequirement::Adaptive, None).is_ok());
     for path in [
         DeviceComputePathRequirement::ReplayedOnly,
         DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
     ] {
-        assert!(validate_submission_requirements(DeviceTimingMode::Off, path, None).is_err());
+        assert!(validate_submission_requirements(path, None).is_err());
     }
     assert!(validate_submission_requirements(
-        DeviceTimingMode::Verification,
-        DeviceComputePathRequirement::Adaptive,
-        None
-    )
-    .is_err());
-    assert!(validate_submission_requirements(
-        DeviceTimingMode::Off,
         DeviceComputePathRequirement::Adaptive,
         Some((2, &[0]))
     )
@@ -471,29 +548,16 @@ fn adaptive_decode_metadata_accepts_all_eager_nodes_without_claiming_replay() {
         DeviceComputePathRequirement::EagerOnly,
         DeviceComputePathRequirement::Adaptive,
     ] {
-        assert!(validate_submission_requirements(
-            DeviceTimingMode::Off,
-            path,
-            Some((3, &[0, 1, 2]))
-        )
-        .is_ok());
+        assert!(validate_submission_requirements(path, Some((3, &[0, 1, 2]))).is_ok());
         for topology in [(3, &[0, 2][..]), (3, &[][..]), (0, &[][..])] {
-            assert!(
-                validate_submission_requirements(DeviceTimingMode::Off, path, Some(topology))
-                    .is_err()
-            );
+            assert!(validate_submission_requirements(path, Some(topology)).is_err());
         }
     }
     for path in [
         DeviceComputePathRequirement::ReplayedOnly,
         DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
     ] {
-        assert!(validate_submission_requirements(
-            DeviceTimingMode::Off,
-            path,
-            Some((3, &[0, 1, 2]))
-        )
-        .is_err());
+        assert!(validate_submission_requirements(path, Some((3, &[0, 1, 2]))).is_err());
     }
     let runtime = runtime(16);
     let mut stream = runtime.create_stream().unwrap();
