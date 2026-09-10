@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://ferrum.pandaailabs.com/zh/">
-    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Local LLM Runtime" width="520">
+    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Rust 原生大模型服务" width="520">
   </a>
 </p>
 
