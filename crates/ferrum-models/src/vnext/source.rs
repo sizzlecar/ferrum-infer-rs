@@ -479,10 +479,9 @@ fn fingerprint_file(root: &Path, relative_path: &str) -> Result<FileFingerprint>
             path.display()
         )));
     }
-    let sha256 = match trusted_hf_blob_sha256(&path) {
-        Some(sha256) => sha256,
-        None => hash_file(&path)?,
-    };
+    // Cache object names may be Xet IDs rather than SHA256 content digests.
+    // Fingerprint the bytes consumed by every source, including HF snapshots.
+    let sha256 = hash_file(&path)?;
     Ok(FileFingerprint {
         relative_path: relative_path.to_owned(),
         size_bytes: metadata.len(),
@@ -508,52 +507,6 @@ fn fingerprint_loaded_file(relative_path: &str, bytes: &[u8]) -> Result<FileFing
         size_bytes,
         sha256: format!("{:x}", Sha256::digest(bytes)),
     })
-}
-
-fn trusted_hf_blob_sha256(path: &Path) -> Option<String> {
-    let mut entry = path.to_path_buf();
-    for _ in 0..8 {
-        if let Some(sha256) = trusted_hf_snapshot_entry_sha256(&entry) {
-            return Some(sha256);
-        }
-        let target = std::fs::read_link(&entry).ok()?;
-        entry = if target.is_absolute() {
-            target
-        } else {
-            entry.parent()?.join(target)
-        };
-    }
-    None
-}
-
-fn trusted_hf_snapshot_entry_sha256(entry: &Path) -> Option<String> {
-    let revision = entry.parent()?;
-    let snapshots = revision.parent()?;
-    (snapshots.file_name()?.to_str()? == "snapshots").then_some(())?;
-    let repository = snapshots.parent()?;
-    repository
-        .file_name()?
-        .to_str()?
-        .starts_with("models--")
-        .then_some(())?;
-
-    let target = std::fs::read_link(entry).ok()?;
-    let target = if target.is_absolute() {
-        target
-    } else {
-        revision.join(target)
-    };
-    let blob = target.canonicalize().ok()?;
-    let blobs = blob.parent()?;
-    (blobs.file_name()?.to_str()? == "blobs").then_some(())?;
-    (blobs.parent()?.canonicalize().ok()? == repository.canonicalize().ok()?).then_some(())?;
-    sha256_file_name(&blob)
-}
-
-fn sha256_file_name(path: &Path) -> Option<String> {
-    let digest = path.file_name()?.to_str()?;
-    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| digest.to_ascii_lowercase())
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -920,7 +873,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn trusts_huggingface_lfs_blob_identity_without_rehashing_name() {
+    fn huggingface_cache_ids_do_not_substitute_for_content_fingerprints() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -929,22 +882,30 @@ mod tests {
         let snapshot = repository.join("snapshots").join("revision");
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::create_dir_all(&snapshot).unwrap();
-        let digest = "a".repeat(64);
-        std::fs::write(blobs.join(&digest), b"weight-bytes").unwrap();
+        let object_id = "a".repeat(64);
+        std::fs::write(blobs.join(&object_id), b"abc").unwrap();
         symlink(
-            Path::new("../../blobs").join(&digest),
+            Path::new("../../blobs").join(&object_id),
             snapshot.join("model.safetensors"),
         )
         .unwrap();
 
         let fingerprint = fingerprint_file(&snapshot, "model.safetensors").unwrap();
-        assert_eq!(fingerprint.sha256, digest);
-        assert_eq!(fingerprint.size_bytes, 12);
+        // Standard SHA256 known answer, independent of the cache locator.
+        assert_eq!(
+            fingerprint.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(fingerprint.size_bytes, 3);
+        std::fs::write(blobs.join(&object_id), b"abd").unwrap();
+        let changed = fingerprint_file(&snapshot, "model.safetensors").unwrap();
+        assert_eq!(changed.size_bytes, fingerprint.size_bytes);
+        assert_ne!(changed.sha256, fingerprint.sha256);
     }
 
     #[cfg(unix)]
     #[test]
-    fn trusts_huggingface_blob_identity_through_product_package_symlink() {
+    fn product_package_and_direct_blob_links_have_the_same_content_identity() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -962,7 +923,10 @@ mod tests {
         symlink(&snapshot_weight, package.join("model.gguf")).unwrap();
 
         let fingerprint = fingerprint_file(&package, "model.gguf").unwrap();
-        assert_eq!(fingerprint.sha256, digest);
+        assert_eq!(
+            fingerprint.sha256,
+            format!("{:x}", Sha256::digest(b"weight-bytes"))
+        );
         assert_eq!(fingerprint.size_bytes, 12);
 
         let direct_blob_link = package.join("direct-blob.gguf");
@@ -972,6 +936,6 @@ mod tests {
             direct_blob_fingerprint.sha256,
             format!("{:x}", Sha256::digest(b"weight-bytes"))
         );
-        assert_ne!(direct_blob_fingerprint.sha256, digest);
+        assert_eq!(direct_blob_fingerprint.sha256, fingerprint.sha256);
     }
 }
