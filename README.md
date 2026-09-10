@@ -1,17 +1,21 @@
 <p align="center">
   <a href="https://ferrum.pandaailabs.com/">
-    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Local LLM Runtime" width="520">
+    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Rust-native LLM serving" width="520">
   </a>
 </p>
 
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-> Rust-native LLM inference for OpenAI-compatible local and private serving.
+# Serve LLMs with a single binary.
 
-**One binary. No Python runtime. Apple Silicon Metal and NVIDIA CUDA acceleration.**
+A Rust-native LLM serving engine. One binary, no Python runtime.
 
 [中文说明](README_zh.md)
+
+## Vision
+
+Make high-performance LLM serving simple to deploy and operate.
 
 ## Quick Start
 
@@ -43,75 +47,52 @@ ferrum --help
 ferrum doctor
 ```
 
-Use the commands for your platform. `doctor` shows the model-source mapping
-without downloading weights or starting the inference engine.
+### Run a model
 
-### macOS Apple Silicon
-
-The first run downloads about **2.55 GiB**. Download time depends on your route
-to Hugging Face; wait for the progress output before treating the process as
-hung.
+With **Ferrum 0.9.0 or later**, use the same GGUF model on macOS, Linux, and
+Windows. Ferrum automatically selects the available backend; both Metal and
+CUDA support this Q4_K_M example.
 
 ```bash
-ferrum doctor qwen3.5:4b-q4_k_m
 ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 ```
 
-### Linux NVIDIA CUDA
+The first run downloads about **2.55 GiB**. Download time depends on your route
+to Hugging Face; the CLI displays download progress. On a 6 GB GPU, append
+`--max-model-len 2048 --max-num-seqs 1` to either `run` or `serve` to limit the
+context and active sequences.
 
-The first run downloads about **8.7 GiB** of repository weights.
+### Serve an API
+
+The server command is also the same on all three platforms:
 
 ```bash
-ferrum doctor qwen3.5:4b
-ferrum run qwen3.5:4b --disable-thinking
+ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
 ```
 
-### Windows NVIDIA CUDA (0.8.9+)
+Send a request from another terminal. On macOS or Linux:
 
-For a 6GB RTX 4050, use the 2B model with a 2048-token context and one active
-sequence. The first run downloads the model; these commands preserve its default
-thinking behavior and allow up to 512 generated tokens:
-
-```powershell
-ferrum doctor Qwen/Qwen3.5-2B
-ferrum run Qwen/Qwen3.5-2B --backend cuda --max-model-len 2048 --max-num-seqs 1 --max-tokens 512
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-To serve it, run:
+In Windows PowerShell:
 
 ```powershell
-ferrum serve --model Qwen/Qwen3.5-2B --served-model-name ferrum --backend cuda --max-model-len 2048 --max-num-seqs 1 --port 8000
-```
-
-Then send a request from another PowerShell terminal:
-
-```powershell
-$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello.' }); max_tokens = 512 } | ConvertTo-Json -Depth 4
+$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello from Ferrum.' }); max_tokens = 32 } | ConvertTo-Json -Depth 4
 Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
 ```
 
 Ferrum does not silently select a model. `run` requires MODEL, and `serve`
 requires either `--model` or an intentional `default_model` in `ferrum.toml`.
 
-On macOS and Linux, serve the same model through an OpenAI-compatible API:
-
-```bash
-# macOS Metal
-ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
-
-# Linux CUDA
-ferrum serve --model qwen3.5:4b --served-model-name ferrum --disable-thinking --port 8000
-
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
-```
-
 A working request returns HTTP 200 with a non-empty assistant response. Ferrum
 uses the model's context limit unless `--max-model-len` is set explicitly; any
 explicit limit must fit the rendered input plus the requested output budget.
 
-The macOS and Linux examples use `--disable-thinking` so the first response is short and
+The examples use `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
 behavior; an HTTP request can override the server default with
 `chat_template_kwargs.enable_thinking`, Chat `reasoning_effort`, or Responses
@@ -145,7 +126,7 @@ admission, queuing, or the model's numerical profile.
   tools, and structured output.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
-- GGUF on Metal and GPTQ/safetensors on CUDA.
+- GGUF on Metal and CUDA; CUDA also supports GPTQ/safetensors.
 - Ferrum covers language-model inference only. Supported models include Qwen3.5 4B,
   Qwen3.5 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense.
 

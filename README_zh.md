@@ -1,17 +1,21 @@
 <p align="center">
   <a href="https://ferrum.pandaailabs.com/zh/">
-    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Local LLM Runtime" width="520">
+    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Rust 原生大模型服务" width="520">
   </a>
 </p>
 
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
 
-> Rust 原生 LLM 推理，用于 OpenAI 兼容的本地与私有服务。
+# 用一个二进制文件提供大模型服务。
 
-**一个二进制，无需 Python runtime，支持 Apple Silicon Metal 与 NVIDIA CUDA 加速。**
+Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。
 
 [English](README.md)
+
+## 愿景
+
+让高性能大模型服务的部署与运维更简单。
 
 ## 快速开始
 
@@ -40,72 +44,50 @@ ferrum --help
 ferrum doctor
 ```
 
-只执行与你的平台对应的命令。`doctor` 只显示模型来源映射，不下载权重，也不启动推理引擎。
+### 运行模型
 
-### macOS Apple Silicon
-
-首次运行会下载约 **2.55 GiB**。下载耗时取决于本机到 Hugging Face 的网络链路；看到进度输出后
-再判断进程是否卡住。
+在 **Ferrum 0.9.0 及以上版本**中，macOS、Linux 和 Windows 使用同一个 GGUF 模型、
+同一条命令。Ferrum 自动选择可用后端；Metal 和 CUDA 均支持此 Q4_K_M 示例。
 
 ```bash
-ferrum doctor qwen3.5:4b-q4_k_m
 ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 ```
 
-### Linux NVIDIA CUDA
+首次运行会下载约 **2.55 GiB**。下载耗时取决于本机到 Hugging Face 的网络链路，
+CLI 会显示下载进度。使用 6 GB 显卡时，可在 `run` 或 `serve` 命令后追加
+`--max-model-len 2048 --max-num-seqs 1`，限制上下文长度和活跃序列数。
 
-首次运行会下载约 **8.7 GiB** 的仓库权重。
+### 启动 API 服务
+
+三个平台的服务启动命令也相同：
 
 ```bash
-ferrum doctor qwen3.5:4b
-ferrum run qwen3.5:4b --disable-thinking
+ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
 ```
 
-### Windows NVIDIA CUDA（0.8.9 起）
+然后从另一个终端发送请求。macOS 或 Linux：
 
-6GB RTX 4050 可使用 2B 模型、2048 token 上下文和一个活跃序列。
-首次运行会下载模型；以下命令保留模板默认思考行为，并允许最多生成 512 token：
-
-```powershell
-ferrum doctor Qwen/Qwen3.5-2B
-ferrum run Qwen/Qwen3.5-2B --backend cuda --max-model-len 2048 --max-num-seqs 1 --max-tokens 512
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-启动 API 服务：
+Windows PowerShell：
 
 ```powershell
-ferrum serve --model Qwen/Qwen3.5-2B --served-model-name ferrum --backend cuda --max-model-len 2048 --max-num-seqs 1 --port 8000
-```
-
-然后从另一个 PowerShell 终端发送请求：
-
-```powershell
-$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello.' }); max_tokens = 512 } | ConvertTo-Json -Depth 4
+$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello from Ferrum.' }); max_tokens = 32 } | ConvertTo-Json -Depth 4
 Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
 ```
 
 Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提供 `--model`，
 或者在 `ferrum.toml` 中有意设置 `default_model`。
 
-在 macOS 和 Linux 上，通过 OpenAI 兼容 API 提供服务：
-
-```bash
-# macOS Metal
-ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
-
-# Linux CUDA
-ferrum serve --model qwen3.5:4b --served-model-name ferrum --disable-thinking --port 8000
-
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
-```
-
 正常时请求会返回 HTTP 200 和非空的 assistant 回答。除非显式设置
 `--max-model-len`，Ferrum 会使用模型自身的上下文上限；显式上限必须容纳渲染后的
 输入与请求的输出预算之和。
 
-macOS 和 Linux 示例使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
+示例使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
 推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking`、Chat 的
 `reasoning_effort` 或 Responses 的 `reasoning.effort` 覆盖服务端默认值。
 模型支持范围及兼容行为见 [API 说明](docs/openai-api-compatibility.md#chat-fields)。
@@ -133,7 +115,7 @@ reusable_execution_preparation = "auto" # auto、startup、on_demand
   tools 和 structured output。
 - 同一 runtime 覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
 - 支持 continuous batching、paged KV cache、prefix cache 和 typed admission。
-- Metal 使用 GGUF，CUDA 使用 GPTQ/safetensors。
+- Metal 与 CUDA 均支持 GGUF；CUDA 还支持 GPTQ/safetensors。
 - Ferrum 只覆盖语言模型推理。支持的模型包括 Qwen3.5 4B、Qwen3.5 35B-A3B、
   Qwen3 30B-A3B 和 Llama 3.1 8B dense。
 

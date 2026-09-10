@@ -109,16 +109,18 @@ const pages = {
     path: "/",
     alternatePath: "/zh/",
     alternateLabel: "中文",
-    title: "Ferrum — Rust-native local LLM inference for Metal and CUDA",
-    description: "Run and serve local LLMs with one Rust binary. Ferrum provides Apple Silicon Metal and NVIDIA CUDA acceleration plus OpenAI-compatible APIs without a Python runtime.",
+    title: "Ferrum — Serve LLMs with a single binary.",
+    description: "A Rust-native LLM serving engine. One binary, no Python runtime.",
     nav: [
       ["Quick start", "#quick-start"],
       ["Features", "#features"],
       ["FAQ", "#faq"],
     ],
-    eyebrow: "Local inference, without the runtime stack",
-    h1: "One Rust binary for local LLM inference.",
-    lead: "Ferrum runs language models on Apple Silicon Metal and NVIDIA CUDA, then serves them through an OpenAI-compatible API — without requiring Python, PyTorch, or vLLM at runtime.",
+    eyebrow: "Rust-native LLM serving",
+    h1: "Serve LLMs with a single binary.",
+    lead: "A Rust-native LLM serving engine. One binary, no Python runtime.",
+    visionLabel: "Vision:",
+    vision: "Make high-performance LLM serving simple to deploy and operate.",
     primary: "View on GitHub",
     secondary: "Start locally",
     proof: ["MIT licensed", "Metal + CUDA", "Run + OpenAI-compatible serve"],
@@ -151,7 +153,7 @@ const pages = {
     ],
     faqTitle: "Frequently asked questions",
     faq: [
-      ["What is Ferrum?", "Ferrum is an open-source Rust workspace and command-line product for running and serving language models locally on supported Metal and CUDA hardware."],
+      ["What is Ferrum?", "A Rust-native LLM serving engine. One binary, no Python runtime."],
       ["Does Ferrum require Python?", "No Python runtime is required. Linux CUDA uses the host's NVIDIA driver, CUDA 12.4 and NCCL runtimes. The Windows installer includes CUDA and VC runtimes; its NVIDIA system driver is installed separately."],
       ["Which models are in the formal release scope?", "Ferrum v0.8 formally covers Qwen3.5 4B and 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense. Other model work may appear as development evidence before entering the support matrix."],
       ["Can existing OpenAI clients connect to Ferrum?", "Ferrum implements OpenAI-compatible Chat Completions and stateless Responses surfaces. Check the compatibility document for the exact request contract."],
@@ -167,16 +169,18 @@ const pages = {
     path: "/zh/",
     alternatePath: "/",
     alternateLabel: "English",
-    title: "Ferrum — 面向 Metal 与 CUDA 的 Rust 原生本地大模型推理",
-    description: "使用一个 Rust 二进制运行与部署本地大模型。Ferrum 支持 Apple Silicon Metal、NVIDIA CUDA 和 OpenAI 兼容 API，无需 Python runtime。",
+    title: "Ferrum — 用一个二进制文件提供大模型服务。",
+    description: "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。",
     nav: [
       ["快速开始", "#quick-start"],
       ["功能", "#features"],
       ["常见问题", "#faq"],
     ],
-    eyebrow: "本地推理，不必背负复杂 runtime",
-    h1: "一个 Rust 二进制，完成本地大模型推理。",
-    lead: "Ferrum 在 Apple Silicon Metal 与 NVIDIA CUDA 上运行语言模型，并通过 OpenAI 兼容 API 提供服务——运行官方预编译版本无需 Python、PyTorch 或 vLLM。",
+    eyebrow: "Rust 原生大模型服务",
+    h1: "用一个二进制文件提供大模型服务。",
+    lead: "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。",
+    visionLabel: "愿景：",
+    vision: "让高性能大模型服务的部署与运维更简单。",
     primary: "查看 GitHub",
     secondary: "开始使用",
     proof: ["MIT 开源", "Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
@@ -209,7 +213,7 @@ const pages = {
     ],
     faqTitle: "常见问题",
     faq: [
-      ["Ferrum 是什么？", "Ferrum 是一个开源 Rust workspace 与命令行产品，用于在受支持的 Metal 和 CUDA 硬件上本地运行并提供语言模型服务。"],
+      ["Ferrum 是什么？", "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。"],
       ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux CUDA 使用主机的 NVIDIA 驱动、CUDA 12.4 与 NCCL 运行库。Windows 安装包内含 CUDA 与 VC 运行库，NVIDIA 系统驱动需单独安装。"],
       ["哪些模型属于正式发布范围？", "Ferrum v0.8 正式覆盖 Qwen3.5 4B 与 35B-A3B、Qwen3 30B-A3B 和 Llama 3.1 8B dense。其他模型可能先以开发证据出现，完成发布级门禁后才进入支持矩阵。"],
       ["现有 OpenAI client 能连接 Ferrum 吗？", "Ferrum 实现 OpenAI 兼容的 Chat Completions 与无状态 Responses 接口；精确请求契约请查看兼容性文档。"],
@@ -287,6 +291,7 @@ function render(page) {
       <div class="eyebrow">${page.eyebrow}</div>
       <h1>${page.h1}</h1>
       <p class="hero-copy">${page.lead}</p>
+      <p class="muted"><strong>${page.visionLabel}</strong> ${page.vision}</p>
       <div class="actions"><a class="button primary" href="${REPOSITORY}">${page.primary}</a><a class="button" href="#quick-start">${page.secondary}</a></div>
       <div class="proof">${proof}</div>
     </div></header>

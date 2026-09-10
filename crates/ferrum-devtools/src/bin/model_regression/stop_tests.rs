@@ -150,12 +150,14 @@ fn run_raw_prefix_keeps_native_framing_and_detects_text_hidden_by_final_fields()
 #[test]
 fn a_length_baseline_is_only_accepted_on_the_dedicated_stop_capture_path() {
     assert!(!RunCaptureMode::Natural.accepts(Some("length")));
+    assert!(!RunCaptureMode::State.accepts(Some("length")));
     assert!(RunCaptureMode::Stop {
         disable_thinking: false
     }
     .accepts(Some("length")));
     for mode in [
         RunCaptureMode::Natural,
+        RunCaptureMode::State,
         RunCaptureMode::Stop {
             disable_thinking: true,
         },
