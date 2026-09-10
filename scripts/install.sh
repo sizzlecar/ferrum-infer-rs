@@ -41,17 +41,36 @@ prepare() {
     [ "$backend" != cuda ] || asset="$asset-cuda-sm89"
     if [ "$platform" = macos-aarch64 ] && [ "$backend" = cpu ]; then asset="$asset-cpu"; fi
     asset="$asset.tar.gz"
-    note "Downloading Ferrum $version ($backend, $platform)..."
-    download_release "$asset" "$work/$asset"
+    note "Checking Ferrum $version ($backend, $platform)..."
     download_release "$asset.sha256" "$work/asset.sha256"
     download_release "$asset.binary.sha256" "$work/binary.sha256"
-    note 'Verifying the downloaded release...'
     asset_hash=$(read_checksum "$work/asset.sha256" "$asset") || die 'Invalid archive checksum file'
-    [ "$(checksum "$work/$asset")" = "$asset_hash" ] || die 'Archive SHA-256 mismatch'
     binary_hash=$(read_checksum "$work/binary.sha256" ferrum) || die 'Invalid binary checksum file'
-    tar -tzf "$work/$asset" > "$work/members" || die 'Cannot list release archive'
     printf '%s\n' LICENSE README.md ferrum > "$work/expected"
     [ "$backend" != cuda ] || printf '%s\n' CUDA-BUILD.txt >> "$work/expected"
+    destination="$root/releases/$version-$backend-$binary_hash"
+    reused=no
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        [ ! -L "$destination" ] && [ -d "$destination" ] || die 'Existing version path was replaced'
+        while IFS= read -r member; do
+            [ ! -L "$destination/$member" ] && [ -f "$destination/$member" ] || die "Existing version file is missing or was replaced: $member"
+        done < "$work/expected"
+        for member in .binary.sha256 .asset.sha256; do
+            [ ! -L "$destination/$member" ] && [ -f "$destination/$member" ] || die 'Existing version ownership checksum was replaced'
+        done
+        [ "$(read_checksum "$destination/.binary.sha256" ferrum)" = "$binary_hash" ] || die 'Existing version ownership checksum differs'
+        [ "$(read_checksum "$destination/.asset.sha256" "$asset")" = "$asset_hash" ] || die 'Published archive differs from the installed release; existing files were preserved'
+        [ "$(checksum "$destination/ferrum")" = "$binary_hash" ] || die 'Existing managed binary was edited; it was preserved'
+        unpack=$destination
+        reused=yes
+        check_runtime
+        return
+    fi
+    note "Downloading Ferrum $version ($backend, $platform)..."
+    download_release "$asset" "$work/$asset"
+    note 'Verifying the downloaded release...'
+    [ "$(checksum "$work/$asset")" = "$asset_hash" ] || die 'Archive SHA-256 mismatch'
+    tar -tzf "$work/$asset" > "$work/members" || die 'Cannot list release archive'
     sort "$work/members" > "$work/members.sorted"
     sort "$work/expected" > "$work/expected.sorted"
     cmp -s "$work/members.sorted" "$work/expected.sorted" || die 'Unexpected or duplicate archive member'
@@ -65,9 +84,12 @@ prepare() {
     done < "$work/expected"
     [ "$(checksum "$unpack/ferrum")" = "$binary_hash" ] || die 'Binary SHA-256 mismatch'
     chmod 755 "$unpack/ferrum"
+    check_runtime
+}
+check_runtime() {
     runtime_ok=no
     if actual_version=$("$unpack/ferrum" --version 2> "$work/runtime-error"); then
-        [ "$actual_version" = "ferrum $version" ] || die 'Downloaded binary version differs from requested release'
+        [ "$actual_version" = "ferrum $version" ] || die 'Release binary version differs from requested release'
         runtime_ok=yes
     else
         cat "$work/runtime-error" >&2
@@ -103,6 +125,7 @@ main() {
                     '  --no-modify-path       Leave shell profiles untouched' \
                     '  --release-base-url URL  Explicit release mirror (vVERSION/asset layout)' \
                     'Installs to ~/.local/bin; preserves unmanaged Ferrum installations.' \
+                    'Repeat to update; intact versions skip package downloads. Running processes keep their version.' \
                     'Linux CUDA requires sm89 GPU, NVIDIA driver, CUDA 12.4 and NCCL runtimes.'
                 return;;
             *) die "Unknown option: $1";;
@@ -206,6 +229,7 @@ main() {
     locked=yes; printf '%s\n' "$$" > "$lock/pid"
     trap cleanup EXIT
     trap 'exit 1' HUP INT TERM
+    [ ! -L "$root/releases" ] || die 'Managed releases directory was replaced by a symlink'
     work=$(mktemp -d "$root/download.XXXXXXXX")
     prepare
     if [ "$runtime_ok" != yes ]; then
@@ -215,16 +239,9 @@ main() {
         fi
         [ "$runtime_ok" = yes ] || die 'The release binary cannot start on this host; no installed binary was replaced'
     fi
-    [ ! -L "$root/releases" ] || die 'Managed releases directory was replaced by a symlink'
     mkdir -p "$root/releases" "$bindir"
-    destination="$root/releases/$version-$backend-$binary_hash"
-    if [ -e "$destination" ] || [ -L "$destination" ]; then
-        [ ! -L "$destination" ] && [ -d "$destination" ] || die 'Existing version path was replaced'
-        while IFS= read -r member; do
-            [ ! -L "$destination/$member" ] && cmp -s "$unpack/$member" "$destination/$member" || die "Existing version file was edited: $member"
-        done < "$work/expected"
-        [ "$(read_checksum "$destination/.binary.sha256" ferrum)" = "$binary_hash" ] || die 'Existing version ownership checksum differs'
-    else
+    if [ "$reused" != yes ]; then
+        [ ! -e "$destination" ] && [ ! -L "$destination" ] || die 'Another installation appeared during download; it was preserved'
         cp "$work/binary.sha256" "$unpack/.binary.sha256"
         cp "$work/asset.sha256" "$unpack/.asset.sha256"
         mv "$unpack" "$destination"
@@ -247,9 +264,14 @@ ENV
     mv -f "$work/env" "$root/env"
     # Finish fallible profile writes before committing the new launch target.
     if [ "$modify_path" = yes ]; then profile_add "$profile_a"; [ -z "$profile_b" ] || profile_add "$profile_b"; fi
-    ln -s "$destination/ferrum" "$work/ferrum-link"
-    mv -f "$work/ferrum-link" "$binary"
-    note "Installed ferrum $version ($backend) at $binary"
+    if [ "$previous_link" = "$destination/ferrum" ]; then
+        note "Ferrum $version ($backend) is already installed and verified. No package download is needed."
+    else
+        ln -s "$destination/ferrum" "$work/ferrum-link"
+        mv -f "$work/ferrum-link" "$binary"
+        note "Installed ferrum $version ($backend) at $binary"
+        note 'Running Ferrum processes keep their current version. New launches use this version.'
+    fi
     note 'Open a new terminal, or run: . "$HOME/.local/share/ferrum/installer/env"'
 }
 main "$@"

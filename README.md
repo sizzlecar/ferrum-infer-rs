@@ -198,7 +198,9 @@ curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
 ```
 
 To upgrade an installation made with the script, rerun the original install
-command. It keeps existing version directories and switches the entry point to
+command. If the selected version and backend are already installed and verify
+successfully, the script checks the small release checksum files and skips the
+package download. It keeps existing version directories and switches the entry point to
 the verified new binary. Running sessions continue using their current version;
 new launches use the new version. Restart an existing server when you want it to
 use the update. Models and configuration are preserved.

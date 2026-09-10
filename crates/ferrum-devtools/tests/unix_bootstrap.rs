@@ -21,6 +21,9 @@ use http_fixture::Server;
 #[path = "unix_bootstrap/candidate.rs"]
 mod candidate;
 
+#[path = "unix_bootstrap/reuse.rs"]
+mod reuse;
+
 #[test]
 fn cdn_transfer_fallback_replaces_partial_bytes_and_propagates_failure() {
     let payload = b"official release payload";
@@ -371,7 +374,16 @@ fn actual_download_install_repeat_and_upgrade_preserve_profiles_and_models() {
     let mut session = VersionSession::start(&host.path().join(".local/bin/ferrum"));
     let original_pid = session.child.id();
     assert_eq!(session.version(), "ferrum 1.2.3");
+    let before_repeat = server.requests();
     success(&first.run(host.path(), &server, "1.2.3", "Darwin", "auto", None, false));
+    assert_eq!(
+        &server.requests()[before_repeat.len()..],
+        [
+            "/v1.2.3/ferrum-macos-aarch64.tar.gz.sha256",
+            "/v1.2.3/ferrum-macos-aarch64.tar.gz.binary.sha256"
+        ]
+    );
+    assert_eq!(session.version(), "ferrum 1.2.3");
     let profile = fs::read_to_string(host.path().join(".bashrc")).unwrap();
     assert!(profile.starts_with("# existing user settings\n"));
     let login = fs::read_to_string(host.path().join(".bash_login")).unwrap();
