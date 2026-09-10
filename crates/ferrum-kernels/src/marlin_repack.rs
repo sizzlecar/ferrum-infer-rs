@@ -1288,6 +1288,9 @@ fn marlin_weight_permutation() -> Vec<usize> {
     interleaved
 }
 
+#[cfg(all(test, feature = "vllm-marlin"))]
+pub(crate) mod fixtures;
+
 #[cfg(test)]
 mod tests {
     use super::*;

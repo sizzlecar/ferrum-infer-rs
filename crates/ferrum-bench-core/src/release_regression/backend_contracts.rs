@@ -94,8 +94,8 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     }
     groups.extend(numerical::groups(backend));
     if backend == Backend::Cuda {
-        // Matrix parity supplements the native suite. It does not bind an
-        // entire Marlin model target until its other providers are covered.
+        // Dense Marlin coverage requires these matrices and the numerical
+        // group's F16 providers, workspace lifecycle and projection stitching.
         let tests: Vec<_> = [
             "gemma4_symmetric_compressed_tensors_w4a16_matches_two_shapes_and_batches_1_4",
             "qwen38_compressed_tensors_w4a16_matches_cpu_reference_for_four_fixed_fixtures",
@@ -374,7 +374,7 @@ mod tests {
             assert_eq!(required_backend(&obligation), Some(backend));
             assert!(receipt.covers(&obligation));
             let mut other = target.clone();
-            other.precision = "block-fp8-e4m3".into();
+            other.precision = "gptq-int4".into();
             obligation.scope = ObligationScope::Target { target: other };
             assert!(!receipt.covers(&obligation));
             assert_eq!(required_backend(&obligation), None);
@@ -480,5 +480,55 @@ mod tests {
                 .retain(|test| !test.binding.name.contains("::f16_tests::"));
         }
         assert!(verify_report(Backend::Cuda, &native_only).is_err());
+    }
+
+    #[test]
+    fn dense_marlin_requires_matrix_and_provider_evidence_without_covering_moe() {
+        let report = report_fixture(Backend::Cuda);
+        let receipt = verify_report(Backend::Cuda, &report).unwrap();
+        for precision in ["compressed-tensors-int4", "block-fp8-e4m3"] {
+            let target = ExecutionTarget {
+                architecture: "qwen3_5_dense_hybrid".into(),
+                protocol: ferrum_types::ModelOutputProtocol::Text,
+                precision: precision.into(),
+                backend: Backend::Cuda,
+                execution_path: PATH.into(),
+            };
+            let descriptors = check_descriptors(std::slice::from_ref(&target));
+            for behavior in [Behavior::KernelNumerics, Behavior::KernelBoundaries] {
+                let descriptor = descriptors.iter().find(|d| d.behavior == behavior).unwrap();
+                let mut obligation = super::super::Obligation {
+                    behavior,
+                    layer: EvidenceLayer::BackendNumerics,
+                    scope: ObligationScope::Target {
+                        target: target.clone(),
+                    },
+                    checkers: vec![descriptor.id.clone()],
+                    entrypoints: Vec::new(),
+                    reason: "dense Marlin operator chain".into(),
+                };
+                assert!(receipt.covers(&obligation));
+                let mut moe = target.clone();
+                moe.architecture = "qwen3_5_hybrid_moe".into();
+                obligation.scope = ObligationScope::Target { target: moe };
+                assert!(!receipt.covers(&obligation));
+                assert_eq!(required_backend(&obligation), None);
+            }
+        }
+        let mut no_matrix = report.clone();
+        no_matrix
+            .execution
+            .groups
+            .retain(|g| !g.id.contains("marlin-matrix"));
+        assert!(verify_report(Backend::Cuda, &no_matrix).is_err());
+        for missing in ["::marlin_tests::", "::projection_stitch_tests::"] {
+            let mut incomplete = report.clone();
+            for group in &mut incomplete.execution.groups {
+                group
+                    .tests
+                    .retain(|test| !test.binding.name.contains(missing));
+            }
+            assert!(verify_report(Backend::Cuda, &incomplete).is_err());
+        }
     }
 }
