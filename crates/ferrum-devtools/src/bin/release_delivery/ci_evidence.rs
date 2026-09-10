@@ -229,6 +229,50 @@ fn producer(
     Ok(job.clone())
 }
 
+/// A failed-jobs retry can carry the same successful staging execution into a
+/// later attempt. Reuse its original artifact only under the same provenance
+/// rules as numerical evidence, including every subsequent execution.
+pub(super) fn verify_staging_job(
+    run: &Value,
+    expected_attempt: u64,
+    name: &str,
+    occurrences: &BTreeMap<u64, Value>,
+) -> Result<(), String> {
+    let original: Job = serde_json::from_value(
+        occurrences
+            .get(&expected_attempt)
+            .ok_or("original release staging job is missing")?
+            .clone(),
+    )
+    .map_err(|_| "original staging execution metadata is incomplete")?;
+    let all: Vec<Job> = occurrences
+        .values()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|_| "staging execution metadata is incomplete")?;
+    let run_id = run["id"].as_u64().ok_or("CI run has no identity")?;
+    let candidate = run["head_sha"].as_str().ok_or("CI run has no candidate")?;
+    let current_attempt = run["run_attempt"].as_u64().ok_or("CI run has no attempt")?;
+    let origin = Origin {
+        schema_version: 1,
+        run_id,
+        run_attempt: expected_attempt,
+        head_sha: candidate.into(),
+        job_id: original.id,
+    };
+    producer(
+        &origin,
+        &[original],
+        &all,
+        run_id,
+        candidate,
+        current_attempt,
+        name,
+    )
+    .map(|_| ())
+}
+
 fn artifact_provenance(
     metadata: &Value,
     run: &Value,

@@ -278,6 +278,56 @@ async fn cloud_controlled_ssh_success_cannot_hide_missing_or_incomplete_report()
     }
 }
 
+#[tokio::test]
+async fn cloud_report_transfer_retry_keeps_model_execution_and_validation_separate() {
+    fn interrupted_copy(program: &str, arguments: &[std::ffi::OsString]) -> Result<String, String> {
+        if program == "ssh" {
+            let key = PathBuf::from(&arguments[1]);
+            // A transfer retry must never execute this model command again.
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(key.with_file_name("model-executed"))
+                .map_err(|error| format!("model command was repeated: {error}"))?;
+        } else if arguments.iter().any(|value| value == "-r") {
+            let root = PathBuf::from(arguments.last().unwrap());
+            let interrupted = root.join("copy-interrupted");
+            if !interrupted.exists() {
+                fs::write(interrupted, b"connection closed").unwrap();
+                return Err("scp connection closed".into());
+            }
+            let report = root.join("report-0");
+            fs::create_dir_all(&report).unwrap();
+            // Recovering transport must still reject incomplete model evidence.
+            write_json(&report.join("report.json"), &json!({"status":"passed"})).unwrap();
+        }
+        Ok(String::new())
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let instance = api::Instance {
+        id: 1,
+        label: None,
+        actual_status: Some("running".into()),
+        ssh_host: Some("localhost".into()),
+        ssh_port: Some(22),
+    };
+    let mut input = args();
+    input.report_dir = directory.path().into();
+    let mut remote = ssh::Remote::new(
+        &instance,
+        &directory.path().join("test-key"),
+        "/workspace/test".into(),
+    )
+    .unwrap();
+    remote.fixture = Some(interrupted_copy);
+    let error = remote
+        .run_task(&input, &task(Backend::Cuda, "cuda"), 0)
+        .await
+        .unwrap_err();
+    assert!(error.contains("schema"), "{error}");
+    assert!(directory.path().join("model-executed").exists());
+}
+
 // The child fixture is the Rust test executable itself, not an added shell or
 // Python script. Normal test discovery performs no child behavior.
 #[test]

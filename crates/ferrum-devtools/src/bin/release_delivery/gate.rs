@@ -977,14 +977,12 @@ async fn ci_at_with_windows(
         return Err("CI returned an incomplete job inventory".into());
     }
     if let Some(expected) = windows_attempt {
-        let (attempt, job) = windows_occurrences
-            .last_key_value()
-            .ok_or("Windows release staging job is missing")?;
-        if *attempt != expected || job["status"] != "completed" || job["conclusion"] != "success" {
-            return Err(
-                "latest Windows staging did not succeed for the accepted artifact attempt".into(),
-            );
-        }
+        ci_evidence::verify_staging_job(
+            &run,
+            expected,
+            "stage-cuda / Stage Windows x86_64 CUDA sm89",
+            &windows_occurrences,
+        )?;
     }
     let (job_attempt, required) = occurrences
         .last_key_value()

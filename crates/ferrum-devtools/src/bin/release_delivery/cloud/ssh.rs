@@ -195,9 +195,27 @@ impl Remote {
         } else {
             args.extend(["--".into(), local.as_os_str().into(), endpoint]);
         }
-        self.transport("scp", &args, log, Duration::from_secs(300))
-            .await
-            .map(|_| ())
+        // Copying the same files is idempotent. Retry a dropped transfer without
+        // executing the model again, and preserve each attempt's diagnostics.
+        for attempt in 0..3 {
+            let retry_log = log.with_file_name(format!(
+                "{}-retry-{attempt}",
+                log.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let attempt_log = if attempt == 0 { log } else { &retry_log };
+            match self
+                .transport("scp", &args, attempt_log, Duration::from_secs(300))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if attempt == 2 => return Err(error),
+                Err(error) => {
+                    eprintln!("{error}; retrying file transfer without rerunning inference");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        unreachable!("last transfer attempt returns")
     }
     pub async fn prepare(
         &self,
