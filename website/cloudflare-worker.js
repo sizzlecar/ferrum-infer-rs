@@ -344,7 +344,7 @@ function response(body, contentType, status = 200) {
     status,
     headers: {
       "content-type": `${contentType}; charset=utf-8`,
-      "cache-control": "public, max-age=300, s-maxage=3600",
+      "cache-control": contentType === "text/html" ? "public, max-age=60, s-maxage=60" : "public, max-age=300, s-maxage=3600",
       "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
       "referrer-policy": "strict-origin-when-cross-origin",
       "x-content-type-options": "nosniff",
