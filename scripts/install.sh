@@ -15,10 +15,22 @@ read_checksum() {
 }
 download() {
     note "Downloading ${1##*/}..."
-    curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
-        --max-time 600 --proto "$protocols" --proto-redir '=https' "$1" -o "$2" \
-        || die "Download failed: $1"
+    if ! curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
+        --max-time 600 --proto "$protocols" --proto-redir '=https' "$1" -o "$2"; then
+        [ -n "${3:-}" ] || die "Download failed: $1"
+        note 'CDN download unavailable; retrying the official GitHub release download...'
+        curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
+            --max-time 600 --proto "$protocols" --proto-redir '=https' "$3" -o "$2" \
+            || die "Download failed: $3"
+    fi
     note "Downloaded ${1##*/}."
+}
+download_release() {
+    if [ "$use_cdn" = yes ]; then
+        download "https://ferrum.pandaailabs.com/downloads/v$version/$1" "$2" "$release_base/v$version/$1"
+    else
+        download "$release_base/v$version/$1" "$2"
+    fi
 }
 cleanup() {
     if [ -n "$work" ]; then rm -rf "$work"; fi
@@ -30,9 +42,9 @@ prepare() {
     if [ "$platform" = macos-aarch64 ] && [ "$backend" = cpu ]; then asset="$asset-cpu"; fi
     asset="$asset.tar.gz"
     note "Downloading Ferrum $version ($backend, $platform)..."
-    download "$release_base/v$version/$asset" "$work/$asset"
-    download "$release_base/v$version/$asset.sha256" "$work/asset.sha256"
-    download "$release_base/v$version/$asset.binary.sha256" "$work/binary.sha256"
+    download_release "$asset" "$work/$asset"
+    download_release "$asset.sha256" "$work/asset.sha256"
+    download_release "$asset.binary.sha256" "$work/binary.sha256"
     note 'Verifying the downloaded release...'
     asset_hash=$(read_checksum "$work/asset.sha256" "$asset") || die 'Invalid archive checksum file'
     [ "$(checksum "$work/$asset")" = "$asset_hash" ] || die 'Archive SHA-256 mismatch'
@@ -77,13 +89,13 @@ profile_add() {
         '. "$HOME/.local/share/ferrum/installer/env"' '# <<< Ferrum installer PATH <<<' >> "$1"
 }
 main() {
-    backend=auto; requested=auto; version=latest; modify_path=yes
+    backend=auto; requested=auto; version=latest; modify_path=yes; use_cdn=yes
     release_base=https://github.com/sizzlecar/ferrum-infer-rs/releases/download
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --backend|--version|--release-base-url)
                 [ "$#" -ge 2 ] || die "Missing value for $1"
-                case "$1" in --backend) backend=$2;; --version) version=${2#v};; --release-base-url) release_base=${2%/};; esac
+                case "$1" in --backend) backend=$2;; --version) version=${2#v};; --release-base-url) release_base=${2%/}; use_cdn=no;; esac
                 shift 2;;
             --no-modify-path) modify_path=no; shift;;
             --help|-h)

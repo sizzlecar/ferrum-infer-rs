@@ -36,7 +36,8 @@ function Select-FerrumRelease {
         $asset = $matchingAssets[0]
         $expected = 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v'+$resolved+'/'+$assetName
         if ([string]$asset.browser_download_url -cne $expected -or [long]$asset.size -le 0) { throw 'Release asset URL or byte size is invalid.' }
-        $selected += [pscustomobject]@{name=$assetName;url=$expected;size=[long]$asset.size}
+        $cdn = 'https://ferrum.pandaailabs.com/downloads/v'+$resolved+'/'+$assetName
+        $selected += [pscustomobject]@{name=$assetName;url=$expected;cdn_url=$cdn;size=[long]$asset.size}
     }
     return [pscustomobject]@{version=$resolved;setup=$selected[0];checksum=$selected[1]}
 }
@@ -119,6 +120,22 @@ function Invoke-FerrumDownload {
         $request.Abort()
         Write-Progress -Id 1 -Activity $activity -Completed
         if ($created -and -not $complete) { Remove-Item -LiteralPath $Destination -Force }
+    }
+}
+
+function Invoke-FerrumDownloadWithFallback {
+    param(
+        [Parameter(Mandatory=$true)][uri]$Uri,
+        [Parameter(Mandatory=$true)][uri]$FallbackUri,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$true)][ValidateRange(1,[long]::MaxValue)][long]$ExpectedSize
+    )
+    try {
+        Invoke-FerrumDownload -Uri $Uri -Destination $Destination -ExpectedSize $ExpectedSize
+    } catch {
+        Write-Host ('CDN download unavailable: '+$_.Exception.Message)
+        Write-Host 'Retrying the official GitHub release download...'
+        Invoke-FerrumDownload -Uri $FallbackUri -Destination $Destination -ExpectedSize $ExpectedSize
     }
 }
 
@@ -271,7 +288,7 @@ function Install-FerrumRelease {
     try {
         foreach ($asset in @($selected.setup,$selected.checksum)) {
             $destination = Join-Path $temporary $asset.name
-            Invoke-FerrumDownload -Uri $asset.url -Destination $destination -ExpectedSize $asset.size
+            Invoke-FerrumDownloadWithFallback -Uri $asset.cdn_url -FallbackUri $asset.url -Destination $destination -ExpectedSize $asset.size
         }
         $checksumPath = Join-Path $temporary $selected.checksum.name
         if ((Get-Item -LiteralPath $checksumPath).Length -gt 4096) { throw 'Installer checksum file is unexpectedly large.' }

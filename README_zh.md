@@ -28,13 +28,16 @@ curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 安装脚本会校验发布包，并将 `~/.local/bin` 加入 shell 的 PATH；完成后打开新终端。
 也可以使用 [Homebrew 或手动安装](#安装)。
 
-Windows x64 与 NVIDIA sm89 显卡从 **0.8.9** 开始支持。在 PowerShell 中执行：
+Windows x64 支持 CPU 推理及兼容的 NVIDIA sm89 显卡。在 PowerShell 中执行：
 
 ```powershell
 irm https://ferrum.pandaailabs.com/install.ps1 | iex
 ```
 
 脚本校验 setup 的 SHA256 后为当前用户安装，并自动添加 PATH；当前 PowerShell 也会立即生效。
+
+没有受支持的 GPU 时，安装脚本会选择 CPU 版本。安装包优先通过 Cloudflare CDN 下载，
+保留 SHA256 校验，下载失败时回退到 GitHub。再次执行同一命令即可安装最新正式版。
 
 下载权重前先检查安装的二进制：
 
