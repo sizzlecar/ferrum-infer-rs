@@ -30,6 +30,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
+        release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage,
         impact: Impact {
@@ -2452,5 +2453,36 @@ fn release_performance_deferral_preserves_every_correctness_obligation() {
         .iter()
         .any(|o| o.layer == EvidenceLayer::Performance));
     request.release_performance = ReleasePerformancePolicy::Deferred { reason: " ".into() };
+    assert!(plan(&request).is_err());
+}
+
+#[test]
+fn explicit_release_models_cannot_be_replaced_by_a_cheaper_same_family_sample() {
+    let t = text_target("gguf-q4_k_m", Backend::Cuda);
+    let mut request = input(
+        Stage::Release,
+        vec![t.clone()],
+        vec![profile("quick", t.clone()), profile("large", t)],
+    );
+    request.quick_start_profile_ids = vec!["quick".into()];
+    request.release_profile_ids = vec!["large".into()];
+    let result = plan(&request).unwrap();
+    assert_eq!(selected_ids(&result), ["large", "quick"]);
+    assert!(result.obligations.iter().any(|o| o.behavior == Behavior::ModelForward && matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "large")));
+    request.profiles[1].available = false;
+    assert!(plan(&request)
+        .unwrap()
+        .gaps
+        .contains(&Gap::MissingReleaseProfile {
+            profile_id: "large".into()
+        }));
+    request.stage = Stage::PullRequest;
+    assert!(!plan(&request)
+        .unwrap()
+        .gaps
+        .iter()
+        .any(|g| matches!(g, Gap::MissingReleaseProfile { .. })));
+    request.stage = Stage::Release;
+    request.release_profile_ids.push("large".into());
     assert!(plan(&request).is_err());
 }

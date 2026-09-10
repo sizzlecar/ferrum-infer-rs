@@ -22,6 +22,10 @@ binary and the actual installation and first-use paths.
   separately when preparing the run.
 - `quick_start_profile_ids` contains two independent mandatory profiles.
   Neither can be replaced by another precision, smaller model, or backend.
+- `release_profile_ids` retains explicit model commitments beyond README examples.
+  Release planning requires each named profile; a cheaper model with the same
+  architecture cannot replace it. An unavailable or missing profile is a gap.
+  PR and nightly sampling do not automatically repeat these release commitments.
 - `required_targets` keeps advertised capability groups visible. Selection must
   consider stage and changed behavior; the number of profiles is not a gate.
   Additional precision-specific work belongs to affected loader/kernel changes.
@@ -29,6 +33,13 @@ binary and the actual installation and first-use paths.
   regression-plan CLI adds the existing model runner's built-in capabilities;
   all other missing bindings remain gaps. Neither declaration nor model
   availability means a check ran or passed.
+
+The current release commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal,
+9B and Qwen3.8 27B mixed GGUF on CUDA/Metal, and Qwen3.5 2B SafeTensors on CPU/Metal.
+Each GGUF profile declares its exact file and independent semantic source;
+execution must observe those sources. These are required checks, not completed
+support claims. Existing CUDA SafeTensors and other advertised architecture and
+encoding representatives remain in the catalog.
 
 Resolve aliases through the production resolver. Record the selected immutable
 weight revision and the tokenizer/config/template revisions in runtime evidence.

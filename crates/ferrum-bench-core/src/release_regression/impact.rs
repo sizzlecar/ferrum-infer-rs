@@ -200,9 +200,13 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     if component == "ferrum-devtools" {
         if cargo_integration_target(relative)
             || relative == "tests/fixtures/unix_bootstrap_program.rs"
+            || matches!(
+                relative,
+                "tests/support/http_fixture.rs" | "tests/unix_bootstrap/candidate.rs"
+            )
         {
             return Some((vec![Validation],
-                "independent Cargo integration target or the Rust child executable compiled by unix_bootstrap; production imports retain their own source impact"));
+                "independent Cargo integration target or reviewed Rust installation-test helper; production imports retain their own source impact"));
         }
         if relative == "Cargo.toml" || (relative.starts_with("src/") && relative.ends_with(".rs")) {
             return Some((vec![Build, Validation],
@@ -537,6 +541,8 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/report.rs"
             | "src/stats.rs"
             | "examples/model_gate.rs"
+            | "examples/checkpoint_diff.rs"
+            | "examples/checkpoint_diff/tests.rs"
             | "examples/model_gate/tests.rs"
             | "examples/regression_plan.rs"
             | "examples/regression_plan/scope.rs"
@@ -657,6 +663,8 @@ mod tests {
             "crates/ferrum-devtools/tests/unix_bootstrap.rs",
             "crates/ferrum-devtools/tests/windows_bootstrap.rs",
             "crates/ferrum-devtools/tests/fixtures/unix_bootstrap_program.rs",
+            "crates/ferrum-devtools/tests/support/http_fixture.rs",
+            "crates/ferrum-devtools/tests/unix_bootstrap/candidate.rs",
             "crates/ferrum-cli/src/source_resolver/cache/tests.rs",
         ] {
             let impact = analyze_paths([path]);
@@ -1019,6 +1027,8 @@ mod tests {
             "crates/ferrum-bench-core/examples/release_delivery.rs",
             "crates/ferrum-bench-core/examples/release_delivery/cloud.rs",
             "crates/ferrum-bench-core/examples/contract_checks.rs",
+            "crates/ferrum-bench-core/examples/checkpoint_diff.rs",
+            "crates/ferrum-bench-core/examples/checkpoint_diff/tests.rs",
             "crates/ferrum-bench-core/examples/regression_plan.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme.rs",

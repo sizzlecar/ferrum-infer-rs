@@ -175,6 +175,7 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
         if !matches!(
             key.as_str(),
             "profiles"
+                | "release_profile_ids"
                 | "quick_start_profile_ids"
                 | "required_targets"
                 | "checks"

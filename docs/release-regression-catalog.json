@@ -171,6 +171,160 @@
       "available": true,
       "estimate": null,
       "reasoning_protocol": "model_generated"
+    },
+    {
+      "id": "release-qwen35-4b-gguf-cpu",
+      "model": "unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523",
+      "gguf": {
+        "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "cpu",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-4b-gguf-cuda",
+      "model": "unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523",
+      "gguf": {
+        "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-4b-gguf-metal",
+      "model": "unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523",
+      "gguf": {
+        "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-9b-gguf-cuda",
+      "model": "unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5",
+      "gguf": {
+        "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-9b-gguf-metal",
+      "model": "unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5",
+      "gguf": {
+        "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen38-27b-gguf-cuda",
+      "model": "unsloth/Qwen3.8-27B-GGUF@4ca720788d1e01f1bff70c033e0d0028fd02e502",
+      "gguf": {
+        "filename": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-mixed-4bit",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen38-27b-gguf-metal",
+      "model": "unsloth/Qwen3.8-27B-GGUF@4ca720788d1e01f1bff70c033e0d0028fd02e502",
+      "gguf": {
+        "filename": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+      },
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-mixed-4bit",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-2b-safetensors-cpu",
+      "model": "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "safetensors-bf16-f32",
+        "backend": "cpu",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-qwen35-2b-safetensors-metal",
+      "model": "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "safetensors-bf16-f32",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     }
   ],
   "quick_start_profile_ids": [
@@ -261,6 +415,48 @@
       "precision": "compressed-tensors-w4a16",
       "backend": "cuda",
       "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "gguf-q4_k_m",
+      "backend": "cpu",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "gguf-q4_k_m",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "gguf-mixed-4bit",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "gguf-mixed-4bit",
+      "backend": "metal",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "safetensors-bf16-f32",
+      "backend": "cpu",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "safetensors-bf16-f32",
+      "backend": "metal",
+      "execution_path": "production-plan-runtime"
     }
   ],
   "checks": [],
@@ -269,15 +465,38 @@
       "path": "README.md",
       "before_sha256": "54d8c1c4b8e8005479d03fb633255f39cddde5be954386ed2113b081bc172d3f",
       "after_sha256": "3825b8e9eecf85874a6c96d9638aab84b6c311ed0d5f92e01b1ac973398216e2",
-      "areas": ["build", "template", "termination", "structured", "tools"],
+      "areas": [
+        "build",
+        "template",
+        "termination",
+        "structured",
+        "tools"
+      ],
       "rationale": "Reviewed distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
     },
     {
       "path": "README_zh.md",
       "before_sha256": "7204b7d801d7c310698f065bd16a6ad2e05cd566b1f6624caa86eabcb37b0438",
       "after_sha256": "c552fbb42649c022158bdffe60345dcc34b6978e3fc798e056deb100da1a225e",
-      "areas": ["build", "template", "termination", "structured", "tools"],
+      "areas": [
+        "build",
+        "template",
+        "termination",
+        "structured",
+        "tools"
+      ],
       "rationale": "Reviewed Chinese distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
     }
+  ],
+  "release_profile_ids": [
+    "release-qwen35-4b-gguf-cpu",
+    "release-qwen35-4b-gguf-cuda",
+    "release-qwen35-4b-gguf-metal",
+    "release-qwen35-9b-gguf-cuda",
+    "release-qwen35-9b-gguf-metal",
+    "release-qwen38-27b-gguf-cuda",
+    "release-qwen38-27b-gguf-metal",
+    "release-qwen35-2b-safetensors-cpu",
+    "release-qwen35-2b-safetensors-metal"
   ]
 }

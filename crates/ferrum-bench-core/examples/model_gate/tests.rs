@@ -29,6 +29,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
         })
         .collect();
     plan(&PlanInput {
+        release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,
         impact: analyze_paths(Vec::<String>::new()),
