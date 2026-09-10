@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
@@ -36,8 +36,9 @@ use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
     ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result,
-    ReusableExecutionCaptureConfig, SchedulingPolicy, SequenceFitPolicy, TokenId,
-    VNextDiagnosticFault, MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
+    ReusableExecutionCaptureConfig, ReusableExecutionPreparationMode, SchedulingPolicy,
+    SequenceFitPolicy, TokenId, VNextDiagnosticFault,
+    MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -60,6 +61,7 @@ mod composition;
 mod determinism;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod request;
+mod reusable_catalog;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -339,8 +341,12 @@ fn resolve_reusable_execution_policy(
         )));
     }
 
-    let requested_sequence_tokens =
-        reusable_execution_maximum_decode_sequence_tokens(requested_decode_widths.len())?;
+    let on_demand = capture_config.preparation == ReusableExecutionPreparationMode::OnDemand;
+    let requested_sequence_tokens = if on_demand {
+        0
+    } else {
+        reusable_execution_maximum_decode_sequence_tokens(requested_decode_widths.len())?
+    };
     let (effective_decode_widths, budget_reduction_reason) = if requested_sequence_tokens
         <= maximum_model_tokens
     {
@@ -416,12 +422,16 @@ fn resolve_reusable_execution_policy(
                 .map_err(|error| FerrumError::config(error.to_string()))?,
         );
     }
-    let program_policy = ReusableExecutionProgramPolicy::exact_startup_sealed(
-        REUSABLE_EXECUTION_WARMUP_PASSES,
-        REUSABLE_EXECUTION_CAPTURE_PASSES,
-        REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
-        program_specs,
-    )
+    let program_policy = if on_demand {
+        ReusableExecutionProgramPolicy::exact_on_demand(program_specs)
+    } else {
+        ReusableExecutionProgramPolicy::exact_startup_sealed(
+            REUSABLE_EXECUTION_WARMUP_PASSES,
+            REUSABLE_EXECUTION_CAPTURE_PASSES,
+            REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+            program_specs,
+        )
+    }
     .map_err(|error| FerrumError::config(error.to_string()))?;
     policy = policy
         .with_program_policy(program_policy)
@@ -540,13 +550,29 @@ impl VNextExecutorConfig {
         info: &ModelInfo,
         runtime: &R,
     ) -> Result<Self> {
+        // This diagnostic requests a fixed eager/replay matrix immediately
+        // after preparation. Its automatic mode must prepare that matrix even
+        // when product requests would normally populate the cache on demand.
+        let mut engine = engine.clone();
+        match engine.backend.reusable_execution_capture.preparation {
+            ReusableExecutionPreparationMode::Auto => {
+                engine.backend.reusable_execution_capture.preparation =
+                    ReusableExecutionPreparationMode::Startup;
+            }
+            ReusableExecutionPreparationMode::Startup => {}
+            ReusableExecutionPreparationMode::OnDemand => {
+                return Err(FerrumError::config(
+                    "fixed determinism collection requires startup reusable execution preparation",
+                ))
+            }
+        }
         let required_chunks = [
             PrefillChunk::new(0, 1, 1)?,
             PrefillChunk::new(0, 4, 4)?,
             PrefillChunk::new(4, 4, 8)?,
         ];
         let config = Self::from_engine_config_with_prefill_chunks(
-            engine,
+            &engine,
             info,
             runtime,
             &required_chunks,
@@ -627,6 +653,15 @@ impl VNextExecutorConfig {
             .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
         let prepare_device_programs =
             engine.backend.enable_reusable_execution && device_reusable_execution_supported;
+        let mut capture_config = engine.backend.reusable_execution_capture.clone();
+        if engine.backend.enable_reusable_execution {
+            capture_config.preparation = capture_config
+                .preparation
+                .resolve(descriptor.capabilities.iter().any(|capability| {
+                    capability.as_str() == DEVICE_ON_DEMAND_REUSABLE_EXECUTION_CAPABILITY_ID
+                }))
+                .map_err(FerrumError::config)?;
+        }
         let mut reusable_execution_prefill_chunks = [
             engine.scheduler.prefill_step_chunk,
             engine.scheduler.active_decode_prefill_chunk,
@@ -674,7 +709,7 @@ impl VNextExecutorConfig {
             maximum_scheduled_tokens,
             maximum_model_tokens,
             &reusable_execution_prefill_chunks,
-            &engine.backend.reusable_execution_capture,
+            &capture_config,
             prepare_device_programs,
         )?;
         let reusable_execution_policy = Some(reusable_execution_resolution.policy);
@@ -920,11 +955,17 @@ impl VNextReusableExecutionStartupPlan {
             .checked_add(capture_passes)
             .and_then(|passes| passes.checked_add(replay_validation_passes))
             .ok_or_else(|| FerrumError::config("vNext reusable startup passes overflow usize"))?;
-        let maximum_decode_sequence_tokens = decode_widths
-            .len()
-            .checked_mul(passes_per_width)
-            .and_then(|decode_tokens| decode_tokens.checked_add(1))
-            .ok_or_else(|| FerrumError::config("vNext startup token ceiling overflowed"))?;
+        let maximum_decode_sequence_tokens = if program_policy.catalog_lifetime()
+            == ReusableExecutionCatalogLifetime::OnDemandBounded
+        {
+            0
+        } else {
+            decode_widths
+                .len()
+                .checked_mul(passes_per_width)
+                .and_then(|decode_tokens| decode_tokens.checked_add(1))
+                .ok_or_else(|| FerrumError::config("vNext startup token ceiling overflowed"))?
+        };
         if maximum_decode_sequence_tokens > maximum_model_tokens {
             return Err(FerrumError::config(format!(
                 "vNext model length {maximum_model_tokens} cannot cover reusable execution startup ceiling {maximum_decode_sequence_tokens}"
@@ -974,8 +1015,14 @@ impl VNextReusableExecutionStartupPlan {
 
         let maximum_executables = usize::try_from(maximum_device_executables)
             .map_err(|_| FerrumError::config("vNext reusable executable capacity exceeds usize"))?;
-        let device_plan = DeviceReusableExecutionPlan::new(maximum_executables)
-            .map_err(|error| FerrumError::config(error.to_string()))?;
+        let device_plan = if program_policy.catalog_lifetime()
+            == ReusableExecutionCatalogLifetime::OnDemandBounded
+        {
+            DeviceReusableExecutionPlan::on_demand(maximum_executables)
+        } else {
+            DeviceReusableExecutionPlan::new(maximum_executables)
+        }
+        .map_err(|error| FerrumError::config(error.to_string()))?;
         Ok(Self {
             descriptors,
             prefill_chunks,
@@ -2171,6 +2218,7 @@ struct VNextReusableExecutionMetrics {
     cached_rejected_segments: AtomicU64,
     capture_rejected_segments: AtomicU64,
     quiescence_deferred_segments: AtomicU64,
+    warmup_required_segments: AtomicU64,
     capacity_deferred_segments: AtomicU64,
     outside_preparation_segments: AtomicU64,
     evicted_segments: AtomicU64,
@@ -2197,6 +2245,8 @@ impl VNextReusableExecutionMetrics {
             observation.quiescence_deferred_segments(),
             Ordering::Relaxed,
         );
+        self.warmup_required_segments
+            .fetch_add(observation.warmup_required_segments(), Ordering::Relaxed);
         self.capacity_deferred_segments
             .fetch_add(observation.capacity_deferred_segments(), Ordering::Relaxed);
         self.outside_preparation_segments.fetch_add(
@@ -2222,6 +2272,7 @@ impl VNextReusableExecutionMetrics {
             "cached_rejected_segments": self.cached_rejected_segments.load(Ordering::Relaxed),
             "capture_rejected_segments": self.capture_rejected_segments.load(Ordering::Relaxed),
             "quiescence_deferred_segments": self.quiescence_deferred_segments.load(Ordering::Relaxed),
+            "warmup_required_segments": self.warmup_required_segments.load(Ordering::Relaxed),
             "capacity_deferred_segments": self.capacity_deferred_segments.load(Ordering::Relaxed),
             "outside_preparation_segments": self.outside_preparation_segments.load(Ordering::Relaxed),
             "evicted_segments": self.evicted_segments.load(Ordering::Relaxed),
@@ -2240,6 +2291,7 @@ impl VNextReusableExecutionMetrics {
             &self.cached_rejected_segments,
             &self.capture_rejected_segments,
             &self.quiescence_deferred_segments,
+            &self.warmup_required_segments,
             &self.capacity_deferred_segments,
             &self.outside_preparation_segments,
             &self.evicted_segments,
@@ -4338,7 +4390,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     device_reusable_execution_enabled: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
-    reusable_execution_catalog: OnceLock<VNextReusableExecutionCatalog>,
+    reusable_execution_catalog: RwLock<Option<Arc<VNextReusableExecutionCatalog>>>,
+    reusable_execution_catalog_refresh_needed: AtomicBool,
     startup_reusable_programs: Mutex<
         BTreeMap<VNextReusableExecutionDescriptor, BTreeSet<DeviceReusableExecutionProgramId>>,
     >,
@@ -4886,7 +4939,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
             reusable_execution_supported,
             reusable_execution_startup_plan,
-            reusable_execution_catalog: OnceLock::new(),
+            reusable_execution_catalog: RwLock::new(None),
+            reusable_execution_catalog_refresh_needed: AtomicBool::new(false),
             startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
@@ -5154,14 +5208,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<VNextReusableExecutionStartupReport> {
         let started = Instant::now();
         let Some(plan) = self.reusable_execution_startup_plan.clone() else {
-            self.reusable_execution_catalog
-                .set(VNextReusableExecutionCatalog {
-                    lane_epoch: self.lane.reusable_execution_epoch(),
-                    programs: BTreeMap::new(),
-                })
-                .map_err(|_| {
-                    FerrumError::internal("vNext reusable execution catalog was already installed")
-                })?;
+            self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
+                lane_epoch: self.lane.reusable_execution_epoch(),
+                programs: BTreeMap::new(),
+            })?;
             return Ok(VNextReusableExecutionStartupReport {
                 enabled: self.device_reusable_execution_enabled,
                 supported: self.reusable_execution_supported,
@@ -5195,6 +5245,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let requested_decode_widths = plan.decode_widths();
         let requested_prefill_chunks = plan.prefill_chunks();
         let requested_prefill_token_counts = plan.prefill_token_counts();
+        if plan.device_plan.catalog_lifetime() == ReusableExecutionCatalogLifetime::OnDemandBounded
+        {
+            return self.prepare_on_demand_reusable_execution(&plan, started);
+        }
         for _ in 0..plan.warmup_passes {
             for chunk in requested_prefill_chunks.iter().copied() {
                 self.execute_startup_prefill_request(chunk, "eager prefill warmup")
@@ -5524,14 +5578,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
         prepared_prefill_token_counts.dedup();
         let incomplete_capture_cases = prepared_descriptors.len() != requested_descriptors.len();
-        self.reusable_execution_catalog
-            .set(VNextReusableExecutionCatalog {
-                lane_epoch: catalog_epoch,
-                programs: catalog_by_id,
-            })
-            .map_err(|_| {
-                FerrumError::internal("vNext reusable execution catalog was already installed")
-            })?;
+        self.install_reusable_execution_catalog(VNextReusableExecutionCatalog {
+            lane_epoch: catalog_epoch,
+            programs: catalog_by_id,
+        })?;
         let requested_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
@@ -7176,7 +7226,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
             let mut reusable_catalog_miss = None;
-            let catalog = self.reusable_execution_catalog.get();
+            let catalog_snapshot = self.reusable_execution_catalog.read().clone();
+            let catalog = catalog_snapshot.as_deref();
             let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
@@ -7257,6 +7308,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             };
             reusable_direct_attempted |= reusable_program.is_some();
+            if reusable_program.is_none() && self.on_demand_reusable_execution_enabled() {
+                self.reusable_execution_catalog_refresh_needed
+                    .store(true, Ordering::Release);
+            }
             let reusable_program_stats = reusable_program.map(|program| {
                 (
                     program.segments().len() as u64,
@@ -7879,6 +7934,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(FerrumError::backend(message));
             }
         };
+        self.refresh_on_demand_reusable_execution_catalog()?;
         self.metrics.device_timing.record(&receipt);
         self.metrics.device_timing_for(kind).record(&receipt);
         if let Some(attribution) = attribution {
@@ -9431,6 +9487,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "failed_waves": self.metrics.failed_waves.load(Ordering::Relaxed),
                 "reusable_execution": {
                     "direct_waves": self.metrics.direct_reusable_waves.load(Ordering::Relaxed),
+                    "catalog": self.reusable_execution_catalog_snapshot(),
                     "direct_segments": self.metrics.direct_reusable_segments.load(Ordering::Relaxed),
                     "direct_logical_nodes": self.metrics.direct_reusable_logical_nodes.load(Ordering::Relaxed),
                     "direct_binding_nodes": self.metrics.direct_reusable_binding_nodes.load(Ordering::Relaxed),
@@ -10629,6 +10686,32 @@ mod tests {
             ..ReusableExecutionCaptureConfig::default()
         };
         assert!(resolve_test_reusable_startup_plan(32, 2_048, 19, &[], 1, &explicit_all).is_err());
+    }
+
+    #[test]
+    fn reusable_execution_on_demand_keeps_capacity_without_synthetic_token_budget() {
+        let config = ReusableExecutionCaptureConfig {
+            preparation: ferrum_types::ReusableExecutionPreparationMode::OnDemand,
+            ..Default::default()
+        };
+        let plan = resolve_test_reusable_startup_plan(32, 32, 2, &[], 7, &config).unwrap();
+        assert_eq!(plan.maximum_decode_sequence_tokens, 0);
+        assert_eq!(plan.decode_widths(), (1..=32).rev().collect::<Vec<_>>());
+        assert_eq!(plan.device_plan.maximum_executables(), 32 * 7);
+        assert_eq!(
+            plan.device_plan.catalog_lifetime(),
+            ferrum_interfaces::vnext::ReusableExecutionCatalogLifetime::OnDemandBounded
+        );
+        assert_eq!(plan.program_policy.replay_validation_passes(), 0);
+        assert!(resolve_test_reusable_startup_plan(
+            32,
+            32,
+            2,
+            &[],
+            7,
+            &ReusableExecutionCaptureConfig::default()
+        )
+        .is_err());
     }
 
     #[test]

@@ -121,6 +121,23 @@ for model support and compatibility details.
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
 
+For vNext execution, `run` and `serve` share this optional `ferrum.toml` setting
+in the working directory:
+
+```toml
+[runtime]
+reusable_execution_preparation = "auto" # auto, startup, on_demand
+```
+
+`auto` uses bounded on-demand preparation on runtimes that declare support
+(currently CUDA). A new shape first executes normally; later occurrences can
+prepare and reuse a device program. First-use latency can therefore be higher
+than steady-state latency. `startup` prepares the configured matrix before the
+server becomes ready. Other backends retain their existing behavior; explicitly
+requesting unsupported `on_demand` reports an error. Set `reusable_execution = false`
+to disable device-program preparation. These options do not change request
+admission, queuing, or the model's numerical profile.
+
 ## Features
 
 - `ferrum run` and `ferrum serve` in one Rust binary.

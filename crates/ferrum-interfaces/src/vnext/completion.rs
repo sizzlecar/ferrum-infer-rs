@@ -191,22 +191,47 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         operation: &'static str,
         action: impl FnOnce(&R, &mut R::Stream) -> Result<T, R::Error>,
     ) -> Result<T, VNextError> {
+        self.try_with_quiescent_stream(operation, true, action)?
+            .ok_or_else(|| {
+                invalid_completion(format!(
+                    "{operation} requires a stable, quiescent execution lane"
+                ))
+            })
+    }
+
+    fn try_with_quiescent_stream<T>(
+        &self,
+        operation: &'static str,
+        wait_for_lane: bool,
+        action: impl FnOnce(&R, &mut R::Stream) -> Result<T, R::Error>,
+    ) -> Result<Option<T>, VNextError> {
         if self.fail_closed.load(Ordering::Acquire) {
             return Err(invalid_completion(format!(
                 "fail-closed execution lane cannot {operation}"
             )));
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| invalid_completion("execution lane state mutex is poisoned"))?;
+        let mut state = if wait_for_lane {
+            self.state
+                .lock()
+                .map_err(|_| invalid_completion("execution lane state mutex is poisoned"))?
+        } else {
+            match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(invalid_completion("execution lane state mutex is poisoned"))
+                }
+            }
+        };
         if state.fail_closed || self.fail_closed.load(Ordering::Acquire) {
             return Err(invalid_completion(format!(
                 "fail-closed execution lane cannot {operation}"
             )));
         }
-        if state.in_flight != 0
-            || !self.current_descriptor_matches_snapshot()
+        if state.in_flight != 0 {
+            return Ok(None);
+        }
+        if !self.current_descriptor_matches_snapshot()
             || self.runtime.stream_state(&state.stream) != StreamState::Ready
         {
             return Err(invalid_completion(format!(
@@ -221,7 +246,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 if self.current_descriptor_matches_snapshot()
                     && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
             {
-                Ok(value)
+                Ok(Some(value))
             }
             Ok(Ok(_)) => {
                 state.fail_closed = true;
@@ -282,6 +307,26 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 }
             })
         })
+    }
+
+    /// Snapshot a catalog without waiting for work owned by another request.
+    /// `None` means the lane is owned by another operation or submissions are
+    /// still in flight; runtime failures are errors.
+    pub fn try_reusable_execution_catalog(
+        &self,
+    ) -> Result<Option<ExecutionLaneReusableExecutionCatalog>, VNextError> {
+        self.try_with_quiescent_stream(
+            "inspect reusable execution catalog",
+            false,
+            |runtime, stream| {
+                runtime.reusable_execution_catalog(stream).map(|programs| {
+                    ExecutionLaneReusableExecutionCatalog {
+                        epoch: self.reusable_execution_epoch(),
+                        programs,
+                    }
+                })
+            },
+        )
     }
 
     pub(crate) fn trim_reusable_executables_if_quiescent(&self) -> Result<bool, VNextError> {

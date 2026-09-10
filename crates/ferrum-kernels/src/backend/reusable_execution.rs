@@ -7,6 +7,9 @@
 
 use std::ops::Range;
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) mod warmup;
+
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
 };
@@ -147,6 +150,15 @@ pub(crate) struct ReusableExecutionPreparationTracker {
 }
 
 impl ReusableExecutionPreparationTracker {
+    pub(crate) const fn is_on_demand(&self) -> bool {
+        match self.lifecycle {
+            ReusableExecutionPreparationLifecycle::Ready(plan) => {
+                !plan.catalog_lifetime().is_startup_sealed()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn configure(
         &mut self,
         plan: DeviceReusableExecutionPlan,
@@ -161,15 +173,25 @@ impl ReusableExecutionPreparationTracker {
                 "reusable execution preparation requires an empty executable cache".to_owned(),
             );
         }
-        self.lifecycle = ReusableExecutionPreparationLifecycle::Preparing(plan);
-        Ok(DeviceReusableExecutionPreparation::preparing(plan))
+        if plan.catalog_lifetime().is_startup_sealed() {
+            self.lifecycle = ReusableExecutionPreparationLifecycle::Preparing(plan);
+            Ok(DeviceReusableExecutionPreparation::preparing(plan))
+        } else {
+            let ready = DeviceReusableExecutionPreparation::ready(plan, 0, 0, 0, 0, 0)
+                .map_err(|error| error.to_string())?;
+            self.lifecycle = ReusableExecutionPreparationLifecycle::Ready(plan);
+            Ok(ready)
+        }
     }
 
     pub(crate) const fn capture_is_open(&self) -> bool {
-        matches!(
-            self.lifecycle,
-            ReusableExecutionPreparationLifecycle::Preparing(_)
-        )
+        match self.lifecycle {
+            ReusableExecutionPreparationLifecycle::Preparing(_) => true,
+            ReusableExecutionPreparationLifecycle::Ready(plan) => {
+                !plan.catalog_lifetime().is_startup_sealed()
+            }
+            ReusableExecutionPreparationLifecycle::Unconfigured => false,
+        }
     }
 
     pub(crate) const fn maximum_executables(&self) -> Option<usize> {
@@ -361,6 +383,34 @@ mod tests {
         assert!(tracker.record_batch(1, 1, 0).is_err());
         assert!(tracker.seal(3, 1).is_err());
         assert!(tracker.configure(plan, 0, 0).is_err());
+    }
+
+    #[test]
+    fn on_demand_is_ready_without_preparation_and_keeps_the_same_capacity_bound() {
+        let plan = DeviceReusableExecutionPlan::on_demand(2).unwrap();
+        let mut tracker = ReusableExecutionPreparationTracker::default();
+        let ready = tracker.configure(plan, 0, 0).unwrap();
+        assert!(tracker.is_on_demand());
+        assert_eq!(
+            ready.state(),
+            DeviceReusableExecutionPreparationState::Ready
+        );
+        assert_eq!(ready.resident_executables(), 0);
+        assert_eq!(ready.captured_executables(), 0);
+        assert!(tracker.capture_is_open());
+        tracker.record_batch(2, 2, 1).unwrap();
+        let populated = tracker.snapshot(2, 1).unwrap();
+        assert_eq!(
+            populated.state(),
+            DeviceReusableExecutionPreparationState::Ready
+        );
+        assert_eq!(populated.maximum_executables(), 2);
+        assert_eq!(populated.resident_executables(), 2);
+        assert!(tracker.snapshot(3, 0).is_err());
+        assert!(tracker.configure(plan, 0, 0).is_err());
+        assert!(tracker.seal(2, 1).is_err());
+        // An eviction changes residency without losing the cumulative history.
+        assert_eq!(tracker.snapshot(1, 1).unwrap().captured_executables(), 2);
     }
 
     #[test]

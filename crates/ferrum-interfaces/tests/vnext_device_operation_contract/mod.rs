@@ -1392,6 +1392,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) fence_behavior: FenceBehavior,
     pub(crate) fence_behaviors: BTreeMap<u64, FenceBehavior>,
     pub(crate) wait_fence_block: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    pub(crate) stream_state_block: Option<(Arc<Barrier>, Arc<Barrier>)>,
     pub(crate) synchronize_fails: bool,
     pub(crate) stream_failed: bool,
     pub(crate) describe_error_panics: bool,
@@ -1674,6 +1675,11 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn stream_state(&self, _stream: &Self::Stream) -> StreamState {
+        let block = self.trace.lock().unwrap().stream_state_block.take();
+        if let Some((entered, release)) = block {
+            entered.wait();
+            release.wait();
+        }
         if self.trace.lock().unwrap().stream_failed {
             StreamState::Failed
         } else {

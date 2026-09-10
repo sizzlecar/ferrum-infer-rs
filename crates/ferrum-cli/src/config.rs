@@ -12,6 +12,7 @@ use tokio::fs;
 
 /// CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct CliConfig {
     /// Requested numerical execution policy; explicit CLI selection takes precedence.
     #[serde(default)]
@@ -263,8 +264,12 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub reusable_execution: Option<bool>,
 
-    /// Exact vNext reusable decode widths prepared at startup. Omitted means
-    /// automatic exact resolution up to the admission and startup hard bounds.
+    /// vNext preparation lifecycle: auto, startup, or on_demand.
+    #[serde(default)]
+    pub reusable_execution_preparation: Option<ferrum_types::ReusableExecutionPreparationMode>,
+
+    /// Exact vNext startup decode widths; also sizes the bounded executable
+    /// inventory for on-demand mode. Omitted means automatic resolution.
     #[serde(default)]
     pub reusable_execution_exact_decode_widths: Option<Vec<usize>>,
 
@@ -465,6 +470,12 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
             self.reusable_execution_exact_decode_widths.as_deref(),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_REUSABLE_EXECUTION_PREPARATION",
+            self.reusable_execution_preparation
+                .map(|mode| mode.as_runtime_value()),
         );
         push_usize_entry(
             &mut entries,
@@ -893,6 +904,26 @@ mod tests {
     }
 
     #[test]
+    fn partial_runtime_config_preserves_defaults_and_preparation_is_typed() {
+        let config: CliConfig =
+            toml::from_str("[runtime]\nreusable_execution_preparation = 'on_demand'\n").unwrap();
+        assert_eq!(config.server.port, CliConfig::default().server.port);
+        let snapshot = ferrum_types::RuntimeConfigSnapshot::from_entries(
+            config.runtime.runtime_config_entries(),
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            engine.backend.reusable_execution_capture.preparation,
+            ferrum_types::ReusableExecutionPreparationMode::OnDemand
+        );
+        assert!(toml::from_str::<CliConfig>(
+            "[runtime]\nreusable_execution_preparation = 'unknown'\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn numerical_config_roundtrip_and_legacy_defaults_preserve_policy() {
         let mut config = CliConfig::default();
         let mut legacy = serde_json::to_value(&config).unwrap();
@@ -974,6 +1005,9 @@ mod tests {
             moe_graph: Some(true),
             batched_graph: Some(true),
             reusable_execution: Some(false),
+            reusable_execution_preparation: Some(
+                ferrum_types::ReusableExecutionPreparationMode::OnDemand,
+            ),
             reusable_execution_exact_decode_widths: Some(vec![1, 2, 4, 8, 16, 24, 32]),
             reusable_execution_max_automatic_exact_decode_width: Some(32),
             unified_graph: Some(true),
@@ -1012,7 +1046,14 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 45);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| &entry.key)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            entries.len()
+        );
         let entry = |key: &str| {
             entries
                 .iter()
@@ -1064,6 +1105,10 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION_PREPARATION").effective_value,
+            "on_demand"
+        );
         assert_eq!(
             entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").effective_value,
             "1,2,4,8,16,24,32"

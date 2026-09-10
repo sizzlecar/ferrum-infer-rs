@@ -195,6 +195,68 @@ fn retire_step_after_deferred_cleanup(
 }
 
 #[test]
+fn reusable_catalog_snapshot_defers_in_flight_work_and_recovers_after_completion() {
+    let harness = CompletionHarness::new();
+    assert!(harness
+        .lane
+        .try_reusable_execution_catalog()
+        .unwrap()
+        .is_some());
+    harness.set_fence_behavior(FenceBehavior::Pending);
+    let completion = harness.dispatch().unwrap();
+    assert!(harness
+        .lane
+        .try_reusable_execution_catalog()
+        .unwrap()
+        .is_none());
+    assert!(harness.lane.reusable_execution_catalog().is_err());
+    assert!(harness.lane.is_reusable());
+    harness.set_fence_behavior(FenceBehavior::Succeeded);
+    assert!(matches!(
+        completion.poll().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    assert!(harness
+        .lane
+        .try_reusable_execution_catalog()
+        .unwrap()
+        .is_some());
+    drop(completion);
+    harness.finish(&mut 0);
+}
+
+#[test]
+fn reusable_catalog_snapshot_does_not_wait_for_an_owned_lane() {
+    let harness = CompletionHarness::new();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    harness.runtime_trace.lock().unwrap().stream_state_block =
+        Some((Arc::clone(&entered), Arc::clone(&release)));
+    let lane = Arc::clone(&harness.lane);
+    let owner = std::thread::spawn(move || lane.reusable_execution_catalog());
+    entered.wait();
+    let lane = Arc::clone(&harness.lane);
+    let (sender, receiver) = mpsc::channel();
+    let reader =
+        std::thread::spawn(move || sender.send(lane.try_reusable_execution_catalog()).unwrap());
+    let result = receiver.recv_timeout(Duration::from_secs(2));
+    // Always release and join before asserting, including the regression case.
+    release.wait();
+    assert!(owner.join().unwrap().is_ok());
+    reader.join().unwrap();
+    assert!(result
+        .expect("catalog inspection waited for the owning operation")
+        .unwrap()
+        .is_none());
+    assert!(harness
+        .lane
+        .try_reusable_execution_catalog()
+        .unwrap()
+        .is_some());
+    harness.finish(&mut 0);
+}
+
+#[test]
 fn completion_reaper_drop_defers_blocking_backend_recovery() {
     let harness = CompletionHarness::new();
     harness.set_fence_behavior(FenceBehavior::Pending);
