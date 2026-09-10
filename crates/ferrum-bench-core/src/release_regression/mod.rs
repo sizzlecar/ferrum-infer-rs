@@ -1,4 +1,5 @@
 //! Change-based regression planning. A plan is not execution evidence or release approval.
+pub mod backend_contracts;
 pub mod contracts;
 pub mod dependency_change;
 pub mod distribution;

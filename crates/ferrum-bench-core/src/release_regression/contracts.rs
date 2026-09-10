@@ -81,6 +81,20 @@ pub fn contract_groups() -> Vec<ContractGroup> {
             &format!("vnext::qwen3_moe::weights::tests::{name}"),
         )
     };
+    let numerical_profile = |name: &str| {
+        integration(
+            "ferrum-interfaces",
+            "vnext_numerical_profile_contract_tests",
+            name,
+        )
+    };
+    let compiler = |name: &str| {
+        integration(
+            "ferrum-interfaces",
+            "vnext_program_plan_compiler_contract_tests",
+            name,
+        )
+    };
     let all = vec![
         Entrypoint::Run,
         Entrypoint::ServeSync,
@@ -88,6 +102,32 @@ pub fn contract_groups() -> Vec<ContractGroup> {
     ];
     let http = vec![Entrypoint::ServeSync, Entrypoint::ServeStream];
     let specifications = vec![
+        // Preparation must retain its original registration, reject source drift,
+        // and reconstruct numerical policy from trusted wire inputs. The tiny
+        // file also exercises actual CPU loading/execution; real checkpoints
+        // and accelerator execution still require their separate model runs.
+        ("model-load", ModelLoad, all.clone(), vec![
+            numerical_profile("definition_retains_its_typed_preparation_and_original_registration"),
+            numerical_profile("definition_has_no_program_and_same_gguf_source_prepares_two_numerical_abis"),
+            numerical_profile("physical_source_drift_is_rejected_before_program_construction"),
+            numerical_profile("wire_rebuilds_selected_profile_and_rejects_forged_arithmetic_or_old_semantics"),
+            integration("ferrum-models", "vnext_l1_reference_runtime", "tiny_real_safetensors_executes_through_cpu_vnext_runtime"),
+        ]),
+        // These check typed state precision and the CPU recurrent implementation
+        // against an independent f64 recurrence. They do not certify a GPU's
+        // state transitions or substitute for real-model state evidence.
+        ("architecture-state", ArchitectureState, all.clone(), vec![
+            numerical_profile("inferred_boundaries_and_declared_state_or_operation_drift_are_rejected"),
+            lib("ferrum-models", "vnext::qwen35::tests::container_alone_does_not_change_the_numerical_contract"),
+            lib("ferrum-kernels", "backend::cpu::vnext_ops::gated_delta::tests::recurrent_steps_match_f64_with_both_declared_head_and_decay_conventions"),
+        ]),
+        // Pre-allocation ABI/shape/layout validation, not GPU output numerics.
+        ("kernel-boundaries", KernelBoundaries, all.clone(), vec![
+            compiler("quantized_binding_still_requires_its_format_and_abi_before_allocation"),
+            compiler("compilation_reports_the_exact_tensor_binding_on_signature_mismatch"),
+            numerical_profile("compiler::missing_tail_rejects_whole_candidate_and_explicit_request_cannot_fall_back"),
+            integration("ferrum-interfaces", "vnext_weight_layout_contract_tests", "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits"),
+        ]),
         ("source-closure", SourceClosure, all.clone(), vec![download("indexed_fresh_download_fetches_only_referenced_shards_and_sidecars"), download("fresh_download_preserves_standalone_chat_template_in_source_bundle")]),
         ("source-revision", SourceRevision, all.clone(), vec![
             download("indexed_download_uses_resolved_snapshot_when_main_moves"),

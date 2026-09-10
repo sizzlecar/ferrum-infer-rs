@@ -390,3 +390,50 @@ fn absent_submission_or_performance_never_satisfies_known_or_unknown_obligations
     obligation.checkers.push("unexecuted-checker".into());
     assert!(!bound.covers(0, &obligation));
 }
+
+#[test]
+fn vnext_device_contracts_require_their_own_producer_and_actual_execution_step() {
+    let evidence = CiEvidence::default();
+    let mut obligations = Vec::new();
+    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
+        let obligation = Obligation {
+            behavior: Behavior::SubmissionCompletion,
+            layer: EvidenceLayer::BackendNumerics,
+            entrypoints: vec![],
+            scope: backend_contracts::submission_scope(backend),
+            reason: "device lifecycle".into(),
+            checkers: backend_contracts::contract_groups(backend)
+                .into_iter()
+                .map(|group| group.id)
+                .collect(),
+        };
+        assert!(!evidence.covers(0, &obligation));
+        obligations.push(obligation);
+    }
+    assert_eq!(
+        required_devices(&obligations),
+        [Backend::Cpu, Backend::Metal, Backend::Cuda]
+    );
+    obligations[0].scope = submission_scope();
+    obligations[1].behavior = Behavior::KernelNumerics;
+    assert_eq!(required_devices(&obligations), [Backend::Cuda]);
+
+    let mut actual = job();
+    actual.name = device_producer(Backend::Cuda).1.into();
+    assert!(producer(
+        &origin(),
+        std::slice::from_ref(&actual),
+        std::slice::from_ref(&actual),
+        17,
+        &"a".repeat(40),
+        1,
+        device_producer(Backend::Metal).1
+    )
+    .is_err());
+    // A successful general GPU job or upload cannot replace this execution.
+    assert!(step(&actual, DEVICE_EXECUTE).is_err());
+    actual.steps[0].name = DEVICE_EXECUTE.into();
+    step(&actual, DEVICE_EXECUTE).unwrap();
+    actual.steps[0].conclusion = Some("skipped".into());
+    assert!(step(&actual, DEVICE_EXECUTE).is_err());
+}
