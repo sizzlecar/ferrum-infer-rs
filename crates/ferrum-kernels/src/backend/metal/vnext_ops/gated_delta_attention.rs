@@ -6,12 +6,15 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, gated_delta_recurrent_attention_f32_master_contract,
-    AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
-    GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    AttributeId, BatchedOperationInvocation, CheckpointBoundaryConstraint,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
+    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
+    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
     ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
     ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
@@ -255,7 +258,40 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+        let mut provider =
+            Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)?;
+        // collect+copy commits the complete F16 convolution window. Both
+        // recurrent and chunked delta paths write the complete F32 boundary
+        // matrix. All remaining workspace is overwritten within the wave.
+        let storage = DynamicStorageProfile::new(
+            DynamicStorageAllocator::LinearArena,
+            DynamicStorageView::Contiguous,
+        )
+        .map_err(super::contract_error)?;
+        let checkpoint = ProviderCheckpointContract::new(
+            CheckpointInputDependency::ExactTokenPrefix,
+            CheckpointBoundaryConstraint::any_positive(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        )
+        .with_state_ports(vec![
+            ProviderCheckpointStatePort::new(
+                ResolvedValueRole::Input,
+                8,
+                storage,
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue,
+            ),
+            ProviderCheckpointStatePort::new(
+                ResolvedValueRole::Input,
+                9,
+                storage,
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue,
+            ),
+        ])
+        .map_err(super::contract_error)?;
+        provider.descriptor = provider.descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
+        );
+        Ok(provider)
     }
 
     fn new_with_hidden_type(

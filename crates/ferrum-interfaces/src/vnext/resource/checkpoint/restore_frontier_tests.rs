@@ -6,6 +6,9 @@ use crate::vnext::{
 };
 use std::ops::Range;
 
+#[path = "checkpoint_access_tests.rs"]
+mod checkpoint_access_tests;
+
 #[test]
 fn imported_step_rejects_changed_wave_and_individual_work_before_submission() {
     let harness = prefix_harness(checkpoint_fixture::Spec::default());

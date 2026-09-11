@@ -24,6 +24,9 @@ use std::sync::Mutex;
 mod capture;
 pub(crate) use capture::*;
 
+mod maintenance;
+pub use maintenance::*;
+
 /// Compact bytes for one base resource after the plan layout has merged all
 /// aliases and validated the actual source ranges at the capture boundary.
 #[derive(Debug)]
@@ -169,17 +172,18 @@ impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
     }
 }
 
+struct EvaluatedCheckpointBacking<'a> {
+    slices: Vec<EvaluatedBackingRequest<'a>>,
+    demand: AdmissionDemand,
+    logical_bytes: u64,
+    extent_bytes: u64,
+}
+
 impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
-    /// Atomically prepares physical extents, claims the exact same logical
-    /// capacity, then commits both under the plan's lifecycle read gate.
-    /// Optional capture never grows or waits for backing in this call.
-    pub(crate) fn try_allocate_checkpoint_backing(
+    fn evaluate_checkpoint_backing(
         &self,
         request: &CheckpointBackingRequests,
-    ) -> Result<CheckpointBackingAllocationDecision<R>, VNextError> {
-        let _lifecycle = self
-            .resources
-            .read_lifecycle("allocate checkpoint backing")?;
+    ) -> Result<EvaluatedCheckpointBacking<'_>, VNextError> {
         if request.plan_hash != *self.plan_hash() {
             return Err(invalid_resource(
                 "checkpoint layout belongs to another plan",
@@ -258,6 +262,30 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )?;
+        Ok(EvaluatedCheckpointBacking {
+            slices: requested_slices,
+            demand,
+            logical_bytes,
+            extent_bytes,
+        })
+    }
+
+    /// Atomically prepares physical extents, claims the exact same logical
+    /// capacity, then commits both under the plan's lifecycle read gate.
+    /// Optional capture never grows or waits for backing in this call.
+    pub(crate) fn try_allocate_checkpoint_backing(
+        &self,
+        request: &CheckpointBackingRequests,
+    ) -> Result<CheckpointBackingAllocationDecision<R>, VNextError> {
+        let _lifecycle = self
+            .resources
+            .read_lifecycle("allocate checkpoint backing")?;
+        let EvaluatedCheckpointBacking {
+            slices: requested_slices,
+            demand,
+            logical_bytes,
+            extent_bytes,
+        } = self.evaluate_checkpoint_backing(request)?;
         // Charge all domains and the aggregate retention fee atomically before
         // preparing physical extents. Later locals drop first on rollback.
         let logical_lease = match self

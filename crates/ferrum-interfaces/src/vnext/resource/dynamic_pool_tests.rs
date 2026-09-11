@@ -17,6 +17,12 @@ use crate::vnext::{
 use serde_json::{json, Value};
 use std::error::Error;
 
+#[path = "checkpoint/maintenance_tests.rs"]
+mod checkpoint_maintenance_tests;
+
+#[path = "capacity_pressure_tests.rs"]
+mod capacity_pressure_tests;
+
 #[path = "checkpoint/tests.rs"]
 mod checkpoint_backing_tests;
 

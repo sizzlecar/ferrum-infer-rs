@@ -38,6 +38,40 @@ impl<R: DeviceRuntime> CapturedCheckpoint<R> {
     pub(crate) fn byte_plan(&self) -> &Arc<SequenceCheckpointBytePlan> {
         &self.byte_plan
     }
+
+    /// Shared by the public pre-submit access boundary and terminal install.
+    /// A native copy never supplies missing conditioning or partition evidence.
+    pub(crate) fn validate_reuse_contract(
+        &self,
+        layout: &SequenceCheckpointLayout,
+        full_input: &[u32],
+    ) -> Result<(), VNextError> {
+        let source = self.boundary();
+        let boundary = u64::try_from(source.completed_tokens())
+            .map_err(|_| invalid_completion("restore boundary exceeds u64"))?;
+        let source_start = u64::try_from(source.capture_span_start())
+            .map_err(|_| invalid_completion("capture span start exceeds u64"))?;
+        let source_length = u64::try_from(source.full_input().len())
+            .map_err(|_| invalid_completion("capture input length exceeds u64"))?;
+        let target_length = u64::try_from(full_input.len())
+            .map_err(|_| invalid_completion("restore input length exceeds u64"))?;
+        if layout.fingerprint()? != self.identity.layout_fingerprint()
+            || !layout.inputs().conditioning_inputs().is_empty()
+            || layout.providers().iter().any(|provider| {
+                provider.contract().partition_numerics()
+                    == CheckpointPartitionNumerics::SamePartitionOnly
+            })
+            || !layout.permits_capture_from(source_start, boundary, source_length)
+            || !layout.permits_suffix(boundary, target_length)
+            || (layout.input_dependency() == CheckpointInputDependency::EntireTokenInput
+                && source.full_input().as_ref() != full_input)
+        {
+            return Err(invalid_completion(
+                "restore lacks the declared input, partition, or legal boundary evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Device completion has made the copied bytes quiescent, but has not committed
@@ -102,33 +136,13 @@ impl<R: DeviceRuntime> PendingRestoreCommit<R> {
     }
 
     fn validate_reuse_contract(&self, full_input: &[u32]) -> Result<(), VNextError> {
-        let source = self.checkpoint.boundary();
-        let boundary = u64::try_from(source.completed_tokens())
-            .map_err(|_| invalid_completion("restore boundary exceeds u64"))?;
-        let source_start = u64::try_from(source.capture_span_start())
-            .map_err(|_| invalid_completion("capture span start exceeds u64"))?;
-        let source_length = u64::try_from(source.full_input().len())
-            .map_err(|_| invalid_completion("capture input length exceeds u64"))?;
-        let target_length = u64::try_from(full_input.len())
-            .map_err(|_| invalid_completion("restore input length exceeds u64"))?;
-        if self.layout.fingerprint()? != self.identity.layout_fingerprint()
-            || !self.layout.inputs().conditioning_inputs().is_empty()
-            || self.layout.providers().iter().any(|provider| {
-                provider.contract().partition_numerics()
-                    == CheckpointPartitionNumerics::SamePartitionOnly
-            })
-            || !self
-                .layout
-                .permits_capture_from(source_start, boundary, source_length)
-            || !self.layout.permits_suffix(boundary, target_length)
-            || (self.layout.input_dependency() == CheckpointInputDependency::EntireTokenInput
-                && source.full_input().as_ref() != full_input)
-        {
+        if self.layout.fingerprint()? != self.identity.layout_fingerprint() {
             return Err(invalid_completion(
-                "restore lacks the declared input, partition, or legal boundary evidence",
+                "restore layout differs from the native transfer identity",
             ));
         }
-        Ok(())
+        self.checkpoint
+            .validate_reuse_contract(&self.layout, full_input)
     }
 }
 

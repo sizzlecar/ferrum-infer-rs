@@ -3549,6 +3549,31 @@ mod tests {
 
         assert_eq!(enabled_entries, product_enabled_entries);
         assert_eq!(disabled_entries, product_disabled_entries);
+        for (entries, enabled) in [
+            (enabled_entries, true),
+            (product_enabled_entries, true),
+            (disabled_entries, false),
+            (product_disabled_entries, false),
+        ] {
+            // Explicit serve flags must reach the actual typed vNext switch,
+            // including disabling an already enabled config/environment value.
+            let config_entries = crate::config::RuntimeCliConfig {
+                prefix_cache: Some(!enabled),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let environment = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_PREFIX_CACHE",
+                if enabled { "0" } else { "1" },
+                RuntimeConfigSource::Env,
+            )]);
+            let effective = merge_runtime_config_sources(config_entries, environment, entries);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.runtime.prefix_state_cache_enabled = !enabled;
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
+            assert!(!engine.runtime.prefix_cache_enabled);
+        }
     }
 
     #[test]

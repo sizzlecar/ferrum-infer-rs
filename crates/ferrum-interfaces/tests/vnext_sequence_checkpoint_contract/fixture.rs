@@ -5,10 +5,15 @@ mod family;
 use family::Family;
 
 pub struct Spec {
+    /// Optional isolated runtime account for resource tests sharing this fixture.
+    pub device_id: Option<DeviceId>,
     pub family_id: ModelFamilyId,
     pub states: Vec<StateSpec>,
     pub declare_inputs: bool,
     pub conditioning: bool,
+    pub output_only_input: Option<ProgramValueId>,
+    pub output_only_feeds_state: bool,
+    pub output_only_unknown_operation: bool,
     pub declare_provider: bool,
     pub declare_ports: bool,
     pub numerics: CheckpointPartitionNumerics,
@@ -57,10 +62,14 @@ impl Default for Spec {
         })
         .collect();
         Self {
+            device_id: None,
             family_id: id("family.checkpoint-fixture"),
             states,
             declare_inputs: true,
             conditioning: false,
+            output_only_input: None,
+            output_only_feeds_state: false,
+            output_only_unknown_operation: false,
             declare_provider: true,
             declare_ports: true,
             numerics: CheckpointPartitionNumerics::BitwiseEquivalent,
@@ -86,7 +95,7 @@ pub struct Fixture {
     pub catalog: CapabilityCatalog,
     pub policy: ResolvedRuntimePolicy,
     _registry: OperationRuntimeRegistry<PlanningTestRuntime>,
-    pub resolution: PlanNodeResolution,
+    resolutions: Vec<PlanNodeResolution>,
     pub plan: ExecutionPlan,
 }
 
@@ -97,6 +106,9 @@ impl Fixture {
             states: spec.states.clone(),
             declare_inputs: spec.declare_inputs,
             conditioning: spec.conditioning,
+            output_only_input: spec.output_only_input.clone(),
+            output_only_feeds_state: spec.output_only_feeds_state,
+            output_only_unknown_operation: spec.output_only_unknown_operation,
         })
         .prepare_fixture(&json!({"width": 4}))?;
         let operation = operation_for(&spec)?;
@@ -107,12 +119,21 @@ impl Fixture {
             serde_json::from_value(json!({"maximum_queue_depth":8,"maximum_scheduled_tokens":4096,"sequence_fit_policy":"immediate_only","allow_defer":true,"cancellation_check_interval_steps":1})).unwrap(),
             ferrum_types::AttentionExecutionPolicy::Portable, ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay, None,
         )?;
+        let mut operations = vec![operation];
+        if spec.output_only_input.is_some() {
+            operations.push(output_operation());
+        }
         let registry = OperationRuntimeRegistry::new(
-            vec![Box::new(TestOperationContract {
-                descriptor: operation,
-                calls: Arc::new(AtomicUsize::new(0)),
-                reject_signature: false,
-            })],
+            operations
+                .into_iter()
+                .map(|descriptor| {
+                    Box::new(TestOperationContract {
+                        descriptor,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        reject_signature: false,
+                    }) as Box<dyn OperationContract>
+                })
+                .collect(),
             catalog
                 .providers()
                 .values()
@@ -136,18 +157,59 @@ impl Fixture {
             BTreeSet::new(),
             Some(id("provider.selected")),
         )?;
+        let mut resolutions = vec![resolution.clone()];
+        if let Some(input) = &spec.output_only_input {
+            resolutions.push(PlanNodeResolution::resolve(
+                &family,
+                &catalog,
+                &policy,
+                &registry.planning(),
+                id("node.output"),
+                vec![
+                    binding(
+                        "value.output",
+                        ResolvedValueRole::Input,
+                        0,
+                        ElementType::F32,
+                        TensorAccess::Read,
+                        BufferUsage::Activations,
+                        "resource.output".to_owned(),
+                    ),
+                    binding(
+                        input.as_str(),
+                        ResolvedValueRole::Input,
+                        1,
+                        ElementType::F32,
+                        TensorAccess::Read,
+                        BufferUsage::Activations,
+                        "resource.selection".to_owned(),
+                    ),
+                    binding(
+                        "value.final",
+                        ResolvedValueRole::Output,
+                        0,
+                        ElementType::F32,
+                        TensorAccess::Write,
+                        BufferUsage::Activations,
+                        "resource.final".to_owned(),
+                    ),
+                ],
+                BTreeSet::new(),
+                Some(id("provider.output")),
+            )?);
+        }
         let plan = ExecutionPlan::build(PlanBuildRequest::new(
             &family,
             &catalog,
             &policy,
-            vec![resolution.clone()],
+            resolutions.clone(),
         )?)?;
         Ok(Self {
             family,
             catalog,
             policy,
             _registry: registry,
-            resolution,
+            resolutions,
             plan,
         })
     }
@@ -174,7 +236,7 @@ impl Fixture {
             &self.family,
             &self.catalog,
             &self.policy,
-            vec![self.resolution.clone()],
+            self.resolutions.clone(),
         )
     }
 }
@@ -220,6 +282,13 @@ fn operation_for(spec: &Spec) -> Result<OperationDescriptor, VNextError> {
             AliasPolicy::NoAlias,
         ));
     }
+    if spec.output_only_input.is_some() && spec.output_only_feeds_state {
+        operation.inputs.push(tensor_contract(
+            ElementType::F32,
+            TensorAccess::Read,
+            AliasPolicy::NoAlias,
+        ));
+    }
     operation.outputs = vec![token(ElementType::F32, TensorAccess::Write)?];
     operation.resources.scratch = ResourcePresenceRequirement::Forbidden;
     operation.resources.persistent = if spec.hidden_persistent {
@@ -248,7 +317,9 @@ fn catalog_for(
             sha('f'),
             ProviderExecutionSemantics::bitwise_eager_and_replay(),
             ContractVersion::new(1, 0),
-            id("device.reference.0"),
+            spec.device_id
+                .clone()
+                .unwrap_or_else(|| id("device.reference.0")),
             BTreeSet::from([id("capability.compute")]),
             BTreeSet::from([id("weight-format.dense")]),
             BTreeSet::new(),
@@ -293,14 +364,90 @@ fn catalog_for(
     }
     let original = catalog();
     let mut device = original.device().clone();
+    if let Some(id) = &spec.device_id {
+        device.id = id.clone();
+    }
     device.total_memory_bytes = 16 << 20;
     device.dynamic_storage_profiles = profiles.into_iter().collect();
+    let mut operations = vec![operation.clone()];
+    let mut provider_map = BTreeMap::from([(operation.id.clone(), providers)]);
+    if spec.output_only_input.is_some() {
+        let output = output_operation();
+        let mut provider = OperationProviderDescriptor::new(
+            id("provider.output"),
+            output.id.clone(),
+            output.fingerprint()?,
+            sha('a'),
+            ProviderExecutionSemantics::bitwise_eager_and_replay(),
+            ContractVersion::new(1, 0),
+            spec.device_id
+                .clone()
+                .unwrap_or_else(|| id("device.reference.0")),
+            BTreeSet::from([id("capability.compute")]),
+            BTreeSet::from([id("weight-format.dense")]),
+            BTreeSet::new(),
+            storage_bindings(&output, contiguous_storage_requirement()),
+            "resource-estimator.checkpoint-output",
+            ContractVersion::new(1, 0),
+            sha('b'),
+        )?;
+        if spec.declare_provider {
+            provider = provider.with_checkpoint_capability(
+                ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+                    spec.dependency,
+                    spec.boundaries,
+                    spec.numerics,
+                )),
+            );
+        }
+        provider_map.insert(output.id.clone(), vec![provider]);
+        operations.push(output);
+    }
     CapabilityCatalog::new(
         device,
-        vec![operation.clone()],
-        BTreeMap::from([(operation.id.clone(), providers)]),
-        original.engine_providers().values().cloned().collect(),
+        operations,
+        provider_map,
+        original
+            .engine_providers()
+            .values()
+            .map(|provider| {
+                EngineProviderDescriptor::new(
+                    provider.provider_id().clone(),
+                    provider.contract_version(),
+                    provider.implementation_fingerprint(),
+                    spec.device_id
+                        .clone()
+                        .unwrap_or_else(|| provider.device_id().clone()),
+                    provider.capabilities().clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     )
+}
+
+fn output_operation() -> OperationDescriptor {
+    let mut output = operation();
+    output.id = id("operation.output");
+    output.inputs = vec![
+        TensorContract::new(
+            vec![DimensionConstraint::Symbol("tokens".to_owned())],
+            BTreeSet::from([ElementType::F32]),
+            vec![LayoutConstraint::Contiguous],
+            TensorAccess::Read,
+            AliasPolicy::NoAlias,
+        )
+        .unwrap(),
+        tensor_contract(ElementType::F32, TensorAccess::Read, AliasPolicy::NoAlias),
+    ];
+    output.outputs = vec![tensor_contract(
+        ElementType::F32,
+        TensorAccess::Write,
+        AliasPolicy::NoAlias,
+    )];
+    output.resources.scratch = ResourcePresenceRequirement::Forbidden;
+    output.resources.persistent = ResourcePresenceRequirement::Forbidden;
+    output.profile_phase = ProfilePhase::Forward;
+    output
 }
 
 fn values_for(spec: &Spec) -> Result<Vec<ResolvedValueBinding>, VNextError> {
@@ -354,6 +501,21 @@ fn values_for(spec: &Spec) -> Result<Vec<ResolvedValueBinding>, VNextError> {
             TensorAccess::Read,
             BufferUsage::Activations,
             "resource.conditioning".to_owned(),
+        ));
+    }
+    if let Some(input) = spec
+        .output_only_input
+        .as_ref()
+        .filter(|_| spec.output_only_feeds_state)
+    {
+        values.push(binding(
+            input.as_str(),
+            ResolvedValueRole::Input,
+            u32::try_from(spec.states.len() + 2 + usize::from(spec.conditioning)).unwrap(),
+            ElementType::F32,
+            TensorAccess::Read,
+            BufferUsage::Activations,
+            "resource.selection".to_owned(),
         ));
     }
     values.push(binding(

@@ -29,6 +29,9 @@ pub(crate) fn derive_sequence_checkpoint(
         Some(inputs) if !inputs.covers(program.inputs()) => reasons.push(Reason::InputCoverage),
         Some(_) => {}
     }
+    if let Some(inputs) = inputs {
+        reasons.extend(super::output_only::state_dependencies(inputs, nodes)?);
+    }
     if program.states().is_empty() {
         reasons.push(Reason::NoSequenceState);
     }

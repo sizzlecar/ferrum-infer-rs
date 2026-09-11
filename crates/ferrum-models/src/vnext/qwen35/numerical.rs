@@ -4,7 +4,8 @@
 
 use super::*;
 use ferrum_interfaces::vnext::{
-    NumericalOperationContract, NumericalProfileId, StateCheckpointCapability,
+    CheckpointInputDependency, NumericalOperationContract, NumericalProfileId,
+    StateCheckpointCapability, StateCheckpointContents, StateCheckpointContract,
 };
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
@@ -176,7 +177,14 @@ fn states(text: &Qwen35TextConfig, maximum_tokens: u64) -> Result<Vec<StateSpec>
                         lifetime: StateLifetime::Sequence,
                         capacity_demand: StateCapacityDemand::FixedPerScope,
                         initialization: StateInitialization::Zero,
-                        checkpoint: StateCheckpointCapability::Unsupported,
+                        // The convolution window and recurrent accumulator
+                        // together contain the complete state at this boundary.
+                        checkpoint: StateCheckpointCapability::CompletedBoundary(
+                            StateCheckpointContract::new(
+                                StateCheckpointContents::BoundaryValue,
+                                CheckpointInputDependency::ExactTokenPrefix,
+                            ),
+                        ),
                     });
                 }
             }
@@ -197,7 +205,14 @@ fn states(text: &Qwen35TextConfig, maximum_tokens: u64) -> Result<Vec<StateSpec>
                     },
                     // Providers write each valid KV slot before reading it.
                     initialization: StateInitialization::None,
-                    checkpoint: StateCheckpointCapability::Unsupported,
+                    // Only written token positions belong to the snapshot;
+                    // unwritten sequence capacity is not continuation state.
+                    checkpoint: StateCheckpointCapability::CompletedBoundary(
+                        StateCheckpointContract::new(
+                            StateCheckpointContents::PrefixPositions,
+                            CheckpointInputDependency::ExactTokenPrefix,
+                        ),
+                    ),
                 });
             }
         }

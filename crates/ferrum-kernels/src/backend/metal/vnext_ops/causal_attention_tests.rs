@@ -6,6 +6,9 @@ use metal::{Buffer, BufferRef, CommandQueueRef, MTLCommandBufferStatus, MTLResou
 use super::super::numerical_tolerance;
 use super::*;
 
+#[path = "causal_attention_checkpoint_tests.rs"]
+mod checkpoint;
+
 const TOKENS: usize = 2;
 const QUERY_HEADS: usize = 2;
 const KV_HEADS: usize = 1;
@@ -918,13 +921,51 @@ fn run_segment(
         epsilon: 1.0e-6,
         rope_theta: 10_000.0,
     };
+    run_segment_bits(
+        device,
+        queue,
+        pipelines,
+        inputs,
+        query_norm_values,
+        key_norm_values,
+        pages,
+        &params,
+        general_attention_dispatch_plan(&params),
+    )
+    .into_iter()
+    .map(|bits| f16::from_bits(bits).to_f32())
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_segment_bits(
+    device: &Device,
+    queue: &CommandQueueRef,
+    pipelines: &MetalCausalAttentionPipelines,
+    inputs: SegmentInputs<'_>,
+    query_norm_values: &[f16],
+    key_norm_values: &[f16],
+    pages: &[Buffer],
+    params: &CausalAttentionParams,
+    plan: AttentionDispatchPlan,
+) -> Vec<u16> {
+    let tokens = params.tokens as usize;
+    let query_features = (params.query_heads * params.head_dim) as usize;
     let query_raw = shared_buffer(device, inputs.query_raw);
     let key_raw = shared_buffer(device, inputs.key_raw);
     let value_raw = shared_buffer(device, inputs.value_raw);
     let query_norm = shared_buffer(device, query_norm_values);
     let key_norm = shared_buffer(device, key_norm_values);
-    let query = output_buffer::<f16>(device, tokens * QUERY_FEATURES);
-    let output = output_buffer::<f16>(device, tokens * QUERY_FEATURES);
+    let query = output_buffer::<f16>(device, tokens * query_features);
+    let output = output_buffer::<f16>(device, tokens * query_features);
+    let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
+        output_buffer::<f32>(
+            device,
+            GROUPED_DECODE_PARTITIONS as usize
+                * params.query_heads as usize
+                * (params.head_dim as usize + 2),
+        )
+    });
     let argument_buffer = device.new_buffer(
         pipelines.binding_slot_bytes().unwrap(),
         MTLResourceOptions::StorageModeShared,
@@ -957,32 +998,43 @@ fn run_segment(
     encoder.set_threadgroup_memory_length(0, 0);
     encoder.set_threadgroup_memory_length(1, 0);
     encoder.dispatch_thread_groups(
-        MTLSize::new(tokens as u64, (QUERY_HEADS + 2 * KV_HEADS) as u64, 1),
+        MTLSize::new(
+            tokens as u64,
+            u64::from(params.query_heads + 2 * params.key_value_heads),
+            1,
+        ),
         MTLSize::new(SIMD_THREADS, 1, 1),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.attention);
     set_raw(encoder, 0, &query);
     set_raw(encoder, 1, &query_raw);
-    set_raw(encoder, 2, &output);
+    set_raw(encoder, 2, grouped_partials.as_ref().unwrap_or(&output));
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, &params);
     use_raw_pages(encoder, pages);
-    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&params));
-    encoder.set_threadgroup_memory_length(1, 0);
-    encoder.dispatch_thread_groups(
-        MTLSize::new(tokens as u64, QUERY_HEADS as u64, 1),
-        MTLSize::new(
-            SIMD_THREADS,
-            u64::from(pipelines.attention_simdgroups_for_context((position_start + tokens) as u64)),
-            1,
-        ),
-    );
+    encode_attention_dispatch(pipelines, encoder, plan);
+    if let Some(grouped_partials) = grouped_partials.as_ref() {
+        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        set_raw(encoder, 0, grouped_partials);
+        set_raw(encoder, 1, &query_raw);
+        set_raw(encoder, 2, &output);
+        set_raw_params(encoder, 4, params);
+        encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
+        encoder.set_threadgroup_memory_length(1, 0);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.query_heads), 1, 1),
+            MTLSize::new(SIMD_THREADS, 1, 1),
+        );
+    }
     encoder.end_encoding();
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-    read_f16(&output, tokens * QUERY_FEATURES)
+    // SAFETY: the command is complete and this output allocation is shared.
+    unsafe {
+        std::slice::from_raw_parts(output.contents().cast::<u16>(), tokens * query_features)
+            .to_vec()
+    }
 }
 
 fn use_raw_pages(encoder: &ComputeCommandEncoderRef, pages: &[Buffer]) {

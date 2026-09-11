@@ -6,17 +6,18 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    last_token_dense_linear_f32_contract, BatchedOperationInvocation, DeviceBatchingForm,
+    last_token_dense_linear_f32_contract, BatchedOperationInvocation, CheckpointBoundaryConstraint,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
     DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
-    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, VNextError, WeightEncoding, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -297,7 +298,16 @@ impl MetalDenseSwiGluProvider {
             DENSE_SWIGLU_ESTIMATOR_ID,
             3,
             ALL_LINEAR_QUANTIZATION_FORMATS,
-        )?;
+        )?
+        // Gate/up and activation scratch are fully produced by this invocation.
+        // No state or previous scratch contents participate in its result.
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            ),
+        ));
         Ok(Self {
             descriptor,
             pipelines,
@@ -389,7 +399,16 @@ impl MetalLastTokenDenseLinearProvider {
         runtime: &MetalDeviceRuntime,
         pipelines: Arc<MetalLinearPipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        Self::new_with_activation_type(runtime, pipelines, ElementType::F32)
+        let mut provider = Self::new_with_activation_type(runtime, pipelines, ElementType::F32)?;
+        // The selected final row and gather/output scratch are invocation-local.
+        provider.descriptor = provider.descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )),
+        );
+        Ok(provider)
     }
 
     fn new_with_activation_type(

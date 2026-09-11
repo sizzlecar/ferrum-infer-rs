@@ -28,8 +28,9 @@ use ferrum_interfaces::model_executor::{
     MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
     PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
     PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
-    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimeResourceSnapshot, PrefillChunk,
-    PrefillInput, PrefillOutput,
+    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreInput,
+    PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput,
+    PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -60,6 +61,7 @@ use super::{
 mod composition;
 mod determinism;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
+mod prefix_cache;
 mod request;
 mod reusable_catalog;
 pub use determinism::{
@@ -732,7 +734,16 @@ impl VNextExecutorConfig {
             POLICY_VERSION,
             scheduling,
             RuntimeMemoryPolicy {
-                checkpoint_capacity: None,
+                checkpoint_capacity: engine
+                    .runtime
+                    .prefix_state_cache_enabled
+                    .then(|| {
+                        CheckpointCapacityPolicy::new(
+                            memory_budget.capacity_bytes - memory_budget.reserve_bytes,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| FerrumError::config(error.to_string()))?,
                 capacity_bytes: memory_budget.capacity_bytes,
                 reserve_bytes: memory_budget.reserve_bytes,
                 maximum_active_sequences,
@@ -1379,6 +1390,7 @@ impl VNextReusableExecutionCatalogMissLedger {
 
 #[derive(Default)]
 struct VNextExecutorMetrics {
+    prefix_cache: Arc<prefix_cache::PrefixCacheMetrics>,
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
@@ -2659,6 +2671,7 @@ impl VNextExecutorMetrics {
     }
 
     fn reset_after_startup(&self) {
+        self.prefix_cache.reset();
         for counter in [
             &self.prefill_operations,
             &self.prefill_frontier_narrowings,
@@ -4398,6 +4411,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     >,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
+    prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
@@ -4945,6 +4959,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
+            prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
@@ -6140,27 +6155,61 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             AdmissionPressureAction::WaitForRelease,
         )
         .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let sequence = match binding
-            .try_admit_initial_sequence(request, sequence, self.run_id.clone(), request_id)
-            .map_err(|error| FerrumError::backend(error.to_string()))?
-        {
-            InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
-            InitialSequenceResourceAdmissionDecision::Deferred(deferred) => {
-                self.metrics
-                    .sequence_deferrals
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(VNextSequenceAdmissionDecision::Deferred(deferred));
-            }
-            InitialSequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
-                self.metrics
-                    .backing_deferrals
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
-                    VNextPrefillBackingDeferral::InitialSequence(deferred),
-                ));
-            }
-            InitialSequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
-                return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
+        let mut prefix_maintenance = self.prefix_pressure_maintenance();
+        let mut prefix_backing_attempts = 0;
+        let sequence = loop {
+            match binding
+                .try_admit_initial_sequence(
+                    request.clone(),
+                    sequence.clone(),
+                    self.run_id.clone(),
+                    request_id.clone(),
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))?
+            {
+                InitialSequenceResourceAdmissionDecision::Admitted(sequence) => break sequence,
+                InitialSequenceResourceAdmissionDecision::Deferred(deferred) => {
+                    match self.recover_prefix_pressure(&mut prefix_maintenance, &deferred)? {
+                        prefix_cache::PrefixPressureRecovery::Maintained(_)
+                        | prefix_cache::PrefixPressureRecovery::Evicted => continue,
+                        prefix_cache::PrefixPressureRecovery::Unchanged => {}
+                    }
+                    self.metrics
+                        .sequence_deferrals
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(VNextSequenceAdmissionDecision::Deferred(deferred));
+                }
+                InitialSequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
+                    if prefix_maintenance.allows_backing_attempt(prefix_backing_attempts)
+                        && self.prefix_checkpoint_may_block(deferred.evidence().wait_condition())
+                    {
+                        prefix_backing_attempts += 1;
+                        match deferred
+                            .maintain()
+                            .map_err(|error| FerrumError::backend(error.to_string()))?
+                        {
+                            DynamicDeferredMaintenanceOutcome::Maintained(_)
+                            | DynamicDeferredMaintenanceOutcome::RetryAdmission { .. } => continue,
+                            DynamicDeferredMaintenanceOutcome::WaitForRelease {
+                                wait_condition,
+                                ..
+                            } => {
+                                if prefix_maintenance.eviction_after_wait(self, &wait_condition) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    self.metrics
+                        .backing_deferrals
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
+                        VNextPrefillBackingDeferral::InitialSequence(deferred),
+                    ));
+                }
+                InitialSequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
+                    return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
+                }
             }
         };
         let session = sequence
@@ -6194,6 +6243,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         source: VNextExecutionMaintenanceSource<'_>,
         participants: impl IntoIterator<Item = &'a VNextSequence<R>>,
         progress_receipts: &mut Vec<DynamicPoolGrowthBatchReceipt>,
+        prefix_maintenance: &mut prefix_cache::PrefixPressureMaintenance,
     ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
         match outcome {
             DynamicDeferredMaintenanceOutcome::RetryAdmission { .. } => Ok(None),
@@ -6241,29 +6291,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 wait_condition,
                 pressure,
                 maintenance_boundary,
-            } => match source {
-                VNextExecutionMaintenanceSource::Logical(source) => {
-                    ExecutorExecutionCapacityDeferral::from_admission_maintenance(
-                        source,
-                        ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                        wait_condition,
-                        pressure,
-                        maintenance_boundary,
-                        stage,
-                    )
+            } => {
+                if prefix_maintenance.eviction_after_wait(self, &wait_condition) {
+                    return Ok(None);
                 }
-                VNextExecutionMaintenanceSource::Backing(source) => {
-                    ExecutorExecutionCapacityDeferral::from_backing_maintenance(
-                        source,
-                        ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                        wait_condition,
-                        pressure,
-                        maintenance_boundary,
-                        stage,
-                    )
+                match source {
+                    VNextExecutionMaintenanceSource::Logical(source) => {
+                        ExecutorExecutionCapacityDeferral::from_admission_maintenance(
+                            source,
+                            ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                            wait_condition,
+                            pressure,
+                            maintenance_boundary,
+                            stage,
+                        )
+                    }
+                    VNextExecutionMaintenanceSource::Backing(source) => {
+                        ExecutorExecutionCapacityDeferral::from_backing_maintenance(
+                            source,
+                            ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                            wait_condition,
+                            pressure,
+                            maintenance_boundary,
+                            stage,
+                        )
+                    }
                 }
+                .map(Some)
             }
-            .map(Some),
         }
     }
 
@@ -6317,6 +6372,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &VNextSequence<R>,
         target: ResourceWorkShape,
     ) -> Result<VNextExecutionCapacityDecision<()>> {
+        let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
         let mut rechecks = 0;
@@ -6350,6 +6406,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::thread::yield_now();
                 }
                 SequenceResourceExtensionDecision::Deferred(deferred) => {
+                    match self.recover_prefix_pressure(&mut prefix_maintenance, &deferred)? {
+                        prefix_cache::PrefixPressureRecovery::Maintained(receipt) => {
+                            if !receipt.growths().is_empty() {
+                                let _ = self.execution_maintenance_decision(
+                                    ExecutorExecutionCapacityStage::SequenceExtension,
+                                    DynamicDeferredMaintenanceOutcome::Maintained(receipt),
+                                    VNextExecutionMaintenanceSource::Logical(&deferred),
+                                    std::iter::once(sequence),
+                                    &mut maintenance_receipts,
+                                    &mut prefix_maintenance,
+                                )?;
+                            }
+                            continue;
+                        }
+                        prefix_cache::PrefixPressureRecovery::Evicted => continue,
+                        prefix_cache::PrefixPressureRecovery::Unchanged => {}
+                    }
                     self.metrics
                         .extension_deferrals
                         .fetch_add(1, Ordering::Relaxed);
@@ -6363,7 +6436,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("sequence extension", &deferred));
                     }
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6388,6 +6461,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Logical(&deferred),
                         std::iter::once(sequence),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -6396,7 +6470,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SequenceExtension,
@@ -6420,6 +6494,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         std::iter::once(sequence),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -6592,6 +6667,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext step maintenance participants differ from the canonical batch",
             ));
         }
+        let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
         loop {
@@ -6611,7 +6687,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("step admission", &deferred));
                     }
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -6639,6 +6715,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -6647,7 +6724,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::StepAdmission,
@@ -6674,6 +6751,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -6790,6 +6868,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let _phase_timing = phase_timing
             .resource_submission_wave_prepare
             .start_if(timing_enabled);
+        let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0;
         let mut maintenance_receipts = Vec::new();
         loop {
@@ -6810,7 +6889,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("submission wave", &deferred));
                     }
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -6838,6 +6917,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -6846,7 +6926,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferral = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -6873,6 +6953,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -7547,12 +7628,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn checkpoint_token_evidence_enabled(&self) -> bool {
-        let plan = self.resolved_plan.execution_plan();
-        plan.payload().memory().checkpoint_capacity().is_some()
-            && matches!(
-                plan.sequence_checkpoint_capability(),
-                SequenceCheckpointCapability::Enabled(_)
-            )
+        self.prefix_restore_enabled()
     }
 
     fn retain_checkpoint_token_evidence(
@@ -7560,14 +7636,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         tokens: &[u32],
     ) -> Result<TokenSpanWork> {
-        if self.checkpoint_token_evidence_enabled() {
-            // Preserve the admitted range, fit ceiling and full-input hash;
-            // with_checkpoint_tokens revalidates all three against real input.
-            span.with_checkpoint_tokens(Arc::from(tokens))
-                .map_err(|error| FerrumError::backend(error.to_string()))
-        } else {
-            Ok(span)
-        }
+        prefix_cache::retain_token_evidence(self.resolved_plan.execution_plan(), span, tokens)
     }
 
     async fn execute_step(
@@ -8911,6 +8980,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             FerrumError::internal("vNext single prefill execution returned no logits")
         })?;
         let logits = logits.into_full_logits()?;
+        self.retain_prefill_boundary(&sequence, &tokens, completed_chunk)
+            .await?;
         let cache = self.cache_handle(&sequence, completed_chunk.end());
         let output = if completed_chunk.is_final() {
             PlanRuntimePrefillOutput::final_logits(
@@ -9236,6 +9307,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 logits.len(),
                 candidates.len()
             )));
+        }
+
+        // Every participating FullPlan has retired. Optional copying here
+        // cannot turn a zero-submission capacity outcome into hidden work.
+        for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
+            self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
+                .await?;
         }
 
         let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
@@ -9577,6 +9655,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let fields = snapshot
             .as_object_mut()
             .expect("vNext executor snapshot is an object");
+        // Cache health consumes these top-level fields. Always publish native
+        // values, including disabled/zero, so text-LCP fallback cannot stand in
+        // for sequence checkpoint reuse on this executor.
+        fields.extend(self.prefix_cache_metrics_snapshot());
         fields.insert(
             "attention_execution_policy".to_owned(),
             serde_json::json!(self.policy.attention_execution()),
@@ -9591,6 +9673,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn supports_plan_runtime_prefix_restore(&self) -> bool {
+        self.prefix_restore_enabled()
+    }
+
+    async fn try_restore_plan_runtime_prefix(
+        &self,
+        input: PlanRuntimePrefixRestoreInput<'_>,
+    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+        self.restore_prefix(input).await
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }
@@ -9906,11 +9999,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 wait_condition,
                 pressure,
                 maintenance_boundary: _,
-            } => Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
-                current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                wait_condition,
-                pressure,
-            }),
+            } => {
+                if self.evict_prefix_for_wait(&wait_condition) {
+                    return Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
+                        current: self.current_execution_capacity_epochs()?,
+                    });
+                }
+                Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                    current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                    wait_condition,
+                    pressure,
+                })
+            }
             DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {
                 let allocated_bytes = receipt
                     .growths()

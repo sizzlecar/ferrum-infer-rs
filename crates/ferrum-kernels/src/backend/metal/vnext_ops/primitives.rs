@@ -7,13 +7,14 @@ use ferrum_interfaces::vnext::{
     last_token_masked_argmax_contract, last_token_masked_argmax_f32_contract,
     residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, token_embedding_f32_master_contract,
-    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
+    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointInputDependency,
+    CheckpointPartitionNumerics, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
     EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
     OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
+    PhysicalWeightPadding, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
     LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
@@ -429,6 +430,7 @@ macro_rules! no_workspace_primitive_provider {
         $bindings:expr,
         $physical_formats:expr,
         $quantization_formats:expr,
+        $checkpoint:expr,
         $encode:ident,
         $failure_stage:literal
     ) => {
@@ -457,7 +459,8 @@ macro_rules! no_workspace_primitive_provider {
                         SHADER_SOURCE.as_bytes(),
                         $provider_id.as_bytes(),
                     ]),
-                )?;
+                )?
+                .with_checkpoint_capability($checkpoint);
                 Ok(Self {
                     descriptor,
                     pipelines,
@@ -511,6 +514,11 @@ no_workspace_primitive_provider!(
     2,
     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
     TOKEN_EMBEDDING_QUANTIZATION_FORMATS,
+    ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointBoundaryConstraint::any_positive(),
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    )),
     encode_token_embedding_f32_master,
     "metal.token_embedding_f32_master.encode"
 );
@@ -524,6 +532,11 @@ no_workspace_primitive_provider!(
     2,
     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
     &[],
+    ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointBoundaryConstraint::any_positive(),
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    )),
     encode_rms_norm_f32_to_f16,
     "metal.rms_norm_f32_to_f16.encode"
 );
@@ -537,6 +550,11 @@ no_workspace_primitive_provider!(
     2,
     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
     &[],
+    ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointBoundaryConstraint::any_positive(),
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    )),
     encode_rms_norm_f32,
     "metal.rms_norm_f32.encode"
 );
@@ -550,6 +568,11 @@ no_workspace_primitive_provider!(
     2,
     &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
     &[],
+    ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointBoundaryConstraint::any_positive(),
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    )),
     encode_residual_add_f32_f16,
     "metal.residual_add_f32_f16.encode"
 );
@@ -579,7 +602,17 @@ impl MetalLastTokenMaskedArgmaxF32Provider {
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID.as_bytes(),
             ]),
-        )?;
+        )?
+        // The output-policy inputs affect only this output, not retained state.
+        // Scratch is invocation-scoped and copied from logits before use;
+        // unique repetition IDs are required by the owning operation contract.
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            ),
+        ));
         Ok(Self {
             descriptor,
             pipelines,

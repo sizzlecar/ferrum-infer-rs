@@ -31,6 +31,8 @@ mod completed_wave;
 pub(crate) use completed_wave::SuccessfulWaveCompletionSeal;
 mod state_transfer;
 pub(crate) use state_transfer::*;
+mod checkpoint_access;
+pub use checkpoint_access::*;
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {

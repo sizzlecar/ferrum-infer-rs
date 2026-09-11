@@ -230,6 +230,14 @@ pub(crate) struct StateTransferHandle<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> StateTransferHandle<R> {
+    /// Only this exact result slot is abandoned. A consumed slot has already
+    /// released the outbox and needs no further cleanup. No device wait occurs.
+    pub(in crate::vnext::completion) fn abandon_consumer(&self) {
+        if let Some(outbox) = self.outbox.upgrade() {
+            outbox.abandon_consumer();
+        }
+    }
+
     pub(crate) fn slot_id(&self) -> CompletionSlotId {
         self.slot_id
     }
@@ -475,14 +483,62 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         &self,
         slot_id: CompletionSlotId,
     ) -> Result<Option<StateTransferObservation>, VNextError> {
-        let record = self.lookup(slot_id)?;
+        self.sweep_state_transfer_slot(slot_id, StateTransferSweepMode::Poll)
+    }
+
+    pub(in crate::vnext::completion) fn recover_abandoned_state_transfer_slot(
+        &self,
+        slot_id: CompletionSlotId,
+    ) -> Result<Option<StateTransferObservation>, VNextError> {
+        self.sweep_state_transfer_slot(slot_id, StateTransferSweepMode::RecoverAbandoned)
+    }
+
+    fn sweep_state_transfer_slot(
+        &self,
+        slot_id: CompletionSlotId,
+        mode: StateTransferSweepMode,
+    ) -> Result<Option<StateTransferObservation>, VNextError> {
+        // A consumer or another sweep may have taken this bounded-snapshot
+        // entry already. It is not an outstanding owner in that case.
+        let record = self
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("completion reaper state mutex is poisoned"))?
+            .slots
+            .get(&slot_id)
+            .cloned();
+        let Some(record) = record else {
+            return Ok(None);
+        };
         let mut guard = record
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
-        match &mut *guard {
-            CompletionRecord::StateTransfer(transfer) => transfer.observe(false).map(Some),
-            _ => Ok(None),
+        let CompletionRecord::StateTransfer(transfer) = &mut *guard else {
+            return Ok(None);
+        };
+        let observation = match mode {
+            StateTransferSweepMode::Poll => transfer.observe(false)?,
+            StateTransferSweepMode::RecoverAbandoned => {
+                if !transfer.outbox.consumer_abandoned() {
+                    return Ok(None);
+                }
+                match transfer.observe(true)? {
+                    StateTransferObservation::Indeterminate
+                    | StateTransferObservation::Quarantined => transfer.recover()?,
+                    observation => observation,
+                }
+            }
+        };
+        if observation == StateTransferObservation::Ready && transfer.outbox.consumer_abandoned() {
+            // A terminal fence or successful drain has settled native writes.
+            // Move the whole record out so dropping a restore result (which
+            // cancels its target) never runs under either registry lock.
+            let settled = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
+            drop(guard);
+            self.remove_exact(slot_id, &record);
+            drop(settled);
         }
+        Ok(Some(observation))
     }
 
     pub(crate) fn take_completed_state_transfer(
@@ -535,4 +591,10 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         }
         Ok(result)
     }
+}
+
+#[derive(Clone, Copy)]
+enum StateTransferSweepMode {
+    Poll,
+    RecoverAbandoned,
 }

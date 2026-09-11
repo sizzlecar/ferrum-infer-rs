@@ -624,6 +624,7 @@ impl EngineInner {
                 .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total")
                 .increment(chunk.tokens_to_process() as u64);
+            self.trace_plan_runtime_prefill_completion(request_id, chunk);
             return Ok(());
         }
 
@@ -690,6 +691,7 @@ impl EngineInner {
             .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
         counter!("ferrum.engine.prefill_tokens_total").increment(chunk.tokens_to_process() as u64);
         counter!("ferrum.engine.prefills_total").increment(1);
+        self.trace_plan_runtime_prefill_completion(request_id, chunk);
 
         let stop_reason = self.stop_reason_for_request(request_id);
         if self.should_stream_generated_token(request_id, first_token, stop_reason) {
@@ -699,6 +701,43 @@ impl EngineInner {
             self.complete_request(request_id, reason).await?;
         }
         Ok(())
+    }
+
+    fn trace_plan_runtime_prefill_completion(
+        &self,
+        request_id: &RequestId,
+        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+    ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
+        // Emit only after the executor result and both outer progress owners
+        // have committed. Imported tokens are recorded by prefix_restore;
+        // these ranges account exclusively for work actually executed here.
+        self.write_executor_scheduler_profile_event(
+            request_id,
+            "vnext.prefill_chunk_completed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "start_token".to_owned(),
+                    serde_json::json!(chunk.tokens_processed()),
+                ),
+                ("end_token".to_owned(), serde_json::json!(chunk.end())),
+                (
+                    "computed_tokens".to_owned(),
+                    serde_json::json!(chunk.tokens_to_process()),
+                ),
+                (
+                    "prompt_tokens".to_owned(),
+                    serde_json::json!(chunk.total_prompt_tokens()),
+                ),
+            ]),
+            BTreeMap::new(),
+            None,
+        );
     }
 
     fn discard_plan_runtime_prefill_completion(

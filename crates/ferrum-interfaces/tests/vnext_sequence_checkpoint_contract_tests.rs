@@ -5,6 +5,91 @@ mod fixture;
 use fixture::{Fixture, Spec};
 
 #[test]
+fn checkpoint_output_only_inputs_require_real_state_independence() {
+    for input in ["value.selection", "value.renamed"] {
+        let safe = Fixture::build(Spec {
+            output_only_input: Some(id(input)),
+            ..Spec::default()
+        })
+        .unwrap();
+        assert_eq!(
+            safe.layout().inputs().output_only_inputs(),
+            &BTreeSet::from([id(input)])
+        );
+        assert_eq!(
+            safe.revalidate(&safe.plan.to_json().unwrap()).unwrap(),
+            safe.plan
+        );
+        // The same family/node/operation/value names now have an actual extra
+        // edge from this input into the state-writing operation.
+        let unsafe_plan = Fixture::build(Spec {
+            output_only_input: Some(id(input)),
+            output_only_feeds_state: true,
+            ..Spec::default()
+        })
+        .unwrap();
+        assert!(unsafe_plan.reasons().iter().any(|reason| matches!(reason,
+            SequenceCheckpointUnsupportedReason::OutputOnlyInputAffectsState { value_id, node_id, .. }
+                if value_id == &id(input) && node_id == &id("node.main"))));
+        assert!(unsafe_plan.plan.checkpoint_byte_plan(2).is_err());
+    }
+}
+
+#[test]
+fn checkpoint_output_only_roles_do_not_relax_conditioning_or_unknown_operations() {
+    let fixture = Fixture::build(Spec {
+        output_only_input: Some(id("value.selection")),
+        conditioning: true,
+        ..Spec::default()
+    })
+    .unwrap();
+    assert!(fixture
+        .layout()
+        .bind_inputs(&id("value.input"), &[1, 2, 3], &BTreeMap::new())
+        .is_err());
+    let content = |byte| {
+        BTreeMap::from([(
+            id("value.conditioning"),
+            CheckpointCanonicalInput::new(resolved_tensor(ElementType::F32), vec![byte; 16])
+                .unwrap(),
+        )])
+    };
+    let source = fixture
+        .layout()
+        .bind_inputs(&id("value.input"), &[1, 2, 3], &content(0))
+        .unwrap();
+    let equal = fixture
+        .layout()
+        .bind_inputs(&id("value.input"), &[1, 2, 4], &content(0))
+        .unwrap();
+    let changed = fixture
+        .layout()
+        .bind_inputs(&id("value.input"), &[1, 2, 3], &content(1))
+        .unwrap();
+    assert!(source.matches_at(&equal, 2));
+    assert!(!source.matches_at(&changed, 2));
+    let unknown = Fixture::build(Spec {
+        output_only_input: Some(id("value.selection")),
+        output_only_unknown_operation: true,
+        ..Spec::default()
+    })
+    .err()
+    .expect("unknown operation must not establish input independence");
+    assert!(
+        matches!(unknown, VNextError::UnsupportedOperation { operation_id, .. }
+        if operation_id == "operation.unknown")
+    );
+    let undeclared = Fixture::build(Spec {
+        output_only_input: Some(id("value.selection")),
+        declare_provider: false,
+        ..Spec::default()
+    })
+    .unwrap();
+    assert!(undeclared.reasons().iter().any(|reason| matches!(reason,
+        SequenceCheckpointUnsupportedReason::ProviderUndeclared { node_id, .. } if node_id == &id("node.output"))));
+}
+
+#[test]
 fn checkpoint_layout_is_derived_by_real_plan_build_for_distinct_families() {
     for family_id in ["family.checkpoint-first", "family.checkpoint-second"] {
         let fixture = Fixture::build(Spec {

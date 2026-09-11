@@ -7,6 +7,9 @@ use metal::{BufferRef, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptio
 use super::super::numerical_tolerance;
 use super::*;
 
+#[path = "gated_delta_attention_checkpoint_tests.rs"]
+mod checkpoint;
+
 const TOKENS: usize = 4;
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
@@ -872,6 +875,32 @@ fn run_segment(
     delta_state: &BufferRef,
     semantics: TestSemantics,
 ) -> Vec<f32> {
+    run_segment_bits(
+        device,
+        queue,
+        pipelines,
+        inputs,
+        weights,
+        conv_state,
+        delta_state,
+        semantics,
+    )
+    .into_iter()
+    .map(|bits| f16::from_bits(bits).to_f32())
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_segment_bits(
+    device: &Device,
+    queue: &CommandQueueRef,
+    pipelines: &MetalGatedDeltaPipelines,
+    inputs: SegmentInputs<'_>,
+    weights: &StaticWeights<'_>,
+    conv_state: &BufferRef,
+    delta_state: &BufferRef,
+    semantics: TestSemantics,
+) -> Vec<u16> {
     let tokens = inputs.mixed_qkv.len() / QKV_FEATURES;
     let params = test_params(tokens, semantics);
     let mut packed_qkvzba = Vec::with_capacity(tokens * (QKVZ_FEATURES + BA_FEATURES));
@@ -1005,7 +1034,11 @@ fn run_segment(
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-    read_f16(&output, tokens * VALUE_FEATURES)
+    // SAFETY: the command is complete and this output allocation is shared.
+    unsafe {
+        std::slice::from_raw_parts(output.contents().cast::<u16>(), tokens * VALUE_FEATURES)
+            .to_vec()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

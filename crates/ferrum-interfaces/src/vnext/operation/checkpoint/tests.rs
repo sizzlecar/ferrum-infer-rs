@@ -130,6 +130,7 @@ fn device_replay_does_not_implicitly_authorize_checkpoint_restore() {
     );
 
     for numerics in [
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
         CheckpointPartitionNumerics::SamePartitionOnly,
         CheckpointPartitionNumerics::BitwiseEquivalent,
         CheckpointPartitionNumerics::OperationOracle,

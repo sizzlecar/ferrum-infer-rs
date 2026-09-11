@@ -11,6 +11,16 @@ pub(in super::super) struct RestoreHarness {
 
 impl RestoreHarness {
     pub(in super::super) fn new(spec: checkpoint_fixture::Spec) -> Self {
+        Self::with_initial_sequences(spec, None)
+    }
+
+    /// `Some(n)` materializes just the normal runnable state for n sequences.
+    /// It deliberately leaves checkpoint growth to the product maintenance API.
+    pub(in super::super) fn with_initial_sequences(
+        spec: checkpoint_fixture::Spec,
+        initial_sequences: Option<u32>,
+    ) -> Self {
+        assert!(initial_sequences.is_none_or(|n| n > 0));
         let fixture = checkpoint_fixture::Fixture::build(spec).unwrap();
         let descriptor = fixture.catalog.device().clone();
         let mut runtime = TestRuntime::new(
@@ -51,7 +61,16 @@ impl RestoreHarness {
         };
         for pool in fixture.plan.payload().memory().dynamic_pools() {
             root.maintenance_controller
-                .grow_pool(pool.pool_id(), pool.provisioning().maximum_resident_bytes())
+                .grow_pool(
+                    pool.pool_id(),
+                    initial_sequences.map_or_else(
+                        || pool.provisioning().maximum_resident_bytes(),
+                        |count| {
+                            pool.provisioning().minimum_resident_bytes()
+                                + pool.minimum_sequence_bytes() * u64::from(count - 1)
+                        },
+                    ),
+                )
                 .unwrap();
         }
         let session = admitted_sequence_with_ceiling(&root, "restore-target", 16)

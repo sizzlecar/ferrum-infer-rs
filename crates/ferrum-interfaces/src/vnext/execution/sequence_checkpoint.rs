@@ -15,6 +15,7 @@ use crate::vnext::{
 };
 
 mod derive;
+mod output_only;
 pub(super) use derive::derive_sequence_checkpoint;
 mod ranges;
 pub use ranges::{
@@ -30,6 +31,11 @@ pub const SEQUENCE_CHECKPOINT_LAYOUT_VERSION: ContractVersion = ContractVersion:
 pub enum SequenceCheckpointUnsupportedReason {
     InputsUndeclared,
     InputCoverage,
+    OutputOnlyInputAffectsState {
+        value_id: ProgramValueId,
+        node_id: NodeId,
+        state_id: StateId,
+    },
     MissingInput {
         value_id: ProgramValueId,
     },

@@ -1,5 +1,6 @@
 use super::{invalid_completion, StateTransferIdentity, StateTransferResult};
 use crate::vnext::{CompletionSlotId, DeviceRuntime, VNextError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub(crate) struct StateTransferResultSlot<R: DeviceRuntime> {
     slot_id: CompletionSlotId,
     identity: Arc<StateTransferIdentity>,
     state: Mutex<ResultState<R>>,
+    consumer_abandoned: AtomicBool,
 }
 
 /// Rejected publication returns its owner after unlocking. In particular, a
@@ -40,7 +42,19 @@ impl<R: DeviceRuntime> StateTransferResultSlot<R> {
             slot_id,
             identity,
             state: Mutex::new(ResultState::Pending),
+            consumer_abandoned: AtomicBool::new(false),
         })
+    }
+
+    /// A public access handle can disappear while another observer holds the
+    /// record lock in a fence wait. Mark abandonment without waiting on that
+    /// lock; the existing reaper remains the sole native resource owner.
+    pub(in crate::vnext::completion) fn abandon_consumer(&self) {
+        self.consumer_abandoned.store(true, Ordering::Release);
+    }
+
+    pub(in crate::vnext::completion) fn consumer_abandoned(&self) -> bool {
+        self.consumer_abandoned.load(Ordering::Acquire)
     }
 
     pub(crate) fn slot_id(&self) -> CompletionSlotId {

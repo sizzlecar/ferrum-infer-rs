@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
-    BatchedOperationInvocation, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
+    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointInputDependency,
+    CheckpointPartitionNumerics, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
+    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
@@ -285,7 +287,35 @@ impl MetalCausalPagedAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+        let mut provider =
+            Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)?;
+        // prepare writes [position_start, position_start + tokens) in the
+        // token-major [2, kv_heads, head_dim] F16 state. Attention reads only
+        // the causal prefix. Scratch and the page table are rebuilt per wave.
+        let checkpoint = ProviderCheckpointContract::new(
+            CheckpointInputDependency::ExactTokenPrefix,
+            CheckpointBoundaryConstraint::any_positive(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        )
+        .with_state_ports(vec![ProviderCheckpointStatePort::new(
+            ResolvedValueRole::Input,
+            8,
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::FixedBlockArena {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+                DynamicStorageView::PagedRegions {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+            )
+            .map_err(contract_error)?,
+            ProviderCheckpointStateLayout::TokenMajorPrefix,
+        )])
+        .map_err(contract_error)?;
+        provider.descriptor = provider.descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
+        );
+        Ok(provider)
     }
 
     fn new_with_hidden_type(

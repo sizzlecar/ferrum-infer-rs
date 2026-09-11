@@ -159,12 +159,21 @@ impl CheckpointBoundaryConstraint {
     }
 }
 
-/// Additional numerical promise when execution partitioning changes. Every
-/// supported checkpoint contract already requires bitwise continuation for
-/// identical partitioning, inputs, initialized state, and runtime identity.
+/// Numerical reference for checkpoint continuation and any stronger promise
+/// about repartitioning. Every supported contract requires bitwise continuation
+/// from identical complete state with identical suffix inputs, execution
+/// partitions, implementation choices, and numerical/runtime identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointPartitionNumerics {
+    /// Adopt the complete boundary state of an authenticated successful source
+    /// execution. Restoring all of that state preserves subsequent outputs and
+    /// state effects under the identical-suffix conditions above. No uncaptured
+    /// execution history may affect continuation. This does not promise that
+    /// recomputing the prefix with other partitions produces identical state.
+    /// The actual capture and native restore identities bind the adopted state;
+    /// a caller-supplied expected history is neither needed nor sufficient.
+    CapturedExecutionContinuation,
     /// Reuse needs identical execution partitions, also in the matching identity.
     SamePartitionOnly,
     /// Legal repartitioning preserves all outputs and persistent state effects.

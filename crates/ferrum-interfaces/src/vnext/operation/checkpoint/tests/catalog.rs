@@ -83,6 +83,9 @@ fn catalog_identity_includes_explicit_checkpoint_semantics_and_numerics() {
     let bitwise = catalog(supported(CheckpointPartitionNumerics::BitwiseEquivalent));
     let oracle = catalog(supported(CheckpointPartitionNumerics::OperationOracle));
     let same_partition = catalog(supported(CheckpointPartitionNumerics::SamePartitionOnly));
+    let captured = catalog(supported(
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    ));
     let conditioned = catalog(ProviderCheckpointCapability::CompletedBoundary(
         ProviderCheckpointContract::new(
             CheckpointInputDependency::EntireTokenInput,
@@ -113,6 +116,12 @@ fn catalog_identity_includes_explicit_checkpoint_semantics_and_numerics() {
         same_partition.fingerprint().unwrap(),
         bitwise.fingerprint().unwrap()
     );
+    for other in [&unsupported, &bitwise, &oracle, &same_partition] {
+        assert_ne!(
+            captured.fingerprint().unwrap(),
+            other.fingerprint().unwrap()
+        );
+    }
     assert_ne!(
         conditioned.fingerprint().unwrap(),
         bitwise.fingerprint().unwrap()

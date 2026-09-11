@@ -1540,6 +1540,12 @@ pub(super) enum DynamicPoolGrowthIntent {
     Additional(DynamicPoolGrowthRequest),
     Minimum(DynamicBackingPoolId),
     RevalidatedDeferral(DynamicBackingBlocker),
+    /// Logical admission has not acquired this demand. Recheck both ledgers
+    /// under the pool maintenance authority before deciding any growth.
+    RevalidatedAdmissionPressure {
+        pool_id: DynamicBackingPoolId,
+        required_free_bytes: u64,
+    },
 }
 
 impl DynamicPoolGrowthIntent {
@@ -1548,6 +1554,7 @@ impl DynamicPoolGrowthIntent {
             Self::Additional(request) => request.pool_id(),
             Self::Minimum(pool_id) => pool_id,
             Self::RevalidatedDeferral(blocker) => blocker.pool_id(),
+            Self::RevalidatedAdmissionPressure { pool_id, .. } => pool_id,
         }
     }
 }

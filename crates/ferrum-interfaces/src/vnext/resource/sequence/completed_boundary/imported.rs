@@ -2,6 +2,16 @@ use super::*;
 use crate::vnext::SuccessfulRestoreFrontierSeal;
 
 impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
+    /// Checks the target's own immutable admission before submitting a copy.
+    /// This does not install a frontier or release the reservation.
+    pub(crate) fn validate_restore_input(&self, full_input: Arc<[u32]>) -> Result<(), VNextError> {
+        self.ensure_fresh_restore_target()?;
+        self.session()
+            .resources()
+            .admitted_work
+            .validate_single_checkpoint_input(full_input)
+    }
+
     pub(crate) fn install_imported_frontier(
         &self,
         seal: &SuccessfulRestoreFrontierSeal,

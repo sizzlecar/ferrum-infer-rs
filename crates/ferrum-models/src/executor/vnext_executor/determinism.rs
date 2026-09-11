@@ -321,6 +321,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut prefix_maintenance = self.prefix_pressure_maintenance();
         let mut backing_attempts = 0_u32;
         let mut maintenance_receipts = Vec::new();
         loop {
@@ -333,7 +334,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if deferred.action() != DeferredAction::AwaitBackingGrowth {
                         return Err(Self::deferred("determinism submission wave", &deferred));
                     }
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferred = ExecutorExecutionCapacityDeferral::from_pending_maintenance(
                             &deferred,
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -351,12 +352,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
                 }
                 StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => {
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                    if !prefix_maintenance.allows_backing_attempt(backing_attempts) {
                         let deferred = ExecutorExecutionCapacityDeferral::from_backing(
                             deferred.evidence(),
                             ExecutorExecutionCapacityStage::SubmissionWave,
@@ -373,6 +375,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
+                        &mut prefix_maintenance,
                     )? {
                         return Err(Self::execution_capacity_error(&deferred));
                     }
