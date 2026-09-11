@@ -1019,7 +1019,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         self.inner.release_cache(cache_id);
     }
 
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.inner.release_cache(completion.cache_id());
         self.completions
             .lock()

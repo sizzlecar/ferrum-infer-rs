@@ -31,6 +31,7 @@ pub struct SequenceCheckpointInputIdentity {
     tokens: Vec<u32>,
     conditioning: BTreeMap<ProgramValueId, CheckpointCanonicalInput>,
     requires_entire_input: bool,
+    completed_input_capture: CheckpointCompletedInputCapture,
 }
 
 impl SequenceCheckpointInputIdentity {
@@ -44,7 +45,9 @@ impl SequenceCheckpointInputIdentity {
     pub fn matches_at(&self, target: &Self, boundary: usize) -> bool {
         boundary > 0
             && boundary < target.tokens.len()
-            && boundary < self.tokens.len()
+            && (boundary < self.tokens.len()
+                || (boundary == self.tokens.len()
+                    && self.completed_input_capture == CheckpointCompletedInputCapture::Supported))
             && self.layout_fingerprint == target.layout_fingerprint
             && self.token_input == target.token_input
             && self.conditioning == target.conditioning
@@ -96,6 +99,7 @@ impl SequenceCheckpointLayout {
             conditioning: conditioning.clone(),
             requires_entire_input: self.input_dependency()
                 == CheckpointInputDependency::EntireTokenInput,
+            completed_input_capture: self.completed_input_capture(),
         })
     }
 }

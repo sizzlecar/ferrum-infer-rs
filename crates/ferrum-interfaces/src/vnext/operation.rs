@@ -36,9 +36,10 @@ pub use catalog::{
     MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
 };
 pub use checkpoint::{
-    CheckpointBoundaryConstraint, CheckpointPartitionNumerics, CheckpointTokenSpanConstraint,
-    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderCheckpointStateLayout,
-    ProviderCheckpointStatePort, PROVIDER_CHECKPOINT_CONTRACT_VERSION,
+    CheckpointBoundaryConstraint, CheckpointCompletedInputCapture, CheckpointPartitionNumerics,
+    CheckpointTokenSpanConstraint, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
+    PROVIDER_CHECKPOINT_CONTRACT_VERSION,
 };
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
 pub use descriptor::{

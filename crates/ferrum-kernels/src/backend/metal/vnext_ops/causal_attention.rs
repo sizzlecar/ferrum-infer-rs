@@ -6,17 +6,17 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
-    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointInputDependency,
-    CheckpointPartitionNumerics, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
-    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    OperationBufferStorageKind, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderCheckpointStateLayout, ProviderCheckpointStatePort, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
@@ -292,11 +292,14 @@ impl MetalCausalPagedAttentionProvider {
         // prepare writes [position_start, position_start + tokens) in the
         // token-major [2, kv_heads, head_dim] F16 state. Attention reads only
         // the causal prefix. Scratch and the page table are rebuilt per wave.
+        // A final one-token decode commits the same KV writes; no write is
+        // deferred until another input token becomes available.
         let checkpoint = ProviderCheckpointContract::new(
             CheckpointInputDependency::ExactTokenPrefix,
             CheckpointBoundaryConstraint::any_positive(),
             CheckpointPartitionNumerics::CapturedExecutionContinuation,
         )
+        .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
         .with_state_ports(vec![ProviderCheckpointStatePort::new(
             ResolvedValueRole::Input,
             8,

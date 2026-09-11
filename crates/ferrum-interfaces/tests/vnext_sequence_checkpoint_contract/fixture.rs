@@ -15,6 +15,7 @@ pub struct Spec {
     pub output_only_feeds_state: bool,
     pub output_only_unknown_operation: bool,
     pub declare_provider: bool,
+    pub completed_input_providers: BTreeSet<ProviderId>,
     pub declare_ports: bool,
     pub numerics: CheckpointPartitionNumerics,
     pub dependency: CheckpointInputDependency,
@@ -71,6 +72,7 @@ impl Default for Spec {
             output_only_feeds_state: false,
             output_only_unknown_operation: false,
             declare_provider: true,
+            completed_input_providers: BTreeSet::new(),
             declare_ports: true,
             numerics: CheckpointPartitionNumerics::BitwiseEquivalent,
             dependency: CheckpointInputDependency::ExactTokenPrefix,
@@ -352,6 +354,13 @@ fn catalog_for(
                         spec.boundaries,
                         spec.numerics,
                     )
+                    .with_completed_input_capture(
+                        if spec.completed_input_providers.contains(&id(name)) {
+                            CheckpointCompletedInputCapture::Supported
+                        } else {
+                            CheckpointCompletedInputCapture::Unsupported
+                        },
+                    )
                     .with_state_ports(ports)?,
                 ),
             );
@@ -393,11 +402,23 @@ fn catalog_for(
         )?;
         if spec.declare_provider {
             provider = provider.with_checkpoint_capability(
-                ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
-                    spec.dependency,
-                    spec.boundaries,
-                    spec.numerics,
-                )),
+                ProviderCheckpointCapability::CompletedBoundary(
+                    ProviderCheckpointContract::new(
+                        spec.dependency,
+                        spec.boundaries,
+                        spec.numerics,
+                    )
+                    .with_completed_input_capture(
+                        if spec
+                            .completed_input_providers
+                            .contains(&id("provider.output"))
+                        {
+                            CheckpointCompletedInputCapture::Supported
+                        } else {
+                            CheckpointCompletedInputCapture::Unsupported
+                        },
+                    ),
+                ),
             );
         }
         provider_map.insert(output.id.clone(), vec![provider]);

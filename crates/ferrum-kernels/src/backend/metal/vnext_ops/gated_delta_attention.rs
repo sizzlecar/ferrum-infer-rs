@@ -7,17 +7,18 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, gated_delta_recurrent_attention_f32_master_contract,
     AttributeId, BatchedOperationInvocation, CheckpointBoundaryConstraint,
-    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
-    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
-    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
-    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
+    GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderCheckpointStateLayout,
+    ProviderCheckpointStatePort, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -263,6 +264,8 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         // collect+copy commits the complete F16 convolution window. Both
         // recurrent and chunked delta paths write the complete F32 boundary
         // matrix. All remaining workspace is overwritten within the wave.
+        // This includes a one-token recurrent frame whose input ends there:
+        // neither the convolution nor delta write depends on a future suffix.
         let storage = DynamicStorageProfile::new(
             DynamicStorageAllocator::LinearArena,
             DynamicStorageView::Contiguous,
@@ -273,6 +276,7 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             CheckpointBoundaryConstraint::any_positive(),
             CheckpointPartitionNumerics::CapturedExecutionContinuation,
         )
+        .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
         .with_state_ports(vec![
             ProviderCheckpointStatePort::new(
                 ResolvedValueRole::Input,

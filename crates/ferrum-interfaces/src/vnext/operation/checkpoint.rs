@@ -187,6 +187,25 @@ pub enum CheckpointPartitionNumerics {
     OperationOracle,
 }
 
+/// Whether a successful frame may be captured at the end of its complete input.
+/// This is separate from the existing partial-input boundary declaration: an
+/// older provider has not promised that its final frame leaves resumable state.
+/// Even when supported, restoration still requires a legal nonempty suffix and
+/// all of the provider's input-dependency and numerical conditions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointCompletedInputCapture {
+    #[default]
+    Unsupported,
+    Supported,
+}
+
+impl CheckpointCompletedInputCapture {
+    pub const fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+}
+
 /// An implementation promises all of its persistent state effects are complete
 /// at the permitted successful frame boundaries, and legal suffix execution can
 /// resume from those values without hidden execution history. Physical export
@@ -198,6 +217,8 @@ pub struct ProviderCheckpointContract {
     input_dependency: CheckpointInputDependency,
     boundaries: CheckpointBoundaryConstraint,
     partition_numerics: CheckpointPartitionNumerics,
+    #[serde(skip_serializing_if = "CheckpointCompletedInputCapture::is_unsupported")]
+    completed_input_capture: CheckpointCompletedInputCapture,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     state_ports: Vec<ProviderCheckpointStatePort>,
 }
@@ -209,6 +230,8 @@ struct ProviderCheckpointContractWire {
     input_dependency: CheckpointInputDependency,
     boundaries: CheckpointBoundaryConstraint,
     partition_numerics: CheckpointPartitionNumerics,
+    #[serde(default)]
+    completed_input_capture: CheckpointCompletedInputCapture,
     #[serde(default)]
     state_ports: Vec<ProviderCheckpointStatePort>,
 }
@@ -231,6 +254,7 @@ impl<'de> Deserialize<'de> for ProviderCheckpointContract {
             wire.boundaries,
             wire.partition_numerics,
         )
+        .with_completed_input_capture(wire.completed_input_capture)
         .with_state_ports(wire.state_ports)
         .map_err(serde::de::Error::custom)?;
         if contract.state_ports != original_ports {
@@ -253,8 +277,21 @@ impl ProviderCheckpointContract {
             input_dependency,
             boundaries,
             partition_numerics,
+            completed_input_capture: CheckpointCompletedInputCapture::Unsupported,
             state_ports: Vec::new(),
         }
+    }
+
+    pub const fn with_completed_input_capture(
+        mut self,
+        capability: CheckpointCompletedInputCapture,
+    ) -> Self {
+        self.completed_input_capture = capability;
+        self
+    }
+
+    pub const fn completed_input_capture(&self) -> CheckpointCompletedInputCapture {
+        self.completed_input_capture
     }
 
     pub fn with_state_ports(

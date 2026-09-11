@@ -161,7 +161,20 @@ impl Fixture {
     }
 
     pub fn admit(&self, name: &str, tokens: Arc<[u32]>) -> Arc<SequenceSession<Runtime>> {
-        let span = token_span(Arc::clone(&tokens), 0..tokens.len());
+        let ceiling = tokens.len();
+        self.admit_with_ceiling(name, tokens, ceiling)
+    }
+
+    pub fn admit_with_ceiling(
+        &self,
+        name: &str,
+        tokens: Arc<[u32]>,
+        ceiling: usize,
+    ) -> Arc<SequenceSession<Runtime>> {
+        let span = TokenSpanWork::from_token_ids_with_fit(&tokens, 0..tokens.len(), ceiling)
+            .unwrap()
+            .with_checkpoint_tokens(tokens)
+            .unwrap();
         let work = ResourceWorkShape::single(span).unwrap();
         let request = RequestResourceAdmissionRequest::new(
             work.clone(),
@@ -223,6 +236,45 @@ impl Fixture {
             }
         };
         sequence.open_session().unwrap()
+    }
+
+    pub fn extend(&self, session: &Arc<SequenceSession<Runtime>>, tokens: Arc<[u32]>) {
+        let work =
+            ResourceWorkShape::single(token_span(Arc::clone(&tokens), 0..tokens.len())).unwrap();
+        let request =
+            SequenceResourceExtensionRequest::new(work, AdmissionPressureAction::WaitForRelease)
+                .unwrap();
+        loop {
+            match session.try_ensure_backing_covers(request.clone()).unwrap() {
+                SequenceResourceExtensionDecision::Current(_)
+                | SequenceResourceExtensionDecision::Extended(_) => break,
+                SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
+                    require_progress(deferred.maintain().unwrap())
+                }
+                SequenceResourceExtensionDecision::Deferred(reason) => {
+                    // A retained checkpoint can fill an otherwise growable
+                    // State pool. Use the authentic foreground pressure path.
+                    if self
+                        .resources
+                        .try_maintain_for_capacity_pressure(&reason)
+                        .unwrap()
+                        .is_none()
+                    {
+                        require_progress(
+                            self.resources
+                                .maintain_for_admission_deferred(&reason)
+                                .unwrap(),
+                        );
+                    }
+                }
+                SequenceResourceExtensionDecision::RetryRequired(_) => {
+                    panic!("fixture has no in-flight frame during extension")
+                }
+                SequenceResourceExtensionDecision::PermanentRejected(reason) => {
+                    panic!("fixture extension rejected: {reason:?}")
+                }
+            }
+        }
     }
 
     pub fn execute(
@@ -534,6 +586,59 @@ impl Fixture {
             }
             _ => panic!("restore did not publish its exact target frontier"),
         }
+    }
+
+    pub fn capture_completed_input(
+        &self,
+        source: &Arc<SequenceSession<Runtime>>,
+    ) -> SequenceCheckpoint<Runtime> {
+        let binding = self.resources.trusted_runtime_binding().unwrap();
+        let plan = self.compilation.executable().execution_plan();
+        let start = || {
+            self.reaper
+                .try_capture_sequence_checkpoint(
+                    plan,
+                    &binding,
+                    Arc::clone(source),
+                    Arc::clone(&self.lane),
+                )
+                .unwrap()
+        };
+        let initial = start();
+        let submitted = match initial {
+            NativeCheckpointStart::CapacityMaintenance { maintenance, .. } => {
+                assert!(matches!(
+                    maintenance.try_maintain().unwrap(),
+                    CheckpointCapacityMaintenanceOutcome::Ready(_)
+                ));
+                start()
+            }
+            other => other,
+        };
+        let NativeCheckpointResult::Captured(checkpoint) = finish(submitted) else {
+            panic!("completed-input capture did not publish a checkpoint");
+        };
+        assert_eq!(checkpoint.completed_tokens(), checkpoint.full_input().len());
+        assert_eq!(checkpoint.token_prefix(), checkpoint.full_input());
+        checkpoint
+    }
+
+    pub fn assert_restore_rejected(
+        &self,
+        target: &Arc<SequenceSession<Runtime>>,
+        checkpoint: &SequenceCheckpoint<Runtime>,
+        tokens: Arc<[u32]>,
+    ) {
+        assert!(self
+            .reaper
+            .try_restore_sequence_checkpoint(
+                self.compilation.executable().execution_plan(),
+                Arc::clone(target),
+                checkpoint,
+                tokens,
+                Arc::clone(&self.lane),
+            )
+            .is_err());
     }
 }
 

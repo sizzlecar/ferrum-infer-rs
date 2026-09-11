@@ -5,6 +5,108 @@ mod fixture;
 use fixture::{Fixture, Spec};
 
 #[test]
+fn completed_input_capture_requires_every_selected_provider() {
+    for (providers, supported) in [
+        (vec![], false),
+        (vec!["provider.alternative"], false),
+        (vec!["provider.selected"], false),
+        (vec!["provider.selected", "provider.output"], true),
+    ] {
+        let fixture = Fixture::build(Spec {
+            output_only_input: Some(id("value.selection")),
+            unselected_support: true,
+            completed_input_providers: providers.into_iter().map(id).collect(),
+            ..Spec::default()
+        })
+        .unwrap();
+        let layout = fixture.layout();
+        assert_eq!(layout.permits_capture_from(3, 4, 4), supported);
+        assert_eq!(
+            layout.completed_input_capture().is_unsupported(),
+            !supported
+        );
+        assert!(layout.permits_capture_from(3, 4, 5));
+        assert!(!layout.permits_suffix(4, 4));
+        let source = layout
+            .bind_inputs(&id("value.input"), &[1, 2, 3, 4], &BTreeMap::new())
+            .unwrap();
+        let target = layout
+            .bind_inputs(&id("value.input"), &[1, 2, 3, 4, 5], &BTreeMap::new())
+            .unwrap();
+        assert_eq!(source.matches_at(&target, 4), supported);
+        assert!(!source.matches_at(&source, 4));
+        assert_eq!(
+            fixture
+                .revalidate(&fixture.plan.to_json().unwrap())
+                .unwrap(),
+            fixture.plan
+        );
+    }
+}
+
+#[test]
+fn completed_input_capture_keeps_actual_span_and_future_suffix_constraints() {
+    use std::num::NonZeroU64;
+    let boundary = CheckpointBoundaryConstraint::new(
+        CheckpointTokenSpanConstraint::new(
+            NonZeroU64::new(4).unwrap(),
+            NonZeroU64::new(4).unwrap(),
+        )
+        .unwrap(),
+        CheckpointTokenSpanConstraint::new(
+            NonZeroU64::new(2).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for dependency in [
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointInputDependency::EntireTokenInput,
+    ] {
+        let fixture = Fixture::build(Spec {
+            dependency,
+            numerics: CheckpointPartitionNumerics::SamePartitionOnly,
+            boundaries: boundary,
+            completed_input_providers: BTreeSet::from([id("provider.selected")]),
+            ..Spec::default()
+        })
+        .unwrap();
+        let layout = fixture.layout();
+        assert_eq!(layout.input_dependency(), dependency);
+        assert_eq!(
+            layout.providers()[0].contract().partition_numerics(),
+            CheckpointPartitionNumerics::SamePartitionOnly
+        );
+        assert!(layout.permits_capture_from(3, 7, 7));
+        assert!(layout.permits_capture_from(3, 7, 10));
+        for (start, end, input) in [
+            (3, 8, 8),
+            (7, 7, 7),
+            (8, 7, 7),
+            (0, 0, 0),
+            (3, 7, 6),
+            (3, 7, 9),
+        ] {
+            assert!(!layout.permits_capture_from(start, end, input));
+        }
+        assert!(layout.permits_suffix(7, 10));
+        assert!(!layout.permits_suffix(7, 7));
+        assert!(!layout.permits_suffix(7, 9));
+        let source = layout
+            .bind_inputs(&id("value.input"), &[1, 2, 3, 4], &BTreeMap::new())
+            .unwrap();
+        let target = layout
+            .bind_inputs(&id("value.input"), &[1, 2, 3, 4, 5, 6, 7], &BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            source.matches_at(&target, 4),
+            dependency == CheckpointInputDependency::ExactTokenPrefix
+        );
+    }
+}
+
+#[test]
 fn checkpoint_output_only_inputs_require_real_state_independence() {
     for input in ["value.selection", "value.renamed"] {
         let safe = Fixture::build(Spec {
@@ -364,6 +466,15 @@ fn checkpoint_wire_requires_rebuild_and_old_undeclared_plans_keep_their_wire_sha
     assert_eq!(original.plan.plan_hash(), round_trip.plan_hash());
     let fixture = Fixture::build(Spec::default()).unwrap();
     let wire: Value = serde_json::from_slice(&fixture.plan.to_json().unwrap()).unwrap();
+    assert!(wire["payload"]["sequence_checkpoint_layout"]
+        .get("completed_input_capture")
+        .is_none());
+    let mut upgraded = wire.clone();
+    upgraded["payload"]["sequence_checkpoint_layout"]["completed_input_capture"] =
+        json!("supported");
+    assert!(fixture
+        .revalidate(&serde_json::to_vec(&upgraded).unwrap())
+        .is_err());
     let mut forged = wire.clone();
     forged["payload"]["sequence_checkpoint_layout"]["states"][0]["offset_bytes"] = json!(16);
     assert!(fixture

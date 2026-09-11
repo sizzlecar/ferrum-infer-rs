@@ -118,11 +118,17 @@ impl<C> PrefixIndex<C> {
         std::mem::take(fields)
     }
 
-    fn remove_input(&mut self, input: &[u32]) -> Vec<C> {
+    fn remove_replaced(&mut self, input: &[u32], completed_tokens: usize) -> Vec<C> {
         let mut removed = Vec::new();
         let mut index = 0;
         while index < self.entries.len() {
-            if self.entries[index].input.as_ref() == input {
+            let entry = &self.entries[index];
+            // A checkpoint at the input end needs a longer future request.
+            // Preserve the partial checkpoint that can serve an exact repeat
+            // of this input. Replacements within either use retain one owner.
+            if entry.input.as_ref() == input
+                && (entry.prefix.len() == input.len()) == (completed_tokens == input.len())
+            {
                 removed.push(self.entries.remove(index).expect("known entry").checkpoint);
             } else {
                 index += 1;
@@ -132,7 +138,7 @@ impl<C> PrefixIndex<C> {
     }
 
     fn insert(&mut self, prefix: Arc<[u32]>, input: Arc<[u32]>, checkpoint: C) -> Vec<C> {
-        let replaced = self.remove_input(&input);
+        let replaced = self.remove_replaced(&input, prefix.len());
         self.entries.push_back(Entry {
             prefix,
             input,
@@ -630,8 +636,49 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         {
             return Ok(());
         }
+        self.retain_sequence_boundary(sequence, tokens, chunk.end())
+            .await
+    }
+
+    pub(super) async fn retain_completed_sequence_boundary(
+        &self,
+        sequence: &Arc<VNextSequence<R>>,
+    ) -> Result<()> {
+        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+            return Ok(());
+        };
+        if sequence.request_origin != ExecutorRequestOrigin::Product
+            || layout.completed_input_capture() != CheckpointCompletedInputCapture::Supported
+            // A completed whole-input-dependent state cannot both match that
+            // same input and leave the nonempty suffix required for restore.
+            || layout.input_dependency() != CheckpointInputDependency::ExactTokenPrefix
+        {
+            return Ok(());
+        }
+        // The caller holds the operation lock while the original session is
+        // still Open. These are only tokens actually consumed by FullPlan
+        // execution; the final sampled token is deliberately absent.
+        let tokens = sequence.tokens.lock().clone();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        // The native facade checks the last retired span and every selected
+        // provider's permission to capture at the end of the known input.
+        self.retain_sequence_boundary(sequence, &tokens, tokens.len())
+            .await
+    }
+
+    async fn retain_sequence_boundary(
+        &self,
+        sequence: &Arc<VNextSequence<R>>,
+        tokens: &[u32],
+        completed_tokens: usize,
+    ) -> Result<()> {
         // Replacing a candidate must not require holding both copies at once.
-        let replaced = self.prefix_cache.lock().remove_input(tokens);
+        let replaced = self
+            .prefix_cache
+            .lock()
+            .remove_replaced(tokens, completed_tokens);
         drop(replaced);
         let entries = self.prefix_cache.lock().entries.len();
         let result = capture_with_capacity(entries, || async {
@@ -716,11 +763,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }, || self.evict_prefix_checkpoint()).await?;
         match result {
             Some(NativeCheckpointResult::Captured(checkpoint)) => {
-                if checkpoint.completed_tokens() != chunk.end()
-                    || checkpoint.token_prefix() != &tokens[..chunk.end()]
+                if checkpoint.completed_tokens() != completed_tokens
+                    || tokens.get(..completed_tokens) != Some(checkpoint.token_prefix())
+                    || checkpoint.full_input() != tokens
                 {
                     return Err(FerrumError::backend(
-                        "capture differs from the retired prefill boundary",
+                        "capture differs from the retired sequence boundary",
                     ));
                 }
                 let removed = self.prefix_cache.lock().insert(

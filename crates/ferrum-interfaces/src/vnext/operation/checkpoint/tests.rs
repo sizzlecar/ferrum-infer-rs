@@ -180,6 +180,37 @@ fn provider_checkpoint_wire_rejects_unknown_versions_and_incomplete_declarations
 mod catalog;
 
 #[test]
+fn completed_input_capture_requires_explicit_wire_permission() {
+    let legacy = ProviderCheckpointContract::new(
+        CheckpointInputDependency::ExactTokenPrefix,
+        CheckpointBoundaryConstraint::any_positive(),
+        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+    );
+    let wire = serde_json::to_value(&legacy).unwrap();
+    assert!(wire.get("completed_input_capture").is_none());
+    let decoded: ProviderCheckpointContract = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        decoded.completed_input_capture(),
+        CheckpointCompletedInputCapture::Unsupported
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+
+    let supported = legacy.with_completed_input_capture(CheckpointCompletedInputCapture::Supported);
+    let supported_wire = serde_json::to_value(&supported).unwrap();
+    assert_eq!(
+        supported_wire["completed_input_capture"],
+        json!("supported")
+    );
+    assert_eq!(
+        serde_json::from_value::<ProviderCheckpointContract>(supported_wire).unwrap(),
+        supported
+    );
+    let mut invalid = wire;
+    invalid["completed_input_capture"] = json!(true);
+    assert!(serde_json::from_value::<ProviderCheckpointContract>(invalid).is_err());
+}
+
+#[test]
 fn checkpoint_state_ports_are_explicit_canonical_abi_declarations() {
     use crate::vnext::{DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView};
     let profile = DynamicStorageProfile::new(

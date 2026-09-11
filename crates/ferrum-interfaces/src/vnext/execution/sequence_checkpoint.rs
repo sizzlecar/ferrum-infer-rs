@@ -10,8 +10,9 @@ use super::{
     ResourceId, StateId, StateInitialization, VNextError,
 };
 use crate::vnext::{
-    CheckpointInputDependency, ContractVersion, ProgramCheckpointInputs,
-    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderId, StateCheckpointContract,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, ContractVersion,
+    ProgramCheckpointInputs, ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderId,
+    StateCheckpointContract,
 };
 
 mod derive;
@@ -154,6 +155,11 @@ pub(super) struct SequenceCheckpointLayoutData {
     inputs: ProgramCheckpointInputs,
     input_dependency: CheckpointInputDependency,
     boundaries: crate::vnext::CheckpointBoundaryConstraint,
+    #[serde(
+        default,
+        skip_serializing_if = "CheckpointCompletedInputCapture::is_unsupported"
+    )]
+    completed_input_capture: CheckpointCompletedInputCapture,
     providers: Vec<SequenceCheckpointProvider>,
     states: Vec<SequenceCheckpointState>,
 }
@@ -194,9 +200,18 @@ impl SequenceCheckpointLayout {
         &self.data.providers
     }
     pub fn permits_capture_from(&self, processed: u64, boundary: u64, prompt: u64) -> bool {
+        if boundary == prompt {
+            return self.data.completed_input_capture == CheckpointCompletedInputCapture::Supported
+                && boundary
+                    .checked_sub(processed)
+                    .is_some_and(|span| self.data.boundaries.prefix().permits(span));
+        }
         self.data
             .boundaries
             .permits_from(processed, boundary, prompt)
+    }
+    pub fn completed_input_capture(&self) -> CheckpointCompletedInputCapture {
+        self.data.completed_input_capture
     }
     pub fn permits_suffix(&self, boundary: u64, prompt: u64) -> bool {
         boundary > 0

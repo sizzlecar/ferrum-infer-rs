@@ -7,9 +7,9 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
     last_token_dense_linear_f32_contract, BatchedOperationInvocation, CheckpointBoundaryConstraint,
-    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    DeviceBatchingForm, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
     ProviderCheckpointCapability, ProviderCheckpointContract, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
@@ -306,7 +306,8 @@ impl MetalDenseSwiGluProvider {
                 CheckpointInputDependency::ExactTokenPrefix,
                 CheckpointBoundaryConstraint::any_positive(),
                 CheckpointPartitionNumerics::CapturedExecutionContinuation,
-            ),
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
         ));
         Ok(Self {
             descriptor,
@@ -402,11 +403,14 @@ impl MetalLastTokenDenseLinearProvider {
         let mut provider = Self::new_with_activation_type(runtime, pipelines, ElementType::F32)?;
         // The selected final row and gather/output scratch are invocation-local.
         provider.descriptor = provider.descriptor.with_checkpoint_capability(
-            ProviderCheckpointCapability::CompletedBoundary(ProviderCheckpointContract::new(
-                CheckpointInputDependency::ExactTokenPrefix,
-                CheckpointBoundaryConstraint::any_positive(),
-                CheckpointPartitionNumerics::CapturedExecutionContinuation,
-            )),
+            ProviderCheckpointCapability::CompletedBoundary(
+                ProviderCheckpointContract::new(
+                    CheckpointInputDependency::ExactTokenPrefix,
+                    CheckpointBoundaryConstraint::any_positive(),
+                    CheckpointPartitionNumerics::CapturedExecutionContinuation,
+                )
+                .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+            ),
         );
         Ok(provider)
     }

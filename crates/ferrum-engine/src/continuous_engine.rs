@@ -2410,7 +2410,7 @@ impl EngineInner {
                 usage.completion_tokens,
             );
             let result = match completion {
-                Ok(completion) => self.model_executor.complete_cache(completion),
+                Ok(completion) => self.model_executor.complete_cache(completion).await,
                 Err(error) => {
                     self.model_executor.release_cache(&cache_id);
                     Err(error)

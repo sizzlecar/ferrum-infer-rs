@@ -3451,8 +3451,10 @@ pub trait ModelExecutor: Send + Sync {
     ///
     /// Legacy executors only need physical release and inherit that behavior.
     /// Plan runtimes with terminal journals override this method so completion
-    /// cannot be inferred from a generic release operation.
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    /// cannot be inferred from a generic release operation. Implementations may
+    /// await retention of the last completed native state before releasing its
+    /// source; sampled output alone is not evidence of an executed frontier.
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.release_cache(completion.cache_id());
         Ok(())
     }

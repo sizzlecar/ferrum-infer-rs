@@ -287,6 +287,14 @@ pub(crate) fn derive_sequence_checkpoint(
             inputs: inputs.expect("input coverage checked").clone(),
             input_dependency: dependency,
             boundaries: boundaries.expect("boundary intersection checked"),
+            completed_input_capture: if providers.iter().all(|provider| {
+                provider.contract.completed_input_capture()
+                    == CheckpointCompletedInputCapture::Supported
+            }) {
+                CheckpointCompletedInputCapture::Supported
+            } else {
+                CheckpointCompletedInputCapture::Unsupported
+            },
             providers,
             states,
         },

@@ -5,6 +5,9 @@ mod checkpoint_fixture;
 #[path = "../../../../../ferrum-interfaces/tests/vnext_core_contract/mod.rs"]
 mod vnext_core_contract;
 
+#[path = "completion_guard_tests.rs"]
+mod completion_guard_tests;
+
 fn insert(
     index: &mut PrefixIndex<Arc<str>>,
     prefix: &[u32],
@@ -63,6 +66,46 @@ fn replacement_and_eviction_drop_index_ownership_but_not_restore_pins() {
     assert_eq!(Arc::strong_count(&first), 1);
     assert_eq!(index.evict().as_deref(), Some("second"));
     assert!(index.evict().is_none());
+}
+
+#[test]
+fn completed_input_capture_preserves_a_prefix_for_exact_repeats() {
+    let mut index = PrefixIndex::default();
+    let input = [1, 2, 3];
+    let partial = insert(&mut index, &[1, 2], &input, "partial");
+    let completed = insert(&mut index, &input, &input, "completed");
+    assert_eq!(
+        index.longest(&input, false, |_| true).as_deref(),
+        Some("partial"),
+        "a repeated input must still leave a token to execute"
+    );
+    assert_eq!(
+        index.longest(&[1, 2, 3, 4], false, |_| true).as_deref(),
+        Some("completed")
+    );
+    assert_eq!(
+        index.longest(&[1, 2, 3, 4], true, |_| true).as_deref(),
+        None,
+        "an entire-input dependency cannot use a completed shorter input"
+    );
+    let pin = index.longest(&[1, 2, 3, 4], false, |_| true).unwrap();
+    insert(&mut index, &input, &input, "new-completed");
+    assert_eq!(Arc::strong_count(&completed), 2);
+    assert_eq!(Arc::strong_count(&partial), 2);
+    drop(pin);
+    assert_eq!(Arc::strong_count(&completed), 1);
+    // A new partial capture can replace its predecessor without discarding
+    // the completed-input state used by an appended conversation.
+    insert(&mut index, &[1], &input, "new-partial");
+    assert_eq!(Arc::strong_count(&partial), 1);
+    assert_eq!(
+        index.longest(&input, false, |_| true).as_deref(),
+        Some("new-partial")
+    );
+    assert_eq!(
+        index.longest(&[1, 2, 3, 4], false, |_| true).as_deref(),
+        Some("new-completed")
+    );
 }
 
 #[test]

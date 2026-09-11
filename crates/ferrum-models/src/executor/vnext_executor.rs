@@ -3490,6 +3490,25 @@ fn validate_sequence_completion_accounting(
     Ok(())
 }
 
+/// Own cancellation as soon as the registry relinquishes this incarnation.
+/// Other already-admitted callers can still hold Arcs, so the sequence's final
+/// Drop cannot be relied upon to cancel an abandoned completion future.
+struct PendingSequenceCompletion<'a, R: DeviceRuntime> {
+    sequence: &'a VNextSequence<R>,
+    operation: Option<tokio::sync::MutexGuard<'a, ()>>,
+    completed: bool,
+}
+
+impl<R: DeviceRuntime> Drop for PendingSequenceCompletion<'_, R> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Cancel before the operation guard is released. An already-owned
+            // decode caller must see an inactive sequence when it next enters.
+            self.sequence.abort();
+        }
+    }
+}
+
 impl<R: DeviceRuntime> VNextSequence<R> {
     fn request_id(&self) -> &RequestId {
         self.request.product_request_id()
@@ -10253,7 +10272,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
     }
 
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         let sequence = self
             .sequences
             .lock()
@@ -10265,7 +10284,25 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                     completion.cache_id()
                 ))
             })?;
-        sequence.complete(&completion)
+        // Removing the registry entry prevents new callers from finding this
+        // incarnation. Wait for already-owned work before inspecting its final
+        // executed tokens or completing the native session.
+        let mut pending = PendingSequenceCompletion {
+            sequence: &sequence,
+            operation: None,
+            completed: false,
+        };
+        pending.operation = Some(sequence.operation.lock().await);
+        validate_sequence_completion_accounting(
+            sequence.request_id(),
+            sequence.product_prompt_tokens,
+            sequence.replayed_output_tokens,
+            &completion,
+        )?;
+        self.retain_completed_sequence_boundary(&sequence).await?;
+        sequence.complete(&completion)?;
+        pending.completed = true;
+        Ok(())
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
