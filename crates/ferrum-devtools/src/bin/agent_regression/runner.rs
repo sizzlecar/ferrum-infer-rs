@@ -3,7 +3,7 @@ use super::{
     events::Events,
     process::{self, ManagedChild, Outcome},
     proxy::{self, Proxy},
-    replay, write_json, Mode,
+    repair, replay, write_json, Mode,
 };
 use anyhow::{ensure, Context, Result};
 use futures::future::join_all;
@@ -25,19 +25,21 @@ use tokio::{
 };
 
 #[derive(Serialize)]
-struct TaskResult {
-    id: String,
-    pid: u32,
-    workdir: PathBuf,
-    started_ns: u64,
-    finished_ns: u64,
-    process: Outcome,
-    events: Events,
-    validation: Outcome,
-    source_changed: bool,
-    closed_loop: bool,
-    replay: replay::Evidence,
-    completed: bool,
+pub(crate) struct TaskResult {
+    pub id: String,
+    pub pid: u32,
+    pub workdir: PathBuf,
+    pub started_ns: u64,
+    pub finished_ns: u64,
+    pub process: Outcome,
+    pub events: Events,
+    pub validation: Option<Outcome>,
+    pub source_changed: bool,
+    pub closed_loop: bool,
+    pub replay: replay::Evidence,
+    pub completed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_repair: Option<repair::Report>,
 }
 
 pub(crate) async fn run(
@@ -45,6 +47,7 @@ pub(crate) async fn run(
     report_dir: &Path,
     mode: Mode,
     profile: Option<&Path>,
+    validation_repairs: u32,
 ) -> Result<i32> {
     let manifest = Manifest::load(manifest_path)?;
     ensure!(
@@ -100,6 +103,7 @@ pub(crate) async fn run(
             task,
             &control,
             &report_dir.join(&task.id).join("initial-validation"),
+            validation_repairs > 0,
         )
         .await?;
         let valid = !outcome.timed_out
@@ -172,6 +176,10 @@ pub(crate) async fn run(
                         before,
                         clock,
                         barrier.clone(),
+                        validation_repairs,
+                        Arc::clone(&proxy.state),
+                        &protected,
+                        &frozen,
                     )
                 }),
         )
@@ -179,7 +187,22 @@ pub(crate) async fn run(
     } else {
         let mut results = Vec::new();
         for (task, output, agent_dir, before) in prepared {
-            results.push(run_task(&manifest, task, output, agent_dir, before, clock, None).await);
+            results.push(
+                run_task(
+                    &manifest,
+                    task,
+                    output,
+                    agent_dir,
+                    before,
+                    clock,
+                    None,
+                    validation_repairs,
+                    Arc::clone(&proxy.state),
+                    &protected,
+                    &frozen,
+                )
+                .await,
+            );
         }
         results
     };
@@ -201,7 +224,31 @@ pub(crate) async fn run(
     write_json(report_dir.join("protected-after.json"), &after)?;
     for task in &mut tasks {
         let records: Vec<_> = requests.iter().filter(|r| r.task_id == task.id).collect();
-        task.replay = replay::verify(&task.events, &records);
+        task.replay = match task
+            .validation_repair
+            .as_ref()
+            .and_then(repair::Report::session_file)
+        {
+            Some(path) => replay::verify_with_session(&task.events, &records, path),
+            None => replay::verify(&task.events, &records),
+        };
+        if let Some(repair) = &mut task.validation_repair {
+            repair.bind_requests(&records);
+            write_json(
+                report_dir.join(&task.id).join("validation-repair.json"),
+                repair,
+            )?;
+            if repair.termination == repair::Termination::InfrastructureFailure {
+                infrastructure_errors.push(format!(
+                    "{} validation repair: {}",
+                    task.id,
+                    repair
+                        .error
+                        .as_deref()
+                        .unwrap_or("independent validation infrastructure failed")
+                ));
+            }
+        }
         task.closed_loop = task.events.completed_loop(&manifest.server.model)
             && task.replay.complete(&task.events);
         let last = records.iter().max_by_key(|r| r.request_index);
@@ -253,6 +300,10 @@ pub(crate) async fn run(
         && (mode == Mode::Sequential || engine_overlap.is_some());
     let report = json!({"schema_version":1,"run_id":manifest.run_id,"mode":mode,
         "server":manifest.server,"pi":manifest.pi,"wall_start_unix_ns":wall_start,"elapsed_ms":elapsed_ms,
+        "validation_repairs":validation_repairs,"agent_mode":if validation_repairs == 0 { "print" } else { "rpc" },
+        "validation_repair_cleanup": if validation_repairs == 0 { None } else { Some(if cfg!(unix) {
+            "ManagedChild owns Unix process groups; structured validators propagate controller SIGTERM to their current Cargo/test group through cancellation. Cleanup is not additional agent work."
+        } else { "Existing ManagedChild direct-child termination; descendant process-group cleanup is not certified on this platform." }) },
         "agent_wall_ms":agent_wall_ms,
         "initial_validations":initial,"tasks":tasks,"requests":requests,
         "protected_unchanged":protected_unchanged,"tasks_completed":tasks_completed,
@@ -260,8 +311,10 @@ pub(crate) async fn run(
         "server_profile_jsonl":profile,"engine_progress_spans":engine,"infrastructure_errors":infrastructure_errors,
         "accepted":accepted,
         "concurrency_evidence_note":"HTTP and SSE overlap alone do not certify inference overlap. Engine token commits are matched by request id. Work directories are isolated inputs, not an OS sandbox.",
-        "replay_evidence_note":"Every invocation requires an origin response id and a successful following request that appends that assistant turn and its exact tool result. Rewritten/compacted history without this evidence is unproven; independent semantic validation is reported separately.",
-        "retry_policy":{"agent":{"enabled":true,"max_retries":3,"base_delay_ms":2000},"provider":{"max_retries":0,"request_timeout_secs":manifest.server.request_timeout_secs},"task_deadline_note":"Each task timeout covers the entire pi process including outer retries; the per-request timeout is not a total task budget."}});
+        "replay_evidence_note":"Every invocation requires an origin response id and a successful following request carrying its exact assistant turn and tool result. Compacted history additionally requires the observed session identity, retained ancestor chain and complete following wire projection; missing evidence stays unproven. Independent semantic validation is reported separately.",
+        "retry_policy":{"agent":{"enabled":true,"max_retries":3,"base_delay_ms":2000},"provider":{"max_retries":0,"request_timeout_secs":manifest.server.request_timeout_secs},
+            "task_deadline_note":if validation_repairs == 0 { "Each task timeout covers the entire pi process including outer retries; the per-request timeout is not a total task budget." }
+                else { "One absolute task deadline covers the Pi RPC process, automatic retries, all independent validations and repair rounds; it is never reset. Shutdown cleanup does not authorize additional agent work." }}});
     write_json(report_dir.join("report.json"), &report)?;
     println!(
         "{}",
@@ -272,9 +325,45 @@ pub(crate) async fn run(
     Ok(if accepted { 0 } else { 1 })
 }
 
-async fn validate(task: &Task, agent_dir: &Path, output: &Path) -> Result<Outcome> {
-    let args: Vec<_> = task
-        .validation
+async fn validate(
+    task: &Task,
+    agent_dir: &Path,
+    output: &Path,
+    structured: bool,
+) -> Result<Outcome> {
+    let mut args = validation_args(task);
+    let evidence_path = output.join("evidence.json");
+    if structured {
+        args.extend([
+            "--result-json".into(),
+            evidence_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    let outcome = process::logged(
+        &task.validation.program,
+        &args,
+        &task.validation.cwd,
+        agent_dir,
+        output,
+        task.validation.timeout_secs,
+    )
+    .await?;
+    if structured && outcome.exit_code == Some(1) && !outcome.timed_out {
+        let evidence: super::validator::Evidence =
+            serde_json::from_slice(&fs::read(evidence_path).context(
+                "repair mode requires a validator with structured --result-json support",
+            )?)?;
+        ensure!(
+            evidence.schema_version == 1
+                && evidence.class == super::validator::Class::SemanticFailure,
+            "initial validator did not provide a known semantic failure"
+        );
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn validation_args(task: &Task) -> Vec<String> {
+    task.validation
         .args
         .iter()
         .map(|arg| {
@@ -284,16 +373,7 @@ async fn validate(task: &Task, agent_dir: &Path, output: &Path) -> Result<Outcom
                 arg.clone()
             }
         })
-        .collect();
-    process::logged(
-        &task.validation.program,
-        &args,
-        &task.validation.cwd,
-        agent_dir,
-        output,
-        task.validation.timeout_secs,
-    )
-    .await
+        .collect()
 }
 
 async fn run_task(
@@ -304,7 +384,27 @@ async fn run_task(
     before: BTreeMap<PathBuf, String>,
     clock: Instant,
     barrier: Option<Arc<Barrier>>,
+    validation_repairs: u32,
+    proxy: Arc<proxy::ProxyState>,
+    protected: &[PathBuf],
+    frozen: &BTreeMap<PathBuf, String>,
 ) -> Result<TaskResult> {
+    if validation_repairs > 0 {
+        return repair::run_task(
+            manifest,
+            task,
+            output,
+            agent_dir,
+            before,
+            clock,
+            barrier,
+            validation_repairs,
+            proxy,
+            protected,
+            frozen,
+        )
+        .await;
+    }
     if let Some(barrier) = barrier {
         barrier.wait().await;
     }
@@ -391,7 +491,7 @@ async fn run_task(
         .await
         .context("pi output did not close")???;
     let finished_ns = clock.elapsed().as_nanos() as u64;
-    let validation = validate(task, &agent_dir, &output.join("final-validation")).await?;
+    let validation = validate(task, &agent_dir, &output.join("final-validation"), false).await?;
     let after = source_snapshot(&task.workdir, &output.join("source-after"))?;
     let source_changed = before != after;
     let completed = !timed_out
@@ -408,18 +508,19 @@ async fn run_task(
         finished_ns,
         process: outcome,
         events,
-        validation,
+        validation: Some(validation),
         source_changed,
         closed_loop: false,
         replay: replay::Evidence::default(),
         completed,
+        validation_repair: None,
     };
     write_json(output.join("result.json"), &result)?;
     Ok(result)
 }
 
 /// Preserve actual candidate edits, excluding build and version-control output.
-fn source_snapshot(root: &Path, output: &Path) -> Result<BTreeMap<PathBuf, String>> {
+pub(crate) fn source_snapshot(root: &Path, output: &Path) -> Result<BTreeMap<PathBuf, String>> {
     fn visit(
         root: &Path,
         relative: &Path,

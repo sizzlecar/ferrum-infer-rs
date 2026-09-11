@@ -10,6 +10,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+#[path = "replay/compaction.rs"]
+mod compaction;
+pub(crate) use compaction::verify_with_session;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Receipt {
     pub tool_key: String,
@@ -20,6 +24,8 @@ pub(crate) struct Receipt {
     pub assistant_message_index: usize,
     pub tool_message_index: usize,
     pub result_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<compaction::Receipt>,
 }
 
 #[derive(Default, Debug, Serialize)]
@@ -121,6 +127,7 @@ fn witness(key: &str, tool: &Tool, requests: &[&RequestRecord]) -> Result<Receip
                     assistant_message_index: assistant_index,
                     tool_message_index: index,
                     result_sha256: format!("{:x}", Sha256::digest(result.as_bytes())),
+                    compaction: None,
                 });
             }
         }

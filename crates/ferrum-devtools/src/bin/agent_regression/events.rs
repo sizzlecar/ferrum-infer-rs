@@ -66,6 +66,20 @@ pub(crate) struct Events {
 impl Events {
     pub fn observe(&mut self, event: &Value, at: u64) {
         match event["type"].as_str() {
+            Some("response") if event["command"] == "get_state" && event["success"] == true => {
+                if let Some(id) = event["data"]["sessionId"].as_str() {
+                    if self
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|previous| previous != id)
+                    {
+                        self.protocol_errors
+                            .push("RPC session identity changed".into());
+                    } else {
+                        self.session_id = Some(id.to_owned());
+                    }
+                }
+            }
             Some("session") => self.session_id = event["id"].as_str().map(str::to_owned),
             Some("agent_start") => self.settled = false,
             Some("agent_settled") => self.settled = true,
@@ -253,6 +267,15 @@ fn result_text(message: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rpc_state_establishes_real_session_and_rejects_session_replacement() {
+        let mut events = Events::default();
+        events.observe(&json!({"type":"response","command":"get_state","success":true,"data":{"sessionId":"first"}}), 1);
+        assert_eq!(events.session_id.as_deref(), Some("first"));
+        events.observe(&json!({"type":"response","command":"get_state","success":true,"data":{"sessionId":"different"}}), 2);
+        assert_eq!(events.session_id.as_deref(), Some("first"));
+        assert!(!events.protocol_errors.is_empty());
+    }
     #[test]
     fn retry_wait_and_failed_request_time_are_recorded_separately() {
         let mut events = Events::default();

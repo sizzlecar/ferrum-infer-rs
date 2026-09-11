@@ -129,6 +129,12 @@ impl Drop for FlightRecord {
     }
 }
 impl ProxyState {
+    /// Global issue cursor; per-round reports select this task's records in the
+    /// half-open interval after the existing proxy has drained.
+    pub(crate) fn request_cursor(&self) -> u32 {
+        self.next_request.load(Ordering::Acquire)
+    }
+
     fn at(&self) -> u64 {
         self.clock.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }

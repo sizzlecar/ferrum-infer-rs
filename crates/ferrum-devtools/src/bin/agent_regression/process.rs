@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{
     fs::{self, File},
@@ -56,6 +56,10 @@ impl ManagedChild {
         Ok(Self { child, pid })
     }
     pub async fn stop(&mut self) {
+        self.stop_with_grace(Duration::from_secs(2)).await;
+    }
+
+    async fn stop_with_grace(&mut self, grace: Duration) {
         #[cfg(unix)]
         unsafe {
             libc::kill(-(self.pid as i32), libc::SIGTERM);
@@ -64,18 +68,106 @@ impl ManagedChild {
         {
             let _ = self.child.start_kill();
         }
-        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
-            .await
-            .is_err()
-        {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGKILL);
-            }
+        let waited = tokio::time::timeout(grace, self.child.wait()).await;
+        // A group leader exiting on TERM does not prove its descendants exited.
+        // Finish terminating this owned group, then reap the direct child.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.pid as i32), libc::SIGKILL);
+        }
+        if !matches!(waited, Ok(Ok(_))) {
             let _ = self.child.kill().await;
         }
         let _ = self.child.wait().await;
     }
+}
+
+/// Reused across compile/list/execute, at the layer retaining the active child.
+/// Non-Unix keeps the existing direct-child timeout capability boundary.
+pub(crate) struct Cancellation {
+    source: CancellationSource,
+    requested: bool,
+}
+
+enum CancellationSource {
+    #[cfg(unix)]
+    Terminate(tokio::signal::unix::Signal),
+    #[cfg(not(unix))]
+    Never,
+    #[cfg(test)]
+    Test(tokio::sync::oneshot::Receiver<()>),
+}
+
+impl Cancellation {
+    pub(crate) fn controller_termination() -> Result<Self> {
+        #[cfg(unix)]
+        let source = CancellationSource::Terminate(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )?);
+        #[cfg(not(unix))]
+        let source = CancellationSource::Never;
+        Ok(Self {
+            source,
+            requested: false,
+        })
+    }
+
+    async fn wait(&mut self) {
+        if self.requested {
+            return;
+        }
+        match &mut self.source {
+            #[cfg(unix)]
+            CancellationSource::Terminate(signal) => {
+                signal.recv().await;
+            }
+            #[cfg(not(unix))]
+            CancellationSource::Never => std::future::pending::<()>().await,
+            #[cfg(test)]
+            CancellationSource::Test(receiver) => {
+                let _ = receiver.await;
+            }
+        }
+        self.requested = true;
+    }
+}
+
+async fn wait_owned(
+    process: &mut ManagedChild,
+    start: Instant,
+    timeout: Duration,
+    cancellation: Option<&mut Cancellation>,
+) -> Result<(Outcome, bool)> {
+    let controlled = cancellation.is_some();
+    let cancel = async {
+        match cancellation {
+            Some(cancellation) => cancellation.wait().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let (exit_code, timed_out, cancelled) = tokio::select! {
+        biased;
+        _ = cancel => {
+            // The controller allows 2s before killing this validator. Escalate
+            // its child well inside that grace, retaining ownership until reaped.
+            process.stop_with_grace(Duration::from_millis(250)).await;
+            (None, false, true)
+        },
+        status = process.child.wait() => (status?.code(), false, false),
+        _ = tokio::time::sleep(timeout) => {
+            if controlled { process.stop_with_grace(Duration::from_millis(250)).await; }
+            else { process.stop().await; }
+            (None, true, false)
+        },
+    };
+    Ok((
+        Outcome {
+            exit_code,
+            timed_out,
+            elapsed_ms: start.elapsed().as_millis(),
+        },
+        cancelled,
+    ))
 }
 impl Drop for ManagedChild {
     fn drop(&mut self) {
@@ -110,6 +202,62 @@ pub(crate) async fn logged(
     output: &Path,
     timeout_secs: u64,
 ) -> Result<Outcome> {
+    logged_for(
+        program,
+        args,
+        cwd,
+        agent_dir,
+        output,
+        Duration::from_secs(timeout_secs),
+    )
+    .await
+}
+
+pub(crate) async fn logged_for(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    agent_dir: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<Outcome> {
+    logged_inner(program, args, cwd, agent_dir, output, timeout, None).await
+}
+
+pub(crate) async fn logged_cancellable(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    agent_dir: &Path,
+    output: &Path,
+    timeout_secs: u64,
+    cancellation: &mut Cancellation,
+) -> Result<Outcome> {
+    ensure!(
+        !cancellation.requested,
+        "independent validation was already cancelled"
+    );
+    logged_inner(
+        program,
+        args,
+        cwd,
+        agent_dir,
+        output,
+        Duration::from_secs(timeout_secs),
+        Some(cancellation),
+    )
+    .await
+}
+
+async fn logged_inner(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    agent_dir: &Path,
+    output: &Path,
+    timeout: Duration,
+    cancellation: Option<&mut Cancellation>,
+) -> Result<Outcome> {
     fs::create_dir_all(output)?;
     super::write_json(
         output.join("command.json"),
@@ -125,19 +273,104 @@ pub(crate) async fn logged(
         .stderr(File::create(output.join("stderr.txt"))?);
     let start = Instant::now();
     let mut process = ManagedChild::spawn(&mut command)?;
-    let (exit_code, timed_out) =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), process.child.wait()).await {
-            Ok(status) => (status?.code(), false),
-            Err(_) => {
-                process.stop().await;
-                (None, true)
-            }
-        };
-    let result = Outcome {
-        exit_code,
-        timed_out,
-        elapsed_ms: start.elapsed().as_millis(),
-    };
+    let (result, cancelled) = wait_owned(&mut process, start, timeout, cancellation).await?;
     super::write_json(output.join("result.json"), &result)?;
+    if cancelled {
+        let reaped = process.child.try_wait()?.is_some();
+        super::write_json(
+            output.join("cancellation.json"),
+            &serde_json::json!({
+                "cancelled":true, "direct_child_reaped":reaped,
+                "unix_group_kill_requested":cfg!(unix)
+            }),
+        )?;
+        ensure!(
+            reaped,
+            "cancelled validator child could not be confirmed reaped"
+        );
+        anyhow::bail!(
+            "independent validation cancelled after stopping and reaping owned child {}",
+            process.pid
+        );
+    }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "subprocess fixture, invoked explicitly by the cancellation lifecycle test"]
+    fn cancellation_child() {
+        let Some(ready) = std::env::var_os("FERRUM_TEST_CANCELLATION_READY") else {
+            return;
+        };
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        fs::write(ready, std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn controller_cancellation_reaps_a_running_child_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        isolated(&mut command, dir.path());
+        command
+            .args([
+                "--exact",
+                "process::tests::cancellation_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FERRUM_TEST_CANCELLATION_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let start = Instant::now();
+        let mut child = ManagedChild::spawn(&mut command).unwrap();
+        let ready_result = tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if ready_result.is_err() {
+            child.stop().await;
+            panic!("child did not reach its live cancellation fixture");
+        }
+        assert!(child.child.try_wait().unwrap().is_none());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut cancellation = Cancellation {
+            source: CancellationSource::Test(receiver),
+            requested: false,
+        };
+        sender.send(()).unwrap();
+        let (outcome, cancelled) = wait_owned(
+            &mut child,
+            start,
+            Duration::from_secs(30),
+            Some(&mut cancellation),
+        )
+        .await
+        .unwrap();
+        assert!(cancelled && cancellation.requested);
+        assert!(!outcome.timed_out);
+        let status = child
+            .child
+            .try_wait()
+            .unwrap()
+            .expect("cancelled child must already be reaped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+        #[cfg(not(unix))]
+        assert!(!status.success());
+    }
 }

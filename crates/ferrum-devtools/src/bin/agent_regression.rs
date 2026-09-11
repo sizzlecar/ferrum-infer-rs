@@ -8,8 +8,12 @@ mod events;
 mod process;
 #[path = "agent_regression/proxy.rs"]
 mod proxy;
+#[path = "agent_regression/repair.rs"]
+mod repair;
 #[path = "agent_regression/replay.rs"]
 mod replay;
+#[path = "agent_regression/rpc.rs"]
+mod rpc;
 #[path = "agent_regression/runner.rs"]
 mod runner;
 #[path = "agent_regression/validator.rs"]
@@ -42,6 +46,10 @@ enum Command {
         /// Same server's latency/detail profile; without it execution overlap is unproven.
         #[arg(long)]
         server_profile_jsonl: Option<PathBuf>,
+        /// Independent validation feedback rounds in the same Pi RPC session.
+        /// Zero preserves the original print-mode run and single final validation.
+        #[arg(long, default_value_t = 0)]
+        validation_repairs: u32,
     },
     Validate(validator::Args),
 }
@@ -66,12 +74,14 @@ async fn main() {
             report_dir,
             mode,
             server_profile_jsonl,
+            validation_repairs,
         } => {
             runner::run(
                 &manifest,
                 &report_dir,
                 mode,
                 server_profile_jsonl.as_deref(),
+                validation_repairs,
             )
             .await
         }
@@ -85,4 +95,37 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn repairs_are_explicit_and_default_to_the_original_print_run() {
+        let args = [
+            "agent_regression",
+            "run",
+            "--manifest",
+            "manifest.json",
+            "--report-dir",
+            "report",
+            "--mode",
+            "sequential",
+        ];
+        assert!(matches!(
+            Args::try_parse_from(args).unwrap().command,
+            Command::Run {
+                validation_repairs: 0,
+                ..
+            }
+        ));
+        let enabled = args.into_iter().chain(["--validation-repairs", "2"]);
+        assert!(matches!(
+            Args::try_parse_from(enabled).unwrap().command,
+            Command::Run {
+                validation_repairs: 2,
+                ..
+            }
+        ));
+    }
 }
