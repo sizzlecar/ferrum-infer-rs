@@ -21,7 +21,7 @@ fn map<'a>(value: &'a Value, location: &str) -> Result<&'a Mapping, String> {
 }
 
 fn workflows() -> Vec<(String, Value)> {
-    ["release.yml", "release-cuda.yml"]
+    ["release.yml", "release-cuda.yml", "release-windows.yml"]
         .into_iter()
         .map(|name| {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -261,6 +261,8 @@ fn inherited_and_explicit_publication_secrets_are_rejected() {
 #[cfg(any(unix, windows))]
 fn dispatch_inputs() -> BTreeMap<String, String> {
     [
+        ("platform", "all".into()),
+        ("backend", "cuda".into()),
         ("version", "12.34.56".into()),
         ("release_candidate_sha", "a".repeat(40)),
         ("release_candidate_tag", "v12.34.56-rc.2".into()),
@@ -384,6 +386,16 @@ fn run_guards(
     let temporary = tempfile::tempdir().unwrap();
     let mut executed = 0;
     for (job_name, job) in workflow["jobs"].as_mapping().unwrap() {
+        if let Some(callee) = job.get("uses").and_then(Value::as_str) {
+            // The callee's guards are executed in its own workflow below.
+            assert!(
+                workflows()
+                    .iter()
+                    .any(|(name, _)| callee == format!("./.github/workflows/{name}")),
+                "unverified staging callee: {callee}"
+            );
+            continue;
+        }
         // Validation must precede checkout, tool installation and build actions.
         let first = job["steps"]
             .as_sequence()
@@ -477,6 +489,8 @@ fn actual_input_guards_accept_formal_versions_and_reject_publication_or_bad_inpu
         sha256.insert("release_candidate_sha".into(), "b".repeat(64));
         run_guards(&workflow, &sha256, true, &name, None);
         for (field, invalid) in [
+            ("platform", "unsupported"),
+            ("backend", "unsupported"),
             ("publish_release", "true"),
             ("publish_release", ""),
             ("version", "01.2.3"),

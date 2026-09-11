@@ -48,8 +48,20 @@ enum LauncherOrigin {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) struct WindowsAttempts {
+    pub cpu: u64,
+    pub cuda: u64,
+}
+
 #[derive(Debug)]
 pub(in super::super) struct VerifiedWindows {
+    pub assets: Vec<AcceptedAsset>,
+    pub attempts: WindowsAttempts,
+}
+
+#[derive(Debug)]
+pub(in super::super) struct VerifiedWindowsArtifact {
     pub assets: Vec<AcceptedAsset>,
     pub attempt: u64,
 }
@@ -80,9 +92,10 @@ pub(in super::super) fn verify(
         baseline_tag,
         repo,
     )?;
-    if cpu.attempt != cuda.attempt {
-        return Err("Windows CPU and CUDA staging attempts differ".into());
-    }
+    let attempts = WindowsAttempts {
+        cpu: cpu.attempt,
+        cuda: cuda.attempt,
+    };
     for asset in cpu.assets {
         if let Some(existing) = cuda
             .assets
@@ -98,7 +111,10 @@ pub(in super::super) fn verify(
             cuda.assets.push(asset);
         }
     }
-    Ok(cuda)
+    Ok(VerifiedWindows {
+        assets: cuda.assets,
+        attempts,
+    })
 }
 
 pub(in super::super) fn verify_one(
@@ -109,7 +125,7 @@ pub(in super::super) fn verify_one(
     run: u64,
     baseline_tag: &str,
     repo: &str,
-) -> Result<VerifiedWindows, String> {
+) -> Result<VerifiedWindowsArtifact, String> {
     let suffix = match backend {
         Backend::Cpu => "cpu",
         Backend::Cuda => "cuda-sm89",
@@ -252,7 +268,7 @@ pub(in super::super) fn verify_one(
         return Err("duplicate Windows public asset".into());
     }
     println!("Verified Windows {suffix} staged bytes; startup {}. Model/upgrade QA is not asserted by this asset gate.", if portable.startup_executed { "passed" } else { "deferred (no driver on staging host)" });
-    Ok(VerifiedWindows {
+    Ok(VerifiedWindowsArtifact {
         assets,
         attempt: stage.workflow_run_attempt,
     })

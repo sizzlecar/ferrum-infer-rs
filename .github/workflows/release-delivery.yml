@@ -223,9 +223,23 @@ jobs:
   stage-cuda:
     needs: prepare
     if: needs.prepare.outputs.active == 'true'
-    uses: ./.github/workflows/release-cuda.yml
+    uses: ./.github/workflows/release-windows.yml
     with:
-      platform: windows
+      backend: cuda
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+      windows_launcher_url: ${{ needs.prepare.outputs.windows_launcher_url }}
+      windows_launcher_sha256: ${{ needs.prepare.outputs.windows_launcher_sha256 }}
+
+  stage-cpu-windows:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release-windows.yml
+    with:
+      backend: cpu
       version: ${{ needs.prepare.outputs.version }}
       release_candidate_sha: ${{ github.sha }}
       release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
@@ -663,7 +677,7 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, tasks, metal-models, cuda-models, cpu-models]
+    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cpu-models]
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -684,9 +698,14 @@ jobs:
           path: ${{ runner.temp }}/staged
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage-cuda.outputs.windows_asset_id }}
+          artifact-ids: ${{ needs.stage-cuda.outputs.asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-windows
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage-cpu-windows.outputs.asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-windows/cpu
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*-evidence
