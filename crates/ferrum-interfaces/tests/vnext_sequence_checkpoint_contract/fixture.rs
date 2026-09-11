@@ -83,7 +83,7 @@ pub struct Fixture {
     pub family: PreparedModelFamily,
     pub catalog: CapabilityCatalog,
     pub policy: ResolvedRuntimePolicy,
-    pub registry: OperationRuntimeRegistry<PlanningTestRuntime>,
+    _registry: OperationRuntimeRegistry<PlanningTestRuntime>,
     pub resolution: PlanNodeResolution,
     pub plan: ExecutionPlan,
 }
@@ -144,7 +144,7 @@ impl Fixture {
             family,
             catalog,
             policy,
-            registry,
+            _registry: registry,
             resolution,
             plan,
         })

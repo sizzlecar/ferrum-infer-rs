@@ -161,6 +161,10 @@ fn oracle(shape: Shape, weights: &[u8], inputs: &[Vec<(usize, f32)>]) -> Vec<f32
     result
 }
 
+#[allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+)]
 fn gpu_elapsed_ns(command: &CommandBufferRef) -> Option<f64> {
     let start_selector = sel!(GPUStartTime);
     let end_selector = sel!(GPUEndTime);
