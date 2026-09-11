@@ -187,7 +187,6 @@ impl Plan {
         ] {
             println!("{key}={}", run.has(check));
         }
-        println!("metal_device_tests={}", run.has(Check::MetalRuntime));
         let mut entries = Vec::new();
         if run.has(Check::MetalRuntime) {
             entries.push(

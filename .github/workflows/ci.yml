@@ -10,6 +10,10 @@ on:
         description: Immutable release candidate used by every quality job
         type: string
         required: true
+    outputs:
+      cpu_source_run_id:
+        description: Original CPU contract producer selected by the quality plan
+        value: ${{ jobs.prepare.outputs.cpu_source_run_id }}
   pull_request:
   workflow_dispatch:
     inputs:
@@ -49,7 +53,7 @@ jobs:
       plan: ${{ steps.scope.outputs.plan }}
       cpu: ${{ steps.scope.outputs.cpu }}
       metal: ${{ steps.scope.outputs.metal }}
-      metal_device_tests: ${{ steps.scope.outputs.metal_device_tests }}
+      cpu_source_run_id: ${{ steps.scope.outputs.cpu_source_run_id }}
       cuda: ${{ steps.scope.outputs.cuda }}
       gpu: ${{ steps.scope.outputs.gpu }}
       gpu_matrix: ${{ steps.scope.outputs.gpu_matrix }}
@@ -82,7 +86,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          if [ "$EVENT_NAME" = workflow_dispatch ] || [ -n "$RELEASE_CANDIDATE" ]; then
+          if [ -n "$RELEASE_CANDIDATE" ]; then
+            "$RUNNER_TEMP/policy" release-plan >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
             "$RUNNER_TEMP/policy" full-plan >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = pull_request ]; then
             test -n "$BASE_SHA"
@@ -104,7 +110,7 @@ jobs:
         with:
           name: ci-plan
           overwrite: true
-          path: ${{ runner.temp }}/ci-plan/origin.txt
+          path: ${{ runner.temp }}/ci-plan/
           if-no-files-found: error
           retention-days: 14
 
@@ -239,6 +245,17 @@ jobs:
             --artifacts "$RUNNER_TEMP/contract-artifacts.jsonl" \
             --output "$RUNNER_TEMP/contract-checks.json"
 
+      - name: Record CPU contract producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          job_id=$(jq -er '[.jobs[] | select(.name == "CPU (Linux)" or .name == "Quality / CPU (Linux)") | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous CPU producer") end' <<< "$jobs")
+          jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
+            '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
+            > "$RUNNER_TEMP/ci-origin.json"
+
       - name: Save executed contract evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -249,6 +266,7 @@ jobs:
           path: |
             ${{ runner.temp }}/contract-checks.json
             ${{ runner.temp }}/contract-checks.logs/
+            ${{ runner.temp }}/ci-origin.json
           retention-days: 14
 
       - name: Execute required device correctness contracts
@@ -323,18 +341,12 @@ jobs:
       - name: Compile with Metal (all targets)
         run: cargo check --locked --workspace --all-targets --features metal
 
-      - name: Workspace and documentation tests for affected execution paths
-        env:
-          METAL_DEVICE_TESTS: ${{ needs.prepare.outputs.metal_device_tests }}
+      - name: Workspace and documentation tests for macOS CPU and OS contracts
         run: |
-          # CPU-only changes still need macOS CPU and OS contracts. Metal
-          # features compile above; enable GPU execution only when affected.
-          test_features=()
-          if [ "$METAL_DEVICE_TESTS" = true ]; then
-            test_features=(--features metal)
-          fi
-          cargo test --locked --workspace --all-targets "${test_features[@]}"
-          cargo test --locked --workspace --doc "${test_features[@]}"
+          # Keep this job's coverage fixed. Metal execution belongs to the
+          # device job so CPU-only edits do not silently execute GPU tests.
+          cargo test --locked --workspace --all-targets
+          cargo test --locked --workspace --doc
 
       # Reuse the real CLI built for integration tests, as in the CPU job.
       - name: "Test: CLI help (macOS build)"
@@ -475,6 +487,15 @@ jobs:
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
           nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
           /usr/local/cuda/bin/nvcc --version
+
+      - name: Metal feature unit integration and documentation tests
+        if: matrix.backend == 'metal'
+        run: |
+          # Retain the former macOS feature suite, including integration tests
+          # beyond op_diff and doctests. CPU/OS contracts also run in their own
+          # platform jobs; their isolated changes do not invalidate GPU results.
+          cargo test --locked --workspace --all-targets --features metal
+          cargo test --locked --workspace --doc --features metal
 
       - name: Build required-backend numerical checker
         env:
@@ -674,10 +695,17 @@ jobs:
         with:
           ref: ${{ inputs.candidate_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Load frozen formal quality sources
+        if: inputs.candidate_sha != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
       - name: Require successful checks for the selected scope
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
           CHANGE_SCOPE: ${{ needs.prepare.outputs.plan }}
+          RELEASE_CANDIDATE: ${{ inputs.candidate_sha }}
           GH_TOKEN: ${{ github.token }}
           PR_BRANCH: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}

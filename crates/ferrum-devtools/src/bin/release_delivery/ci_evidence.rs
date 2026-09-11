@@ -37,6 +37,9 @@ const EXTRACT_LIMIT: u64 = 128 * 1024 * 1024;
 const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 const JSON_LIMIT: u64 = 4 * 1024 * 1024;
 
+#[path = "ci_quality_sources.rs"]
+mod quality_sources;
+
 #[derive(Default)]
 pub(super) struct CiEvidence {
     submission: Option<submission::VerifiedSubmission>,
@@ -67,7 +70,7 @@ impl CiEvidence {
 fn device_producer(backend: Backend) -> (&'static str, &'static str) {
     match backend {
         Backend::Cpu => ("backend-numerics-cpu", "Quality / CPU (Linux)"),
-        Backend::Metal => ("backend-numerics-metal", "Quality / GPU runtime (metal)"),
+        Backend::Metal => ("backend-numerics-metal", SUBMISSION_JOB),
         Backend::Cuda => ("backend-numerics-cuda", "Quality / GPU runtime (cuda)"),
     }
 }
@@ -517,6 +520,7 @@ struct Artifact {
     origin: Origin,
     producer: Job,
     directory: tempfile::TempDir,
+    reused_quality: bool,
 }
 async fn artifact(
     github: &Github,
@@ -568,6 +572,7 @@ async fn artifact(
         origin,
         producer,
         directory,
+        reused_quality: false,
     })
 }
 
@@ -630,6 +635,8 @@ pub(super) async fn load(
     base_tag: &str,
     version: &str,
     metal_binary_sha: &str,
+    workspace: &Path,
+    contracts: &Path,
 ) -> Result<CiEvidence, String> {
     tokio::time::timeout(
         Duration::from_secs(300),
@@ -641,6 +648,8 @@ pub(super) async fn load(
             base_tag,
             version,
             metal_binary_sha,
+            workspace,
+            contracts,
         ),
     )
     .await
@@ -654,6 +663,8 @@ async fn load_inner(
     base_tag: &str,
     version: &str,
     metal_binary_sha: &str,
+    workspace: &Path,
+    contracts: &Path,
 ) -> Result<CiEvidence, String> {
     let needs_submission = plan.obligations.iter().any(|o| {
         o.layer == EvidenceLayer::BackendNumerics
@@ -664,9 +675,6 @@ async fn load_inner(
     let schedule = performance_task_schedule(plan);
     if !schedule.unsupported_obligations.is_empty() {
         return Err("release performance schedule contains unsupported obligations".into());
-    }
-    if !needs_submission && devices.is_empty() && schedule.runs.is_empty() {
-        return Ok(CiEvidence::default());
     }
     let github = Github {
         client: reqwest::Client::builder()
@@ -685,19 +693,18 @@ async fn load_inner(
         .await?;
     let jobs = github.jobs(&format!("{run_path}/jobs?filter=all")).await?;
     let mut evidence = CiEvidence::default();
-    let mut consumed = Vec::new();
+    let (quality, mut consumed) = quality_sources::QualitySources::load(
+        &github, &run, &inventory, &jobs, workspace, contracts,
+    )
+    .await?;
     if needs_submission {
-        let raw = artifact(
-            &github,
-            &run,
-            &inventory,
-            &jobs,
-            "backend-numerics-metal",
-            SUBMISSION_JOB,
-            run_id,
-            candidate,
-        )
-        .await?;
+        let raw = quality
+            .artifact(
+                &github,
+                quality_sources::Check::MetalRuntime,
+                "backend-numerics-metal",
+            )
+            .await?;
         uploaded_during(
             &raw.metadata,
             &raw.producer,
@@ -727,15 +734,22 @@ async fn load_inner(
         consumed.push(raw);
     }
     for backend in devices {
-        let (name, job) = device_producer(backend);
+        let (name, _) = device_producer(backend);
         // Legacy Metal and vNext device assertions share the same immutable
         // producer archive. Reuse it without accepting one route for the other.
         if !consumed.iter().any(|raw| raw.metadata["name"] == name) {
             consumed.push(
-                artifact(
-                    &github, &run, &inventory, &jobs, name, job, run_id, candidate,
-                )
-                .await?,
+                quality
+                    .artifact(
+                        &github,
+                        match backend {
+                            Backend::Cpu => quality_sources::Check::Cpu,
+                            Backend::Metal => quality_sources::Check::MetalRuntime,
+                            Backend::Cuda => quality_sources::Check::CudaRuntime,
+                        },
+                        name,
+                    )
+                    .await?,
             );
         }
         let raw = consumed
@@ -867,15 +881,30 @@ async fn load_inner(
     // racing the download/replay, without rejecting unchanged copied jobs.
     let current = github.json(&run_path).await?;
     verify_run(&current, repo, run_id, candidate)?;
-    let latest = github.jobs(&format!("{run_path}/jobs?filter=all")).await?;
+    let mut latest = BTreeMap::new();
     for raw in consumed {
+        let source_run = raw.origin.run_id;
+        if !latest.contains_key(&source_run) {
+            let path = format!("actions/runs/{source_run}");
+            let refreshed = github.json(&path).await?;
+            verify_run(&refreshed, repo, source_run, &raw.origin.head_sha)?;
+            latest.insert(
+                source_run,
+                (
+                    refreshed,
+                    github.jobs(&format!("{path}/jobs?filter=all")).await?,
+                ),
+            );
+        }
+        let (source, jobs) = &latest[&source_run];
+        let history = quality_sources::execution_history(jobs, raw.reused_quality);
         producer(
             &raw.origin,
             std::slice::from_ref(&raw.producer),
-            &latest,
-            run_id,
-            candidate,
-            current["run_attempt"].as_u64().unwrap(),
+            &history,
+            source_run,
+            &raw.origin.head_sha,
+            source["run_attempt"].as_u64().unwrap(),
             &raw.producer.name,
         )?;
         let refreshed = github
@@ -888,6 +917,7 @@ async fn load_inner(
             return Err("CI evidence artifact metadata changed during verification".into());
         }
     }
+    quality.revalidate(&github).await?;
     Ok(evidence)
 }
 fn verify_run(run: &Value, repo: &str, run_id: u64, candidate: &str) -> Result<(), String> {

@@ -6,7 +6,8 @@ use std::{
     process::ExitCode,
 };
 
-mod checks;
+pub mod checks;
+pub mod release_reuse;
 mod reuse;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,14 +117,24 @@ fn aggregate(prepare: &str, scope: &str, jobs: [&str; REQUIRED_JOBS.len()]) -> R
 
 fn run(args: &[String]) -> Result<(), String> {
     match args {
-        [command] if command == "plan" || command == "full-plan" => {
-            let required = if command == "full-plan" { checks::Checks::ALL } else {
+        [command] if command == "plan" || command == "full-plan" || command == "release-plan" => {
+            let required = if command != "plan" { checks::Checks::ALL } else {
                 let mut input = Vec::new();
                 io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
                 checks::affected(&input)
             };
             let mut plan = checks::Plan::fresh(required);
             let mut notes = Vec::new();
+            let mut release = None;
+            if command == "release-plan" {
+                let selected = release_reuse::from_environment(&mut notes).unwrap_or_else(|error| {
+                    notes.clear();
+                    notes.push(format!("Prior release evidence unavailable; run fresh checks: {error}."));
+                    release_reuse::ReleasePlan::fresh()
+                });
+                plan = selected.plan;
+                release = Some(selected);
+            }
             if command == "plan" && required.0 != 0 {
                 if let Err(error) = reuse::reuse(&mut plan, &mut notes) {
                     plan = checks::Plan::fresh(required);
@@ -132,6 +143,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             reuse::write_origin()?;
+            if let Some(release) = release {
+                release_reuse::save(&release)?;
+                release_reuse::write_producer()?;
+                println!("cpu_source_run_id={}", release.source(checks::Check::Cpu).map(|source| source.run_id.clone()).unwrap_or(env::var("GITHUB_RUN_ID").map_err(|_| "run ID missing")?));
+            }
             if let Ok(path) = env::var("GITHUB_STEP_SUMMARY") {
                 let mut summary = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
                 writeln!(summary, "\nCI check plan: `{}`\n", plan.encode()).map_err(|e| e.to_string())?;
@@ -156,6 +172,13 @@ fn run(args: &[String]) -> Result<(), String> {
             if scope.starts_with("v1:") {
                 let accepted = checks::Plan::parse(scope)?;
                 if accepted.reused.0 != 0 {
+                    if env::var("RELEASE_CANDIDATE").is_ok_and(|value| !value.is_empty()) {
+                        let directory = env::var("RUNNER_TEMP").map_err(|_| "RUNNER_TEMP missing")?;
+                        let frozen = release_reuse::ReleasePlan::parse(&std::fs::read_to_string(std::path::Path::new(&directory).join("ci-plan/release-plan.txt")).map_err(|e| e.to_string())?)?;
+                        if frozen.plan != accepted { return Err("frozen release plan differs from selected checks".into()); }
+                        release_reuse::verify(&frozen, &env::var("GITHUB_REPOSITORY").map_err(|_| "repository missing")?, &env::var("GITHUB_RUN_ID").map_err(|_| "run missing")?, env::var("GITHUB_RUN_ATTEMPT").map_err(|_| "attempt missing")?.parse().map_err(|_| "invalid attempt")?, ".")?;
+                        return Ok(());
+                    }
                     // A source job may have been rerun since prepare. Recheck
                     // the latest outcomes before admitting its earlier success.
                     let mut current = checks::Plan::fresh(accepted.required);
