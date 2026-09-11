@@ -218,6 +218,8 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
         &text(&document["provenance"], "release_base_tag")?,
         &args.version,
         &distributions[&(Backend::Metal, "aarch64-apple-darwin".into())].binary_sha256,
+        &args.workspace,
+        &args.contracts,
     )
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;

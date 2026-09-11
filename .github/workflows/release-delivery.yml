@@ -319,7 +319,7 @@ jobs:
 
   cpu-models:
     name: CPU release models
-    needs: [prepare, quality, tools, stage]
+    needs: [prepare, tools, stage]
     runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
     timeout-minutes: 180
     env:
@@ -377,7 +377,7 @@ jobs:
 
   metal-models:
     name: Metal release models
-    needs: [prepare, quality, stage-metal]
+    needs: [prepare, stage-metal]
     runs-on: [self-hosted, macOS, ARM64, ferrum-metal-large]
     timeout-minutes: 120
     env:
@@ -509,7 +509,7 @@ jobs:
           retention-days: 30
 
   cuda-models:
-    needs: [prepare, quality, tools, stage, stage-cuda-linux]
+    needs: [prepare, tools, stage, stage-cuda-linux]
     runs-on: ubuntu-22.04
     timeout-minutes: 200
     env:
@@ -729,6 +729,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: contract-checks
+          run-id: ${{ needs.quality.outputs.cpu_source_run_id }}
+          github-token: ${{ github.token }}
           path: ${{ runner.temp }}/contracts
       # Optional cached package checkpoints only save work. The publisher still
       # verifies candidate inputs, archived bytes, and every public channel.

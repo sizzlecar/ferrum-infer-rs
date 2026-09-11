@@ -1,9 +1,9 @@
-//! Reuse individual successful PR checks only when the complete source diff
-//! leaves their inputs unaffected. Release/manual workflows always run fresh.
+//! Reuse individual successful PR checks when their execution scope is unchanged.
+//! Formal releases share these history primitives through release_reuse.
 use super::checks::{affected, Check, Checks, Plan};
 use std::{collections::BTreeMap, env, fs, path::PathBuf, process::Command};
 
-fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -15,21 +15,56 @@ fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     }
     Ok(output.stdout)
 }
-fn api(path: &str, query: &str) -> Result<String, String> {
+pub(super) fn api(path: &str, query: &str) -> Result<String, String> {
     String::from_utf8(command("gh", &["api", path, "--paginate", "--jq", query])?)
         .map_err(|_| "non-UTF-8 Actions metadata".into())
 }
-fn id(value: &str) -> bool {
+
+/// Each page includes its declared total before its projected rows. Never
+/// authorize reuse from a truncated or changing Actions history.
+pub(super) fn inventory_rows(input: &str, id_column: usize) -> Result<Vec<String>, String> {
+    let mut total = None;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for line in input.lines() {
+        if let Some(value) = line.strip_prefix("total\t") {
+            let count = value
+                .parse::<usize>()
+                .map_err(|_| "missing Actions inventory count")?;
+            if total.is_some_and(|previous| previous != count) {
+                return Err("Actions inventory changed during pagination".into());
+            }
+            total = Some(count);
+        } else if let Some(row) = line.strip_prefix("item\t") {
+            let value = row
+                .split('\t')
+                .nth(id_column)
+                .filter(|value| id(value))
+                .ok_or("Actions inventory row has no ID")?;
+            if total.is_none() || !ids.insert(value.to_owned()) {
+                return Err("duplicate or uncounted Actions inventory row".into());
+            }
+            rows.push(row.to_owned());
+        } else {
+            return Err("invalid Actions inventory response".into());
+        }
+    }
+    if total != Some(rows.len()) {
+        return Err("Actions inventory is incomplete".into());
+    }
+    Ok(rows)
+}
+pub(super) fn id(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit())
 }
-fn sha(value: &str) -> bool {
+pub(super) fn sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
             .bytes()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
-fn origin(repo: &str, run_id: &str) -> Result<String, String> {
+pub(super) fn origin(repo: &str, run_id: &str) -> Result<String, String> {
     let ids = api(
         &format!("repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"),
         ".artifacts[] | select(.name == \"ci-plan\" and .expired == false) | .id",
@@ -84,20 +119,40 @@ fn parse_origin(input: &str, run_id: &str) -> Result<String, String> {
 }
 
 fn changes_since(revision: &str) -> Result<Checks, String> {
+    changes_since_at(revision, ".")
+}
+
+pub(super) fn changes_since_at(revision: &str, workspace: &str) -> Result<Checks, String> {
     if command(
         "git",
-        &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+        &[
+            "-C",
+            workspace,
+            "cat-file",
+            "-e",
+            &format!("{revision}^{{commit}}"),
+        ],
     )
     .is_err()
     {
         command(
             "git",
-            &["fetch", "--no-tags", "--depth=1", "origin", revision],
+            &[
+                "-C",
+                workspace,
+                "fetch",
+                "--no-tags",
+                "--depth=1",
+                "origin",
+                revision,
+            ],
         )?;
     }
     let diff = command(
         "git",
         &[
+            "-C",
+            workspace,
             "diff",
             "--no-renames",
             "--name-only",
@@ -124,15 +179,15 @@ enum Decision {
 }
 
 #[derive(Debug)]
-struct Execution {
-    run_id: String,
-    job_id: u64,
-    status: String,
-    conclusion: String,
-    completed_at: String,
+pub(super) struct Execution {
+    pub run_id: String,
+    pub job_id: u64,
+    pub status: String,
+    pub conclusion: String,
+    pub completed_at: String,
 }
 
-fn latest(executions: &[Execution]) -> Result<Option<&Execution>, String> {
+pub(super) fn latest(executions: &[Execution]) -> Result<Option<&Execution>, String> {
     let mut result: Option<&Execution> = None;
     for execution in executions {
         if execution.status == "completed" && execution.conclusion == "skipped" {
@@ -158,7 +213,13 @@ fn latest(executions: &[Execution]) -> Result<Option<&Execution>, String> {
         // Rerunning Windows must not make an older GPU success newer than
         // another GPU failure. Order actual check verdicts, not workflow runs.
         if result.is_none_or(|old| {
-            (&execution.completed_at, execution.job_id) > (&old.completed_at, old.job_id)
+            // Timestamps have one-second precision. An old success copied
+            // under a newer ID cannot outrank a failure in that same second.
+            (
+                &execution.completed_at,
+                execution.conclusion != "success",
+                execution.job_id,
+            ) > (&old.completed_at, old.conclusion != "success", old.job_id)
         }) {
             result = Some(execution);
         }
@@ -182,12 +243,17 @@ fn collect_jobs(
 ) -> Result<(), String> {
     let jobs = api(
         &format!("repos/{repo}/actions/runs/{run_id}/{endpoint}"),
-        ".jobs[] | [.name, .status, (.conclusion // \"\"), .id, (.completed_at // \"\"), .run_attempt] | @tsv",
+        "([\"total\", .total_count] | @tsv), (.jobs[] | [\"item\", .name, .status, (.conclusion // \"\"), .id, (.completed_at // \"\"), .run_attempt] | @tsv)",
     )?;
-    record_jobs(run_id, &jobs, required, executions)
+    record_jobs(
+        run_id,
+        &inventory_rows(&jobs, 3)?.join("\n"),
+        required,
+        executions,
+    )
 }
 
-fn record_jobs(
+pub(super) fn record_jobs(
     run_id: &str,
     jobs: &str,
     required: Checks,
@@ -245,10 +311,10 @@ pub fn reuse(plan: &mut Plan, notes: &mut Vec<String>) -> Result<(), String> {
     let runs = String::from_utf8(command("gh", &[
         "api", &format!("repos/{repo}/actions/workflows/ci.yml/runs"), "--method", "GET", "--paginate",
         "-f", "event=pull_request", "-f", &format!("branch={branch}"), "-F", "per_page=100", "--jq",
-        ".workflow_runs[] | [.id, .head_repository.full_name, .head_branch, ([.pull_requests[].number | tostring] | join(\",\"))] | @tsv",
+        "([\"total\", .total_count] | @tsv), (.workflow_runs[] | [\"item\", .id, .head_repository.full_name, .head_branch, ([.pull_requests[].number | tostring] | join(\",\"))] | @tsv)",
     ])?).map_err(|_| "invalid prior run metadata")?;
     let mut executions: BTreeMap<u8, Vec<Execution>> = BTreeMap::new();
-    for row in runs.lines() {
+    for row in inventory_rows(&runs, 0)? {
         let fields: Vec<_> = row.split('\t').collect();
         if fields.len() != 4 || !id(fields[0]) {
             return Err("incomplete prior run metadata".into());
@@ -335,6 +401,28 @@ pub fn write_origin() -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn history_requires_complete_stable_pages_without_duplicate_ids() {
+        assert_eq!(
+            inventory_rows(
+                "total\t2\nitem\t11\tsuccess\ntotal\t2\nitem\t12\tfailure\n",
+                0
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        assert!(inventory_rows("total\t0\n", 0).unwrap().is_empty());
+        for partial in [
+            "total\t2\nitem\t11\tsuccess\n",
+            "total\t2\nitem\t11\tsuccess\ntotal\t2\nitem\t11\tsuccess\n",
+            "total\t1\nitem\t11\tsuccess\ntotal\t2\nitem\t12\tfailure\n",
+            "item\t11\tsuccess\n",
+            "total\tnull\n",
+        ] {
+            assert!(inventory_rows(partial, 0).is_err(), "{partial}");
+        }
+    }
+    #[test]
     fn actions_history_keeps_failed_attempts_and_backdated_success_copies() {
         // GitHub copies unchanged successful jobs into later attempts, with
         // new job IDs but their original completion timestamps.
@@ -391,6 +479,8 @@ mod tests {
             execution("200", 2, "2026-09-10T10:00:00Z", "failure"),
             execution("400", 3, "2026-09-10T11:00:00Z", "skipped"),
         ];
+        assert_eq!(latest(&jobs).unwrap().unwrap().conclusion, "failure");
+        jobs.push(execution("300", 99, "2026-09-10T10:00:00Z", "success"));
         assert_eq!(latest(&jobs).unwrap().unwrap().conclusion, "failure");
         jobs.reverse();
         assert_eq!(latest(&jobs).unwrap().unwrap().conclusion, "failure");

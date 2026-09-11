@@ -496,6 +496,33 @@ artifact digest, product and test-runner bytes, complete task inputs and model
 reports before reusing evidence. Any mismatch falls back to normal cloud
 regression. Performance is measured again under the newly registered policy.
 
+Formal quality checks also support automatic reuse across release attempts at
+different commits. The plan covers every quality check using either a fresh
+execution or a frozen successful source from this repository's main release
+workflow. Complete source diffs determine the affected execution contracts:
+documentation edits can reuse unchanged checks; isolated CPU execution edits
+retain platform compilation and CPU tests without repeating unrelated GPU
+execution. Shared dependencies, workflow/toolchain changes and unknown paths
+require fresh coverage. Version and lockfile changes are not ignored.
+
+Each reused check records its original run, commit, job and executed steps in
+the `ci-plan` artifact. Missing or expired evidence causes that check to run.
+The latest real failure or pending execution blocks older success; retry copies
+and expected skips do not erase that history. `CI required` and the publisher
+revalidate the frozen source, rather than selecting a different success later.
+CPU contracts and backend numerical reports retain their original producer and
+are verified against GitHub's artifact digest and execution/upload intervals.
+
+The macOS platform job has fixed CPU/OS tests and Metal compilation. Metal
+feature integration tests and doctests run in the device job, alongside the
+existing required numerical contracts. Isolated CPU tests duplicated in that
+feature suite are covered by the current platform jobs when GPU results are
+reused; reuse does not claim that every workspace source byte is identical.
+Model tasks depend on their staged packages independently of Quality, so a
+quality-only retry does not restart model execution. Publication still requires
+both, and staged packages, installation reports, model results and performance
+evidence keep their existing candidate and binary bindings.
+
 Resolve failures in mandatory Quick Start paths and selected required regressions
 before publishing. Publish the validated staged bytes and verify the public
 tarballs and checksums.
