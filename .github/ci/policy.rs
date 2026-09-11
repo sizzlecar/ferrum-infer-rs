@@ -2,9 +2,12 @@
 //! required check do not compile Ferrum or download Cargo dependencies.
 use std::{
     env,
-    io::{self, Read},
+    io::{self, Read, Write},
     process::ExitCode,
 };
+
+mod checks;
+mod reuse;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scope {
@@ -93,6 +96,9 @@ fn aggregate(prepare: &str, scope: &str, jobs: [&str; REQUIRED_JOBS.len()]) -> R
     if Outcome::parse(prepare)? != Outcome::Success {
         return Err(format!("prepare must succeed, got {prepare:?}"));
     }
+    if scope.starts_with("v1:") {
+        return checks::Plan::parse(scope)?.aggregate(jobs);
+    }
     let expected = match Scope::parse(scope)? {
         Scope::Docs => Outcome::Skipped,
         Scope::Code => Outcome::Success,
@@ -110,6 +116,34 @@ fn aggregate(prepare: &str, scope: &str, jobs: [&str; REQUIRED_JOBS.len()]) -> R
 
 fn run(args: &[String]) -> Result<(), String> {
     match args {
+        [command] if command == "plan" || command == "full-plan" => {
+            let required = if command == "full-plan" { checks::Checks::ALL } else {
+                let mut input = Vec::new();
+                io::stdin().read_to_end(&mut input).map_err(|e| e.to_string())?;
+                checks::affected(&input)
+            };
+            let mut plan = checks::Plan::fresh(required);
+            let mut notes = Vec::new();
+            if command == "plan" && required.0 != 0 {
+                if let Err(error) = reuse::reuse(&mut plan, &mut notes) {
+                    plan = checks::Plan::fresh(required);
+                    notes.clear();
+                    notes.push(format!("Prior check evidence unavailable; run the required scope: {error}."));
+                }
+            }
+            reuse::write_origin()?;
+            if let Ok(path) = env::var("GITHUB_STEP_SUMMARY") {
+                let mut summary = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+                writeln!(summary, "\nCI check plan: `{}`\n", plan.encode()).map_err(|e| e.to_string())?;
+                for check in checks::Check::ALL {
+                    let state = if plan.reused.has(check) { "reuse verified success" } else if plan.required.has(check) { "run" } else { "unaffected" };
+                    writeln!(summary, "- {}: {state}", check.name()).map_err(|e| e.to_string())?;
+                }
+                for note in notes { writeln!(summary, "\n{note}").map_err(|e| e.to_string())?; }
+            }
+            plan.output();
+            Ok(())
+        }
         [command] if command == "classify" => {
             let mut input = Vec::new();
             io::stdin().read_to_end(&mut input).map_err(|e| format!("reading changed paths: {e}"))?;
@@ -118,7 +152,20 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         [command, prepare, scope, cpu, metal, cuda, gpu, windows] if command == "aggregate" => {
             eprintln!("prepare={prepare:?}, scope={scope:?}, CPU={cpu:?}, Metal={metal:?}, CUDA={cuda:?}, GPU runtime={gpu:?}, Windows MSVC contracts={windows:?}");
-            aggregate(prepare, scope, [cpu, metal, cuda, gpu, windows])
+            aggregate(prepare, scope, [cpu, metal, cuda, gpu, windows])?;
+            if scope.starts_with("v1:") {
+                let accepted = checks::Plan::parse(scope)?;
+                if accepted.reused.0 != 0 {
+                    // A source job may have been rerun since prepare. Recheck
+                    // the latest outcomes before admitting its earlier success.
+                    let mut current = checks::Plan::fresh(accepted.required);
+                    reuse::reuse(&mut current, &mut Vec::new())?;
+                    if current.reused.0 & accepted.reused.0 != accepted.reused.0 {
+                        return Err("a reused check no longer has valid successful evidence; rerun the CI plan".into());
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Err("usage: policy classify < changed-paths.z; policy aggregate PREPARE SCOPE CPU METAL CUDA GPU WINDOWS".to_owned()),
     }

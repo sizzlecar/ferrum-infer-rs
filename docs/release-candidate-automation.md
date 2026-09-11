@@ -184,7 +184,10 @@ executables retain the release profile.
 The native runner label is `ferrum-windows-native`. Configure its service with
 `FERRUM_WINDOWS_VS_ROOT`, `FERRUM_WINDOWS_CUDA_ROOT`,
 `FERRUM_WINDOWS_INNO_ROOT`, and `FERRUM_WINDOWS_OBJECT_CACHE`, plus persistent
-Cargo/Rustup homes and PowerShell 7 on PATH. CUDA 12.4.1 and Inno 6.7.3 remain
+Cargo/Rustup homes, PowerShell 7 and Git for Windows (including Git Bash) on
+the service PATH. MinGit alone does not provide Bash; the Windows WSL launcher
+is not a substitute for Git Bash in composite Actions. The service account
+needs access to these tool directories. CUDA 12.4.1 and Inno 6.7.3 remain
 required; runtime/license hashes and compiler provenance are still verified.
 Trusted Windows CI jobs use this runner; fork PRs use hosted runners. These
 changes remove repeated setup and serialization; no measured cold-build speedup
@@ -200,6 +203,27 @@ Use **Re-run failed jobs** to keep successful platform builds and model results.
 A failed Windows CUDA staging job does not invalidate Windows CPU or Metal
 artifacts; each package is bound to its own successful execution. Avoid
 **Re-run all jobs** for an isolated failure.
+
+PR quality checks also distinguish compilation from device execution. The
+planner reads the complete diff, including removed paths and both sides of
+renames. Documentation changes require documentation checks. Isolated Metal or
+CUDA modules select that backend; CPU vNext changes retain CPU checks and the
+GPU feature compilations that include CPU code, without running unrelated GPU
+arithmetic. The macOS job runs CPU and OS contracts without Metal test features
+when Metal execution is unaffected. CPU reference operators, shared interfaces, dependency changes and
+unknown paths retain broader coverage. Windows installer changes select their
+platform contracts without requiring GPU numerical tests.
+
+For a follow-up PR commit, an individual successful check can be reused only
+when its recorded checkout revision and the new complete diff establish that
+its input scope is unchanged. The summary links the actual source job. Jobs are
+ordered by their own completion time, so retrying Windows cannot make an old
+CUDA success override a newer CUDA failure. Failed, cancelled or pending checks
+are not reusable. A missing or expired origin artifact requires a new execution;
+the first run of this planner therefore establishes its initial evidence.
+The final required check verifies the reused outcomes again in case a source
+job was rerun after planning. Manual and formal-release quality runs require
+fresh checks; PR reuse does not certify newly built release binaries.
 
 After a publication or installation failure, keep the original run and its
 evidence artifacts;

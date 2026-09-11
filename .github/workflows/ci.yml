@@ -41,8 +41,19 @@ jobs:
     name: Plan and validate docs
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
       scope: ${{ steps.scope.outputs.scope }}
+      plan: ${{ steps.scope.outputs.plan }}
+      cpu: ${{ steps.scope.outputs.cpu }}
+      metal: ${{ steps.scope.outputs.metal }}
+      metal_device_tests: ${{ steps.scope.outputs.metal_device_tests }}
+      cuda: ${{ steps.scope.outputs.cuda }}
+      gpu: ${{ steps.scope.outputs.gpu }}
+      gpu_matrix: ${{ steps.scope.outputs.gpu_matrix }}
+      windows: ${{ steps.scope.outputs.windows }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,9 +77,13 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           RELEASE_CANDIDATE: ${{ inputs.candidate_sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           if [ "$EVENT_NAME" = workflow_dispatch ] || [ -n "$RELEASE_CANDIDATE" ]; then
-            echo 'scope=code' >> "$GITHUB_OUTPUT"
+            "$RUNNER_TEMP/policy" full-plan >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = pull_request ]; then
             test -n "$BASE_SHA"
             if ! git cat-file -e "$BASE_SHA^{commit}"; then
@@ -78,12 +93,20 @@ jobs:
             # Keep both paths of renames and preserve NUL separators in a file.
             # A code file renamed into docs must still run code checks.
             git diff --no-renames --name-only -z "$BASE_SHA" HEAD -- > "$RUNNER_TEMP/changed-paths.z"
-            scope=$("$RUNNER_TEMP/policy" classify < "$RUNNER_TEMP/changed-paths.z")
-            echo "scope=$scope" >> "$GITHUB_OUTPUT"
+            "$RUNNER_TEMP/policy" plan < "$RUNNER_TEMP/changed-paths.z" >> "$GITHUB_OUTPUT"
           else
             echo "Unsupported event: $EVENT_NAME" >&2
             exit 1
           fi
+
+      - name: Save checked source identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan
+          overwrite: true
+          path: ${{ runner.temp }}/ci-plan/origin.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Check local documentation links and anchors
         run: |
@@ -115,7 +138,7 @@ jobs:
   cpu:
     name: CPU (Linux)
     needs: prepare
-    if: needs.prepare.outputs.scope == 'code'
+    if: needs.prepare.outputs.cpu == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -279,7 +302,7 @@ jobs:
   metal:
     name: Metal (macOS)
     needs: prepare
-    if: needs.prepare.outputs.scope == 'code'
+    if: needs.prepare.outputs.metal == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -300,14 +323,21 @@ jobs:
       - name: Compile with Metal (all targets)
         run: cargo check --locked --workspace --all-targets --features metal
 
-      - name: Workspace tests (all targets, Metal feature)
-        run: cargo test --locked --workspace --all-targets --features metal
-
-      - name: Documentation tests (Metal feature)
-        run: cargo test --locked --workspace --doc --features metal
+      - name: Workspace and documentation tests for affected execution paths
+        env:
+          METAL_DEVICE_TESTS: ${{ needs.prepare.outputs.metal_device_tests }}
+        run: |
+          # CPU-only changes still need macOS CPU and OS contracts. Metal
+          # features compile above; enable GPU execution only when affected.
+          test_features=()
+          if [ "$METAL_DEVICE_TESTS" = true ]; then
+            test_features=(--features metal)
+          fi
+          cargo test --locked --workspace --all-targets "${test_features[@]}"
+          cargo test --locked --workspace --doc "${test_features[@]}"
 
       # Reuse the real CLI built for integration tests, as in the CPU job.
-      - name: "Test: CLI help (Metal build)"
+      - name: "Test: CLI help (macOS build)"
         run: |
           ./target/debug/ferrum --help
           ./target/debug/ferrum tts --help
@@ -317,7 +347,7 @@ jobs:
   cuda:
     name: CUDA (Linux)
     needs: prepare
-    if: needs.prepare.outputs.scope == 'code'
+    if: needs.prepare.outputs.cuda == 'true'
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.4.0-devel-ubuntu22.04
@@ -384,7 +414,7 @@ jobs:
     # skip remains a missing required result; run reviewed code from a local
     # repository branch before merging it.
     if: >-
-      needs.prepare.outputs.scope == 'code' &&
+      needs.prepare.outputs.gpu == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
@@ -394,12 +424,7 @@ jobs:
       actions: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - backend: metal
-            runner: [self-hosted, macOS, ARM64, ferrum-metal]
-          - backend: cuda
-            runner: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+      matrix: ${{ fromJSON(needs.prepare.outputs.gpu_matrix) }}
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -531,7 +556,7 @@ jobs:
   windows:
     name: Windows (MSVC contracts)
     needs: prepare
-    if: needs.prepare.outputs.scope == 'code'
+    if: needs.prepare.outputs.windows == 'true'
     # Fork pull requests stay on disposable hosted runners.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Windows", "X64", "ferrum-windows-native"]') || fromJSON('["windows-2022"]') }}
     timeout-minutes: 120
@@ -639,6 +664,9 @@ jobs:
     name: CI required
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     needs: [prepare, cpu, metal, cuda, gpu, windows]
     if: always()
     steps:
@@ -649,7 +677,11 @@ jobs:
       - name: Require successful checks for the selected scope
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
-          CHANGE_SCOPE: ${{ needs.prepare.outputs.scope }}
+          CHANGE_SCOPE: ${{ needs.prepare.outputs.plan }}
+          GH_TOKEN: ${{ github.token }}
+          PR_BRANCH: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           CPU_RESULT: ${{ needs.cpu.result }}
           METAL_RESULT: ${{ needs.metal.result }}
           CUDA_RESULT: ${{ needs.cuda.result }}
