@@ -49,7 +49,13 @@ pub(super) async fn command_with(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("start {program}: {e}"))?;
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
+    let mut progress = crate::progress::Follow::new(&log.with_extension("stderr.log"), program);
+    let waited = tokio::select! {
+        _=progress.watch()=>unreachable!("progress monitor runs until cancelled"),
+        result=tokio::time::timeout(timeout, child.wait())=>result,
+    };
+    progress.flush();
+    let status = match waited {
         Ok(result) => result.map_err(|e| format!("wait {program}: {e}"))?,
         Err(_) => {
             let _ = child.kill().await;

@@ -43,6 +43,7 @@ fn args(directory: &Path) -> LocalArgs {
         runner_sha256: "b".repeat(64),
         report_dir: directory.join("reports"),
         task_timeout_secs: 20,
+        request_timeout_secs: 10,
     }
 }
 #[test]
@@ -146,6 +147,8 @@ fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     assert_eq!(after("--stop-prompt"), Some(expected.stop_prompt.as_str()));
     assert_eq!(after("--checks"), Some("basic,tools"));
     assert_eq!(after("--max-tokens"), Some("512"));
+    assert_eq!(after("--run-timeout-secs"), Some("20"));
+    assert_eq!(after("--request-timeout-secs"), Some("10"));
     assert_eq!(after("--context-tokens"), None);
     assert_eq!(after("--max-num-seqs"), None);
     for flag in [

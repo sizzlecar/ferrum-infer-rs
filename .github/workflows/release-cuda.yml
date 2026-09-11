@@ -3,6 +3,10 @@ name: Stage CUDA sm89 release assets
 on:
   workflow_call:
     inputs:
+      platform:
+        description: Stage all platforms, linux, or windows independently
+        type: string
+        default: all
       version:
         description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
         required: true
@@ -42,6 +46,11 @@ on:
         value: ${{ jobs.windows-x86_64-cuda-sm89.outputs.asset_id }}
   workflow_dispatch:
     inputs:
+      platform:
+        description: Platform to stage
+        type: choice
+        default: all
+        options: [all, linux, windows]
       version:
         description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
         required: true
@@ -84,6 +93,7 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  STAGING_PLATFORM: ${{ inputs.platform }}
   VERSION: ${{ inputs.version }}
   RC_SHA: ${{ inputs.release_candidate_sha }}
   RC_TAG: ${{ inputs.release_candidate_tag }}
@@ -99,6 +109,7 @@ env:
 
 jobs:
   linux-x86_64-cuda-sm89:
+    if: inputs.platform != 'windows'
     outputs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
     name: Stage Linux x86_64 CUDA sm89
@@ -109,6 +120,7 @@ jobs:
     steps:
       - name: Validate immutable staging inputs
         run: |
+          case "$STAGING_PLATFORM" in all|linux) ;; *) echo 'Invalid staging platform' >&2; exit 1;; esac
           if [[ "$PUBLISH_RELEASE" != "false" ]]; then
             echo "publish_release must remain false; this workflow only stages bytes" >&2
             exit 1
@@ -261,6 +273,7 @@ jobs:
             ferrum-linux-x86_64-cuda-sm89.dependencies.txt
 
   windows-x86_64-cuda-sm89:
+    if: inputs.platform != 'linux'
     name: Stage Windows x86_64 CUDA sm89
     runs-on: windows-2022
     timeout-minutes: 180
@@ -278,6 +291,7 @@ jobs:
       - name: Validate immutable Windows staging inputs
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:STAGING_PLATFORM -notin @('all', 'windows')) { throw 'Invalid staging platform' }
           if ($env:PUBLISH_RELEASE -ne 'false') { throw 'This workflow only stages bytes' }
           if ($env:RC_SHA -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$') { throw 'A full candidate SHA is required' }
           if ($env:VERSION -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'A formal version is required' }
@@ -374,10 +388,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            ~/ferrum-native-object-cache
-          key: stage-windows-msvc1938-cuda1241-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
+          key: stage-windows-rust-msvc1938-cuda1241-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
           restore-keys: |
+            stage-windows-rust-msvc1938-cuda1241-
             stage-windows-msvc1938-cuda1241-
+      - uses: actions/cache/restore@v4
+        id: windows_native_cache
+        with:
+          path: ~/ferrum-native-object-cache
+          key: stage-windows-native-msvc1938-cuda1241-sm89-${{ hashFiles('crates/ferrum-native-ops-builder/**', 'native-operators/**') }}
+          restore-keys: |
+            stage-windows-native-msvc1938-cuda1241-sm89-
       - name: Verify selected Windows toolchain probes
         run: |
           $ErrorActionPreference = 'Stop'
@@ -389,6 +410,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo build --locked -p ferrum-native-ops-builder --bin ferrum-native-ops-builder
       - name: Build the four native CUDA operators with MSVC
+        id: native_build
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -418,7 +440,10 @@ jobs:
           $builderSha = git rev-parse HEAD
           $receiptArgs = @()
           $failedOperators = @()
+          '| Native operator | Cache hits | Compiled units | Build seconds |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '| --- | ---: | ---: | ---: |' | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2')) {
+            Write-Host "Starting native operator: $operator"
             $build = Join-Path $work "build/$operator"
             $package = Join-Path $set "packages/$operator"
             $plan = Join-Path $work "$operator.plan.json"
@@ -428,6 +453,12 @@ jobs:
               & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $source --out $plan
               $stage = 'source-build'
               & $builder source-build --plan $plan --source-root $source --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:USERPROFILE/ferrum-native-object-cache"
+              $buildReceipt = Get-Content "$build/source-build.receipt.json" -Raw | ConvertFrom-Json
+              $hits = @($buildReceipt.cache_hit_translation_units).Count
+              $compiled = @($buildReceipt.compiled_translation_units).Count
+              $seconds = [math]::Round($buildReceipt.elapsed_ms / 1000, 1)
+              Write-Host "$operator completed: $hits object cache hits, $compiled compiled units, $seconds seconds"
+              "| $operator | $hits | $compiled | $seconds |" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
               $stage = 'materialize-package-spec'
               & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
               $stage = 'package'
@@ -447,6 +478,12 @@ jobs:
           $lock = Join-Path $set 'native-operator-set.lock.json'
           & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
           "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Save native objects before Rust compilation and packaging
+        if: ${{ always() && steps.native_build.outcome == 'success' && steps.windows_native_cache.outputs.cache-primary-key != '' && steps.windows_native_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/ferrum-native-object-cache
+          key: ${{ steps.windows_native_cache.outputs.cache-primary-key }}
       - name: Build and preserve the CPU-only Windows executable
         run: |
           $ErrorActionPreference = 'Stop'
@@ -732,5 +769,4 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            ~/ferrum-native-object-cache
           key: ${{ steps.windows_cache.outputs.cache-primary-key }}

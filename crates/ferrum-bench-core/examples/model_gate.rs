@@ -37,6 +37,10 @@ enum Action {
         output_dir: PathBuf,
         #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..))]
         max_tokens: u32,
+        /// Prepare one backend as soon as its staged bytes are ready. Publication
+        /// still requires the complete plan prepared without this filter.
+        #[arg(long, value_parser = parse_backend)]
+        backend: Option<Backend>,
     },
     /// Missing, failed, duplicate and unfinished reports fail this model gate.
     Verify {
@@ -60,6 +64,14 @@ struct PreparedTasks {
 struct StagedBinary {
     backend: Backend,
     sha256: String,
+}
+fn parse_backend(value: &str) -> Result<Backend, String> {
+    match value {
+        "cpu" => Ok(Backend::Cpu),
+        "metal" => Ok(Backend::Metal),
+        "cuda" => Ok(Backend::Cuda),
+        _ => Err("backend must be cpu, metal or cuda".into()),
+    }
 }
 fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?)
@@ -126,6 +138,15 @@ fn prepare(
     version: &str,
     max_tokens: u32,
 ) -> Result<PreparedTasks, String> {
+    prepare_backend(plan, assets, version, max_tokens, None)
+}
+fn prepare_backend(
+    plan: &Plan,
+    assets: &[StagedBinary],
+    version: &str,
+    max_tokens: u32,
+    backend: Option<Backend>,
+) -> Result<PreparedTasks, String> {
     let version_value = semver::Version::parse(version).map_err(|e| e.to_string())?;
     if !version_value.pre.is_empty() || !version_value.build.is_empty() || max_tokens == 0 {
         return Err("task version must be formal and output budget positive".into());
@@ -142,6 +163,9 @@ fn prepare(
     let schedule = model_task_schedule(plan);
     let mut expectations = Vec::new();
     for run in schedule.runs {
+        if backend.is_some_and(|selected| run.profile.target.backend != selected) {
+            continue;
+        }
         let asset = by_backend
             .get(&run.profile.target.backend)
             .ok_or_else(|| format!("no staged binary for profile {}", run.profile.id))?;
@@ -181,6 +205,7 @@ fn run(action: Action) -> Result<(), String> {
             abi,
             output_dir,
             max_tokens,
+            backend,
         } => {
             let document = read_json(&plan)?;
             if document["schema_version"] != 2 {
@@ -207,7 +232,12 @@ fn run(action: Action) -> Result<(), String> {
                     candidate,
                 )?);
             }
-            let tasks = prepare(&plan, &assets, &version, max_tokens)?;
+            let tasks = match backend {
+                Some(backend) => {
+                    prepare_backend(&plan, &assets, &version, max_tokens, Some(backend))?
+                }
+                None => prepare(&plan, &assets, &version, max_tokens)?,
+            };
             // Reserve a fresh directory so a retry cannot reuse partial or stale tasks.
             fs::create_dir(&output_dir).map_err(|e| format!("create task directory: {e}"))?;
             write_new(&output_dir.join("tasks.json"), &tasks)?;

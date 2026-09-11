@@ -152,6 +152,27 @@ Merging starts [release delivery](../.github/workflows/release-delivery.yml):
 candidate builds, selected model checks, Cargo/GitHub/Homebrew publication and
 actual public installation checks. Require the final `complete` job to succeed.
 
+CPU, Metal, Linux CUDA and Windows staging run independently. CPU and Metal
+model checks use their existing native hosts; CUDA model checks use the bounded
+lease below. Each backend prepares its selected tasks after its own artifacts
+and quality checks are ready, without waiting for Windows packaging. Linux
+delivery tools are built once and shared by artifact ID; Metal consumes its
+staged native tools. Publication still requires every staging job, the complete
+unfiltered task plan, and all selected model reports.
+
+Model jobs print profile counts and case start/completion events. A 30-second
+heartbeat indicates the controller is still waiting; it does not imply a passed
+check. Full diagnostics remain in evidence artifacts, and deadlines and process
+cleanup still apply. CPU requests have a 900-second allowance within the existing
+one-hour task deadline.
+
+Windows native object caching is separate from Rust dependency/build caching.
+Successful native builds save their cache before application compilation, and
+the job summary records actual object hits, compiled units and build time per
+operator. Compiler and dependency validation still decide whether an object can
+be reused. Windows CPU and CUDA packaging currently remain in one staging job;
+this change does not claim to have shortened their cold compilation.
+
 Configure these repository Actions secrets before starting:
 
 - `RELEASE_GITHUB_TOKEN`: repository/workflow and tap write access; must trigger PR CI.

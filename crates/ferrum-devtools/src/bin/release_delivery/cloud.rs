@@ -467,7 +467,23 @@ async fn run_lease(
         .await?;
     let mut reports = Vec::new();
     for (index, task) in tasks.iter().enumerate() {
-        reports.push(remote.run_task(args, task, index).await?);
+        eprintln!(
+            "cuda model {}/{}: {} started",
+            index + 1,
+            tasks.len(),
+            task.profile.id
+        );
+        let started = std::time::Instant::now();
+        let result = remote.run_task(args, task, index).await;
+        eprintln!(
+            "cuda model {}/{}: {} {} after {} s",
+            index + 1,
+            tasks.len(),
+            task.profile.id,
+            if result.is_ok() { "passed" } else { "failed" },
+            started.elapsed().as_secs()
+        );
+        reports.push(result?);
     }
     verify_model_reports(tasks, &reports).map_err(|issues| issues.join("; "))?;
     Ok(reports)
