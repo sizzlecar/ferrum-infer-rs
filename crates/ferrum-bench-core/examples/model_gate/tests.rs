@@ -10,7 +10,7 @@ fn fixture() -> Plan {
 }
 
 fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
-    let profiles: Vec<_> = [Backend::Metal, Backend::Cuda]
+    let profiles: Vec<_> = [Backend::Metal, Backend::Cuda, Backend::Cpu]
         .into_iter()
         .map(|backend| ModelProfile {
             gguf: None,
@@ -45,7 +45,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
     .unwrap()
 }
 fn assets() -> Vec<StagedBinary> {
-    [Backend::Metal, Backend::Cuda]
+    [Backend::Metal, Backend::Cuda, Backend::Cpu]
         .into_iter()
         .enumerate()
         .map(|(i, backend)| StagedBinary {
@@ -155,4 +155,39 @@ fn functional_tasks_declare_context_room_without_changing_output_budget() {
         assert_eq!(task.use_default_backend, expected_capacity.is_none());
     }
     assert!(prepare(&fixture_with_quick_start(false), &assets(), "1.2.3", 2048).is_err());
+}
+
+#[test]
+fn backend_preparation_matches_full_tasks_and_preserves_unresolved_obligations() {
+    let plan = fixture_with_quick_start(false);
+    let full = prepare(&plan, &assets(), "1.2.3", 512).unwrap();
+    let mut combined = Vec::new();
+    for backend in [Backend::Cpu, Backend::Metal, Backend::Cuda] {
+        let selected_assets: Vec<_> = assets()
+            .into_iter()
+            .filter(|asset| asset.backend == backend)
+            .collect();
+        let partial =
+            prepare_backend(&plan, &selected_assets, "1.2.3", 512, Some(backend)).unwrap();
+        assert_eq!(partial.remaining_plan_gaps, full.remaining_plan_gaps);
+        assert_eq!(
+            partial.unsupported_obligations,
+            full.unsupported_obligations
+        );
+        assert!(partial
+            .expectations
+            .iter()
+            .all(|task| task.profile.target.backend == backend));
+        assert!(!partial.expectations.is_empty());
+        combined.extend(partial.expectations);
+    }
+    combined.sort_by(|a, b| a.profile.id.cmp(&b.profile.id));
+    let mut expected = full.expectations;
+    expected.sort_by(|a, b| a.profile.id.cmp(&b.profile.id));
+    assert_eq!(
+        serde_json::to_value(combined).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert!(prepare_backend(&plan, &[], "1.2.3", 512, Some(Backend::Metal)).is_err());
+    assert!(prepare(&plan, &assets()[..1], "1.2.3", 512).is_err());
 }

@@ -209,7 +209,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     let contracts: ContractReport = read(&args.contracts)?;
     verify_contract_report(&contract_groups(), &contracts)
         .map_err(|issues| format!("CPU contract evidence: {}", issues.join("; ")))?;
-    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempt).await?;
+    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempts).await?;
     let ci_evidence = ci_evidence::load(
         &args.repo,
         args.ci_run_id,
@@ -222,7 +222,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
     // A rerun that began while artifacts were inspected must not reuse old Quality.
-    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempt).await?;
+    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempts).await?;
     let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
         return Err("release notes are empty".into());
@@ -829,7 +829,7 @@ async fn verify_ci(
     repo: &str,
     run_id: u64,
     candidate: &str,
-    windows_attempt: u64,
+    windows_attempt: windows_assets::WindowsAttempts,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
@@ -866,7 +866,7 @@ async fn ci_at_with_windows(
     run_id: u64,
     candidate: &str,
     token: Option<&str>,
-    windows_attempt: Option<u64>,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
 ) -> Result<(), String> {
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
@@ -926,6 +926,7 @@ async fn ci_at_with_windows(
     let mut page = 1;
     let mut occurrences = BTreeMap::new();
     let mut windows_occurrences = BTreeMap::new();
+    let mut windows_cpu_occurrences = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut total = None;
     loop {
@@ -947,7 +948,9 @@ async fn ci_at_with_windows(
                 return Err("CI response repeats a job across pages".into());
             }
             let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89";
-            if job["name"] != "Quality / CI required" && !(windows_attempt.is_some() && windows_job)
+            let windows_cpu_job = job["name"] == "stage-cpu-windows / Stage Windows x86_64 CPU";
+            if job["name"] != "Quality / CI required"
+                && !(windows_attempt.is_some() && (windows_job || windows_cpu_job))
             {
                 continue;
             }
@@ -959,7 +962,9 @@ async fn ci_at_with_windows(
             {
                 return Err("Quality job belongs to another run or candidate".into());
             }
-            let selected = if windows_job {
+            let selected = if windows_cpu_job {
+                &mut windows_cpu_occurrences
+            } else if windows_job {
                 &mut windows_occurrences
             } else {
                 &mut occurrences
@@ -979,9 +984,15 @@ async fn ci_at_with_windows(
     if let Some(expected) = windows_attempt {
         ci_evidence::verify_staging_job(
             &run,
-            expected,
+            expected.cuda,
             "stage-cuda / Stage Windows x86_64 CUDA sm89",
             &windows_occurrences,
+        )?;
+        ci_evidence::verify_staging_job(
+            &run,
+            expected.cpu,
+            "stage-cpu-windows / Stage Windows x86_64 CPU",
+            &windows_cpu_occurrences,
         )?;
     }
     let (job_attempt, required) = occurrences

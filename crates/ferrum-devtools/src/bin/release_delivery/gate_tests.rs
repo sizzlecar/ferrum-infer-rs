@@ -378,7 +378,7 @@ async fn ci_fixture_with_windows(
     jobs: Vec<Value>,
     status: u16,
     expect_jobs: bool,
-    windows_attempt: Option<u64>,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
 ) -> Result<(), String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -465,43 +465,68 @@ fn windows_ci_job() -> Value {
     windows
 }
 
+fn windows_cpu_ci_job() -> Value {
+    let mut job = windows_ci_job();
+    job["id"] = json!(25);
+    job["name"] = json!("stage-cpu-windows / Stage Windows x86_64 CPU");
+    job
+}
+
 #[tokio::test]
 async fn windows_assets_require_the_latest_successful_staging_attempt() {
     let windows = windows_ci_job();
     ci_fixture_with_windows(
         ci_run(),
-        vec![ci_job(), windows.clone()],
+        vec![ci_job(), windows_cpu_ci_job(), windows.clone()],
         200,
         true,
-        Some(2),
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
     )
     .await
     .unwrap();
     // A publication-only retry may reuse this exact, still-latest staging job.
     let mut retry = ci_run();
     retry["run_attempt"] = json!(3);
-    ci_fixture_with_windows(retry, vec![ci_job(), windows.clone()], 200, true, Some(2))
-        .await
-        .unwrap();
+    ci_fixture_with_windows(
+        retry,
+        vec![ci_job(), windows_cpu_ci_job(), windows.clone()],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
+    )
+    .await
+    .unwrap();
     for changed in [json!("failure"), json!("cancelled")] {
         let mut failure = windows.clone();
         failure["conclusion"] = changed;
-        assert!(
-            ci_fixture_with_windows(ci_run(), vec![ci_job(), failure], 200, true, Some(2))
-                .await
-                .is_err()
-        );
+        assert!(ci_fixture_with_windows(
+            ci_run(),
+            vec![ci_job(), windows_cpu_ci_job(), failure],
+            200,
+            true,
+            Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 })
+        )
+        .await
+        .is_err());
     }
-    assert!(
-        ci_fixture_with_windows(ci_run(), vec![ci_job(), windows], 200, true, Some(1))
-            .await
-            .is_err()
-    );
-    assert!(
-        ci_fixture_with_windows(ci_run(), vec![ci_job()], 200, true, Some(2))
-            .await
-            .is_err()
-    );
+    assert!(ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), windows_cpu_ci_job(), windows],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 1 })
+    )
+    .await
+    .is_err());
+    assert!(ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job()],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 })
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -514,10 +539,15 @@ async fn windows_staging_reuses_retry_clones_but_rejects_new_executions() {
     run["run_attempt"] = json!(3);
     ci_fixture_with_windows(
         run.clone(),
-        vec![ci_job(), original.clone(), cloned.clone()],
+        vec![
+            ci_job(),
+            windows_cpu_ci_job(),
+            original.clone(),
+            cloned.clone(),
+        ],
         200,
         true,
-        Some(2),
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
     )
     .await
     .unwrap();
@@ -533,21 +563,86 @@ async fn windows_staging_reuses_retry_clones_but_rejects_new_executions() {
         assert!(
             ci_fixture_with_windows(
                 run.clone(),
-                vec![ci_job(), original.clone(), changed],
+                vec![ci_job(), windows_cpu_ci_job(), original.clone(), changed],
                 200,
                 true,
-                Some(2),
+                Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
             )
             .await
             .is_err(),
             "accepted changed {field}"
         );
     }
-    assert!(
-        ci_fixture_with_windows(run, vec![ci_job(), cloned], 200, true, Some(2),)
-            .await
-            .is_err()
-    );
+    assert!(ci_fixture_with_windows(
+        run,
+        vec![ci_job(), windows_cpu_ci_job(), cloned],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn windows_cpu_and_cuda_assets_keep_independent_producer_attempts() {
+    let cuda = windows_ci_job();
+    let mut cpu = windows_cpu_ci_job();
+    cpu["run_attempt"] = json!(1);
+    let attempts = windows_assets::WindowsAttempts { cpu: 1, cuda: 2 };
+    ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), cuda.clone(), cpu.clone()],
+        200,
+        true,
+        Some(attempts),
+    )
+    .await
+    .unwrap();
+    // A new CPU execution must not invalidate a still-current CUDA receipt.
+    let mut newer_cpu = windows_cpu_ci_job();
+    newer_cpu["id"] = json!(26);
+    newer_cpu["started_at"] = json!("2026-01-01T00:02:00Z");
+    newer_cpu["completed_at"] = json!("2026-01-01T00:03:00Z");
+    for conclusion in ["failure", "success"] {
+        newer_cpu["conclusion"] = json!(conclusion);
+        assert!(ci_fixture_with_windows(
+            ci_run(),
+            vec![ci_job(), cuda.clone(), cpu.clone(), newer_cpu.clone()],
+            200,
+            true,
+            Some(attempts)
+        )
+        .await
+        .is_err());
+    }
+    ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), cuda.clone(), newer_cpu],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 }),
+    )
+    .await
+    .unwrap();
+    assert!(ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), cuda.clone()],
+        200,
+        true,
+        Some(attempts)
+    )
+    .await
+    .is_err());
+    assert!(ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), cuda, cpu],
+        200,
+        true,
+        Some(windows_assets::WindowsAttempts { cpu: 2, cuda: 2 })
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]

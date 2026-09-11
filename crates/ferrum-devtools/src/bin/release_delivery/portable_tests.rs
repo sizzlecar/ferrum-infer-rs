@@ -290,7 +290,7 @@ fn staged_fixture_backend(backend: Backend) -> Fixture {
 
 fn accept_staged(
     fixture: &Fixture,
-) -> Result<super::super::gate::windows_assets::VerifiedWindows, String> {
+) -> Result<super::super::gate::windows_assets::VerifiedWindowsArtifact, String> {
     super::super::gate::windows_assets::verify_one(
         fixture.root.path(),
         Backend::Cuda,

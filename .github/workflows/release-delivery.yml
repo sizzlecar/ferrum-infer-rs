@@ -145,6 +145,37 @@ jobs:
             ${{ runner.temp }}/release-performance.json
           retention-days: 30
 
+  tools:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      artifact_id: ${{ steps.tools.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-controller-rust-1.91
+      - name: Build release tools once for Linux consumers
+        run: |
+          cargo build --locked -p ferrum-devtools -p ferrum-bench-core --bin release_delivery --example model_gate
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp target/debug/release_delivery target/debug/examples/model_gate "$RUNNER_TEMP/release-tools/"
+          cd "$RUNNER_TEMP/release-tools"
+          sha256sum release_delivery model_gate > binaries.sha256
+          tar -czf tools.tar.gz release_delivery model_gate binaries.sha256
+      - uses: actions/upload-artifact@v4
+        id: tools
+        with:
+          name: release-tools-linux
+          path: ${{ runner.temp }}/release-tools/tools.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
   quality:
     name: Quality
     needs: prepare
@@ -158,6 +189,31 @@ jobs:
     if: needs.prepare.outputs.active == 'true'
     uses: ./.github/workflows/release.yml
     with:
+      platform: linux
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+
+  stage-metal:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      platform: macos
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+
+  stage-cuda-linux:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release-cuda.yml
+    with:
+      platform: linux
       version: ${{ needs.prepare.outputs.version }}
       release_candidate_sha: ${{ github.sha }}
       release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
@@ -167,8 +223,23 @@ jobs:
   stage-cuda:
     needs: prepare
     if: needs.prepare.outputs.active == 'true'
-    uses: ./.github/workflows/release-cuda.yml
+    uses: ./.github/workflows/release-windows.yml
     with:
+      backend: cuda
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+      windows_launcher_url: ${{ needs.prepare.outputs.windows_launcher_url }}
+      windows_launcher_sha256: ${{ needs.prepare.outputs.windows_launcher_sha256 }}
+
+  stage-cpu-windows:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release-windows.yml
+    with:
+      backend: cpu
       version: ${{ needs.prepare.outputs.version }}
       release_candidate_sha: ${{ github.sha }}
       release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
@@ -178,7 +249,7 @@ jobs:
       windows_launcher_sha256: ${{ needs.prepare.outputs.windows_launcher_sha256 }}
 
   tasks:
-    needs: [prepare, quality, stage, stage-cuda]
+    needs: [prepare, tools, stage, stage-metal, stage-cuda-linux]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     env:
@@ -187,22 +258,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          shared-key: release-delivery-controller-rust-1.91
+          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-tools
+      - name: Verify prepared release tools
+        run: |
+          cd "$RUNNER_TEMP/release-tools"
+          tar -xzf tools.tar.gz
+          sha256sum --check binaries.sha256
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v4
         with:
           name: release-plan
           path: ${{ runner.temp }}/plan
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged
       - name: Bind selected tasks and inspect CPU and CUDA archive bytes
         run: |
-          cargo build --locked -p ferrum-devtools -p ferrum-bench-core --bin release_delivery --example model_gate
           mkdir -p "$RUNNER_TEMP/installation"
           for backend in cpu cuda; do
             asset=ferrum-linux-x86_64.tar.gz
@@ -211,14 +288,14 @@ jobs:
               asset=ferrum-linux-x86_64-cuda-sm89.tar.gz
               extra=(--extract-only)
             fi
-            target/debug/release_delivery inspect \
+            release_delivery inspect \
               --abi "$RUNNER_TEMP/staged/$asset.abi.json" --version "$VERSION" \
               --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-$backend" \
               --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
           done
           # Model runners execute Linux CPU/CUDA and macOS Metal. The separate
           # macOS CPU artifact has its own native installation report.
-          target/debug/examples/model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
+          model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
             --version "$VERSION" \
             --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64.tar.gz.abi.json" \
             --abi "$RUNNER_TEMP/staged/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
@@ -240,9 +317,67 @@ jobs:
           path: ${{ runner.temp }}/installation/
           retention-days: 30
 
+  cpu-models:
+    name: CPU release models
+    needs: [prepare, quality, tools, stage]
+    runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-tools
+      - name: Verify prepared release tools
+        run: |
+          cd "$RUNNER_TEMP/release-tools"
+          tar -xzf tools.tar.gz
+          sha256sum --check binaries.sha256
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage.outputs.linux_runner_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan
+      - name: Execute selected CPU models from the staged archive
+        run: |
+          model_gate prepare --backend cpu --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" --abi "$RUNNER_TEMP/staged-cpu/ferrum-linux-x86_64.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks"
+          release_delivery inspect \
+            --abi "$RUNNER_TEMP/staged-cpu/ferrum-linux-x86_64.tar.gz.abi.json" \
+            --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
+            --extract-dir "$RUNNER_TEMP/extracted-cpu" --output "$RUNNER_TEMP/installation-cpu.json"
+          cd "$RUNNER_TEMP/staged-cpu"
+          sha256sum --check model-regression-linux-x86_64.tar.gz.sha256
+          tar -xzf model-regression-linux-x86_64.tar.gz model_regression
+          runner_sha=$(awk '{print $1}' model-regression-linux-x86_64.binary.sha256)
+          release_delivery local --backend cpu \
+            --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cpu/ferrum" \
+            --runner "$RUNNER_TEMP/staged-cpu/model_regression" --runner-sha256 "$runner_sha" \
+            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 3600 \
+            --request-timeout-secs 900
+      - name: Save CPU release evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-cpu-evidence
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/installation-cpu.json
+            ${{ runner.temp }}/model-cpu/
+          if-no-files-found: error
+          retention-days: 30
+
   metal-models:
     name: Metal release models
-    needs: [prepare, stage, tasks]
+    needs: [prepare, quality, stage-metal]
     runs-on: [self-hosted, macOS, ARM64, ferrum-metal-large]
     timeout-minutes: 120
     env:
@@ -251,13 +386,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage.outputs.metal_runner_id }},${{ needs.stage.outputs.metal_controller_id }}
+          artifact-ids: ${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-metal.outputs.metal_runner_id }},${{ needs.stage-metal.outputs.metal_controller_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-metal
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-tasks
-          path: ${{ runner.temp }}/tasks
       - uses: actions/download-artifact@v4
         with:
           name: release-plan
@@ -266,8 +397,11 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/staged-metal"
           shasum -a 256 -c release-delivery-macos-aarch64.tar.gz.sha256
-          tar -xzf release-delivery-macos-aarch64.tar.gz release_delivery
+          tar -xzf release-delivery-macos-aarch64.tar.gz release_delivery model_gate
           shasum -a 256 -c release-delivery-macos-aarch64.binary.sha256
+          ./model_gate prepare --backend metal --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" --abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks"
           ./release_delivery inspect \
             --abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
             --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
@@ -375,7 +509,7 @@ jobs:
           retention-days: 30
 
   cuda-models:
-    needs: [prepare, stage, stage-cuda, tasks]
+    needs: [prepare, quality, tools, stage, stage-cuda-linux]
     runs-on: ubuntu-22.04
     timeout-minutes: 200
     env:
@@ -384,23 +518,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-delivery-controller-rust-1.91
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.linux_runner_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-tools
+      - name: Verify prepared release tools
+        run: |
+          cd "$RUNNER_TEMP/release-tools"
+          tar -xzf tools.tar.gz
+          sha256sum --check binaries.sha256
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_runner_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-cuda
       - uses: actions/download-artifact@v4
         with:
-          name: release-tasks
-          path: ${{ runner.temp }}/tasks
+          name: release-plan
+          path: ${{ runner.temp }}/plan
       - name: Prepare controller and verified CUDA bytes before the lease clock
         run: |
-          cargo build --locked -p ferrum-devtools --bin release_delivery
-          target/debug/release_delivery inspect \
+          model_gate prepare --backend cuda --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks"
+          release_delivery inspect \
             --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
             --version "$VERSION" --candidate-sha "$GITHUB_SHA" --extract-only \
             --extract-dir "$RUNNER_TEMP/extracted-cuda" --output "$RUNNER_TEMP/cuda-extraction.json"
@@ -482,11 +625,10 @@ jobs:
           jq -s 'sort_by(.profile.id)' "$reuse/raw"/task-*.json > "$reuse/source-tasks.json"
           jq -e --slurpfile source "$reuse/source-tasks.json" \
             '(.expectations | length) > 0 and (.expectations | sort_by(.profile.id)) == $source[0]' "$reuse/current-tasks.json"
-          cargo build --locked -p ferrum-bench-core --example model_gate
           reports=()
           while IFS= read -r -d '' report; do reports+=(--report "$report"); done \
             < <(find "$reuse/raw" -name report.json -type f -print0)
-          target/debug/examples/model_gate verify --tasks "$reuse/current-tasks.json" \
+          model_gate verify --tasks "$reuse/current-tasks.json" \
             "${reports[@]}" --output "$reuse/model-verification.json"
           # Reject a rerun or artifact replacement while download/reverification was in progress.
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" | \
@@ -514,7 +656,7 @@ jobs:
           archive="$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz"
           archive_sha=$(jq -er .asset_sha256 "$archive.abi.json")
           runner_sha=$(awk '{print $1}' "$RUNNER_TEMP/staged-cuda/model-regression-linux-x86_64.binary.sha256")
-          exec target/debug/release_delivery cloud \
+          exec release_delivery cloud \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --archive "$archive" --archive-sha256 "$archive_sha" \
             --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
             --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
@@ -535,7 +677,7 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: [prepare, quality, stage, stage-cuda, tasks, metal-models, cuda-models]
+    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cpu-models]
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -551,14 +693,19 @@ jobs:
           shared-key: release-delivery-publisher-rust-1.91
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage-cuda.outputs.windows_asset_id }}
+          artifact-ids: ${{ needs.stage-cuda.outputs.asset_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-windows
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage-cpu-windows.outputs.asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-windows/cpu
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*-evidence
@@ -590,8 +737,17 @@ jobs:
           path: ${{ runner.temp }}/publication
           key: publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: publication-${{ github.sha }}-
-      - name: Build the release controller
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-tools
+      - name: Verify prepared release tools
+        run: |
+          cd "$RUNNER_TEMP/release-tools"
+          tar -xzf tools.tar.gz
+          sha256sum --check binaries.sha256
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
       - name: Recheck all required evidence and publish missing channel outputs
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
@@ -607,7 +763,7 @@ jobs:
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
-          target/debug/release_delivery publish "${gate_args[@]}" \
+          release_delivery publish "${gate_args[@]}" \
             --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
       - uses: actions/cache/save@v4
         if: always()

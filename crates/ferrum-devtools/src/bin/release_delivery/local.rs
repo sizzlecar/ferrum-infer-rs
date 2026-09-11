@@ -56,6 +56,9 @@ pub struct LocalArgs {
     pub report_dir: PathBuf,
     #[arg(long)]
     pub task_timeout_secs: u64,
+    /// Per-request deadline; CPU profiles can need longer than accelerated runs.
+    #[arg(long, default_value_t = 300)]
+    pub request_timeout_secs: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +166,10 @@ fn runner_arguments(
         task.max_tokens.to_string().into(),
         "--stop-prompt".into(),
         task.stop_prompt.clone().into(),
+        "--run-timeout-secs".into(),
+        args.task_timeout_secs.to_string().into(),
+        "--request-timeout-secs".into(),
+        args.request_timeout_secs.to_string().into(),
     ];
     if let Some(gguf) = &task.profile.gguf {
         words.extend(["--gguf-file".into(), gguf.filename.clone().into()]);
@@ -271,7 +278,10 @@ pub(super) async fn run_command(
         id,
         armed: true,
     };
+    let mut progress =
+        crate::progress::Follow::new(&log.with_extension("stderr.log"), "model runner");
     let result = tokio::select! {
+        _=progress.watch()=>unreachable!("progress monitor runs until cancelled"),
         waited=tokio::time::timeout(timeout,group.child.wait())=>match waited {
             Ok(Ok(status)) if status.success()=>Ok(()),
             Ok(Ok(status))=>Err(format!("model runner exited {status}; raw logs retained")),
@@ -281,6 +291,7 @@ pub(super) async fn run_command(
         _=terminate.recv()=>Err("model runner interrupted by SIGTERM".into()),
         _=interrupt.recv()=>Err("model runner interrupted by SIGINT".into()),
     };
+    progress.flush();
     // Also removes an accidentally orphaned model after an otherwise successful
     // runner exit. SIGKILL cannot invoke the runner's own Drop implementations.
     let cleanup = group.cleanup().await;
@@ -306,12 +317,17 @@ fn checked_report(path: &Path, task: &ExpectedModelRun) -> Result<Value, String>
 }
 
 pub async fn execute(mut args: LocalArgs) -> Result<(), String> {
-    if args.task_timeout_secs == 0
-        || tokio::time::Instant::now()
-            .checked_add(Duration::from_secs(args.task_timeout_secs))
-            .is_none()
-    {
-        return Err("task timeout must be positive and representable".into());
+    for (name, seconds) in [
+        ("task", args.task_timeout_secs),
+        ("request", args.request_timeout_secs),
+    ] {
+        if seconds == 0
+            || tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .is_none()
+        {
+            return Err(format!("{name} timeout must be positive and representable"));
+        }
     }
     let document: PreparedTasks = serde_json::from_value(read_json(&args.tasks)?)
         .map_err(|error| format!("read model tasks: {error}"))?;
@@ -344,6 +360,15 @@ pub async fn execute(mut args: LocalArgs) -> Result<(), String> {
     let mut completed = Vec::new();
     let mut failure = None;
     for (index, task) in selected.iter().enumerate() {
+        eprintln!(
+            "{} model {}/{}: {} started ({} s deadline)",
+            args.backend.name(),
+            index + 1,
+            selected.len(),
+            task.profile.id,
+            args.task_timeout_secs
+        );
+        let task_started = std::time::Instant::now();
         let outcome=async {
             let expected=args.report_dir.join(format!("task-{index}.json"));
             let report_dir=args.report_dir.join(format!("report-{index}"));
@@ -359,6 +384,15 @@ pub async fn execute(mut args: LocalArgs) -> Result<(), String> {
                 (Err(process),Err(report))=>Err(format!("{process}; report: {report}")),
             }
         }.await;
+        eprintln!(
+            "{} model {}/{}: {} {} after {} s",
+            args.backend.name(),
+            index + 1,
+            selected.len(),
+            task.profile.id,
+            if outcome.is_ok() { "passed" } else { "failed" },
+            task_started.elapsed().as_secs()
+        );
         match outcome {
             Ok(()) => completed.push(task.profile.id.clone()),
             Err(error) => {

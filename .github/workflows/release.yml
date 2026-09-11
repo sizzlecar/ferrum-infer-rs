@@ -3,6 +3,10 @@ name: Stage CPU and Metal release assets
 on:
   workflow_call:
     inputs:
+      platform:
+        description: Stage all platforms, linux, or macos independently
+        type: string
+        default: all
       version:
         description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
         required: true
@@ -41,6 +45,11 @@ on:
         value: ${{ jobs.macos-aarch64.outputs.controller_id }}
   workflow_dispatch:
     inputs:
+      platform:
+        description: Platform to stage
+        type: choice
+        default: all
+        options: [all, linux, macos]
       version:
         description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
         required: true
@@ -73,6 +82,7 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  STAGING_PLATFORM: ${{ inputs.platform }}
   VERSION: ${{ inputs.version }}
   RC_SHA: ${{ inputs.release_candidate_sha }}
   RC_TAG: ${{ inputs.release_candidate_tag }}
@@ -81,6 +91,7 @@ env:
 
 jobs:
   linux-x86_64:
+    if: inputs.platform != 'macos'
     outputs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
       runner_id: ${{ steps.runner_id.outputs.artifact-id }}
@@ -90,6 +101,7 @@ jobs:
     steps:
       - name: Validate immutable staging inputs
         run: |
+          case "$STAGING_PLATFORM" in all|linux) ;; *) echo 'Invalid staging platform' >&2; exit 1;; esac
           if [[ "$PUBLISH_RELEASE" != "false" ]]; then
             echo "publish_release must remain false; this workflow only stages bytes" >&2
             exit 1
@@ -238,6 +250,7 @@ jobs:
             ferrum-linux-x86_64.dependencies.txt
 
   macos-aarch64:
+    if: inputs.platform != 'linux'
     outputs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
       runner_id: ${{ steps.runner_id.outputs.artifact-id }}
@@ -248,6 +261,7 @@ jobs:
     steps:
       - name: Validate immutable staging inputs
         run: |
+          case "$STAGING_PLATFORM" in all|macos) ;; *) echo 'Invalid staging platform' >&2; exit 1;; esac
           if [[ "$PUBLISH_RELEASE" != "false" ]]; then
             echo "publish_release must remain false; this workflow only stages bytes" >&2
             exit 1
@@ -298,7 +312,7 @@ jobs:
             stage-rust1.91.0-macos-aarch64-
 
       - name: Build CPU-feature release metadata tool, controller and regression runner once
-        run: cargo build --release --locked -p ferrum-bench-core -p ferrum-devtools --example release_candidate --bin release_delivery --bin model_regression
+        run: cargo build --release --locked -p ferrum-bench-core -p ferrum-devtools --example release_candidate --example model_gate --bin release_delivery --bin model_regression
 
       - name: Verify all workspace release versions
         run: |
@@ -391,9 +405,10 @@ jobs:
 
       - name: Package macOS release controller
         run: |
-          tar -C target/release -czf release-delivery-macos-aarch64.tar.gz release_delivery
+          cp target/release/examples/model_gate target/release/model_gate
+          tar -C target/release -czf release-delivery-macos-aarch64.tar.gz release_delivery model_gate
           shasum -a 256 release-delivery-macos-aarch64.tar.gz > release-delivery-macos-aarch64.tar.gz.sha256
-          (cd target/release && shasum -a 256 release_delivery) > release-delivery-macos-aarch64.binary.sha256
+          (cd target/release && shasum -a 256 release_delivery model_gate) > release-delivery-macos-aarch64.binary.sha256
 
       - name: Upload macOS release controller
         id: controller_id

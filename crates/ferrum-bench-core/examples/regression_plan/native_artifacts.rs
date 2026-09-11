@@ -12,6 +12,8 @@ use std::{
 };
 
 const WORKFLOW: &str = ".github/workflows/release-cuda.yml";
+const WINDOWS_WORKFLOW: &str = ".github/workflows/release-windows.yml";
+const DELIVERY: &str = ".github/workflows/release-delivery.yml";
 const BUNDLE: &str = "native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json";
 const NATIVE: &str = "crates/ferrum-kernels/src/native_ops.rs";
 const BUILDER: &str = "crates/ferrum-native-ops-builder/src/source_build.rs";
@@ -117,6 +119,8 @@ fn snapshot(repo: &Path, revision: &str) -> Result<Snapshot, String> {
         .into_iter()
         .chain([
             WORKFLOW.to_string(),
+            WINDOWS_WORKFLOW.to_string(),
+            DELIVERY.to_string(),
             CI.to_string(),
             NATIVE.to_string(),
             BUILDER.to_string(),
@@ -164,7 +168,26 @@ fn require_fragments(script: &str, fragments: &[&str]) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[path = "native_artifacts/topology.rs"]
+mod topology;
+use topology::producer_jobs;
+
 fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
+    // Source-input reuse is justified only under an unchanged, resolved
+    // producer/consumer graph. A topology migration must retain kernel scope;
+    // do not infer PowerShell or Actions expression equivalence from similar names.
+    for path in [WORKFLOW, WINDOWS_WORKFLOW, DELIVERY] {
+        if yaml(before.get(path)?)? != yaml(after.get(path)?)? {
+            return Err(format!(
+                "artifact producer or consumer workflow changed: {path}"
+            ));
+        }
+    }
+    let delivery = yaml(after.get(DELIVERY)?)?;
+    let windows_workflow = yaml(after.get(WINDOWS_WORKFLOW)?)?;
+    let (linux, windows) =
+        producer_jobs(&yaml(after.get(WORKFLOW)?)?, &windows_workflow, &delivery)?;
     let before = yaml(before.get(WORKFLOW)?)?;
     let after = yaml(after.get(WORKFLOW)?)?;
     for key in ["env", "defaults"] {
@@ -198,11 +221,10 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
             return Err("unreviewed new staging input".into());
         }
     }
-    let linux = &after["jobs"][LINUX];
-    if before["jobs"].get(LINUX) != Some(linux) || linux.is_null() {
+    if before["jobs"].get(LINUX) != after["jobs"].get(LINUX) || linux.is_null() {
         return Err("Linux artifact recipe/toolchain changed".into());
     }
-    mandatory_steps(linux)?;
+    mandatory_steps(&linux)?;
     let url = after["env"]["NATIVE_OPERATOR_SET_ARCHIVE_URL"]
         .as_str()
         .ok_or("native archive URL absent")?;
@@ -216,7 +238,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
     {
         return Err("Linux native archive is not pinned by URL and SHA256".into());
     }
-    let materialize = step(linux, "Materialize pinned CUDA native operator set")?;
+    let materialize = step(&linux, "Materialize pinned CUDA native operator set")?;
     require_fragments(
         materialize,
         &[
@@ -227,7 +249,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
             "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock",
         ],
     )?;
-    let linux_text = serde_json::to_string(linux).unwrap();
+    let linux_text = serde_json::to_string(&linux).unwrap();
     if NEEDLES.iter().any(|needle| linux_text.contains(needle))
         || linux_text.contains("source-build")
         || linux_text.contains("ferrum-native-ops-builder")
@@ -235,25 +257,15 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
         return Err("Linux artifact now consumes native source inputs".into());
     }
     require_fragments(
-        step(linux, "Build release CUDA sm89 binary exactly once")?,
+        step(&linux, "Build release CUDA sm89 binary exactly once")?,
         &[
             "$FERRUM_NATIVE_OPERATOR_SET_LOCK",
             "cargo build --release --locked -p ferrum-cli --bin ferrum",
             "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
         ],
     )?;
-    let windows = &after["jobs"][WINDOWS];
-    if before["jobs"]
-        .get(WINDOWS)
-        .is_some_and(|previous| previous != windows)
-    {
-        return Err("existing Windows native staging recipe changed".into());
-    }
-    if windows["runs-on"] != "windows-2022" || windows["defaults"]["run"]["shell"] != "pwsh" {
-        return Err("Windows native artifact producer host changed".into());
-    }
     require_fragments(
-        step(windows, "Build the four native CUDA operators with MSVC")?,
+        step(&windows, "Build the four native CUDA operators with MSVC")?,
         &[
             "$ErrorActionPreference = 'Stop'",
             "$PSNativeCommandUseErrorActionPreference = $true",
@@ -270,8 +282,8 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
     )?;
     require_fragments(
         step(
-            windows,
-            "Build the release Windows CUDA binary exactly once",
+            &windows,
+            "Build the selected Windows executable exactly once",
         )?,
         &[
             "FERRUM_NATIVE_OPERATOR_SET_LOCK",
@@ -281,7 +293,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
     )?;
     require_fragments(
         step(
-            windows,
+            &windows,
             "Pack the exact release EXE and redistributable runtime bytes",
         )?,
         &[
@@ -297,8 +309,10 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
         "linux_native_archive": {"url": url, "sha256": hash},
         "linux_toolchain": linux["container"], "global_env": after["env"], "global_defaults": after["defaults"],
         "windows_job": WINDOWS, "windows_ci_job": "stage-cuda / Stage Windows x86_64 CUDA sm89",
-        "windows_recipe_check": if before["jobs"].get(WINDOWS).is_some() { "unchanged complete job and inputs" } else { "first introduction: reviewed staging shape, not PowerShell semantic equivalence" },
-        "windows_job_sha256": digest(serde_json::to_string(windows).unwrap().as_bytes())}),
+        "windows_recipe_check": "unchanged local caller, callee and delivery bindings; literal CUDA backend",
+        "windows_job_sha256": digest(serde_json::to_string(&windows).unwrap().as_bytes()),
+        "windows_workflow_sha256": digest(serde_json::to_string(&windows_workflow).unwrap().as_bytes()),
+        "delivery_workflow_sha256": digest(serde_json::to_string(&delivery).unwrap().as_bytes())}),
     )
 }
 
@@ -386,7 +400,7 @@ fn identity_only(
 
 fn consumers(before: &Snapshot, after: &Snapshot) -> Result<(), String> {
     for path in before.consumers.union(&after.consumers) {
-        if path == WORKFLOW || path == CI {
+        if matches!(path.as_str(), WORKFLOW | WINDOWS_WORKFLOW | DELIVERY | CI) {
             for snapshot in [before, after] {
                 let workflow = yaml(snapshot.get(path)?)?;
                 let mut globals = workflow.clone();
@@ -406,9 +420,7 @@ fn consumers(before: &Snapshot, after: &Snapshot) -> Result<(), String> {
                 for (name, job) in jobs {
                     let text = serde_json::to_string(job).unwrap();
                     if NEEDLES.iter().any(|needle| text.contains(needle))
-                        && !job["runs-on"]
-                            .as_str()
-                            .is_some_and(|host| host.starts_with("windows-"))
+                        && !topology::windows_consumer(path, name, job)
                     {
                         return Err(format!(
                             "native source consumer {path}:{name} is not Windows staging"
@@ -558,6 +570,14 @@ mod tests {
         let mut snapshot = Snapshot::default();
         snapshot.files.insert(WORKFLOW.into(), workflow.to_string());
         snapshot.files.insert(
+            WINDOWS_WORKFLOW.into(),
+            include_str!("../../../../.github/workflows/release-windows.yml").into(),
+        );
+        snapshot.files.insert(
+            DELIVERY.into(),
+            include_str!("../../../../.github/workflows/release-delivery.yml").into(),
+        );
+        snapshot.files.insert(
             CI.into(),
             json!({"jobs": {"quality": {"runs-on": "ubuntu-latest", "steps": []}}}).to_string(),
         );
@@ -566,7 +586,9 @@ mod tests {
         snapshot
             .files
             .insert(BUILDER.into(), "fn source_build() {}".into());
-        snapshot.consumers.extend([WORKFLOW.into(), NATIVE.into()]);
+        snapshot
+            .consumers
+            .extend([WINDOWS_WORKFLOW.into(), NATIVE.into()]);
         for path in CONSUMERS {
             snapshot.files.insert(
                 (*path).into(),
@@ -588,9 +610,13 @@ mod tests {
     }
 
     fn change_workflow(snapshot: &mut Snapshot, change: impl FnOnce(&mut Value)) {
-        let mut workflow = yaml(snapshot.get(WORKFLOW).unwrap()).unwrap();
+        change_file(snapshot, WORKFLOW, change);
+    }
+
+    fn change_file(snapshot: &mut Snapshot, path: &str, change: impl FnOnce(&mut Value)) {
+        let mut workflow = yaml(snapshot.get(path).unwrap()).unwrap();
         change(&mut workflow);
-        snapshot.files.insert(WORKFLOW.into(), workflow.to_string());
+        snapshot.files.insert(path.into(), workflow.to_string());
     }
 
     fn commit(repo: &Path, snapshot: &Snapshot) -> String {
@@ -625,7 +651,7 @@ mod tests {
     fn immutable_artifact_inputs_preserve_independent_kernel_and_protocol_impact() {
         let repo = tempfile::tempdir().unwrap();
         super::super::git(repo.path(), &["init", "--quiet"]).unwrap();
-        let before = fixture(false, b"old native device arithmetic");
+        let before = fixture(true, b"old native device arithmetic");
         let after = fixture(true, b"different native device arithmetic");
         let base = commit(repo.path(), &before);
         let candidate = commit(repo.path(), &after);
@@ -678,7 +704,7 @@ mod tests {
 
     #[test]
     fn linux_recipe_archive_toolchain_and_future_windows_changes_retain_kernel_scope() {
-        let before = fixture(false, b"old");
+        let before = fixture(true, b"old");
         let after = fixture(true, b"new");
         assert!(prove(&before, &after).is_ok());
         for change in [
@@ -701,7 +727,7 @@ mod tests {
         let existing = fixture(true, b"old");
         assert!(prove(&existing, &after).is_ok());
         for change in [
-            |value: &mut Value| value["jobs"][WINDOWS]["steps"][0]["run"] = json!("exit 0"),
+            |value: &mut Value| value["jobs"][WINDOWS]["uses"] = json!("unreviewed/producer@main"),
             |value: &mut Value| {
                 value["on"]["workflow_call"]["inputs"]["windows_launcher_url"]["default"] =
                     json!("different input")
@@ -715,7 +741,7 @@ mod tests {
 
     #[test]
     fn provider_logic_inventory_and_test_only_consumer_boundaries_are_strict() {
-        let before = fixture(false, b"old");
+        let before = fixture(true, b"old");
         let after = fixture(true, b"new");
         let mut changed = after.clone();
         *changed.files.get_mut(NATIVE).unwrap() = changed
@@ -749,5 +775,57 @@ mod tests {
             .unwrap()
             .push_str("const PRODUCTION: &str = \"native-operators/cuda/fixture\";");
         assert!(prove(&before, &after).is_err());
+    }
+
+    #[test]
+    fn unresolved_or_optional_producers_never_authorize_reuse() {
+        type Mutation = (&'static str, fn(&mut Value));
+        let changes: &[Mutation] = &[
+            (DELIVERY, |v| {
+                v["jobs"]["stage-cuda-linux"]["with"]["platform"] = json!("windows")
+            }),
+            (DELIVERY, |v| {
+                v["jobs"]["stage-cuda"]["with"]["backend"] = json!("cpu")
+            }),
+            (DELIVERY, |v| {
+                v["jobs"]["stage-cuda"]["uses"] = json!("elsewhere/windows@main")
+            }),
+            (DELIVERY, |v| {
+                v["jobs"]["publish"]["needs"] = json!(["stage-cpu-windows"])
+            }),
+            (DELIVERY, |v| {
+                v["jobs"]["cuda-models"]["continue-on-error"] = json!(true)
+            }),
+            (WORKFLOW, |v| {
+                v["jobs"][LINUX]["if"] = json!("inputs.platform == 'windows'")
+            }),
+            (WINDOWS_WORKFLOW, |v| {
+                v["jobs"]["build"]["if"] = json!("false")
+            }),
+            (WINDOWS_WORKFLOW, |v| {
+                v["jobs"]["build"]["runs-on"] = json!("ubuntu-latest")
+            }),
+            (WINDOWS_WORKFLOW, |v| v["env"]["BACKEND"] = json!("cpu")),
+            (WINDOWS_WORKFLOW, |v| {
+                for step in v["jobs"]["build"]["steps"].as_array_mut().unwrap() {
+                    if step["name"] == "Build the four native CUDA operators with MSVC" {
+                        step["if"] = json!("inputs.backend != 'cuda'");
+                    }
+                }
+            }),
+        ];
+        for &(path, change) in changes {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            // Even an unchanged graph is insufficient when its selected
+            // producer is optional or consumes another platform's artifact.
+            change_file(&mut before, path, change);
+            change_file(&mut after, path, change);
+            assert!(prove(&before, &after).is_err(), "{path}");
+        }
+        assert!(prove(&fixture(false, b"old"), &fixture(true, b"new")).is_err());
+        let mut missing_callee = fixture(true, b"old");
+        missing_callee.files.remove(WINDOWS_WORKFLOW);
+        assert!(prove(&missing_callee, &fixture(true, b"new")).is_err());
     }
 }

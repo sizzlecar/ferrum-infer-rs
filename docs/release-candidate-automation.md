@@ -65,8 +65,9 @@ killed process. Use an isolated preparation checkout to keep this boundary small
 
 ## Verify and stage a candidate
 
-Both [CPU/Metal staging](../.github/workflows/release.yml) and
-[CUDA staging](../.github/workflows/release-cuda.yml) require:
+[CPU/Metal staging](../.github/workflows/release.yml),
+[CUDA staging](../.github/workflows/release-cuda.yml), and
+[Windows staging](../.github/workflows/release-windows.yml) require:
 
 | Input | Meaning |
 | --- | --- |
@@ -132,7 +133,7 @@ execute the required checks using those bytes.
 
 ## What the workflow tests establish
 
-Rust tests parse both real staging workflows and check effective workflow and job
+Rust tests parse the real staging workflows and check effective workflow and job
 permissions, including attempts to elevate package, repository or OIDC access.
 They reject forwarded or inherited secrets and publication secret expressions;
 the automatic read-only GitHub token remains usable. Negative YAML fixtures
@@ -152,14 +153,80 @@ Merging starts [release delivery](../.github/workflows/release-delivery.yml):
 candidate builds, selected model checks, Cargo/GitHub/Homebrew publication and
 actual public installation checks. Require the final `complete` job to succeed.
 
+CPU, Metal, Linux CUDA and Windows staging run independently. CPU and Metal
+model checks use their existing native hosts; CUDA model checks use the bounded
+lease below. Each backend prepares its selected tasks after its own artifacts
+and quality checks are ready, without waiting for Windows packaging. Linux
+delivery tools are built once and shared by artifact ID; Metal consumes its
+staged native tools. Publication still requires every staging job, the complete
+unfiltered task plan, and all selected model reports.
+
+Model jobs print profile counts and case start/completion events. A 30-second
+heartbeat indicates the controller is still waiting; it does not imply a passed
+check. Full diagnostics remain in evidence artifacts, and deadlines and process
+cleanup still apply. CPU requests have a 900-second allowance within the existing
+one-hour task deadline.
+
+Windows native object caching is separate from Rust dependency/build caching.
+Successful native builds save their cache before application compilation, and
+the job summary records actual object hits, compiled units and build time per
+operator. Compiler and dependency validation still decide whether an object can
+be reused. Windows CPU and CUDA packages are built independently by
+[Windows staging](../.github/workflows/release-windows.yml). CUDA uses the dedicated
+Windows runner with preinstalled MSVC, CUDA and Inno Setup; Cargo outputs and
+native objects persist there. CPU uses a separate hosted Windows runner, so its
+package/startup checks do not wait for CUDA compilation or require a GPU driver.
+Both packages reuse the same released launcher. The publisher checks each
+backend's actual successful staging attempt independently, including retries.
+Packaging helpers use debug builds without debug information; distributed Ferrum
+executables retain the release profile.
+
+The native runner label is `ferrum-windows-native`. Configure its service with
+`FERRUM_WINDOWS_VS_ROOT`, `FERRUM_WINDOWS_CUDA_ROOT`,
+`FERRUM_WINDOWS_INNO_ROOT`, and `FERRUM_WINDOWS_OBJECT_CACHE`, plus persistent
+Cargo/Rustup homes, PowerShell 7 and Git for Windows (including Git Bash) on
+the service PATH. MinGit alone does not provide Bash; the Windows WSL launcher
+is not a substitute for Git Bash in composite Actions. The service account
+needs access to these tool directories. CUDA 12.4.1 and Inno 6.7.3 remain
+required; runtime/license hashes and compiler provenance are still verified.
+Trusted Windows CI jobs use this runner; fork PRs use hosted runners. These
+changes remove repeated setup and serialization; no measured cold-build speedup
+is claimed yet.
+
 Configure these repository Actions secrets before starting:
 
 - `RELEASE_GITHUB_TOKEN`: repository/workflow and tap write access; must trigger PR CI.
 - `CARGO_TOKEN`: crates.io publishing credential.
 - `VAST_API_KEY`: Vast account credential for GPU rental and cleanup.
 
-Use **Re-run failed jobs** to reuse successful model results after a publication
-or installation failure. Keep the original run and its evidence artifacts;
+Use **Re-run failed jobs** to keep successful platform builds and model results.
+A failed Windows CUDA staging job does not invalidate Windows CPU or Metal
+artifacts; each package is bound to its own successful execution. Avoid
+**Re-run all jobs** for an isolated failure.
+
+PR quality checks also distinguish compilation from device execution. The
+planner reads the complete diff, including removed paths and both sides of
+renames. Documentation changes require documentation checks. Isolated Metal or
+CUDA modules select that backend; CPU vNext changes retain CPU checks and the
+GPU feature compilations that include CPU code, without running unrelated GPU
+arithmetic. The macOS job runs CPU and OS contracts without Metal test features
+when Metal execution is unaffected. CPU reference operators, shared interfaces, dependency changes and
+unknown paths retain broader coverage. Windows installer changes select their
+platform contracts without requiring GPU numerical tests.
+
+For a follow-up PR commit, an individual successful check can be reused only
+when its recorded checkout revision and the new complete diff establish that
+its input scope is unchanged. The summary links the actual source job. Jobs are
+ordered by their own completion time, so retrying Windows cannot make an old
+CUDA success override a newer CUDA failure. Failed, cancelled or pending checks
+are not reusable. A missing or expired origin artifact requires a new execution;
+the first run of this planner therefore establishes its initial evidence.
+The final required check verifies the reused outcomes again in case a source
+job was rerun after planning. Manual and formal-release quality runs require
+fresh checks; PR reuse does not certify newly built release binaries.
+
+After a publication or installation failure, keep the original run and its
+evidence artifacts;
 missing or failed evidence blocks publication. Do not restart the whole workflow
 solely to retry an upload.
 

@@ -190,7 +190,10 @@ impl Report {
                 failed
             }
         };
-        eprintln!("{name}: {}", case["status"]);
+        eprintln!(
+            "FERRUM_PROGRESS {}",
+            json!({"case":name,"status":case["status"],"elapsed_ms":elapsed.as_millis()})
+        );
         if let Some(error) = case.get("error") {
             eprintln!("  {error}");
         }
@@ -228,6 +231,10 @@ async fn record(
     future: impl Future<Output = Result<Value>>,
 ) -> Result<()> {
     let started = Instant::now();
+    eprintln!(
+        "FERRUM_PROGRESS {}",
+        json!({"case":name,"status":"started","elapsed_ms":0})
+    );
     let result = future.await;
     report.record(name, started.elapsed(), result)
 }

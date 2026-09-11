@@ -14,6 +14,8 @@ mod local;
 mod performance;
 #[path = "release_delivery/portable.rs"]
 mod portable;
+#[path = "release_delivery/progress.rs"]
+mod progress;
 #[path = "release_delivery/public_entry.rs"]
 mod public_entry;
 #[path = "release_delivery/public_install.rs"]
