@@ -4704,7 +4704,16 @@ fn validate_structured_tool_response(
                 call.function.name
             )));
         }
-        if let Some(schema) = tool.function.parameters.as_ref() {
+        // Automatic Chat Completions tools are best effort unless the tool
+        // opts into strict mode. Keep non-strict arguments intact so clients
+        // can report validation errors through the normal tool-result turn.
+        // Required/forced calls retain their existing hard output contract.
+        if let Some(schema) = tool
+            .function
+            .parameters
+            .as_ref()
+            .filter(|_| required || tool.function.strict.unwrap_or(false))
+        {
             validate_json_text_against_schema(schema, &call.function.arguments).map_err(
                 |reason| {
                     ServerError::InternalError(format!(
@@ -5727,6 +5736,7 @@ mod tests {
     mod gemma_thought;
     mod harmony_stops;
     mod reasoning_controls;
+    mod tool_argument_strictness;
     use super::*;
     use async_trait::async_trait;
     use axum::{
@@ -8907,6 +8917,8 @@ mod tests {
             "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
             "function-parameter-xml-template",
         );
+        let mut request = xml_object_argument_tool_request(false);
+        request["tools"][0]["function"]["strict"] = json!(true);
         let response = post_json(
             router_with_stub_and_template(
                 concat!(
@@ -8918,7 +8930,7 @@ mod tests {
                 template,
             ),
             "/v1/chat/completions",
-            xml_object_argument_tool_request(false),
+            request,
         )
         .await;
 
@@ -8939,6 +8951,8 @@ mod tests {
             "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
             "function-parameter-xml-template",
         );
+        let mut request = xml_object_argument_tool_request(true);
+        request["tools"][0]["function"]["strict"] = json!(true);
         let response = post_json(
             router_with_stub_and_template(
                 concat!(
@@ -8950,7 +8964,7 @@ mod tests {
                 template,
             ),
             "/v1/chat/completions",
-            xml_object_argument_tool_request(true),
+            request,
         )
         .await;
 

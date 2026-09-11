@@ -1213,9 +1213,7 @@ async fn execute_with_compatibility(
     println!();
     println!("Endpoints:");
     println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
-    println!("  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)");
-    println!("  POST /v1/audio/speech          - Text-to-speech (TTS)");
-    println!("  POST /v1/embeddings            - Text/image embeddings");
+    println!("  POST /v1/responses             - OpenAI Responses API");
     println!("  GET  /v1/models                - List models");
     println!("  GET  /health                   - Health check");
     println!();

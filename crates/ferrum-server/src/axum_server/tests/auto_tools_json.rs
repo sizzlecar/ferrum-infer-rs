@@ -423,13 +423,56 @@ async fn strict_auto_rejects_tool_arguments_outside_the_declared_schema() {
             };
             // This remains valid JSON but violates the tool's city:string schema.
             chat.message.tool_calls[0].function.arguments = json!({"city": 7}).to_string();
+            let mut request = endpoint.request(weather_schema(), stream);
+            match endpoint {
+                Endpoint::Chat => request["tools"][0]["function"]["strict"] = json!(true),
+                Endpoint::Responses => request["tools"][0]["strict"] = json!(true),
+            }
             let response = post_json(
                 router_with_stub_api_response("", response),
                 endpoint.path(),
-                endpoint.request(weather_schema(), stream),
+                request,
             )
             .await;
             assert_invalid_output(response, endpoint, stream, InvalidOutput::ToolArguments).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_auto_tool_strictness_keeps_default_validation_and_allows_explicit_opt_out() {
+    let arguments = json!({"city": 7}).to_string();
+    for strict in [None, Some(true), Some(false)] {
+        for stream in [false, true] {
+            let mut request = Endpoint::Responses.request(weather_schema(), stream);
+            if let Some(strict) = strict {
+                request["tools"][0]["strict"] = json!(strict);
+            }
+            let mut output = weather_tool_api_response();
+            let ferrum_types::ApiResponse::Chat(chat) = &mut output else {
+                panic!("chat fixture")
+            };
+            chat.message.tool_calls[0].function.arguments = arguments.clone();
+            let response = post_json(
+                router_with_stub_api_response("", output),
+                Endpoint::Responses.path(),
+                request,
+            )
+            .await;
+            if strict == Some(false) {
+                let output = answer(response, Endpoint::Responses, stream).await;
+                assert_eq!(output.calls.len(), 1);
+                assert_eq!(output.calls[0]["name"], "weather");
+                assert_eq!(output.calls[0]["arguments"], arguments);
+            } else {
+                assert_invalid_output(
+                    response,
+                    Endpoint::Responses,
+                    stream,
+                    InvalidOutput::ToolArguments,
+                )
+                .await;
+            }
         }
     }
 }
