@@ -99,6 +99,22 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
     pub(crate) fn kind(&self) -> SequenceStateTransferKind {
         self.reservation.reservation.kind
     }
+
+    pub(super) fn ensure_active_reservation(
+        &self,
+        active: &ActiveSequenceSessionState,
+    ) -> Result<(), VNextError> {
+        if active.epoch != self.reservation.epoch
+            || active.fingerprint != self.reservation.fingerprint
+            || active.state_transfer.active != Some(self.reservation.reservation)
+            || self.reservation.reservation.generation != self.backing.generation()
+        {
+            return Err(invalid_resource(
+                "state transfer reservation does not own this exact session and backing",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct PreparedStateTransferHold {

@@ -21,6 +21,7 @@ fn candidate() -> SequenceFrameCandidate {
                     participant_flights: BTreeMap::new(),
                     submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
+                    completed_boundary: super::super::SequenceCompletedFrontier::default(),
                     retired_frames: 0,
                 },
             )),

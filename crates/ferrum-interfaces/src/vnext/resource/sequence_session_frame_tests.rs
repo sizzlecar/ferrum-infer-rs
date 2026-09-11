@@ -42,6 +42,7 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
                     participant_flights: BTreeMap::new(),
                     submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
+                    completed_boundary: SequenceCompletedFrontier::default(),
                     retired_frames: next_frame - 1,
                 },
             )),

@@ -10,7 +10,8 @@ use super::{
     ProgramBindingLayout, ProgramBindingNodeBinding, RequestAuthorityId, SequenceAuthorityId,
     SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
     SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
-    StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    StepCompletedBoundaryProof, StepCompletedBoundarySlot, StepParticipantFrameAssignment,
+    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
@@ -31,6 +32,7 @@ where
     pub(super) execution_lane: Arc<ExecutionLane<R>>,
     pub(super) reusable_execution_bucket: Option<ReusableExecutionBucketSpec>,
     pub(super) batch_step_id: BatchStepId,
+    pub(super) completed_boundary: Mutex<StepCompletedBoundarySlot>,
     pub(super) finalized: bool,
 }
 
@@ -1062,6 +1064,14 @@ pub(super) fn finalize_session_frames(
     holds: &mut [&mut SessionFrameHold],
     finalization: StepFrameFinalization,
 ) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
+    finalize_session_frames_with_boundary(holds, finalization, None)
+}
+
+pub(super) fn finalize_session_frames_with_boundary(
+    holds: &mut [&mut SessionFrameHold],
+    finalization: StepFrameFinalization,
+    completed: Option<&StepCompletedBoundaryProof>,
+) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
     let slots = holds
         .iter()
         .map(|hold| Arc::clone(&hold.slot))
@@ -1114,12 +1124,18 @@ pub(super) fn finalize_session_frames(
             StepFrameFinalization::Commit => StepParticipantRetirementDisposition::Committed,
         });
     }
-    for (hold, state) in holds.iter().zip(&mut states) {
+    // Compute all frontier updates before changing any participant. A private
+    // Step proof cannot partially commit a batch whose later member is stale.
+    let frontiers = super::completed_frontier_updates(&holds, &states, &dispositions, completed)?;
+    for ((hold, state), frontier) in holds.iter().zip(&mut states).zip(frontiers) {
         let hold = &**hold;
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all step participant sessions were validated");
         };
         active.active_frame = None;
+        if let Some(frontier) = frontier {
+            active.completed_boundary = frontier;
+        }
         match finalization {
             StepFrameFinalization::Abort => active.phase = SequenceSessionPhase::Poisoned,
             StepFrameFinalization::Commit => active.retired_frames += 1,

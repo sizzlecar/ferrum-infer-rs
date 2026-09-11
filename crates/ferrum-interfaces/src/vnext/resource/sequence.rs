@@ -20,6 +20,8 @@ use crate::vnext::CapacityAvailabilitySource;
 
 mod state_transfer;
 pub(crate) use state_transfer::*;
+mod completed_boundary;
+pub(crate) use completed_boundary::*;
 
 const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
 
@@ -818,6 +820,7 @@ pub(super) struct ActiveSequenceSessionState {
     pub(super) participant_flights: BTreeMap<ParticipantNodeKey, ParticipantFlightPhase>,
     pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
     pub(super) state_transfer: SequenceStateTransferSlot,
+    pub(super) completed_boundary: SequenceCompletedFrontier,
     pub(super) retired_frames: u64,
 }
 
@@ -2054,6 +2057,7 @@ where
             participant_flights: BTreeMap::new(),
             submission_wave_flight: None,
             state_transfer: SequenceStateTransferSlot::default(),
+            completed_boundary: SequenceCompletedFrontier::default(),
             retired_frames: 0,
         });
         *authority_source = SequenceExecutionAuthoritySource::SequenceSession;

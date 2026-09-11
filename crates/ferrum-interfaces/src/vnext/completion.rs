@@ -27,6 +27,8 @@ use super::{
 
 mod readback_collection;
 pub use readback_collection::*;
+mod completed_wave;
+pub(crate) use completed_wave::SuccessfulWaveCompletionSeal;
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
@@ -2358,6 +2360,22 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                         "request-state hazard terminal transition failed: {error}"
                     )),
                 );
+            }
+            if matches!(disposition, OperationCompletionDisposition::Succeeded) {
+                if let CompletionResourceLease::Wave(wave) = &resources {
+                    if wave.purpose() == super::SubmissionWavePurpose::FullPlan {
+                        let seal =
+                            SuccessfulWaveCompletionSeal::from_terminal_identity(&batch_identity);
+                        if let Err(error) = wave.record_full_plan_success(&seal) {
+                            disposition =
+                                OperationCompletionDisposition::ContractFailedButQuiescent(
+                                    QuiescentCompletionContractFailure::new(format!(
+                                        "full-plan completion boundary transition failed: {error}"
+                                    )),
+                                );
+                        }
+                    }
+                }
             }
             drop(guard);
             self.remove_exact(slot_id, &record);

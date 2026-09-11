@@ -23,6 +23,9 @@ mod checkpoint_backing_tests;
 #[path = "sequence/state_transfer/resource_tests.rs"]
 mod sequence_state_transfer_tests;
 
+#[path = "sequence/completed_boundary/tests.rs"]
+mod completed_boundary_tests;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;
@@ -86,6 +89,15 @@ struct TestRuntime {
     observed_close_return_during_allocation: AtomicBool,
     reusable_resident_executables: AtomicU64,
     reusable_trim_calls: AtomicU64,
+    fence_behavior: AtomicU8,
+}
+
+#[derive(Clone, Copy)]
+enum TestFenceBehavior {
+    Succeeded = 0,
+    FailedButQuiescent = 1,
+    Indeterminate = 2,
+    Pending = 3,
 }
 
 impl Drop for TestRuntime {
@@ -124,6 +136,21 @@ impl TestRuntime {
             observed_close_return_during_allocation: AtomicBool::new(false),
             reusable_resident_executables: AtomicU64::new(0),
             reusable_trim_calls: AtomicU64::new(0),
+            fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
+        }
+    }
+
+    fn set_fence_behavior(&self, behavior: TestFenceBehavior) {
+        self.fence_behavior.store(behavior as u8, Ordering::Release);
+    }
+
+    fn fence_behavior(&self) -> TestFenceBehavior {
+        match self.fence_behavior.load(Ordering::Acquire) {
+            0 => TestFenceBehavior::Succeeded,
+            1 => TestFenceBehavior::FailedButQuiescent,
+            2 => TestFenceBehavior::Indeterminate,
+            3 => TestFenceBehavior::Pending,
+            _ => unreachable!("test fence behavior is set through its typed setter"),
         }
     }
 
@@ -293,14 +320,35 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {
-        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+        match self.fence_behavior() {
+            TestFenceBehavior::Succeeded => {
+                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+            }
+            TestFenceBehavior::FailedButQuiescent => {
+                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(
+                    DeviceTerminal::FailedButQuiescent(TestRuntimeError),
+                ))
+            }
+            TestFenceBehavior::Indeterminate => FenceQuery::Indeterminate(TestRuntimeError),
+            TestFenceBehavior::Pending => FenceQuery::Pending,
+        }
     }
 
     fn wait_fence(
         &self,
         _fence: &Self::Fence,
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
-        Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+        match self.fence_behavior() {
+            TestFenceBehavior::Succeeded => {
+                Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+            }
+            TestFenceBehavior::FailedButQuiescent => Ok(DeviceTerminalReceipt::unprofiled(
+                DeviceTerminal::FailedButQuiescent(TestRuntimeError),
+            )),
+            TestFenceBehavior::Indeterminate | TestFenceBehavior::Pending => {
+                Err(FenceIndeterminate::new(TestRuntimeError))
+            }
+        }
     }
 
     fn synchronize(&self, _stream: &mut Self::Stream) -> Result<(), Self::Error> {

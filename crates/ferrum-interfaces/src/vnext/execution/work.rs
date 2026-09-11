@@ -1,6 +1,7 @@
 use super::{
     invalid_plan, Deserialize, Deserializer, Digest, Range, Serialize, Sha256, VNextError,
 };
+use std::sync::Arc;
 
 pub const MAX_PROVIDER_WORKSPACE_SHAPE_BUCKETS: usize = 64;
 
@@ -51,7 +52,7 @@ impl DynamicResourceShape {
 /// Evidence for one non-empty immediate token span inside an exact full input.
 /// Counts are derived from the supplied token slice and private range rather
 /// than accepted as caller-provided aggregate dimensions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TokenSpanWork {
     pub(super) immediate_tokens: u64,
     pub(super) full_input_tokens: u64,
@@ -59,7 +60,38 @@ pub struct TokenSpanWork {
     pub(super) immediate_start_token: u64,
     pub(super) immediate_end_token: u64,
     pub(super) fingerprint: String,
+    // Optional process-local evidence. It does not change ordinary work
+    // identity, serialized plans, or resource admission fingerprints.
+    #[serde(skip)]
+    checkpoint_tokens: Option<Arc<[u32]>>,
 }
+
+impl std::fmt::Debug for TokenSpanWork {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenSpanWork")
+            .field("immediate_tokens", &self.immediate_tokens)
+            .field("full_input_tokens", &self.full_input_tokens)
+            .field("fit_input_tokens", &self.fit_input_tokens)
+            .field("immediate_start_token", &self.immediate_start_token)
+            .field("immediate_end_token", &self.immediate_end_token)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+impl PartialEq for TokenSpanWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.immediate_tokens == other.immediate_tokens
+            && self.full_input_tokens == other.full_input_tokens
+            && self.fit_input_tokens == other.fit_input_tokens
+            && self.immediate_start_token == other.immediate_start_token
+            && self.immediate_end_token == other.immediate_end_token
+            && self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for TokenSpanWork {}
 
 impl TokenSpanWork {
     pub fn from_token_ids(
@@ -112,7 +144,31 @@ impl TokenSpanWork {
             immediate_start_token,
             immediate_end_token,
             fingerprint: format!("{:x}", digest.finalize()),
+            checkpoint_tokens: None,
         })
+    }
+
+    /// Retains the exact input for completed-state prefix validation. The
+    /// supplied tokens must reproduce this work's existing identity. Ordinary
+    /// execution need not retain them and remains wire-compatible.
+    pub fn with_checkpoint_tokens(mut self, tokens: Arc<[u32]>) -> Result<Self, VNextError> {
+        let start = usize::try_from(self.immediate_start_token)
+            .map_err(|_| invalid_plan("checkpoint span start exceeds usize"))?;
+        let end = usize::try_from(self.immediate_end_token)
+            .map_err(|_| invalid_plan("checkpoint span end exceeds usize"))?;
+        let fit = usize::try_from(self.fit_input_tokens)
+            .map_err(|_| invalid_plan("checkpoint fit ceiling exceeds usize"))?;
+        if Self::from_token_ids_with_fit(&tokens, start..end, fit)? != self {
+            return Err(invalid_plan(
+                "checkpoint tokens differ from admitted token work",
+            ));
+        }
+        self.checkpoint_tokens = Some(tokens);
+        Ok(self)
+    }
+
+    pub(crate) fn checkpoint_tokens(&self) -> Option<&Arc<[u32]>> {
+        self.checkpoint_tokens.as_ref()
     }
 
     pub const fn immediate_tokens(&self) -> u64 {

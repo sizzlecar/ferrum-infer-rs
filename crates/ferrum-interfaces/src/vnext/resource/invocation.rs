@@ -1,6 +1,6 @@
 use super::{
     begin_participant_flights_dispatch, begin_submission_wave_participant_flights_dispatch,
-    finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id,
+    finalize_session_frames_with_boundary, fmt, invalid_resource, issue_batch_invocation_id,
     poison_session_frame, prepare_participant_flights, prepare_submission_wave_participant_flights,
     reset_participant_flights_after_definitely_not_submitted,
     reset_submission_wave_participant_flights_after_definitely_not_submitted,
@@ -192,6 +192,7 @@ where
             execution_lane,
             reusable_execution_bucket,
             batch_step_id,
+            completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
             finalized: false,
         })
     }
@@ -290,7 +291,13 @@ where
             .iter_mut()
             .map(|participant| &mut participant.frame)
             .collect::<Vec<_>>();
-        let dispositions = finalize_session_frames(&mut holds, finalization)?;
+        let completed = self
+            .completed_boundary
+            .get_mut()
+            .map_err(|_| invalid_resource("step completed-boundary mutex is poisoned"))?;
+        let dispositions =
+            finalize_session_frames_with_boundary(&mut holds, finalization, completed.proof())?;
+        completed.consume();
         self.finalized = true;
         Ok(dispositions)
     }
@@ -1673,6 +1680,13 @@ where
 
     pub(crate) const fn purpose(&self) -> SubmissionWavePurpose {
         self.purpose
+    }
+
+    pub(crate) fn record_full_plan_success(
+        &self,
+        seal: &crate::vnext::SuccessfulWaveCompletionSeal,
+    ) -> Result<(), VNextError> {
+        super::record_completed_wave(self, seal)
     }
 
     pub fn claimed_backing(&self) -> &ClaimedSubmissionWaveBacking {
