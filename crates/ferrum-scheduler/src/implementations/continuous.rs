@@ -8549,6 +8549,89 @@ mod tests {
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
     }
 
+    #[tokio::test]
+    async fn metal_plan_default_limits_low_concurrency_prefill_until_decoder_finishes() {
+        let mut hardware = ferrum_types::HardwareCapabilities::unknown();
+        hardware.backend = "metal".into();
+        let mut workload = ferrum_types::WorkloadProfile::serving_default();
+        workload.target_concurrency = 16;
+        let resolved = ferrum_types::FerrumConfigBuilder::new(
+            ferrum_types::RuntimeConfigSnapshot::from_env_vars(std::iter::empty::<(&str, &str)>()),
+        )
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .with_execution_resource_authority(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        .resolve()
+        .unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        let cap = engine.scheduler.active_decode_prefill_chunk.unwrap();
+        let scheduler = ContinuousBatchScheduler::new(engine.scheduler);
+        let hint = BatchHint {
+            max_batch_size: 16,
+            max_tokens: cap * 16,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let cold_tokens = cap * 4 + 3;
+        let decoder = create_test_request_with_prompt_tokens(Priority::Normal, cold_tokens);
+        let decoder_id = decoder.id.clone();
+        enqueue_waiting(&scheduler, decoder);
+        let cold = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(cold.requests.len(), 1);
+        assert_eq!(cold.requests[0].tokens_to_process, Some(cold_tokens));
+        scheduler.mark_prefill_complete(&decoder_id, cold_tokens);
+        let decoding = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(decoding.requests.len(), 1);
+        assert_eq!(decoding.requests[0].request.id, decoder_id);
+        scheduler.update_decode_progress(&decoder_id, 1);
+
+        let long_tokens = cap * 8 + 7;
+        let prefill = create_test_request_with_prompt_tokens(Priority::Normal, long_tokens);
+        let prefill_id = prefill.id.clone();
+        enqueue_waiting(&scheduler, prefill);
+        let mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert!(mixed.requests.iter().any(|r| r.request.id == decoder_id));
+        let first_chunk = mixed
+            .requests
+            .iter()
+            .find(|r| r.request.id == prefill_id)
+            .unwrap()
+            .tokens_to_process
+            .unwrap();
+        assert!(first_chunk > 0 && first_chunk <= cap && first_chunk < long_tokens);
+        assert!(!scheduler.mark_prefill_chunk_processed(&prefill_id, long_tokens, first_chunk));
+
+        scheduler
+            .complete(
+                decoder_id.clone(),
+                &InferenceResponse {
+                    request_id: decoder_id,
+                    text: String::new(),
+                    tokens: Vec::new(),
+                    finish_reason: ferrum_types::FinishReason::Length,
+                    usage: ferrum_types::TokenUsage::new(cold_tokens, 1),
+                    latency_ms: 0,
+                    created_at: chrono::Utc::now(),
+                    metadata: Default::default(),
+                    api_response: None,
+                    execution_evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        let resumed = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(resumed.requests.len(), 1);
+        assert_eq!(resumed.requests[0].request.id, prefill_id);
+        assert_eq!(
+            resumed.requests[0].tokens_to_process,
+            Some(long_tokens - first_chunk)
+        );
+    }
+
     #[test]
     fn active_decode_prefill_chunk_caps_aggregate_mixed_prefill_tokens() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {

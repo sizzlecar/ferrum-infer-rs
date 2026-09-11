@@ -313,8 +313,7 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             implementation_fingerprint(&[
                 include_str!("gated_delta_attention.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
-                include_str!("linear.rs").as_bytes(),
-                include_str!("linear.metal").as_bytes(),
+                super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),

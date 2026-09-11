@@ -1762,6 +1762,26 @@ impl MetalDeviceRuntime {
     where
         S: DeviceSubmissionTimingSink,
     {
+        // Metal's autoreleased pass descriptors retain their counter sample
+        // buffers. Drain those temporary references after synchronous encoding,
+        // including when the caller runs on a long-lived Rust worker thread.
+        // The returned fence owns the command buffer, counter pages, and command
+        // resources needed until asynchronous device completion.
+        metal::objc::rc::autoreleasepool(|| {
+            self.submit_commands_inner(stream, entries, timing_mode, timing_sink)
+        })
+    }
+
+    fn submit_commands_inner<S>(
+        &self,
+        stream: &mut MetalDeviceStream,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
+        timing_mode: DeviceTimingMode,
+        timing_sink: &S,
+    ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
         let validate_stage = MetalSubmissionStageTimer::start(
             timing_sink,
             DeviceSubmissionStage::ValidateAndPrepare,
@@ -2337,6 +2357,9 @@ impl DeviceRuntime for MetalDeviceRuntime {
         DeviceErrorReport::new(code, error.to_string(), retryable)
     }
 }
+
+#[cfg(test)]
+mod counter_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

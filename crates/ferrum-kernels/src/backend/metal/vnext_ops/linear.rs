@@ -43,6 +43,16 @@ use super::{
 };
 
 const SHADER_SOURCE: &str = include_str!("linear.metal");
+pub(super) const FINGERPRINT_SOURCE: &str = concat!(
+    include_str!("linear.rs"),
+    include_str!("linear.metal"),
+    include_str!("linear/small_batch.rs"),
+    include_str!("linear/small_batch.metal"),
+    include_str!("../q4_k_gemv_v2.metal"),
+    include_str!("../q5_k_gemv.metal"),
+    include_str!("../q6_k_gemv.metal"),
+    include_str!("../k_quant_gemm.metal"),
+);
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.metal.dense_linear.f16.native";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_linear.f16.native";
 const DENSE_SWIGLU_PROVIDER_ID: &str = "provider.metal.dense_swiglu.f16.native";
@@ -54,8 +64,13 @@ const LAST_TOKEN_F32_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_dense_linear.f32.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
+// Small output grids do not provide enough parallelism after sharing weights.
+// Keep the existing GEMV there; the opt-in microbench covers both regimes.
+const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
+
+mod small_batch;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
@@ -83,6 +98,7 @@ pub(super) struct MetalLinearPipelines {
     q6_k_gemv: ComputePipelineState,
     q6_k_gemv_f32: ComputePipelineState,
     k_quant_gemm: MetalKQuantGemmPipelines,
+    small_batch: small_batch::SmallBatchPipelines,
     q8_0: ComputePipelineState,
     q8_0_f32: ComputePipelineState,
     swiglu: ComputePipelineState,
@@ -92,6 +108,7 @@ pub(super) struct MetalLinearPipelines {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinearDispatchKind {
     CooperativeGemv,
+    SharedWeightGemv,
     TiledGemm,
 }
 
@@ -133,6 +150,7 @@ impl MetalLinearPipelines {
                 .map_err(MetalDeviceRuntimeError::contract)?,
             k_quant_gemm: MetalKQuantGemmPipelines::new(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
+            small_batch: small_batch::SmallBatchPipelines::new(device)?,
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
             q8_0_f32: pipeline(LINEAR_Q8_0_F32_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
@@ -144,7 +162,13 @@ impl MetalLinearPipelines {
         &self,
         format: LinearPhysicalFormat,
         rows: u32,
+        out_features: u32,
     ) -> (&ComputePipelineState, LinearDispatchKind) {
+        if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+            if let Some(pipeline) = self.small_batch.pipeline(format, rows) {
+                return (pipeline, LinearDispatchKind::SharedWeightGemv);
+            }
+        }
         let tiled = rows >= QUANTIZED_TILED_GEMM_MIN_ROWS;
         match (format, tiled) {
             (LinearPhysicalFormat::Q4K, true) => {
@@ -518,13 +542,8 @@ fn linear_provider_descriptor(
         &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
         accepted_quantization_formats,
         implementation_fingerprint(&[
-            include_str!("linear.rs").as_bytes(),
-            SHADER_SOURCE.as_bytes(),
+            FINGERPRINT_SOURCE.as_bytes(),
             super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
-            include_str!("../q4_k_gemv_v2.metal").as_bytes(),
-            include_str!("../q5_k_gemv.metal").as_bytes(),
-            include_str!("../q6_k_gemv.metal").as_bytes(),
-            crate::backend::metal::k_quant_gemm::SHADER_SOURCE.as_bytes(),
             provider_id.as_bytes(),
         ]),
     )
@@ -1415,7 +1434,11 @@ pub(super) fn dispatch_linear(
     launch: LinearLaunch,
 ) {
     let (pipeline, dispatch_kind) = match launch.activation_type {
-        ElementType::F16 => pipelines.linear_pipeline(launch.format, launch.params.rows),
+        ElementType::F16 => pipelines.linear_pipeline(
+            launch.format,
+            launch.params.rows,
+            launch.params.out_features,
+        ),
         ElementType::F32 => (
             pipelines
                 .f32_linear_pipeline(launch.format)
@@ -1475,6 +1498,10 @@ fn dispatch_linear_grid(
                 u64::from(params.rows),
                 1,
             ),
+            MTLSize::new(32, 2, 1),
+        ),
+        LinearDispatchKind::SharedWeightGemv => encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.out_features).div_ceil(4), 1, 1),
             MTLSize::new(32, 2, 1),
         ),
         LinearDispatchKind::TiledGemm => {
@@ -2018,6 +2045,9 @@ fn validate_swiglu_participant(
 mod native_tests;
 
 #[cfg(test)]
+mod microbench;
+
+#[cfg(test)]
 mod tests {
     use super::super::numerical_tolerance;
     use super::*;
@@ -2370,7 +2400,8 @@ mod tests {
             (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
             (GgmlDType::Q8_0, LinearPhysicalFormat::Q8_0),
         ] {
-            let (_, dispatch_kind) = pipelines.linear_pipeline(format, rows as u32);
+            let (_, dispatch_kind) =
+                pipelines.linear_pipeline(format, rows as u32, output_width as u32);
             assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
             let quantized = QTensor::quantize(&dense, dtype).unwrap();
             let reference = input_tensor
@@ -2477,7 +2508,8 @@ mod tests {
         let output = output_buffer::<f16>(&device, rows * output_width);
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        let (_, dispatch_kind) = pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32);
+        let (_, dispatch_kind) =
+            pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32, output_width as u32);
         assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
         dispatch_raw_linear(
             &pipelines,
@@ -2942,8 +2974,11 @@ mod tests {
         gather.end_encoding();
 
         let encoder = command.new_compute_command_encoder();
-        let (_, dispatch_kind) =
-            pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, participant_count as u32);
+        let (_, dispatch_kind) = pipelines.linear_pipeline(
+            LinearPhysicalFormat::Q6K,
+            participant_count as u32,
+            output_width as u32,
+        );
         assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
         dispatch_raw_linear_with_offsets(
             &pipelines,
@@ -3057,7 +3092,8 @@ mod tests {
         output_offset_bytes: u64,
         params: LinearParams,
     ) {
-        let (pipeline, dispatch_kind) = pipelines.linear_pipeline(format, params.rows);
+        let (pipeline, dispatch_kind) =
+            pipelines.linear_pipeline(format, params.rows, params.out_features);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);
