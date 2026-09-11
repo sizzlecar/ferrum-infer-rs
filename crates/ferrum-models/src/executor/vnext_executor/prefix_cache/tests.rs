@@ -408,6 +408,284 @@ fn empty_or_raced_index_removal_grants_no_extra_maintenance_attempt() {
     assert!(!empty.allows_backing_attempt(MAX_BACKING_MAINTENANCE_ATTEMPTS));
 }
 
+#[tokio::test]
+async fn capture_growth_reprobes_before_replacing_any_index_owner() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let new: Arc<str> = Arc::from("new");
+    let mut attempts = VecDeque::from([
+        CaptureAttempt::NeedsMaintenance(()),
+        CaptureAttempt::Finished(Some(Arc::clone(&new))),
+    ]);
+    let mut maintained = false;
+    let entries = index.lock().entries.len();
+    let result = capture_with_capacity(
+        entries,
+        || std::future::ready(Ok(attempts.pop_front().expect("fresh capture is bounded"))),
+        |()| {
+            assert_eq!(Arc::strong_count(&old), 2);
+            maintained = true;
+            std::future::ready(Ok(CaptureMaintenanceDecision::RetryCapture))
+        },
+        || panic!("growth did not establish an eviction reason"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(maintained);
+    assert!(attempts.is_empty());
+    assert!(Arc::ptr_eq(&result, &new));
+    assert_eq!(
+        index.lock().longest(&[1, 3], false, |_| true).as_deref(),
+        Some("old")
+    );
+    assert_eq!(Arc::strong_count(&old), 2);
+}
+
+#[tokio::test]
+async fn capture_ready_but_claim_still_unavailable_skips_without_eviction() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let maintenance_owner: Arc<str> = Arc::from("maintenance");
+    let mut attempts = VecDeque::from([
+        CaptureAttempt::<_, ()>::NeedsMaintenance(Arc::clone(&maintenance_owner)),
+        CaptureAttempt::NeedsMaintenance(Arc::clone(&maintenance_owner)),
+    ]);
+    let mut maintained = false;
+    let entries = index.lock().entries.len();
+    let result = capture_with_capacity(
+        entries,
+        || {
+            std::future::ready(Ok(attempts
+                .pop_front()
+                .expect("cannot chase concurrent claims")))
+        },
+        |owner| {
+            assert!(!maintained);
+            maintained = true;
+            drop(owner);
+            std::future::ready(Ok(CaptureMaintenanceDecision::RetryCapture))
+        },
+        || panic!("a failed claim after Ready is not a device budget refusal"),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert!(attempts.is_empty());
+    assert_eq!(Arc::strong_count(&maintenance_owner), 1);
+    assert_eq!(Arc::strong_count(&old), 2);
+}
+
+#[tokio::test]
+async fn capture_ready_then_fresh_retention_refusal_uses_bounded_new_evidence() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let pin = index.lock().longest(&[1, 3], false, |_| true).unwrap();
+    let retention = || CheckpointRetentionSkipReason::Capacity {
+        requested_bytes: 32,
+        retained_bytes: 64,
+        maximum_bytes: 80,
+    };
+    let mut attempts = VecDeque::from([
+        CaptureAttempt::<(), ()>::NeedsMaintenance(()),
+        CaptureAttempt::RetentionLimited(retention()),
+        CaptureAttempt::RetentionLimited(retention()),
+    ]);
+    let observed = std::cell::Cell::new(0);
+    let mut maintained = false;
+    let entries = index.lock().entries.len();
+    let result = capture_with_capacity(
+        entries,
+        || {
+            observed.set(observed.get() + 1);
+            std::future::ready(Ok(attempts
+                .pop_front()
+                .expect("retention retries are bounded")))
+        },
+        |()| {
+            assert!(!maintained);
+            maintained = true;
+            std::future::ready(Ok(CaptureMaintenanceDecision::RetryCapture))
+        },
+        || {
+            assert_eq!(
+                observed.get(),
+                2,
+                "eviction requires the fresh retention refusal"
+            );
+            index.lock().evict().is_some()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert!(attempts.is_empty());
+    assert!(maintained);
+    assert_eq!(Arc::strong_count(&old), 2);
+    assert!(index.lock().entries.is_empty());
+    drop(pin);
+    assert_eq!(Arc::strong_count(&old), 1);
+}
+
+#[tokio::test]
+async fn capture_noncapacity_maintenance_error_preserves_existing_checkpoint() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let entries = index.lock().entries.len();
+    let result = capture_with_capacity(
+        entries,
+        || std::future::ready(Ok(CaptureAttempt::<(), ()>::NeedsMaintenance(()))),
+        |()| {
+            std::future::ready(Ok(capture_maintenance_decision(Err(
+                VNextError::InvalidExecutionPlan {
+                    reason: "maintenance authority no longer matches the plan".into(),
+                },
+            ))))
+        },
+        || panic!("an arbitrary maintenance error is not capacity pressure"),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(Arc::strong_count(&old), 2);
+
+    let cancelled = capture_with_capacity(
+        entries,
+        || std::future::ready(Ok(CaptureAttempt::<(), ()>::NeedsMaintenance(()))),
+        |()| std::future::ready(Err(FerrumError::backend("source is no longer Open"))),
+        || panic!("cancellation is not a capacity refusal"),
+    )
+    .await;
+    assert!(cancelled.is_err());
+    assert_eq!(Arc::strong_count(&old), 2);
+}
+
+fn capture_budget_refusal() -> CaptureMaintenanceDecision {
+    capture_maintenance_decision(Ok(CheckpointCapacityMaintenanceOutcome::Skipped(
+        CheckpointCapacityMaintenanceSkipReason::DeviceCapacity(
+            DeviceCapacityPressure::new(
+                DeviceCapacityPressureScope::PlanBudget,
+                "device.capture-budget-test".into(),
+                32,
+                64,
+                80,
+                64,
+                80,
+            )
+            .unwrap(),
+        ),
+    )))
+}
+
+#[tokio::test]
+async fn capture_budget_refusal_releases_one_index_owner_then_retries_capture() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let other = insert(&mut index.lock(), &[3], &[3, 4], "other");
+    let maintained = std::cell::Cell::new(false);
+    let entries = index.lock().entries.len();
+    let result = capture_with_capacity(
+        entries,
+        || {
+            let attempt = if index.lock().entries.len() == 2 {
+                CaptureAttempt::NeedsMaintenance(())
+            } else {
+                assert!(maintained.get());
+                assert_eq!(Arc::strong_count(&old), 1);
+                CaptureAttempt::Finished(Some("captured after release"))
+            };
+            std::future::ready(Ok(attempt))
+        },
+        |()| {
+            maintained.set(true);
+            std::future::ready(Ok(capture_budget_refusal()))
+        },
+        || {
+            assert!(
+                maintained.get(),
+                "maintenance must establish actual pressure first"
+            );
+            index.lock().evict().is_some()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, Some("captured after release"));
+    assert_eq!(Arc::strong_count(&other), 2);
+}
+
+#[tokio::test]
+async fn capture_pins_and_new_index_entries_cannot_extend_the_recovery_budget() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    let pin = index.lock().longest(&[1, 3], false, |_| true).unwrap();
+    let initial_entries = index.lock().entries.len();
+    let mut maintenance_attempts = 0;
+    let result = capture_with_capacity(
+        initial_entries,
+        || std::future::ready(Ok(CaptureAttempt::<(), ()>::NeedsMaintenance(()))),
+        |()| {
+            maintenance_attempts += 1;
+            assert!(maintenance_attempts <= initial_entries + 1);
+            // Removing the index owner has not released the pinned resource.
+            assert!(Arc::strong_count(&old) >= 2);
+            std::future::ready(Ok(capture_budget_refusal()))
+        },
+        || {
+            let removed = index.lock().evict();
+            drop(insert(
+                &mut index.lock(),
+                &[5],
+                &[5, 6],
+                "concurrent capture",
+            ));
+            removed.is_some()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(maintenance_attempts, initial_entries + 1);
+    assert_eq!(Arc::strong_count(&old), 2);
+    drop(pin);
+    assert_eq!(Arc::strong_count(&old), 1);
+    assert_eq!(
+        index.lock().longest(&[5, 7], false, |_| true).as_deref(),
+        Some("concurrent capture")
+    );
+}
+
+#[tokio::test]
+async fn disabled_or_individually_oversized_capture_never_discards_index_owners() {
+    let index = Mutex::new(PrefixIndex::default());
+    let old = insert(&mut index.lock(), &[1], &[1, 2], "old");
+    for reason in [
+        CheckpointRetentionSkipReason::Disabled,
+        CheckpointRetentionSkipReason::Capacity {
+            requested_bytes: 65,
+            retained_bytes: 32,
+            maximum_bytes: 64,
+        },
+    ] {
+        let mut reason = Some(reason);
+        let entries = index.lock().entries.len();
+        let result = capture_with_capacity(
+            entries,
+            || {
+                std::future::ready(Ok(CaptureAttempt::<(), ()>::RetentionLimited(
+                    reason.take().unwrap(),
+                )))
+            },
+            |()| std::future::ready(Ok(CaptureMaintenanceDecision::RetryCapture)),
+            || panic!("release cannot satisfy disabled retention or an oversized candidate"),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
+    assert_eq!(Arc::strong_count(&old), 2);
+}
+
 #[test]
 fn native_snapshot_reports_index_extents_after_replacement_and_pinned_eviction() {
     use checkpoint_fixture::{Fixture, Spec};

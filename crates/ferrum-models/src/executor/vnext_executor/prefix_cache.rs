@@ -198,6 +198,99 @@ fn capture_candidate(chunk: PrefillChunk) -> bool {
         && chunk.total_prompt_tokens() - chunk.end() <= chunk.tokens_to_process()
 }
 
+enum CaptureAttempt<M, C> {
+    Finished(Option<C>),
+    NeedsMaintenance(M),
+    RetentionLimited(CheckpointRetentionSkipReason),
+}
+
+enum CaptureMaintenanceDecision {
+    RetryCapture,
+    CapacityLimited,
+    Skip,
+}
+
+fn retention_release_can_help(reason: &CheckpointRetentionSkipReason) -> bool {
+    matches!(
+        reason,
+        CheckpointRetentionSkipReason::Capacity {
+            requested_bytes,
+            retained_bytes,
+            maximum_bytes,
+        } if requested_bytes <= maximum_bytes && *retained_bytes > 0
+    )
+}
+
+fn capture_maintenance_decision(
+    result: std::result::Result<CheckpointCapacityMaintenanceOutcome, VNextError>,
+) -> CaptureMaintenanceDecision {
+    match result {
+        Ok(CheckpointCapacityMaintenanceOutcome::Ready(_)) => {
+            CaptureMaintenanceDecision::RetryCapture
+        }
+        Ok(CheckpointCapacityMaintenanceOutcome::Skipped(
+            CheckpointCapacityMaintenanceSkipReason::DeviceCapacity(_)
+            | CheckpointCapacityMaintenanceSkipReason::PoolResident(_),
+        )) => CaptureMaintenanceDecision::CapacityLimited,
+        Ok(CheckpointCapacityMaintenanceOutcome::Skipped(
+            CheckpointCapacityMaintenanceSkipReason::Retention(reason),
+        )) if retention_release_can_help(&reason) => CaptureMaintenanceDecision::CapacityLimited,
+        // Disabled retention, an oversized checkpoint, and arbitrary backend or
+        // contract errors cannot justify discarding a valid cached checkpoint.
+        Ok(CheckpointCapacityMaintenanceOutcome::Skipped(_)) | Err(_) => {
+            CaptureMaintenanceDecision::Skip
+        }
+    }
+}
+
+/// The callbacks keep native allocation and completion on the existing worker.
+/// Each successful index removal permits one new maintenance attempt; concurrent
+/// insertions and still-pinned owners cannot increase this call's finite budget.
+async fn capture_with_capacity<M, C, A, F>(
+    entries: usize,
+    mut capture: impl FnMut() -> A,
+    mut maintain: impl FnMut(M) -> F,
+    mut evict: impl FnMut() -> bool,
+) -> Result<Option<C>>
+where
+    A: std::future::Future<Output = Result<CaptureAttempt<M, C>>>,
+    F: std::future::Future<Output = Result<CaptureMaintenanceDecision>>,
+{
+    let mut remaining_evictions = entries;
+    let mut maintenance_attempted = false;
+    loop {
+        match capture().await? {
+            CaptureAttempt::Finished(result) => return Ok(result),
+            CaptureAttempt::NeedsMaintenance(owner) => {
+                if maintenance_attempted {
+                    // Even successful growth grants no claim. If a fresh claim
+                    // still fails, skip optional capture instead of evicting on
+                    // an old shortage or chasing concurrent allocations.
+                    return Ok(None);
+                }
+                maintenance_attempted = true;
+                match maintain(owner).await? {
+                    CaptureMaintenanceDecision::RetryCapture => continue,
+                    CaptureMaintenanceDecision::CapacityLimited => {}
+                    CaptureMaintenanceDecision::Skip => return Ok(None),
+                }
+            }
+            CaptureAttempt::RetentionLimited(reason) => {
+                if !retention_release_can_help(&reason) {
+                    return Ok(None);
+                }
+            }
+        }
+        if remaining_evictions == 0 || !evict() {
+            return Ok(None);
+        }
+        remaining_evictions -= 1;
+        maintenance_attempted = false;
+        // No previous capture guard or maintenance owner is retained. Re-probe
+        // the complete native capture after release, including source validity.
+    }
+}
+
 fn checkpoint_release_can_help(
     wait: &CapacityWaitCondition,
     checkpoint_domains: &BTreeSet<CapacityDomainId>,
@@ -540,14 +633,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Replacing a candidate must not require holding both copies at once.
         let replaced = self.prefix_cache.lock().remove_input(tokens);
         drop(replaced);
-        let mut maintenance_attempted = false;
-        let result = loop {
+        let entries = self.prefix_cache.lock().entries.len();
+        let result = capture_with_capacity(entries, || async {
             let reaper = Arc::clone(&self.reaper);
             let plan = self.resolved_plan.execution_plan().clone();
             let resources = Arc::clone(&self.plan_resources);
             let source = Arc::clone(&sequence.session);
             let lane = Arc::clone(&self.lane);
-            let (pressure, maintenance, result) = self
+            self
                 .completion_worker
                 .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
                     let _ = reaper.recover_abandoned_checkpoints(MAX_COMPLETION_SWEEP_SLOTS);
@@ -562,14 +655,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             source.write_release_capacity_sources(&mut Vec::new())
                                 .map_err(|source_error| FerrumError::backend(format!("capture source became unavailable after {error}: {source_error}")))?;
                             tracing::warn!(reason = %error, "prefix capture skipped before submission");
-                            return Ok((false, None, None));
+                            return Ok(CaptureAttempt::Finished(None));
                         }
                         Ok(start) => start,
                     };
                     let start = match start {
                         NativeCheckpointStart::CapacityMaintenance { reason, maintenance } => {
                             tracing::debug!(?reason, "prefix capture needs optional pool maintenance");
-                            return Ok((true, Some(maintenance), None));
+                            return Ok(CaptureAttempt::NeedsMaintenance(maintenance));
+                        }
+                        NativeCheckpointStart::Skipped(CheckpointAccessSkipReason::Retention(reason)) => {
+                            tracing::debug!(?reason, "prefix capture skipped before submission");
+                            return Ok(CaptureAttempt::RetentionLimited(reason));
                         }
                         NativeCheckpointStart::Skipped(reason) => {
                             tracing::debug!(?reason, "prefix capture skipped before submission");
@@ -577,70 +674,46 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         }
                         start => start,
                     };
-                    let pressure = matches!(
-                        &start,
-                        NativeCheckpointStart::Skipped(
-                            CheckpointAccessSkipReason::Retention(_)
-                                | CheckpointAccessSkipReason::CapacityDeferred(_)
-                                | CheckpointAccessSkipReason::BackingDeferred(_)
-                        )
-                    );
                     let result = finish_transfer(&reaper, start)?;
                     if let Some(NativeCheckpointResult::Failed(reason @ (NativeCheckpointFailure::FailedButQuiescent(_) | NativeCheckpointFailure::AbandonedAfterDrain))) = &result {
                         source.write_release_capacity_sources(&mut Vec::new())
                             .map_err(|error| FerrumError::backend(format!("capture failed and its source is no longer Open: {reason:?}: {error}")))?;
                         tracing::warn!(?reason, "prefix capture skipped after quiescent failure; source remains Open");
-                        return Ok((false, None, None));
+                        return Ok(CaptureAttempt::Finished(None));
                     }
-                    Ok((pressure, None, result))
+                    Ok(CaptureAttempt::Finished(result))
                 })
                 .await
-                .map_err(|error| FerrumError::backend(error.to_string()))??;
-            if pressure && self.evict_prefix_checkpoint() {
-                // Drop the stale maintenance opportunity. Retry the ordinary
-                // claim after release; a restore pin may still own its bytes.
-                drop(maintenance);
-                continue;
-            }
-            if !maintenance_attempted {
-                if let Some(maintenance) = maintenance {
-                    maintenance_attempted = true;
+                .map_err(|error| FerrumError::backend(error.to_string()))?
+        }, |maintenance: CheckpointCapacityMaintenance<R>| async move {
                     let source = Arc::clone(&sequence.session);
-                    let ready = self
+                    self
                         .completion_worker
-                        .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<bool> {
+                        .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
                             // No capture guard survives in this owner. Budget
                             // and packing are rechecked by the resource layer,
                             // without waiting for or reclaiming foreground work.
                             source.write_release_capacity_sources(&mut Vec::new())
                                 .map_err(|error| FerrumError::backend(format!("capture source became unavailable before maintenance: {error}")))?;
-                            match maintenance.try_maintain() {
-                                Ok(CheckpointCapacityMaintenanceOutcome::Ready(_)) => Ok(true),
+                            let result = maintenance.try_maintain();
+                            match &result {
+                                Ok(CheckpointCapacityMaintenanceOutcome::Ready(_)) => {}
                                 Ok(CheckpointCapacityMaintenanceOutcome::Skipped(reason)) => {
                                     source.write_release_capacity_sources(&mut Vec::new())
                                         .map_err(|error| FerrumError::backend(format!("capture maintenance skipped and its source is no longer Open: {reason:?}: {error}")))?;
                                     tracing::debug!(?reason, "prefix capture skipped after optional pool maintenance");
-                                    Ok(false)
                                 }
                                 Err(error) => {
                                     source.write_release_capacity_sources(&mut Vec::new())
                                         .map_err(|source_error| FerrumError::backend(format!("capture source became unavailable after maintenance error {error}: {source_error}")))?;
                                     tracing::warn!(reason = %error, "prefix capture maintenance failed before submission");
-                                    Ok(false)
                                 }
                             }
+                            Ok(capture_maintenance_decision(result))
                         })
                         .await
-                        .map_err(|error| FerrumError::backend(error.to_string()))??;
-                    if ready {
-                        // A growth receipt grants no backing or boundary
-                        // authority. Re-enter the complete capture path once.
-                        continue;
-                    }
-                }
-            }
-            break result;
-        };
+                        .map_err(|error| FerrumError::backend(error.to_string()))?
+        }, || self.evict_prefix_checkpoint()).await?;
         match result {
             Some(NativeCheckpointResult::Captured(checkpoint)) => {
                 if checkpoint.completed_tokens() != chunk.end()
