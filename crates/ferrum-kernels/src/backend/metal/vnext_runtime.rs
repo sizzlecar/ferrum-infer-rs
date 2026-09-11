@@ -47,6 +47,9 @@ use metal::{
 
 use super::st;
 
+mod counter_readback;
+use counter_readback::CounterReadbackStats;
+
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_SUBMISSION_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -698,10 +701,15 @@ struct MetalCounterCaptureBuilder {
     cpu_anchor_start: u64,
     gpu_anchor_start: u64,
     unavailable: bool,
+    readback_stats: Arc<CounterReadbackStats>,
 }
 
 impl MetalCounterCaptureBuilder {
-    fn new(device: metal::Device, counter_set: CounterSet) -> Option<Self> {
+    fn new(
+        device: metal::Device,
+        counter_set: CounterSet,
+        readback_stats: Arc<CounterReadbackStats>,
+    ) -> Option<Self> {
         let mut cpu_anchor_start = 0;
         let mut gpu_anchor_start = 0;
         device.sample_timestamps(&mut cpu_anchor_start, &mut gpu_anchor_start);
@@ -727,6 +735,7 @@ impl MetalCounterCaptureBuilder {
             cpu_anchor_start,
             gpu_anchor_start,
             unavailable: false,
+            readback_stats,
         })
     }
 
@@ -857,6 +866,7 @@ impl MetalCounterCaptureBuilder {
             cpu_anchor_start: self.cpu_anchor_start,
             gpu_anchor_start: self.gpu_anchor_start,
             unavailable: self.unavailable,
+            readback_stats: self.readback_stats,
         }
     }
 }
@@ -875,6 +885,7 @@ struct MetalCounterCapture {
     cpu_anchor_start: u64,
     gpu_anchor_start: u64,
     unavailable: bool,
+    readback_stats: Arc<CounterReadbackStats>,
 }
 
 fn metal_submission_execution_timing(
@@ -960,7 +971,7 @@ impl MetalCounterCapture {
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
         }
-        let mut page_samples = Vec::with_capacity(self.pages.len());
+        let mut resolved_pages = Vec::with_capacity(self.pages.len());
         for (_page_index, page) in self.pages.iter().enumerate() {
             let Some(sample_count) = usize::try_from(page.used_samples).ok() else {
                 #[cfg(test)]
@@ -997,8 +1008,44 @@ impl MetalCounterCapture {
             let samples = unsafe {
                 std::slice::from_raw_parts(page.resolved.contents().cast::<u64>(), sample_count)
             };
-            page_samples.push(samples);
+            let samples = match counter_readback::resolve_missing_samples(
+                samples,
+                self.gpu_anchor_start,
+                gpu_anchor_end,
+                || counter_readback::resolve_cpu_page(page),
+            ) {
+                Ok(samples) => samples,
+                Err(_cause) => {
+                    tracing::debug!(
+                        cause = _cause,
+                        page_index = _page_index,
+                        "Metal counter readback unavailable"
+                    );
+                    #[cfg(test)]
+                    counter_diagnostic::report(
+                        _cause,
+                        (self.cpu_anchor_start, self.gpu_anchor_start),
+                        Some((cpu_anchor_end, gpu_anchor_end)),
+                        None,
+                        Some(_page_index),
+                        None,
+                        None,
+                        None,
+                    );
+                    return DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    );
+                }
+            };
+            if matches!(samples, std::borrow::Cow::Owned(_)) {
+                self.readback_stats.record_cpu_page(sample_count as u64);
+            }
+            resolved_pages.push(samples);
         }
+        let page_samples = resolved_pages
+            .iter()
+            .map(|page| page.as_ref())
+            .collect::<Vec<_>>();
         let raw_interval =
             |mapping: &MetalCounterIntervalMapping| -> Result<(u64, u64), &'static str> {
                 let samples = *page_samples
@@ -1778,6 +1825,7 @@ pub struct MetalDeviceRuntime {
     runtime_instance: u64,
     device: metal::Device,
     timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
+    counter_readback_stats: Arc<CounterReadbackStats>,
     static_weight_import_gate: Mutex<()>,
 }
 
@@ -1811,11 +1859,14 @@ impl MetalDeviceRuntime {
                 current.checked_add(1)
             })
             .map_err(|_| MetalDeviceRuntimeError::contract("Metal runtime identity exhausted"))?;
+        let counter_readback_stats =
+            Arc::new(CounterReadbackStats::new(runtime_instance, device.name()));
         Ok(Self {
             descriptor,
             runtime_instance,
             device,
             timestamp_counter_support: OnceLock::new(),
+            counter_readback_stats,
             static_weight_import_gate: Mutex::new(()),
         })
     }
@@ -2007,7 +2058,11 @@ impl MetalDeviceRuntime {
         let counter_capture = if physical_span_attribution {
             match self.timestamp_counter_support() {
                 MetalTimestampCounterSupport::Supported(counter_set) => {
-                    MetalCounterCaptureBuilder::new(self.device.clone(), counter_set)
+                    MetalCounterCaptureBuilder::new(
+                        self.device.clone(),
+                        counter_set,
+                        Arc::clone(&self.counter_readback_stats),
+                    )
                 }
                 MetalTimestampCounterSupport::Unsupported => None,
             }
@@ -2982,6 +3037,64 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
+    }
+
+    #[test]
+    fn shared_counter_cpu_resolve_uses_original_completed_samples() {
+        let runtime = runtime();
+        if !matches!(
+            runtime.timestamp_counter_support(),
+            MetalTimestampCounterSupport::Supported(_)
+        ) {
+            return;
+        }
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/cpu-counter-resolve"))
+            .unwrap();
+        let command = runtime.encode_zero(&destination, 0, 8).unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                compute_entries(vec![command]),
+                DeviceTimingMode::Kernel,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .unwrap();
+        // Wait for the same command, without invoking its production resolve.
+        // Capture the end anchors once; CPU resolution does not sample again.
+        fence.command_buffer.wait_until_completed();
+        assert_eq!(
+            fence.command_buffer.status(),
+            MTLCommandBufferStatus::Completed
+        );
+        let MetalFenceCommandTiming::Captured { capture, .. } = &fence.command_timing else {
+            panic!("timestamp support must produce a capture")
+        };
+        let mut cpu_end = 0;
+        let mut gpu_end = 0;
+        capture.device.sample_timestamps(&mut cpu_end, &mut gpu_end);
+        let page = &capture.pages[0];
+        let missing = vec![0; page.used_samples as usize];
+        // Exercise the official CPU API on real GPU-produced samples even on
+        // devices whose GPU resolve does not exhibit the reported zero result.
+        let recovered = counter_readback::resolve_missing_samples(
+            &missing,
+            capture.gpu_anchor_start,
+            gpu_end,
+            || counter_readback::resolve_cpu_page(page),
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0] >= capture.gpu_anchor_start);
+        assert!(recovered[1] > recovered[0] && recovered[1] <= gpu_end);
+        assert!(cpu_end > capture.cpu_anchor_start);
+        // The real terminal path also resolves only once and returns one
+        // immutable result on subsequent observations.
+        let terminal = runtime.wait_fence(&fence).unwrap();
+        assert!(terminal.terminal().is_succeeded());
+        let again = runtime.wait_fence(&fence).unwrap();
+        assert_eq!(terminal.submission_timing(), again.submission_timing());
     }
 
     #[test]
