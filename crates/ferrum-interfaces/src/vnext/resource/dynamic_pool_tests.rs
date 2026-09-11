@@ -17,6 +17,12 @@ use crate::vnext::{
 use serde_json::{json, Value};
 use std::error::Error;
 
+#[path = "checkpoint/tests.rs"]
+mod checkpoint_backing_tests;
+
+#[path = "sequence/state_transfer/resource_tests.rs"]
+mod sequence_state_transfer_tests;
+
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
 const MAX_DYNAMIC_POOL_TEST_WORKERS: usize = 2;
@@ -1897,12 +1903,13 @@ fn maintenance_status_exposes_typed_pool_contract() {
     );
     for residency in ["transient", "lane_stable"] {
         let residency_wire = live_wire[residency].as_object().unwrap();
-        assert_eq!(residency_wire.len(), 7);
+        assert_eq!(residency_wire.len(), 8);
         for field in [
             "total",
             "plan",
             "request",
             "sequence",
+            "checkpoint",
             "step",
             "invocation",
             "initial_sequence_bundle",

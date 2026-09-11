@@ -226,6 +226,7 @@ impl ModelFamilyProvider for TestFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }],
             vec![WeightReference {
                 weight_id: id("weight.matrix"),
@@ -568,6 +569,7 @@ impl ModelFamilyProvider for SequentialScratchFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }],
             vec![WeightReference {
                 weight_id: id("weight.matrix"),
@@ -1891,5 +1893,6 @@ pub(crate) fn graph_state_spec() -> StateSpec {
         lifetime: StateLifetime::Sequence,
         capacity_demand: StateCapacityDemand::FixedPerScope,
         initialization: StateInitialization::Zero,
+        checkpoint: StateCheckpointCapability::Unsupported,
     }
 }

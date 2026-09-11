@@ -319,6 +319,7 @@ impl ModelFamilyProvider for TestFamily {
                     StateCapacityDemand::FixedPerScope
                 },
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }]
         } else {
             Vec::new()
@@ -335,6 +336,7 @@ impl ModelFamilyProvider for TestFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             });
         }
         fixture_f32_profiles(

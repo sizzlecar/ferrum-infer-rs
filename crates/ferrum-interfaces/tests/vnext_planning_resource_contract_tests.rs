@@ -774,6 +774,7 @@ fn state_capacity_demand_is_explicit_checked_and_wire_closed() {
             maximum_tokens: 128,
         },
         initialization: StateInitialization::Zero,
+        checkpoint: StateCheckpointCapability::Unsupported,
     };
     let restored: StateSpec =
         serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();

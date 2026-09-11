@@ -72,6 +72,8 @@ mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod checkpoint;
+pub(crate) use checkpoint::*;
 mod request_state_hazard;
 pub use request_state_hazard::*;
 mod sequence_state;

@@ -38,6 +38,8 @@ pub struct ExecutionPlan {
     pub(super) operation_registry_authority: OperationRegistryAuthority,
     #[serde(skip)]
     pub(super) trusted_execution_weights: TrustedExecutionWeightPlan,
+    #[serde(skip)]
+    pub(super) checkpoint_unsupported_reasons: Vec<super::SequenceCheckpointUnsupportedReason>,
 }
 
 impl ExecutionPlan {
@@ -211,6 +213,13 @@ impl ExecutionPlan {
             &retained_completion_resources,
         )?;
 
+        let (sequence_checkpoint_layout, checkpoint_unsupported_reasons) =
+            super::sequence_checkpoint::derive_sequence_checkpoint(
+                program,
+                &nodes,
+                memory.dynamic_descriptors(),
+                request.capabilities,
+            )?;
         let mut payload = ExecutionPlanPayload {
             schema: EXECUTION_PLAN_SCHEMA,
             plan_id: PlanId::new("plan/unset")?,
@@ -230,6 +239,7 @@ impl ExecutionPlan {
             terminal_output_resources,
             nodes,
             memory,
+            sequence_checkpoint_layout,
         };
         let plan_hash = PlanHash::new(canonical_fingerprint(
             &PlanHashMaterial::from(&payload),
@@ -241,6 +251,7 @@ impl ExecutionPlan {
             plan_hash,
             operation_registry_authority,
             trusted_execution_weights: request.execution_weights,
+            checkpoint_unsupported_reasons,
         };
         plan.validate_internal()?;
         Ok(plan)

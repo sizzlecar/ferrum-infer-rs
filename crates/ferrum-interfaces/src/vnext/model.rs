@@ -4,6 +4,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+mod checkpoint;
+pub use checkpoint::{
+    CheckpointInputDependency, ProgramCheckpointInputs, StateCheckpointCapability,
+    StateCheckpointContents, StateCheckpointContract, PROGRAM_CHECKPOINT_INPUTS_VERSION,
+    STATE_CHECKPOINT_CONTRACT_VERSION,
+};
+
 use super::{
     checked_elements, physical_component_ids, validate_physical_layout_budget, AttributeId,
     AxisWeightComponent, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart,
@@ -1362,6 +1369,10 @@ pub struct StateSpec {
     /// Initial contents required when a new logical state scope acquires
     /// physical backing. This is semantic model state, not an allocator hint.
     pub initialization: StateInitialization,
+    /// Explicit semantic continuation contract. A capacity formula never grants
+    /// checkpoint eligibility, and an undeclared contract stays unsupported.
+    #[serde(skip_serializing_if = "StateCheckpointCapability::is_unsupported")]
+    pub checkpoint: StateCheckpointCapability,
 }
 
 #[derive(Deserialize)]
@@ -1373,6 +1384,8 @@ struct StateSpecWire {
     lifetime: StateLifetime,
     capacity_demand: StateCapacityDemand,
     initialization: StateInitialization,
+    #[serde(default)]
+    checkpoint: StateCheckpointCapability,
 }
 
 impl<'de> Deserialize<'de> for StateSpec {
@@ -1384,6 +1397,7 @@ impl<'de> Deserialize<'de> for StateSpec {
         wire.tensor
             .validate("state_spec.tensor")
             .and_then(|()| wire.capacity_demand.validate(wire.tensor.byte_len()?))
+            .and_then(|()| wire.checkpoint.validate_lifetime(wire.lifetime))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
             id: wire.id,
@@ -1392,6 +1406,7 @@ impl<'de> Deserialize<'de> for StateSpec {
             lifetime: wire.lifetime,
             capacity_demand: wire.capacity_demand,
             initialization: wire.initialization,
+            checkpoint: wire.checkpoint,
         })
     }
 }
@@ -1535,6 +1550,8 @@ pub struct ModelProgram {
     states: Vec<StateSpec>,
     weights: Vec<WeightReference>,
     outputs: Vec<ProgramValueId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_inputs: Option<ProgramCheckpointInputs>,
 }
 
 #[derive(Deserialize)]
@@ -1546,6 +1563,8 @@ struct ModelProgramWire {
     states: Vec<StateSpec>,
     weights: Vec<WeightReference>,
     outputs: Vec<ProgramValueId>,
+    #[serde(default)]
+    checkpoint_inputs: Option<ProgramCheckpointInputs>,
 }
 
 impl<'de> Deserialize<'de> for ModelProgram {
@@ -1554,7 +1573,7 @@ impl<'de> Deserialize<'de> for ModelProgram {
         D: Deserializer<'de>,
     {
         let wire = ModelProgramWire::deserialize(deserializer)?;
-        Self::new(
+        let program = Self::new(
             wire.family_id,
             wire.inputs,
             wire.blocks,
@@ -1562,7 +1581,13 @@ impl<'de> Deserialize<'de> for ModelProgram {
             wire.weights,
             wire.outputs,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        match wire.checkpoint_inputs {
+            Some(inputs) => program
+                .with_checkpoint_inputs(inputs)
+                .map_err(serde::de::Error::custom),
+            None => Ok(program),
+        }
     }
 }
 
@@ -1597,6 +1622,7 @@ impl ModelProgram {
         let mut block_ids = BTreeSet::new();
         let mut node_ids = BTreeSet::new();
         for state in &states {
+            state.checkpoint.validate_lifetime(state.lifetime)?;
             let tensor_valid = state
                 .tensor
                 .validate(&format!("program.states.{}.tensor", state.id))
@@ -1728,7 +1754,26 @@ impl ModelProgram {
             states,
             weights,
             outputs,
+            checkpoint_inputs: None,
         })
+    }
+
+    pub fn with_checkpoint_inputs(
+        mut self,
+        inputs: ProgramCheckpointInputs,
+    ) -> Result<Self, VNextError> {
+        if !inputs.covers(&self.inputs) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "checkpoint input declaration must cover exactly every program input"
+                    .to_owned(),
+            });
+        }
+        self.checkpoint_inputs = Some(inputs);
+        Ok(self)
+    }
+
+    pub fn checkpoint_inputs(&self) -> Option<&ProgramCheckpointInputs> {
+        self.checkpoint_inputs.as_ref()
     }
 
     pub fn family_id(&self) -> &ModelFamilyId {

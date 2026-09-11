@@ -865,6 +865,7 @@ pub(super) fn acquire_session_frames(
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame.is_none()
+                    && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.epoch
@@ -958,6 +959,7 @@ where
                     && active.fingerprint == candidate.frame.fingerprint
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame.is_none()
+                    && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.frame.epoch

@@ -207,6 +207,7 @@ impl ModelFamilyProvider for TestFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }],
             vec![WeightReference {
                 weight_id: id("weight.matrix"),

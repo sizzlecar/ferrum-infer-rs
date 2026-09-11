@@ -3,7 +3,9 @@
 //! explicit profile controls the graph and never changes source tensor bytes.
 
 use super::*;
-use ferrum_interfaces::vnext::{NumericalOperationContract, NumericalProfileId};
+use ferrum_interfaces::vnext::{
+    NumericalOperationContract, NumericalProfileId, StateCheckpointCapability,
+};
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
@@ -174,6 +176,7 @@ fn states(text: &Qwen35TextConfig, maximum_tokens: u64) -> Result<Vec<StateSpec>
                         lifetime: StateLifetime::Sequence,
                         capacity_demand: StateCapacityDemand::FixedPerScope,
                         initialization: StateInitialization::Zero,
+                        checkpoint: StateCheckpointCapability::Unsupported,
                     });
                 }
             }
@@ -194,6 +197,7 @@ fn states(text: &Qwen35TextConfig, maximum_tokens: u64) -> Result<Vec<StateSpec>
                     },
                     // Providers write each valid KV slot before reading it.
                     initialization: StateInitialization::None,
+                    checkpoint: StateCheckpointCapability::Unsupported,
                 });
             }
         }

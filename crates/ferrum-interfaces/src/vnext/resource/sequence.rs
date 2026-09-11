@@ -18,6 +18,9 @@ use super::{
 };
 use crate::vnext::CapacityAvailabilitySource;
 
+mod state_transfer;
+pub(crate) use state_transfer::*;
+
 const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
 
 pub(super) fn sequence_dispatch_is_poisoned(gate: &AtomicU64) -> bool {
@@ -814,6 +817,7 @@ pub(super) struct ActiveSequenceSessionState {
     pub(super) active_frame: Option<ActiveSequenceFrame>,
     pub(super) participant_flights: BTreeMap<ParticipantNodeKey, ParticipantFlightPhase>,
     pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
+    pub(super) state_transfer: SequenceStateTransferSlot,
     pub(super) retired_frames: u64,
 }
 
@@ -1102,7 +1106,10 @@ where
                     "sequence backing coverage target is incomparable with committed work",
                 ));
             }
-            if active.active_frame.is_some() || active.has_participant_flights() {
+            if active.active_frame.is_some()
+                || active.has_participant_flights()
+                || active.state_transfer.is_reserved()
+            {
                 return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
             }
             current
@@ -1207,7 +1214,10 @@ where
             }
             return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
         }
-        if active.active_frame.is_some() || active.has_participant_flights() {
+        if active.active_frame.is_some()
+            || active.has_participant_flights()
+            || active.state_transfer.is_reserved()
+        {
             return Ok(SequenceResourceExtensionDecision::RetryRequired(
                 Arc::clone(&backing.current),
             ));
@@ -1259,6 +1269,7 @@ where
             active_frame: active.active_frame.map(|frame| frame.frame_id),
             participant_flights: u64::try_from(active.participant_flight_count())
                 .map_err(|_| invalid_resource("participant flight count exceeds u64"))?,
+            state_transfer_pending: active.state_transfer.is_reserved(),
         })
     }
 
@@ -1306,9 +1317,10 @@ where
         if active.phase == SequenceSessionPhase::Poisoned
             || active.active_frame.is_some()
             || active.has_participant_flights()
+            || active.state_transfer.is_reserved()
         {
             return Err(invalid_resource(
-                "quiescent sequence abort requires an open or cancel-requested phase, no active frame, and no participant flight",
+                "quiescent sequence abort requires an open or cancel-requested phase with no active frame, participant flight, or state transfer",
             ));
         }
         let receipt = SequenceSessionTerminalReceipt {
@@ -1358,9 +1370,13 @@ where
                 SequenceSessionPhase::CancelRequested | SequenceSessionPhase::Poisoned
             ),
         };
-        if !phase_matches || active.active_frame.is_some() || active.has_participant_flights() {
+        if !phase_matches
+            || active.active_frame.is_some()
+            || active.has_participant_flights()
+            || active.state_transfer.is_reserved()
+        {
             return Err(invalid_resource(
-                "sequence terminalization requires the matching phase, no active frame, and no participant flight",
+                "sequence terminalization requires the matching phase with no active frame, participant flight, or state transfer",
             ));
         }
         let receipt = SequenceSessionTerminalReceipt {
@@ -1378,6 +1394,7 @@ where
 pub struct SequenceSessionCancelSnapshot {
     active_frame: Option<ExecutionFrameId>,
     participant_flights: u64,
+    state_transfer_pending: bool,
 }
 
 impl SequenceSessionCancelSnapshot {
@@ -1387,6 +1404,10 @@ impl SequenceSessionCancelSnapshot {
 
     pub const fn participant_flights(self) -> u64 {
         self.participant_flights
+    }
+
+    pub const fn state_transfer_pending(self) -> bool {
+        self.state_transfer_pending
     }
 }
 
@@ -2032,6 +2053,7 @@ where
             active_frame: None,
             participant_flights: BTreeMap::new(),
             submission_wave_flight: None,
+            state_transfer: SequenceStateTransferSlot::default(),
             retired_frames: 0,
         });
         *authority_source = SequenceExecutionAuthoritySource::SequenceSession;

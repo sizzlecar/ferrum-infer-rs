@@ -1445,6 +1445,36 @@ where
         )
     }
 
+    pub(in crate::vnext::resource) fn prepare_checkpoint_claim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        if requests.is_empty()
+            || requests.iter().any(|request| {
+                !self
+                    .domains
+                    .iter()
+                    .any(|domain| std::ptr::eq(domain, request.domain))
+                    || request.reusable_execution_bucket_id.is_some()
+                    || request.projections.len() != 1
+                    || request.projections.iter().any(|projection| {
+                        projection.descriptor.lifetime() != AllocationLifetime::Sequence
+                            || projection.descriptor.usage() != super::BufferUsage::State
+                            || *projection.descriptor.kind() != super::AllocationKind::Value
+                    })
+            })
+        {
+            return Err(invalid_resource(
+                "checkpoint backing requires this plan's non-empty Sequence state projections",
+            ));
+        }
+        self.prepare_claim_scoped(
+            requests,
+            DynamicBackingClaimScope::Checkpoint,
+            DynamicBackingClaimResidency::Transient,
+        )
+    }
+
     fn prepare_claim_scoped(
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
@@ -1566,7 +1596,9 @@ where
                                         .is_ok_and(|bytes| bytes == projection.capacity_size_bytes)
                                 }
                                 None => {
-                                    projection.logical_size_bytes == projection.capacity_size_bytes
+                                    scope == DynamicBackingClaimScope::Checkpoint
+                                        || projection.logical_size_bytes
+                                            == projection.capacity_size_bytes
                                 }
                             };
                             projection.descriptor.pool_id() != pool.domain.pool_id()

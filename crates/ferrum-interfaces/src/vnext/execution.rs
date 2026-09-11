@@ -80,6 +80,9 @@ pub use compiler::*;
 mod checkpoint;
 pub use checkpoint::*;
 
+mod sequence_checkpoint;
+pub use sequence_checkpoint::*;
+
 mod determinism;
 pub use determinism::*;
 

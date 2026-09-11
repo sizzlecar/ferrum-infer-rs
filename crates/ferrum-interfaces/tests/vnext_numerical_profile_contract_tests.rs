@@ -54,6 +54,7 @@ impl Family {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }],
             operations: vec![NumericalOperationContract {
                 operation_id: id(if dtype == ElementType::F16 {

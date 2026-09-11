@@ -894,6 +894,13 @@ where
                 .lifecycle
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The write gate excludes checkpoint prepare/claim/commit. A
+            // poisoned coordinator is already fail-closed; existing owners
+            // still keep the plan alive and may release their backing.
+            let _ = resources
+                .dynamic_pools
+                .logical_admission
+                .close_checkpoint_admission();
             match resources.phase.compare_exchange(
                 PLAN_RUNTIME_OPEN,
                 PLAN_RUNTIME_CLOSING,

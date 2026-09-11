@@ -162,6 +162,7 @@ impl ModelFamilyProvider for SyntheticExtensionFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             })
             .into_iter()
             .collect();

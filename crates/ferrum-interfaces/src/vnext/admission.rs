@@ -7,6 +7,12 @@ use tokio::sync::watch;
 
 use super::{DynamicAdmissionFaultKind, VNextError};
 
+mod checkpoint;
+use checkpoint::CheckpointClaimLedger;
+pub use checkpoint::{
+    CheckpointAuthorityId, CheckpointCapacityClaimDecision, LogicalCheckpointLease,
+};
+
 fn invalid_admission(reason: impl Into<String>) -> VNextError {
     admission_fault(DynamicAdmissionFaultKind::InvalidContract, reason)
 }
@@ -374,6 +380,7 @@ pub struct CapacitySnapshot {
     active_requests: u32,
     active_sequences: u32,
     active_child_claims: u64,
+    active_checkpoint_claims: u64,
     maximum_active_sequences: u32,
     release_epoch: u64,
     capacity_epoch: u64,
@@ -403,6 +410,12 @@ impl CapacitySnapshot {
 
     pub const fn active_child_claims(&self) -> u64 {
         self.active_child_claims
+    }
+
+    /// Independent checkpoint claims; these consume domain capacity, not
+    /// request or sequence execution slots.
+    pub const fn active_checkpoint_claims(&self) -> u64 {
+        self.active_checkpoint_claims
     }
 
     pub const fn maximum_active_sequences(&self) -> u32 {
@@ -901,6 +914,7 @@ struct CoordinatorState {
     active_requests: u32,
     active_sequences: u32,
     active_child_claims: u64,
+    checkpoint_claims: CheckpointClaimLedger,
     live_requests: Vec<Option<LiveRequestRecord>>,
     reusable_request_ids: Vec<u32>,
     live_sequences: Vec<Option<LiveSequenceRecord>>,
@@ -935,6 +949,7 @@ impl CoordinatorState {
             active_requests: self.active_requests,
             active_sequences: self.active_sequences,
             active_child_claims: self.active_child_claims,
+            active_checkpoint_claims: self.checkpoint_claims.count(),
             maximum_active_sequences: self.maximum_active_sequences,
             release_epoch: self.release_epoch,
             capacity_epoch: self.capacity_epoch,
@@ -1445,6 +1460,7 @@ impl LogicalAdmissionCoordinator {
                     active_requests: 0,
                     active_sequences: 0,
                     active_child_claims: 0,
+                    checkpoint_claims: CheckpointClaimLedger::new(),
                     live_requests: Vec::new(),
                     reusable_request_ids: Vec::new(),
                     live_sequences: Vec::new(),
@@ -1540,6 +1556,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(next_active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(state.active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -1751,6 +1768,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(next_active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -1898,6 +1916,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(state.active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -2144,6 +2163,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(state.active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(state.active_sequences)))
             .and_then(|epoch| epoch.checked_add(next_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
