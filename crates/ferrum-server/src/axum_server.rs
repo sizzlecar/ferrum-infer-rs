@@ -2669,7 +2669,7 @@ async fn handle_chat_completions_stream(
                             &openai_request,
                             &parsed_final.content,
                         );
-                        let structured_chat_response =
+                        let mut structured_chat_response =
                             finish_reason_allows_structured_api_response(terminal_finish_reason)
                                 .then(|| match chunk.api_response.as_ref() {
                                     // The native envelope owns the recipient and whether this is
@@ -2692,6 +2692,24 @@ async fn handle_chat_completions_stream(
                                     _ => None,
                                 })
                                 .flatten();
+
+                        if matches!(chunk.api_response, Some(ferrum_types::ApiResponse::Chat(_))) {
+                            if let Some(response) = structured_chat_response.as_mut() {
+                                if let Err(error) = project_typed_tool_response_content(
+                                    response,
+                                    model_output_protocol,
+                                    started_in_think,
+                                ) {
+                                    let _ = tx.send(Ok(openai_error_sse_event(
+                                        stream_validation_error_message(error),
+                                        "internal_server_error",
+                                        Some("model_output"),
+                                    )));
+                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                    break;
+                                }
+                            }
+                        }
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             if let Err(e) =
@@ -3071,7 +3089,7 @@ async fn handle_chat_completions_sync(
                 function_call: None,
             };
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
-            let structured_chat_response =
+            let mut structured_chat_response =
                 finish_reason_allows_structured_api_response(finish_reason)
                     .then(|| match api_response.as_ref() {
                         // The native envelope owns the recipient and whether this is
@@ -3092,6 +3110,15 @@ async fn handle_chat_completions_sync(
                         },
                     })
                     .flatten();
+            if matches!(api_response, Some(ferrum_types::ApiResponse::Chat(_))) {
+                if let Some(response) = structured_chat_response.as_mut() {
+                    project_typed_tool_response_content(
+                        response,
+                        model_output_protocol,
+                        started_in_think,
+                    )?;
+                }
+            }
             if let Some(chat_response) = structured_chat_response.as_ref() {
                 if let Err(error) =
                     validate_structured_tool_response(&openai_request, chat_response)
@@ -3971,6 +3998,27 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
     String::new()
 }
 
+fn project_typed_tool_response_content(
+    response: &mut ferrum_types::ApiChatResponse,
+    protocol: ModelOutputProtocol,
+    started_in_think: bool,
+) -> std::result::Result<(), ServerError> {
+    if protocol == ModelOutputProtocol::HarmonyGptOss
+        || response.message.tool_calls.is_empty()
+        || response.message.content.is_empty()
+    {
+        return Ok(());
+    }
+    // Engine tool parsing can precede reasoning projection. Its structural
+    // parser already removed the envelopes and owns every call and argument;
+    // project only the outside text, never a payload or classified final JSON.
+    response.message.content =
+        parse_model_reasoning_response(protocol, &response.message.content, started_in_think)
+            .map_err(|error| ServerError::InternalError(error.to_string()))?
+            .content;
+    Ok(())
+}
+
 fn chat_api_response_from_parsed_generated_text(
     chat_request: &ferrum_types::ApiChatRequest,
     parsed: &ParsedReasoningResponse,
@@ -3985,6 +4033,12 @@ fn chat_api_response_from_parsed_generated_text(
                 reasoning,
                 finish_reason,
             )
+        })
+        .map(|mut response| {
+            // Reasoning is published through its own channel. Detecting a tool
+            // there must not promote its surrounding text to visible content.
+            response.message.content.clear();
+            response
         })
         .or_else(|| {
             ferrum_types::chat_api_response_from_generated_text(

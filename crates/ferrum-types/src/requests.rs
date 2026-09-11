@@ -582,11 +582,13 @@ pub fn chat_api_response_from_generated_text(
     }
 
     if !chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request) {
-        if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, chat_request) {
+        if let Some((content, tool_calls)) =
+            parse_tool_calls_from_generated_text(text, chat_request)
+        {
             return Some(ApiChatResponse {
                 message: ApiChatMessage {
                     role: ApiMessageRole::Assistant,
-                    content: String::new(),
+                    content,
                     name: None,
                     tool_calls,
                     tool_call_id: None,
@@ -636,22 +638,24 @@ fn api_function_call_choice_is_none(chat_request: &ApiChatRequest) -> bool {
 fn parse_tool_calls_from_generated_text(
     text: &str,
     chat_request: &ApiChatRequest,
-) -> Option<Vec<ApiToolCall>> {
+) -> Option<(String, Vec<ApiToolCall>)> {
     if chat_request.automatic_tools_with_hard_response_format()
         || chat_request.requires_native_tool_call()
     {
-        return parse_explicit_tool_call_envelopes(text, chat_request);
+        return parse_explicit_tool_call_envelopes(text, chat_request)
+            .map(|calls| (String::new(), calls));
     }
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml
         && xml_tool_calls::has_native_envelope(text)
     {
         // Once a native envelope establishes tool intent, a malformed envelope
         // must not acquire different semantics from JSON inside its payload.
-        return xml_tool_calls::parse(text, chat_request, false);
+        return xml_tool_calls::parse_with_content(text, chat_request, false)
+            .map(|parsed| (parsed.content, parsed.calls));
     }
 
     let value = parse_json_value_from_generated_text(text)?;
-    parse_json_tool_call_value(&value, chat_request, 0, true)
+    parse_json_tool_call_value(&value, chat_request, 0, true).map(|calls| (String::new(), calls))
 }
 
 fn parse_json_tool_call_value(

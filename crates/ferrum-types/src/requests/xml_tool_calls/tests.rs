@@ -67,11 +67,95 @@ fn source_code_closing_literals_remain_exact_parameter_data() {
          <parameter=path>\nsrc/xml.rs\n</parameter>\n\
          <parameter=content>\n{payload}\n</parameter>\n</function>\n</tool_call>"
     );
-    let calls = generated_calls(&request(), &text).expect("source must be a write call");
+    let response = chat_api_response_from_generated_text(&request(), &text, FinishReason::Stop)
+        .expect("source must be a write call");
+    assert_eq!(response.message.content, "I will write the parser.\n");
+    let calls = response.message.tool_calls;
     assert_eq!(
         arguments(&calls[0]),
         json!({"path": "src/xml.rs", "content": payload})
     );
+}
+
+#[test]
+fn automatic_calls_preserve_outside_text_in_order_without_exposing_payload() {
+    let payload = "const END: &str = \"</tool_call> </parameter>\";\n";
+    let text = format!(
+        "  First.\r\n{}\nBetween calls.\n{}\r\nDone.  ",
+        call("a.rs", payload),
+        call("b.rs", "second payload")
+    );
+    for choice in [None, Some(ApiToolChoice::Mode("auto".into()))] {
+        let mut request = request();
+        request.tool_choice = choice;
+        let response =
+            chat_api_response_from_generated_text(&request, &text, FinishReason::EOS).unwrap();
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            response.message.content,
+            "  First.\r\n\nBetween calls.\n\r\nDone.  "
+        );
+        let calls = response.message.tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(arguments(&calls[0])["content"], payload);
+        assert_eq!(arguments(&calls[1])["content"], "second payload");
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+}
+
+#[test]
+fn whitespace_only_outside_calls_keeps_the_existing_empty_content() {
+    let text = format!(" \r\n{}\n\t{}\r\n ", call("a.rs", "a"), call("b.rs", "b"));
+    let response =
+        chat_api_response_from_generated_text(&request(), &text, FinishReason::Stop).unwrap();
+    assert!(response.message.content.is_empty());
+    assert_eq!(response.message.tool_calls.len(), 2);
+}
+
+#[test]
+fn required_forced_and_hard_branches_still_reject_outside_prose() {
+    let mut required = request();
+    required.tool_choice = Some(ApiToolChoice::Mode("required".into()));
+    let mut forced = request();
+    forced.tool_choice = Some(ApiToolChoice::Function {
+        tool_type: "function".into(),
+        function: ApiToolChoiceFunction {
+            name: "write".into(),
+        },
+    });
+    let mut hard = request();
+    hard.response_format = Some(ApiResponseFormat {
+        format_type: "json_object".into(),
+        json_schema: None,
+    });
+    let first = call("a.rs", "first");
+    let second = call("b.rs", "second");
+    for request in [required, forced, hard] {
+        let complete = format!(" \n{first}\n{second}\r\n");
+        let response =
+            chat_api_response_from_generated_text(&request, &complete, FinishReason::Stop).unwrap();
+        assert!(response.message.content.is_empty());
+        assert_eq!(response.message.tool_calls.len(), 2);
+        for text in [
+            format!("Before. {first}"),
+            format!("{first} Between. {second}"),
+            format!("{first} After."),
+        ] {
+            assert!(generated_calls(&request, &text).is_none(), "{text}");
+        }
+    }
+}
+
+#[test]
+fn outside_prose_does_not_publish_partial_calls_when_later_framing_is_invalid() {
+    let first = call("a.rs", "first");
+    for tail in [
+        "<tool_call><function=write><parameter=content>truncated",
+        "</parameter>",
+    ] {
+        let text = format!("Before. {first} Between. {tail}");
+        assert!(generated_calls(&request(), &text).is_none(), "{text}");
+    }
 }
 
 #[test]

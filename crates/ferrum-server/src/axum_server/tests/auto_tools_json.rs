@@ -615,6 +615,217 @@ impl ToolProtocol {
     }
 }
 
+#[tokio::test]
+async fn native_xml_auto_calls_preserve_outside_text_in_chat_and_responses() {
+    let protocol = ToolProtocol::FunctionParameterXml;
+    let city = "Paris </tool_call> literal";
+    let output = format!(
+        "I will check both cities.\n{}\nThen the second city.\n{}\nPlease wait.",
+        protocol.envelope().replace("Paris", city),
+        protocol.envelope().replace("Paris", "Berlin"),
+    );
+    let expected_content = "I will check both cities.\n\nThen the second city.\n\nPlease wait.";
+    for endpoint in [Endpoint::Chat, Endpoint::Responses] {
+        for stream in [false, true] {
+            let mut wire = endpoint.request(weather_schema(), stream);
+            wire.as_object_mut().unwrap().remove("response_format");
+            wire.as_object_mut().unwrap().remove("text");
+            let response = post_json(
+                router_with_stub_and_template(&output, protocol.template()),
+                endpoint.path(),
+                wire,
+            )
+            .await;
+            let response = if matches!(endpoint, Endpoint::Responses) && stream {
+                let (parts, body) = response.into_parts();
+                let bytes = to_bytes(body, usize::MAX).await.unwrap();
+                let events = responses_sse_json_events(std::str::from_utf8(&bytes).unwrap());
+                let deltas: String = events
+                    .iter()
+                    .filter(|event| event["type"] == "response.output_text.delta")
+                    .map(|event| event["delta"].as_str().unwrap())
+                    .collect();
+                assert_eq!(deltas, expected_content);
+                Response::from_parts(parts, Body::from(bytes))
+            } else {
+                response
+            };
+            let result = answer(response, endpoint, stream).await;
+            assert_eq!(result.content, expected_content);
+            assert_eq!(result.calls.len(), 2);
+            assert_ne!(result.calls[0]["id"], result.calls[1]["id"]);
+            for (call, city) in result.calls.iter().zip([city, "Berlin"]) {
+                assert_eq!(call["name"], "weather");
+                assert_eq!(
+                    serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+                    json!({"city": city}),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_xml_tool_detection_keeps_reasoning_and_visible_content_separate() {
+    let protocol = ToolProtocol::FunctionParameterXml;
+    let mut wire = Endpoint::Chat.request(weather_schema(), false);
+    wire.as_object_mut().unwrap().remove("response_format");
+    let request: ChatCompletionsRequest = serde_json::from_value(wire).unwrap();
+    let request = api_chat_request(
+        &request,
+        request.tool_choice.as_ref(),
+        ferrum_types::ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let visible = format!(
+        "Visible explanation.\n{}",
+        protocol.envelope().replace("Paris", "Berlin")
+    );
+    for (reasoning, expected_content, expected_city) in [
+        (
+            format!("Private reasoning.\n{}", protocol.envelope()),
+            "",
+            "Paris",
+        ),
+        (
+            "Private reasoning without a tool.".to_owned(),
+            "Visible explanation.\n",
+            "Berlin",
+        ),
+    ] {
+        let parsed = ParsedReasoningResponse {
+            content: visible.clone(),
+            reasoning: Some(reasoning),
+        };
+        let response =
+            chat_api_response_from_parsed_generated_text(&request, &parsed, FinishReason::Stop)
+                .unwrap();
+        assert_eq!(response.message.content, expected_content);
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.message.tool_calls[0].function.arguments)
+                .unwrap(),
+            json!({"city": expected_city}),
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_xml_typed_engine_response_projects_only_outside_reasoning() {
+    let protocol = ToolProtocol::FunctionParameterXml;
+    let city = "Paris <think>payload</think> </tool_call> literal";
+    for prompt_opened in [false, true] {
+        let mut template = if prompt_opened {
+            prompt_opened_literal_json_template()
+        } else {
+            let mut template = protocol.template();
+            template.reasoning_protocol = ModelReasoningProtocol::ModelGenerated;
+            template
+        };
+        template.tool_call_protocol = ferrum_types::ApiToolCallProtocol::FunctionParameterXml;
+        let raw = format!(
+            "{}Private reasoning.</think>\nI will check.\n{}\nPlease wait.",
+            if prompt_opened { "" } else { "<think>" },
+            protocol.envelope().replace("Paris", city),
+        );
+        for stream in [false, true] {
+            let mut wire = Endpoint::Chat.request(weather_schema(), stream);
+            wire.as_object_mut().unwrap().remove("response_format");
+            wire["chat_template_kwargs"] = json!({"enable_thinking": true});
+            let request: ChatCompletionsRequest = serde_json::from_value(wire.clone()).unwrap();
+            let internal =
+                convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                    .unwrap();
+            assert_eq!(request_started_in_reasoning(&internal), prompt_opened);
+            // Match engine completion's raw-text -> typed-response path. The
+            // stub must carry this response so the server skips text fallback.
+            let mut typed =
+                ferrum_types::api_response_from_generated_text(&internal, &raw, FinishReason::EOS)
+                    .unwrap();
+            let ferrum_types::ApiResponse::Chat(response) = &mut typed else {
+                panic!("expected typed chat response");
+            };
+            assert!(response.message.content.contains("Private reasoning."));
+            response.message.tool_calls[0].id = "call_engine_owned".into();
+            let arguments = response.message.tool_calls[0].function.arguments.clone();
+            let router = AxumServer::from_llm(Arc::new(StubLlm::with_api_response(&raw, typed)))
+                .with_prompt_template(Some(template.clone()))
+                .build_router();
+            let response = post_json(router, Endpoint::Chat.path(), wire).await;
+            let (parts, body) = response.into_parts();
+            let bytes = to_bytes(body, usize::MAX).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let reasoning = if stream {
+                responses_sse_json_events(text)
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["reasoning"].as_str())
+                    .collect::<String>()
+            } else {
+                serde_json::from_str::<Value>(text).unwrap()["choices"][0]["message"]["reasoning"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(reasoning, "Private reasoning.", "{text}");
+            let result = answer(
+                Response::from_parts(parts, Body::from(bytes)),
+                Endpoint::Chat,
+                stream,
+            )
+            .await;
+            assert_eq!(result.content, "I will check.\n\nPlease wait.");
+            assert_eq!(result.calls.len(), 1);
+            assert_eq!(result.calls[0]["id"], "call_engine_owned");
+            assert_eq!(result.calls[0]["arguments"], arguments);
+            assert_eq!(
+                serde_json::from_str::<Value>(&arguments).unwrap(),
+                json!({"city": city}),
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_content_projection_preserves_classified_final_json_and_harmony() {
+    let ferrum_types::ApiResponse::Chat(mut response) = weather_tool_api_response() else {
+        panic!("expected typed chat response");
+    };
+    response.message.content = r#"{"text":"<think>literal</think>"}"#.into();
+    let original = response.clone();
+    project_typed_tool_response_content(&mut response, ModelOutputProtocol::HarmonyGptOss, true)
+        .unwrap();
+    assert_eq!(response, original);
+
+    response.message.tool_calls.clear();
+    response.finish_reason = Some("stop".into());
+    let original = response.clone();
+    for started_in_think in [false, true] {
+        project_typed_tool_response_content(
+            &mut response,
+            ModelOutputProtocol::Text,
+            started_in_think,
+        )
+        .unwrap();
+        assert_eq!(response, original);
+    }
+}
+
+#[tokio::test]
+async fn native_xml_outside_prose_cannot_bypass_a_hard_final_format() {
+    let protocol = ToolProtocol::FunctionParameterXml;
+    let output = format!("I will check.\n{}", protocol.envelope());
+    for endpoint in [Endpoint::Chat, Endpoint::Responses] {
+        for stream in [false, true] {
+            let response = post_json(
+                router_with_stub_and_template(&output, protocol.template()),
+                endpoint.path(),
+                endpoint.request(weather_schema(), stream),
+            )
+            .await;
+            assert_invalid_output(response, endpoint, stream, InvalidOutput::FinalSchema).await;
+        }
+    }
+}
+
 async fn infer_competing_branches(
     protocol: ToolProtocol,
     endpoint: Endpoint,

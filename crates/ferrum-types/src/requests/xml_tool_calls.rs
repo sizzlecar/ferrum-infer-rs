@@ -34,11 +34,26 @@ pub(super) fn parse(
     request: &ApiChatRequest,
     require_complete_envelopes: bool,
 ) -> Option<Vec<ApiToolCall>> {
+    parse_with_content(text, request, require_complete_envelopes).map(|parsed| parsed.calls)
+}
+
+pub(super) struct Parsed {
+    pub(super) calls: Vec<ApiToolCall>,
+    pub(super) content: String,
+}
+
+pub(super) fn parse_with_content(
+    text: &str,
+    request: &ApiChatRequest,
+    require_complete_envelopes: bool,
+) -> Option<Parsed> {
     let mut remaining = text;
     let mut calls = Vec::new();
+    let mut content = String::new();
     loop {
         let Some(start) = remaining.find(TOOL_START) else {
             valid_outside_text(remaining, require_complete_envelopes).then_some(())?;
+            content.push_str(remaining);
             break;
         };
         if calls.len() == MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE
@@ -47,10 +62,20 @@ pub(super) fn parse(
             return None;
         }
         let (call, rest) = parse_one(&remaining[start..], request, calls.len())?;
+        // Only the structural parser knows where parameter payload ends.
+        // Preserve its outside spans directly; marker literals inside a value
+        // must never be recovered as assistant prose by another text scan.
+        content.push_str(&remaining[..start]);
         calls.push(call);
         remaining = rest;
     }
-    validate_parsed_tool_calls(calls)
+    let calls = validate_parsed_tool_calls(calls)?;
+    // Keep the existing empty-content behavior for tools separated only by
+    // framing whitespace. Otherwise retain every outside byte in order.
+    if content.trim().is_empty() {
+        content.clear();
+    }
+    Some(Parsed { calls, content })
 }
 
 fn valid_outside_text(text: &str, require_complete_envelopes: bool) -> bool {
