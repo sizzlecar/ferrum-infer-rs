@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) mod cached_weights;
 pub use cached_weights::{inspect_cached_weights, CachedWeights};
+pub mod gguf_selection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelSourceRuntimeEnv {

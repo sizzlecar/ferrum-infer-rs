@@ -23,11 +23,11 @@ use tokio::signal;
 
 #[derive(Args)]
 pub struct ServeCommand {
-    /// Model to serve (default: from config)
+    /// Model alias, owner/repository[:QUANT], or local path (default: from config)
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Model to serve (default: from config)
+    /// Model alias, owner/repository[:QUANT], or local path (default: from config)
     #[arg(
         short = 'm',
         long = "model",

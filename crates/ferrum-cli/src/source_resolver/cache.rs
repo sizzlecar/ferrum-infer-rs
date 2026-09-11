@@ -46,16 +46,16 @@ pub(super) fn inspect_snapshot(
     let (format, local_path) = match inspect_cached_weights(path)? {
         CachedWeights::Ready(format) => (format, path.to_owned()),
         CachedWeights::Absent => {
-            match cached_gguf_files(path)?.as_slice() {
-                [] => return Ok(CachedModel::Missing(None)),
-                [file] => (ModelFormat::GGUF, file.clone()),
-                files => {
-                    return Err(FerrumError::model(format!(
-                    "GGUF repository has multiple cached files; select an explicit .gguf path:\n{}",
-                    files.iter().map(|file| format!("  {}", file.display())).collect::<Vec<_>>().join("\n")
-                )));
-                }
-            }
+            let files = cached_gguf_files(path)?;
+            let relative = relative_gguf_paths(path, &files)?;
+            let selected = ferrum_models::source::gguf_selection::select_gguf_file(
+                relative.iter().map(String::as_str),
+                None,
+            )?;
+            let Some(selected) = selected else {
+                return Ok(CachedModel::Missing(None));
+            };
+            (ModelFormat::GGUF, path.join(selected))
         }
         CachedWeights::Incomplete { reason } => return Ok(CachedModel::Missing(Some(reason))),
     };
@@ -108,7 +108,22 @@ pub(super) fn inspect_snapshot(
     }))
 }
 
-fn cached_gguf_files(snapshot: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn relative_gguf_paths(snapshot: &Path, files: &[PathBuf]) -> Result<Vec<String>> {
+    files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(snapshot)
+                .ok()
+                .and_then(Path::to_str)
+                .map(|path| path.replace('\\', "/"))
+                .ok_or_else(|| {
+                    FerrumError::model("Cached GGUF filename is not a portable repository path")
+                })
+        })
+        .collect()
+}
+
+pub(super) fn cached_gguf_files(snapshot: &Path) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(snapshot) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -116,7 +131,13 @@ fn cached_gguf_files(snapshot: &Path) -> Result<Vec<PathBuf>> {
     };
     let mut files = Vec::new();
     for entry in entries {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
+        // Recurse through real repository directories, never directory symlinks.
+        if entry.file_type()?.is_dir() {
+            files.extend(cached_gguf_files(&path)?);
+            continue;
+        }
         if path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))

@@ -7,7 +7,7 @@ use ferrum_types::Result;
 
 #[derive(Args)]
 pub struct PullCommand {
-    /// Model to download (for example `qwen3.5:4b-q4_k_m` on Metal or `qwen3.5:4b` on CUDA)
+    /// Model alias, owner/repository, or owner/repository:QUANT (for example :Q4_K_M).
     pub model: String,
     /// Exact repository-relative GGUF filename; MODEL may include @<40-hex-commit>.
     #[arg(long, value_name = "FILE")]
@@ -54,7 +54,6 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
         Err(error) => {
             eprintln!();
             eprintln!("{} Failed to pull model: {}", "✗".red().bold(), error);
-            eprintln!("Set HF_TOKEN for private models and verify network/proxy settings.");
             Err(error)
         }
     }

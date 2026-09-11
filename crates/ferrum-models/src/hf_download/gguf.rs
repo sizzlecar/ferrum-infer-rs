@@ -14,28 +14,30 @@ pub(super) fn selected_file<'a>(files: &'a [HfFileInfo], filename: &str) -> Resu
             "GGUF filename '{filename}' is ambiguous under case-insensitive matching"
         )));
     }
-    validate_gguf_filename(&first.path)?;
+    crate::source::gguf_selection::validate_standalone_gguf(&first.path)?;
     Ok(first)
 }
 
-pub(super) fn require_weight_selection(
-    files: &[HfFileInfo],
+pub(super) fn automatic_file<'a>(
+    files: &'a [HfFileInfo],
     selected: &[&HfFileInfo],
-) -> Result<()> {
-    let has_gguf = files.iter().any(|file| {
-        file.file_type.as_deref() != Some("directory")
-            && file.path.to_ascii_lowercase().ends_with(".gguf")
-    });
-    if has_gguf
-        && !selected
-            .iter()
-            .any(|file| selection::is_weight_path(&file.path))
+) -> Result<Option<&'a HfFileInfo>> {
+    if selected
+        .iter()
+        .any(|file| selection::is_weight_path(&file.path))
     {
-        return Err(FerrumError::model(
-            "This repository distributes GGUF weights; select one exact file with --gguf-file FILE when using ferrum pull, run or serve",
-        ));
+        return Ok(None);
     }
-    Ok(())
+    let filename = crate::source::gguf_selection::select_gguf_file(
+        files
+            .iter()
+            .filter(|file| file.file_type.as_deref() != Some("directory"))
+            .map(|file| file.path.as_str()),
+        None,
+    )?;
+    filename
+        .map(|filename| selected_file(files, filename))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -95,11 +97,16 @@ mod tests {
     }
 
     #[test]
-    fn gguf_only_repository_requires_a_file_even_when_sidecars_exist() {
+    fn gguf_selection_preserves_existing_repository_weights_and_sidecars() {
         let mut files = vec![file("model.gguf"), file("config.json")];
-        assert!(require_weight_selection(&files, &[&files[1]]).is_err());
+        assert_eq!(
+            automatic_file(&files, &[&files[1]]).unwrap().unwrap().path,
+            "model.gguf"
+        );
         files.push(file("model.safetensors"));
-        assert!(require_weight_selection(&files, &[&files[1], &files[2]]).is_ok());
-        assert!(require_weight_selection(&[], &[]).is_ok());
+        assert!(automatic_file(&files, &[&files[1], &files[2]])
+            .unwrap()
+            .is_none());
+        assert!(automatic_file(&[], &[]).unwrap().is_none());
     }
 }

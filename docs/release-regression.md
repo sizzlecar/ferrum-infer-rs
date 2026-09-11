@@ -273,7 +273,15 @@ This selects the exact snapshot through Ferrum's downloader and cache; aliases,
 branches and tags cannot be used as pins. The runner verifies the actual
 repository, revision and file fingerprints reported by both product entrypoints.
 
-For a GGUF repository, `pull`, `run` and `serve` accept `--gguf-file FILE` to
+`pull`, `run` and `serve` accept full Hugging Face repository names without an
+alias-table entry. For a GGUF repository they select one standard `Q4_K_M` file,
+or the only model file when there is no `Q4_K_M` candidate. Projector files are
+excluded. Use a model name such as `owner/repository:Q8_0` to select a published
+quantization; labels are case-insensitive and may precede an immutable
+`@FULL_40_HEX_COMMIT` pin. This selects existing files rather than quantizing
+weights during download. An ambiguous selection lists the available files.
+
+For an exact artifact, `pull`, `run` and `serve` accept `--gguf-file FILE` to
 select one repository-relative artifact, including a file in a subdirectory.
 The same selection works for a fresh download or a cache containing several
 quantizations. An immutable repository pin applies to the selected file:
@@ -286,8 +294,11 @@ ferrum run unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523 --gg
 Semantic configuration and tokenizer files resolve independently from colocated
 metadata or the GGUF's declared source repository. `run` and `serve` also accept
 `--semantic-source DIR` and `--tokenizer-source DIR` for explicit metadata roles.
-A bare repository reuses one unambiguous cached GGUF; without a cached selection,
-choose an exact file instead of downloading every quantization.
+Cold downloads and warm caches use the same selection policy. Only selected
+weights and required colocated metadata roles are downloaded; a repeated pull
+reuses complete cached files. Interrupted selected metadata transfers must
+finish before the model is ready. Split GGUF sets currently require a standalone
+variant; selecting one part does not make the set loadable.
 
 The model runner also forwards `--gguf-file FILE` to both entrypoints and requires
 an immutable `--model` pin with this option. A prepared `ModelProfile` can declare

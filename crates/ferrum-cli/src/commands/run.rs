@@ -725,7 +725,7 @@ async fn collect_run_text_stream(
 
 #[derive(Args)]
 pub struct RunCommand {
-    /// Model name (release alias, Hugging Face repository, local directory, or `.gguf` file).
+    /// Model name (alias, owner/repository[:QUANT], local directory, or `.gguf` file).
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 

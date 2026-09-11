@@ -355,10 +355,68 @@ async fn gguf_download_selects_one_file_from_the_resolved_immutable_snapshot() {
 }
 
 #[tokio::test]
-async fn fresh_gguf_repository_reports_file_selection_before_downloading_sidecars() {
+async fn fresh_single_gguf_download_and_repeat_reuse_the_selected_payload() {
     let hub = HubFixture::with_files(
         vec![
             HubFile::new("model.gguf", b"GGUF payload"),
+            HubFile::new("config.json", b"{}"),
+        ],
+        None,
+    )
+    .await;
+    let snapshot = hub.downloader().download(MODEL_ID, None).await.unwrap();
+    assert_eq!(
+        std::fs::read(snapshot.join("model.gguf")).unwrap(),
+        b"GGUF payload"
+    );
+    assert_eq!(hub.file_requests("GET", "config.json"), 1);
+    assert_eq!(hub.file_requests("GET", "model.gguf"), 1);
+    assert_eq!(
+        hub.downloader()
+            .download_safetensors(MODEL_ID, None)
+            .await
+            .unwrap(),
+        snapshot
+    );
+    assert_eq!(hub.file_requests("GET", "model.gguf"), 1);
+    hub.assert_pinned_reads();
+}
+
+#[tokio::test]
+async fn default_and_explicit_quantization_download_only_the_requested_variant() {
+    let hub = HubFixture::with_files(
+        vec![
+            HubFile::new("weights/model-Q8_0.gguf", b"eight bit"),
+            HubFile::new("weights/model-Q4_K_M.gguf", b"four bit"),
+            HubFile::new("mmproj-F16.gguf", b"projector"),
+            HubFile::new("config.json", b"{}"),
+        ],
+        None,
+    )
+    .await;
+    let root = hub.downloader().download(MODEL_ID, None).await.unwrap();
+    assert_eq!(
+        std::fs::read(root.join("weights/model-Q4_K_M.gguf")).unwrap(),
+        b"four bit"
+    );
+    assert_eq!(hub.file_requests("GET", "weights/model-Q8_0.gguf"), 0);
+    let path = hub
+        .downloader()
+        .download_gguf_quantization(MODEL_ID, None, "q8_0")
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"eight bit");
+    assert_eq!(hub.file_requests("GET", "weights/model-Q4_K_M.gguf"), 1);
+    assert_eq!(hub.file_requests("GET", "mmproj-F16.gguf"), 0);
+    hub.assert_pinned_reads();
+}
+
+#[tokio::test]
+async fn ambiguous_gguf_repository_reports_choices_before_downloading_sidecars() {
+    let hub = HubFixture::with_files(
+        vec![
+            HubFile::new("first.gguf", b"GGUF payload"),
+            HubFile::new("second.gguf", b"another model"),
             HubFile::new("config.json", b"{}"),
         ],
         None,
@@ -372,8 +430,103 @@ async fn fresh_gguf_repository_reports_file_selection_before_downloading_sidecar
         .to_string();
     assert!(error.contains("--gguf-file"), "{error}");
     assert_eq!(hub.file_requests("GET", "config.json"), 0);
-    assert_eq!(hub.file_requests("GET", "model.gguf"), 0);
+    assert_eq!(hub.file_requests("GET", "first.gguf"), 0);
     assert!(!hub.main_ref().exists());
+}
+
+#[tokio::test]
+async fn selected_gguf_repairs_failed_metadata_without_refetching_weights() {
+    let filename = "weights/model-Q4_K_M.gguf";
+    let hub = HubFixture::with_files(
+        vec![
+            HubFile::new(filename, b"selected GGUF payload"),
+            HubFile::new("weights/model-Q8_0.gguf", b"unselected GGUF payload"),
+            HubFile::new("config.json", b"{}"),
+            HubFile::new("tokenizer.json", b"{}"),
+            HubFile::new("chat_template.jinja", TEMPLATE.as_bytes()),
+        ],
+        None,
+    )
+    .await;
+    let metadata = ["config.json", "tokenizer.json", "chat_template.jinja"];
+    hub.fail_get("chat_template.jinja", true);
+    let error = hub
+        .downloader()
+        .download_selected_gguf(
+            MODEL_ID,
+            None,
+            super::GgufRequest::Quantization("q4_k_m"),
+            &metadata,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("chat_template.jinja"), "{error}");
+    assert!(!hub.main_ref().exists());
+    let snapshot = hub
+        .cache
+        .path()
+        .join("hub/models--fixture--standalone-template/snapshots")
+        .join(REVISION);
+    assert!(
+        super::inspect_cached_metadata_selection(&snapshot, &metadata)
+            .unwrap()
+            .is_some()
+    );
+    hub.fail_get("chat_template.jinja", false);
+    let downloaded = hub
+        .downloader()
+        .download_selected_gguf(
+            MODEL_ID,
+            None,
+            super::GgufRequest::Quantization("Q4_K_M"),
+            &metadata,
+        )
+        .await
+        .unwrap();
+    assert_eq!(downloaded, snapshot.join(filename));
+    assert!(
+        super::inspect_cached_metadata_selection(&snapshot, &metadata)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(hub.file_requests("GET", filename), 1);
+    assert_eq!(hub.file_requests("GET", "config.json"), 1);
+    assert_eq!(hub.file_requests("GET", "weights/model-Q8_0.gguf"), 0);
+    assert_eq!(hub.file_requests("GET", "chat_template.jinja"), 2);
+    assert_eq!(std::fs::read_to_string(hub.main_ref()).unwrap(), REVISION);
+    hub.assert_pinned_reads();
+}
+
+#[tokio::test]
+async fn selected_gguf_does_not_fetch_metadata_roles_supplied_by_the_caller() {
+    for metadata in [&[][..], &["config.json"][..]] {
+        let hub = HubFixture::with_files(
+            vec![
+                HubFile::new("model.gguf", b"GGUF payload"),
+                HubFile::new("config.json", b"{}"),
+                HubFile::new("tokenizer.json", b"unused tokenizer"),
+            ],
+            None,
+        )
+        .await;
+        hub.fail_get("tokenizer.json", true);
+        hub.downloader()
+            .download_selected_gguf(
+                MODEL_ID,
+                None,
+                super::GgufRequest::File("model.gguf"),
+                metadata,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hub.file_requests("GET", "model.gguf"), 1);
+        assert_eq!(
+            hub.file_requests("GET", "config.json"),
+            usize::from(!metadata.is_empty())
+        );
+        assert_eq!(hub.file_requests("HEAD", "tokenizer.json"), 0);
+        assert_eq!(hub.file_requests("GET", "tokenizer.json"), 0);
+    }
 }
 
 #[tokio::test]

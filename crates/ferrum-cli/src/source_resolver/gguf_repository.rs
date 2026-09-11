@@ -86,7 +86,7 @@ pub(super) async fn resolve_metadata(
     // An explicit tokenizer leaves the semantic role intact. It must not force
     // downloading or validating a tokenizer that the caller will replace.
     if let Some(tokenizer) = tokenizer_override {
-        let root = local_path.parent().unwrap_or_else(|| Path::new("."));
+        let root = gguf_metadata_root(local_path);
         if semantic_ready(root)? {
             return compose(
                 root,
@@ -100,12 +100,28 @@ pub(super) async fn resolve_metadata(
     }
     let repo = &weights_original.location;
     let metadata_repo = declared_metadata_repository(&read_metadata(local_path)?)?
-        .or_else(|| tokenizer_sibling_repo(repo)).ok_or_else(|| {
-        FerrumError::model(format!(
-            "GGUF repository '{repo}' has no semantic/tokenizer source; provide --semantic-source DIR"
-        ))
-    })?;
-    let cached = if tokenizer_override.is_some() {
+        .or_else(|| tokenizer_sibling_repo(repo))
+        .unwrap_or_else(|| repo.clone());
+    // A cached weight may predate metadata-aware downloads. If there is no
+    // independent source declaration, resolve sidecars from its own revision.
+    let colocated = metadata_repo == *repo;
+    let weight_identity = huggingface_snapshot_identity(local_path);
+    let metadata_revision = if colocated {
+        weight_identity
+            .as_ref()
+            .map(|identity| identity.revision.as_str())
+    } else {
+        None
+    };
+    let cached = if colocated {
+        let root = gguf_metadata_root(local_path);
+        let ready = if tokenizer_override.is_some() {
+            semantic_ready(root)?
+        } else {
+            is_complete_product_metadata_snapshot(root)?
+        };
+        ready.then(|| root.to_path_buf())
+    } else if tokenizer_override.is_some() {
         let directory = cache_dir
             .join("hub")
             .join(format!("models--{}", metadata_repo.replace('/', "--")));
@@ -133,7 +149,7 @@ pub(super) async fn resolve_metadata(
                     .ok();
                 let downloader = ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
                 let path = downloader
-                    .download_sidecar_files(&metadata_repo, None, files)
+                    .download_sidecar_files(&metadata_repo, metadata_revision, files)
                     .await?;
                 let ready = if tokenizer_override.is_some() { semantic_ready(&path)? } else { is_complete_product_metadata_snapshot(&path)? };
                 if !ready {
@@ -149,7 +165,11 @@ pub(super) async fn resolve_metadata(
                 )))
             }
         };
-    let metadata_original = repository_source(metadata_repo);
+    let metadata_original = if colocated {
+        weights_original.clone()
+    } else {
+        repository_source(metadata_repo)
+    };
     compose(
         &metadata_root,
         tokenizer_override.unwrap_or(&metadata_root),
@@ -201,4 +221,61 @@ fn compose(
         },
     )?);
     Ok((Some(sources), metadata_from_cache))
+}
+
+/// Compose identical metadata roles after a cold download or a warm cache hit.
+pub(super) async fn compose_repository(
+    source: &mut ResolvedModelSource,
+    original_source: &ModelSource,
+    model: &str,
+    cache_dir: &Path,
+    download: DownloadPolicy,
+    composition: ProductSourceComposition<'_>,
+) -> Result<Option<Arc<ProductionModelSourceBundle>>> {
+    let tokenizer_override = match composition {
+        ProductSourceComposition::ResolveWithExplicitTokenizer(path) => Some(path),
+        _ => None,
+    };
+    let defer_repository_product_sources =
+        composition != ProductSourceComposition::ResolveColocated;
+    let sources = if source.format == ModelFormat::GGUF && tokenizer_override.is_some() {
+        let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
+            model,
+            original_product_source(original_source, &source.local_path)?,
+            &source.local_path,
+            cache_dir,
+            download,
+            tokenizer_override,
+        )
+        .await?;
+        source.from_cache &= metadata_from_cache;
+        sources
+    } else if defer_repository_product_sources {
+        None
+    } else {
+        let colocated = open_colocated_product_sources(source, original_source)?;
+        let needs_repository_metadata = source.format == ModelFormat::GGUF
+            && colocated.is_none()
+            && (direct_gguf_requires_typed_product_sources(&source.local_path)?
+                || ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(
+                    &source.local_path,
+                )
+                .is_none());
+        if needs_repository_metadata {
+            let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
+                model,
+                original_product_source(original_source, &source.local_path)?,
+                &source.local_path,
+                cache_dir,
+                download,
+                None,
+            )
+            .await?;
+            source.from_cache &= metadata_from_cache;
+            sources
+        } else {
+            colocated
+        }
+    };
+    Ok(sources)
 }
