@@ -3,6 +3,84 @@ use crate::source_resolver::gguf_repository::tests::write_iq_fixture;
 use ferrum_quantization::gguf::Value;
 
 #[tokio::test]
+async fn nested_quantization_uses_snapshot_metadata_and_preserves_source_overrides() {
+    let cache = tempfile::tempdir().unwrap();
+    let repo = "Publisher/Checkpoint-GGUF";
+    let revision = "a".repeat(40);
+    let snapshot = cache
+        .path()
+        .join("hub/models--Publisher--Checkpoint-GGUF/snapshots")
+        .join(&revision);
+    std::fs::create_dir_all(snapshot.join("weights")).unwrap();
+    let filename = "weights/model-IQ4_XS.gguf";
+    write_iq_fixture(&snapshot.join(filename), &[]);
+    write_iq_fixture(&snapshot.join("other-Q8_0.gguf"), &[]);
+    std::fs::write(
+        snapshot.join("config.json"),
+        crate::source_resolver::tests::qwen35_semantic_config(false),
+    )
+    .unwrap();
+    std::fs::write(snapshot.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+    std::fs::write(
+        snapshot.join("tokenizer_config.json"),
+        br#"{"chat_template":"fixture-template"}"#,
+    )
+    .unwrap();
+    for request in [
+        format!("{repo}:iq4_xs"),
+        format!("{repo}:IQ4_XS@{revision}"),
+    ] {
+        let product = resolve_model_source_with_product_sources(
+            &request,
+            cache.path(),
+            DownloadPolicy::NoDownload,
+            None,
+            &ProductSourceArgs::default(),
+        )
+        .await
+        .unwrap()
+        .into_product_engine_input();
+        assert!(product.source.from_cache);
+        assert_eq!(product.requested_model, request);
+        let sources = product.model_sources.unwrap();
+        assert_eq!(
+            sources.weights().path(),
+            snapshot.join(filename).canonicalize().unwrap()
+        );
+        assert_eq!(sources.semantic_root(), snapshot.canonicalize().unwrap());
+        assert_eq!(sources.tokenizer_root(), snapshot.canonicalize().unwrap());
+        assert_eq!(sources.original_sources().weights.location, repo);
+        assert_eq!(sources.original_sources().semantic.location, repo);
+        assert_eq!(sources.original_sources().tokenizer.location, repo);
+        assert_eq!(
+            sources.resolved_sources().weights.files[0].relative_path,
+            filename
+        );
+    }
+    let tokenizer = cache.path().join("tokenizer-override");
+    std::fs::create_dir(&tokenizer).unwrap();
+    for file in ["tokenizer.json", "tokenizer_config.json"] {
+        std::fs::rename(snapshot.join(file), tokenizer.join(file)).unwrap();
+    }
+    let product = resolve_model_source_with_product_sources(
+        &format!("{repo}:IQ4_XS"),
+        cache.path(),
+        DownloadPolicy::NoDownload,
+        None,
+        &ProductSourceArgs {
+            tokenizer_source: Some(tokenizer.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .into_product_engine_input();
+    let sources = product.model_sources.unwrap();
+    assert_eq!(sources.semantic_root(), snapshot.canonicalize().unwrap());
+    assert_eq!(sources.tokenizer_root(), tokenizer.canonicalize().unwrap());
+}
+
+#[tokio::test]
 async fn explicit_filename_selects_one_cached_quantization_and_respects_revision_and_roles() {
     let cache = tempfile::tempdir().unwrap();
     let repo = "Quantizer/Checkpoint-GGUF";

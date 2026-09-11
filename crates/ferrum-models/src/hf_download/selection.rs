@@ -74,14 +74,16 @@ fn is_file(file: &HfFileInfo) -> bool {
 }
 
 pub(super) fn is_weight_path(path: &str) -> bool {
-    [".safetensors", ".pt", ".bin", ".onnx"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
+    path.to_ascii_lowercase().ends_with(".gguf")
+        || [".safetensors", ".pt", ".bin", ".onnx"]
+            .iter()
+            .any(|extension| path.ends_with(extension))
 }
 
 /// Preserve the original ordinary downloader's sidecars and no-index fallback.
 fn legacy_selected_path(path: &str) -> bool {
-    !path.ends_with(".md")
+    !path.to_ascii_lowercase().ends_with(".gguf")
+        && !path.ends_with(".md")
         && !path.starts_with(".git")
         && (is_weight_path(path)
             || [

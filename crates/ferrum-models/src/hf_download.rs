@@ -34,6 +34,13 @@ enum DownloadLayout {
     RootSafetensors,
 }
 
+#[derive(Clone, Copy)]
+/// Select existing GGUF bytes by filename or published quantization label.
+pub enum GgufRequest<'a> {
+    File(&'a str),
+    Quantization(&'a str),
+}
+
 /// HuggingFace API base URL (override with `HF_ENDPOINT`, e.g.
 /// `https://hf-mirror.com` — same convention as huggingface_hub).
 const HF_API_URL: &str = "https://huggingface.co";
@@ -169,7 +176,41 @@ impl HfDownloader {
         revision: Option<&str>,
         gguf_filename: &str,
     ) -> Result<PathBuf> {
-        validate_gguf_filename(gguf_filename)?;
+        self.download_selected_gguf(model_id, revision, GgufRequest::File(gguf_filename), &[])
+            .await
+    }
+
+    /// Download one published quantization using the same commit/cache contract.
+    pub async fn download_gguf_quantization(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+        quantization: &str,
+    ) -> Result<PathBuf> {
+        self.download_selected_gguf(
+            model_id,
+            revision,
+            GgufRequest::Quantization(quantization),
+            &[],
+        )
+        .await
+    }
+
+    /// Download one weight artifact and only the colocated metadata roles the
+    /// caller needs. All files retain the same immutable repository identity.
+    pub async fn download_selected_gguf(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+        request: GgufRequest<'_>,
+        metadata_filenames: &[&str],
+    ) -> Result<PathBuf> {
+        match request {
+            GgufRequest::File(filename) => validate_gguf_filename(filename)?,
+            GgufRequest::Quantization(quant) => {
+                crate::source::gguf_selection::validate_quantization_label(quant)?
+            }
+        }
         let revision = revision.unwrap_or("main");
         let model_cache_name = format!("models--{}", model_id.replace('/', "--"));
         let model_dir = self.cache_dir.join("hub").join(&model_cache_name);
@@ -187,27 +228,48 @@ impl HfDownloader {
             ));
         }
         let files = self.list_files(model_id, &commit_sha).await?;
-        let file = gguf::selected_file(&files, gguf_filename)?;
+        let filename = match request {
+            GgufRequest::File(filename) => filename,
+            GgufRequest::Quantization(quant) => crate::source::gguf_selection::select_gguf_file(
+                files
+                    .iter()
+                    .filter(|file| file.file_type.as_deref() != Some("directory"))
+                    .map(|file| file.path.as_str()),
+                Some(quant),
+            )?
+            .ok_or_else(|| FerrumError::model("No matching model artifact"))?,
+        };
+        let file = gguf::selected_file(&files, filename)?;
+        eprintln!("Selected model file: {}", file.path);
         let snapshot_dir = snapshots_dir.join(&commit_sha);
         fs::create_dir_all(&snapshot_dir).await?;
 
-        let total_size = file.size.unwrap_or(0);
+        let mut selected = vec![file];
+        selected.extend(files.iter().filter(|file| {
+            file.file_type.as_deref() != Some("directory")
+                && !selection::is_weight_path(&file.path)
+                && metadata_filenames.contains(&file.path.as_str())
+        }));
+        metadata_inventory::record_selected_metadata(&snapshot_dir, &selected).await?;
+        let total_size: u64 = selected.iter().filter_map(|file| file.size).sum();
         eprintln!(
             "📦 Downloading {} files ({:.2} GB)",
-            1,
+            selected.len(),
             total_size as f64 / 1_073_741_824.0
         );
 
-        self.download_file_concurrent(
-            model_id,
-            &commit_sha,
-            &file.path,
-            total_size,
-            &blobs_dir,
-            &snapshot_dir,
-            None,
-        )
-        .await?;
+        for selected_file in selected {
+            self.download_file_concurrent(
+                model_id,
+                &commit_sha,
+                &selected_file.path,
+                selected_file.size.unwrap_or(0),
+                &blobs_dir,
+                &snapshot_dir,
+                None,
+            )
+            .await?;
+        }
 
         let ref_file = refs_dir.join(revision);
         fs::write(&ref_file, &commit_sha).await?;
@@ -356,7 +418,10 @@ impl HfDownloader {
             DownloadLayout::Repository => selection::repository_files(&files),
             DownloadLayout::RootSafetensors => selection::selected_files(&files, index.as_deref())?,
         };
-        gguf::require_weight_selection(&files, &files_to_download)?;
+        if let Some(file) = gguf::automatic_file(&files, &files_to_download)? {
+            eprintln!("Selected model file: {}", file.path);
+            files_to_download.push(file);
+        }
         if files_to_download.is_empty() {
             return Err(FerrumError::model("No model files found in repository"));
         }

@@ -652,6 +652,7 @@ pub fn serve_profile_runtime_entries(
         is_gguf,
         detect_moe_arch(snapshot_path),
         device_is_metal(device),
+        !matches!(device, ferrum_types::Device::CPU),
         vnext_plan_owns_context_capacity,
         current,
         source,
@@ -674,6 +675,7 @@ pub fn serve_profile_runtime_entries_for_arch(
     is_gguf: bool,
     is_moe: bool,
     is_metal: bool,
+    supports_paged_kv: bool,
     vnext_plan_owns_context_capacity: bool,
     current: &RuntimeConfigSnapshot,
     source: RuntimeConfigSource,
@@ -702,6 +704,10 @@ pub fn serve_profile_runtime_entries_for_arch(
             kv_capacity,
             source,
         );
+    }
+    if !supports_paged_kv {
+        push_paged_kv_compat_entries(&mut entries, current, "0", source);
+        return entries;
     }
     push_paged_kv_compat_entries(&mut entries, current, "1", source);
     for (k, v) in [
@@ -1117,6 +1123,26 @@ fn original_product_source(
     }
 }
 
+fn gguf_metadata_root(path: &Path) -> &Path {
+    // Preserve the Hub snapshot boundary for files in quantization folders.
+    // Do not canonicalize LFS links into blobs or search arbitrary local parents.
+    if let Some(identity) = huggingface_snapshot_identity(path) {
+        if let Some(root) = path.ancestors().find(|root| {
+            root.file_name().and_then(|name| name.to_str()) == Some(identity.revision.as_str())
+                && root
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("snapshots")
+        }) {
+            return root;
+        }
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn open_colocated_product_sources(
     source: &ResolvedModelSource,
     original_source: &ModelSource,
@@ -1135,18 +1161,19 @@ fn open_colocated_product_sources(
             )
         }
         ModelFormat::GGUF => {
-            let metadata_root = source
-                .local_path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
+            let metadata_root = gguf_metadata_root(&source.local_path);
             if !is_complete_product_metadata_snapshot(metadata_root)? {
                 return Ok(None);
             }
-            let metadata_original = OriginalModelSource {
-                kind: ModelSourceKind::LocalDirectory,
-                location: metadata_root.display().to_string(),
-                requested_revision: None,
+            let weight_original = original_product_source(original_source, &source.local_path)?;
+            let metadata_original = if matches!(original_source, ModelSource::HuggingFace { .. }) {
+                weight_original.clone()
+            } else {
+                OriginalModelSource {
+                    kind: ModelSourceKind::LocalDirectory,
+                    location: metadata_root.display().to_string(),
+                    requested_revision: None,
+                }
             };
             (
                 metadata_root,
@@ -1154,7 +1181,7 @@ fn open_colocated_product_sources(
                 OriginalModelSources {
                     semantic: metadata_original.clone(),
                     tokenizer: metadata_original,
-                    weights: original_product_source(original_source, &source.local_path)?,
+                    weights: weight_original,
                 },
             )
         }
@@ -1496,6 +1523,21 @@ async fn resolve_model_source_internal(
         )));
     }
 
+    // A full repository plus quantization needs no entry in the alias table.
+    if let Some((repository, quant)) = gguf_repository::selection::quantized_repository(model)? {
+        let mut resolved = gguf_repository::selection::resolve_quantization(
+            &repository,
+            quant,
+            cache_dir,
+            download,
+            autosize,
+            source_composition,
+        )
+        .await?;
+        resolved.requested_model = model.to_owned();
+        return Ok(resolved);
+    }
+
     // 4. HF cache hit. Parse pins only after existing local sources.
     let pinned = parse_pinned_hf_repository(model)?;
     let model_id = pinned
@@ -1520,41 +1562,15 @@ async fn resolve_model_source_internal(
             revision: revision.map(str::to_owned),
             cache_dir: Some(cache_dir.display().to_string()),
         };
-        let model_sources = if source.format == ModelFormat::GGUF && tokenizer_override.is_some() {
-            let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
-                model,
-                original_product_source(&original_source, &source.local_path)?,
-                &source.local_path,
-                cache_dir,
-                download,
-                tokenizer_override,
-            )
-            .await?;
-            source.from_cache &= metadata_from_cache;
-            sources
-        } else if defer_repository_product_sources {
-            None
-        } else {
-            let colocated = open_colocated_product_sources(&source, &original_source)?;
-            if source.format == ModelFormat::GGUF
-                && colocated.is_none()
-                && direct_gguf_requires_typed_product_sources(&source.local_path)?
-            {
-                let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
-                    model,
-                    original_product_source(&original_source, &source.local_path)?,
-                    &source.local_path,
-                    cache_dir,
-                    download,
-                    None,
-                )
-                .await?;
-                source.from_cache &= metadata_from_cache;
-                sources
-            } else {
-                colocated
-            }
-        };
+        let model_sources = gguf_repository::compose_repository(
+            &mut source,
+            &original_source,
+            model,
+            cache_dir,
+            download,
+            source_composition,
+        )
+        .await?;
         return Ok(finalize_resolution(
             source,
             original_source,
@@ -1612,11 +1628,15 @@ async fn resolve_model_source_internal(
         revision: revision.map(str::to_owned),
         cache_dir: Some(cache_dir.display().to_string()),
     };
-    let model_sources = if defer_repository_product_sources {
-        None
-    } else {
-        open_colocated_product_sources(&source, &original_source)?
-    };
+    let model_sources = gguf_repository::compose_repository(
+        &mut source,
+        &original_source,
+        model,
+        cache_dir,
+        download,
+        source_composition,
+    )
+    .await?;
     Ok(finalize_resolution(
         source,
         original_source,
@@ -2544,6 +2564,7 @@ mod tests {
             true,
             true,
             true,
+            true,
             false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
@@ -2576,6 +2597,7 @@ mod tests {
             true,
             true,
             false,
+            true,
             false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
@@ -2608,6 +2630,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             false,
             &RuntimeConfigSnapshot::default(),
             RuntimeConfigSource::Default,
@@ -2634,6 +2657,7 @@ mod tests {
         let entries = serve_profile_runtime_entries_for_arch(
             true,
             false,
+            true,
             true,
             true,
             &RuntimeConfigSnapshot::default(),
@@ -2664,6 +2688,7 @@ mod tests {
             true,
             true,
             true,
+            true,
             false,
             &current,
             RuntimeConfigSource::Default,
@@ -2674,6 +2699,27 @@ mod tests {
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("16")
         );
+    }
+
+    #[test]
+    fn cpu_gguf_serve_profile_does_not_enable_unsupported_paged_operators() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("model.gguf");
+        gguf_repository::tests::write_metadata_fixture(&file, "qwen3", &[]);
+        let entries = serve_profile_runtime_entries(
+            &file,
+            &ferrum_types::Device::CPU,
+            false,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("0"));
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("0")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        assert_eq!(value(&entries, "FERRUM_PAGED_MAX_SEQS"), None);
     }
 
     #[test]

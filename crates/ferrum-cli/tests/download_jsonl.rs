@@ -160,3 +160,19 @@ async fn cold_and_blob_cached_gguf_alias_download_preserves_jsonl_stdout() {
     .into();
     exercise(alias, files).await;
 }
+
+#[tokio::test]
+async fn repository_and_quantization_names_resolve_metadata_before_reaching_the_loader() {
+    let repo = "fixture/checkpoint-GGUF";
+    for model in [repo.to_owned(), format!("{repo}:Q4_K_M")] {
+        let files = [
+            (
+                repo.to_owned(),
+                [("model-Q4_K_M.gguf".to_owned(), hub::gguf_without_weights())].into(),
+            ),
+            ("fixture/checkpoint".to_owned(), hub::sidecar_files()),
+        ]
+        .into();
+        exercise(&model, files).await;
+    }
+}

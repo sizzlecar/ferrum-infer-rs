@@ -141,12 +141,42 @@ async fn a_single_cached_gguf_is_the_shared_product_weight_source() {
 }
 
 #[tokio::test]
-async fn cached_legacy_gguf_does_not_require_an_invented_metadata_repository() {
+async fn cached_gguf_requires_available_metadata_before_product_resolution_succeeds() {
     let cache = CacheFixture::new();
     let snapshot = cache.snapshot(CURRENT);
     let file = snapshot.path.join("model.gguf");
     crate::source_resolver::gguf_repository::tests::write_metadata_fixture(&file, "qwen3", &[]);
     cache.select(CURRENT);
+    let error = resolve_model_source_with_product_sources(
+        REPO,
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+        &ProductSourceArgs::default(),
+    )
+    .await
+    .err()
+    .expect("weights alone cannot supply the product tokenizer")
+    .to_string();
+    assert!(error.contains("NoDownload"), "{error}");
+    assert!(error.contains(REPO), "{error}");
+    assert!(file.is_file());
+    // Legacy GGUF already carries its model config. Preserve the supported
+    // tokenizer-only layout instead of inventing an independent config repo.
+    write_tokenizer(&snapshot.path);
+    let legacy = resolve_model_source_with_product_sources(
+        REPO,
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+        &ProductSourceArgs::default(),
+    )
+    .await
+    .unwrap()
+    .into_product_engine_input();
+    assert_eq!(legacy.source.local_path, file);
+    assert!(legacy.model_sources.is_none());
+    snapshot.metadata();
     let product = resolve_model_source_with_product_sources(
         REPO,
         cache.root(),
@@ -158,7 +188,7 @@ async fn cached_legacy_gguf_does_not_require_an_invented_metadata_repository() {
     .unwrap()
     .into_product_engine_input();
     assert_eq!(product.source.local_path, file);
-    assert!(product.model_sources.is_none());
+    assert!(product.model_sources.is_some());
 }
 
 #[test]
