@@ -1187,7 +1187,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut participant_frames = Vec::with_capacity(participant_sessions.len());
         let mut flight_candidates = Vec::with_capacity(participant_sessions.len());
-        for participant in &participant_sessions {
+        let mut canonical_work = None;
+        for (request_index, participant) in participant_sessions.iter().enumerate() {
             let key = session_participant_key(participant);
             let index = self
                 .participants
@@ -1198,6 +1199,42 @@ where
                     invalid_resource("invocation participant lost its execution-frame assignment")
                 })?;
             let step_participant = &self.participants[index];
+            let frame = ActiveSequenceFrame {
+                frame_id: step_participant.frame.frame_id,
+                batch_step_id: self.batch_step_id,
+            };
+            let admitted = self.work_shape().participant_work()[index].token_span();
+            // Imported Step admission requires retained token evidence and
+            // stores that same immutable work Arc. Default untracked execution
+            // keeps its existing flight-stage validation without another lock.
+            if admitted.checkpoint_tokens().is_some() {
+                // The held frame prevents frontier advancement or restore.
+                let state =
+                    participant.slot.state.lock().map_err(|_| {
+                        invalid_resource("sequence session state mutex is poisoned")
+                    })?;
+                let super::SequenceSessionSlotState::Active(active) = &*state else {
+                    return Err(invalid_resource("invocation session is no longer active"));
+                };
+                if active.epoch != participant.epoch
+                    || active.fingerprint != participant.fingerprint
+                    || active.active_frame != Some(frame)
+                {
+                    return Err(invalid_resource("invocation lost its exact Step frame"));
+                }
+                if let Some(span) = active.completed_boundary.bind_imported_invocation_work(
+                    admitted,
+                    work_shape.participant_work()[request_index].token_span(),
+                    participant.resources().request.plan.plan_hash(),
+                )? {
+                    let work = canonical_work
+                        .get_or_insert_with(|| work_shape.participant_work().to_vec());
+                    work[request_index] = BatchParticipantTokenSpan::new(
+                        work_shape.participants()[request_index],
+                        span,
+                    );
+                }
+            }
             participant_frames.push(StepParticipantFrameAssignment::new(
                 participant.sequence_authority(),
                 participant.request_authority(),
@@ -1207,10 +1244,7 @@ where
                 slot: Arc::clone(&participant.slot),
                 epoch: participant.epoch,
                 fingerprint: participant.fingerprint.clone(),
-                frame: ActiveSequenceFrame {
-                    frame_id: step_participant.frame.frame_id,
-                    batch_step_id: self.batch_step_id,
-                },
+                frame,
                 participant: BatchParticipantAuthority::new(
                     participant.sequence_authority(),
                     participant.request_authority(),
@@ -1249,6 +1283,10 @@ where
             .iter()
             .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
+        let work_shape = match canonical_work {
+            Some(work) => Arc::new(BatchWorkShape::new(work)?),
+            None => work_shape,
+        };
         Ok(PreparedParticipantAuthority {
             plan_evidence: self.plan_evidence(),
             participants,

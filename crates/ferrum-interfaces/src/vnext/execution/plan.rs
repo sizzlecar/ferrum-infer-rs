@@ -220,6 +220,12 @@ impl ExecutionPlan {
                 memory.dynamic_descriptors(),
                 request.capabilities,
             )?;
+        let memory = memory.with_checkpoint_capacity(
+            request.policy.checkpoint_capacity_policy().copied(),
+            sequence_checkpoint_layout.as_ref(),
+            &nodes,
+            &retained_completion_resources,
+        )?;
         let mut payload = ExecutionPlanPayload {
             schema: EXECUTION_PLAN_SCHEMA,
             plan_id: PlanId::new("plan/unset")?,
@@ -2099,12 +2105,19 @@ impl ExecutionPlan {
             .map(ReusableExecutionMemoryPlan::pool_workspace_ceilings)
             .transpose()?
             .unwrap_or_default();
-        let expected_pools = MemoryPlan::derive_dynamic_pools_with_reusable(
+        let checkpoint_growth_ceilings =
+            super::checkpoint_capacity::derive_checkpoint_growth_ceilings(
+                self.payload.memory.checkpoint_capacity.as_ref(),
+                self.payload.sequence_checkpoint_layout.as_ref(),
+                &self.payload.memory.dynamic_descriptors,
+            )?;
+        let expected_pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
             &retained_completion_resources,
+            &checkpoint_growth_ceilings,
         )?;
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(

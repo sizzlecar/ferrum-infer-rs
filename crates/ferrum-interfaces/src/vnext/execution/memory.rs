@@ -1,3 +1,4 @@
+use super::checkpoint_capacity::{validate_checkpoint_pool_ceiling, CheckpointCapacityPolicy};
 use super::{
     invalid_plan, minimum_for_lifetime, node_completion_precedes, quantize_storage_bytes,
     static_contiguous_storage_profile, validate_active_sequence_ceiling,
@@ -29,6 +30,8 @@ pub struct MemoryPlan {
     pub(super) dynamic_descriptors: Vec<DynamicResourceDescriptor>,
     pub(super) dynamic_pools: Vec<DynamicBackingPoolSpec>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) checkpoint_capacity: Option<CheckpointCapacityPolicy>,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
 }
@@ -204,6 +207,7 @@ impl MemoryPlan {
             dynamic_descriptors,
             dynamic_pools,
             reusable_execution,
+            checkpoint_capacity: None,
             invocation_liveness_mode,
             invocation_liveness,
         };
@@ -350,6 +354,7 @@ impl MemoryPlan {
             &dynamic_by_id,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
+            self.checkpoint_capacity.as_ref(),
         )?;
         let (actual_liveness_mode, actual_liveness) =
             Self::summarize_pool_invocation_liveness(&self.dynamic_pools)?;
@@ -424,6 +429,24 @@ impl MemoryPlan {
         dynamic_capacity_bytes: u64,
         reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
         retained_completion_resources: &BTreeSet<ResourceId>,
+    ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
+        Self::derive_dynamic_pools_with_checkpoint(
+            dynamic_descriptors,
+            nodes,
+            dynamic_capacity_bytes,
+            reusable_workspace_ceilings,
+            retained_completion_resources,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub(super) fn derive_dynamic_pools_with_checkpoint(
+        dynamic_descriptors: &[DynamicResourceDescriptor],
+        nodes: &[PlanNode],
+        dynamic_capacity_bytes: u64,
+        reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
+        retained_completion_resources: &BTreeSet<ResourceId>,
+        checkpoint_growth_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
     ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
         let mut groups = BTreeMap::<
             DynamicBackingPoolId,
@@ -503,6 +526,10 @@ impl MemoryPlan {
                     .get(&pool_id)
                     .copied()
                     .unwrap_or(0);
+                let checkpoint_growth_ceiling_bytes = checkpoint_growth_ceilings
+                    .get(&pool_id)
+                    .copied()
+                    .unwrap_or(0);
                 DynamicBackingPoolSpec::from_core(
                     compatibility,
                     resource_ids,
@@ -513,6 +540,7 @@ impl MemoryPlan {
                     step_resource_slots,
                     theoretical_ceiling_bytes,
                     reusable_workspace_ceiling_bytes,
+                    checkpoint_growth_ceiling_bytes,
                     dynamic_capacity_bytes,
                     invocation_liveness_mode,
                     invocation_liveness,
@@ -525,6 +553,14 @@ impl MemoryPlan {
         {
             return Err(invalid_plan(
                 "reusable workspace ceiling references an unknown dynamic pool",
+            ));
+        }
+        if checkpoint_growth_ceilings
+            .keys()
+            .any(|pool_id| !pools.iter().any(|pool| &pool.pool_id == pool_id))
+        {
+            return Err(invalid_plan(
+                "checkpoint growth ceiling references an unknown dynamic pool",
             ));
         }
         Ok(pools)
@@ -929,6 +965,7 @@ impl MemoryPlan {
         descriptors: &BTreeMap<ResourceId, &DynamicResourceDescriptor>,
         dynamic_capacity_bytes: u64,
         reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
+        checkpoint_capacity: Option<&CheckpointCapacityPolicy>,
     ) -> Result<PoolAggregateEvidence, VNextError> {
         let mut expected_members =
             BTreeMap::<DynamicBackingPoolId, (PoolCompatibilityKey, Vec<ResourceId>)>::new();
@@ -1059,7 +1096,15 @@ impl MemoryPlan {
                 .unwrap_or(0);
             let combined_ceiling = theoretical
                 .checked_add(u128::from(reusable_workspace_ceiling_bytes))
+                .and_then(|bytes| {
+                    bytes.checked_add(u128::from(pool.checkpoint_growth_ceiling_bytes))
+                })
                 .ok_or_else(|| invalid_plan("pool combined ceiling overflows u128"))?;
+            validate_checkpoint_pool_ceiling(
+                checkpoint_capacity,
+                &members,
+                pool.checkpoint_growth_ceiling_bytes,
+            )?;
             let maximum_resident =
                 u64::try_from(combined_ceiling.min(u128::from(dynamic_capacity_bytes)))
                     .map_err(|_| invalid_plan("pool resident ceiling exceeds u64"))?;
@@ -1154,6 +1199,12 @@ impl MemoryPlan {
         self.maximum_active_sequences
     }
 
+    /// Aggregate retained-extent permission, without reserving bytes or
+    /// implying that runtime cache admission has been enabled.
+    pub const fn checkpoint_capacity(&self) -> Option<&CheckpointCapacityPolicy> {
+        self.checkpoint_capacity.as_ref()
+    }
+
     pub const fn capacity_bytes(&self) -> u64 {
         self.usable_capacity_bytes
     }
@@ -1193,6 +1244,8 @@ impl MemoryPlan {
     /// Conservative checked evidence across static allocations, live provider
     /// formula maxima, reusable execution workspace, and the protocol ceiling.
     /// It is never itself a reservation, admission target, or performance claim.
+    /// Ordinary resource and reusable-workspace ceiling. Optional checkpoint
+    /// growth is reported separately by `checkpoint_capacity` and pool bounds.
     pub fn theoretical_ceiling_bytes(&self) -> u128 {
         self.theoretical_ceiling_bytes.get()
     }
@@ -1240,6 +1293,8 @@ pub(super) struct MemoryPlanWire {
     pub(super) dynamic_descriptors: Vec<DynamicResourceDescriptor>,
     pub(super) dynamic_pools: Vec<DynamicBackingPoolSpec>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
+    #[serde(default)]
+    pub(super) checkpoint_capacity: Option<CheckpointCapacityPolicy>,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
 }
@@ -1267,6 +1322,7 @@ impl<'de> Deserialize<'de> for MemoryPlan {
             dynamic_descriptors: wire.dynamic_descriptors,
             dynamic_pools: wire.dynamic_pools,
             reusable_execution: wire.reusable_execution,
+            checkpoint_capacity: wire.checkpoint_capacity,
             invocation_liveness_mode: wire.invocation_liveness_mode,
             invocation_liveness: wire.invocation_liveness,
         };

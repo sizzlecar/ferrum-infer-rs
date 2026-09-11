@@ -928,11 +928,13 @@ pub(super) fn session_frame_candidates<R: DeviceRuntime>(
 pub(super) fn acquire_session_frames_with_backing<R>(
     candidates: &[SequenceFrameCaptureCandidate<R>],
     batch_step_id: BatchStepId,
+    work_shape: &BatchWorkShape,
 ) -> Result<Vec<CapturedSessionFrame<R>>, VNextError>
 where
     R: DeviceRuntime,
 {
     if candidates.is_empty()
+        || candidates.len() != work_shape.participant_work().len()
         || candidates.iter().enumerate().any(|(index, candidate)| {
             candidates[..index]
                 .iter()
@@ -980,6 +982,19 @@ where
                 ));
             }
         }
+    }
+    for ((candidate, state), work) in candidates
+        .iter()
+        .zip(&states)
+        .zip(work_shape.participant_work())
+    {
+        let SequenceSessionSlotState::Active(active) = &**state else {
+            unreachable!("all session frame candidates were validated");
+        };
+        active.completed_boundary.validate_imported_work(
+            work.token_span(),
+            candidate.resources.request.plan.plan_hash(),
+        )?;
     }
     // Frame capture and extension publication use the same slot -> backing
     // lock order. Allocator, device, copy, and fence work stay outside it.

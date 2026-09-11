@@ -24,22 +24,45 @@ impl CheckpointAuthorityId {
 #[derive(Debug)]
 pub enum CheckpointCapacityClaimDecision {
     Claimed(LogicalCheckpointLease),
+    Skipped(CheckpointRetentionSkipReason),
     Deferred(AdmissionDeferred),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Optional retention policy decisions, independent of device pressure or
+/// ordinary capacity-domain availability. A skipped capture does not wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointRetentionSkipReason {
+    Disabled,
+    Capacity {
+        requested_bytes: u64,
+        retained_bytes: u64,
+        maximum_bytes: u64,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CheckpointClaimRecord {
+    claims: CapacityVector,
+    retained_bytes: u64,
 }
 
 #[derive(Debug)]
 pub(super) struct CheckpointClaimLedger {
     next_serial: u64,
-    live: BTreeMap<CheckpointAuthorityId, CapacityVector>,
+    live: BTreeMap<CheckpointAuthorityId, CheckpointClaimRecord>,
+    capacity: Option<CheckpointCapacityPolicy>,
+    retained_bytes: u64,
     closed: bool,
 }
 
 impl CheckpointClaimLedger {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(capacity: Option<CheckpointCapacityPolicy>) -> Self {
         Self {
             next_serial: 1,
             live: BTreeMap::new(),
+            capacity,
+            retained_bytes: 0,
             closed: false,
         }
     }
@@ -61,20 +84,47 @@ pub struct LogicalCheckpointLease {
     inner: Arc<CoordinatorInner>,
     authority: CheckpointAuthorityId,
     claims: CapacityVector,
+    retained_bytes: u64,
     released: bool,
 }
 
 impl LogicalAdmissionCoordinator {
+    /// Aligned bytes reserved or retained by every live checkpoint lease,
+    /// including owners outside the cache index. This is a limit within pool
+    /// residency, not an additional DeviceCapacityBudget charge.
+    pub fn checkpoint_retained_bytes(&self) -> Result<u64, VNextError> {
+        Ok(self.inner.lock_state()?.checkpoint_claims.retained_bytes)
+    }
+
     /// Claims plan-derived checkpoint demand in the existing domain ledger.
     /// The caller must hold the plan lifecycle guard and commit this together
     /// with prepared physical backing. This is not a product allocation API.
     pub(crate) fn try_claim_checkpoint(
         &self,
         demand: &AdmissionDemand,
+        retained_bytes: u64,
     ) -> Result<CheckpointCapacityClaimDecision, VNextError> {
         if demand.immediate_claim.is_empty() {
             return Err(invalid_admission(
                 "checkpoint claim requires non-empty demand",
+            ));
+        }
+        // Resource domains are denominated in their actual aligned physical
+        // bytes. Never accept a caller's smaller fee for those same claims.
+        let claimed_bytes = demand
+            .immediate_claim
+            .entries()
+            .iter()
+            .try_fold(0_u64, |sum, claim| sum.checked_add(claim.units.get()))
+            .ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "checkpoint domain byte sum overflows u64",
+                )
+            })?;
+        if retained_bytes == 0 || retained_bytes != claimed_bytes {
+            return Err(invalid_admission(
+                "checkpoint retention fee must equal the complete aligned domain claims",
             ));
         }
         let mut state = self.inner.lock_mutation()?;
@@ -87,6 +137,11 @@ impl LogicalAdmissionCoordinator {
         if state.checkpoint_claims.closed {
             return Err(invalid_admission("checkpoint admission is closed"));
         }
+        let Some(policy) = state.checkpoint_claims.capacity else {
+            return Ok(CheckpointCapacityClaimDecision::Skipped(
+                CheckpointRetentionSkipReason::Disabled,
+            ));
+        };
         let evaluation = evaluate_demand(&state, demand)?;
         if !evaluation.permanent.is_empty() {
             return Ok(CheckpointCapacityClaimDecision::PermanentRejected(
@@ -117,6 +172,33 @@ impl LogicalAdmissionCoordinator {
             ));
         }
 
+        let current_retained = state.checkpoint_claims.retained_bytes;
+        let maximum_bytes = policy.maximum_retained_bytes();
+        let Some(remaining) = maximum_bytes.checked_sub(current_retained) else {
+            state.poisoned = true;
+            self.inner.epoch_tx.send_replace(state.epochs(self.id()));
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "checkpoint retained capacity exceeds its immutable policy",
+            ));
+        };
+        if retained_bytes > remaining {
+            return Ok(CheckpointCapacityClaimDecision::Skipped(
+                CheckpointRetentionSkipReason::Capacity {
+                    requested_bytes: retained_bytes,
+                    retained_bytes: current_retained,
+                    maximum_bytes,
+                },
+            ));
+        }
+        let next_retained = current_retained
+            .checked_add(retained_bytes)
+            .ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "checkpoint retained byte usage overflows u64",
+                )
+            })?;
         let serial = state.checkpoint_claims.next_serial;
         let next_serial = serial
             .checked_add(1)
@@ -169,12 +251,16 @@ impl LogicalAdmissionCoordinator {
         }
         let claims = demand.immediate_claim.clone();
         // Prepare both owned vectors before the first ledger mutation.
-        let recorded_claims = claims.clone();
+        let recorded_claims = CheckpointClaimRecord {
+            claims: claims.clone(),
+            retained_bytes,
+        };
         state
             .checkpoint_claims
             .live
             .insert(authority, recorded_claims);
         state.checkpoint_claims.next_serial = next_serial;
+        state.checkpoint_claims.retained_bytes = next_retained;
         for (domain, used) in next_usage {
             state
                 .domains
@@ -187,6 +273,7 @@ impl LogicalAdmissionCoordinator {
                 inner: Arc::clone(&self.inner),
                 authority,
                 claims,
+                retained_bytes,
                 released: false,
             },
         ))
@@ -226,6 +313,11 @@ impl LogicalCheckpointLease {
         &self.claims
     }
 
+    /// Independently retained aligned extents, not another device allocation.
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
     fn release_inner(&mut self) -> bool {
         if self.released {
             return true;
@@ -236,7 +328,24 @@ impl LogicalCheckpointLease {
         };
         let valid = !state.poisoned
             && self.authority.coordinator_id == self.inner.id
-            && state.checkpoint_claims.live.get(&self.authority) == Some(&self.claims)
+            && state
+                .checkpoint_claims
+                .live
+                .get(&self.authority)
+                .is_some_and(|record| {
+                    record.claims == self.claims && record.retained_bytes == self.retained_bytes
+                })
+            && self.retained_bytes > 0
+            && self
+                .claims
+                .entries()
+                .iter()
+                .try_fold(0_u64, |sum, claim| sum.checked_add(claim.units.get()))
+                == Some(self.retained_bytes)
+            && state.checkpoint_claims.retained_bytes >= self.retained_bytes
+            && state.checkpoint_claims.capacity.is_some_and(|policy| {
+                state.checkpoint_claims.retained_bytes <= policy.maximum_retained_bytes()
+            })
             && self.claims.entries().iter().all(|claim| {
                 state.domains.get(&claim.domain).is_some_and(|domain| {
                     domain.used >= claim.units.get() && domain.availability_epoch < u64::MAX
@@ -259,6 +368,7 @@ impl LogicalCheckpointLease {
             domain.availability_epoch += 1;
         }
         state.checkpoint_claims.live.remove(&self.authority);
+        state.checkpoint_claims.retained_bytes -= self.retained_bytes;
         state.release_epoch = next_release_epoch.expect("validated release epoch");
         // Logical availability is published here; this says nothing about
         // device residency or completion of physical backing release.

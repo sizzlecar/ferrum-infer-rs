@@ -11,6 +11,16 @@ use crate::vnext::{
     StateTransferObservation, StateTransferResult, StateTransferSubmission,
 };
 
+#[path = "restore_frontier_tests.rs"]
+mod restore_frontier_tests;
+
+fn checkpoint_harness() -> RestoreHarness {
+    RestoreHarness::new(checkpoint_fixture::Spec {
+        checkpoint_capacity: Some(crate::vnext::CheckpointCapacityPolicy::new(1024).unwrap()),
+        ..Default::default()
+    })
+}
+
 fn reserve_capture(
     session: &Arc<SequenceSession<TestRuntime>>,
 ) -> PreparedSequenceStateTransfer<TestRuntime> {
@@ -150,6 +160,15 @@ fn assert_checkpoint_budget_released(harness: &RestoreHarness) {
             .root
             .dynamic_pools
             .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
             .snapshot()
             .unwrap()
             .active_checkpoint_claims(),
@@ -172,7 +191,7 @@ fn assert_checkpoint_budget_released(harness: &RestoreHarness) {
 
 #[test]
 fn native_capture_fence_outbox_restore_preserves_gates_and_releases_execution_owners() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
@@ -257,7 +276,7 @@ fn native_capture_fence_outbox_restore_preserves_gates_and_releases_execution_ow
 
 #[test]
 fn native_capture_failed_fence_poisoned_destination_releases_source_and_capacity() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
@@ -297,11 +316,12 @@ fn native_capture_failed_fence_poisoned_destination_releases_source_and_capacity
 
 #[test]
 fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_all_owners() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
     let (owner, bytes) = allocate_checkpoint(&harness);
+    let retained_bytes = owner.extent_bytes();
     let weak_owner = Arc::downgrade(&owner);
     harness
         .runtime
@@ -327,6 +347,15 @@ fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_al
         StateTransferObservation::Indeterminate
     );
     assert!(weak_owner.upgrade().is_some());
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        retained_bytes
+    );
     assert_transfer_gate(&harness.session);
     assert_eq!(
         reaper.wait_state_transfer_for_recovery(slot).unwrap(),
@@ -340,6 +369,15 @@ fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_al
         StateTransferObservation::Quarantined
     );
     assert!(weak_owner.upgrade().is_some());
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        retained_bytes
+    );
     assert_transfer_gate(&harness.session);
     assert_eq!(
         reaper
@@ -368,7 +406,7 @@ fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_al
 
 #[test]
 fn native_ready_restore_outbox_survives_handle_drop_and_reaper_cleanup_cancels_target() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
@@ -415,7 +453,7 @@ fn native_ready_restore_outbox_survives_handle_drop_and_reaper_cleanup_cancels_t
 
 #[test]
 fn native_cancelled_restore_stays_gated_through_unknown_and_failed_drain() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
@@ -464,7 +502,7 @@ fn native_cancelled_restore_stays_gated_through_unknown_and_failed_drain() {
 
 #[test]
 fn native_definitely_not_submitted_rolls_back_capture_and_restore_without_writing() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);
@@ -512,7 +550,7 @@ fn native_definitely_not_submitted_rolls_back_capture_and_restore_without_writin
 
 #[test]
 fn native_submit_panic_keeps_capture_owned_until_drain_and_never_reopens_destination() {
-    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let harness = checkpoint_harness();
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);

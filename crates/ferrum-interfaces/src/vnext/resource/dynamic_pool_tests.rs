@@ -724,6 +724,26 @@ fn harness_with_nodes_and_reusable(
     nodes: Arc<[PlanNode]>,
     reusable_execution: Option<ReusableExecutionMemoryPlan>,
 ) -> Harness {
+    harness_with_checkpoint_policy(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        nodes,
+        reusable_execution,
+        None,
+    )
+}
+
+fn harness_with_checkpoint_policy(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+    reusable_execution: Option<ReusableExecutionMemoryPlan>,
+    checkpoint_capacity: Option<crate::vnext::CheckpointCapacityPolicy>,
+) -> Harness {
     let generation = issue_generation().unwrap();
     let plan_id = PlanId::new(format!("plan/dynamic-pool-test/{generation}")).unwrap();
     let plan_hash: PlanHash = serde_json::from_value(json!("1".repeat(64))).unwrap();
@@ -767,6 +787,7 @@ fn harness_with_nodes_and_reusable(
         binding.maximum_active_sequences(),
         &catalog.pools,
         &catalog.descriptors,
+        checkpoint_capacity,
     )
     .unwrap();
     let logical_admission = if mismatched_coordinator {

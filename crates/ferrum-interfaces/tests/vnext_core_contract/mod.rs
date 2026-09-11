@@ -1280,6 +1280,7 @@ pub(crate) fn policy_with_tokens(
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes,
             reserve_bytes,
             maximum_active_sequences,

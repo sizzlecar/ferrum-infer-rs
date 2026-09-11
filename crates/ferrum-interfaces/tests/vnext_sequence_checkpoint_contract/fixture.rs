@@ -21,6 +21,7 @@ pub struct Spec {
     pub read_only_state: bool,
     pub locations: Vec<(ResourceId, u64)>,
     pub layouts: Vec<ProviderCheckpointStateLayout>,
+    pub checkpoint_capacity: Option<CheckpointCapacityPolicy>,
 }
 
 impl Default for Spec {
@@ -75,6 +76,7 @@ impl Default for Spec {
                 ProviderCheckpointStateLayout::TokenMajorPrefix,
                 ProviderCheckpointStateLayout::ContiguousBoundaryValue,
             ],
+            checkpoint_capacity: None,
         }
     }
 }
@@ -101,7 +103,7 @@ impl Fixture {
         let catalog = catalog_for(&spec, operation.clone())?;
         let policy = ResolvedRuntimePolicy::new(
             "runtime-policy.checkpoint-fixture", ContractVersion::new(1, 0), SchedulingDiscipline::FirstReady,
-            RuntimeMemoryPolicy { capacity_bytes: 8 << 20, reserve_bytes: 128, maximum_active_sequences: 3, dynamic_storage_profile_order: if spec.profile == contiguous_storage_profile() { vec![spec.profile] } else { vec![spec.profile, contiguous_storage_profile()] } },
+            RuntimeMemoryPolicy { checkpoint_capacity: spec.checkpoint_capacity, capacity_bytes: 8 << 20, reserve_bytes: 128, maximum_active_sequences: 3, dynamic_storage_profile_order: if spec.profile == contiguous_storage_profile() { vec![spec.profile] } else { vec![spec.profile, contiguous_storage_profile()] } },
             serde_json::from_value(json!({"maximum_queue_depth":8,"maximum_scheduled_tokens":4096,"sequence_fit_policy":"immediate_only","allow_defer":true,"cancellation_check_interval_steps":1})).unwrap(),
             ferrum_types::AttentionExecutionPolicy::Portable, ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay, None,
         )?;

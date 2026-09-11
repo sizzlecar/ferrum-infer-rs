@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::watch;
 
-use super::{DynamicAdmissionFaultKind, VNextError};
+use super::{CheckpointCapacityPolicy, DynamicAdmissionFaultKind, VNextError};
 
 mod checkpoint;
 use checkpoint::CheckpointClaimLedger;
 pub use checkpoint::{
-    CheckpointAuthorityId, CheckpointCapacityClaimDecision, LogicalCheckpointLease,
+    CheckpointAuthorityId, CheckpointCapacityClaimDecision, CheckpointRetentionSkipReason,
+    LogicalCheckpointLease,
 };
 
 fn invalid_admission(reason: impl Into<String>) -> VNextError {
@@ -1423,6 +1424,16 @@ impl LogicalAdmissionCoordinator {
         domains: Vec<(CapacityDomainId, CapacityDomainSpec)>,
         maximum_active_sequences: u32,
     ) -> Result<Self, VNextError> {
+        Self::with_checkpoint_capacity(domains, maximum_active_sequences, None)
+    }
+
+    /// The trusted plan provisioning adapter supplies this immutable policy.
+    /// Ordinary coordinator construction leaves checkpoint admission disabled.
+    pub(crate) fn with_checkpoint_capacity(
+        domains: Vec<(CapacityDomainId, CapacityDomainSpec)>,
+        maximum_active_sequences: u32,
+        checkpoint_capacity: Option<CheckpointCapacityPolicy>,
+    ) -> Result<Self, VNextError> {
         if maximum_active_sequences == 0 {
             return Err(invalid_admission(
                 "coordinator requires a non-zero sequence ceiling",
@@ -1460,7 +1471,7 @@ impl LogicalAdmissionCoordinator {
                     active_requests: 0,
                     active_sequences: 0,
                     active_child_claims: 0,
-                    checkpoint_claims: CheckpointClaimLedger::new(),
+                    checkpoint_claims: CheckpointClaimLedger::new(checkpoint_capacity),
                     live_requests: Vec::new(),
                     reusable_request_ids: Vec::new(),
                     live_sequences: Vec::new(),

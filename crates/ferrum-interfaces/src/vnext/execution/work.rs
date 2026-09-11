@@ -240,6 +240,21 @@ impl ResourceWorkShape {
         Self::from_token_spans(vec![token_span])
     }
 
+    /// Revalidates the complete input against the exact single-sequence work
+    /// admitted earlier, including its original range and fit ceiling.
+    pub(crate) fn validate_single_checkpoint_input(
+        &self,
+        tokens: Arc<[u32]>,
+    ) -> Result<(), VNextError> {
+        let [span] = self.token_spans.as_slice() else {
+            return Err(invalid_plan(
+                "checkpoint input requires one admitted sequence token span",
+            ));
+        };
+        span.clone().with_checkpoint_tokens(tokens)?;
+        Ok(())
+    }
+
     pub(crate) fn from_sources(
         token_spans: Vec<TokenSpanWork>,
         committed_pages: Vec<CommittedPageWork>,

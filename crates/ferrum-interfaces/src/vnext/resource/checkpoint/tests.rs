@@ -7,6 +7,14 @@ use std::task::{Context, Poll, Wake, Waker};
 mod capture_permit_tests;
 
 fn fixture(profile: DynamicStorageProfile, maximum_bytes: u64) -> (Harness, ResourceId) {
+    fixture_with_capacity(profile, maximum_bytes, Some(maximum_bytes))
+}
+
+fn fixture_with_capacity(
+    profile: DynamicStorageProfile,
+    maximum_bytes: u64,
+    retained_capacity: Option<u64>,
+) -> (Harness, ResourceId) {
     let catalog = pool_catalog(
         profile,
         AllocationLifetime::Sequence,
@@ -17,7 +25,19 @@ fn fixture(profile: DynamicStorageProfile, maximum_bytes: u64) -> (Harness, Reso
     );
     let resource_id = catalog.descriptors[0].base_resource_id().clone();
     let runtime = new_runtime(&catalog, maximum_bytes);
-    (harness(runtime, catalog, maximum_bytes, false), resource_id)
+    (
+        harness_with_checkpoint_policy(
+            runtime,
+            catalog,
+            maximum_bytes,
+            false,
+            Arc::from(Vec::<PlanNode>::new()),
+            None,
+            retained_capacity
+                .map(|bytes| crate::vnext::CheckpointCapacityPolicy::new(bytes).unwrap()),
+        ),
+        resource_id,
+    )
 }
 
 fn requests(
@@ -46,6 +66,148 @@ fn allocate(
         CheckpointBackingAllocationDecision::Allocated(owner) => owner,
         _ => panic!("resident checkpoint must allocate"),
     }
+}
+
+#[test]
+fn checkpoint_missing_policy_skips_without_touching_backing_or_normal_admission() {
+    let (harness, resource) = fixture_with_capacity(linear_profile(), 64, None);
+    initialize(&harness);
+    let request = requests(&harness.root, &resource, 17);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let before = harness.root.dynamic_pool_status().unwrap();
+    assert!(matches!(
+        binding.try_allocate_checkpoint_backing(&request).unwrap(),
+        CheckpointBackingAllocationDecision::Skipped(
+            crate::vnext::CheckpointRetentionSkipReason::Disabled
+        )
+    ));
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        harness.root.dynamic_pool_status().unwrap().pools()[0].free_bytes(),
+        before.pools()[0].free_bytes()
+    );
+    // All resident state still belongs to ordinary sequence admission.
+    let sequence = admitted_sequence(&harness.root, "checkpoint-disabled");
+    drop(sequence);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn checkpoint_cap_charges_aligned_extents_and_not_payload_or_resident_chunks() {
+    let (harness, resource) = fixture_with_capacity(linear_profile(), 64, Some(48));
+    initialize(&harness);
+    let request = requests(&harness.root, &resource, 17);
+    let owner = allocate(&harness.root, &request);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    assert_eq!(owner.logical_bytes(), 17);
+    assert_eq!(owner.extent_bytes(), 32);
+    assert!(matches!(
+        binding.try_allocate_checkpoint_backing(&request).unwrap(),
+        CheckpointBackingAllocationDecision::Skipped(
+            crate::vnext::CheckpointRetentionSkipReason::Capacity {
+                requested_bytes: 32,
+                retained_bytes: 32,
+                maximum_bytes: 48,
+            }
+        )
+    ));
+    let status = harness.root.dynamic_pool_status().unwrap();
+    assert_eq!(status.budget_claimed_bytes(), 64);
+    assert_eq!(status.process_claimed_bytes(), 64);
+    assert_eq!(status.pools()[0].free_bytes(), 32);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        32
+    );
+    drop(owner);
+    let replacement = allocate(&harness.root, &request);
+    assert_eq!(replacement.extent_bytes(), 32);
+    drop(replacement);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
+    // Releasing retention returns extents. The resident chunk stays charged
+    // once until the existing pool maintenance path reclaims it.
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pool_status()
+            .unwrap()
+            .budget_claimed_bytes(),
+        64
+    );
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn checkpoint_fragmentation_rolls_back_precharged_fee_and_domains() {
+    let (harness, resource) = fixture(linear_profile(), 64);
+    initialize(&harness);
+    let small = requests(&harness.root, &resource, 16);
+    let [first, second, third, fourth] = [0; 4].map(|_| allocate(&harness.root, &small));
+    drop(first);
+    drop(third);
+    let coordinator = &harness.root.dynamic_pools.logical_admission;
+    let before = coordinator.snapshot().unwrap();
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 32);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let large = requests(&harness.root, &resource, 32);
+    let deferred = match binding.try_allocate_checkpoint_backing(&large).unwrap() {
+        CheckpointBackingAllocationDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("separated holes cannot satisfy contiguous checkpoint backing"),
+    };
+    assert_eq!(deferred.scope(), DynamicBackingClaimScope::Checkpoint);
+    assert_eq!(
+        coordinator
+            .snapshot()
+            .unwrap()
+            .domains()
+            .iter()
+            .map(|domain| domain.used())
+            .collect::<Vec<_>>(),
+        before
+            .domains()
+            .iter()
+            .map(|domain| domain.used())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 32);
+    assert_eq!(
+        coordinator.snapshot().unwrap().active_checkpoint_claims(),
+        2
+    );
+    assert_eq!(
+        harness.root.dynamic_pool_status().unwrap().pools()[0].free_bytes(),
+        32
+    );
+    drop(second);
+    let replacement = allocate(&harness.root, &large);
+    drop(replacement);
+    drop(fourth);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
 }
 
 fn initialize(harness: &Harness) {
@@ -91,16 +253,43 @@ fn checkpoint_compact_extents_charge_alignment_without_charging_the_shared_chunk
     assert_eq!(logical.active_checkpoint_claims(), 2);
     assert_eq!(logical.domains()[0].used().get(), 64);
     assert_eq!(first.claims().entries()[0].units().get(), 32);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        64
+    );
     let view = first.view(&resource).unwrap();
     assert_eq!(view.size_bytes(), 17);
     assert_eq!(view.capacity_size_bytes(), 32);
     assert_eq!(view.segment_bindings().len(), 1);
     drop(view);
     drop(first);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        32
+    );
     let status = harness.root.dynamic_pool_status().unwrap();
     assert_eq!(status.pools()[0].free_bytes(), 32);
     assert_eq!(status.budget_claimed_bytes(), 64);
     drop(second);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
     assert_eq!(
         harness.root.dynamic_pool_status().unwrap().pools()[0].free_bytes(),
         64
@@ -209,11 +398,13 @@ fn checkpoint_optional_allocation_defers_without_growing_or_reserving_a_slot() {
     let allocations = harness.runtime.allocate_calls();
     let binding = harness.root.trusted_runtime_binding().unwrap();
     let deferred = match binding.try_allocate_checkpoint_backing(&request).unwrap() {
-        CheckpointBackingAllocationDecision::BackingDeferred(deferred) => deferred,
+        CheckpointBackingAllocationDecision::Deferred(deferred) => deferred,
         _ => panic!("nonresident backing must defer"),
     };
-    assert_eq!(deferred.scope(), DynamicBackingClaimScope::Checkpoint);
-    assert_eq!(deferred.scope().lifetime(), None);
+    assert_eq!(
+        deferred.action(),
+        crate::vnext::DeferredAction::AwaitBackingGrowth
+    );
     assert_eq!(harness.runtime.allocate_calls(), allocations);
     let snapshot = harness
         .root
@@ -229,7 +420,7 @@ fn checkpoint_optional_allocation_defers_without_growing_or_reserving_a_slot() {
 }
 
 #[test]
-fn checkpoint_logical_rejection_rolls_back_prepared_physical_extents() {
+fn checkpoint_logical_rejection_does_not_prepare_physical_extents() {
     let (harness, resource) = fixture(linear_profile(), 64);
     initialize(&harness);
     let coordinator = &harness.root.dynamic_pools.logical_admission;
@@ -245,9 +436,9 @@ fn checkpoint_logical_rejection_rolls_back_prepared_physical_extents() {
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
-    // Model a competing prepare/claim/commit transaction with its claim held
-    // before physical commit. Our prepared extents must roll back on pressure.
-    let competing = match coordinator.try_claim_checkpoint(&demand).unwrap() {
+    // A competing transaction holds logical domains and fee before physical
+    // prepare. Rejection must leave all physical extents available.
+    let competing = match coordinator.try_claim_checkpoint(&demand, 64).unwrap() {
         CheckpointCapacityClaimDecision::Claimed(lease) => lease,
         _ => panic!("logical claim must fit"),
     };
@@ -386,11 +577,25 @@ fn checkpoint_segment_retention_pins_all_ownership_through_close_and_last_drop()
     let snapshot = root.dynamic_pools.logical_admission.snapshot().unwrap();
     assert_eq!(snapshot.active_checkpoint_claims(), 1);
     assert_eq!(snapshot.domains()[0].used().get(), 32);
+    assert_eq!(
+        root.dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        32
+    );
     drop(binding);
     drop(retention);
     let snapshot = root.dynamic_pools.logical_admission.snapshot().unwrap();
     assert_eq!(snapshot.active_checkpoint_claims(), 0);
     assert_eq!(snapshot.domains()[0].used().get(), 0);
+    assert_eq!(
+        root.dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
     assert_eq!(
         root.maintenance_controller.status().unwrap().pools()[0].free_bytes(),
         64
@@ -428,7 +633,7 @@ fn checkpoint_release_returns_physical_extents_before_waking_a_pending_waiter() 
     let pin = Arc::clone(&owner);
     let binding = harness.root.trusted_runtime_binding().unwrap();
     let deferred = match binding.try_allocate_checkpoint_backing(&request).unwrap() {
-        CheckpointBackingAllocationDecision::BackingDeferred(deferred) => deferred,
+        CheckpointBackingAllocationDecision::Deferred(deferred) => deferred,
         _ => panic!("full checkpoint pool must defer"),
     };
     let waiter = harness

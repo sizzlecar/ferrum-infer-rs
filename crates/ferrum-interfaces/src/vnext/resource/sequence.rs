@@ -1765,6 +1765,9 @@ pub struct AdmittedSequenceResources<R>
 where
     R: DeviceRuntime,
 {
+    // Exact immutable child admission identity. Its full-input hash must not
+    // be replaced by the parent's request work or by later capacity shapes.
+    pub(super) admitted_work: ResourceWorkShape,
     // Recovery records own undrained raw streams. They must drop before the
     // backing slices and logical lease can make those resources reusable.
     pub(super) sequence_recovery: ManuallyDrop<Arc<SequenceRecoveryRegistry<R>>>,
@@ -1843,10 +1846,11 @@ where
         });
         let backing_snapshot = Arc::new(SequenceBackingSnapshot::initial(
             backing_slices,
-            work_shape,
+            work_shape.clone(),
             Arc::clone(&logical_owner),
         )?);
         Ok(Self {
+            admitted_work: work_shape,
             sequence_recovery: ManuallyDrop::new(Arc::new(SequenceRecoveryRegistry::new(
                 plan_resources,
             ))),

@@ -14,7 +14,8 @@ use super::{
     PlanHash, PlanRuntimeResources, ResourceId, TrustedPlanRuntimeBinding, VNextError,
 };
 use crate::vnext::{
-    CheckpointAuthorityId, CheckpointCapacityClaimDecision, LogicalCheckpointLease,
+    CheckpointAuthorityId, CheckpointCapacityClaimDecision, CheckpointRetentionSkipReason,
+    LogicalCheckpointLease,
 };
 use std::collections::BTreeMap;
 mod transfer;
@@ -87,6 +88,7 @@ impl CheckpointBackingRequests {
 
 pub(crate) enum CheckpointBackingAllocationDecision<R: DeviceRuntime> {
     Allocated(Arc<CheckpointBackingOwner<R>>),
+    Skipped(CheckpointRetentionSkipReason),
     Deferred(AdmissionDeferred),
     BackingDeferred(DynamicBackingDeferred),
     PermanentRejected(AdmissionRejected),
@@ -256,19 +258,16 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )?;
-        let prepared = match self
-            .dynamic_pools()
-            .prepare_checkpoint_claim(&requested_slices)?
+        // Charge all domains and the aggregate retention fee atomically before
+        // preparing physical extents. Later locals drop first on rollback.
+        let logical_lease = match self
+            .logical_admission()
+            .try_claim_checkpoint(&demand, extent_bytes)?
         {
-            BackingPrepareDecision::Prepared(prepared) => prepared,
-            BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(CheckpointBackingAllocationDecision::BackingDeferred(
-                    deferred,
-                ));
-            }
-        };
-        let logical_lease = match self.logical_admission().try_claim_checkpoint(&demand)? {
             CheckpointCapacityClaimDecision::Claimed(lease) => lease,
+            CheckpointCapacityClaimDecision::Skipped(reason) => {
+                return Ok(CheckpointBackingAllocationDecision::Skipped(reason));
+            }
             CheckpointCapacityClaimDecision::Deferred(deferred) => {
                 return Ok(CheckpointBackingAllocationDecision::Deferred(deferred));
             }
@@ -282,12 +281,22 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
             .logical_admission()
             .owns_checkpoint_claim(&logical_lease)
         {
-            drop(prepared);
             drop(logical_lease);
             return Err(invalid_resource(
                 "checkpoint claim belongs to another coordinator",
             ));
         }
+        let prepared = match self
+            .dynamic_pools()
+            .prepare_checkpoint_claim(&requested_slices)?
+        {
+            BackingPrepareDecision::Prepared(prepared) => prepared,
+            BackingPrepareDecision::Deferred(deferred) => {
+                return Ok(CheckpointBackingAllocationDecision::BackingDeferred(
+                    deferred,
+                ));
+            }
+        };
         let owner = CheckpointBackingOwner {
             backing_slices: prepared.commit(),
             logical_lease,

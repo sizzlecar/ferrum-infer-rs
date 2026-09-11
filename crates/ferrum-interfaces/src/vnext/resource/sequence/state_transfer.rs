@@ -144,6 +144,20 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
         }
         Ok(())
     }
+
+    /// The caller holds the session slot and exact backing locks and has
+    /// validated the installed restore frontier before opening this gate.
+    pub(super) fn release_active_reservation(
+        &self,
+        active: &mut ActiveSequenceSessionState,
+    ) -> Result<(), VNextError> {
+        self.ensure_active_reservation(active)?;
+        self.reservation
+            .released
+            .store(true, std::sync::atomic::Ordering::Release);
+        active.state_transfer.active = None;
+        Ok(())
+    }
 }
 
 struct PreparedStateTransferHold {
@@ -151,10 +165,14 @@ struct PreparedStateTransferHold {
     epoch: SequenceSessionEpoch,
     fingerprint: SequenceSessionFingerprint,
     reservation: StateTransferReservation,
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for PreparedStateTransferHold {
     fn drop(&mut self) {
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut state = match self.slot.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -244,6 +262,7 @@ impl<R: DeviceRuntime> SequenceSession<R> {
                     epoch: self.epoch,
                     fingerprint,
                     reservation,
+                    released: std::sync::atomic::AtomicBool::new(false),
                 },
                 backing: Arc::clone(&backing.current),
                 session: Arc::clone(self),

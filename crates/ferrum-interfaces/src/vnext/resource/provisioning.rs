@@ -7,6 +7,7 @@ use super::{
     PlanHash, PlanId, PlanNode, RequestIdentity, ResourcePoolId, ResourcePoolIdentity,
     ResourceReservationBatch, StaticProvisioningBinding, VNextError,
 };
+use crate::vnext::CheckpointCapacityPolicy;
 
 /// One-shot plan/admission authority. It cannot be constructed, cloned, or
 /// deserialized by product or backend code. `ResourceTransaction::begin`
@@ -31,6 +32,7 @@ pub(super) fn plan_dynamic_pool_admission(
     maximum_active_sequences: u32,
     pools: &[DynamicBackingPoolSpec],
     descriptors: &[DynamicResourceDescriptor],
+    checkpoint_capacity: Option<CheckpointCapacityPolicy>,
 ) -> Result<(LogicalAdmissionCoordinator, Vec<DynamicPoolDomainSpec>), VNextError> {
     let mut descriptors_by_id = descriptors
         .iter()
@@ -90,7 +92,16 @@ pub(super) fn plan_dynamic_pool_admission(
         })
         .collect::<Result<Vec<_>, VNextError>>()?;
     Ok((
-        LogicalAdmissionCoordinator::new(coordinator_domains, maximum_active_sequences)?,
+        match checkpoint_capacity {
+            Some(policy) => LogicalAdmissionCoordinator::with_checkpoint_capacity(
+                coordinator_domains,
+                maximum_active_sequences,
+                Some(policy),
+            )?,
+            None => {
+                LogicalAdmissionCoordinator::new(coordinator_domains, maximum_active_sequences)?
+            }
+        },
         domains,
     ))
 }
@@ -256,6 +267,7 @@ impl ExecutionPlan {
             memory.maximum_active_sequences(),
             memory.dynamic_pools(),
             memory.dynamic_descriptors(),
+            memory.checkpoint_capacity().copied(),
         )?;
         let generation = issue_generation()?;
         let reservations = ResourceReservationBatch::from_allocations(

@@ -14,6 +14,7 @@ enum TransferDestination<R: DeviceRuntime> {
     Restore {
         checkpoint: Arc<CapturedCheckpoint<R>>,
         initializations: PreparedBackingInitializations,
+        layout: SequenceCheckpointLayout,
     },
 }
 
@@ -79,6 +80,7 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
             destination: TransferDestination::Restore {
                 checkpoint,
                 initializations,
+                layout: layout.clone(),
             },
             identity,
             copy_retentions: None,
@@ -237,6 +239,7 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
             TransferDestination::Restore {
                 checkpoint,
                 initializations,
+                layout,
             } => {
                 initializations.finish(true)?;
                 StateTransferResult::restore_ready(
@@ -244,6 +247,7 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
                     Arc::clone(&self.identity),
                     self.guard.take().expect("restore owns target guard"),
                     Arc::clone(checkpoint),
+                    layout.clone(),
                 )
             }
         }

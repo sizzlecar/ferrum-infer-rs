@@ -49,6 +49,7 @@ fn reserve(candidate: &SequenceFrameCandidate) -> PreparedStateTransferHold {
         epoch: candidate.epoch,
         fingerprint: candidate.fingerprint.clone(),
         reservation,
+        released: std::sync::atomic::AtomicBool::new(false),
     }
 }
 

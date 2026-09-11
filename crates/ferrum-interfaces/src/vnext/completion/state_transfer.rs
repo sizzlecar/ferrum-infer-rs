@@ -75,6 +75,10 @@ pub(crate) struct StateTransferIdentity {
     reservation_serial: NonZeroU64,
     backing_generation: SequenceBackingGeneration,
     source_frame: Option<ExecutionFrameId>,
+    // The source may itself be imported state and therefore have no model
+    // frame. A digest binds its complete typed host provenance without
+    // retaining an unbounded chain of prior transfer identities.
+    source_provenance_fingerprint: Option<String>,
     lane_id: ExecutionLaneId,
     device_id: DeviceId,
     runtime_implementation_fingerprint: String,
@@ -99,7 +103,7 @@ impl StateTransferIdentity {
                 "native transfer runtime differs from its execution lane snapshot",
             ));
         }
-        let source_frame = match guard.kind() {
+        let (source_frame, source_provenance_fingerprint) = match guard.kind() {
             SequenceStateTransferKind::CaptureRead => {
                 let boundary = guard.completed_boundary()?;
                 if boundary.plan_hash() != byte_plan.plan_hash()
@@ -109,11 +113,17 @@ impl StateTransferIdentity {
                         "transfer byte plan differs from the reserved completed boundary",
                     ));
                 }
-                Some(boundary.frame_id())
+                (
+                    boundary.frame_id(),
+                    Some(canonical_completion_fingerprint(&(
+                        boundary.provenance(),
+                        boundary.continuation_contract(),
+                    ))),
+                )
             }
             SequenceStateTransferKind::RestoreWrite => {
                 guard.ensure_fresh_restore_target()?;
-                None
+                (None, None)
             }
         };
         let session = guard.session();
@@ -132,6 +142,7 @@ impl StateTransferIdentity {
             reservation_serial: guard.reservation_serial(),
             backing_generation: guard.backing().generation(),
             source_frame,
+            source_provenance_fingerprint,
             lane_id: lane.id(),
             device_id: lane.descriptor().id.clone(),
             runtime_implementation_fingerprint: lane

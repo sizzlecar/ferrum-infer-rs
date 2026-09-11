@@ -702,7 +702,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let spans = participants
             .iter()
-            .map(|participant| participant.token_span())
+            .map(|participant| {
+                self.retain_checkpoint_token_evidence(
+                    participant.token_span()?,
+                    participant.token_ids(),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let step = match self.begin_step_for_spans_with_capacity(
             &batch,

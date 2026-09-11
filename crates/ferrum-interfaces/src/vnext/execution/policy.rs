@@ -4,7 +4,7 @@ use super::{
     PreparedModelFamily, ReusableExecutionPolicy, Serialize, TrustedExecutionWeightPlan,
     VNextError,
 };
-use crate::vnext::ExecutionDeterminismRequirement;
+use crate::vnext::{CheckpointCapacityPolicy, ExecutionDeterminismRequirement};
 use ferrum_types::AttentionExecutionPolicy;
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -44,6 +44,12 @@ pub trait RuntimePolicy:
     /// Optional reusable-execution capacity policy selected before planning.
     /// Core treats class identities as opaque and owns their memory derivation.
     fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy>;
+
+    /// Optional physical State-pool growth permission. Runtime aggregate
+    /// charging and foreground protection remain separate requirements.
+    fn checkpoint_capacity_policy(&self) -> Option<&CheckpointCapacityPolicy> {
+        None
+    }
 
     fn validate(&self) -> Result<(), VNextError>;
 }

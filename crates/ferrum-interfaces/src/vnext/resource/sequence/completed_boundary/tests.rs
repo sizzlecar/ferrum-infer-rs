@@ -273,7 +273,7 @@ fn completed_boundary_requires_success_then_commit_and_tracks_same_generation_de
     let capture = harness.reserve(0, SequenceStateTransferKind::CaptureRead);
     let old = capture.completed_boundary().unwrap();
     assert_eq!(old.token_prefix(), &[3, 5]);
-    assert_eq!(old.batch_step_id(), first_id);
+    assert_eq!(old.batch_step_id(), Some(first_id));
     let generation = old.backing_generation();
     drop(capture);
 

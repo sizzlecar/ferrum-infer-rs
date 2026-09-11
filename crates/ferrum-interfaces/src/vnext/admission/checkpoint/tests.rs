@@ -5,7 +5,14 @@ fn domain(value: u32) -> CapacityDomainId {
 }
 
 fn coordinator(maximum_active_sequences: u32) -> LogicalAdmissionCoordinator {
-    LogicalAdmissionCoordinator::new(
+    coordinator_with_capacity(maximum_active_sequences, Some(24))
+}
+
+fn coordinator_with_capacity(
+    maximum_active_sequences: u32,
+    maximum_retained_bytes: Option<u64>,
+) -> LogicalAdmissionCoordinator {
+    LogicalAdmissionCoordinator::with_checkpoint_capacity(
         vec![
             (
                 domain(1),
@@ -17,6 +24,7 @@ fn coordinator(maximum_active_sequences: u32) -> LogicalAdmissionCoordinator {
             ),
         ],
         maximum_active_sequences,
+        maximum_retained_bytes.map(|bytes| CheckpointCapacityPolicy::new(bytes).unwrap()),
     )
     .unwrap()
 }
@@ -48,7 +56,13 @@ fn claim(
     coordinator: &LogicalAdmissionCoordinator,
     entries: &[(u32, u64)],
 ) -> LogicalCheckpointLease {
-    match coordinator.try_claim_checkpoint(&demand(entries)).unwrap() {
+    match coordinator
+        .try_claim_checkpoint(
+            &demand(entries),
+            entries.iter().map(|(_, bytes)| bytes).sum(),
+        )
+        .unwrap()
+    {
         CheckpointCapacityClaimDecision::Claimed(lease) => lease,
         other => panic!("expected checkpoint capacity, got {other:?}"),
     }
@@ -88,6 +102,8 @@ fn checkpoint_owns_capacity_without_an_execution_parent_or_slot() {
     assert_eq!(retained.active_checkpoint_claims(), 1);
     assert_eq!(retained.domains()[0].used().get(), 6);
     assert_eq!(retained.domains()[1].used().get(), 2);
+    assert_eq!(checkpoint.retained_bytes(), 8);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 8);
 
     drop(source_sequence);
     drop(source_request);
@@ -100,6 +116,7 @@ fn checkpoint_owns_capacity_without_an_execution_parent_or_slot() {
     drop(next_sequence);
     drop(next_request);
     drop(checkpoint);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
     assert!(coordinator
         .snapshot()
         .unwrap()
@@ -114,7 +131,7 @@ fn checkpoint_pressure_uses_existing_domains_and_failed_claims_are_atomic() {
     let retained = claim(&coordinator, &[(1, 6)]);
     let before = coordinator.snapshot().unwrap();
     let blocked = coordinator
-        .try_claim_checkpoint(&demand(&[(1, 5), (2, 1)]))
+        .try_claim_checkpoint(&demand(&[(1, 5), (2, 1)]), 6)
         .unwrap();
     let CheckpointCapacityClaimDecision::Deferred(deferred) = blocked else {
         panic!("live domain use must defer the checkpoint");
@@ -124,22 +141,22 @@ fn checkpoint_pressure_uses_existing_domains_and_failed_claims_are_atomic() {
     assert_eq!(coordinator.snapshot().unwrap(), before);
     assert!(matches!(
         coordinator
-            .try_claim_checkpoint(&demand(&[(1, 21)]))
+            .try_claim_checkpoint(&demand(&[(1, 21)]), 21)
             .unwrap(),
         CheckpointCapacityClaimDecision::PermanentRejected(_)
     ));
     assert!(matches!(
-        coordinator.try_claim_checkpoint(&demand(&[(1, 1), (3, 1)])),
+        coordinator.try_claim_checkpoint(&demand(&[(1, 1), (3, 1)]), 2),
         Err(VNextError::DynamicAdmissionContract {
             kind: DynamicAdmissionFaultKind::UnknownDomain,
             ..
         })
     ));
-    assert!(coordinator.try_claim_checkpoint(&demand(&[])).is_err());
+    assert!(coordinator.try_claim_checkpoint(&demand(&[]), 0).is_err());
     assert_eq!(coordinator.snapshot().unwrap(), before);
     drop(retained);
     let growth = coordinator
-        .try_claim_checkpoint(&demand(&[(1, 11)]))
+        .try_claim_checkpoint(&demand(&[(1, 11)]), 11)
         .unwrap();
     let CheckpointCapacityClaimDecision::Deferred(growth) = growth else {
         panic!("unprovisioned domain capacity must defer");
@@ -176,11 +193,13 @@ async fn checkpoint_last_owner_drop_wakes_only_affected_capacity_sources() {
     let before = coordinator.epochs().unwrap();
     drop(checkpoint);
     assert!(!waiter.recheck().unwrap().should_retry());
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 8);
     assert_eq!(
         coordinator.snapshot().unwrap().active_checkpoint_claims(),
         1
     );
     drop(pin);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
     assert!(waiter.recheck().unwrap().should_retry());
     assert_eq!(
         waiter.wait_for_change().await.unwrap(),
@@ -235,7 +254,7 @@ fn checkpoint_close_is_one_way_and_keeps_existing_lease_releasable() {
     coordinator.close_checkpoint_admission().unwrap();
     let before = coordinator.snapshot().unwrap();
     assert!(coordinator
-        .try_claim_checkpoint(&demand(&[(1, 1)]))
+        .try_claim_checkpoint(&demand(&[(1, 1)]), 1)
         .is_err());
     assert_eq!(coordinator.snapshot().unwrap(), before);
     // Closing only checkpoint admission must not change ordinary admission.
@@ -258,7 +277,7 @@ fn checkpoint_close_and_claim_are_serialized_without_stranding_a_lease() {
     let outcome = std::thread::scope(|scope| {
         let attempt = scope.spawn(|| {
             start.wait();
-            coordinator.try_claim_checkpoint(&demand(&[(1, 2)]))
+            coordinator.try_claim_checkpoint(&demand(&[(1, 2)]), 2)
         });
         start.wait();
         coordinator.close_checkpoint_admission().unwrap();
@@ -280,7 +299,7 @@ fn checkpoint_close_and_claim_are_serialized_without_stranding_a_lease() {
         other => panic!("unexpected concurrent checkpoint admission: {other:?}"),
     }
     assert!(coordinator
-        .try_claim_checkpoint(&demand(&[(1, 1)]))
+        .try_claim_checkpoint(&demand(&[(1, 1)]), 1)
         .is_err());
     let after = coordinator.snapshot().unwrap();
     assert_eq!(after.active_checkpoint_claims(), 0);
@@ -294,12 +313,12 @@ fn checkpoint_concurrent_claims_cannot_overcommit() {
     let outcomes = std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             coordinator
-                .try_claim_checkpoint(&demand(&[(1, 6)]))
+                .try_claim_checkpoint(&demand(&[(1, 6)]), 6)
                 .unwrap()
         });
         let second = scope.spawn(|| {
             coordinator
-                .try_claim_checkpoint(&demand(&[(1, 6)]))
+                .try_claim_checkpoint(&demand(&[(1, 6)]), 6)
                 .unwrap()
         });
         [first.join().unwrap(), second.join().unwrap()]
@@ -371,7 +390,7 @@ fn checkpoint_outstanding_release_is_reserved_by_all_admission_paths() {
     );
     exhausted(
         coordinator
-            .try_claim_checkpoint(&demand(&[(1, 1)]))
+            .try_claim_checkpoint(&demand(&[(1, 1)]), 1)
             .err()
             .unwrap(),
     );
@@ -398,7 +417,7 @@ fn checkpoint_authority_exhaustion_and_unpublishable_release_have_no_side_effect
         .next_serial = u64::MAX;
     let before = coordinator.snapshot().unwrap();
     assert!(matches!(
-        coordinator.try_claim_checkpoint(&demand(&[(1, 1)])),
+        coordinator.try_claim_checkpoint(&demand(&[(1, 1)]), 1),
         Err(VNextError::DynamicAdmissionContract {
             kind: DynamicAdmissionFaultKind::AuthorityExhausted,
             ..
@@ -415,7 +434,7 @@ fn checkpoint_authority_exhaustion_and_unpublishable_release_have_no_side_effect
             .availability_epoch = u64::MAX;
     }
     assert!(matches!(
-        coordinator.try_claim_checkpoint(&demand(&[(1, 1)])),
+        coordinator.try_claim_checkpoint(&demand(&[(1, 1)]), 1),
         Err(VNextError::DynamicAdmissionContract {
             kind: DynamicAdmissionFaultKind::EpochExhausted,
             ..
@@ -437,7 +456,7 @@ fn checkpoint_corrupt_identity_fails_closed_without_releasing_other_capacity() {
     assert_eq!(failed.active_checkpoint_claims(), 1);
     assert_eq!(failed.release_epoch(), before.release_epoch());
     assert!(coordinator
-        .try_claim_checkpoint(&demand(&[(1, 1)]))
+        .try_claim_checkpoint(&demand(&[(1, 1)]), 1)
         .is_err());
 }
 
@@ -452,5 +471,172 @@ fn checkpoint_unwind_releases_without_poisoning_coordinator() {
     let after = coordinator.snapshot().unwrap();
     assert_eq!(after.active_checkpoint_claims(), 0);
     assert_eq!(after.domains()[0].used(), CapacityUnits::ZERO);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
     assert!(!after.poisoned());
+}
+
+#[test]
+fn checkpoint_retention_is_disabled_by_default_without_affecting_normal_slots() {
+    let coordinator = LogicalAdmissionCoordinator::new(
+        vec![(
+            domain(1),
+            CapacityDomainSpec::new(CapacityUnits::new(8), CapacityUnits::new(8)).unwrap(),
+        )],
+        3,
+    )
+    .unwrap();
+    let before = coordinator.snapshot().unwrap();
+    assert!(matches!(
+        coordinator
+            .try_claim_checkpoint(&demand(&[(1, 4)]), 4)
+            .unwrap(),
+        CheckpointCapacityClaimDecision::Skipped(CheckpointRetentionSkipReason::Disabled)
+    ));
+    assert_eq!(coordinator.snapshot().unwrap(), before);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+    let request = request(&coordinator);
+    let sequences = (0..3)
+        .map(|_| sequence(&coordinator, &request))
+        .collect::<Vec<_>>();
+    assert_eq!(coordinator.snapshot().unwrap().active_sequences(), 3);
+    drop(sequences);
+    drop(request);
+}
+
+#[test]
+fn checkpoint_fee_must_equal_every_actual_domain_claim() {
+    let coordinator = coordinator(1);
+    let before = coordinator.snapshot().unwrap();
+    for fee in [0, 4, 6] {
+        assert!(coordinator
+            .try_claim_checkpoint(&demand(&[(1, 3), (2, 2)]), fee)
+            .is_err());
+        assert_eq!(coordinator.snapshot().unwrap(), before);
+        assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+    }
+    let lease = claim(&coordinator, &[(1, 3), (2, 2)]);
+    assert_eq!(lease.retained_bytes(), 5);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 5);
+    drop(lease);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+}
+
+#[test]
+fn checkpoint_aggregate_fee_serializes_competing_distinct_domains_and_recovers() {
+    let coordinator = coordinator_with_capacity(3, Some(4));
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            coordinator
+                .try_claim_checkpoint(&demand(&[(1, 3)]), 3)
+                .unwrap()
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            coordinator
+                .try_claim_checkpoint(&demand(&[(2, 3)]), 3)
+                .unwrap()
+        });
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+    let mut retained = None;
+    let mut skipped = None;
+    for outcome in outcomes {
+        match outcome {
+            CheckpointCapacityClaimDecision::Claimed(lease) => {
+                assert!(retained.replace(lease).is_none());
+            }
+            CheckpointCapacityClaimDecision::Skipped(reason) => {
+                assert!(skipped.replace(reason).is_none());
+            }
+            other => {
+                panic!("individually available domains must compete only for retention: {other:?}")
+            }
+        }
+    }
+    assert!(retained.is_some());
+    assert_eq!(
+        skipped,
+        Some(CheckpointRetentionSkipReason::Capacity {
+            requested_bytes: 3,
+            retained_bytes: 3,
+            maximum_bytes: 4,
+        })
+    );
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 3);
+    let snapshot = coordinator.snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .domains()
+            .iter()
+            .map(|entry| entry.used().get())
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(snapshot.active_requests(), 0);
+    assert_eq!(snapshot.active_sequences(), 0);
+    drop(retained);
+    let full = claim(&coordinator, &[(1, 2), (2, 2)]);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 4);
+    drop(full);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+}
+
+#[test]
+fn checkpoint_fee_sum_overflow_and_full_u64_cap_do_not_wrap() {
+    let coordinator = LogicalAdmissionCoordinator::with_checkpoint_capacity(
+        [1, 2]
+            .map(|id| {
+                (
+                    domain(id),
+                    CapacityDomainSpec::new(
+                        CapacityUnits::new(u64::MAX),
+                        CapacityUnits::new(u64::MAX),
+                    )
+                    .unwrap(),
+                )
+            })
+            .to_vec(),
+        1,
+        Some(CheckpointCapacityPolicy::new(u64::MAX).unwrap()),
+    )
+    .unwrap();
+    let before = coordinator.snapshot().unwrap();
+    assert!(matches!(
+        coordinator.try_claim_checkpoint(&demand(&[(1, u64::MAX), (2, 1)]), u64::MAX),
+        Err(VNextError::DynamicAdmissionContract {
+            kind: DynamicAdmissionFaultKind::ArithmeticOverflow,
+            ..
+        })
+    ));
+    assert_eq!(coordinator.snapshot().unwrap(), before);
+    let retained = claim(&coordinator, &[(1, u64::MAX)]);
+    assert!(matches!(
+        coordinator
+            .try_claim_checkpoint(&demand(&[(2, 1)]), 1)
+            .unwrap(),
+        CheckpointCapacityClaimDecision::Skipped(CheckpointRetentionSkipReason::Capacity {
+            requested_bytes: 1,
+            retained_bytes: u64::MAX,
+            maximum_bytes: u64::MAX,
+        })
+    ));
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), u64::MAX);
+    drop(retained);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 0);
+}
+
+#[test]
+fn checkpoint_corrupt_fee_fails_closed_without_crediting_domains_or_retention() {
+    let coordinator = coordinator(1);
+    let mut lease = claim(&coordinator, &[(1, 3)]);
+    lease.retained_bytes = 2;
+    let before = coordinator.snapshot().unwrap();
+    assert!(!lease.release_inner());
+    let after = coordinator.snapshot().unwrap();
+    assert!(after.poisoned());
+    assert_eq!(after.domains(), before.domains());
+    assert_eq!(after.active_checkpoint_claims(), 1);
+    assert_eq!(coordinator.checkpoint_retained_bytes().unwrap(), 3);
 }

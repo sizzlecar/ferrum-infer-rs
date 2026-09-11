@@ -1,8 +1,12 @@
-use super::{invalid_completion, StateTransferIdentity, StateTransferKind};
+use super::{
+    canonical_completion_fingerprint, invalid_completion, StateTransferIdentity, StateTransferKind,
+};
 use crate::vnext::{
-    CapturedCheckpointBacking, CheckpointBackingOwner, CompletedSequenceBoundary, CompletionSlotId,
-    DeviceErrorReport, DeviceRuntime, PreparedSequenceStateTransfer, SequenceCheckpointBytePlan,
-    VNextError,
+    CapturedCheckpointBacking, CheckpointBackingOwner, CheckpointCaptureAttemptId,
+    CheckpointInputDependency, CheckpointPartitionNumerics, CheckpointTokenSpanConstraint,
+    CompletedSequenceBoundary, CompletedSequenceProvenance, CompletionSlotId, DeviceErrorReport,
+    DeviceRuntime, PreparedSequenceStateTransfer, SequenceCheckpointBytePlan,
+    SequenceCheckpointLayout, SequenceSession, VNextError,
 };
 use std::sync::Arc;
 
@@ -43,8 +47,9 @@ impl<R: DeviceRuntime> CapturedCheckpoint<R> {
 pub(crate) struct PendingRestoreCommit<R: DeviceRuntime> {
     slot_id: CompletionSlotId,
     identity: Arc<StateTransferIdentity>,
-    target: PreparedSequenceStateTransfer<R>,
+    target: Option<PreparedSequenceStateTransfer<R>>,
     checkpoint: Arc<CapturedCheckpoint<R>>,
+    layout: SequenceCheckpointLayout,
 }
 
 impl<R: DeviceRuntime> PendingRestoreCommit<R> {
@@ -55,6 +60,76 @@ impl<R: DeviceRuntime> PendingRestoreCommit<R> {
     pub(crate) fn checkpoint(&self) -> &Arc<CapturedCheckpoint<R>> {
         &self.checkpoint
     }
+
+    /// Installs only the exact native result into its still-gated target.
+    /// Full input is verified against the target's own immutable admission,
+    /// not a caller assertion or its parent's request work.
+    pub(crate) fn install_frontier(
+        self,
+        expected_target: &Arc<SequenceSession<R>>,
+        full_input: Arc<[u32]>,
+    ) -> Result<RestoreFrontierPublication<R>, VNextError> {
+        let target = self.target.as_ref().expect("pending restore owns target");
+        if !Arc::ptr_eq(expected_target, target.session())
+            || self.identity.kind() != StateTransferKind::Restore
+            || !self.identity.matches_guard(target)
+            || !self
+                .identity
+                .matches_checkpoint(self.checkpoint.backing(), self.checkpoint.byte_plan())
+        {
+            return Err(invalid_completion(
+                "restore publication names another exact target or checkpoint",
+            ));
+        }
+        self.validate_reuse_contract(&full_input)?;
+        let seal = SuccessfulRestoreFrontierSeal {
+            identity: Arc::clone(&self.identity),
+            capture_attempt: self.checkpoint.backing.attempt_id(),
+            source: Arc::clone(self.checkpoint.boundary()),
+            input_dependency: self.layout.input_dependency(),
+            suffix_constraints: self
+                .layout
+                .providers()
+                .iter()
+                .map(|provider| provider.contract().boundaries().suffix())
+                .collect(),
+        };
+        let boundary = target.install_imported_frontier(&seal, full_input)?;
+        Ok(RestoreFrontierPublication {
+            pending: Some(self),
+            boundary,
+        })
+    }
+
+    fn validate_reuse_contract(&self, full_input: &[u32]) -> Result<(), VNextError> {
+        let source = self.checkpoint.boundary();
+        let boundary = u64::try_from(source.completed_tokens())
+            .map_err(|_| invalid_completion("restore boundary exceeds u64"))?;
+        let source_start = u64::try_from(source.capture_span_start())
+            .map_err(|_| invalid_completion("capture span start exceeds u64"))?;
+        let source_length = u64::try_from(source.full_input().len())
+            .map_err(|_| invalid_completion("capture input length exceeds u64"))?;
+        let target_length = u64::try_from(full_input.len())
+            .map_err(|_| invalid_completion("restore input length exceeds u64"))?;
+        if self.layout.fingerprint()? != self.identity.layout_fingerprint()
+            || !self.layout.inputs().conditioning_inputs().is_empty()
+            || self.layout.providers().iter().any(|provider| {
+                provider.contract().partition_numerics()
+                    == CheckpointPartitionNumerics::SamePartitionOnly
+            })
+            || !self
+                .layout
+                .permits_capture_from(source_start, boundary, source_length)
+            || !self.layout.permits_suffix(boundary, target_length)
+            || (self.layout.input_dependency() == CheckpointInputDependency::EntireTokenInput
+                && source.full_input().as_ref() != full_input)
+        {
+            return Err(invalid_completion(
+                "restore lacks the declared input, partition, or legal boundary evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<R: DeviceRuntime> Drop for PendingRestoreCommit<R> {
@@ -62,7 +137,87 @@ impl<R: DeviceRuntime> Drop for PendingRestoreCommit<R> {
         // request_cancel validates the exact session epoch/fingerprint. It must
         // happen before the target field releases its exclusive reservation.
         // A poisoned slot remains fail-closed in the reservation's own Drop.
-        let _ = self.target.session().request_cancel();
+        if let Some(target) = &self.target {
+            let _ = target.session().request_cancel();
+        }
+    }
+}
+
+/// Cannot be constructed by resource consumers. Only an owned successful
+/// native restore result can request a frontier installation.
+pub(crate) struct SuccessfulRestoreFrontierSeal {
+    identity: Arc<StateTransferIdentity>,
+    capture_attempt: CheckpointCaptureAttemptId,
+    source: Arc<CompletedSequenceBoundary>,
+    input_dependency: CheckpointInputDependency,
+    suffix_constraints: Vec<CheckpointTokenSpanConstraint>,
+}
+
+impl SuccessfulRestoreFrontierSeal {
+    pub(crate) fn matches_target<R: DeviceRuntime>(
+        &self,
+        target: &PreparedSequenceStateTransfer<R>,
+    ) -> bool {
+        self.identity.kind() == StateTransferKind::Restore && self.identity.matches_guard(target)
+    }
+
+    pub(crate) fn source(&self) -> &Arc<CompletedSequenceBoundary> {
+        &self.source
+    }
+
+    pub(crate) fn provenance(&self) -> CompletedSequenceProvenance {
+        CompletedSequenceProvenance::ImportedCheckpoint {
+            capture_attempt: self.capture_attempt,
+            restore: Arc::clone(&self.identity),
+        }
+    }
+
+    pub(crate) fn input_dependency(&self) -> CheckpointInputDependency {
+        self.input_dependency
+    }
+
+    pub(crate) fn suffix_constraints(&self) -> &[CheckpointTokenSpanConstraint] {
+        &self.suffix_constraints
+    }
+}
+
+/// The core frontier is installed but its gate remains closed while outer
+/// executor/scheduler state is published. No target guard is exposed. Dropping
+/// or rejecting publication cancels the target before releasing its gate.
+#[must_use = "acknowledge outer progress publication or cancel by dropping"]
+pub(crate) struct RestoreFrontierPublication<R: DeviceRuntime> {
+    pending: Option<PendingRestoreCommit<R>>,
+    boundary: Arc<CompletedSequenceBoundary>,
+}
+
+impl<R: DeviceRuntime> RestoreFrontierPublication<R> {
+    pub(crate) fn boundary(&self) -> &Arc<CompletedSequenceBoundary> {
+        &self.boundary
+    }
+
+    pub(crate) fn completed_tokens(&self) -> usize {
+        self.boundary.completed_tokens()
+    }
+
+    pub(crate) fn token_prefix(&self) -> &[u32] {
+        self.boundary.token_prefix()
+    }
+
+    pub(crate) fn acknowledge(mut self) -> Result<Arc<CompletedSequenceBoundary>, VNextError> {
+        let pending = self
+            .pending
+            .as_mut()
+            .expect("publication owns pending target");
+        let target = pending
+            .target
+            .as_ref()
+            .expect("publication owns target gate");
+        target.acknowledge_imported_frontier(&self.boundary)?;
+        // The exact gate was released under the same lock that validated its
+        // installed boundary. Suppress PendingRestoreCommit's cancellation.
+        drop(pending.target.take());
+        drop(self.pending.take());
+        Ok(Arc::clone(&self.boundary))
     }
 }
 
@@ -132,7 +287,15 @@ impl<R: DeviceRuntime> StateTransferResult<R> {
             || boundary.epoch() != identity.epoch
             || boundary.session_fingerprint() != &identity.session_fingerprint
             || boundary.backing_generation() != identity.backing_generation
-            || Some(boundary.frame_id()) != identity.source_frame
+            || boundary.frame_id() != identity.source_frame
+            || identity.source_provenance_fingerprint.as_deref()
+                != Some(
+                    canonical_completion_fingerprint(&(
+                        boundary.provenance(),
+                        boundary.continuation_contract(),
+                    ))
+                    .as_str(),
+                )
         {
             return Err(invalid_completion(
                 "completed capture owners do not match its identity",
@@ -154,15 +317,19 @@ impl<R: DeviceRuntime> StateTransferResult<R> {
         identity: Arc<StateTransferIdentity>,
         target: PreparedSequenceStateTransfer<R>,
         checkpoint: Arc<CapturedCheckpoint<R>>,
+        layout: SequenceCheckpointLayout,
     ) -> Result<Self, VNextError> {
         let pending = PendingRestoreCommit {
             slot_id,
             identity,
-            target,
+            target: Some(target),
             checkpoint,
+            layout,
         };
         if pending.identity.kind() != StateTransferKind::Restore
-            || !pending.identity.matches_guard(&pending.target)
+            || !pending
+                .identity
+                .matches_guard(pending.target.as_ref().expect("pending owns target"))
             || !pending
                 .identity
                 .matches_checkpoint(pending.checkpoint.backing(), pending.checkpoint.byte_plan())

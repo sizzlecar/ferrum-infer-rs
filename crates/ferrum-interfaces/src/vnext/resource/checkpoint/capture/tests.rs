@@ -13,6 +13,15 @@ fn owner_fixture() -> (
 }
 
 fn assert_released(harness: &Harness) {
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        0
+    );
     let logical = harness
         .root
         .dynamic_pools
@@ -121,6 +130,15 @@ fn captured_owner_and_retained_views_can_never_reserve_another_write() {
     drop(captured);
     assert!(owner.try_reserve_capture().is_err());
     drop(owner);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        32
+    );
     assert_eq!(
         harness
             .root
@@ -253,6 +271,15 @@ fn unknown_permit_drop_keeps_poisoned_backing_instead_of_reopening_or_freeing_it
     assert!(owner.try_reserve_capture().is_err());
     drop(owner);
     assert!(weak.upgrade().is_some());
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        32
+    );
     assert_eq!(
         harness
             .root

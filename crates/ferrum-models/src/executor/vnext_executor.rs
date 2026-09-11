@@ -732,6 +732,7 @@ impl VNextExecutorConfig {
             POLICY_VERSION,
             scheduling,
             RuntimeMemoryPolicy {
+                checkpoint_capacity: None,
                 capacity_bytes: memory_budget.capacity_bytes,
                 reserve_bytes: memory_budget.reserve_bytes,
                 maximum_active_sequences,
@@ -7545,6 +7546,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    fn checkpoint_token_evidence_enabled(&self) -> bool {
+        let plan = self.resolved_plan.execution_plan();
+        plan.payload().memory().checkpoint_capacity().is_some()
+            && matches!(
+                plan.sequence_checkpoint_capability(),
+                SequenceCheckpointCapability::Enabled(_)
+            )
+    }
+
+    fn retain_checkpoint_token_evidence(
+        &self,
+        span: TokenSpanWork,
+        tokens: &[u32],
+    ) -> Result<TokenSpanWork> {
+        if self.checkpoint_token_evidence_enabled() {
+            // Preserve the admitted range, fit ceiling and full-input hash;
+            // with_checkpoint_tokens revalidates all three against real input.
+            span.with_checkpoint_tokens(Arc::from(tokens))
+                .map_err(|error| FerrumError::backend(error.to_string()))
+        } else {
+            Ok(span)
+        }
+    }
+
     async fn execute_step(
         &self,
         sequence: &Arc<VNextSequence<R>>,
@@ -7552,6 +7577,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         logits_policy: &LogitsReturnPolicy,
     ) -> Result<ExecutorSamplingOutput> {
+        // The Step retains its original work Arc. Adding evidence only to a
+        // later wave would leave the completed-state proof without tokens.
+        let span = self.retain_checkpoint_token_evidence(span, tokens)?;
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self
@@ -7604,6 +7632,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext decode batch differs from its canonical participant set",
             ));
         }
+        let retained_spans = if self.checkpoint_token_evidence_enabled() {
+            Some(
+                spans
+                    .iter()
+                    .zip(token_batches)
+                    .map(|(span, tokens)| {
+                        self.retain_checkpoint_token_evidence(span.clone(), tokens)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        // Unsupported/default plans keep the original slice and do not copy
+        // full token inputs or repeat their hash calculation.
+        let spans = retained_spans.as_deref().unwrap_or(spans);
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
             let _phase_timing = self

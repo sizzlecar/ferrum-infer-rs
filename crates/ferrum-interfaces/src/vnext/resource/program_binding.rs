@@ -460,7 +460,7 @@ mod tests {
         let pools =
             MemoryPlan::derive_dynamic_pools(&descriptors, &nodes, 1 << 20).expect("derive pools");
         let (_, domains) =
-            super::super::plan_dynamic_pool_admission(1, &pools, &descriptors).unwrap();
+            super::super::plan_dynamic_pool_admission(1, &pools, &descriptors, None).unwrap();
         let layouts = domains
             .iter()
             .map(|domain| {
