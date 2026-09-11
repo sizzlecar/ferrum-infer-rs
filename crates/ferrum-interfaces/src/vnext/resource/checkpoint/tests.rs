@@ -3,6 +3,9 @@ use crate::vnext::CheckpointCapacityClaimDecision;
 use std::future::Future;
 use std::task::{Context, Poll, Wake, Waker};
 
+#[path = "capture/tests.rs"]
+mod capture_permit_tests;
+
 fn fixture(profile: DynamicStorageProfile, maximum_bytes: u64) -> (Harness, ResourceId) {
     let catalog = pool_catalog(
         profile,

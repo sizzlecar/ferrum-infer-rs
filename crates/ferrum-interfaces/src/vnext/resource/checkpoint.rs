@@ -17,6 +17,11 @@ use crate::vnext::{
     CheckpointAuthorityId, CheckpointCapacityClaimDecision, LogicalCheckpointLease,
 };
 use std::collections::BTreeMap;
+mod transfer;
+use std::sync::Mutex;
+
+mod capture;
+pub(crate) use capture::*;
 
 /// Compact bytes for one base resource after the plan layout has merged all
 /// aliases and validated the actual source ranges at the capture boundary.
@@ -99,6 +104,7 @@ pub(crate) struct CheckpointBackingOwner<R: DeviceRuntime> {
     plan: Arc<PlanRuntimeResources<R>>,
     logical_bytes: u64,
     extent_bytes: u64,
+    capture: Mutex<CheckpointCaptureState>,
 }
 
 impl<R: DeviceRuntime> CheckpointBackingOwner<R> {
@@ -288,6 +294,7 @@ impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
             plan: Arc::clone(&self.resources),
             logical_bytes,
             extent_bytes,
+            capture: Mutex::new(CheckpointCaptureState::default()),
         };
         // Verify the committed extents and charged demand together before
         // returning an owner. Error drop retains physical-before-logical order.

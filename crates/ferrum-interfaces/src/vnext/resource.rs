@@ -83,8 +83,9 @@ pub use sequence::*;
 mod batch;
 pub use batch::*;
 mod backing_initialization;
-pub(crate) use backing_initialization::BackingInitializationEncodeError;
-use backing_initialization::PreparedBackingInitializations;
+pub(crate) use backing_initialization::{
+    BackingInitializationEncodeError, PreparedBackingInitializations,
+};
 mod invocation;
 pub use invocation::*;
 mod execution_session;

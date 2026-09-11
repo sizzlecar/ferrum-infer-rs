@@ -29,6 +29,8 @@ mod readback_collection;
 pub use readback_collection::*;
 mod completed_wave;
 pub(crate) use completed_wave::SuccessfulWaveCompletionSeal;
+mod state_transfer;
+pub(crate) use state_transfer::*;
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
@@ -1391,11 +1393,16 @@ impl CompletionSweepEntry {
 #[must_use = "a bounded completion sweep contains scheduler-owned progress evidence"]
 pub struct CompletionSweepReceipt {
     entries: Vec<CompletionSweepEntry>,
+    state_transfers: Vec<StateTransferSweepEntry>,
     retained_after: usize,
     quarantined_after: usize,
 }
 
 impl CompletionSweepReceipt {
+    pub(crate) fn state_transfers(&self) -> &[StateTransferSweepEntry] {
+        &self.state_transfers
+    }
+
     pub fn entries(&self) -> &[CompletionSweepEntry] {
         &self.entries
     }
@@ -1601,6 +1608,7 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
 
 enum CompletionRecord<R: DeviceRuntime> {
     Reserved,
+    StateTransfer(StateTransferRecord<R>),
     InFlight {
         resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
@@ -1681,12 +1689,21 @@ impl<R: DeviceRuntime> CompletionQuarantineOwnership<R> {
 }
 
 impl<R: DeviceRuntime> CompletionRecord<R> {
+    fn is_quarantined(&self) -> bool {
+        match self {
+            Self::Quarantined { .. } => true,
+            Self::StateTransfer(transfer) => transfer.is_quarantined(),
+            _ => false,
+        }
+    }
+
     fn deferred_cleanup_domain(&self) -> Option<DeferredDeviceCleanupDomainId> {
         match self {
             Self::InFlight { resources, .. } | Self::SubmissionIndeterminate { resources, .. } => {
                 Some(resources.deferred_cleanup_domain())
             }
             Self::Quarantined { ownership, .. } => Some(ownership.deferred_cleanup_domain()),
+            Self::StateTransfer(transfer) => transfer.deferred_cleanup_domain(),
             Self::Reserved | Self::Reaped => None,
         }
     }
@@ -1697,6 +1714,11 @@ impl<R: DeviceRuntime> CompletionRecord<R> {
                 resources
             }
             Self::Quarantined { ownership, .. } => ownership.resources_mut(),
+            Self::StateTransfer(_) => {
+                return Err(invalid_completion(
+                    "state transfer requires its owned completion path",
+                ))
+            }
             Self::Reserved | Self::Reaped => return Ok(()),
         };
         resources.finish_request_state_hazards(
@@ -1759,7 +1781,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .filter(|record| {
                 record
                     .lock()
-                    .map(|record| matches!(&*record, CompletionRecord::Quarantined { .. }))
+                    .map(|record| record.is_quarantined())
                     .unwrap_or(true)
             })
             .count()
@@ -1795,16 +1817,34 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
             slot_ids
         };
-        let entries = slot_ids
-            .into_iter()
-            .map(|slot_id| CompletionSweepEntry {
+        let mut entries = Vec::new();
+        let mut state_transfers = Vec::new();
+        for slot_id in slot_ids {
+            match self.poll_state_transfer_slot(slot_id) {
+                Ok(Some(observation)) => {
+                    state_transfers.push(StateTransferSweepEntry {
+                        slot_id,
+                        observation,
+                    });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    entries.push(CompletionSweepEntry {
+                        slot_id,
+                        observation: CompletionSweepObservation::Failed(error),
+                    });
+                    continue;
+                }
+            }
+            entries.push(CompletionSweepEntry {
                 slot_id,
                 observation: match self.poll_bound(slot_id) {
                     Ok(observation) => CompletionSweepObservation::Observed(observation),
                     Err(error) => CompletionSweepObservation::Failed(error),
                 },
-            })
-            .collect();
+            });
+        }
         let records = self
             .state
             .lock()
@@ -1819,12 +1859,13 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .filter(|record| {
                 record
                     .lock()
-                    .map(|record| matches!(&*record, CompletionRecord::Quarantined { .. }))
+                    .map(|record| record.is_quarantined())
                     .unwrap_or(true)
             })
             .count();
         Ok(CompletionSweepReceipt {
             entries,
+            state_transfers,
             retained_after,
             quarantined_after,
         })
@@ -1889,20 +1930,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 "completion lane runtime is not the submission resource runtime instance",
             ));
         }
-        let mut state = reaper
-            .state
-            .lock()
-            .map_err(|_| invalid_completion("completion reaper state mutex is poisoned"))?;
-        let raw = state
-            .next_slot
-            .ok_or_else(|| invalid_completion("completion slot identity space is exhausted"))?;
-        state.next_slot = raw.get().checked_add(1).and_then(NonZeroU64::new);
-        let slot_id = CompletionSlotId(raw);
-        let record = Arc::new(Mutex::new(CompletionRecord::Reserved));
-        if state.slots.insert(slot_id, Arc::clone(&record)).is_some() {
-            return Err(invalid_completion("completion slot identity was reused"));
-        }
-        drop(state);
+        let (slot_id, record) = reaper.reserve_slot()?;
         #[derive(Serialize)]
         struct SubmissionFingerprintInput<'a> {
             domain: &'static str,
@@ -1928,6 +1956,23 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             submission_may_have_happened: false,
             finished: false,
         })
+    }
+
+    fn reserve_slot(&self) -> Result<(CompletionSlotId, SharedCompletionRecord<R>), VNextError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("completion reaper state mutex is poisoned"))?;
+        let raw = state
+            .next_slot
+            .ok_or_else(|| invalid_completion("completion slot identity space is exhausted"))?;
+        state.next_slot = raw.get().checked_add(1).and_then(NonZeroU64::new);
+        let slot_id = CompletionSlotId(raw);
+        let record = Arc::new(Mutex::new(CompletionRecord::Reserved));
+        if state.slots.insert(slot_id, Arc::clone(&record)).is_some() {
+            return Err(invalid_completion("completion slot identity was reused"));
+        }
+        Ok((slot_id, record))
     }
 
     fn lookup(&self, slot_id: CompletionSlotId) -> Result<SharedCompletionRecord<R>, VNextError> {
@@ -2114,6 +2159,9 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 "completion slot has not reached submission",
             )),
             CompletionRecord::Quarantined { .. } => Ok(()),
+            CompletionRecord::StateTransfer(_) => Err(invalid_completion(
+                "native transfers do not expose model readback",
+            )),
             CompletionRecord::Reaped => {
                 Err(invalid_completion("completion slot is already reaped"))
             }
@@ -2138,6 +2186,9 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 "completion slot has not reached submission",
             )),
             CompletionRecord::Quarantined { .. } => Ok(()),
+            CompletionRecord::StateTransfer(_) => Err(invalid_completion(
+                "native transfers do not expose model readback",
+            )),
             CompletionRecord::Reaped => {
                 Err(invalid_completion("completion slot is already reaped"))
             }
@@ -2187,6 +2238,11 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
         let observation = match &*guard {
+            CompletionRecord::StateTransfer(_) => {
+                return Err(invalid_completion(
+                    "state transfer has no model-operation receipt",
+                ))
+            }
             CompletionRecord::Reserved => {
                 return Err(invalid_completion(
                     "completion slot has not reached submission",
@@ -2207,36 +2263,23 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 batch_identity,
                 timing_mode,
                 ..
-            } if blocking => {
-                let wait_started = timing_mode.completion_enabled().then(Instant::now);
-                match catch_unwind(AssertUnwindSafe(|| lane.wait_fence(fence))) {
-                    Ok(Ok(terminal)) => {
-                        let wait_timing = match wait_started {
-                            Some(started) => u64::try_from(started.elapsed().as_nanos()).map_or(
-                                DeviceTimingMeasurement::Unavailable(
-                                    DeviceTimingUnavailableReason::DurationOverflow,
-                                ),
-                                DeviceTimingMeasurement::Measured,
-                            ),
-                            None => DeviceTimingMeasurement::NotRequested,
-                        };
-                        catch_unwind(AssertUnwindSafe(|| {
-                            terminal_observation(
-                                lane,
-                                batch_identity,
-                                terminal,
-                                *timing_mode,
-                                wait_timing,
-                            )
-                        }))
-                        .unwrap_or(FenceObservation::ObservationPanicked)
-                    }
-                    Ok(Err(indeterminate)) => catch_unwind(AssertUnwindSafe(|| {
-                        classify_batch_device_error(
-                            lane.runtime(),
+            } => {
+                let (observed, wait_timing) =
+                    observe_device_fence(lane, fence, blocking, *timing_mode);
+                match observed {
+                    Ok(FenceQuery::Pending) => FenceObservation::Pending,
+                    Ok(FenceQuery::Terminal(terminal)) => catch_unwind(AssertUnwindSafe(|| {
+                        terminal_observation(
+                            lane,
                             batch_identity,
-                            indeterminate.error(),
+                            terminal,
+                            *timing_mode,
+                            wait_timing,
                         )
+                    }))
+                    .unwrap_or(FenceObservation::ObservationPanicked),
+                    Ok(FenceQuery::Indeterminate(error)) => catch_unwind(AssertUnwindSafe(|| {
+                        classify_batch_device_error(lane.runtime(), batch_identity, &error)
                     }))
                     .map_or(
                         FenceObservation::ObservationPanicked,
@@ -2248,40 +2291,6 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     Err(_) => FenceObservation::ObservationPanicked,
                 }
             }
-            CompletionRecord::InFlight {
-                lane,
-                fence,
-                batch_identity,
-                timing_mode,
-                ..
-            } => match catch_unwind(AssertUnwindSafe(|| lane.query_fence(fence))) {
-                Ok(FenceQuery::Pending) => FenceObservation::Pending,
-                Ok(FenceQuery::Terminal(terminal)) => catch_unwind(AssertUnwindSafe(|| {
-                    terminal_observation(
-                        lane,
-                        batch_identity,
-                        terminal,
-                        *timing_mode,
-                        if timing_mode.completion_enabled() {
-                            DeviceTimingMeasurement::Measured(0)
-                        } else {
-                            DeviceTimingMeasurement::NotRequested
-                        },
-                    )
-                }))
-                .unwrap_or(FenceObservation::ObservationPanicked),
-                Ok(FenceQuery::Indeterminate(error)) => catch_unwind(AssertUnwindSafe(|| {
-                    classify_batch_device_error(lane.runtime(), batch_identity, &error)
-                }))
-                .map_or(
-                    FenceObservation::ObservationPanicked,
-                    |classified| match classified {
-                        Ok(failure) => FenceObservation::Indeterminate(failure),
-                        Err(error) => FenceObservation::ContractIndeterminate(error),
-                    },
-                ),
-                Err(_) => FenceObservation::ObservationPanicked,
-            },
         };
         let recovery_state = match &observation {
             FenceObservation::Indeterminate(_) | FenceObservation::ContractIndeterminate(_) => {
@@ -2420,6 +2429,11 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
         let (lane, batch_identity, submission, cause, had_submission_fence) = match &*guard {
+            CompletionRecord::StateTransfer(_) => {
+                return Err(invalid_completion(
+                    "state transfer requires its native recovery path",
+                ))
+            }
             CompletionRecord::InFlight {
                 lane,
                 batch_identity,
@@ -2536,6 +2550,40 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             had_submission_fence,
         }))
     }
+}
+
+/// One physical query/wait boundary for model work and native state transfers.
+/// Identity-specific failure attribution and success authority are applied only
+/// after this common observation has returned an actual terminal receipt.
+fn observe_device_fence<R: DeviceRuntime>(
+    lane: &ExecutionLane<R>,
+    fence: &R::Fence,
+    blocking: bool,
+    timing_mode: DeviceTimingMode,
+) -> (
+    Result<FenceQuery<R::Error>, ()>,
+    DeviceTimingMeasurement<u64>,
+) {
+    let started = (blocking && timing_mode.completion_enabled()).then(Instant::now);
+    let observation = catch_unwind(AssertUnwindSafe(|| {
+        if blocking {
+            lane.wait_fence(fence)
+                .map(FenceQuery::Terminal)
+                .unwrap_or_else(|error| FenceQuery::Indeterminate(error.into_error()))
+        } else {
+            lane.query_fence(fence)
+        }
+    }))
+    .map_err(|_| ());
+    let timing = match started {
+        Some(started) => u64::try_from(started.elapsed().as_nanos()).map_or(
+            DeviceTimingMeasurement::Unavailable(DeviceTimingUnavailableReason::DurationOverflow),
+            DeviceTimingMeasurement::Measured,
+        ),
+        None if timing_mode.completion_enabled() => DeviceTimingMeasurement::Measured(0),
+        None => DeviceTimingMeasurement::NotRequested,
+    };
+    (observation, timing)
 }
 
 enum FenceObservation {
@@ -2656,7 +2704,7 @@ impl<R: DeviceRuntime> DeferredDeviceCleanupTask for DeferredCompletionCleanup<R
             retryable = true;
             quarantined |= record
                 .lock()
-                .map(|record| matches!(&*record, CompletionRecord::Quarantined { .. }))
+                .map(|record| record.is_quarantined())
                 .unwrap_or(true);
         }
         if self.records.is_empty() {
@@ -2679,6 +2727,7 @@ fn fail_close_completion_record<R: DeviceRuntime>(record: &SharedCompletionRecor
         CompletionRecord::InFlight { lane, .. }
         | CompletionRecord::SubmissionIndeterminate { lane, .. } => lane.fail_closed(),
         CompletionRecord::Quarantined { ownership, .. } => ownership.lane().fail_closed(),
+        CompletionRecord::StateTransfer(transfer) => transfer.fail_close(),
         CompletionRecord::Reserved | CompletionRecord::Reaped => {}
     }
 }
@@ -2688,6 +2737,9 @@ fn cleanup_dropped_completion_record<R: DeviceRuntime>(record: &SharedCompletion
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if let CompletionRecord::StateTransfer(transfer) = &mut *guard {
+        return transfer.cleanup_abandoned();
+    }
     let (quiescent, drained) = match &*guard {
         CompletionRecord::InFlight { lane, fence, .. } => {
             let queried = catch_unwind(AssertUnwindSafe(|| lane.query_fence(fence)))
@@ -2711,12 +2763,14 @@ fn cleanup_dropped_completion_record<R: DeviceRuntime>(record: &SharedCompletion
             (drained, drained)
         }
         CompletionRecord::Reserved | CompletionRecord::Reaped => (true, false),
+        CompletionRecord::StateTransfer(_) => unreachable!("native cleanup was handled above"),
     };
     if !quiescent {
         match &*guard {
             CompletionRecord::InFlight { lane, .. }
             | CompletionRecord::SubmissionIndeterminate { lane, .. } => lane.fail_closed(),
             CompletionRecord::Quarantined { ownership, .. } => ownership.lane().fail_closed(),
+            CompletionRecord::StateTransfer(transfer) => transfer.fail_close(),
             CompletionRecord::Reserved | CompletionRecord::Reaped => {}
         }
         return false;

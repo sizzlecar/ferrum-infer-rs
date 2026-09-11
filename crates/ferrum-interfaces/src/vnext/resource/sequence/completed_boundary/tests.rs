@@ -172,29 +172,41 @@ fn finish_and_record(step: &Arc<StepResourceLease<TestRuntime>>) {
 
 fn submit_through_reaper(
     harness: &BoundaryHarness,
+    wave: PreparedStepSubmissionWave<TestRuntime>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+) -> CompletionHandle<TestRuntime> {
+    submit_fixture_wave_through_reaper(
+        &harness.harness.root,
+        &harness.sessions,
+        &harness.lane,
+        wave,
+        reaper,
+    )
+}
+
+pub(super) fn submit_fixture_wave_through_reaper(
+    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    sessions: &[Arc<SequenceSession<TestRuntime>>],
+    lane: &Arc<ExecutionLane<TestRuntime>>,
     mut wave: PreparedStepSubmissionWave<TestRuntime>,
     reaper: &Arc<CompletionReaper<TestRuntime>>,
 ) -> CompletionHandle<TestRuntime> {
-    let active = harness
-        .sessions
+    let active = sessions
         .iter()
         .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
         .collect::<Vec<_>>();
-    let identity = BatchOperationIdentity::test_only_for_wave(
-        &wave,
-        &harness.harness.root.dynamic_pools.nodes,
-        &active,
-    )
-    .unwrap();
+    let identity =
+        BatchOperationIdentity::test_only_for_wave(&wave, &root.dynamic_pools.nodes, &active)
+            .unwrap();
     wave.begin_dispatch().unwrap();
     let mut reservation =
-        CompletionReaper::reserve_wave(reaper, wave, Arc::clone(&harness.lane), identity).unwrap();
+        CompletionReaper::reserve_wave(reaper, wave, Arc::clone(lane), identity).unwrap();
     let mut commands = DeviceCommandBatch::with_capacity(1);
     assert!(reservation
-        .encode_backing_initializations(&harness.harness.runtime, &mut commands,)
+        .encode_backing_initializations(lane.runtime(), &mut commands)
         .is_ok());
     reservation.mark_submission_started();
-    let fence = match harness.lane.reserve_enqueue().unwrap().submit(commands) {
+    let fence = match lane.reserve_enqueue().unwrap().submit(commands) {
         LaneSubmitOutcome::Submitted(fence) => fence,
         _ => panic!("CPU fixture must return a real tracked fence"),
     };

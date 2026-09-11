@@ -100,6 +100,35 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
         self.reservation.reservation.kind
     }
 
+    pub(crate) fn reservation_serial(&self) -> NonZeroU64 {
+        self.reservation.reservation.serial
+    }
+
+    pub(crate) fn runtime_arc(&self) -> &Arc<R> {
+        &self.session.resources.request.plan.resources.runtime
+    }
+
+    pub(crate) fn deferred_cleanup_domain(&self) -> crate::vnext::DeferredDeviceCleanupDomainId {
+        self.session
+            .resources
+            .request
+            .plan
+            .resources
+            .deferred_cleanup_domain
+    }
+
+    pub(crate) fn backing_view(
+        &self,
+        resource: &crate::vnext::ResourceId,
+    ) -> Result<crate::vnext::LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        self.session
+            .resources
+            .request
+            .plan
+            .dynamic_pools()
+            .view_many(self.backing.backing_slices_for(resource))
+    }
+
     pub(super) fn ensure_active_reservation(
         &self,
         active: &ActiveSequenceSessionState,

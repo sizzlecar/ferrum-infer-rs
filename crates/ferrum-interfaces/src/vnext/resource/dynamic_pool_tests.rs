@@ -20,6 +20,12 @@ use std::error::Error;
 #[path = "checkpoint/tests.rs"]
 mod checkpoint_backing_tests;
 
+#[path = "checkpoint/native_tests.rs"]
+mod native_checkpoint_tests;
+
+#[path = "backing_initialization/tests.rs"]
+mod restore_initialization_tests;
+
 #[path = "sequence/state_transfer/resource_tests.rs"]
 mod sequence_state_transfer_tests;
 
@@ -90,6 +96,14 @@ struct TestRuntime {
     reusable_resident_executables: AtomicU64,
     reusable_trim_calls: AtomicU64,
     fence_behavior: AtomicU8,
+    submit_behavior: AtomicU8,
+}
+
+#[derive(Clone, Copy)]
+enum TestSubmitBehavior {
+    Submitted = 0,
+    DefinitelyNotSubmitted = 1,
+    PossiblySubmittedPanic = 2,
 }
 
 #[derive(Clone, Copy)]
@@ -137,11 +151,17 @@ impl TestRuntime {
             reusable_resident_executables: AtomicU64::new(0),
             reusable_trim_calls: AtomicU64::new(0),
             fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
+            submit_behavior: AtomicU8::new(TestSubmitBehavior::Submitted as u8),
         }
     }
 
     fn set_fence_behavior(&self, behavior: TestFenceBehavior) {
         self.fence_behavior.store(behavior as u8, Ordering::Release);
+    }
+
+    fn set_submit_behavior(&self, behavior: TestSubmitBehavior) {
+        self.submit_behavior
+            .store(behavior as u8, Ordering::Release);
     }
 
     fn fence_behavior(&self) -> TestFenceBehavior {
@@ -316,7 +336,12 @@ impl DeviceRuntime for TestRuntime {
         _stream: &mut Self::Stream,
         _commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
-        Ok(())
+        match self.submit_behavior.load(Ordering::Acquire) {
+            0 => Ok(()),
+            1 => Err(DefinitelyNotSubmitted::new(TestRuntimeError)),
+            2 => panic!("injected native submit panic with unknown device visibility"),
+            _ => unreachable!("test submit behavior is set through its typed setter"),
+        }
     }
 
     fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {

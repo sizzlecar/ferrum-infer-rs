@@ -597,7 +597,7 @@ impl<'a, B> OperationBufferView<'a, B> {
         )
     }
 
-    pub(super) fn from_backing_prefix(
+    pub(crate) fn from_backing_prefix(
         descriptor: BufferDescriptor,
         backing: LogicalBackingBufferView<'a, B>,
         allocation_lifetime: AllocationLifetime,

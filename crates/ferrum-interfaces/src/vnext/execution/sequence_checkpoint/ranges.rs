@@ -158,6 +158,8 @@ impl SequenceCheckpointLayout {
         Ok(())
     }
 
+    // Only the owning ExecutionPlan entrypoint may attach a plan hash. Resource
+    // and completion code must not relabel another plan's trusted layout.
     pub(super) fn byte_plan(
         &self,
         plan_hash: PlanHash,
