@@ -9,6 +9,33 @@ use ferrum_types::RuntimeConfigSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Sampling fields actually sent by an HTTP benchmark client.
+/// Optional values are omitted from the wire, not inferred server defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct HttpRequestSampling {
+    pub temperature: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Generation seed, independent of the benchmark's prompt-generation seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+impl HttpRequestSampling {
+    pub fn validate(&self) -> ferrum_types::Result<()> {
+        ferrum_types::SamplingParams {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p.unwrap_or(1.0),
+            seed: self.seed,
+            ..ferrum_types::SamplingParams::greedy()
+        }
+        .validate()
+    }
+}
+
 /// Snapshot of everything we expect to affect bench outcomes.
 ///
 /// `BTreeMap` (not `HashMap`) for `ferrum_env` so JSON serialization
@@ -57,6 +84,10 @@ pub struct Env {
     /// for ferrum cells — used by the config-parity report block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_args: Option<Vec<String>>,
+
+    /// Requested HTTP sampling. Missing in old reports means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_request_sampling: Option<HttpRequestSampling>,
 }
 
 /// SHA-256 of canonical-JSON-serialized `Env`, prefixed with `sha256:`.
@@ -113,6 +144,7 @@ impl Env {
             ferrum_env: capture_ferrum_env(),
             runtime_config: RuntimeConfigSnapshot::capture_current(),
             vllm_args: None,
+            http_request_sampling: None,
         }
     }
 }
@@ -271,6 +303,7 @@ mod tests {
             ferrum_env,
             runtime_config: RuntimeConfigSnapshot::default(),
             vllm_args: None,
+            http_request_sampling: None,
         }
     }
 
@@ -299,6 +332,46 @@ mod tests {
         e.ferrum_env.insert("FERRUM_VLLM_MOE".into(), "1".into());
         let h2 = e.hash();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn http_sampling_is_unknown_in_old_reports_and_part_of_environment_hash() {
+        let old = fixture_env();
+        let serialized = serde_json::to_value(&old).unwrap();
+        assert!(serialized.get("http_request_sampling").is_none());
+        let restored: Env = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.http_request_sampling, None);
+        assert_eq!(restored.hash(), old.hash());
+
+        let mut baseline = old.clone();
+        baseline.http_request_sampling = Some(HttpRequestSampling::default());
+        assert_ne!(baseline.hash(), old.hash());
+        for sampling in [
+            HttpRequestSampling {
+                temperature: 0.6,
+                ..Default::default()
+            },
+            HttpRequestSampling {
+                top_k: Some(20),
+                ..Default::default()
+            },
+            HttpRequestSampling {
+                top_p: Some(0.95),
+                ..Default::default()
+            },
+            HttpRequestSampling {
+                seed: Some(42),
+                ..Default::default()
+            },
+        ] {
+            let mut changed = baseline.clone();
+            changed.http_request_sampling = Some(sampling);
+            assert_ne!(changed.hash(), baseline.hash());
+            let restored: Env =
+                serde_json::from_value(serde_json::to_value(&changed).unwrap()).unwrap();
+            assert_eq!(restored.http_request_sampling, Some(sampling));
+            assert_eq!(restored.hash(), changed.hash());
+        }
     }
 
     #[test]

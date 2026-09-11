@@ -69,6 +69,14 @@ fn write_env_block(s: &mut String, r: &BenchReport) {
     if let Some(mode) = r.env.http_connection_mode.as_ref() {
         writeln!(s, "| http_connection_mode | {} |", mode).ok();
     }
+    if let Some(sampling) = r.env.http_request_sampling {
+        writeln!(
+            s,
+            "| http_request_sampling | `{}` |",
+            serde_json::to_string(&sampling).expect("validated sampling")
+        )
+        .ok();
+    }
     if let Some(mhz) = r.env.gpu_clock_lock_mhz {
         writeln!(s, "| gpu_clock_lock | {} MHz |", mhz).ok();
     }
@@ -333,6 +341,23 @@ mod tests {
         // n_repeats=3 → CI columns ARE present
         assert!(!md.contains("⚠ < 3"));
         assert!(md.contains("±")); // mean ± ci95 format
+    }
+
+    #[test]
+    fn http_sampling_is_shown_only_when_recorded() {
+        let mut report = fixture_report();
+        assert!(!render_single(&report).contains("http_request_sampling"));
+        let sampling = crate::env::HttpRequestSampling {
+            temperature: 0.6,
+            top_k: Some(20),
+            top_p: Some(0.95),
+            seed: Some(37),
+        };
+        report.env.http_request_sampling = Some(sampling);
+        report.env_hash = report.env.hash();
+        let markdown = render_single(&report);
+        assert!(markdown.contains("http_request_sampling"));
+        assert!(markdown.contains(&serde_json::to_string(&sampling).unwrap()));
     }
 
     #[test]

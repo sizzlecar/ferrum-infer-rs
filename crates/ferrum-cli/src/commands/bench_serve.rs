@@ -18,6 +18,7 @@
 
 use clap::{Args, ValueEnum};
 use colored::*;
+use ferrum_bench_core::env::HttpRequestSampling;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, BenchmarkPhase,
     BenchmarkRequestCorrelation, Env, ItlEvidenceSource, OutputTokenCountSource,
@@ -40,8 +41,10 @@ use uuid::Uuid;
 use crate::config::CliConfig;
 
 mod decode_isolation;
+mod sampling;
 
 use decode_isolation::{BenchServeWorkload, DecodeIsolationArgs};
+use sampling::BenchSamplingArgs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchTargetBackend {
@@ -110,6 +113,9 @@ pub struct BenchServeCommand {
 
     #[command(flatten)]
     pub decode_isolation: DecodeIsolationArgs,
+
+    #[command(flatten)]
+    pub sampling: BenchSamplingArgs,
 
     // ─── Workload selection (pick one mode) ────────────────────────
     /// Closed-loop concurrency (single cell). Default when no other mode is
@@ -340,6 +346,7 @@ async fn stream_one(
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
+    sampling: HttpRequestSampling,
     timeout_s: f64,
     correlation: BenchmarkRequestCorrelation,
 ) -> RequestRecord {
@@ -352,6 +359,7 @@ async fn stream_one(
         ignore_eos,
         enable_thinking,
         reasoning_effort,
+        sampling,
         timeout_s,
         correlation,
         None,
@@ -383,6 +391,7 @@ async fn stream_one_observed(
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
+    sampling: HttpRequestSampling,
     timeout_s: f64,
     correlation: BenchmarkRequestCorrelation,
     progress: Option<tokio::sync::watch::Sender<DecodeStreamProgress>>,
@@ -399,6 +408,7 @@ async fn stream_one_observed(
         ignore_eos,
         enable_thinking,
         reasoning_effort,
+        sampling,
     );
     let start = Instant::now();
     let mut state = StreamState::for_prompt(
@@ -600,6 +610,7 @@ fn chat_completion_body(
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
+    sampling: HttpRequestSampling,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -607,8 +618,15 @@ fn chat_completion_body(
         "max_tokens": max_tokens,
         "stream": true,
         "stream_options": {"include_usage": true},
-        "temperature": 0.0,
     });
+    let serde_json::Value::Object(sampling) =
+        serde_json::to_value(sampling).expect("validated HTTP sampling must serialize")
+    else {
+        unreachable!("HTTP sampling serializes as an object");
+    };
+    body.as_object_mut()
+        .expect("request body is an object")
+        .extend(sampling);
     let mut chat_template_kwargs = serde_json::Map::new();
     if let Some(enable_thinking) = enable_thinking {
         chat_template_kwargs.insert(
@@ -1309,6 +1327,7 @@ struct RunContext {
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
+    sampling: HttpRequestSampling,
     timeout_s: f64,
     benchmark_run_id: Arc<String>,
 }
@@ -1400,6 +1419,7 @@ async fn run_closed_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.reasoning_effort,
+                    ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1446,6 +1466,7 @@ async fn run_closed_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.reasoning_effort,
+                    ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1491,6 +1512,7 @@ async fn run_open_loop(
                 ctx.ignore_eos,
                 ctx.enable_thinking,
                 ctx.reasoning_effort,
+                ctx.sampling,
                 ctx.timeout_s,
                 benchmark_request_correlation(
                     &ctx.benchmark_run_id,
@@ -1540,6 +1562,7 @@ async fn run_open_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.reasoning_effort,
+                    ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1568,6 +1591,7 @@ impl RunContext {
             ignore_eos: self.ignore_eos,
             enable_thinking: self.enable_thinking,
             reasoning_effort: self.reasoning_effort,
+            sampling: self.sampling,
             timeout_s: self.timeout_s,
             benchmark_run_id: self.benchmark_run_id.clone(),
         }
@@ -1594,6 +1618,7 @@ fn build_env(cmd: &BenchServeCommand, features: Vec<String>) -> Env {
 
     let mut env = Env::capture_minimal(commit_sha, features);
     env.http_connection_mode = Some(cmd.http_connection_mode.as_str().to_string());
+    env.http_request_sampling = Some(cmd.sampling.request_sampling());
     if let Some(hw) = cmd.hw_id.clone() {
         env.hw_id = hw;
     }
@@ -1886,6 +1911,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         ignore_eos: cmd.ignore_eos,
         enable_thinking: cmd.enable_thinking,
         reasoning_effort: cmd.reasoning_effort,
+        sampling: cmd.sampling.request_sampling(),
         timeout_s: cmd.timeout,
         benchmark_run_id: Arc::new(format!("bench-{}", Uuid::new_v4())),
     };
@@ -1932,6 +1958,7 @@ fn emit_reports(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> 
 }
 
 fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
+    cmd.sampling.request_sampling().validate()?;
     if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         if cmd.dataset != "random" {
             return Err(ferrum_types::FerrumError::model(
@@ -2327,7 +2354,15 @@ mod tests {
 
     #[test]
     fn chat_completion_body_omits_ignore_eos_by_default() {
-        let body = chat_completion_body("model", "prompt", 128, false, None, None);
+        let body = chat_completion_body(
+            "model",
+            "prompt",
+            128,
+            false,
+            None,
+            None,
+            HttpRequestSampling::default(),
+        );
         assert_eq!(body["model"], serde_json::json!("model"));
         assert_eq!(body["max_tokens"], serde_json::json!(128));
         assert_eq!(body["stream"], serde_json::json!(true));
@@ -2341,18 +2376,42 @@ mod tests {
 
     #[test]
     fn chat_completion_body_sends_ignore_eos_when_requested() {
-        let body = chat_completion_body("model", "prompt", 128, true, None, None);
+        let body = chat_completion_body(
+            "model",
+            "prompt",
+            128,
+            true,
+            None,
+            None,
+            HttpRequestSampling::default(),
+        );
         assert_eq!(body["ignore_eos"], serde_json::json!(true));
     }
 
     #[test]
     fn chat_completion_body_sends_typed_thinking_values() {
-        let disabled = chat_completion_body("model", "prompt", 128, false, Some(false), None);
+        let disabled = chat_completion_body(
+            "model",
+            "prompt",
+            128,
+            false,
+            Some(false),
+            None,
+            HttpRequestSampling::default(),
+        );
         assert_eq!(
             disabled["chat_template_kwargs"]["enable_thinking"],
             serde_json::json!(false)
         );
-        let enabled = chat_completion_body("model", "prompt", 128, false, Some(true), None);
+        let enabled = chat_completion_body(
+            "model",
+            "prompt",
+            128,
+            false,
+            Some(true),
+            None,
+            HttpRequestSampling::default(),
+        );
         assert_eq!(
             enabled["chat_template_kwargs"]["enable_thinking"],
             serde_json::json!(true)
@@ -2368,6 +2427,7 @@ mod tests {
             false,
             Some(false),
             Some(ReasoningEffort::Low),
+            HttpRequestSampling::default(),
         );
         assert_eq!(
             body["chat_template_kwargs"]["enable_thinking"],
@@ -2777,6 +2837,7 @@ mod tests {
             http_connection_mode: BenchHttpConnectionMode::Pooled,
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
+            sampling: BenchSamplingArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -3007,6 +3068,7 @@ mod tests {
             http_connection_mode: BenchHttpConnectionMode::Pooled,
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
+            sampling: BenchSamplingArgs::default(),
             concurrency: 2,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -3100,6 +3162,7 @@ mod tests {
             http_connection_mode: BenchHttpConnectionMode::Pooled,
             scenario: BenchServeWorkload::Standard,
             decode_isolation: DecodeIsolationArgs::default(),
+            sampling: BenchSamplingArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,

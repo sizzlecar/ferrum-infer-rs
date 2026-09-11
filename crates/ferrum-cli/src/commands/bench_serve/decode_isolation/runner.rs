@@ -131,6 +131,7 @@ pub(super) async fn run_once(
             true,
             cmd.enable_thinking,
             cmd.reasoning_effort,
+            ctx.sampling,
             cmd.timeout,
             benchmark_request_correlation(
                 &ctx.benchmark_run_id,
@@ -175,6 +176,7 @@ pub(super) async fn run_once(
                 true,
                 enable_thinking,
                 reasoning_effort,
+                request_ctx.sampling,
                 timeout,
                 correlation,
                 Some(progress_tx),
@@ -244,6 +246,7 @@ pub(super) async fn run_once(
             true,
             enable_thinking,
             reasoning_effort,
+            aggressor_ctx.sampling,
             timeout,
             aggressor_correlation,
             Some(aggressor_progress_tx),
@@ -648,6 +651,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockMode {
+        Standard,
         Normal,
         EventUsageMismatch,
         Starvation,
@@ -665,6 +669,7 @@ mod tests {
         aggressor_first: AtomicBool,
         active_streams: AtomicUsize,
         events: Mutex<Vec<String>>,
+        requests: Mutex<Vec<(String, usize, Value)>>,
     }
 
     struct ActiveStream(Arc<MockState>);
@@ -696,6 +701,7 @@ mod tests {
             aggressor_first: AtomicBool::new(false),
             active_streams: AtomicUsize::new(0),
             events: Mutex::new(vec![]),
+            requests: Mutex::new(vec![]),
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_completion))
@@ -728,6 +734,11 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         let max_tokens = body["max_tokens"].as_u64().unwrap() as usize;
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push((phase.clone(), request_index, body));
         let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, Infallible>>(2);
         state.active_streams.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(produce_stream(state, request_index, phase, max_tokens, tx));
@@ -746,6 +757,15 @@ mod tests {
         tx: mpsc::Sender<std::result::Result<Bytes, Infallible>>,
     ) {
         let _active = ActiveStream(state.clone());
+        if state.mode == MockMode::Standard {
+            for token in 0..max_tokens {
+                if !send_token(&tx, request_index, token).await {
+                    return;
+                }
+            }
+            send_end(&tx, request_index, max_tokens).await;
+            return;
+        }
         let invalid_warmup = state.mode == MockMode::InvalidWarmup && phase == "warmup";
         let is_aggressor = phase == "measured" && request_index == state.incumbents;
         if is_aggressor {
@@ -927,6 +947,7 @@ mod tests {
             ignore_eos: true,
             enable_thinking: None,
             reasoning_effort: None,
+            sampling: Default::default(),
             timeout_s: 1.0,
             benchmark_run_id: Arc::new("test-run".to_string()),
         }
@@ -938,6 +959,86 @@ mod tests {
         cmd.random_output_len = 6;
         cmd.decode_isolation.decode_isolation_baseline_events = 2;
         cmd
+    }
+
+    fn sampled_command() -> BenchServeCommand {
+        let mut cmd = command(1.0);
+        cmd.sampling.temperature = 0.6;
+        cmd.sampling.top_k = Some(20);
+        cmd.sampling.top_p = Some(0.95);
+        cmd.sampling.sampling_seed = Some(37);
+        cmd.seed = Some(11);
+        cmd
+    }
+
+    fn assert_sampling_requests(server: &MockServer, command: &BenchServeCommand, measured: usize) {
+        let expected = serde_json::to_value(command.sampling.request_sampling()).unwrap();
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(phase, _, _)| phase == "warmup")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(phase, _, _)| phase == "measured")
+                .count(),
+            measured
+        );
+        assert_eq!(requests.len(), measured + 1);
+        for (_, _, body) in requests.iter() {
+            for (name, value) in expected.as_object().unwrap() {
+                assert_eq!(body.get(name), Some(value), "{name}: {body}");
+            }
+            assert_eq!(
+                body["seed"], 37,
+                "prompt seed must not replace sampling seed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sampling_reaches_standard_closed_and_open_loop_warmup_and_measurement() {
+        use super::super::super::{run_closed_loop, run_open_loop};
+        for open_loop in [false, true] {
+            let server = start_mock(MockMode::Standard, 1, 2).await;
+            let cmd = sampled_command();
+            let mut ctx = context(&server);
+            ctx.sampling = cmd.sampling.request_sampling();
+            let run = prepared(1);
+            let prompts = run.warmups.into_iter().chain(run.incumbents).collect();
+            let record = if open_loop {
+                run_open_loop(&ctx, prompts, 1, 1000.0, "sampling", 0).await
+            } else {
+                run_closed_loop(&ctx, prompts, 1, 1, "sampling", 0).await
+            };
+            assert_eq!(record.warmup.completed, 1);
+            assert_eq!(record.warmup.errored, 0);
+            assert_eq!(record.records.len(), 1);
+            assert!(record.records.iter().all(|request| request.success));
+            assert_sampling_requests(&server, &cmd, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn sampling_reaches_isolation_warmup_incumbent_and_aggressor() {
+        let server = start_mock(MockMode::Normal, 1, 2).await;
+        let cmd = sampled_command();
+        let mut ctx = context(&server);
+        ctx.sampling = cmd.sampling.request_sampling();
+        let report = run_once(&cmd, &ctx, &test_config(), prepared(1)).await;
+        assert!(report.validity.all_valid, "{:?}", report.validity);
+        assert_sampling_requests(&server, &cmd, 2);
+        let requests = server.state.requests.lock().unwrap();
+        assert!(requests
+            .iter()
+            .any(|(phase, index, _)| phase == "measured" && *index == 0));
+        assert!(requests
+            .iter()
+            .any(|(phase, index, _)| phase == "measured" && *index == 1));
     }
 
     fn request_record(
