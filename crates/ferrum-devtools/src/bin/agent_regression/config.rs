@@ -106,6 +106,30 @@ pub(crate) fn disjoint(a: &Path, b: &Path) -> bool {
     !a.starts_with(b) && !b.starts_with(a)
 }
 
+fn ensure_owned_regular_file(workdir: &Path, declared: &Path) -> Result<()> {
+    let mut prefix = PathBuf::new();
+    let mut inside = false;
+    for component in declared.components() {
+        prefix.push(component);
+        if inside {
+            ensure!(
+                !fs::symlink_metadata(&prefix)?.file_type().is_symlink(),
+                "candidate-owned protected input traverses symlink {}",
+                prefix.display()
+            );
+        } else if prefix.has_root() && prefix.canonicalize()? == workdir {
+            // System aliases above the canonical workdir do not change ownership.
+            inside = true;
+        }
+    }
+    ensure!(
+        inside && fs::symlink_metadata(declared)?.is_file(),
+        "candidate-owned protected input must be a regular file: {}",
+        declared.display()
+    );
+    Ok(())
+}
+
 impl Manifest {
     pub(crate) fn pi_program(&self) -> Result<&Program> {
         match (&self.pi, &self.agent) {
@@ -241,7 +265,16 @@ impl Manifest {
                 "validator protection paths required"
             );
             for p in &mut task.validation.protected_paths {
-                *p = canonical(base, p)?;
+                let resolved = canonical(base, p)?;
+                if resolved.starts_with(&task.workdir) {
+                    let declared = if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        base.join(&*p)
+                    };
+                    ensure_owned_regular_file(&task.workdir, &declared)?;
+                }
+                *p = resolved;
             }
         }
         for (i, task) in m.tasks.iter().enumerate() {
@@ -263,15 +296,21 @@ impl Manifest {
                     "agent workdirs overlap"
                 );
             }
-            for other in &m.tasks {
-                for p in other
-                    .validation
-                    .protected_paths
-                    .iter()
-                    .chain([&other.validation.program, &other.prompt_file])
-                {
+            for (other_idx, other) in m.tasks.iter().enumerate() {
+                for p in [&other.validation.program, &other.prompt_file] {
                     ensure!(
                         disjoint(&task.workdir, p),
+                        "agent workdir overlaps protected input {}",
+                        p.display()
+                    );
+                }
+                for p in &other.validation.protected_paths {
+                    let owned_file = i == other_idx
+                        && p != &task.workdir
+                        && p.starts_with(&task.workdir)
+                        && p.is_file();
+                    ensure!(
+                        disjoint(&task.workdir, p) || owned_file,
                         "agent workdir overlaps protected input {}",
                         p.display()
                     );
@@ -296,7 +335,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// Snapshot protected source trees without following symlinks into user directories.
+/// Snapshot canonical protected paths without following symlinks into user directories.
 pub(crate) fn snapshot(paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, String>> {
     fn visit(path: &Path, entries: &mut BTreeMap<PathBuf, String>) -> Result<()> {
         let meta = fs::symlink_metadata(path)?;
@@ -319,6 +358,15 @@ pub(crate) fn snapshot(paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, String>> {
     }
     let mut result = BTreeMap::new();
     for path in paths {
+        // Manifest loading canonicalizes these paths. A later directory-to-symlink
+        // replacement must not redirect an individually protected file's lookup.
+        for ancestor in path.ancestors().skip(1) {
+            ensure!(
+                !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
+                "protected symlink ancestor {}",
+                ancestor.display()
+            );
+        }
         visit(path, &mut result)?;
     }
     Ok(result)
@@ -380,7 +428,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("contract.rs");
         fs::write(&file, "original").unwrap();
-        let paths = [dir.path().to_owned()];
+        let paths = [dir.path().canonicalize().unwrap()];
         let before = snapshot(&paths).unwrap();
         fs::write(&file, "changed").unwrap();
         assert_ne!(before, snapshot(&paths).unwrap());
@@ -399,5 +447,244 @@ mod tests {
             Path::new("/runs/a/contract")
         ));
         assert!(!disjoint(Path::new("/runs/a"), Path::new("/runs")));
+    }
+
+    struct ProtectedFilesFixture {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+        manifest: Manifest,
+    }
+
+    impl ProtectedFilesFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let inputs = base.join("inputs");
+            fs::create_dir(&inputs).unwrap();
+            let program = base.join("program-stub");
+            fs::write(&program, "not executed by manifest loading").unwrap();
+            let tasks = ["first", "second"]
+                .into_iter()
+                .map(|id| {
+                    let workdir = base.join("work").join(id);
+                    fs::create_dir_all(workdir.join("tests")).unwrap();
+                    fs::write(workdir.join("tests/repro.rs"), "original regression").unwrap();
+                    let prompt_file = inputs.join(format!("{id}.txt"));
+                    fs::write(
+                        &prompt_file,
+                        "Repair the regression without changing tests.",
+                    )
+                    .unwrap();
+                    let contract = inputs.join(format!("{id}-contract.rs"));
+                    fs::write(&contract, "independent contract").unwrap();
+                    Task {
+                        id: id.into(),
+                        workdir,
+                        prompt_file,
+                        timeout_secs: 30,
+                        validation: Validation {
+                            program: program.clone(),
+                            args: Vec::new(),
+                            cwd: inputs.clone(),
+                            timeout_secs: 10,
+                            expected_initial_exit_code: 1,
+                            protected_paths: vec![contract],
+                        },
+                    }
+                })
+                .collect();
+            Self {
+                _root: root,
+                path: base.join("manifest.json"),
+                manifest: Manifest {
+                    schema_version: 2,
+                    run_id: "protected-files".into(),
+                    pi: None,
+                    agent: Some(AgentSpec::Pi(Program {
+                        program,
+                        args: Vec::new(),
+                    })),
+                    server: Server {
+                        base_url: "http://127.0.0.1:8001/v1".into(),
+                        model: "local".into(),
+                        context_window: 4096,
+                        max_tokens: 512,
+                        request_timeout_secs: 30,
+                        reasoning: false,
+                        thinking: "off".into(),
+                        sampling_params: BTreeMap::new(),
+                    },
+                    tasks,
+                },
+            }
+        }
+
+        fn repro(&self, task: usize) -> PathBuf {
+            self.manifest.tasks[task].workdir.join("tests/repro.rs")
+        }
+
+        fn load(&self) -> Result<Manifest> {
+            fs::write(&self.path, serde_json::to_vec(&self.manifest)?)?;
+            Manifest::load(&self.path)
+        }
+    }
+
+    #[test]
+    fn protected_files_accept_each_owners_file_and_preserve_external_contracts() {
+        let mut fixture = ProtectedFilesFixture::new();
+        for i in 0..fixture.manifest.tasks.len() {
+            let relative = fixture
+                .repro(i)
+                .strip_prefix(fixture.path.parent().unwrap())
+                .unwrap()
+                .to_owned();
+            fixture.manifest.tasks[i]
+                .validation
+                .protected_paths
+                .push(relative);
+        }
+        let loaded = fixture.load().unwrap();
+        for (i, task) in loaded.tasks.iter().enumerate() {
+            assert_eq!(
+                task.validation.protected_paths[0],
+                fixture.manifest.tasks[i].validation.protected_paths[0]
+            );
+            assert_eq!(task.validation.protected_paths[1], fixture.repro(i));
+            assert_eq!(snapshot(&task.validation.protected_paths).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn protected_files_reject_candidate_directories_and_ancestors() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let workdir = fixture.manifest.tasks[0].workdir.clone();
+        for path in [
+            workdir.join("tests"),
+            workdir.clone(),
+            workdir.parent().unwrap().to_owned(),
+        ] {
+            fixture.manifest.tasks[0].validation.protected_paths = vec![path.clone()];
+            assert!(fixture.load().is_err(), "accepted {}", path.display());
+        }
+    }
+
+    #[test]
+    fn protected_files_reject_another_tasks_candidate_file() {
+        for (owner, other) in [(0, 1), (1, 0)] {
+            let mut fixture = ProtectedFilesFixture::new();
+            let repro = fixture.repro(owner);
+            fixture.manifest.tasks[other].validation.protected_paths = vec![repro];
+            assert!(
+                fixture.load().is_err(),
+                "accepted task {owner} file for task {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_files_do_not_relax_prompt_program_or_manifest_isolation() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let repro = fixture.repro(0);
+        fixture.manifest.tasks[0]
+            .validation
+            .protected_paths
+            .push(repro.clone());
+        let prompt = fixture.manifest.tasks[0].prompt_file.clone();
+        fixture.manifest.tasks[0].prompt_file = repro.clone();
+        assert!(fixture.load().is_err());
+        fixture.manifest.tasks[0].prompt_file = prompt;
+        let program = fixture.manifest.tasks[0].validation.program.clone();
+        fixture.manifest.tasks[0].validation.program = repro;
+        assert!(fixture.load().is_err());
+        fixture.manifest.tasks[0].validation.program = program;
+        fixture.path = fixture.manifest.tasks[0].workdir.join("manifest.json");
+        assert!(fixture.load().is_err());
+    }
+
+    #[test]
+    fn protected_files_snapshot_detects_owned_file_edits_and_deletion() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let repro = fixture.repro(0);
+        fixture.manifest.tasks[0]
+            .validation
+            .protected_paths
+            .push(repro.clone());
+        let loaded = fixture.load().unwrap();
+        let paths = &loaded.tasks[0].validation.protected_paths;
+        let frozen = snapshot(paths).unwrap();
+        fs::write(&repro, "changed regression").unwrap();
+        assert_ne!(snapshot(paths).unwrap(), frozen);
+        fs::write(&repro, "original regression").unwrap();
+        assert_eq!(snapshot(paths).unwrap(), frozen);
+        fs::remove_file(&repro).unwrap();
+        assert!(snapshot(paths).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_files_reject_owned_symlink_at_load_and_after_snapshot() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let repro = fixture.repro(0);
+        fixture.manifest.tasks[0]
+            .validation
+            .protected_paths
+            .push(repro.clone());
+        let loaded = fixture.load().unwrap();
+        let paths = &loaded.tasks[0].validation.protected_paths;
+        let frozen = snapshot(paths).unwrap();
+        let target = repro.with_file_name("same-content.rs");
+        fs::write(&target, "original regression").unwrap();
+        fs::remove_file(&repro).unwrap();
+        std::os::unix::fs::symlink(&target, &repro).unwrap();
+        assert_eq!(hash_file(&repro).unwrap(), frozen[&repro]);
+        assert!(snapshot(paths).is_err());
+        assert!(fixture.load().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_files_reject_owned_symlink_ancestors_and_later_redirection() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let repro = fixture.repro(0);
+        fixture.manifest.tasks[0]
+            .validation
+            .protected_paths
+            .push(repro.clone());
+        let loaded = fixture.load().unwrap();
+        let paths = &loaded.tasks[0].validation.protected_paths;
+        let frozen = snapshot(paths).unwrap();
+        let tests = repro.parent().unwrap();
+        let target = tests.with_file_name("real-tests");
+        fs::rename(tests, &target).unwrap();
+        std::os::unix::fs::symlink(&target, tests).unwrap();
+        assert!(fs::symlink_metadata(&repro).unwrap().is_file());
+        assert_eq!(hash_file(&repro).unwrap(), frozen[&repro]);
+        assert!(fixture.load().is_err());
+        assert!(snapshot(paths).is_err());
+
+        // Replacing the link with another ordinary directory changes the frozen file.
+        fs::remove_file(tests).unwrap();
+        fs::create_dir(tests).unwrap();
+        fs::write(&repro, "redirected regression").unwrap();
+        assert_ne!(snapshot(paths).unwrap(), frozen);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_files_allow_aliases_above_the_owning_workdir() {
+        let mut fixture = ProtectedFilesFixture::new();
+        let root = fixture.path.parent().unwrap();
+        let alias = root.join("work-alias");
+        std::os::unix::fs::symlink(root.join("work"), &alias).unwrap();
+        fixture.manifest.tasks[0]
+            .validation
+            .protected_paths
+            .push(alias.join("first/tests/repro.rs"));
+        let loaded = fixture.load().unwrap();
+        assert_eq!(
+            loaded.tasks[0].validation.protected_paths[1],
+            fixture.repro(0)
+        );
+        snapshot(&loaded.tasks[0].validation.protected_paths).unwrap();
     }
 }
