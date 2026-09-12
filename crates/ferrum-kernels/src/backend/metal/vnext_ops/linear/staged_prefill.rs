@@ -13,6 +13,7 @@ const MIN_STAGED_WEIGHT_ELEMENTS: u64 = 1 << 20;
 fn leaf_format(
     weight: &ResolvedWeightBinding,
     layout: &PhysicalWeightLayout,
+    logical_dimensions: &[u64],
     expected_axis: u32,
 ) -> Option<LinearPhysicalFormat> {
     let PhysicalWeightLayout::BlockQuantized {
@@ -23,10 +24,7 @@ fn leaf_format(
     else {
         return None;
     };
-    if *block_axis != expected_axis
-        || *block_padding != PhysicalWeightPadding::Exact
-        || blocks.storage != PhysicalStorageLayout::exact_contiguous()
-    {
+    if *block_axis != expected_axis || *block_padding != PhysicalWeightPadding::Exact {
         return None;
     }
     let component = weight
@@ -36,10 +34,50 @@ fn leaf_format(
     let WeightEncoding::BlockQuantized(spec) = component.encoding() else {
         return None;
     };
+    // A composite can add a singleton axis to a native matrix without moving
+    // its blocks. That shape-only reshape is explicitly Strided, although the
+    // matrix still has exactly the row-major storage consumed by staging.
+    let mut block_dimensions = logical_dimensions.to_vec();
+    let axis = block_dimensions.get_mut(expected_axis as usize)?;
+    let block_width = u64::from(spec.logical_values_per_block);
+    if block_width == 0 || !axis.is_multiple_of(block_width) {
+        return None;
+    }
+    *axis /= block_width;
+    if !exact_row_major(&blocks.storage, &block_dimensions) {
+        return None;
+    }
     match GgufBlockFormat::from_spec(spec).ok()? {
         GgufBlockFormat::Q4K => Some(LinearPhysicalFormat::Q4K),
         GgufBlockFormat::Q6K => Some(LinearPhysicalFormat::Q6K),
         _ => None,
+    }
+}
+
+fn exact_row_major(storage: &PhysicalStorageLayout, dimensions: &[u64]) -> bool {
+    match storage {
+        PhysicalStorageLayout::Contiguous {
+            padding: PhysicalWeightPadding::Exact,
+        } => true,
+        PhysicalStorageLayout::Strided {
+            strides_in_elements,
+            padding: PhysicalWeightPadding::Exact,
+        } if strides_in_elements.len() == dimensions.len() => {
+            let mut expected_stride = 1_u64;
+            for (&extent, &stride) in dimensions.iter().zip(strides_in_elements).rev() {
+                // A singleton axis is never advanced, so its stride cannot
+                // introduce either a hole or a permutation into the matrix.
+                if extent == 0 || (extent > 1 && stride != expected_stride) {
+                    return false;
+                }
+                let Some(next) = expected_stride.checked_mul(extent) else {
+                    return false;
+                };
+                expected_stride = next;
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -77,10 +115,16 @@ fn weight_workspace_bytes(
             parts.iter().any(|part| {
                 part.logical_offsets == [part_index, 0, 0]
                     && part.extents == [1, intermediate, hidden]
-                    && leaf_format(gate_weight, &part.layout, 2).is_some()
+                    && leaf_format(gate_weight, &part.layout, &part.extents, 2).is_some()
             })
         })
-        || leaf_format(down_weight, down_weight.physical_layout(), 1).is_none()
+        || leaf_format(
+            down_weight,
+            down_weight.physical_layout(),
+            &[hidden, intermediate],
+            1,
+        )
+        .is_none()
     {
         return Ok(0);
     }

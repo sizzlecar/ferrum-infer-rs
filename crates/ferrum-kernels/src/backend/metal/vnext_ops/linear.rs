@@ -313,7 +313,7 @@ impl MetalDenseSwiGluProvider {
             DENSE_SWIGLU_PROVIDER_ID,
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
-            4,
+            5,
             ALL_LINEAR_QUANTIZATION_FORMATS,
         )?
         // Gate/up and activation scratch are fully produced by this invocation.

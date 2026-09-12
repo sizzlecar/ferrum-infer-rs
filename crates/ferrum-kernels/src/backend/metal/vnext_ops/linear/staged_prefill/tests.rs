@@ -2,9 +2,10 @@ use super::*;
 use crate::backend::metal::vnext_ops::linear::microbench::{weights, Shape};
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
 use ferrum_interfaces::vnext::{
-    BlockQuantizationSpec, BufferRequest, BufferUsage, CompositeWeightPart, ContractVersion,
-    DeviceId, PhysicalWeightComponentBinding, QuantizationFormatId, ResourceId,
-    WeightComponentRole, WeightId,
+    AliasPolicy, BlockQuantizationSpec, BufferRequest, BufferUsage, CompositeWeightPart,
+    ContractVersion, DeviceId, OperationContract, PhysicalWeightComponentBinding, ProgramValueId,
+    QuantizationFormatId, ResolvedStorageComponent, ResolvedTensorSpec, ResolvedValueStorage,
+    ResourceId, TensorAccess, WeightComponentRole, WeightId,
 };
 use half::f16;
 use metal::MTLCommandBufferStatus;
@@ -72,6 +73,243 @@ fn staged_swiglu_workspace_declaration_preserves_layout_and_format_boundaries() 
         0
     );
     assert_eq!(weight_workspace_bytes(&gate, &down, 256, 2048).unwrap(), 0);
+}
+
+fn gguf_weight_metadata(
+    gate: bool,
+    hidden: u64,
+    intermediate: u64,
+    storage: PhysicalStorageLayout,
+) -> ResolvedWeightBinding {
+    let (name, format, rows, columns) = if gate {
+        ("gate_up", GgufBlockFormat::Q4K, intermediate, hidden)
+    } else {
+        ("down", GgufBlockFormat::Q6K, hidden, intermediate)
+    };
+    let spec = BlockQuantizationSpec {
+        format_id: QuantizationFormatId::new(format.format_id()).unwrap(),
+        logical_values_per_block: format.block_values() as u32,
+        bytes_per_block: format.block_bytes() as u32,
+    };
+    let leaf = |index| PhysicalWeightLayout::BlockQuantized {
+        blocks: PhysicalWeightComponentBinding {
+            component_id: WeightId::new(format!("{name}.{index}")).unwrap(),
+            storage: storage.clone(),
+        },
+        block_axis: if gate { 2 } else { 1 },
+        block_padding: PhysicalWeightPadding::Exact,
+    };
+    let layout = if gate {
+        PhysicalWeightLayout::Composite {
+            parts: (0..2)
+                .map(|index| CompositeWeightPart {
+                    layout: Box::new(leaf(index)),
+                    logical_offsets: vec![index, 0, 0],
+                    extents: vec![1, intermediate, hidden],
+                })
+                .collect(),
+        }
+    } else {
+        leaf(0)
+    };
+    // Native GGUF stores each gate/up matrix with rank two. The family schema
+    // adds the singleton partition axis through storage strides, not repacking.
+    serde_json::from_value(json!({
+        "weight_id": name, "format_id": "weight-format.gguf.native-block",
+        "layout_id": "layout.gguf.native-block", "schema_version": ContractVersion::new(1, 0),
+        "physical_layout": layout,
+        "components": (0..if gate {2} else {1}).map(|index| json!({
+            "component_id": format!("{name}.{index}"), "role": WeightComponentRole::PackedValues,
+            "physical_dimensions": [rows, columns / u64::from(spec.logical_values_per_block)],
+            "encoding": WeightEncoding::BlockQuantized(spec.clone()),
+        })).collect::<Vec<_>>(),
+    }))
+    .unwrap()
+}
+
+fn resolved_swiglu_bindings(
+    gate: ResolvedWeightBinding,
+    down: ResolvedWeightBinding,
+    hidden: u64,
+    intermediate: u64,
+    weight_type: ElementType,
+) -> Result<Vec<ResolvedValueBinding>, VNextError> {
+    [
+        (ResolvedValueRole::Input, 0, vec![768, hidden], None),
+        (
+            ResolvedValueRole::Input,
+            1,
+            vec![2, intermediate, hidden],
+            Some(gate),
+        ),
+        (
+            ResolvedValueRole::Input,
+            2,
+            vec![hidden, intermediate],
+            Some(down),
+        ),
+        (ResolvedValueRole::Output, 0, vec![768, hidden], None),
+    ]
+    .into_iter()
+    .map(|(role, ordinal, dimensions, weight)| {
+        let name = format!("{role:?}.{ordinal}");
+        let element_type = if weight.is_some() {
+            weight_type
+        } else {
+            ElementType::F16
+        };
+        let tensor =
+            ResolvedTensorSpec::new(dimensions, element_type, ResolvedTensorLayout::Contiguous)?;
+        let storage = if let Some(weight) = &weight {
+            ResolvedValueStorage::composite(
+                weight
+                    .components()
+                    .iter()
+                    .map(|component| {
+                        ResolvedStorageComponent::new(
+                            Some(component.component_id().clone()),
+                            ResourceId::new(format!("resource.{}", component.component_id()))?,
+                            0,
+                            component.physical_bytes()?,
+                            component.physical_element_type(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, VNextError>>()?,
+            )?
+        } else {
+            ResolvedValueStorage::single(
+                ResourceId::new(name.clone())?,
+                0,
+                tensor.minimum_storage_bytes()?,
+                element_type,
+            )?
+        };
+        ResolvedValueBinding::new(
+            ProgramValueId::new(name)?,
+            role,
+            ordinal,
+            tensor,
+            if role == ResolvedValueRole::Output {
+                TensorAccess::Write
+            } else {
+                TensorAccess::Read
+            },
+            AliasPolicy::NoAlias,
+            if weight.is_some() {
+                BufferUsage::Weights
+            } else {
+                BufferUsage::Activations
+            },
+            weight,
+            storage,
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn staged_swiglu_resolved_gguf_reshape_declares_one_projection_workspace() {
+    // Covers the native FFN dimensions and a smaller supported matrix without
+    // allocating weights. Both use the same validated physical binding path.
+    for (hidden, intermediate) in [(4096, 12288), (512, 2048)] {
+        for singleton_stride in [intermediate * (hidden / 256), 1] {
+            let gate = gguf_weight_metadata(
+                true,
+                hidden,
+                intermediate,
+                PhysicalStorageLayout::Strided {
+                    strides_in_elements: vec![singleton_stride, hidden / 256, 1],
+                    padding: PhysicalWeightPadding::Exact,
+                },
+            );
+            let down = gguf_weight_metadata(
+                false,
+                hidden,
+                intermediate,
+                PhysicalStorageLayout::exact_contiguous(),
+            );
+            let bindings = resolved_swiglu_bindings(
+                gate.clone(),
+                down.clone(),
+                hidden,
+                intermediate,
+                ElementType::F16,
+            )
+            .unwrap();
+            dense_swiglu_contract()
+                .unwrap()
+                .descriptor()
+                .validate_resolved_bindings(&bindings)
+                .unwrap();
+            assert_eq!(
+                workspace_bytes(&bindings, hidden, intermediate).unwrap(),
+                hidden * intermediate * 2
+            );
+            let f32_weights =
+                resolved_swiglu_bindings(gate, down, hidden, intermediate, ElementType::F32)
+                    .unwrap();
+            assert_eq!(
+                workspace_bytes(&f32_weights, hidden, intermediate).unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn staged_swiglu_reshape_rejects_noncontiguous_or_padded_storage() {
+    let (hidden, intermediate) = (512, 2048);
+    for (valid_binding, storage) in [
+        (
+            false,
+            PhysicalStorageLayout::Strided {
+                strides_in_elements: vec![4096, 3, 1],
+                padding: PhysicalWeightPadding::Exact,
+            },
+        ),
+        (
+            true,
+            PhysicalStorageLayout::Strided {
+                strides_in_elements: vec![4096, 1, 2048],
+                padding: PhysicalWeightPadding::Exact,
+            },
+        ),
+        (
+            false,
+            PhysicalStorageLayout::Strided {
+                strides_in_elements: vec![4096, 2, 1],
+                padding: PhysicalWeightPadding::ZeroFill {
+                    padded_dimensions: vec![1, 2049, 2],
+                },
+            },
+        ),
+        (
+            true,
+            PhysicalStorageLayout::Tiled {
+                tile_shape: vec![1, 8, 2],
+                axis_order: vec![0, 1, 2],
+                tile_strides_in_elements: vec![4096, 16, 16],
+                padding: PhysicalWeightPadding::Exact,
+            },
+        ),
+    ] {
+        let gate = gguf_weight_metadata(true, hidden, intermediate, storage);
+        let down = gguf_weight_metadata(
+            false,
+            hidden,
+            intermediate,
+            PhysicalStorageLayout::exact_contiguous(),
+        );
+        let bindings = resolved_swiglu_bindings(gate, down, hidden, intermediate, ElementType::F16);
+        // Holes/padding exceed the declared physical source span. Transposed
+        // and tiled bindings are valid, but this row-major kernel rejects them.
+        if valid_binding {
+            let bindings = bindings.unwrap();
+            assert_eq!(workspace_bytes(&bindings, hidden, intermediate).unwrap(), 0);
+        } else {
+            assert!(bindings.is_err());
+        }
+    }
 }
 
 fn region<T: Copy>(
