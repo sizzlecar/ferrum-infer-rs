@@ -22,6 +22,8 @@ pub(crate) struct Evidence {
     pub session_path: Option<PathBuf>,
     pub input: Option<String>,
     pub output: Option<String>,
+    /// Unmodified committed assistant message; opaque continuation is not output text.
+    pub output_message: Option<Value>,
     pub tool_exchanges: Vec<ToolExchange>,
     pub usage: Usage,
     pub compaction_events: usize,
@@ -266,6 +268,7 @@ fn inspect(journal: &Path, expected_session: &str, evidence: &mut Evidence) -> R
                     "Session output differs from Delivery",
                 )?;
                 observe_usage(&mut usages, request_id, &payload["usage"])?;
+                evidence.output_message = Some(payload["message"].clone());
                 output_seen = true;
             }
             "compaction_committed" | "active_run_compaction_committed" => {
@@ -321,7 +324,12 @@ fn tool_exchange(
         )?;
     }
     let mut calls = Vec::new();
+    let mut continuations = BTreeSet::new();
     for call in array(assistant, "content")? {
+        if call["type"] == "continuation" {
+            validate_continuation(call, &mut continuations)?;
+            continue;
+        }
         if call["type"] != "tool_call" {
             require(
                 matches!(call["type"].as_str(), Some("text" | "json" | "data")),
@@ -459,19 +467,33 @@ fn model_text(message: &Value, role: &str) -> Result<String, String> {
     require(message["role"] == role, "ModelMessage role mismatch")?;
     let content = array(message, "content")?;
     require(!content.is_empty(), "empty ModelMessage")?;
-    content
-        .iter()
-        .map(|item| {
+    let mut continuations = BTreeSet::new();
+    let mut texts = Vec::new();
+    for item in content {
+        if role == "assistant" && item["type"] == "continuation" {
+            validate_continuation(item, &mut continuations)?;
+        } else {
             require(
                 item["type"] == "text",
                 "headless final/input message is not plain text",
             )?;
-            item["text"]
-                .as_str()
-                .ok_or_else(|| "missing ModelMessage text".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|texts| texts.join("\n"))
+            texts.push(item["text"].as_str().ok_or("missing ModelMessage text")?);
+        }
+    }
+    require(!texts.is_empty(), "message has no visible text")?;
+    Ok(texts.join("\n"))
+}
+
+fn validate_continuation(content: &Value, namespaces: &mut BTreeSet<String>) -> Result<(), String> {
+    let namespace = string(content, "namespace")?;
+    require(
+        !namespace.trim().is_empty() && content.get("value").is_some(),
+        "invalid message continuation",
+    )?;
+    require(
+        namespaces.insert(namespace.to_owned()),
+        "duplicate continuation namespace",
+    )
 }
 
 fn require(condition: bool, message: &str) -> Result<(), String> {
@@ -547,6 +569,48 @@ mod tests {
         assert_eq!(call.result, json!({"text":"fn answer() {}\n"}));
         assert_eq!(evidence.usage.input_tokens, Some(75));
         assert_eq!(evidence.usage.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn continuation_stays_opaque_in_assistant_journals_and_never_becomes_visible_text() {
+        let (run, mut session) = fixtures();
+        let continuation = json!({"type":"continuation", "namespace":"fixture/state", "value":{"private":"opaque"}});
+        session[1]["payload"]["assistant"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(continuation.clone());
+        session[2]["payload"]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(continuation.clone());
+        let evidence = inspect_fixture(&run, &session);
+        assert!(evidence.complete(), "{:?}", evidence.errors);
+        assert_eq!(evidence.output.as_deref(), Some("Finished"));
+        assert_eq!(
+            evidence.output_message.as_ref().unwrap()["content"][1],
+            continuation
+        );
+        assert_eq!(
+            evidence.tool_exchanges[0].assistant["content"][1],
+            continuation
+        );
+        let mut duplicate = session.clone();
+        duplicate[2]["payload"]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(continuation.clone());
+        assert!(!inspect_fixture(&run, &duplicate).complete());
+        let mut user = session.clone();
+        user[0]["payload"]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(continuation);
+        assert!(!inspect_fixture(&run, &user).complete());
+        session[1]["payload"]["assistant"]["content"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("value");
+        assert!(!inspect_fixture(&run, &session).complete());
     }
 
     #[test]

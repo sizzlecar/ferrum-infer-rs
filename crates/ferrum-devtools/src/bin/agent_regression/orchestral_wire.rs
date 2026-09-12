@@ -197,6 +197,15 @@ fn bind_inner(
         "terminal raw SSE differs from public delivered output"
     );
     ensure!(
+        public_reasoning(
+            public
+                .output_message
+                .as_ref()
+                .context("missing public committed output message")?
+        )? == terminal.response.reasoning.as_deref(),
+        "terminal raw/public message continuation differs"
+    );
+    ensure!(
         seen_requests.len() == responses.len(),
         "successful HTTP requests remain outside the public causal chain"
     );
@@ -267,7 +276,7 @@ fn project_exchange(
         "public exchange roles changed"
     );
     let mut texts = Vec::new();
-    let mut reasoning = None;
+    let reasoning = public_reasoning(&exchange.assistant)?;
     for block in exchange.assistant["content"]
         .as_array()
         .context("missing public assistant content")?
@@ -285,19 +294,7 @@ fn project_exchange(
                     .context("missing structured public content")?
                     .to_string(),
             ),
-            Some("tool_call") => {}
-            Some("continuation") => {
-                ensure!(
-                    block["namespace"] == "openai-compatible/reasoning-content/v1"
-                        && reasoning.is_none(),
-                    "unknown or duplicate public continuation"
-                );
-                reasoning = Some(
-                    block["value"]
-                        .as_str()
-                        .context("invalid public reasoning")?,
-                );
-            }
+            Some("tool_call" | "continuation") => {}
             _ => anyhow::bail!("unsupported public assistant content"),
         }
     }
@@ -369,6 +366,34 @@ fn project_exchange(
     Ok((assistant, ordered))
 }
 
+/// Provider continuation must match the original response, including absent vs empty.
+/// It never contributes to the visible assistant text projection.
+fn public_reasoning(message: &Value) -> Result<Option<&str>> {
+    ensure!(
+        message["role"] == "assistant",
+        "public reasoning role mismatch"
+    );
+    let mut reasoning = None;
+    for block in message["content"]
+        .as_array()
+        .context("missing public assistant content")?
+    {
+        if block["type"] != "continuation" {
+            continue;
+        }
+        ensure!(
+            block["namespace"] == "openai-compatible/reasoning-content/v1" && reasoning.is_none(),
+            "unknown or duplicate public continuation"
+        );
+        reasoning = Some(
+            block["value"]
+                .as_str()
+                .context("invalid public reasoning")?,
+        );
+    }
+    Ok(reasoning)
+}
+
 fn tool_result_content(
     format: OrchestralToolResultFormat,
     result: &Value,
@@ -386,6 +411,10 @@ fn tool_result_content(
 
 #[path = "orchestral_wire/tool_text_parts.rs"]
 mod tool_text_parts;
+
+#[path = "orchestral_wire/audit.rs"]
+mod audit;
+pub(crate) use audit::audit_saved;
 
 fn canonical_id(model_request_id: &str, native_id: &str) -> Result<String> {
     Ok(format!(

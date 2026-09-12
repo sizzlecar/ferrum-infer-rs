@@ -13,7 +13,7 @@ use ferrum_bench_core::{
     BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -35,7 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub(crate) const TASK_HEADER: &str = "x-ferrum-agent-task";
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct RequestRecord {
     pub task_id: String,
     pub request_index: u32,

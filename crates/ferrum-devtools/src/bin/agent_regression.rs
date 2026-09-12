@@ -58,6 +58,16 @@ enum Command {
         validation_repairs: u32,
     },
     Validate(validator::Args),
+    /// Recheck retained Orchestral journals and exact HTTP replay without rerunning a model.
+    AuditOrchestral {
+        #[arg(long)]
+        report_dir: PathBuf,
+        #[arg(long)]
+        task_id: String,
+        /// New evidence file; existing reports are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
@@ -92,6 +102,11 @@ async fn main() {
             .await
         }
         Command::Validate(args) => validator::run(&args).await,
+        Command::AuditOrchestral {
+            report_dir,
+            task_id,
+            output,
+        } => orchestral_wire::audit_saved(&report_dir, &task_id, &output),
     };
     let code = match result {
         Ok(code) => code,
