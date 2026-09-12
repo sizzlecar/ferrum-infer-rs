@@ -95,7 +95,7 @@ fn valid_outside_text(text: &str, require_complete_envelopes: bool) -> bool {
     .any(|marker| text.contains(marker))
 }
 
-fn parse_one<'a>(
+pub(super) fn parse_one<'a>(
     text: &'a str,
     request: &ApiChatRequest,
     index: usize,

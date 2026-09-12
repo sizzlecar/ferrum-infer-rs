@@ -744,7 +744,7 @@ async fn native_xml_typed_engine_response_projects_only_outside_reasoning() {
             let ferrum_types::ApiResponse::Chat(response) = &mut typed else {
                 panic!("expected typed chat response");
             };
-            assert!(response.message.content.contains("Private reasoning."));
+            assert_eq!(response.message.content, "I will check.\n\nPlease wait.");
             response.message.tool_calls[0].id = "call_engine_owned".into();
             let arguments = response.message.tool_calls[0].function.arguments.clone();
             let router = AxumServer::from_llm(Arc::new(StubLlm::with_api_response(&raw, typed)))

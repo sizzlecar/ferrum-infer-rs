@@ -293,9 +293,29 @@ fn malformed_native_calls_do_not_fall_back_to_json_from_their_payload() {
     let payload = r#"{"name":"write","arguments":{"path":"a.rs","content":"wrong"}}"#;
     let text = format!("<tool_call><function=write><parameter=content>{payload}");
     assert!(generated_calls(&request(), &text).is_none());
-    // The existing JSON fallback remains available when there is no native
-    // function/parameter envelope to contradict it.
-    assert!(generated_calls(&request(), payload).is_some());
+    assert!(generated_calls(&request(), payload).is_none());
+}
+
+#[test]
+fn explicit_xml_does_not_guess_json_calls_but_json_protocol_still_accepts_them() {
+    let payload = r#"{"name":"write","arguments":{"path":"a.rs","content":"source"}}"#;
+    let mut json_request = request();
+    json_request.tool_call_protocol = ApiToolCallProtocol::Json;
+    for text in [
+        payload.to_owned(),
+        format!(r#"{{"tool_call":{payload}}}"#),
+        format!(r#"{{"tool_calls":[{payload}]}}"#),
+        format!("```json\n{payload}\n```"),
+        format!("Example call: {payload}"),
+    ] {
+        assert!(generated_calls(&request(), &text).is_none(), "{text}");
+        let calls = generated_calls(&json_request, &text).expect("declared JSON call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            arguments(&calls[0]),
+            json!({"path": "a.rs", "content": "source"})
+        );
+    }
 }
 
 #[test]

@@ -1,7 +1,10 @@
 //! Request and response types for inference
 
+mod native_projection;
 mod xml_parameter_schema;
 mod xml_tool_calls;
+
+pub use native_projection::{NativeChatOutputProjection, NativeChatOutputProjector};
 
 use crate::{
     ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
@@ -13,6 +16,8 @@ use std::collections::HashMap;
 
 pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
 pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
+/// Actual rendered generation-suffix state, supplied by the prompt renderer.
+pub const PROMPT_OPENED_REASONING_METADATA_KEY: &str = "ferrum_prompt_opened_reasoning";
 
 /// Explicit request for execution evidence that is expensive or sensitive to retain.
 ///
@@ -451,6 +456,13 @@ pub fn api_response_from_generated_text(
     text: &str,
     finish_reason: FinishReason,
 ) -> Option<ApiResponse> {
+    if let Some(mut projector) = NativeChatOutputProjector::for_request(request) {
+        projector.push(text);
+        return projector
+            .finish(finish_reason)
+            .api_response
+            .map(ApiResponse::Chat);
+    }
     let ApiRequest::Chat(chat_request) = request.api_request.as_ref()? else {
         return None;
     };
@@ -645,11 +657,9 @@ fn parse_tool_calls_from_generated_text(
         return parse_explicit_tool_call_envelopes(text, chat_request)
             .map(|calls| (String::new(), calls));
     }
-    if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml
-        && xml_tool_calls::has_native_envelope(text)
-    {
-        // Once a native envelope establishes tool intent, a malformed envelope
-        // must not acquire different semantics from JSON inside its payload.
+    if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
+        // Only native framing establishes tool intent for this protocol.
+        // Ordinary JSON or JSON inside malformed framing is not a fallback.
         return xml_tool_calls::parse_with_content(text, chat_request, false)
             .map(|parsed| (parsed.content, parsed.calls));
     }
