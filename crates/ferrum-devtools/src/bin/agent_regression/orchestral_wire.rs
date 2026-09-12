@@ -1,7 +1,7 @@
 //! Bind public Orchestral exchanges to actual OpenAI-compatible SSE and replay.
 //! The first slice certifies one fresh, uncompacted Run. Unsupported rewrites
 //! remain unproven; public delivery is still separate from task validation.
-use super::{orchestral_evidence, proxy::RequestRecord};
+use super::{config::OrchestralToolResultFormat, orchestral_evidence, proxy::RequestRecord};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct Evidence {
+    pub tool_result_format: OrchestralToolResultFormat,
     pub receipts: Vec<Receipt>,
     pub terminal: Option<TerminalReceipt>,
     pub unproven: Vec<String>,
@@ -55,8 +56,12 @@ pub(crate) fn bind(
     public: &orchestral_evidence::Evidence,
     records: &[&RequestRecord],
     raw_dir: &Path,
+    tool_result_format: OrchestralToolResultFormat,
 ) -> Evidence {
-    let mut evidence = Evidence::default();
+    let mut evidence = Evidence {
+        tool_result_format,
+        ..Evidence::default()
+    };
     if let Err(error) = bind_inner(public, records, raw_dir, &mut evidence) {
         evidence.unproven.push(format!("{error:#}"));
     }
@@ -146,7 +151,8 @@ fn bind_inner(
             matches!(origin.response.finish.as_str(), "tool_calls" | "stop"),
             "tool source did not finish normally"
         );
-        let (assistant, results) = project_exchange(exchange, &origin.response)?;
+        let (assistant, results) =
+            project_exchange(exchange, &origin.response, evidence.tool_result_format)?;
         expected.push(assistant);
         expected.extend(results.clone());
         let following = unique_history(&responses, &expected)?;
@@ -254,6 +260,7 @@ fn normalize_history(messages: &[Value]) -> Result<Vec<Value>> {
 fn project_exchange(
     exchange: &orchestral_evidence::ToolExchange,
     response: &Response,
+    format: OrchestralToolResultFormat,
 ) -> Result<(Value, Vec<Value>)> {
     ensure!(
         exchange.assistant["role"] == "assistant" && exchange.tool["role"] == "tool",
@@ -306,10 +313,18 @@ fn project_exchange(
             "raw/public exact tool name or JSON arguments differ"
         );
         calls.push(json!({"id":raw.id,"type":"function","function":{"name":raw.name,"arguments":raw.arguments}}));
-        ensure!(results.insert(public.call_id.as_str(), json!({
-            "role":"tool", "tool_call_id":raw.id,
-            "content":json!({"result":public.result,"is_error":public.is_error}).to_string(),
-        })).is_none(), "duplicate canonical tool result");
+        ensure!(
+            results
+                .insert(
+                    public.call_id.as_str(),
+                    json!({
+                        "role":"tool", "tool_call_id":raw.id,
+                        "content":tool_result_content(format, &public.result, public.is_error)?,
+                    })
+                )
+                .is_none(),
+            "duplicate canonical tool result"
+        );
     }
     // Preserve actual Tool-role order, which need not equal call-start order.
     let mut ordered = Vec::new();
@@ -334,6 +349,20 @@ fn project_exchange(
         }),
         ordered,
     ))
+}
+
+fn tool_result_content(
+    format: OrchestralToolResultFormat,
+    result: &Value,
+    is_error: bool,
+) -> Result<String> {
+    let envelope = json!({"result":result,"is_error":is_error});
+    match format {
+        OrchestralToolResultFormat::Json => Ok(envelope.to_string()),
+        OrchestralToolResultFormat::Yaml => {
+            serde_yaml::to_string(&envelope).context("serialize declared YAML tool result")
+        }
+    }
 }
 
 fn canonical_id(model_request_id: &str, native_id: &str) -> Result<String> {
@@ -610,11 +639,30 @@ mod tests {
         }
 
         fn bind(&self) -> Evidence {
+            self.bind_as(OrchestralToolResultFormat::Json)
+        }
+
+        fn bind_as(&self, format: OrchestralToolResultFormat) -> Evidence {
             bind(
                 &self.public,
                 &self.records.iter().collect::<Vec<_>>(),
                 self.dir.path(),
+                format,
             )
+        }
+
+        fn yaml() -> Self {
+            let mut fixture = Self::new();
+            for record in &mut fixture.records {
+                for message in &mut record.messages {
+                    if message["role"] == "tool" {
+                        let envelope: Value =
+                            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+                        message["content"] = serde_yaml::to_string(&envelope).unwrap().into();
+                    }
+                }
+            }
+            fixture
         }
     }
 
@@ -774,5 +822,92 @@ mod tests {
         let evidence = fixture.bind();
         assert!(!evidence.complete());
         assert!(evidence.unproven[0].contains("logical model request"));
+    }
+
+    #[test]
+    fn yaml_tool_envelope_preserves_code_strings_errors_and_scalar_types() {
+        let code = "fn main() {\n    println!(\"<tool_call>\\\\path\");\n}\n";
+        let result = json!({"content":code,"empty":"","crlf":"first\r\nsecond\r\n",
+            "controls":"\u{0}\t\u{feff}","numeric_text":"001","bool_text":"false","none":null});
+        let yaml = tool_result_content(OrchestralToolResultFormat::Yaml, &result, true).unwrap();
+        assert!(yaml.contains("content: |\n"));
+        assert!(yaml.contains("    println!(\"<tool_call>\\\\path\");"));
+        assert_eq!(
+            serde_yaml::from_str::<Value>(&yaml).unwrap(),
+            json!({"result":result,"is_error":true})
+        );
+        assert_eq!(
+            tool_result_content(OrchestralToolResultFormat::Json, &result, true).unwrap(),
+            json!({"result":result,"is_error":true}).to_string()
+        );
+    }
+
+    #[test]
+    fn declared_yaml_binds_exact_history_without_format_detection_or_normalization() {
+        let fixture = Fixture::yaml();
+        let evidence = fixture.bind_as(OrchestralToolResultFormat::Yaml);
+        assert!(evidence.complete(), "{:?}", evidence.unproven);
+        assert_eq!(
+            evidence.tool_result_format,
+            OrchestralToolResultFormat::Yaml
+        );
+        assert_eq!(evidence.receipts.len(), 2);
+        assert!(
+            !fixture.bind().complete(),
+            "JSON declaration must not accept YAML wire"
+        );
+        assert!(!Fixture::new()
+            .bind_as(OrchestralToolResultFormat::Yaml)
+            .complete());
+        let mut changed = Fixture::yaml();
+        let original = changed.records[1].messages[3]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let with_blank_line = format!("{original}\n");
+        assert_eq!(
+            serde_yaml::from_str::<Value>(&original).unwrap(),
+            serde_yaml::from_str::<Value>(&with_blank_line).unwrap()
+        );
+        changed.records[1].messages[3]["content"] = with_blank_line.into();
+        assert!(
+            !changed.bind_as(OrchestralToolResultFormat::Yaml).complete(),
+            "semantic YAML equality is insufficient"
+        );
+        let mut changed = Fixture::yaml();
+        changed.public.tool_exchanges[0].calls[0].is_error = true;
+        assert!(!changed.bind_as(OrchestralToolResultFormat::Yaml).complete());
+    }
+
+    #[test]
+    fn yaml_matching_history_does_not_relax_delivery_finish_metadata_or_causality() {
+        let mut cancelled = Fixture::yaml();
+        cancelled.public.delivered = false;
+        cancelled.public.terminal = Some("run_cancelled".into());
+        assert!(!cancelled
+            .bind_as(OrchestralToolResultFormat::Yaml)
+            .complete());
+        let mut missing = Fixture::yaml();
+        missing.public.tool_exchanges[0].calls[0].native_call_id = None;
+        assert!(!missing.bind_as(OrchestralToolResultFormat::Yaml).complete());
+        let mut incomplete = Fixture::yaml();
+        incomplete.records[0].saw_done = false;
+        assert!(!incomplete
+            .bind_as(OrchestralToolResultFormat::Yaml)
+            .complete());
+        let mut premature = Fixture::yaml();
+        premature.records[1].submitted_ns = 1;
+        assert!(!premature
+            .bind_as(OrchestralToolResultFormat::Yaml)
+            .complete());
+        let mut length = Fixture::yaml();
+        length.records[0].finish_reasons = vec!["length".into()];
+        let path = length.dir.path().join("coding-0.response.sse");
+        let raw = fs::read_to_string(&path).unwrap().replace(
+            "\"finish_reason\":\"tool_calls\"",
+            "\"finish_reason\":\"length\"",
+        );
+        fs::write(path, raw).unwrap();
+        assert!(!length.bind_as(OrchestralToolResultFormat::Yaml).complete());
     }
 }

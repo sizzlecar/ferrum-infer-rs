@@ -1,6 +1,6 @@
 //! One real Orchestral headless process per task, on the shared runner clock.
 use super::{
-    config::{self, Manifest, OrchestralSpec, Server, Task},
+    config::{self, Manifest, OrchestralSpec, OrchestralToolResultFormat, Server, Task},
     orchestral_evidence,
     process::{self, ManagedChild, Outcome},
     runner::{self, TaskResult},
@@ -50,15 +50,18 @@ pub(crate) fn prepare(
         ("{model}", json!(manifest.server.model)),
         ("{context_window}", json!(manifest.server.context_window)),
         ("{max_tokens}", json!(manifest.server.max_tokens)),
+        ("{tool_result_format}", json!(spec.tool_result_format)),
         (
             "{request_timeout_secs}",
             json!(manifest.server.request_timeout_secs),
         ),
     ]);
-    let rendered = render(&template, &substitutions)?;
+    let mut rendered = render(&template, &substitutions)?;
+    bind_tool_result_format(&mut rendered, spec.tool_result_format)?;
     validate_config(
         &rendered,
         &manifest.server,
+        spec.tool_result_format,
         base_url,
         &journal,
         &artifacts,
@@ -71,7 +74,7 @@ pub(crate) fn prepare(
         &json!({
             "session_id":session_id,"home":home,"journal":journal,"config":config_path,
             "config_sha256":config::hash_file(&config_path)?,"template":spec.config_template,
-            "endpoint":base_url,"validation_repairs":0,
+            "endpoint":base_url,"validation_repairs":0,"tool_result_format":spec.tool_result_format,
             "thinking_note":"No HTTP body rewriting. Thinking is the actual product/server configuration, not inferred from the Pi thinking field."
         }),
     )?;
@@ -115,6 +118,7 @@ fn render(value: &Value, substitutions: &BTreeMap<&str, Value>) -> Result<Value>
 fn validate_config(
     config: &Value,
     server: &Server,
+    tool_result_format: OrchestralToolResultFormat,
     base_url: &str,
     journal: &Path,
     artifacts: &Path,
@@ -136,6 +140,16 @@ fn validate_config(
     );
     let backend = &backends[0];
     let model = &models[0];
+    let actual_format = model["config"]
+        .get("tool_result_format")
+        .map(|value| serde_json::from_value::<OrchestralToolResultFormat>(value.clone()))
+        .transpose()
+        .context("invalid Orchestral tool result format")?
+        .unwrap_or_default();
+    ensure!(
+        actual_format == tool_result_format,
+        "Orchestral tool result format differs from manifest"
+    );
     ensure!(
         backend["kind"] == "openai"
             && backend["endpoint"] == base_url
@@ -159,10 +173,13 @@ fn validate_config(
             && backend["config"]["stream_idle_timeout_secs"] == server.request_timeout_secs,
         "Orchestral model/context/output/timeout differs from manifest"
     );
-    let mut actual = model["config"]["sampling"]
-        .as_object()
-        .context("explicit native sampling object required")?
-        .clone();
+    let mut actual = match model["config"].get("sampling") {
+        Some(sampling) => sampling
+            .as_object()
+            .context("native sampling must be an object")?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
     ensure!(
         model.get("temperature").is_some(),
         "explicit temperature required"
@@ -208,6 +225,36 @@ fn validate_config(
             && config["tools"]["exec"]["allow_host_execution"] == false,
         "headless regression requires MCP/skills disabled and sandboxed execution"
     );
+    Ok(())
+}
+
+fn bind_tool_result_format(config: &mut Value, format: OrchestralToolResultFormat) -> Result<()> {
+    let models = config
+        .get_mut("providers")
+        .and_then(|providers| providers.get_mut("models"))
+        .and_then(Value::as_array_mut)
+        .context("model array")?;
+    ensure!(
+        models.len() == 1,
+        "one explicit local OpenAI model required"
+    );
+    let model = models[0]
+        .as_object_mut()
+        .context("model profile object required")?;
+    let profile = model.entry("config").or_insert_with(|| json!({}));
+    if profile.is_null() {
+        *profile = json!({});
+    }
+    let profile = profile
+        .as_object_mut()
+        .context("model profile config object required")?;
+    if let Some(value) = profile.get("tool_result_format") {
+        ensure!(
+            serde_json::from_value::<OrchestralToolResultFormat>(value.clone())? == format,
+            "Orchestral template tool result format conflicts with manifest"
+        );
+    }
+    profile.insert("tool_result_format".into(), json!(format));
     Ok(())
 }
 
@@ -404,6 +451,7 @@ mod tests {
             validate_config(
                 value,
                 server,
+                OrchestralToolResultFormat::Json,
                 "http://127.0.0.1:42/_agents/a/v1",
                 Path::new("/journal"),
                 Path::new("/artifacts"),
@@ -426,5 +474,91 @@ mod tests {
             json!({"enable_thinking":false}),
         );
         assert!(check(&value, &changed).is_err());
+    }
+
+    #[test]
+    fn declared_tool_result_format_binds_the_profile_without_overriding_conflicts() {
+        let (original, server) = config_fixture();
+        for format in [
+            OrchestralToolResultFormat::Json,
+            OrchestralToolResultFormat::Yaml,
+        ] {
+            let mut value = original.clone();
+            bind_tool_result_format(&mut value, format).unwrap();
+            assert_eq!(
+                value["providers"]["models"][0]["config"]["tool_result_format"],
+                json!(format)
+            );
+            validate_config(
+                &value,
+                &server,
+                format,
+                "http://127.0.0.1:42/_agents/a/v1",
+                Path::new("/journal"),
+                Path::new("/artifacts"),
+                Path::new("/log"),
+            )
+            .unwrap();
+            bind_tool_result_format(&mut value, format).unwrap();
+        }
+        let mut explicit = original.clone();
+        explicit["providers"]["models"][0]["config"]["tool_result_format"] = json!("json");
+        assert!(bind_tool_result_format(&mut explicit, OrchestralToolResultFormat::Yaml).is_err());
+        assert!(validate_config(
+            &explicit,
+            &server,
+            OrchestralToolResultFormat::Yaml,
+            "http://127.0.0.1:42/_agents/a/v1",
+            Path::new("/journal"),
+            Path::new("/artifacts"),
+            Path::new("/log"),
+        )
+        .is_err());
+        let mut template = original;
+        template["providers"]["models"][0]["config"]["tool_result_format"] =
+            json!("{tool_result_format}");
+        let mut rendered = render(
+            &template,
+            &BTreeMap::from([("{tool_result_format}", json!("yaml"))]),
+        )
+        .unwrap();
+        bind_tool_result_format(&mut rendered, OrchestralToolResultFormat::Yaml).unwrap();
+        assert!(bind_tool_result_format(
+            &mut json!({"providers":false}),
+            OrchestralToolResultFormat::Json
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn missing_or_null_profile_config_preserves_empty_sampling_defaults() {
+        let (original, mut server) = config_fixture();
+        server.sampling_params.remove("top_k");
+        for config in [None, Some(Value::Null)] {
+            let mut value = original.clone();
+            let model = value["providers"]["models"][0].as_object_mut().unwrap();
+            model.remove("config");
+            if let Some(config) = config {
+                model.insert("config".into(), config);
+            }
+            bind_tool_result_format(&mut value, OrchestralToolResultFormat::Json).unwrap();
+            validate_config(
+                &value,
+                &server,
+                OrchestralToolResultFormat::Json,
+                "http://127.0.0.1:42/_agents/a/v1",
+                Path::new("/journal"),
+                Path::new("/artifacts"),
+                Path::new("/log"),
+            )
+            .unwrap();
+            assert_eq!(
+                value["providers"]["models"][0]["config"],
+                json!({"tool_result_format":"json"})
+            );
+        }
+        let mut invalid = original;
+        invalid["providers"]["models"][0]["config"] = json!(false);
+        assert!(bind_tool_result_format(&mut invalid, OrchestralToolResultFormat::Json).is_err());
     }
 }

@@ -23,6 +23,16 @@ pub(crate) struct OrchestralSpec {
     pub program: PathBuf,
     /// JSON configuration (also valid YAML); only whole-value placeholders render.
     pub config_template: PathBuf,
+    #[serde(default)]
+    pub tool_result_format: OrchestralToolResultFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OrchestralToolResultFormat {
+    #[default]
+    Json,
+    Yaml,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -346,6 +356,22 @@ mod tests {
             .unwrap()
             .validate_selection()
             .is_err());
+    }
+
+    #[test]
+    fn orchestral_tool_result_format_is_explicit_and_legacy_defaults_to_json() {
+        let mut value = json!({"program":"orchestral","config_template":"agent.json"});
+        let legacy: OrchestralSpec = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.tool_result_format, OrchestralToolResultFormat::Json);
+        value["tool_result_format"] = json!("yaml");
+        let selected: OrchestralSpec = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            selected.tool_result_format,
+            OrchestralToolResultFormat::Yaml
+        );
+        assert_eq!(serde_json::to_value(selected).unwrap(), value);
+        value["tool_result_format"] = json!("auto");
+        assert!(serde_json::from_value::<OrchestralSpec>(value).is_err());
     }
 
     #[test]

@@ -281,7 +281,15 @@ pub(crate) async fn run(
     for task in &mut tasks {
         let records: Vec<_> = requests.iter().filter(|r| r.task_id == task.id).collect();
         if let Some(evidence) = &mut task.orchestral {
-            let binding = orchestral_wire::bind(evidence, &records, &report_dir.join("requests"));
+            let binding = orchestral_wire::bind(
+                evidence,
+                &records,
+                &report_dir.join("requests"),
+                manifest
+                    .orchestral()
+                    .context("missing Orchestral manifest for public evidence")?
+                    .tool_result_format,
+            );
             task.closed_loop = evidence.complete() && binding.complete();
             task.orchestral_transport = Some(binding);
         } else if let Some(events) = &task.events {
