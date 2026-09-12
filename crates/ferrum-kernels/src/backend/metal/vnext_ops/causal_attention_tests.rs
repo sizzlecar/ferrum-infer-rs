@@ -157,6 +157,48 @@ fn grouped_decode_head256_with_gate_matches_direct_and_cpu_across_page_boundary_
 }
 
 #[test]
+fn grouped_decode_head256_matches_cpu_at_partition_limit_and_long_context_on_real_metal() {
+    for context in [1023, 1024, 1025, 4097] {
+        run_decode_cpu_case(
+            "head256 ratio4 grouped decode partition limit",
+            256,
+            16,
+            4,
+            true,
+            context,
+            AttentionDispatchKind::GroupedDecode,
+        );
+    }
+}
+
+#[test]
+fn grouped_decode_head128_matches_cpu_at_long_context_on_real_metal() {
+    run_decode_cpu_case(
+        "head128 ratio8 long grouped decode",
+        128,
+        32,
+        4,
+        false,
+        4097,
+        AttentionDispatchKind::GroupedDecode,
+    );
+}
+
+#[test]
+fn grouped_decode_dispatch_grows_to_the_simd_reduction_capacity() {
+    for (context, partitions) in [(256_u32, 8), (257, 9), (992, 31), (993, 32), (1025, 32)] {
+        let mut params = dispatch_test_params(1, 256);
+        params.position_start = context - 1;
+        let plan = attention_dispatch_plan(&params);
+        assert_eq!(plan.kind, AttentionDispatchKind::GroupedDecode);
+        assert_eq!(plan.threadgroups[0], partitions);
+    }
+    let mut params = dispatch_test_params(1, 256);
+    params.position_start = u32::MAX;
+    assert_eq!(grouped_decode_partitions(&params), SIMD_THREADS);
+}
+
+#[test]
 fn direct_decode_ratio_one_matches_general_and_cpu_across_page_boundary_on_real_metal() {
     run_decode_cpu_case(
         "head128 ratio1 direct decode",
@@ -200,7 +242,7 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         .iter()
         .all(|bytes| *bytes > 0));
     assert_eq!(exact_tile.threadgroup_memory_bytes, [2560, 5120]);
-    assert_eq!(grouped_decode_reduce_threadgroup_memory_bytes(), 48);
+    assert_eq!(grouped_decode_reduce_threadgroup_memory_bytes(), 144);
 
     let head256_tile = attention_dispatch_plan(&dispatch_test_params(8, 256));
     assert_eq!(head256_tile.threadgroup_memory_bytes, [10240, 20480]);
@@ -290,7 +332,7 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
 
     let decode = attention_dispatch_plan(&dispatch_test_params(1, 256));
     assert_eq!(decode.kind, AttentionDispatchKind::GroupedDecode);
-    assert_eq!(decode.threadgroups, [GROUPED_DECODE_PARTITIONS, 4, 1]);
+    assert_eq!(decode.threadgroups, [8, 4, 1]);
     assert_eq!(
         decode.threads_per_threadgroup,
         [SIMD_THREADS, TILED_PREFILL_SIMDGROUPS, 1],
@@ -348,7 +390,7 @@ fn packed_mixed_decode_and_prefill_keep_participant_local_dispatch_plans() {
     let participant_params = [dispatch_test_params(1, 256), dispatch_test_params(9, 256)];
     let plans = participant_params.map(|params| attention_dispatch_plan(&params));
     assert_eq!(plans[0].kind, AttentionDispatchKind::GroupedDecode);
-    assert_eq!(plans[0].threadgroups[0], GROUPED_DECODE_PARTITIONS);
+    assert_eq!(plans[0].threadgroups[0], 8);
     assert_eq!(plans[1].kind, AttentionDispatchKind::GqaTiledPrefill);
     assert_eq!(plans[1].threadgroups[0], 2);
     let grouped_decode_reductions = plans
@@ -724,11 +766,15 @@ fn run_attention_plan(
         params.tokens as usize * params.query_heads as usize * params.head_dim as usize;
     let output = output_buffer::<f16>(device, output_elements);
     let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
-        output_buffer::<f32>(
+        // Unused capacity must not participate in the dynamic reduction.
+        shared_buffer(
             device,
-            GROUPED_DECODE_PARTITIONS as usize
-                * params.query_heads as usize
-                * (params.head_dim as usize + 2),
+            &vec![
+                f32::NAN;
+                GROUPED_DECODE_MAX_PARTITIONS as usize
+                    * params.query_heads as usize
+                    * (params.head_dim as usize + 2)
+            ],
         )
     });
     let argument_buffer = device.new_buffer(
@@ -959,11 +1005,14 @@ fn run_segment_bits(
     let query = output_buffer::<f16>(device, tokens * query_features);
     let output = output_buffer::<f16>(device, tokens * query_features);
     let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
-        output_buffer::<f32>(
+        shared_buffer(
             device,
-            GROUPED_DECODE_PARTITIONS as usize
-                * params.query_heads as usize
-                * (params.head_dim as usize + 2),
+            &vec![
+                f32::NAN;
+                GROUPED_DECODE_MAX_PARTITIONS as usize
+                    * params.query_heads as usize
+                    * (params.head_dim as usize + 2)
+            ],
         )
     });
     let argument_buffer = device.new_buffer(

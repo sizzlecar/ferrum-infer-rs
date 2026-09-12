@@ -75,8 +75,9 @@ const GQA_TILED_PREFILL_KEY_TILE: u64 = 64;
 const TILED_PREFILL_SIMDGROUPS: u64 = 4;
 const GQA_TILED_PREFILL_QUERY_HEADS: u32 = 2;
 const GQA_TILED_PREFILL_SIMDGROUPS: u64 = 8;
-const GROUPED_DECODE_PARTITIONS: u64 = 8;
-const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = GROUPED_DECODE_PARTITIONS * TILED_PREFILL_KEY_TILE;
+// One SIMD lane reduces each partial, so the reduction supports at most 32.
+const GROUPED_DECODE_MAX_PARTITIONS: u64 = SIMD_THREADS;
+const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = 256;
 
 pub(super) struct MetalCausalAttentionPipelines {
     prepare: ComputePipelineState,
@@ -667,7 +668,7 @@ impl CausalAttentionShape {
             .head_dim
             .checked_add(2)
             .ok_or_else(|| "Metal grouped-decode partial width overflows".to_owned())?;
-        let elements = GROUPED_DECODE_PARTITIONS
+        let elements = GROUPED_DECODE_MAX_PARTITIONS
             .checked_mul(self.query_heads)
             .and_then(|value| value.checked_mul(elements_per_partial))
             .ok_or_else(|| "Metal grouped-decode partial workspace overflows".to_owned())?;
@@ -1802,7 +1803,7 @@ fn grouped_decode_attention_dispatch_plan(params: &CausalAttentionParams) -> Att
     AttentionDispatchPlan {
         kind: AttentionDispatchKind::GroupedDecode,
         threadgroups: [
-            GROUPED_DECODE_PARTITIONS,
+            grouped_decode_partitions(params),
             u64::from(params.key_value_heads),
             1,
         ],
@@ -1894,6 +1895,13 @@ fn encode_attention_dispatch(
     );
     encoder.set_threadgroup_memory_length(0, 0);
     encoder.set_threadgroup_memory_length(1, 0);
+}
+
+fn grouped_decode_partitions(params: &CausalAttentionParams) -> u64 {
+    // Split available key tiles across the reduction's lanes without launching
+    // empty partitions for short contexts. Keep this geometry in sync with MSL.
+    (u64::from(params.position_start) / TILED_PREFILL_KEY_TILE + 1)
+        .min(GROUPED_DECODE_MAX_PARTITIONS)
 }
 
 fn uses_grouped_decode(params: &CausalAttentionParams) -> bool {
@@ -2012,7 +2020,7 @@ fn gqa_tiled_prefill_threadgroup_memory_bytes(params: &CausalAttentionParams) ->
 
 fn grouped_decode_reduce_threadgroup_memory_bytes() -> u64 {
     aligned_threadgroup_memory_bytes(
-        (GROUPED_DECODE_PARTITIONS + 1) * std::mem::size_of::<f32>() as u64,
+        (GROUPED_DECODE_MAX_PARTITIONS + 1) * std::mem::size_of::<f32>() as u64,
     )
 }
 
@@ -2038,11 +2046,17 @@ fn use_pages(
     let pages = regions
         .get(launch.first_page_region..page_end)
         .expect("validated Metal causal-attention page range changed during dispatch");
+    // Metal declares access to the whole buffer, including every page offset
+    // bound through the argument table. Repeat declarations only at a buffer
+    // change; each invocation still declares its own encoder's resources.
+    let mut previous_buffer: Option<&metal::BufferRef> = None;
     for page in pages {
-        encoder.use_resource(
-            page.buffer(),
-            MTLResourceUsage::Read | MTLResourceUsage::Write,
-        );
+        let buffer = page.buffer();
+        if previous_buffer.is_some_and(|previous| std::ptr::eq(previous, buffer)) {
+            continue;
+        }
+        encoder.use_resource(buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        previous_buffer = Some(buffer);
     }
 }
 
@@ -2334,7 +2348,7 @@ mod shape_tests {
         let shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
         let split_stride = shape.split_decode_partial_bytes_per_sequence().unwrap();
         let token_stride = shape.scratch_bytes_per_token().unwrap();
-        assert_eq!(split_stride, 132_096);
+        assert_eq!(split_stride, 528_384);
 
         for participant_count in [1_usize, 3] {
             for total_tokens in [1_u64, 2_048] {

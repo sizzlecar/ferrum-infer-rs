@@ -14,34 +14,58 @@ const HEAD_DIM: usize = 256;
 const QUERY_WIDTH: usize = QUERY_HEADS * HEAD_DIM * 2;
 const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
 const KV_BYTES_PER_TOKEN: usize = 2 * KV_WIDTH * size_of::<f16>();
-const PREFIX: usize = 17;
-const TOTAL: usize = 35;
 
 #[test]
 fn private_native_checkpoint_preserves_causal_state_and_continuation_bits() {
+    verify_checkpoint_continuation(
+        &[0..15, 15..17],
+        &[17..25, 25..34, 34..35],
+        AttentionDispatchKind::DirectDecode,
+    );
+}
+
+#[test]
+fn private_native_checkpoint_preserves_grouped_decode_across_partition_stride_and_page_boundary() {
+    // Capture the partial page before 1024 keys. The first two suffix steps
+    // finish that page, then introduce the 33rd 32-key tile and a new page.
+    // The production dispatch must use grouped decode across the partition
+    // stride; a direct-decode fallback cannot satisfy this fixture.
+    verify_checkpoint_continuation(
+        &[0..1022, 1022..1023],
+        &[1023..1024, 1024..1025, 1025..1033, 1033..1034],
+        AttentionDispatchKind::GroupedDecode,
+    );
+}
+
+fn verify_checkpoint_continuation(
+    prefix: &[Range<usize>],
+    suffix: &[Range<usize>],
+    expected_decode_kind: AttentionDispatchKind,
+) {
+    let prefix_tokens = prefix.last().unwrap().end;
+    let total = suffix.last().unwrap().end;
     metal::objc::rc::autoreleasepool(|| {
         let device = Device::system_default().expect("checkpoint continuation requires Metal");
         let queue = device.new_command_queue();
         let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
         let inputs = Inputs {
-            query: half_values(TOTAL * QUERY_WIDTH, 0.013, 0.31),
-            key: half_values(TOTAL * KV_WIDTH, 0.017, 0.27),
-            value: half_values(TOTAL * KV_WIDTH, 0.019, 0.22),
+            query: half_values(total * QUERY_WIDTH, 0.013, 0.31),
+            key: half_values(total * KV_WIDTH, 0.017, 0.27),
+            value: half_values(total * KV_WIDTH, 0.019, 0.22),
             query_norm: half_values(HEAD_DIM, 0.019, 0.94),
             key_norm: half_values(HEAD_DIM, 0.023, 0.89),
+            expected_decode_kind,
         };
         // Each pair has one participant, the same token spans, page ABI,
         // packing (none), and production attention-dispatch selection.
-        let prefix = [0..15, 15..PREFIX];
-        let suffix = [PREFIX..25, 25..34, 34..TOTAL];
         eprintln!("causal native continuation: prefix={prefix:?}, suffix={suffix:?}, participants=1, projected-input ABI, Hq=16 Hkv=4 D=256 RoPE=64/interleaved, page_bytes={VNEXT_KV_PAGE_BYTES}");
-        let source = private_pages(&device, &queue);
-        let cold = private_pages(&device, &queue);
-        let restored = private_pages(&device, &queue);
-        let prefix_output = inputs.run(&device, &queue, &pipelines, &source, &prefix);
-        let cold_prefix_output = inputs.run(&device, &queue, &pipelines, &cold, &prefix);
+        let source = private_pages(&device, &queue, total);
+        let cold = private_pages(&device, &queue, total);
+        let restored = private_pages(&device, &queue, total);
+        let prefix_output = inputs.run(&device, &queue, &pipelines, &source, prefix);
+        let cold_prefix_output = inputs.run(&device, &queue, &pipelines, &cold, prefix);
         native::assert_output_bits("cold prefix", &cold_prefix_output, &prefix_output);
-        let prefix_bytes = (PREFIX * KV_BYTES_PER_TOKEN) as u64;
+        let prefix_bytes = (prefix_tokens * KV_BYTES_PER_TOKEN) as u64;
         assert!(prefix_bytes > VNEXT_KV_PAGE_BYTES);
         assert!(!prefix_bytes.is_multiple_of(VNEXT_KV_PAGE_BYTES));
         let saved = read_pages_bytes(&device, &queue, &source);
@@ -58,9 +82,9 @@ fn private_native_checkpoint_preserves_causal_state_and_continuation_bits() {
             &saved[..prefix_bytes as usize],
         );
 
-        let source_output = inputs.run(&device, &queue, &pipelines, &source, &suffix);
+        let source_output = inputs.run(&device, &queue, &pipelines, &source, suffix);
         // Restore only after the source has continued into the captured page's
-        // previous slack and into a third page. The compact snapshot is owned.
+        // previous slack and into another page. The compact snapshot is owned.
         native::assert_bits(
             "checkpoint after source continuation",
             &native::read_bytes(&device, &queue, &checkpoint),
@@ -72,8 +96,8 @@ fn private_native_checkpoint_preserves_causal_state_and_continuation_bits() {
             &read_pages_bytes(&device, &queue, &restored),
             &saved,
         );
-        let cold_output = inputs.run(&device, &queue, &pipelines, &cold, &suffix);
-        let restored_output = inputs.run(&device, &queue, &pipelines, &restored, &suffix);
+        let cold_output = inputs.run(&device, &queue, &pipelines, &cold, suffix);
+        let restored_output = inputs.run(&device, &queue, &pipelines, &restored, suffix);
         native::assert_output_bits("cold suffix", &cold_output, &source_output);
         native::assert_output_bits("restored suffix", &restored_output, &source_output);
         let final_source = read_pages_bytes(&device, &queue, &source);
@@ -88,7 +112,7 @@ fn private_native_checkpoint_preserves_causal_state_and_continuation_bits() {
             &final_source,
         );
         assert!(
-            final_source[TOTAL * KV_BYTES_PER_TOKEN..]
+            final_source[total * KV_BYTES_PER_TOKEN..]
                 .iter()
                 .all(|&byte| byte == 0xFF),
             "KV writes changed capacity after the completed frontier"
@@ -107,6 +131,7 @@ struct Inputs {
     value: Vec<f16>,
     query_norm: Vec<f16>,
     key_norm: Vec<f16>,
+    expected_decode_kind: AttentionDispatchKind,
 }
 
 impl Inputs {
@@ -140,7 +165,24 @@ impl Inputs {
                     epsilon: 1.0e-6,
                     rope_theta: 10_000_000.0,
                 };
-                run_segment_bits(
+                let plan = attention_dispatch_plan(&params);
+                if span.len() == 1 {
+                    assert_eq!(
+                        plan.kind, self.expected_decode_kind,
+                        "checkpoint continuation decode route at {span:?}"
+                    );
+                    if self.expected_decode_kind == AttentionDispatchKind::GroupedDecode {
+                        assert_eq!(
+                            plan.threadgroups[0], 32,
+                            "long continuation must exercise the 32-partition cap at {span:?}"
+                        );
+                    }
+                    eprintln!(
+                        "causal checkpoint decode: context={}, route={:?}, threadgroups={:?}",
+                        span.end, plan.kind, plan.threadgroups
+                    );
+                }
+                let output = run_segment_bits(
                     device,
                     queue,
                     pipelines,
@@ -153,15 +195,24 @@ impl Inputs {
                     &self.key_norm,
                     pages,
                     &params,
-                    attention_dispatch_plan(&params),
-                )
+                    plan,
+                );
+                assert!(
+                    output.iter().all(|&bits| f16::from_bits(bits).is_finite()),
+                    "non-finite checkpoint continuation output at {span:?}"
+                );
+                assert!(
+                    output.iter().any(|&bits| bits & 0x7fff != 0),
+                    "checkpoint continuation output must be nonzero at {span:?}"
+                );
+                output
             })
             .collect()
     }
 }
 
-fn private_pages(device: &Device, queue: &CommandQueueRef) -> Vec<Buffer> {
-    (0..(TOTAL * KV_BYTES_PER_TOKEN).div_ceil(VNEXT_KV_PAGE_BYTES as usize))
+fn private_pages(device: &Device, queue: &CommandQueueRef, tokens: usize) -> Vec<Buffer> {
+    (0..(tokens * KV_BYTES_PER_TOKEN).div_ceil(VNEXT_KV_PAGE_BYTES as usize))
         .map(|_| native::private_filled(device, queue, VNEXT_KV_PAGE_BYTES, 0xFF))
         .collect()
 }
