@@ -69,10 +69,14 @@ impl<'a> PairedAttention<'a> {
             case.pipelines.binding_slot_bytes().unwrap(),
             MTLResourceOptions::StorageModeShared,
         );
-        let encoder = case.pipelines.new_binding_encoder();
-        encoder.set_argument_buffer(&bindings, 0);
         let pages = case.pages.iter().map(|page| &**page).collect::<Vec<_>>();
-        encoder.set_buffers(0, &pages, &vec![0; pages.len()]);
+        case.pipelines
+            .with_binding_encoder(|encoder| {
+                encoder.set_argument_buffer(&bindings, 0);
+                encoder.set_buffers(0, &pages, &vec![0; pages.len()]);
+                Ok(())
+            })
+            .unwrap();
         Self {
             case,
             output: GuardedAttentionOutput::new(&case.device, &case.params),

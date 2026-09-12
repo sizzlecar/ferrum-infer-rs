@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
@@ -20,9 +20,10 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
+use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    ArgumentEncoder, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
+    ArgumentEncoder, ArgumentEncoderRef, CompileOptions, ComputeCommandEncoderRef,
+    ComputePipelineState, Device, Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
 };
 use sha2::{Digest, Sha256};
 
@@ -87,7 +88,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     grouped_decode_reduce_attention: ComputePipelineState,
     tiled_prefill_attention: ComputePipelineState,
     gqa_tiled_prefill_attention: ComputePipelineState,
-    prepare_function: Function,
+    binding_encoder: Mutex<ArgumentEncoder>,
     binding_encoded_length: u64,
     binding_alignment: u64,
     maximum_attention_simdgroups: u32,
@@ -239,7 +240,7 @@ impl MetalCausalAttentionPipelines {
             grouped_decode_reduce_attention,
             tiled_prefill_attention,
             gqa_tiled_prefill_attention,
-            prepare_function,
+            binding_encoder: Mutex::new(prepare_encoder),
             binding_encoded_length,
             binding_alignment,
             maximum_attention_simdgroups,
@@ -256,9 +257,48 @@ impl MetalCausalAttentionPipelines {
         align_up(self.binding_encoded_length, self.binding_alignment)
     }
 
-    fn new_binding_encoder(&self) -> ArgumentEncoder {
-        self.prepare_function
-            .new_argument_encoder(PREPARE_PAGE_TABLE_INDEX)
+    /// Reflection is immutable, but setting the destination is not. Only CPU
+    /// argument writes hold this lock; each command retains its own workspace
+    /// until its GPU fence completes.
+    fn with_binding_encoder<T>(
+        &self,
+        encode: impl FnOnce(&ArgumentEncoderRef) -> Result<T, MetalDeviceRuntimeError>,
+    ) -> Result<T, MetalDeviceRuntimeError> {
+        let guard = BindingEncoderGuard {
+            // An unwind can only leave partially written command-owned bytes.
+            // The guard always detaches that destination before unlocking, so
+            // the encoder's reusable state remains valid after poisoning.
+            encoder: self
+                .binding_encoder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
+        encode(&guard.encoder)
+    }
+}
+
+struct BindingEncoderGuard<'a> {
+    encoder: MutexGuard<'a, ArgumentEncoder>,
+}
+
+impl Drop for BindingEncoderGuard<'_> {
+    #[allow(
+        unexpected_cfgs,
+        reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+    )]
+    fn drop(&mut self) {
+        let encoder: &ArgumentEncoderRef = &self.encoder;
+        // SAFETY: MTLArgumentEncoder's setArgumentBuffer:offset: explicitly
+        // accepts nil (macOS 10.13+). metal 0.31 only exposes the non-null Rust
+        // overload. Detach before releasing the mutex, including during unwind,
+        // so the cached encoder cannot retain a previous invocation workspace.
+        // https://developer.apple.com/documentation/metal/mtlargumentencoder/setargumentbuffer(_:offset:)
+        let _: () = unsafe {
+            msg_send![encoder,
+                setArgumentBuffer: std::ptr::null_mut::<metal::objc::runtime::Object>()
+                offset: 0_u64
+            ]
+        };
     }
 }
 
@@ -1285,12 +1325,14 @@ fn encode_attention(
         None
     };
 
-    let argument_encoder = attention.new_binding_encoder();
+    let binding_pipelines = Arc::clone(&attention);
     let binding_command = MetalDeviceCommand::operation(
         "vnext_causal_paged_attention_bindings",
         binding_regions,
         move |_encoder, regions| {
-            encode_page_bindings(&argument_encoder, binding_layout, &page_bindings, regions)
+            binding_pipelines.with_binding_encoder(|argument_encoder| {
+                encode_page_bindings(argument_encoder, binding_layout, &page_bindings, regions)
+            })
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1458,7 +1500,7 @@ fn dispatch_hidden_residual(
 }
 
 fn encode_page_bindings(
-    encoder: &ArgumentEncoder,
+    encoder: &ArgumentEncoderRef,
     layout: BindingLayout,
     bindings: &[PageBinding],
     regions: &[MetalBufferRegion],

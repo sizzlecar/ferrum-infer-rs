@@ -30,6 +30,127 @@ const SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 const CPU_KV_STATE_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 
 #[test]
+fn cached_argument_encoder_detaches_on_success_error_and_unwind() {
+    use metal::objc::rc::{autoreleasepool, WeakPtr};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let device = Device::system_default().expect("argument-encoder conformance requires Metal");
+    let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let mut encoder_identity = None;
+    // The last success exercises reuse after a poisoned Mutex. Each previous
+    // workspace must already be released, not only when the next one is bound.
+    for mode in [0, 1, 2, 0] {
+        let weak = autoreleasepool(|| {
+            let workspace = device.new_buffer(
+                pipelines.binding_slot_bytes().unwrap(),
+                MTLResourceOptions::StorageModeShared,
+            );
+            // SAFETY: workspace owns this live Objective-C MTLBuffer. WeakPtr
+            // uses the runtime's zeroing weak reference, not retainCount guesses.
+            let weak = unsafe { WeakPtr::new((&*workspace as *const BufferRef).cast_mut().cast()) };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                pipelines.with_binding_encoder(|encoder| {
+                    let identity = encoder as *const ArgumentEncoderRef as usize;
+                    assert_eq!(*encoder_identity.get_or_insert(identity), identity);
+                    encoder.set_argument_buffer(&workspace, 0);
+                    match mode {
+                        1 => Err(MetalDeviceRuntimeError::contract("fixture binding failure")),
+                        2 => panic!("fixture binding unwind"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match mode {
+                1 => assert!(outcome.unwrap().is_err()),
+                2 => assert!(outcome.is_err()),
+                _ => outcome.unwrap().unwrap(),
+            }
+            drop(workspace);
+            weak
+        });
+        assert!(
+            weak.load().is_null(),
+            "cached encoder retained a detached workspace"
+        );
+    }
+}
+
+#[test]
+fn cached_argument_encoder_serializes_distinct_workspace_writes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let device = Device::system_default().expect("argument-encoder conformance requires Metal");
+    let pipelines = Arc::new(MetalCausalAttentionPipelines::new(&device).unwrap());
+    let active = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(3));
+    let workers = (0..3)
+        .map(|_| {
+            let (device, pipelines, active, start) = (
+                device.clone(),
+                pipelines.clone(),
+                active.clone(),
+                start.clone(),
+            );
+            std::thread::spawn(move || {
+                let workspace = device.new_buffer(
+                    pipelines.binding_slot_bytes().unwrap(),
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let page =
+                    device.new_buffer(VNEXT_KV_PAGE_BYTES, MTLResourceOptions::StorageModeShared);
+                // SAFETY: the CPU owns this shared buffer exclusively and initializes
+                // all bytes, including padding, before taking byte snapshots.
+                unsafe {
+                    std::ptr::write_bytes(
+                        workspace.contents().cast::<u8>(),
+                        0xa5,
+                        workspace.length() as usize,
+                    )
+                };
+                start.wait();
+                pipelines
+                    .with_binding_encoder(|encoder| {
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        encoder.set_argument_buffer(&workspace, 0);
+                        std::thread::yield_now();
+                        encoder.set_buffer(0, &page, 0);
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                // SAFETY: binding writes have completed; no GPU command uses it.
+                let snapshot = unsafe {
+                    std::slice::from_raw_parts(
+                        workspace.contents().cast::<u8>(),
+                        workspace.length() as usize,
+                    )
+                }
+                .to_vec();
+                (workspace, page, snapshot)
+            })
+        })
+        .collect::<Vec<_>>();
+    let completed = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    for (workspace, _page, snapshot) in completed {
+        // SAFETY: all writer threads have joined and the owning buffer is live.
+        let actual = unsafe {
+            std::slice::from_raw_parts(
+                workspace.contents().cast::<u8>(),
+                workspace.length() as usize,
+            )
+        };
+        assert_eq!(
+            actual, snapshot,
+            "another binding changed a completed workspace"
+        );
+    }
+}
+
+#[test]
 fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
     let device = Device::system_default().expect("causal-attention conformance requires Metal");
     let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
@@ -991,11 +1112,15 @@ fn run_attention_plan(
         pipelines.binding_slot_bytes().unwrap(),
         MTLResourceOptions::StorageModeShared,
     );
-    let argument_encoder = pipelines.new_binding_encoder();
-    argument_encoder.set_argument_buffer(&argument_buffer, 0);
     let page_refs = pages.iter().map(|page| &**page).collect::<Vec<_>>();
     let page_offsets = vec![0; pages.len()];
-    argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+    pipelines
+        .with_binding_encoder(|argument_encoder| {
+            argument_encoder.set_argument_buffer(&argument_buffer, 0);
+            argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+            Ok(())
+        })
+        .unwrap();
 
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
@@ -1233,11 +1358,15 @@ fn run_segment_bits(
         pipelines.binding_slot_bytes().unwrap(),
         MTLResourceOptions::StorageModeShared,
     );
-    let argument_encoder = pipelines.new_binding_encoder();
-    argument_encoder.set_argument_buffer(&argument_buffer, 0);
     let page_refs = pages.iter().map(|page| &**page).collect::<Vec<_>>();
     let page_offsets = vec![0; pages.len()];
-    argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+    pipelines
+        .with_binding_encoder(|argument_encoder| {
+            argument_encoder.set_argument_buffer(&argument_buffer, 0);
+            argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+            Ok(())
+        })
+        .unwrap();
 
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
