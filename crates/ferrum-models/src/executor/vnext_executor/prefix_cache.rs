@@ -553,6 +553,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     pub(super) fn evict_prefix_checkpoint(&self) -> bool {
+        let started = Instant::now();
         let removed = self.prefix_cache.lock().evict();
         let evicted = removed.is_some();
         if evicted {
@@ -564,6 +565,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // Physical/logical release takes place outside the index lock. A clone
         // pinned by a transfer continues to count against the native ledger.
         drop(removed);
+        self.reaper.record_checkpoint_cache_timing(
+            CheckpointCacheTimingPhase::EvictionDrop,
+            started.elapsed(),
+        );
         evicted
     }
 
@@ -675,11 +680,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         completed_tokens: usize,
     ) -> Result<()> {
         // Replacing a candidate must not require holding both copies at once.
+        let replacement_started = Instant::now();
         let replaced = self
             .prefix_cache
             .lock()
             .remove_replaced(tokens, completed_tokens);
         drop(replaced);
+        self.reaper.record_checkpoint_cache_timing(
+            CheckpointCacheTimingPhase::ReplacementDrop,
+            replacement_started.elapsed(),
+        );
         let entries = self.prefix_cache.lock().entries.len();
         let result = capture_with_capacity(entries, || async {
             let reaper = Arc::clone(&self.reaper);
@@ -690,7 +700,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self
                 .completion_worker
                 .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
+                    let recovery_started = Instant::now();
                     let _ = reaper.recover_abandoned_checkpoints(MAX_COMPLETION_SWEEP_SLOTS);
+                    reaper.record_checkpoint_cache_timing(
+                        CheckpointCacheTimingPhase::AbandonedRecovery,
+                        recovery_started.elapsed(),
+                    );
                     let binding = resources
                         .trusted_runtime_binding()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
@@ -734,6 +749,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?
         }, |maintenance: CheckpointCapacityMaintenance<R>| async move {
                     let source = Arc::clone(&sequence.session);
+                    let reaper = Arc::clone(&self.reaper);
                     self
                         .completion_worker
                         .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
@@ -742,7 +758,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             // without waiting for or reclaiming foreground work.
                             source.write_release_capacity_sources(&mut Vec::new())
                                 .map_err(|error| FerrumError::backend(format!("capture source became unavailable before maintenance: {error}")))?;
+                            let maintenance_started = Instant::now();
                             let result = maintenance.try_maintain();
+                            reaper.record_checkpoint_cache_timing(
+                                CheckpointCacheTimingPhase::Maintenance,
+                                maintenance_started.elapsed(),
+                            );
                             match &result {
                                 Ok(CheckpointCapacityMaintenanceOutcome::Ready(_)) => {}
                                 Ok(CheckpointCapacityMaintenanceOutcome::Skipped(reason)) => {
@@ -771,12 +792,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         "capture differs from the retired sequence boundary",
                     ));
                 }
+                let publication_started = Instant::now();
                 let removed = self.prefix_cache.lock().insert(
                     Arc::from(checkpoint.token_prefix()),
                     Arc::from(checkpoint.full_input()),
                     checkpoint,
                 );
+                self.reaper.record_checkpoint_cache_timing(
+                    CheckpointCacheTimingPhase::IndexPublication,
+                    publication_started.elapsed(),
+                );
+                let replacement_started = Instant::now();
                 drop(removed);
+                self.reaper.record_checkpoint_cache_timing(
+                    CheckpointCacheTimingPhase::ReplacementDrop,
+                    replacement_started.elapsed(),
+                );
                 Ok(())
             }
             None => Ok(()),

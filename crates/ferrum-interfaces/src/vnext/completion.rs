@@ -33,6 +33,12 @@ mod state_transfer;
 pub(crate) use state_transfer::*;
 mod checkpoint_access;
 pub use checkpoint_access::*;
+mod checkpoint_timings;
+pub use checkpoint_timings::{
+    CheckpointCacheTimingPhase, CheckpointCacheTimings, CheckpointOperationTimings,
+    CheckpointTimingMeasurement, CheckpointTimingSnapshot,
+};
+use checkpoint_timings::{CheckpointTimingCounters, CheckpointTimingPhase};
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
@@ -1742,6 +1748,7 @@ struct CompletionReaperState<R: DeviceRuntime> {
 #[must_use = "the scheduler must retain its completion reaper"]
 pub struct CompletionReaper<R: DeviceRuntime> {
     state: Mutex<CompletionReaperState<R>>,
+    checkpoint_timings: Arc<CheckpointTimingCounters>,
 }
 
 pub const MAX_COMPLETION_SWEEP_SLOTS: usize = 64;
@@ -1763,6 +1770,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 sweep_cursor: None,
                 slots: BTreeMap::new(),
             }),
+            checkpoint_timings: Arc::new(CheckpointTimingCounters::default()),
         })
     }
 

@@ -66,6 +66,12 @@ fn verify_public_continuation(numerics: CheckpointPartitionNumerics) {
     prove_prefix_source(&harness, &lane, &reaper);
     let source_refs = Arc::strong_count(&harness.session);
     let checkpoint = access_capture(&harness, &lane, &reaper);
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.capture.prepare_claim.samples, 1);
+    assert_eq!(timings.capture.encode_submit.samples, 1);
+    assert_eq!(timings.capture.fence_recovery.samples, 1);
+    assert_eq!(timings.capture.publication.samples, 1);
+    assert_eq!(timings.restore, Default::default());
     assert_eq!(Arc::strong_count(&harness.session), source_refs);
     assert_eq!(checkpoint.token_prefix(), &[19]);
     assert_eq!(checkpoint.full_input(), &[19, 31]);
@@ -106,10 +112,29 @@ fn verify_public_continuation(numerics: CheckpointPartitionNumerics) {
     );
     assert!(transfer.take_result().unwrap().is_none());
     assert_transfer_gate(&target);
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.restore.prepare_claim.samples, 1);
+    assert_eq!(timings.restore.encode_submit.samples, 1);
+    assert_eq!(timings.restore.fence_recovery.samples, 1);
+    assert_eq!(timings.restore.publication.samples, 0);
+    // Reset is observation-only, even while a native write owns its target.
+    reaper.reset_checkpoint_timings();
+    assert_eq!(reaper.checkpoint_timing_snapshot(), Default::default());
+    assert_eq!(reaper.retained_count(), 1);
+    assert_eq!(lane.in_flight_count(), 1);
+    assert_transfer_gate(&target);
     harness
         .runtime
         .set_fence_behavior(TestFenceBehavior::Succeeded);
     assert_eq!(transfer.poll().unwrap(), NativeCheckpointObservation::Ready);
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.capture, Default::default());
+    assert_eq!(timings.restore.prepare_claim.samples, 0);
+    assert_eq!(timings.restore.encode_submit.samples, 0);
+    assert_eq!(timings.restore.fence_recovery.samples, 1);
+    assert_eq!(timings.restore.publication.samples, 1);
+    assert_eq!(transfer.poll().unwrap(), NativeCheckpointObservation::Ready);
+    assert_eq!(reaper.checkpoint_timing_snapshot(), timings);
     let Some(NativeCheckpointResult::Restored(publication)) = transfer.take_result().unwrap()
     else {
         panic!("public restore must keep outer publication gated")

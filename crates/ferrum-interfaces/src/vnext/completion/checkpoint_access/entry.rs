@@ -1,3 +1,4 @@
+use super::super::{CheckpointTimingPhase, StateTransferKind};
 use super::*;
 use crate::vnext::{
     CheckpointBackingAllocationDecision, CheckpointPartitionNumerics, ExecutionPlan,
@@ -57,6 +58,10 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         source: Arc<SequenceSession<R>>,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        let preparation = self.checkpoint_timings.start(
+            StateTransferKind::Capture,
+            CheckpointTimingPhase::PrepareClaim,
+        );
         let layout = match access_layout(plan) {
             Ok(layout) => layout,
             Err(reason) => return Ok(NativeCheckpointStart::Skipped(reason)),
@@ -131,6 +136,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
         };
         let permit = owner.try_reserve_capture()?;
+        drop(preparation);
         Ok(wrap_submission(
             self.submit_capture(guard, permit, byte_plan, lane),
             None,
@@ -148,6 +154,10 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         full_input: Arc<[u32]>,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        let preparation = self.checkpoint_timings.start(
+            StateTransferKind::Restore,
+            CheckpointTimingPhase::PrepareClaim,
+        );
         let layout = match access_layout(plan) {
             Ok(layout) => layout,
             Err(reason) => return Ok(NativeCheckpointStart::Skipped(reason)),
@@ -180,6 +190,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
         };
         guard.validate_restore_input(Arc::clone(&full_input))?;
+        drop(preparation);
         let submission = self.submit_restore(guard, Arc::clone(&checkpoint.inner), layout, lane);
         Ok(wrap_submission(
             submission,

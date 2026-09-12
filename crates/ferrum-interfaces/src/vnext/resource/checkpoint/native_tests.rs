@@ -368,6 +368,9 @@ fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_al
             .unwrap(),
         StateTransferObservation::Quarantined
     );
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.capture.fence_recovery.samples, 3);
+    assert_eq!(timings.capture.publication.samples, 0);
     assert!(weak_owner.upgrade().is_some());
     assert_eq!(
         harness
@@ -385,6 +388,10 @@ fn native_detached_unknown_capture_recovers_by_exact_scheduler_slot_and_keeps_al
             .unwrap(),
         StateTransferObservation::Ready
     );
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.capture.fence_recovery.samples, 4);
+    assert_eq!(timings.capture.publication.samples, 1);
+    assert_eq!(timings.restore, Default::default());
     let Some(StateTransferResult::Failed(failure)) =
         reaper.take_completed_state_transfer(slot).unwrap()
     else {

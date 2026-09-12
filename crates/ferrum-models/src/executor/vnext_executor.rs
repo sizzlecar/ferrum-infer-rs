@@ -5659,6 +5659,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext startup cleanup left a completion task in flight",
             ));
         }
+        self.reaper.reset_checkpoint_timings();
         // Startup waves are synthetic evidence. Forget their residency proof so
         // the first product wave establishes and accounts for its own upload.
         self.product_token_mask_residency.lock().clear();
@@ -9665,6 +9666,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 VNextExecutionWaveKind::Decode.as_str(): self.metrics.decode_device_timing.snapshot(),
             },
             "completion_worker": self.completion_worker.metrics_snapshot(),
+            "checkpoint_timings": self.reaper.checkpoint_timing_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
             "startup_preparation": serde_json::to_value(&*self.startup_preparation.lock())

@@ -69,6 +69,11 @@ fn checkpoint_access_first_capture_grows_without_a_spare_execution_slot() {
         .completed_boundary()
         .unwrap();
     let maintenance = capture_maintenance(&harness, &lane, &reaper);
+    let timings = reaper.checkpoint_timing_snapshot();
+    assert_eq!(timings.capture.prepare_claim.samples, 1);
+    assert_eq!(timings.capture.encode_submit.samples, 0);
+    assert_eq!(timings.capture.fence_recovery.samples, 0);
+    assert_eq!(timings.capture.publication.samples, 0);
     // The public maintenance owner holds no source gate or copy authority.
     assert!(Arc::ptr_eq(
         &boundary,

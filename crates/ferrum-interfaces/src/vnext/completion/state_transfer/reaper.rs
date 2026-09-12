@@ -1,6 +1,6 @@
 use super::super::{
-    CompletionRecord, CompletionRecoveryCause, CompletionRecoveryState, LaneSubmitOutcome,
-    SharedCompletionRecord,
+    CheckpointTimingCounters, CheckpointTimingPhase, CompletionRecord, CompletionRecoveryCause,
+    CompletionRecoveryState, LaneSubmitOutcome, SharedCompletionRecord,
 };
 use super::*;
 use crate::vnext::{
@@ -39,6 +39,8 @@ enum TransferPhase<F> {
 /// This is a record in CompletionReaper's existing slot table. It has no
 /// allocator, stream, recovery worker or capacity ledger of its own.
 pub(in crate::vnext::completion) struct StateTransferRecord<R: DeviceRuntime> {
+    timing_kind: StateTransferKind,
+    timings: Arc<CheckpointTimingCounters>,
     resources: Option<StateTransferLease<R>>,
     lane: Arc<ExecutionLane<R>>,
     outbox: Arc<StateTransferResultSlot<R>>,
@@ -68,6 +70,9 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
         &mut self,
         reason: Option<StateTransferFailureReason>,
     ) -> Result<(), VNextError> {
+        let _timing = self
+            .timings
+            .start(self.timing_kind, CheckpointTimingPhase::Publication);
         let resources = self
             .resources
             .take()
@@ -105,12 +110,17 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
             TransferPhase::Quarantined { .. } => return Ok(StateTransferObservation::Quarantined),
             TransferPhase::InFlight { fence, .. } => fence,
         };
-        let (observation, _) = super::super::observe_device_fence(
-            &self.lane,
-            fence,
-            blocking,
-            crate::vnext::DeviceTimingMode::Off,
-        );
+        let (observation, _) = {
+            let _timing = self
+                .timings
+                .start(self.timing_kind, CheckpointTimingPhase::FenceRecovery);
+            super::super::observe_device_fence(
+                &self.lane,
+                fence,
+                blocking,
+                crate::vnext::DeviceTimingMode::Off,
+            )
+        };
         let terminal = match observation {
             Ok(FenceQuery::Pending) => return Ok(StateTransferObservation::Pending),
             Ok(FenceQuery::Terminal(terminal)) => terminal,
@@ -186,7 +196,13 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
             }
         };
         self.lane.fail_closed();
-        if self.lane.drain(has_fence) {
+        let drained = {
+            let _timing = self
+                .timings
+                .start(self.timing_kind, CheckpointTimingPhase::FenceRecovery);
+            self.lane.drain(has_fence)
+        };
+        if drained {
             self.publish_terminal(Some(StateTransferFailureReason::AbandonedAfterDrain))?;
             return Ok(StateTransferObservation::Ready);
         }
@@ -340,6 +356,8 @@ impl<R: DeviceRuntime> TransferReservation<R> {
             self.lane.fail_closed();
         }
         *record = CompletionRecord::StateTransfer(StateTransferRecord {
+            timing_kind: resources.identity().kind,
+            timings: Arc::clone(&self.reaper.checkpoint_timings),
             resources: Some(resources),
             lane: Arc::clone(&self.lane),
             outbox: Arc::clone(&self.outbox),
@@ -382,6 +400,10 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         byte_plan: Arc<SequenceCheckpointBytePlan>,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<StateTransferSubmission<R>, VNextError> {
+        let _timing = self.checkpoint_timings.start(
+            StateTransferKind::Capture,
+            CheckpointTimingPhase::EncodeSubmit,
+        );
         let resources = StateTransferLease::capture(source, permit, byte_plan, &lane)?;
         self.submit_state_transfer(resources, lane)
     }
@@ -393,6 +415,10 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         layout: &SequenceCheckpointLayout,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<StateTransferSubmission<R>, VNextError> {
+        let _timing = self.checkpoint_timings.start(
+            StateTransferKind::Restore,
+            CheckpointTimingPhase::EncodeSubmit,
+        );
         let resources = StateTransferLease::restore(target, checkpoint, layout, &lane)?;
         self.submit_state_transfer(resources, lane)
     }
