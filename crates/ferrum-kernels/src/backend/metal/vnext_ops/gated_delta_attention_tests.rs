@@ -10,6 +10,9 @@ use super::*;
 #[path = "gated_delta_attention_checkpoint_tests.rs"]
 mod checkpoint;
 
+#[path = "gated_delta_attention_staging_tests.rs"]
+mod staging;
+
 const TOKENS: usize = 4;
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;

@@ -1,4 +1,4 @@
-//! Invocation-scoped dequantization for independent SwiGLU projections.
+//! Invocation-scoped dequantization for selected native projections.
 //! The planner owns all backing; no materialized weights survive as model state.
 
 use super::*;
@@ -10,7 +10,37 @@ use ferrum_interfaces::vnext::{
 // This total-matrix work gate is independent of either logical matrix axis.
 const MIN_STAGED_WEIGHT_ELEMENTS: u64 = 1 << 20;
 
+/// Projection owners select their measured or candidate route explicitly;
+/// adding a format for one operation must not enable it for another.
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) enum StagingPolicy {
+    SwiGlu,
+    GatedDelta,
+}
+
+impl StagingPolicy {
+    fn minimum_rows(self, format: LinearPhysicalFormat) -> Option<u32> {
+        match (self, format) {
+            (Self::SwiGlu, LinearPhysicalFormat::Q4K) => Some(768),
+            (Self::SwiGlu, LinearPhysicalFormat::Q6K) => Some(256),
+            // Candidate large-prefill policy; the recurrent core is unchanged.
+            (Self::GatedDelta, LinearPhysicalFormat::Q4K | LinearPhysicalFormat::Q5K) => Some(768),
+            _ => None,
+        }
+    }
+}
+
 fn leaf_format(
+    weight: &ResolvedWeightBinding,
+    layout: &PhysicalWeightLayout,
+    logical_dimensions: &[u64],
+    expected_axis: u32,
+) -> Option<LinearPhysicalFormat> {
+    let format = quantized_leaf_format(weight, layout, logical_dimensions, expected_axis)?;
+    StagingPolicy::SwiGlu.minimum_rows(format).map(|_| format)
+}
+
+fn quantized_leaf_format(
     weight: &ResolvedWeightBinding,
     layout: &PhysicalWeightLayout,
     logical_dimensions: &[u64],
@@ -49,7 +79,9 @@ fn leaf_format(
     }
     match GgufBlockFormat::from_spec(spec).ok()? {
         GgufBlockFormat::Q4K => Some(LinearPhysicalFormat::Q4K),
+        GgufBlockFormat::Q5K => Some(LinearPhysicalFormat::Q5K),
         GgufBlockFormat::Q6K => Some(LinearPhysicalFormat::Q6K),
+        GgufBlockFormat::Q8_0 => Some(LinearPhysicalFormat::Q8_0),
         _ => None,
     }
 }
@@ -139,11 +171,73 @@ fn weight_workspace_bytes(
         .ok_or_else(|| "Metal staged SwiGLU workspace size overflows".to_owned())
 }
 
+/// One shared expansion for the largest eligible leaf of a row-partitioned
+/// projection. Fixed workspace is conservatively declared even for small waves;
+/// runtime admission, rather than a model-specific byte cap, owns its backing.
+pub(in super::super) fn partitioned_workspace_bytes(
+    value: &ResolvedValueBinding,
+    out_features: u64,
+    in_features: u64,
+    policy: StagingPolicy,
+) -> Result<u64, String> {
+    if value.tensor().element_type() != ElementType::F16
+        || value.tensor().dimensions() != [out_features, in_features]
+    {
+        return Ok(0);
+    }
+    let Some(weight) = value.weight() else {
+        return Ok(0);
+    };
+    let PhysicalWeightLayout::Composite { parts } = weight.physical_layout() else {
+        return Ok(0);
+    };
+    let mut ordered = parts.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.logical_offsets.cmp(&right.logical_offsets));
+    let mut next_row = 0_u64;
+    let mut largest = 0_u64;
+    for part in ordered {
+        if part.logical_offsets != [next_row, 0]
+            || part.extents.len() != 2
+            || part.extents[0] == 0
+            || part.extents[1] != in_features
+        {
+            return Ok(0);
+        }
+        next_row = next_row
+            .checked_add(part.extents[0])
+            .ok_or_else(|| "Metal staged projection row extent overflows".to_owned())?;
+        let Some(format) = quantized_leaf_format(weight, &part.layout, &part.extents, 1) else {
+            // Launches retain the quantization format, not physical strides.
+            // Keep the whole projection on its existing route if any leaf's
+            // row-major storage is unproven; another eligible leaf's scratch
+            // must not accidentally enable staging for that unknown layout.
+            return Ok(0);
+        };
+        if policy.minimum_rows(format).is_none() {
+            continue;
+        }
+        let elements = in_features
+            .checked_mul(part.extents[0])
+            .ok_or_else(|| "Metal staged projection matrix size overflows".to_owned())?;
+        if elements < MIN_STAGED_WEIGHT_ELEMENTS || elements / 16 > u64::from(u32::MAX) {
+            continue;
+        }
+        largest = largest.max(
+            elements
+                .checked_mul(ElementType::F16.size_bytes())
+                .ok_or_else(|| "Metal staged projection workspace size overflows".to_owned())?,
+        );
+    }
+    Ok(if next_row == out_features { largest } else { 0 })
+}
+
 pub(super) fn selected(launch: LinearLaunch) -> bool {
-    let minimum_rows = match launch.format {
-        LinearPhysicalFormat::Q4K => 768,
-        LinearPhysicalFormat::Q6K => 256,
-        _ => return false,
+    selected_for(launch, StagingPolicy::SwiGlu)
+}
+
+fn selected_for(launch: LinearLaunch, policy: StagingPolicy) -> bool {
+    let Some(minimum_rows) = policy.minimum_rows(launch.format) else {
+        return false;
     };
     let elements = u64::from(launch.params.in_features) * u64::from(launch.params.out_features);
     launch.activation_type == ElementType::F16
@@ -154,10 +248,11 @@ pub(super) fn selected(launch: LinearLaunch) -> bool {
         && elements / 16 <= u64::from(u32::MAX)
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct Workspace {
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) struct Workspace {
     region: usize,
     offset: u64,
+    policy: StagingPolicy,
 }
 
 pub(super) struct Sequence {
@@ -210,6 +305,24 @@ impl Workspace {
         bytes: u64,
         launches: impl IntoIterator<Item = LinearLaunch>,
     ) -> Result<Option<Self>, String> {
+        Self::with_policy(
+            regions,
+            region,
+            offset,
+            bytes,
+            launches,
+            StagingPolicy::SwiGlu,
+        )
+    }
+
+    pub(in super::super) fn with_policy(
+        regions: &[MetalBufferRegion],
+        region: usize,
+        offset: u64,
+        bytes: u64,
+        launches: impl IntoIterator<Item = LinearLaunch>,
+        policy: StagingPolicy,
+    ) -> Result<Option<Self>, String> {
         if bytes == 0 {
             return Ok(None);
         }
@@ -224,7 +337,7 @@ impl Workspace {
             return Err("Metal staged SwiGLU scratch is not F16 aligned".to_owned());
         }
         for launch in launches {
-            if !selected(launch) {
+            if !selected_for(launch, policy) {
                 continue;
             }
             let elements =
@@ -234,6 +347,7 @@ impl Workspace {
             }
             let format = match launch.format {
                 LinearPhysicalFormat::Q4K => GgufBlockFormat::Q4K,
+                LinearPhysicalFormat::Q5K => GgufBlockFormat::Q5K,
                 LinearPhysicalFormat::Q6K => GgufBlockFormat::Q6K,
                 _ => unreachable!("selected staging format"),
             };
@@ -255,24 +369,34 @@ impl Workspace {
                 return Err("Metal staged SwiGLU workspace overlaps live activations".to_owned());
             }
         }
-        Ok(Some(Self { region, offset }))
+        Ok(Some(Self {
+            region,
+            offset,
+            policy,
+        }))
     }
 }
 
-pub(super) fn dispatch(
+pub(in super::super) fn dispatch_count(launch: LinearLaunch, workspace: Option<Workspace>) -> u64 {
+    1 + u64::from(workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)))
+}
+
+pub(in super::super) fn dispatch(
     pipelines: &MetalLinearPipelines,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],
     launch: LinearLaunch,
     workspace: Option<Workspace>,
 ) {
-    let Some(workspace) = workspace.filter(|_| selected(launch)) else {
+    let Some(workspace) = workspace.filter(|workspace| selected_for(launch, workspace.policy))
+    else {
         return dispatch_linear(pipelines, encoder, regions, launch);
     };
     let blocks =
         (u64::from(launch.params.in_features) * u64::from(launch.params.out_features) / 256) as u32;
     encoder.set_compute_pipeline_state(match launch.format {
         LinearPhysicalFormat::Q4K => &pipelines.k_quant_gemm.stage_q4_k,
+        LinearPhysicalFormat::Q5K => &pipelines.k_quant_gemm.stage_q5_k,
         LinearPhysicalFormat::Q6K => &pipelines.k_quant_gemm.stage_q6_k,
         _ => unreachable!("selected staging format"),
     });
@@ -306,3 +430,6 @@ pub(super) fn dispatch(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod gated_delta_tests;

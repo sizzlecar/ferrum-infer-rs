@@ -312,7 +312,7 @@ fn staged_swiglu_reshape_rejects_noncontiguous_or_padded_storage() {
     }
 }
 
-fn region<T: Copy>(
+pub(super) fn region<T: Copy>(
     runtime: &MetalDeviceRuntime,
     name: &str,
     values: &[T],
@@ -334,7 +334,7 @@ fn region<T: Copy>(
     region
 }
 
-fn overwrite<T: Copy>(region: &MetalBufferRegion, values: &[T]) {
+pub(super) fn overwrite<T: Copy>(region: &MetalBufferRegion, values: &[T]) {
     assert_eq!(
         region.length_bytes() as usize,
         std::mem::size_of_val(values)
@@ -354,7 +354,7 @@ fn overwrite<T: Copy>(region: &MetalBufferRegion, values: &[T]) {
     }
 }
 
-fn bytes(region: &MetalBufferRegion) -> Vec<u8> {
+pub(super) fn bytes(region: &MetalBufferRegion) -> Vec<u8> {
     // SAFETY: called only after completion, over the retained allocation span.
     unsafe {
         std::slice::from_raw_parts(

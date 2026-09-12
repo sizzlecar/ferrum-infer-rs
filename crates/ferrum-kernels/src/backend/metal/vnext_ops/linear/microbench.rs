@@ -89,8 +89,9 @@ fn buffer<T>(device: &Device, data: &[T]) -> Buffer {
 fn physical(format: GgufBlockFormat) -> LinearPhysicalFormat {
     match format {
         GgufBlockFormat::Q4K => LinearPhysicalFormat::Q4K,
+        GgufBlockFormat::Q5K => LinearPhysicalFormat::Q5K,
         GgufBlockFormat::Q6K => LinearPhysicalFormat::Q6K,
-        _ => unreachable!("bounded Q4_K/Q6_K experiment"),
+        _ => unreachable!("bounded K-quant experiment"),
     }
 }
 
@@ -594,8 +595,9 @@ impl PrefillStagingCase {
         }
         let (fused, dequant) = match self.shape.format {
             GgufBlockFormat::Q4K => (&pipelines.q4_k, &pipelines.stage_q4_k),
+            GgufBlockFormat::Q5K => (&pipelines.q5_k, &pipelines.stage_q5_k),
             GgufBlockFormat::Q6K => (&pipelines.q6_k, &pipelines.stage_q6_k),
-            _ => unreachable!("bounded Q4/Q6 prefill experiment"),
+            _ => unreachable!("bounded K-quant prefill experiment"),
         };
         let started = Instant::now();
         let command = queue.new_command_buffer();
@@ -742,7 +744,11 @@ fn prefill_staged_dequant_matches_dense_cpu_and_preserves_guards() {
     let device = Device::system_default().expect("prefill conformance requires Metal");
     let queue = device.new_command_queue();
     let pipelines = MetalKQuantGemmPipelines::new(&device).unwrap();
-    for format in [GgufBlockFormat::Q4K, GgufBlockFormat::Q6K] {
+    for format in [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q5K,
+        GgufBlockFormat::Q6K,
+    ] {
         let case = PrefillStagingCase::new(
             &device,
             Shape {

@@ -36,7 +36,8 @@ use super::super::vnext_runtime::{
 };
 use super::linear::{
     append_shared_matrix_weight, append_shared_partitioned_matrix_weight, dispatch_linear,
-    linear_launch, validate_launch_regions_with_raw_workspace, LinearLaunch, MetalLinearPipelines,
+    linear_launch, staged_prefill, validate_launch_regions_with_raw_workspace, LinearLaunch,
+    MetalLinearPipelines,
 };
 use super::primitives::{
     dispatch_residual_add_at, dispatch_residual_add_f32_f16_at, dispatch_rms_norm_at,
@@ -393,9 +394,15 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
             )));
         }
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        let staging_bytes =
+            input_projection_workspace(request.values(), shape).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                shape.fixed_scratch_bytes().map_err(invalid_plan)?,
+                shape
+                    .fixed_scratch_bytes()
+                    .map_err(invalid_plan)?
+                    .checked_add(staging_bytes)
+                    .ok_or_else(|| invalid_plan("Metal gated-delta fixed scratch overflows"))?,
                 0,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
@@ -835,9 +842,22 @@ fn value_head_mapping_attribute(
         .ok_or_else(|| format!("Metal gated-delta has unsupported value-head mapping {value:?}"))
 }
 
+fn input_projection_workspace(
+    values: &[ResolvedValueBinding],
+    shape: AttentionShape,
+) -> Result<u64, String> {
+    staged_prefill::partitioned_workspace_bytes(
+        binding(values, ResolvedValueRole::Input, 2)?,
+        shape.qkvzba_features,
+        shape.hidden_size,
+        staged_prefill::StagingPolicy::GatedDelta,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
+    projection_workspace: u64,
     conv_state: u64,
     normalized: u64,
     qkvzba: u64,
@@ -882,6 +902,7 @@ impl ScratchLayout {
         }
         Ok(Self {
             required_bytes: offset,
+            projection_workspace: offset,
             conv_state,
             normalized,
             qkvzba,
@@ -893,6 +914,14 @@ impl ScratchLayout {
             beta,
             core,
         })
+    }
+
+    fn with_projection_workspace(mut self, bytes: u64) -> Result<Self, String> {
+        self.required_bytes = self
+            .required_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "Metal gated-delta projection scratch overflows".to_owned())?;
+        Ok(self)
     }
 
     fn token_offset(
@@ -941,6 +970,7 @@ struct ParticipantLaunch {
     execution_form: GatedDeltaExecutionForm,
     params: GatedDeltaParams,
     input_projections: Vec<LinearLaunch>,
+    input_projection_workspace: Option<staged_prefill::Workspace>,
     output_projection: LinearLaunch,
 }
 
@@ -951,6 +981,7 @@ struct PackedLaunch {
     residual_elements: u32,
     params: GatedDeltaParams,
     input_projections: Vec<LinearLaunch>,
+    input_projection_workspace: Option<staged_prefill::Workspace>,
     output_projection: LinearLaunch,
 }
 
@@ -975,7 +1006,9 @@ fn encode_attention(
         validate_signature(participant, shape, hidden_type)?;
     }
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens)?;
+    let staging_bytes = input_projection_workspace(first.bindings(), shape)?;
+    let layout =
+        ScratchLayout::new(shape, total_tokens)?.with_projection_workspace(staging_bytes)?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal gated-delta participant ranges are incomplete".to_owned());
@@ -1158,6 +1191,7 @@ fn encode_attention(
             execution_form,
             params: shape.params(tokens)?,
             input_projections,
+            input_projection_workspace: None,
             output_projection,
         });
     }
@@ -1179,7 +1213,7 @@ fn encode_attention(
             hidden_type,
             total_tokens,
         )?);
-        let packed = PackedLaunch {
+        let mut packed = PackedLaunch {
             input,
             output,
             residual_elements: checked_u32(
@@ -1187,6 +1221,7 @@ fn encode_attention(
                 "Metal packed gated-delta residual elements",
             )?,
             params: shape.params(total_tokens)?,
+            input_projection_workspace: None,
             input_projections: input_weights
                 .iter()
                 .map(|part| {
@@ -1220,15 +1255,31 @@ fn encode_attention(
             &projection_launches,
             &[shared.scratch],
         )?;
+        packed.input_projection_workspace = staged_prefill::Workspace::with_policy(
+            &regions,
+            shared.scratch,
+            layout.projection_workspace,
+            staging_bytes,
+            packed.input_projections.iter().copied(),
+            staged_prefill::StagingPolicy::GatedDelta,
+        )?;
         Some(packed)
     } else {
-        for launch in &launches {
+        for launch in &mut launches {
             let mut projection_launches = launch.input_projections.clone();
             projection_launches.push(launch.output_projection);
             validate_launch_regions_with_raw_workspace(
                 &regions,
                 &projection_launches,
                 &[shared.scratch],
+            )?;
+            launch.input_projection_workspace = staged_prefill::Workspace::with_policy(
+                &regions,
+                shared.scratch,
+                layout.projection_workspace,
+                staging_bytes,
+                launch.input_projections.iter().copied(),
+                staged_prefill::StagingPolicy::GatedDelta,
             )?;
         }
         None
@@ -1239,8 +1290,14 @@ fn encode_attention(
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
-    let dispatch_count = if packed_enabled {
-        let shared_projection_dispatches = input_weights.len() as u64;
+    let dispatch_count = if let Some(packed) = &packed {
+        let shared_projection_dispatches = packed
+            .input_projections
+            .iter()
+            .map(|launch| {
+                staged_prefill::dispatch_count(*launch, packed.input_projection_workspace)
+            })
+            .sum::<u64>();
         launches
             .iter()
             .fold(6_u64 + shared_projection_dispatches, |total, launch| {
@@ -1252,7 +1309,18 @@ fn encode_attention(
         launches.iter().fold(0_u64, |total, launch| {
             total
                 .saturating_add(9)
-                .saturating_add(launch.input_projections.len() as u64)
+                .saturating_add(
+                    launch
+                        .input_projections
+                        .iter()
+                        .map(|projection| {
+                            staged_prefill::dispatch_count(
+                                *projection,
+                                launch.input_projection_workspace,
+                            )
+                        })
+                        .sum::<u64>(),
+                )
                 .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
         })
     };
@@ -1440,11 +1508,12 @@ fn enqueue_attention(
         launch.params.epsilon,
     );
     for projection in &launch.input_projections {
-        dispatch_linear(
+        staged_prefill::dispatch(
             linear,
             compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
             *projection,
+            launch.input_projection_workspace,
         );
     }
     dispatch_prepare_conv_and_state(attention, encoder, regions, shared, layout, launch);
@@ -1531,11 +1600,12 @@ fn enqueue_packed_attention(
         packed.params.epsilon,
     );
     for projection in &packed.input_projections {
-        dispatch_linear(
+        staged_prefill::dispatch(
             linear,
             compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
             *projection,
+            packed.input_projection_workspace,
         );
     }
     dispatch_prepare_gates(

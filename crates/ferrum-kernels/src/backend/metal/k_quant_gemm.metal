@@ -385,6 +385,14 @@ kernel void stage_q6k_f16(
     stage_quant_f16<block_q6_K, dequantize_q6_K>(weight, staged, blocks, tile);
 }
 
+kernel void stage_q5k_f16(
+    device const block_q5_K * weight [[buffer(0)]],
+    device half * staged [[buffer(1)]],
+    constant uint & blocks [[buffer(2)]],
+    uint tile [[thread_position_in_grid]]) {
+    stage_quant_f16<block_q5_K, dequantize_q5_K>(weight, staged, blocks, tile);
+}
+
 kernel void gemm_f16a_f16w_tiled(
     device const half * input [[buffer(0)]],
     device const block_f16_32 * weight [[buffer(1)]],

@@ -12,6 +12,7 @@ pub(crate) struct MetalKQuantGemmPipelines {
     pub(crate) q6_k: ComputePipelineState,
     pub(crate) q8_0: ComputePipelineState,
     pub(crate) stage_q4_k: ComputePipelineState,
+    pub(crate) stage_q5_k: ComputePipelineState,
     pub(crate) stage_q6_k: ComputePipelineState,
     pub(crate) staged_f16: ComputePipelineState,
 }
@@ -35,6 +36,7 @@ impl MetalKQuantGemmPipelines {
             q6_k: pipeline("gemm_f16a_q6kw_tiled")?,
             q8_0: pipeline("gemm_f16a_q8_0w_tiled")?,
             stage_q4_k: pipeline("stage_q4k_f16")?,
+            stage_q5_k: pipeline("stage_q5k_f16")?,
             stage_q6_k: pipeline("stage_q6k_f16")?,
             staged_f16: pipeline("gemm_f16a_f16w_tiled")?,
         })
