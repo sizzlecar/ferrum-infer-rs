@@ -1875,6 +1875,15 @@ impl MetalDeviceRuntime {
         &self.device
     }
 
+    #[cfg(test)]
+    pub(crate) fn allocate_test_region(
+        &self,
+        request: &BufferRequest,
+    ) -> Result<MetalBufferRegion, MetalDeviceRuntimeError> {
+        self.allocate_request(request)?
+            .region(0..request.size_bytes())
+    }
+
     fn timestamp_counter_support(&self) -> MetalTimestampCounterSupport {
         self.timestamp_counter_support
             .get_or_init(|| timestamp_counter_support(&self.device))

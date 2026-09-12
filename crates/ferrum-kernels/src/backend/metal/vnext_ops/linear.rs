@@ -49,6 +49,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear.metal"),
     include_str!("linear/small_batch.rs"),
     include_str!("linear/small_batch.metal"),
+    include_str!("linear/staged_prefill.rs"),
     include_str!("../q4_k_gemv_v2.metal"),
     include_str!("../q5_k_gemv.metal"),
     include_str!("../q6_k_gemv.metal"),
@@ -72,6 +73,7 @@ const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
 mod small_batch;
+mod staged_prefill;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
@@ -311,7 +313,7 @@ impl MetalDenseSwiGluProvider {
             DENSE_SWIGLU_PROVIDER_ID,
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
-            3,
+            4,
             ALL_LINEAR_QUANTIZATION_FORMATS,
         )?
         // Gate/up and activation scratch are fully produced by this invocation.
@@ -350,12 +352,17 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
         }
         let intermediate_size =
             unsigned_attribute(request.attributes(), "intermediate_size").map_err(invalid_plan)?;
+        let hidden_size =
+            unsigned_attribute(request.attributes(), "hidden_size").map_err(invalid_plan)?;
+        let staging_bytes =
+            staged_prefill::workspace_bytes(request.values(), hidden_size, intermediate_size)
+                .map_err(invalid_plan)?;
         let bytes_per_token = intermediate_size
             .checked_mul(SWIGLU_SCRATCH_PARTS)
             .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
             .ok_or_else(|| invalid_plan("Metal dense SwiGLU scratch size overflows"))?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?,
+            ProviderWorkspaceSizeFormula::affine(staging_bytes, 0, bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
@@ -1209,9 +1216,14 @@ fn encode_dense_swiglu(
     let activation_bytes = activation_elements
         .checked_mul(ElementType::F16.size_bytes())
         .ok_or_else(|| "Metal dense SwiGLU activation scratch size overflows".to_owned())?;
-    let required_scratch_bytes = gate_up_bytes
+    let activation_scratch_bytes = gate_up_bytes
         .checked_add(activation_bytes)
         .ok_or_else(|| "Metal dense SwiGLU total scratch size overflows".to_owned())?;
+    let staging_bytes =
+        staged_prefill::workspace_bytes(first.bindings(), hidden_size, intermediate_size)?;
+    let required_scratch_bytes = activation_scratch_bytes
+        .checked_add(staging_bytes)
+        .ok_or_else(|| "Metal dense SwiGLU staged scratch size overflows".to_owned())?;
 
     if gate_up.regions.is_empty() || down.regions.is_empty() {
         return Err("Metal dense SwiGLU resolved empty weight storage".to_owned());
@@ -1281,23 +1293,27 @@ fn encode_dense_swiglu(
         "Metal dense SwiGLU scratch",
     )?;
     let swiglu = swiglu_launch(0, gate_up_bytes, tokens, intermediate_size, packed_width)?;
+    let staging = staged_prefill::Workspace::new(
+        &regions,
+        scratch_region,
+        activation_scratch_bytes,
+        staging_bytes,
+        gate_launches.iter().copied().chain([down_launch]),
+    )?;
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal dense SwiGLU participant count",
     )?;
-    let dispatch_count = gate_launches.len() as u64 + 2;
+    let sequence = staged_prefill::Sequence {
+        gate_up: gate_launches,
+        down: down_launch,
+        activation: swiglu,
+        scratch_region,
+        workspace: staging,
+    };
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(dispatch_count);
-        for launch in &gate_launches {
-            dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
-        }
-        dispatch_swiglu(
-            &pipelines,
-            encoder.compute_encoder(),
-            &regions[scratch_region],
-            swiglu,
-        );
-        dispatch_linear(&pipelines, encoder.compute_encoder(), regions, down_launch);
+        encoder.record_compute_dispatches(sequence.dispatch_count());
+        sequence.encode(&pipelines, encoder.compute_encoder(), regions);
         Ok(())
     })
     .map_err(|error| error.to_string())?

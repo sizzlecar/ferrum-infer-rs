@@ -21,11 +21,11 @@ const MEASURED_ROUNDS: usize = 7;
 const DISPATCHES_PER_COMMAND: usize = 8;
 
 #[derive(Clone, Copy)]
-struct Shape {
-    name: &'static str,
-    input: u32,
-    output: u32,
-    format: GgufBlockFormat,
+pub(super) struct Shape {
+    pub(super) name: &'static str,
+    pub(super) input: u32,
+    pub(super) output: u32,
+    pub(super) format: GgufBlockFormat,
 }
 
 // Text config: hidden=4096, intermediate=12288, Q heads=16, KV heads=4,
@@ -94,7 +94,7 @@ fn physical(format: GgufBlockFormat) -> LinearPhysicalFormat {
     }
 }
 
-fn weights(shape: Shape) -> Vec<u8> {
+pub(super) fn weights(shape: Shape) -> Vec<u8> {
     let blocks_per_row = shape.input as usize / shape.format.block_values();
     let templates = oracle_blocks(shape.format);
     let block_bytes = shape.format.block_bytes();
@@ -512,6 +512,369 @@ fn linear_tolerance(activation_type: ElementType, expected: f32) -> f32 {
         ElementType::F16 => 0.002 + 0.003 * expected.abs(),
         ElementType::F32 => 2.0e-4_f32.max(expected.abs() * 2.0e-4),
         _ => unreachable!("linear activation ABI"),
+    }
+}
+
+// Explicit prefill comparison. Both dispatches use the existing 32-input-row MMA
+// tile; the candidate includes a fresh full-matrix dequantization in every
+// timed command. This fixture does not exercise provider resource admission.
+struct PrefillStagingCase {
+    shape: Shape,
+    params: LinearParams,
+    input: Buffer,
+    input_values: Vec<f16>,
+    quantized: Buffer,
+    quantized_bytes: Vec<u8>,
+    outputs: [Buffer; 2],
+}
+
+impl PrefillStagingCase {
+    const INPUT_PREFIX: usize = 3;
+    const OUTPUT_PREFIX: usize = 7;
+    const WEIGHT_PREFIX_BYTES: usize = 16;
+    const STAGED_PREFIX: usize = 8;
+    const GUARD: f16 = f16::from_bits(0x57b0); // 123
+
+    fn new(device: &Device, shape: Shape, rows: u32) -> Self {
+        let mut input_values = vec![Self::GUARD; Self::INPUT_PREFIX];
+        input_values.extend(
+            (0..rows as usize * shape.input as usize)
+                .map(|index| f16::from_f32(((index as f32) * 0.013).sin() * 0.125)),
+        );
+        input_values.extend([Self::GUARD; 5]);
+        let quantized_bytes = weights(shape);
+        let mut prefixed_weights = vec![0xa5; Self::WEIGHT_PREFIX_BYTES];
+        prefixed_weights.extend_from_slice(&quantized_bytes);
+        prefixed_weights.extend([0xa5; 16]);
+        let params = LinearParams {
+            rows,
+            in_features: shape.input,
+            out_features: shape.output,
+            output_stride: shape.output + 11,
+            output_column_offset: 5,
+        };
+        let output_elements =
+            Self::OUTPUT_PREFIX + rows as usize * params.output_stride as usize + 13;
+        Self {
+            shape,
+            params,
+            input: buffer(device, &input_values),
+            input_values,
+            quantized: buffer(device, &prefixed_weights),
+            quantized_bytes,
+            outputs: std::array::from_fn(|_| buffer(device, &vec![Self::GUARD; output_elements])),
+        }
+    }
+
+    fn staged_elements(&self) -> usize {
+        self.shape.input as usize * self.shape.output as usize
+    }
+
+    fn run(
+        &self,
+        queue: &CommandQueueRef,
+        pipelines: &MetalKQuantGemmPipelines,
+        staged: &Buffer,
+        candidate: bool,
+    ) -> serde_json::Value {
+        let output = &self.outputs[usize::from(candidate)];
+        // SAFETY: the shared half buffer has this size and no prior command is
+        // live. Guards stay finite; every actual output starts as NaN.
+        let values = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.contents().cast::<f16>(),
+                output.length() as usize / 2,
+            )
+        };
+        for row in 0..self.params.rows as usize {
+            let first = Self::OUTPUT_PREFIX
+                + row * self.params.output_stride as usize
+                + self.params.output_column_offset as usize;
+            values[first..first + self.shape.output as usize].fill(f16::NAN);
+        }
+        let (fused, dequant) = match self.shape.format {
+            GgufBlockFormat::Q4K => (&pipelines.q4_k, &pipelines.stage_q4_k),
+            GgufBlockFormat::Q6K => (&pipelines.q6_k, &pipelines.stage_q6_k),
+            _ => unreachable!("bounded Q4/Q6 prefill experiment"),
+        };
+        let started = Instant::now();
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        if candidate {
+            let blocks = u32::try_from(self.staged_elements() / 256).unwrap();
+            encoder.set_compute_pipeline_state(dequant);
+            encoder.set_threadgroup_memory_length(0, 0);
+            encoder.set_buffer(0, Some(&self.quantized), Self::WEIGHT_PREFIX_BYTES as u64);
+            encoder.set_buffer(1, Some(staged), (Self::STAGED_PREFIX * 2) as u64);
+            encoder.set_bytes(2, 4, (&blocks as *const u32).cast());
+            encoder.dispatch_thread_groups(
+                MTLSize::new(u64::from(blocks).div_ceil(8), 1, 1),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+        encoder.set_compute_pipeline_state(if candidate {
+            &pipelines.staged_f16
+        } else {
+            fused
+        });
+        encoder.set_buffer(0, Some(&self.input), (Self::INPUT_PREFIX * 2) as u64);
+        encoder.set_buffer(
+            1,
+            Some(if candidate { staged } else { &self.quantized }),
+            if candidate {
+                (Self::STAGED_PREFIX * 2) as u64
+            } else {
+                Self::WEIGHT_PREFIX_BYTES as u64
+            },
+        );
+        encoder.set_buffer(2, Some(output), (Self::OUTPUT_PREFIX * 2) as u64);
+        bind_linear_params(
+            encoder,
+            self.params,
+            physical(self.shape.format),
+            ElementType::F16,
+        );
+        dispatch_linear_grid(encoder, self.params, LinearDispatchKind::TiledGemm);
+        encoder.end_encoding();
+        let host_encode_ns = started.elapsed().as_nanos() as u64;
+        let submitted = Instant::now();
+        command.commit();
+        command.wait_until_completed();
+        let host_submit_wait_ns = submitted.elapsed().as_nanos() as u64;
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        serde_json::json!({
+            "variant": if candidate { "dequant_plus_f16_gemm" } else { "fused_quant_gemm" },
+            "host_encode_ns": host_encode_ns,
+            "host_submit_wait_ns": host_submit_wait_ns,
+            "device_command_ns": gpu_elapsed_ns(command),
+        })
+    }
+
+    fn validate(&self, dense_cpu_oracle: bool) -> serde_json::Value {
+        let mut compact = [Vec::new(), Vec::new()];
+        for (variant, output) in self.outputs.iter().enumerate() {
+            let values = read_linear_values(output, output.length() as usize / 2, ElementType::F16);
+            for (index, &value) in values.iter().enumerate() {
+                let relative = index.saturating_sub(Self::OUTPUT_PREFIX);
+                let row = relative / self.params.output_stride as usize;
+                let column = relative % self.params.output_stride as usize;
+                let written = index >= Self::OUTPUT_PREFIX
+                    && row < self.params.rows as usize
+                    && column >= self.params.output_column_offset as usize
+                    && column < (self.params.output_column_offset + self.shape.output) as usize;
+                if written {
+                    assert!(
+                        value.is_finite(),
+                        "unwritten/nonfinite output {variant}/{index}"
+                    );
+                    compact[variant].push(value);
+                } else {
+                    assert_eq!(
+                        value,
+                        Self::GUARD.to_f32(),
+                        "output guard {variant}/{index}"
+                    );
+                }
+            }
+        }
+        let mut max_error = 0.0_f32;
+        let mut bitwise_differences = 0;
+        for (&fused, &staged) in compact[0].iter().zip(&compact[1]) {
+            let error = (fused - staged).abs();
+            max_error = max_error.max(error);
+            bitwise_differences += usize::from(fused.to_bits() != staged.to_bits());
+            assert!(error <= linear_tolerance(ElementType::F16, fused));
+        }
+        if dense_cpu_oracle {
+            let inputs = self.input_values[Self::INPUT_PREFIX..]
+                .chunks_exact(self.shape.input as usize)
+                .take(self.params.rows as usize)
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(i, value)| (i, value.to_f32()))
+                        .collect()
+                })
+                .collect::<Vec<_>>();
+            let expected = oracle(self.shape, &self.quantized_bytes, &inputs);
+            for actual in &compact {
+                for (&value, &reference) in actual.iter().zip(&expected) {
+                    assert!(
+                        (value - reference).abs() <= linear_tolerance(ElementType::F16, reference)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            read_linear_values(&self.input, self.input_values.len(), ElementType::F16),
+            self.input_values
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>()
+        );
+        // SAFETY: all commands have completed, and this byte buffer covers the
+        // declared prefix, quantized matrix, and suffix.
+        let quantized = unsafe {
+            std::slice::from_raw_parts(
+                self.quantized.contents().cast::<u8>(),
+                self.quantized.length() as usize,
+            )
+        };
+        assert_eq!(
+            &quantized[..Self::WEIGHT_PREFIX_BYTES],
+            &[0xa5; Self::WEIGHT_PREFIX_BYTES]
+        );
+        assert_eq!(
+            &quantized
+                [Self::WEIGHT_PREFIX_BYTES..Self::WEIGHT_PREFIX_BYTES + self.quantized_bytes.len()],
+            self.quantized_bytes
+        );
+        assert_eq!(
+            &quantized[Self::WEIGHT_PREFIX_BYTES + self.quantized_bytes.len()..],
+            &[0xa5; 16]
+        );
+        serde_json::json!({ "compared_output_elements": compact[0].len(), "max_abs_error": max_error, "bitwise_differences": bitwise_differences, "dense_cpu_oracle": dense_cpu_oracle })
+    }
+}
+
+#[test]
+fn prefill_staged_dequant_matches_dense_cpu_and_preserves_guards() {
+    let device = Device::system_default().expect("prefill conformance requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalKQuantGemmPipelines::new(&device).unwrap();
+    for format in [GgufBlockFormat::Q4K, GgufBlockFormat::Q6K] {
+        let case = PrefillStagingCase::new(
+            &device,
+            Shape {
+                name: "strided_tail",
+                input: 512,
+                output: 67,
+                format,
+            },
+            33,
+        );
+        let elements = case.staged_elements();
+        let mut initial =
+            vec![PrefillStagingCase::GUARD; PrefillStagingCase::STAGED_PREFIX + elements + 17];
+        initial[PrefillStagingCase::STAGED_PREFIX..PrefillStagingCase::STAGED_PREFIX + elements]
+            .fill(f16::NAN);
+        let staged = buffer(&device, &initial);
+        for candidate in [false, true] {
+            case.run(&queue, &pipelines, &staged, candidate);
+        }
+        let validation = case.validate(true);
+        let actual = read_linear_values(&staged, initial.len(), ElementType::F16);
+        for (index, value) in actual.iter().enumerate() {
+            if (PrefillStagingCase::STAGED_PREFIX..PrefillStagingCase::STAGED_PREFIX + elements)
+                .contains(&index)
+            {
+                let position = index - PrefillStagingCase::STAGED_PREFIX;
+                let block = position / 256 * format.block_bytes();
+                let expected = f16::from_f32(format.decode_value(
+                    &case.quantized_bytes[block..block + format.block_bytes()],
+                    position % 256,
+                ))
+                .to_f32();
+                assert_eq!(*value, expected, "{format:?} staged coefficient {position}");
+            } else {
+                assert_eq!(
+                    *value,
+                    PrefillStagingCase::GUARD.to_f32(),
+                    "staged guard {index}"
+                );
+            }
+        }
+        println!("{validation}");
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_prefill_staging_microbench() {
+    let shapes = SHAPES[..2]
+        .iter()
+        .flat_map(|&shape| [256, 768].map(|rows| (shape, rows)))
+        .collect::<Vec<_>>();
+    measure_prefill_staging(&shapes);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_prefill_staging_small_cost_microbench() {
+    let shapes = [(GgufBlockFormat::Q4K, 768), (GgufBlockFormat::Q6K, 256)]
+        .into_iter()
+        .flat_map(|(format, rows)| {
+            [256, 2048].map(|output| {
+                (
+                    Shape {
+                        name: "staging_cost_boundary",
+                        input: 512,
+                        output,
+                        format,
+                    },
+                    rows,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    measure_prefill_staging(&shapes);
+}
+
+fn measure_prefill_staging(shapes: &[(Shape, u32)]) {
+    let device = Device::system_default().expect("prefill microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalKQuantGemmPipelines::new(&device).unwrap();
+    let cases = shapes
+        .iter()
+        .map(|&(shape, rows)| PrefillStagingCase::new(&device, shape, rows))
+        .collect::<Vec<_>>();
+    let staged_elements = cases
+        .iter()
+        .map(PrefillStagingCase::staged_elements)
+        .max()
+        .unwrap();
+    let mut initial =
+        vec![PrefillStagingCase::GUARD; PrefillStagingCase::STAGED_PREFIX + staged_elements + 17];
+    initial[PrefillStagingCase::STAGED_PREFIX..PrefillStagingCase::STAGED_PREFIX + staged_elements]
+        .fill(f16::NAN);
+    let staged = buffer(&device, &initial);
+    drop(initial);
+    for case in &cases {
+        let mut samples = Vec::new();
+        for round in 0..8 {
+            for candidate in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let mut sample = case.run(&queue, &pipelines, &staged, candidate);
+                sample["round"] = round.into();
+                sample["warmup"] = (round < 2).into();
+                samples.push(sample);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "quantized_prefill_staging_microbench", "device": device.name(),
+                "shape": case.shape.name, "format": case.shape.format.format_id(),
+                "rows": case.params.rows, "input_features": case.shape.input, "output_features": case.shape.output,
+                "quantized_bytes": case.quantized_bytes.len(), "staged_payload_bytes": case.staged_elements() * 2,
+                "shared_staged_allocation_bytes": staged.length(), "scratch_reused_across_cases": true,
+                "pipeline_max_threads": pipelines.staged_f16.max_total_threads_per_threadgroup(),
+                "pipeline_execution_width": pipelines.staged_f16.thread_execution_width(),
+                "scope": "hot_projection_buffers_including_dequant_and_full_gemm_not_model_throughput",
+                "samples": samples,
+            })
+        );
+    }
+    // Full output/input/weight checks occur after every timing sample, avoiding
+    // CPU scans and readback allocations between the paired GPU measurements.
+    for case in &cases {
+        println!(
+            "{}",
+            serde_json::json!({"shape": case.shape.name, "rows": case.params.rows, "validation": case.validate(false)})
+        );
     }
 }
 

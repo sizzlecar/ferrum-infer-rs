@@ -331,3 +331,70 @@ kernel void gemm_f16a_q8_0w_tiled(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
+
+// Stage each quantized coefficient once in invocation workspace, preserving
+// the same float-to-half conversion as the fused path above. The identity
+// loader then reuses its exact tile layout and accumulation order.
+struct block_f16_32 {
+    half values[32];
+};
+
+static inline void load_f16_tile(
+    device const block_f16_32 * block,
+    short tile,
+    thread half4x4 & values
+) {
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        values[i / 4][i % 4] = block->values[16 * tile + i];
+    }
+}
+
+template <
+    typename block_q,
+    void (*dequantize)(device const block_q *, short, thread half4x4 &)
+>
+static inline void stage_quant_f16(
+    device const block_q * weight,
+    device half * staged,
+    uint blocks,
+    uint tile
+) {
+    if (tile / 16 >= blocks) {
+        return;
+    }
+    half4x4 values;
+    dequantize(weight + tile / 16, short(tile % 16), values);
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        staged[ulong(tile) * 16 + i] = values[i / 4][i % 4];
+    }
+}
+
+kernel void stage_q4k_f16(
+    device const block_q4_K * weight [[buffer(0)]],
+    device half * staged [[buffer(1)]],
+    constant uint & blocks [[buffer(2)]],
+    uint tile [[thread_position_in_grid]]) {
+    stage_quant_f16<block_q4_K, dequantize_q4_K>(weight, staged, blocks, tile);
+}
+
+kernel void stage_q6k_f16(
+    device const block_q6_K * weight [[buffer(0)]],
+    device half * staged [[buffer(1)]],
+    constant uint & blocks [[buffer(2)]],
+    uint tile [[thread_position_in_grid]]) {
+    stage_quant_f16<block_q6_K, dequantize_q6_K>(weight, staged, blocks, tile);
+}
+
+kernel void gemm_f16a_f16w_tiled(
+    device const half * input [[buffer(0)]],
+    device const block_f16_32 * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant KQuantGemmParams & p [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    gemm_f16a_quant_tiled<block_f16_32, 2, load_f16_tile>(
+        input, weight, output, p, shmem, position, thread_index, simdgroup_index
+    );
+}
