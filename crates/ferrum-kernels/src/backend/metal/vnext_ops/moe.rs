@@ -6,15 +6,17 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract, AttributeId,
-    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
-    WeightEncoding, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
-    ROUTED_SWIGLU_MOE_OPERATION_ID,
+    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightEncoding,
+    ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -127,7 +129,18 @@ impl MetalRoutedSharedSwiGluMoeProvider {
                 include_str!("linear.metal").as_bytes(),
                 PROVIDER_ID.as_bytes(),
             ]),
-        )?;
+        )?
+        // Routing and both expert branches initialize every consumed scratch range.
+        // Fixed weights and this invocation's inputs are the only dependencies;
+        // there are no persistent state ports or hidden routing history.
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+        ));
         Ok(Self {
             descriptor,
             pipelines,
@@ -2224,6 +2237,9 @@ mod tests {
     use super::*;
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device as CandleDevice, Tensor};
+    use ferrum_interfaces::vnext::{
+        DeviceId, OperationContract, OperationId, ResourcePresenceRequirement, TensorAccess,
+    };
     use half::f16;
     use metal::{MTLCommandBufferStatus, MTLResourceOptions};
 
@@ -2236,6 +2252,77 @@ mod tests {
             shared_intermediate_size: 512,
             normalize_topk: true,
         }
+    }
+
+    #[test]
+    fn routed_shared_moe_checkpoint_contract_has_no_persistent_state() {
+        let composition =
+            super::super::MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
+                .expect("create real Metal provider registry");
+        let contract = routed_shared_swiglu_moe_contract().unwrap();
+        let operation = contract.descriptor();
+        let providers = composition.catalog().providers_for(&operation.id).unwrap();
+        let [provider] = providers else {
+            panic!("expected one selected routed/shared implementation");
+        };
+        assert_eq!(
+            provider.operation_fingerprint(),
+            operation.fingerprint().unwrap()
+        );
+        assert!(operation
+            .inputs
+            .iter()
+            .all(|input| input.access() == TensorAccess::Read));
+        assert!(operation
+            .outputs
+            .iter()
+            .all(|output| output.access() == TensorAccess::Write));
+        assert_eq!(
+            operation.resources.persistent,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            operation.resources.binding,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            operation.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+
+        let ProviderCheckpointCapability::CompletedBoundary(checkpoint) =
+            provider.checkpoint_capability()
+        else {
+            panic!("invocation-local MoE must not veto a completed-state checkpoint");
+        };
+        assert!(checkpoint.state_ports().is_empty());
+        assert_eq!(
+            checkpoint.input_dependency(),
+            CheckpointInputDependency::ExactTokenPrefix
+        );
+        assert_eq!(
+            checkpoint.partition_numerics(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        );
+        assert_eq!(
+            checkpoint.completed_input_capture(),
+            CheckpointCompletedInputCapture::Supported
+        );
+        assert!(checkpoint.boundaries().permits(1, 2));
+        assert!(checkpoint.boundaries().permits_from(5, 6, 7));
+        assert!(!checkpoint.boundaries().permits(0, 2));
+        assert!(!checkpoint.boundaries().permits(2, 2));
+
+        // This declaration is scoped to the audited implementation. It must
+        // not turn the separate routed-only provider into an implicit opt-in.
+        let routed = composition
+            .catalog()
+            .providers_for(&OperationId::new(ROUTED_SWIGLU_MOE_OPERATION_ID).unwrap())
+            .unwrap();
+        assert!(routed.iter().all(|provider| matches!(
+            provider.checkpoint_capability(),
+            ProviderCheckpointCapability::Unsupported
+        )));
     }
 
     #[test]
