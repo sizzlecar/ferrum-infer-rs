@@ -1,6 +1,7 @@
 use super::{
     config::{self, Manifest, Task},
     events::Events,
+    orchestral, orchestral_evidence, orchestral_wire,
     process::{self, ManagedChild, Outcome},
     proxy::{self, Proxy},
     repair, replay, write_json, Mode,
@@ -32,11 +33,17 @@ pub(crate) struct TaskResult {
     pub started_ns: u64,
     pub finished_ns: u64,
     pub process: Outcome,
-    pub events: Events,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<Events>,
     pub validation: Option<Outcome>,
     pub source_changed: bool,
     pub closed_loop: bool,
-    pub replay: replay::Evidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<replay::Evidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestral: Option<orchestral_evidence::Evidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestral_transport: Option<orchestral_wire::Evidence>,
     pub completed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_repair: Option<repair::Report>,
@@ -51,16 +58,24 @@ pub(crate) async fn run(
 ) -> Result<i32> {
     let manifest = Manifest::load(manifest_path)?;
     ensure!(
+        manifest.orchestral().is_none() || validation_repairs == 0,
+        "Orchestral supports validation_repairs=0 only; same-session repair is not implemented"
+    );
+    ensure!(
         !report_dir.exists() || fs::read_dir(report_dir)?.next().is_none(),
         "report directory must be new or empty"
     );
     fs::create_dir_all(report_dir)?;
     let report_dir = report_dir.canonicalize()?;
-    let mut protected = vec![manifest_path.canonicalize()?, manifest.pi.program.clone()];
-    for arg in &manifest.pi.args {
-        let path = Path::new(arg);
-        if path.is_absolute() && path.is_file() {
-            protected.push(path.canonicalize()?);
+    let mut protected = vec![manifest_path.canonicalize()?, manifest.program().to_owned()];
+    if let Some(spec) = manifest.orchestral() {
+        protected.push(spec.config_template.clone());
+    } else {
+        for arg in &manifest.pi_program()?.args {
+            let path = Path::new(arg);
+            if path.is_absolute() && path.is_file() {
+                protected.push(path.canonicalize()?);
+            }
         }
     }
     for task in &manifest.tasks {
@@ -77,25 +92,32 @@ pub(crate) async fn run(
             "report directory overlaps protected input"
         );
     }
-    let frozen = config::snapshot(&protected)?;
+    let mut frozen = config::snapshot(&protected)?;
     write_json(report_dir.join("protected-before.json"), &frozen)?;
     write_json(report_dir.join("manifest.json"), &manifest)?;
     let control = report_dir.join("control-agent");
     fs::create_dir(&control)?;
-    let mut version_args = manifest.pi.args.clone();
+    let mut version_args = manifest
+        .pi_program()
+        .map(|pi| pi.args.clone())
+        .unwrap_or_default();
     version_args.push("--version".into());
     let version = process::logged(
-        &manifest.pi.program,
+        manifest.program(),
         &version_args,
         &report_dir,
         &control,
-        &report_dir.join("pi-version"),
+        &report_dir.join(if manifest.orchestral().is_some() {
+            "orchestral-version"
+        } else {
+            "pi-version"
+        }),
         30,
     )
     .await?;
     ensure!(
         version.exit_code == Some(0) && !version.timed_out,
-        "pi version probe failed"
+        "agent version probe failed"
     );
     let mut initial = BTreeMap::new();
     for task in &manifest.tasks {
@@ -137,6 +159,19 @@ pub(crate) async fn run(
     let mut prepared = Vec::new();
     for task in &manifest.tasks {
         let output = report_dir.join(&task.id);
+        if let Some(spec) = manifest.orchestral() {
+            let client = orchestral::prepare(
+                &manifest,
+                spec,
+                task,
+                &output,
+                &proxy.task_base_url(&task.id),
+            )?;
+            protected.push(client.config_path.clone());
+            let before = source_snapshot(&task.workdir, &output.join("source-before"))?;
+            prepared.push((task, output, client.home.clone(), before, Some(client)));
+            continue;
+        }
         let agent_dir = output.join("pi-agent");
         fs::create_dir(&agent_dir)?;
         fs::create_dir(output.join("sessions"))?;
@@ -161,13 +196,25 @@ pub(crate) async fn run(
                     "provider":{"timeoutMs":s.request_timeout_secs.saturating_mul(1000),"maxRetries":0}}}),
         )?;
         let before = source_snapshot(&task.workdir, &output.join("source-before"))?;
-        prepared.push((task, output, agent_dir, before));
+        if manifest.schema_version == 2 {
+            protected.extend([
+                agent_dir.join("models.json"),
+                agent_dir.join("settings.json"),
+            ]);
+        }
+        prepared.push((task, output, agent_dir, before, None));
+    }
+    // Generated configurations are frozen before any participant crosses the barrier.
+    // Legacy schema 1 keeps its original protected-input/report behavior.
+    if manifest.schema_version == 2 {
+        frozen = config::snapshot(&protected)?;
+        write_json(report_dir.join("protected-before.json"), &frozen)?;
     }
     let results = if mode == Mode::Concurrent {
         join_all(
             prepared
                 .into_iter()
-                .map(|(task, output, agent_dir, before)| {
+                .map(|(task, output, agent_dir, before, orchestral)| {
                     run_task(
                         &manifest,
                         task,
@@ -180,13 +227,14 @@ pub(crate) async fn run(
                         Arc::clone(&proxy.state),
                         &protected,
                         &frozen,
+                        orchestral,
                     )
                 }),
         )
         .await
     } else {
         let mut results = Vec::new();
-        for (task, output, agent_dir, before) in prepared {
+        for (task, output, agent_dir, before, orchestral) in prepared {
             results.push(
                 run_task(
                     &manifest,
@@ -200,6 +248,7 @@ pub(crate) async fn run(
                     Arc::clone(&proxy.state),
                     &protected,
                     &frozen,
+                    orchestral,
                 )
                 .await,
             );
@@ -219,38 +268,56 @@ pub(crate) async fn run(
         infrastructure_errors.push(format!("proxy terminal evidence: {error:#}"));
     }
     let requests = proxy.state.records.lock().expect("request records").clone();
-    let after = config::snapshot(&protected)?;
+    let after = match config::snapshot(&protected) {
+        Ok(after) => after,
+        Err(error) if manifest.schema_version == 2 => {
+            infrastructure_errors.push(format!("protected input inspection: {error:#}"));
+            BTreeMap::new()
+        }
+        Err(error) => return Err(error),
+    };
     let protected_unchanged = frozen == after;
     write_json(report_dir.join("protected-after.json"), &after)?;
     for task in &mut tasks {
         let records: Vec<_> = requests.iter().filter(|r| r.task_id == task.id).collect();
-        task.replay = match task
-            .validation_repair
-            .as_ref()
-            .and_then(repair::Report::session_file)
-        {
-            Some(path) => replay::verify_with_session(&task.events, &records, path),
-            None => replay::verify(&task.events, &records),
-        };
-        if let Some(repair) = &mut task.validation_repair {
-            repair.bind_requests(&records);
-            write_json(
-                report_dir.join(&task.id).join("validation-repair.json"),
-                repair,
-            )?;
-            if repair.termination == repair::Termination::InfrastructureFailure {
-                infrastructure_errors.push(format!(
-                    "{} validation repair: {}",
-                    task.id,
-                    repair
-                        .error
-                        .as_deref()
-                        .unwrap_or("independent validation infrastructure failed")
-                ));
+        if let Some(evidence) = &mut task.orchestral {
+            let binding = orchestral_wire::bind(evidence, &records, &report_dir.join("requests"));
+            task.closed_loop = evidence.complete() && binding.complete();
+            task.orchestral_transport = Some(binding);
+        } else if let Some(events) = &task.events {
+            task.replay = Some(
+                match task
+                    .validation_repair
+                    .as_ref()
+                    .and_then(repair::Report::session_file)
+                {
+                    Some(path) => replay::verify_with_session(events, &records, path),
+                    None => replay::verify(events, &records),
+                },
+            );
+            if let Some(repair) = &mut task.validation_repair {
+                repair.bind_requests(&records);
+                write_json(
+                    report_dir.join(&task.id).join("validation-repair.json"),
+                    repair,
+                )?;
+                if repair.termination == repair::Termination::InfrastructureFailure {
+                    infrastructure_errors.push(format!(
+                        "{} validation repair: {}",
+                        task.id,
+                        repair
+                            .error
+                            .as_deref()
+                            .unwrap_or("independent validation infrastructure failed")
+                    ));
+                }
             }
+            task.closed_loop = events.completed_loop(&manifest.server.model)
+                && task
+                    .replay
+                    .as_ref()
+                    .is_some_and(|replay| replay.complete(events));
         }
-        task.closed_loop = task.events.completed_loop(&manifest.server.model)
-            && task.replay.complete(&task.events);
         let last = records.iter().max_by_key(|r| r.request_index);
         task.completed &= protected_unchanged
             && task.closed_loop
@@ -259,7 +326,11 @@ pub(crate) async fn run(
     }
     let distinct_sessions: BTreeSet<_> = tasks
         .iter()
-        .filter_map(|t| t.events.session_id.as_ref())
+        .filter_map(|t| match (&t.events, &t.orchestral) {
+            (Some(events), None) => events.session_id.as_deref(),
+            (None, Some(evidence)) => evidence.session_id.as_deref(),
+            _ => None,
+        })
         .collect();
     let distinct_processes: BTreeSet<_> = tasks.iter().map(|t| t.pid).collect();
     if distinct_sessions.len() != tasks.len() || distinct_processes.len() != tasks.len() {
@@ -298,7 +369,7 @@ pub(crate) async fn run(
     let accepted = tasks_completed
         && infrastructure_errors.is_empty()
         && (mode == Mode::Sequential || engine_overlap.is_some());
-    let report = json!({"schema_version":1,"run_id":manifest.run_id,"mode":mode,
+    let mut report = json!({"schema_version":manifest.schema_version,"run_id":manifest.run_id,"mode":mode,
         "server":manifest.server,"pi":manifest.pi,"wall_start_unix_ns":wall_start,"elapsed_ms":elapsed_ms,
         "validation_repairs":validation_repairs,"agent_mode":if validation_repairs == 0 { "print" } else { "rpc" },
         "validation_repair_cleanup": if validation_repairs == 0 { None } else { Some(if cfg!(unix) {
@@ -315,6 +386,21 @@ pub(crate) async fn run(
         "retry_policy":{"agent":{"enabled":true,"max_retries":3,"base_delay_ms":2000},"provider":{"max_retries":0,"request_timeout_secs":manifest.server.request_timeout_secs},
             "task_deadline_note":if validation_repairs == 0 { "Each task timeout covers the entire pi process including outer retries; the per-request timeout is not a total task budget." }
                 else { "One absolute task deadline covers the Pi RPC process, automatic retries, all independent validations and repair rounds; it is never reset. Shutdown cleanup does not authorize additional agent work." }}});
+    if manifest.schema_version == 2 {
+        report["agent"] = serde_json::to_value(&manifest.agent)?;
+        report.as_object_mut().expect("report object").remove("pi");
+        if validation_repairs == 0 {
+            report["retry_policy"]["task_deadline_note"] = json!("One absolute task deadline covers the agent process and independent final validation. Shutdown cleanup does not authorize additional agent work.");
+        }
+        if manifest.orchestral().is_some() {
+            report["agent_mode"] = json!("orchestral_headless");
+            report["retry_policy"] = json!({"validation_repairs":0,
+                "task_deadline_note":"One absolute deadline includes the headless process and independent validation. Timeout cleanup cannot authorize new agent work.",
+                "agent_retry_note":"No harness repair/retry rounds. Product retry/context behavior remains its protected native configuration.",
+                "request_timeout_secs":manifest.server.request_timeout_secs});
+            report["replay_evidence_note"] = json!("Public Orchestral Run/Session journal and exact native tool exchanges are bound to original response and following request bytes. No Pi events or private checkpoints are interpreted; unproven compaction remains incomplete. Delivery is distinct from independent semantic acceptance.");
+        }
+    }
     write_json(report_dir.join("report.json"), &report)?;
     println!(
         "{}",
@@ -376,6 +462,38 @@ pub(crate) fn validation_args(task: &Task) -> Vec<String> {
         .collect()
 }
 
+/// Schema 2 uses the same absolute task budget for both products, including validation.
+pub(crate) async fn validate_within(
+    task: &Task,
+    agent_dir: &Path,
+    output: &Path,
+    remaining: Duration,
+) -> Result<Outcome> {
+    if remaining.is_zero() {
+        let outcome = Outcome {
+            exit_code: None,
+            timed_out: true,
+            elapsed_ms: 0,
+        };
+        fs::create_dir_all(output)?;
+        write_json(output.join("result.json"), &outcome)?;
+        write_json(
+            output.join("not-started.json"),
+            &json!({"reason":"task deadline exhausted; no validator process started"}),
+        )?;
+        return Ok(outcome);
+    }
+    process::logged_for(
+        &task.validation.program,
+        &validation_args(task),
+        &task.validation.cwd,
+        agent_dir,
+        output,
+        remaining.min(Duration::from_secs(task.validation.timeout_secs)),
+    )
+    .await
+}
+
 async fn run_task(
     manifest: &Manifest,
     task: &Task,
@@ -388,7 +506,14 @@ async fn run_task(
     proxy: Arc<proxy::ProxyState>,
     protected: &[PathBuf],
     frozen: &BTreeMap<PathBuf, String>,
+    orchestral: Option<orchestral::Prepared>,
 ) -> Result<TaskResult> {
+    if let Some(client) = orchestral {
+        return orchestral::run_task(
+            manifest, task, output, client, before, clock, barrier, protected, frozen,
+        )
+        .await;
+    }
     if validation_repairs > 0 {
         return repair::run_task(
             manifest,
@@ -408,7 +533,8 @@ async fn run_task(
     if let Some(barrier) = barrier {
         barrier.wait().await;
     }
-    let mut args = manifest.pi.args.clone();
+    let pi = manifest.pi_program()?;
+    let mut args = pi.args.clone();
     args.extend(
         [
             "--mode",
@@ -435,9 +561,9 @@ async fn run_task(
     args.push(fs::read_to_string(&task.prompt_file)?);
     write_json(
         output.join("command.json"),
-        &json!({"program":manifest.pi.program,"args":args,"cwd":task.workdir}),
+        &json!({"program":pi.program,"args":args,"cwd":task.workdir}),
     )?;
-    let mut command = Command::new(&manifest.pi.program);
+    let mut command = Command::new(&pi.program);
     process::isolated(&mut command, &agent_dir);
     command
         .args(&args)
@@ -482,6 +608,9 @@ async fn run_task(
                 (None, true)
             }
         };
+    if manifest.schema_version == 2 && !timed_out {
+        process.stop().await;
+    }
     let outcome = Outcome {
         exit_code,
         timed_out,
@@ -491,7 +620,27 @@ async fn run_task(
         .await
         .context("pi output did not close")???;
     let finished_ns = clock.elapsed().as_nanos() as u64;
-    let validation = validate(task, &agent_dir, &output.join("final-validation"), false).await?;
+    let validation_source = if manifest.schema_version == 2 {
+        Some(source_snapshot(
+            &task.workdir,
+            &output.join("validation-source"),
+        )?)
+    } else {
+        None
+    };
+    let validation = if manifest.schema_version == 1 {
+        validate(task, &agent_dir, &output.join("final-validation"), false).await?
+    } else {
+        validate_within(
+            task,
+            &agent_dir,
+            &output.join("final-validation"),
+            Duration::from_secs(task.timeout_secs).saturating_sub(start.elapsed()),
+        )
+        .await?
+    };
+    let validation_within_deadline =
+        manifest.schema_version == 1 || start.elapsed() <= Duration::from_secs(task.timeout_secs);
     let after = source_snapshot(&task.workdir, &output.join("source-after"))?;
     let source_changed = before != after;
     let completed = !timed_out
@@ -499,6 +648,10 @@ async fn run_task(
         && events.completed_loop(&manifest.server.model)
         && !validation.timed_out
         && validation.exit_code == Some(0)
+        && validation_within_deadline
+        && validation_source
+            .as_ref()
+            .is_none_or(|snapshot| snapshot == &after)
         && source_changed;
     let result = TaskResult {
         id: task.id.clone(),
@@ -507,11 +660,13 @@ async fn run_task(
         started_ns,
         finished_ns,
         process: outcome,
-        events,
+        events: Some(events),
         validation: Some(validation),
         source_changed,
         closed_loop: false,
-        replay: replay::Evidence::default(),
+        replay: Some(replay::Evidence::default()),
+        orchestral: None,
+        orchestral_transport: None,
         completed,
         validation_repair: None,
     };
@@ -554,4 +709,38 @@ pub(crate) fn source_snapshot(root: &Path, output: &Path) -> Result<BTreeMap<Pat
     visit(root, Path::new(""), output, &mut result)?;
     write_json(output.with_extension("hashes.json"), &result)?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_task_budget_does_not_start_a_validator_or_invent_its_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let task = Task {
+            id: "expired".into(),
+            workdir: directory.path().into(),
+            prompt_file: directory.path().join("prompt"),
+            timeout_secs: 1,
+            validation: config::Validation {
+                // This path cannot execute: an attempted spawn would return an error.
+                program: directory.path().join("does-not-exist"),
+                args: Vec::new(),
+                cwd: directory.path().into(),
+                timeout_secs: 120,
+                expected_initial_exit_code: 1,
+                protected_paths: Vec::new(),
+            },
+        };
+        let output = directory.path().join("validation");
+        let result = validate_within(&task, directory.path(), &output, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.elapsed_ms, 0);
+        assert!(output.join("not-started.json").is_file());
+        assert!(!output.join("command.json").exists());
+    }
 }

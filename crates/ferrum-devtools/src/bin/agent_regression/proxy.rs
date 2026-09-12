@@ -2,7 +2,7 @@ use super::{config::Server, write_json};
 use anyhow::{Context, Result};
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -181,6 +181,7 @@ impl Proxy {
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(forward))
+            .route("/_agents/:task/v1/chat/completions", post(forward_task))
             .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(state.clone());
         let server_task = tokio::spawn(async move {
@@ -193,6 +194,13 @@ impl Proxy {
             state,
             server_task,
         })
+    }
+
+    pub(crate) fn task_base_url(&self, task: &str) -> String {
+        format!(
+            "{}/_agents/{task}/v1",
+            self.base_url.trim_end_matches("/v1")
+        )
     }
 
     pub async fn drain(&self, timeout_secs: u64) -> Result<()> {
@@ -224,7 +232,31 @@ async fn forward(
         .get(TASK_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| bad("missing task identity"))?;
-    if !state.tasks.contains(task) {
+    forward_for(state, task.to_owned(), body).await
+}
+
+async fn forward_task(
+    State(state): State<Arc<ProxyState>>,
+    RoutePath(task): RoutePath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    if headers.get(TASK_HEADER).is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "task route must not override identity with a header".into(),
+        ));
+    }
+    forward_for(state, task, body).await
+}
+
+async fn forward_for(
+    state: Arc<ProxyState>,
+    task: String,
+    body: Bytes,
+) -> std::result::Result<Response, (StatusCode, String)> {
+    let bad = |message: &str| (StatusCode::BAD_REQUEST, message.to_owned());
+    if !state.tasks.contains(&task) {
         return Err(bad("unknown task identity"));
     }
     let request: Value = serde_json::from_slice(&body).map_err(|_| bad("invalid JSON body"))?;
@@ -232,7 +264,7 @@ async fn forward(
         return Err(bad("unexpected inference model"));
     }
     if request["stream"] != true {
-        return Err(bad("pi evidence requires streaming"));
+        return Err(bad("agent evidence requires streaming"));
     }
     let index = state.next_request.fetch_add(1, Ordering::Relaxed);
     let mut record = FlightRecord::new(
@@ -268,7 +300,7 @@ async fn forward(
         ))
         .header("content-type", "application/json")
         .header(BENCHMARK_RUN_ID_HEADER, &state.run_id)
-        .header(BENCHMARK_CELL_ID_HEADER, task)
+        .header(BENCHMARK_CELL_ID_HEADER, &task)
         .header(BENCHMARK_REPEAT_INDEX_HEADER, "0")
         .header(BENCHMARK_PHASE_HEADER, "measured")
         .header(BENCHMARK_REQUEST_INDEX_HEADER, index.to_string())
@@ -565,6 +597,126 @@ pub(crate) fn engine_spans(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn three_task_routes_cross_one_barrier_without_rewriting_body_or_sse() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let observed = captured.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let app = Router::new().route("/v1/chat/completions", post(move |headers:HeaderMap, body:Bytes| {
+            let captured=observed.clone(); let barrier=barrier.clone();
+            async move {
+                let task=headers[BENCHMARK_CELL_ID_HEADER].to_str().unwrap().to_owned();
+                captured.lock().unwrap().push((task.clone(),body));
+                barrier.wait().await;
+                ([("content-type","text/event-stream")],format!("data: {}\n\ndata: [DONE]\n\n",
+                    json!({"id":task,"choices":[{"delta":{"content":" unchanged \"quoted\""},"finish_reason":"stop"}]})))
+            }
+        }));
+        let upstream = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let server = Server {
+            base_url,
+            model: "local".into(),
+            context_window: 4096,
+            max_tokens: 512,
+            request_timeout_secs: 10,
+            reasoning: false,
+            thinking: "off".into(),
+            sampling_params: Default::default(),
+        };
+        let tasks = BTreeSet::from(["a".into(), "b".into(), "c".into()]);
+        let proxy = Proxy::start(
+            &server,
+            "three-routes",
+            tasks.clone(),
+            directory.path().to_owned(),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let bodies:Vec<_>=tasks.iter().map(|task| (task.clone(),format!(" \n{{\"model\":\"local\",\"stream\":true,\"temperature\":0.6,\"top_k\":20,\"messages\":[{{\"role\":\"user\",\"content\":\"{task}\"}}]}}\n"))).collect();
+        let responses = futures::future::join_all(bodies.iter().map(|(task, body)| {
+            let client = client.clone();
+            let url = format!("{}/chat/completions", proxy.task_base_url(task));
+            async move {
+                let response = client
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = response.bytes().await.unwrap();
+                (task.clone(), bytes)
+            }
+        }))
+        .await;
+        proxy.drain(10).await.unwrap();
+        for (task, bytes) in responses {
+            let record = proxy
+                .state
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.task_id == task)
+                .unwrap()
+                .clone();
+            let raw = fs::read(
+                directory
+                    .path()
+                    .join(format!("{task}-{}.response.sse", record.request_index)),
+            )
+            .unwrap();
+            assert_eq!(bytes.as_ref(), raw.as_slice());
+            assert!(record.saw_done && record.error.is_none());
+        }
+        let actual = captured.lock().unwrap();
+        assert_eq!(actual.len(), 3);
+        for (task, bytes) in actual.iter() {
+            assert_eq!(
+                bytes.as_ref(),
+                bodies
+                    .iter()
+                    .find(|(id, _)| id == task)
+                    .unwrap()
+                    .1
+                    .as_bytes()
+            );
+        }
+        drop(actual);
+        let rejected = client
+            .post(format!(
+                "{}/chat/completions",
+                proxy.task_base_url("unknown")
+            ))
+            .body(bodies[0].1.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let rejected = client
+            .post(format!("{}/chat/completions", proxy.task_base_url("a")))
+            .header(TASK_HEADER, "b")
+            .body(bodies[0].1.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(proxy.state.records.lock().unwrap().len(), 3);
+        upstream.abort();
+    }
 
     #[test]
     fn engine_timing_requires_unambiguous_ids_and_explicit_clock_error() {

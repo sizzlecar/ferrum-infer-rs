@@ -87,7 +87,8 @@ impl Agent {
         clock: Instant,
         started: Instant,
     ) -> Result<Self> {
-        let mut args = manifest.pi.args.clone();
+        let pi = manifest.pi_program()?;
+        let mut args = pi.args.clone();
         args.extend(
             [
                 "--mode",
@@ -111,9 +112,9 @@ impl Agent {
         );
         write_json(
             output.join("command.json"),
-            &json!({"program":manifest.pi.program,"args":args,"cwd":task.workdir,"mode":"rpc"}),
+            &json!({"program":pi.program,"args":args,"cwd":task.workdir,"mode":"rpc"}),
         )?;
-        let mut command = Command::new(&manifest.pi.program);
+        let mut command = Command::new(&pi.program);
         process::isolated(&mut command, agent_dir);
         command
             .args(&args)

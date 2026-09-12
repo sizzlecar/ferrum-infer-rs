@@ -4,6 +4,12 @@
 mod config;
 #[path = "agent_regression/events.rs"]
 mod events;
+#[path = "agent_regression/orchestral.rs"]
+mod orchestral;
+#[path = "agent_regression/orchestral_evidence.rs"]
+mod orchestral_evidence;
+#[path = "agent_regression/orchestral_wire.rs"]
+mod orchestral_wire;
 #[path = "agent_regression/process.rs"]
 mod process;
 #[path = "agent_regression/proxy.rs"]

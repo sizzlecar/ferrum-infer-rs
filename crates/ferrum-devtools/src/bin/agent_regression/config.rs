@@ -19,6 +19,21 @@ pub(crate) struct Program {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct OrchestralSpec {
+    pub program: PathBuf,
+    /// JSON configuration (also valid YAML); only whole-value placeholders render.
+    pub config_template: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum AgentSpec {
+    Pi(Program),
+    Orchestral(OrchestralSpec),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Server {
     /// OpenAI base URL including /v1, on this machine only.
     pub base_url: String,
@@ -58,7 +73,10 @@ pub(crate) struct Task {
 pub(crate) struct Manifest {
     pub schema_version: u32,
     pub run_id: String,
-    pub pi: Program,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi: Option<Program>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentSpec>,
     pub server: Server,
     pub tasks: Vec<Task>,
 }
@@ -78,11 +96,43 @@ pub(crate) fn disjoint(a: &Path, b: &Path) -> bool {
 }
 
 impl Manifest {
+    pub(crate) fn pi_program(&self) -> Result<&Program> {
+        match (&self.pi, &self.agent) {
+            (Some(pi), None) | (None, Some(AgentSpec::Pi(pi))) => Ok(pi),
+            _ => anyhow::bail!("this manifest does not select Pi"),
+        }
+    }
+
+    pub(crate) fn orchestral(&self) -> Option<&OrchestralSpec> {
+        match &self.agent {
+            Some(AgentSpec::Orchestral(spec)) => Some(spec),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn program(&self) -> &Path {
+        match &self.agent {
+            Some(AgentSpec::Orchestral(spec)) => &spec.program,
+            _ => &self.pi_program().expect("validated Pi selection").program,
+        }
+    }
+
+    fn validate_selection(&self) -> Result<()> {
+        ensure!(
+            matches!(
+                (self.schema_version, &self.pi, &self.agent),
+                (1, Some(_), None) | (2, None, Some(_))
+            ),
+            "schema 1 requires only pi; schema 2 requires only an explicit agent"
+        );
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let path = path.canonicalize()?;
         let base = path.parent().context("manifest parent")?;
         let mut m: Self = serde_json::from_slice(&fs::read(&path)?)?;
-        ensure!(m.schema_version == 1, "unsupported manifest schema");
+        m.validate_selection()?;
         ensure!(!m.tasks.is_empty(), "no tasks");
         ferrum_bench_core::BenchmarkRequestCorrelation::new(
             m.run_id.clone(),
@@ -135,7 +185,18 @@ impl Manifest {
                 "sampling_params cannot replace {key}"
             );
         }
-        m.pi.program = canonical(base, &m.pi.program)?;
+        match (&mut m.pi, &mut m.agent) {
+            (Some(pi), None) | (None, Some(AgentSpec::Pi(pi))) => {
+                pi.program = canonical(base, &pi.program)?;
+            }
+            (None, Some(AgentSpec::Orchestral(spec))) => {
+                spec.program = canonical(base, &spec.program)?;
+                spec.config_template = canonical(base, &spec.config_template)?;
+                let _: Value = serde_json::from_slice(&fs::read(&spec.config_template)?)
+                    .context("Orchestral config template must be JSON (valid YAML)")?;
+            }
+            _ => unreachable!("selection validated"),
+        }
         let mut ids = BTreeSet::new();
         for task in &mut m.tasks {
             ensure!(
@@ -173,6 +234,14 @@ impl Manifest {
             }
         }
         for (i, task) in m.tasks.iter().enumerate() {
+            if let Some(spec) = m.orchestral() {
+                for input in [&spec.program, &spec.config_template] {
+                    ensure!(
+                        disjoint(&task.workdir, input),
+                        "Orchestral input overlaps candidate"
+                    );
+                }
+            }
             ensure!(
                 disjoint(&task.workdir, &path),
                 "manifest must be outside agent workdir"
@@ -247,6 +316,37 @@ pub(crate) fn snapshot(paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_pi_selection_round_trips_and_schema_two_is_explicit() {
+        let legacy = json!({"schema_version":1,"run_id":"legacy","pi":{"program":"pi","args":["script.js"]},
+            "server":{"base_url":"http://127.0.0.1:8001/v1","model":"local","context_window":4096,
+                "max_tokens":512,"request_timeout_secs":30,"reasoning":false,"thinking":"off","sampling_params":{}},"tasks":[]});
+        let parsed: Manifest = serde_json::from_value(legacy.clone()).unwrap();
+        parsed.validate_selection().unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+        assert_eq!(parsed.pi_program().unwrap().args, ["script.js"]);
+        let mut explicit = legacy.clone();
+        explicit["schema_version"] = json!(2);
+        explicit.as_object_mut().unwrap().remove("pi");
+        explicit["agent"] =
+            json!({"kind":"orchestral","program":"orchestral","config_template":"agent.json"});
+        let selected: Manifest = serde_json::from_value(explicit.clone()).unwrap();
+        selected.validate_selection().unwrap();
+        assert!(selected.orchestral().is_some() && selected.pi_program().is_err());
+        explicit["pi"] = legacy["pi"].clone();
+        assert!(serde_json::from_value::<Manifest>(explicit)
+            .unwrap()
+            .validate_selection()
+            .is_err());
+        let mut no_agent = legacy;
+        no_agent["schema_version"] = json!(2);
+        assert!(serde_json::from_value::<Manifest>(no_agent)
+            .unwrap()
+            .validate_selection()
+            .is_err());
+    }
 
     #[test]
     fn protection_detects_edits_additions_and_deletions() {

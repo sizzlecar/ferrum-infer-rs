@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::process::{Child, Command};
 
-pub(crate) fn isolated(command: &mut Command, agent_dir: &Path) {
+pub(crate) fn isolated_local(command: &mut Command) {
     command.env_clear();
     // Keep ordinary local toolchain discovery; do not inherit provider credentials,
     // Node injection flags, proxies, or a user's pi plugins/configuration.
@@ -33,9 +33,6 @@ pub(crate) fn isolated(command: &mut Command, agent_dir: &Path) {
         }
     }
     command
-        .env("PI_CODING_AGENT_DIR", agent_dir)
-        .env("PI_OFFLINE", "1")
-        .env("PI_TELEMETRY", "0")
         .env("CARGO_NET_OFFLINE", "true")
         .env("NO_COLOR", "1");
     #[cfg(unix)]
@@ -43,6 +40,14 @@ pub(crate) fn isolated(command: &mut Command, agent_dir: &Path) {
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
+}
+
+pub(crate) fn isolated(command: &mut Command, agent_dir: &Path) {
+    isolated_local(command);
+    command
+        .env("PI_CODING_AGENT_DIR", agent_dir)
+        .env("PI_OFFLINE", "1")
+        .env("PI_TELEMETRY", "0");
 }
 
 pub(crate) struct ManagedChild {
@@ -57,6 +62,27 @@ impl ManagedChild {
     }
     pub async fn stop(&mut self) {
         self.stop_with_grace(Duration::from_secs(2)).await;
+    }
+
+    /// Orchestral handles Ctrl-C by cancelling its run and shutting down owned tools.
+    /// The normal TERM/KILL cleanup remains the bounded fallback, with the same owner.
+    pub(crate) async fn interrupt_then_stop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGINT);
+            }
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await,
+                Ok(Ok(_))
+            ) {
+                unsafe {
+                    libc::kill(-(self.pid as i32), libc::SIGKILL);
+                }
+                return;
+            }
+        }
+        self.stop().await;
     }
 
     async fn stop_with_grace(&mut self, grace: Duration) {
@@ -309,9 +335,61 @@ mod tests {
         #[cfg(unix)]
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            if std::env::var_os("FERRUM_TEST_IGNORE_INTERRUPT").is_some() {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+            }
         }
         fs::write(ready, std::process::id().to_string()).unwrap();
         std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_cleanup_reaps_both_cooperative_and_signal_ignoring_children() {
+        for ignores_interrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let ready = dir.path().join("ready");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            isolated_local(&mut command);
+            command
+                .args([
+                    "--exact",
+                    "process::tests::cancellation_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FERRUM_TEST_CANCELLATION_READY", &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if ignores_interrupt {
+                command.env("FERRUM_TEST_IGNORE_INTERRUPT", "1");
+            }
+            let mut child = ManagedChild::spawn(&mut command).unwrap();
+            let ready_result = tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if ready_result.is_err() {
+                child.stop().await;
+                panic!("fixture did not become ready");
+            }
+            assert_eq!(fs::read_to_string(&ready).unwrap(), child.pid.to_string());
+            let result =
+                tokio::time::timeout(Duration::from_secs(6), child.interrupt_then_stop()).await;
+            if result.is_err() {
+                child.stop().await;
+            }
+            assert!(result.is_ok());
+            assert!(!child
+                .child
+                .try_wait()
+                .unwrap()
+                .expect("child must be reaped before return")
+                .success());
+        }
     }
 
     #[tokio::test]
