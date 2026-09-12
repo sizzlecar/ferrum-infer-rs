@@ -35,10 +35,11 @@ mod checkpoint_access;
 pub use checkpoint_access::*;
 mod checkpoint_timings;
 pub use checkpoint_timings::{
-    CheckpointCacheTimingPhase, CheckpointCacheTimings, CheckpointOperationTimings,
-    CheckpointTimingMeasurement, CheckpointTimingSnapshot,
+    CheckpointCacheTimingPhase, CheckpointCacheTimings, CheckpointCopyMeasurements,
+    CheckpointDeviceTimings, CheckpointOperationTimings, CheckpointTimingMeasurement,
+    CheckpointTimingSnapshot,
 };
-use checkpoint_timings::{CheckpointTimingCounters, CheckpointTimingPhase};
+use checkpoint_timings::{CheckpointCopyGeometry, CheckpointTimingCounters, CheckpointTimingPhase};
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {

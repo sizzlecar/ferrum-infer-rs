@@ -1,7 +1,8 @@
+use super::super::CheckpointCopyGeometry;
 use super::*;
 use crate::vnext::{
     BackingInitializationEncodeError, CheckpointCapturePermit, CompletedSequenceBoundary,
-    CompletionSlotId, DeferredDeviceCleanupDomainId, DeviceCommandBatch,
+    CompletionSlotId, DeferredDeviceCleanupDomainId, DeviceCommandBatch, DeviceTimingMode,
     PreparedBackingInitializations, SequenceCheckpointLayout,
 };
 
@@ -104,7 +105,8 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
     pub(super) fn encode(
         &mut self,
         lane: &ExecutionLane<R>,
-    ) -> Result<DeviceCommandBatch<R::Command>, VNextError> {
+        timing_mode: DeviceTimingMode,
+    ) -> Result<(DeviceCommandBatch<R::Command>, CheckpointCopyGeometry), VNextError> {
         if self.copy_retentions.is_some() {
             return Err(invalid_completion("state transfer was already encoded"));
         }
@@ -137,7 +139,8 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
                     "state copy encode failed for {resource_id:?} at {region:?}: {error}"
                 )),
             })?;
-        let mut commands = DeviceCommandBatch::with_capacity(copies.len());
+        let geometry = copies.geometry();
+        let mut commands = DeviceCommandBatch::with_capacity_and_timing(copies.len(), timing_mode);
         if let TransferDestination::Restore {
             initializations, ..
         } = &self.destination
@@ -152,7 +155,7 @@ impl<R: DeviceRuntime> StateTransferLease<R> {
                 })?;
         }
         self.copy_retentions = Some(copies.append_to(&mut commands));
-        Ok(commands)
+        Ok((commands, geometry))
     }
 
     pub(super) fn mark_possibly_submitted(&mut self) -> Result<(), VNextError> {

@@ -1,9 +1,9 @@
 use super::super::{CheckpointTimingPhase, StateTransferKind};
 use super::*;
 use crate::vnext::{
-    CheckpointBackingAllocationDecision, CheckpointPartitionNumerics, ExecutionPlan,
-    SequenceCheckpointCapability, SequenceCheckpointLayout, SequenceStateTransferKind,
-    SequenceStateTransferPreparation, TrustedPlanRuntimeBinding,
+    CheckpointBackingAllocationDecision, CheckpointPartitionNumerics, DeviceTimingMode,
+    ExecutionPlan, SequenceCheckpointCapability, SequenceCheckpointLayout,
+    SequenceStateTransferKind, SequenceStateTransferPreparation, TrustedPlanRuntimeBinding,
 };
 
 fn access_layout(
@@ -57,6 +57,26 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         binding: &TrustedPlanRuntimeBinding<R>,
         source: Arc<SequenceSession<R>>,
         lane: Arc<ExecutionLane<R>>,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_capture_sequence_checkpoint_with_timing(
+            plan,
+            binding,
+            source,
+            lane,
+            DeviceTimingMode::Off,
+        )
+    }
+
+    /// Same capture authority and lifecycle, with optional terminal device
+    /// elapsed time. Enabled modes use Completion only: no kernel counters or
+    /// changes to copy encoder boundaries are introduced.
+    pub fn try_capture_sequence_checkpoint_with_timing(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        binding: &TrustedPlanRuntimeBinding<R>,
+        source: Arc<SequenceSession<R>>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
         let preparation = self.checkpoint_timings.start(
             StateTransferKind::Capture,
@@ -138,7 +158,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let permit = owner.try_reserve_capture()?;
         drop(preparation);
         Ok(wrap_submission(
-            self.submit_capture(guard, permit, byte_plan, lane),
+            self.submit_capture_with_timing(guard, permit, byte_plan, lane, timing_mode),
             None,
         ))
     }
@@ -153,6 +173,27 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         checkpoint: &SequenceCheckpoint<R>,
         full_input: Arc<[u32]>,
         lane: Arc<ExecutionLane<R>>,
+    ) -> Result<NativeCheckpointStart<R>, VNextError> {
+        self.try_restore_sequence_checkpoint_with_timing(
+            plan,
+            target,
+            checkpoint,
+            full_input,
+            lane,
+            DeviceTimingMode::Off,
+        )
+    }
+
+    /// Same restore and consumer-acknowledgement contract, with Completion
+    /// timing for the whole transfer submission (including initialization).
+    pub fn try_restore_sequence_checkpoint_with_timing(
+        self: &Arc<Self>,
+        plan: &ExecutionPlan,
+        target: Arc<SequenceSession<R>>,
+        checkpoint: &SequenceCheckpoint<R>,
+        full_input: Arc<[u32]>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
     ) -> Result<NativeCheckpointStart<R>, VNextError> {
         let preparation = self.checkpoint_timings.start(
             StateTransferKind::Restore,
@@ -191,7 +232,13 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         };
         guard.validate_restore_input(Arc::clone(&full_input))?;
         drop(preparation);
-        let submission = self.submit_restore(guard, Arc::clone(&checkpoint.inner), layout, lane);
+        let submission = self.submit_restore_with_timing(
+            guard,
+            Arc::clone(&checkpoint.inner),
+            layout,
+            lane,
+            timing_mode,
+        );
         Ok(wrap_submission(
             submission,
             Some(RestoreInput { target, full_input }),

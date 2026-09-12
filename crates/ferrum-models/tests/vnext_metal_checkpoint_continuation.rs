@@ -40,6 +40,22 @@ fn gated_delta_f32_master_q4k_provider_resumes_public_native_checkpoint() {
 }
 
 #[test]
+fn native_checkpoint_completion_timing_preserves_metal_continuation() {
+    verify_with_timing(
+        AttentionKind::Causal,
+        &[0..64, 64..65],
+        &[65..73, 73..74],
+        DeviceTimingMode::Completion,
+    );
+    verify_with_timing(
+        AttentionKind::GatedDelta,
+        &[0..2, 2..5],
+        &[5..6, 6..9],
+        DeviceTimingMode::Completion,
+    );
+}
+
+#[test]
 fn causal_f32_master_captures_growing_decode_input_end() {
     verify_completed_input(AttentionKind::Causal, &[0..64, 64..65], &[65..66, 66..74]);
 }
@@ -134,7 +150,16 @@ fn verify(
     prefix: &[std::ops::Range<usize>],
     suffix: &[std::ops::Range<usize>],
 ) {
-    let fixture = Fixture::new(kind);
+    verify_with_timing(kind, prefix, suffix, DeviceTimingMode::Off);
+}
+
+fn verify_with_timing(
+    kind: AttentionKind,
+    prefix: &[std::ops::Range<usize>],
+    suffix: &[std::ops::Range<usize>],
+    timing: DeviceTimingMode,
+) {
+    let fixture = Fixture::new(kind).with_checkpoint_timing(timing);
     let total = suffix.last().unwrap().end;
     let tokens: Arc<[u32]> = (0..total)
         .map(|index| ((index * 7 + 3) % 32) as u32)
@@ -142,7 +167,9 @@ fn verify(
     let source = fixture.admit("source", Arc::clone(&tokens));
     let cold = fixture.admit("cold", Arc::clone(&tokens));
     let restored = fixture.admit("restored", Arc::clone(&tokens));
-    eprintln!("{kind:?}: F32-master hidden={HIDDEN}, native Q4_K projections, single participant, prefix={prefix:?}, suffix={suffix:?}; real embedding+attention FullPlan, native public capture/restore");
+    eprintln!(
+        "{kind:?}: F32-master hidden={HIDDEN}, native Q4_K projections, single participant, prefix={prefix:?}, suffix={suffix:?}; real embedding+attention FullPlan, native public capture/restore"
+    );
     let mut previous = None;
     for span in prefix {
         let expected = fixture.execute(&source, Arc::clone(&tokens), span.clone());

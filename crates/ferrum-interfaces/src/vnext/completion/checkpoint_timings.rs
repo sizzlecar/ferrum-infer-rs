@@ -1,8 +1,11 @@
-//! Host timing of the existing checkpoint path. No device query or wait is
-//! introduced here; these counters do not measure GPU execution time.
+//! Host phases and optional device timing of the existing checkpoint path.
+//! Device samples come only from its terminal receipt, without an extra wait.
 
 use super::{CompletionReaper, StateTransferKind};
-use crate::vnext::DeviceRuntime;
+use crate::vnext::{
+    DeviceExecutionTiming, DeviceRuntime, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason,
+};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,8 +26,46 @@ impl CheckpointTimingMeasurement {
     }
 }
 
+/// Device elapsed time is separate from host phases, not additive with them.
+/// Samples cover successful native transfers only. Restore elapsed time also
+/// includes any required initialization commands in that same submission.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CheckpointDeviceTimings {
+    pub measured: CheckpointTimingMeasurement,
+    pub not_requested: u64,
+    /// Timing was requested but the backend returned NotRequested rather
+    /// than a measurement or an explicit unavailable reason.
+    pub not_reported: u64,
+    pub unavailable: u64,
+    pub last_unavailable_reason: Option<DeviceTimingUnavailableReason>,
+    pub failed_or_unproven: u64,
+}
+
+/// Physical checkpoint-copy ranges submitted to the backend. These are not
+/// allocator padding or restore initialization bytes, nor proof that every
+/// submitted byte was executed when the transfer fails.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CheckpointCopyMeasurements {
+    pub samples: u64,
+    pub total_bytes: u64,
+    pub max_bytes: u64,
+    pub total_commands: u64,
+    pub max_commands: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CheckpointCopyGeometry {
+    pub bytes: u64,
+    pub commands: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CheckpointOperationTimings {
+    pub device_execution: CheckpointDeviceTimings,
+    pub submitted_copies: CheckpointCopyMeasurements,
+    /// Submission panicked after device visibility became possible. Kept
+    /// separate from known-submitted copies and never counted as success.
+    pub indeterminate_copies: CheckpointCopyMeasurements,
     /// Public facade validation and backing claim, including skipped and
     /// deferred attempts. Private native submission tests bypass this phase.
     pub prepare_claim: CheckpointTimingMeasurement,
@@ -52,7 +93,7 @@ pub struct CheckpointCacheTimings {
 }
 
 /// Host phase totals may overlap (notably abandoned recovery and the native
-/// phases it invokes). They must not be summed as device execution time.
+/// phases it invokes). They must not be summed with device execution time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CheckpointTimingSnapshot {
     pub capture: CheckpointOperationTimings,
@@ -81,15 +122,81 @@ pub(super) enum CheckpointTimingPhase {
 pub(super) struct CheckpointTimingCounters(Mutex<CheckpointTimingSnapshot>);
 
 impl CheckpointTimingCounters {
+    fn operation(
+        snapshot: &mut CheckpointTimingSnapshot,
+        kind: StateTransferKind,
+    ) -> &mut CheckpointOperationTimings {
+        match kind {
+            StateTransferKind::Capture => &mut snapshot.capture,
+            StateTransferKind::Restore => &mut snapshot.restore,
+        }
+    }
+
+    pub(super) fn record_copies(
+        &self,
+        kind: StateTransferKind,
+        geometry: CheckpointCopyGeometry,
+        indeterminate: bool,
+    ) {
+        let mut snapshot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = Self::operation(&mut snapshot, kind);
+        let copies = if indeterminate {
+            &mut operation.indeterminate_copies
+        } else {
+            &mut operation.submitted_copies
+        };
+        copies.samples = copies.samples.saturating_add(1);
+        copies.total_bytes = copies.total_bytes.saturating_add(geometry.bytes);
+        copies.max_bytes = copies.max_bytes.max(geometry.bytes);
+        copies.total_commands = copies.total_commands.saturating_add(geometry.commands);
+        copies.max_commands = copies.max_commands.max(geometry.commands);
+    }
+
+    pub(super) fn record_device_terminal(
+        &self,
+        kind: StateTransferKind,
+        mode: DeviceTimingMode,
+        succeeded: bool,
+        timing: Option<DeviceTimingMeasurement<DeviceExecutionTiming>>,
+    ) {
+        let mut snapshot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let device = &mut Self::operation(&mut snapshot, kind).device_execution;
+        if !mode.completion_enabled() {
+            device.not_requested = device.not_requested.saturating_add(1);
+        } else if !succeeded {
+            device.failed_or_unproven = device.failed_or_unproven.saturating_add(1);
+        } else {
+            match timing.unwrap_or(DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendMeasurementFailed,
+            )) {
+                DeviceTimingMeasurement::Measured(timing) => {
+                    device
+                        .measured
+                        .record(Duration::from_nanos(timing.elapsed_ns()));
+                }
+                DeviceTimingMeasurement::NotRequested => {
+                    device.not_reported = device.not_reported.saturating_add(1);
+                }
+                DeviceTimingMeasurement::Unavailable(reason) => {
+                    device.unavailable = device.unavailable.saturating_add(1);
+                    device.last_unavailable_reason = Some(reason);
+                }
+            }
+        }
+    }
+
     fn record(&self, kind: StateTransferKind, phase: CheckpointTimingPhase, elapsed: Duration) {
         let mut snapshot = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let operation = match kind {
-            StateTransferKind::Capture => &mut snapshot.capture,
-            StateTransferKind::Restore => &mut snapshot.restore,
-        };
+        let operation = Self::operation(&mut snapshot, kind);
         match phase {
             CheckpointTimingPhase::PrepareClaim => &mut operation.prepare_claim,
             CheckpointTimingPhase::EncodeSubmit => &mut operation.encode_submit,

@@ -1,5 +1,6 @@
 //! Native state-copy encoding without submission or completion authority.
 
+use super::super::CheckpointCopyGeometry;
 use super::{invalid_completion, StateTransferKind};
 use crate::vnext::{
     AllocationLifetime, BufferDescriptor, CheckpointBackingOwner, CopyRegion,
@@ -36,6 +37,7 @@ pub(super) struct StateTransferCopyRetentions {
 #[must_use = "encoded copies must be retained through submission or discarded before submission"]
 pub(super) struct PreparedStateTransferCopies<R: DeviceRuntime> {
     commands: Vec<R::Command>,
+    geometry: CheckpointCopyGeometry,
     kind: StateTransferKind,
     retentions: StateTransferCopyRetentions,
 }
@@ -118,8 +120,15 @@ impl<R: DeviceRuntime> PreparedStateTransferCopies<R> {
         let commands = encode_planned_copies(&planned, |source, destination, region| {
             runtime.encode_copy(source, destination, region)
         })?;
+        let geometry = CheckpointCopyGeometry {
+            bytes: planned.iter().fold(0_u64, |bytes, copy| {
+                bytes.saturating_add(copy.region.length_bytes())
+            }),
+            commands: commands.len() as u64,
+        };
         Ok(Self {
             commands,
+            geometry,
             kind,
             retentions: StateTransferCopyRetentions { _owners: owners },
         })
@@ -127,6 +136,10 @@ impl<R: DeviceRuntime> PreparedStateTransferCopies<R> {
 
     pub(super) fn len(&self) -> usize {
         self.commands.len()
+    }
+
+    pub(super) fn geometry(&self) -> CheckpointCopyGeometry {
+        self.geometry
     }
 
     /// Restore initialization must already precede these copies in `batch`.

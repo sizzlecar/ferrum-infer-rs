@@ -13,6 +13,9 @@ mod checkpoint_access_abandon_tests;
 #[path = "checkpoint_access_maintenance_tests.rs"]
 mod checkpoint_access_maintenance_tests;
 
+#[path = "checkpoint_access_timing_tests.rs"]
+mod checkpoint_access_timing_tests;
+
 fn access_submitted(
     start: NativeCheckpointStart<TestRuntime>,
 ) -> NativeCheckpointTransfer<TestRuntime> {
@@ -71,6 +74,9 @@ fn verify_public_continuation(numerics: CheckpointPartitionNumerics) {
     assert_eq!(timings.capture.encode_submit.samples, 1);
     assert_eq!(timings.capture.fence_recovery.samples, 1);
     assert_eq!(timings.capture.publication.samples, 1);
+    assert_eq!(timings.capture.device_execution.not_requested, 1);
+    assert_eq!(timings.capture.device_execution.measured.samples, 0);
+    assert_eq!(harness.runtime.timing_queries.load(Ordering::Relaxed), 0);
     assert_eq!(timings.restore, Default::default());
     assert_eq!(Arc::strong_count(&harness.session), source_refs);
     assert_eq!(checkpoint.token_prefix(), &[19]);

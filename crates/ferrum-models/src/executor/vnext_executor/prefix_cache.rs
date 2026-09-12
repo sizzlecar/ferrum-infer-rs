@@ -697,6 +697,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let resources = Arc::clone(&self.plan_resources);
             let source = Arc::clone(&sequence.session);
             let lane = Arc::clone(&self.lane);
+            let timing_mode = self.device_timing_mode();
             self
                 .completion_worker
                 .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
@@ -709,7 +710,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     let binding = resources
                         .trusted_runtime_binding()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
-                    let start = match reaper.try_capture_sequence_checkpoint(&plan, &binding, Arc::clone(&source), lane) {
+                    let start = match reaper.try_capture_sequence_checkpoint_with_timing(&plan, &binding, Arc::clone(&source), lane, timing_mode) {
                         Ok(NativeCheckpointStart::NotSubmitted(error)) | Err(error) => {
                             // A cancelled/poisoned source is not a cache miss.
                             // This existing projection rechecks the exact Open
@@ -887,13 +888,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let plan = self.resolved_plan.execution_plan().clone();
         let target = Arc::clone(&sequence.session);
         let lane = Arc::clone(&self.lane);
+        let timing_mode = self.device_timing_mode();
         let full_input: Arc<[u32]> = Arc::from(tokens.as_slice());
         let result = self
             .completion_worker
             .execute(VNextCompletionTaskKind::CheckpointTransfer, move || {
                 let _ = reaper.recover_abandoned_checkpoints(MAX_COMPLETION_SWEEP_SLOTS);
                 let start = reaper
-                    .try_restore_sequence_checkpoint(&plan, target, &checkpoint, full_input, lane)
+                    .try_restore_sequence_checkpoint_with_timing(
+                        &plan,
+                        target,
+                        &checkpoint,
+                        full_input,
+                        lane,
+                        timing_mode,
+                    )
                     .map_err(|error| FerrumError::backend(error.to_string()))?;
                 finish_transfer(&reaper, start)
             })
@@ -908,12 +917,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Some(NativeCheckpointResult::Failed(reason)) => {
                 return Err(FerrumError::backend(format!(
                     "prefix restore failed: {reason:?}"
-                )))
+                )));
             }
             _ => {
                 return Err(FerrumError::internal(
                     "restore returned a non-restore result",
-                ))
+                ));
             }
         };
         if publication.completed_tokens() != restored_tokens

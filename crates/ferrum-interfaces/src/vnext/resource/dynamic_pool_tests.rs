@@ -6,8 +6,9 @@ use crate::model_executor::{
 use crate::vnext::{
     BoundExecutionResourceMaintenance, CapacityAvailabilitySource, CopyRegion, DeferredAction,
     DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
-    DeviceErrorReport, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionTrim, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
+    DeviceErrorReport, DeviceExecutionTiming, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
     ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ProgramValueId, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
     ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
@@ -103,6 +104,14 @@ struct TestRuntime {
     reusable_trim_calls: AtomicU64,
     fence_behavior: AtomicU8,
     submit_behavior: AtomicU8,
+    device_timing: Mutex<DeviceTimingMeasurement<DeviceExecutionTiming>>,
+    timing_queries: AtomicU64,
+    submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
+    encoded_copy_regions: Mutex<Vec<CopyRegion>>,
+}
+
+struct TestFence {
+    timing_mode: DeviceTimingMode,
 }
 
 #[derive(Clone, Copy)]
@@ -158,11 +167,27 @@ impl TestRuntime {
             reusable_trim_calls: AtomicU64::new(0),
             fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
             submit_behavior: AtomicU8::new(TestSubmitBehavior::Submitted as u8),
+            device_timing: Mutex::new(DeviceTimingMeasurement::NotRequested),
+            timing_queries: AtomicU64::new(0),
+            submitted_timing_modes: Mutex::new(Vec::new()),
+            encoded_copy_regions: Mutex::new(Vec::new()),
         }
     }
 
     fn set_fence_behavior(&self, behavior: TestFenceBehavior) {
         self.fence_behavior.store(behavior as u8, Ordering::Release);
+    }
+
+    fn terminal_receipt(
+        &self,
+        fence: &TestFence,
+        terminal: DeviceTerminal<TestRuntimeError>,
+    ) -> DeviceTerminalReceipt<TestRuntimeError> {
+        if !fence.timing_mode.completion_enabled() {
+            return DeviceTerminalReceipt::unprofiled(terminal);
+        }
+        self.timing_queries.fetch_add(1, Ordering::Relaxed);
+        DeviceTerminalReceipt::profiled(terminal, *self.device_timing.lock().unwrap())
     }
 
     fn set_submit_behavior(&self, behavior: TestSubmitBehavior) {
@@ -243,7 +268,7 @@ impl DeviceRuntime for TestRuntime {
     type Buffer = TestBuffer;
     type Stream = TestStream;
     type Command = ();
-    type Fence = ();
+    type Fence = TestFence;
     type Error = TestRuntimeError;
 
     fn descriptor(&self) -> &DeviceDescriptor {
@@ -313,8 +338,9 @@ impl DeviceRuntime for TestRuntime {
         &self,
         _source: &Self::Buffer,
         _destination: &Self::Buffer,
-        _region: CopyRegion,
+        region: CopyRegion,
     ) -> Result<Self::Command, Self::Error> {
+        self.encoded_copy_regions.lock().unwrap().push(region);
         Ok(())
     }
 
@@ -340,26 +366,30 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _commands: DeviceCommandBatch<Self::Command>,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        self.submitted_timing_modes
+            .lock()
+            .unwrap()
+            .push(commands.timing_mode());
         match self.submit_behavior.load(Ordering::Acquire) {
-            0 => Ok(()),
+            0 => Ok(TestFence {
+                timing_mode: commands.timing_mode(),
+            }),
             1 => Err(DefinitelyNotSubmitted::new(TestRuntimeError)),
             2 => panic!("injected native submit panic with unknown device visibility"),
             _ => unreachable!("test submit behavior is set through its typed setter"),
         }
     }
 
-    fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {
+    fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
         match self.fence_behavior() {
             TestFenceBehavior::Succeeded => {
-                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+                FenceQuery::Terminal(self.terminal_receipt(fence, DeviceTerminal::Succeeded))
             }
-            TestFenceBehavior::FailedButQuiescent => {
-                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(
-                    DeviceTerminal::FailedButQuiescent(TestRuntimeError),
-                ))
-            }
+            TestFenceBehavior::FailedButQuiescent => FenceQuery::Terminal(
+                self.terminal_receipt(fence, DeviceTerminal::FailedButQuiescent(TestRuntimeError)),
+            ),
             TestFenceBehavior::Indeterminate => FenceQuery::Indeterminate(TestRuntimeError),
             TestFenceBehavior::Pending => FenceQuery::Pending,
         }
@@ -367,15 +397,16 @@ impl DeviceRuntime for TestRuntime {
 
     fn wait_fence(
         &self,
-        _fence: &Self::Fence,
+        fence: &Self::Fence,
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         match self.fence_behavior() {
             TestFenceBehavior::Succeeded => {
-                Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+                Ok(self.terminal_receipt(fence, DeviceTerminal::Succeeded))
             }
-            TestFenceBehavior::FailedButQuiescent => Ok(DeviceTerminalReceipt::unprofiled(
-                DeviceTerminal::FailedButQuiescent(TestRuntimeError),
-            )),
+            TestFenceBehavior::FailedButQuiescent => {
+                Ok(self
+                    .terminal_receipt(fence, DeviceTerminal::FailedButQuiescent(TestRuntimeError)))
+            }
             TestFenceBehavior::Indeterminate | TestFenceBehavior::Pending => {
                 Err(FenceIndeterminate::new(TestRuntimeError))
             }

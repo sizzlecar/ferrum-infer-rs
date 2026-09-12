@@ -5,7 +5,8 @@ use super::super::{
 use super::*;
 use crate::vnext::{
     CheckpointCapturePermit, CompletionReaper, CompletionSlotId, DeferredDeviceCleanupDomainId,
-    DeviceTerminal, FenceQuery, SequenceCheckpointLayout,
+    DeviceExecutionTiming, DeviceTerminal, DeviceTimingMeasurement, DeviceTimingMode, FenceQuery,
+    SequenceCheckpointLayout,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Weak;
@@ -41,6 +42,7 @@ enum TransferPhase<F> {
 pub(in crate::vnext::completion) struct StateTransferRecord<R: DeviceRuntime> {
     timing_kind: StateTransferKind,
     timings: Arc<CheckpointTimingCounters>,
+    timing_mode: DeviceTimingMode,
     resources: Option<StateTransferLease<R>>,
     lane: Arc<ExecutionLane<R>>,
     outbox: Arc<StateTransferResultSlot<R>>,
@@ -69,6 +71,7 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
     fn publish_terminal(
         &mut self,
         reason: Option<StateTransferFailureReason>,
+        device_timing: Option<DeviceTimingMeasurement<DeviceExecutionTiming>>,
     ) -> Result<(), VNextError> {
         let _timing = self
             .timings
@@ -93,6 +96,15 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
                 ),
             },
         };
+        self.timings.record_device_terminal(
+            self.timing_kind,
+            self.timing_mode,
+            matches!(
+                &result,
+                StateTransferResult::Captured(_) | StateTransferResult::RestoreReady(_)
+            ),
+            device_timing,
+        );
         self.phase = TransferPhase::Ready;
         self.outbox.publish(result).map_err(|failure| {
             // Dropping a rejected restore result cancels its exact target.
@@ -114,12 +126,7 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
             let _timing = self
                 .timings
                 .start(self.timing_kind, CheckpointTimingPhase::FenceRecovery);
-            super::super::observe_device_fence(
-                &self.lane,
-                fence,
-                blocking,
-                crate::vnext::DeviceTimingMode::Off,
-            )
+            super::super::observe_device_fence(&self.lane, fence, blocking, self.timing_mode)
         };
         let terminal = match observation {
             Ok(FenceQuery::Pending) => return Ok(StateTransferObservation::Pending),
@@ -141,8 +148,8 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
         };
         // The terminal receipt itself proves quiescence. A panic while
         // checking its metadata cannot turn it into successful capture.
+        let (terminal, execution_timing, _) = terminal.into_parts();
         let reason = catch_unwind(AssertUnwindSafe(|| {
-            let (terminal, _, _) = terminal.into_parts();
             if !self.lane.current_descriptor_matches_snapshot() {
                 return Some(StateTransferFailureReason::ContractFailedButQuiescent(
                     "native transfer runtime descriptor changed".into(),
@@ -176,7 +183,7 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
             .take()
             .map(StateTransferFailureReason::ContractFailedButQuiescent)
             .or(reason);
-        self.publish_terminal(reason)?;
+        self.publish_terminal(reason, Some(execution_timing))?;
         Ok(StateTransferObservation::Ready)
     }
 
@@ -203,7 +210,7 @@ impl<R: DeviceRuntime> StateTransferRecord<R> {
             self.lane.drain(has_fence)
         };
         if drained {
-            self.publish_terminal(Some(StateTransferFailureReason::AbandonedAfterDrain))?;
+            self.publish_terminal(Some(StateTransferFailureReason::AbandonedAfterDrain), None)?;
             return Ok(StateTransferObservation::Ready);
         }
         let old = std::mem::replace(&mut self.phase, TransferPhase::SubmissionIndeterminate);
@@ -319,6 +326,7 @@ struct TransferReservation<R: DeviceRuntime> {
     record: SharedCompletionRecord<R>,
     resources: Option<StateTransferLease<R>>,
     lane: Arc<ExecutionLane<R>>,
+    timing_mode: DeviceTimingMode,
     outbox: Arc<StateTransferResultSlot<R>>,
     submission_started: bool,
     finished: bool,
@@ -358,6 +366,7 @@ impl<R: DeviceRuntime> TransferReservation<R> {
         *record = CompletionRecord::StateTransfer(StateTransferRecord {
             timing_kind: resources.identity().kind,
             timings: Arc::clone(&self.reaper.checkpoint_timings),
+            timing_mode: self.timing_mode,
             resources: Some(resources),
             lane: Arc::clone(&self.lane),
             outbox: Arc::clone(&self.outbox),
@@ -393,6 +402,7 @@ impl<R: DeviceRuntime> Drop for TransferReservation<R> {
 }
 
 impl<R: DeviceRuntime> CompletionReaper<R> {
+    #[cfg(test)]
     pub(crate) fn submit_capture(
         self: &Arc<Self>,
         source: PreparedSequenceStateTransfer<R>,
@@ -400,14 +410,26 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         byte_plan: Arc<SequenceCheckpointBytePlan>,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<StateTransferSubmission<R>, VNextError> {
+        self.submit_capture_with_timing(source, permit, byte_plan, lane, DeviceTimingMode::Off)
+    }
+
+    pub(crate) fn submit_capture_with_timing(
+        self: &Arc<Self>,
+        source: PreparedSequenceStateTransfer<R>,
+        permit: CheckpointCapturePermit<R>,
+        byte_plan: Arc<SequenceCheckpointBytePlan>,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+    ) -> Result<StateTransferSubmission<R>, VNextError> {
         let _timing = self.checkpoint_timings.start(
             StateTransferKind::Capture,
             CheckpointTimingPhase::EncodeSubmit,
         );
         let resources = StateTransferLease::capture(source, permit, byte_plan, &lane)?;
-        self.submit_state_transfer(resources, lane)
+        self.submit_state_transfer(resources, lane, timing_mode)
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_restore(
         self: &Arc<Self>,
         target: PreparedSequenceStateTransfer<R>,
@@ -415,19 +437,38 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         layout: &SequenceCheckpointLayout,
         lane: Arc<ExecutionLane<R>>,
     ) -> Result<StateTransferSubmission<R>, VNextError> {
+        self.submit_restore_with_timing(target, checkpoint, layout, lane, DeviceTimingMode::Off)
+    }
+
+    pub(crate) fn submit_restore_with_timing(
+        self: &Arc<Self>,
+        target: PreparedSequenceStateTransfer<R>,
+        checkpoint: Arc<CapturedCheckpoint<R>>,
+        layout: &SequenceCheckpointLayout,
+        lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
+    ) -> Result<StateTransferSubmission<R>, VNextError> {
         let _timing = self.checkpoint_timings.start(
             StateTransferKind::Restore,
             CheckpointTimingPhase::EncodeSubmit,
         );
         let resources = StateTransferLease::restore(target, checkpoint, layout, &lane)?;
-        self.submit_state_transfer(resources, lane)
+        self.submit_state_transfer(resources, lane, timing_mode)
     }
 
     fn submit_state_transfer(
         self: &Arc<Self>,
         resources: StateTransferLease<R>,
         lane: Arc<ExecutionLane<R>>,
+        timing_mode: DeviceTimingMode,
     ) -> Result<StateTransferSubmission<R>, VNextError> {
+        // Transfers have no compute kernels to attribute. Reuse terminal
+        // elapsed timing without enabling counter buffers or encoder changes.
+        let timing_mode = if timing_mode.completion_enabled() {
+            DeviceTimingMode::Completion
+        } else {
+            DeviceTimingMode::Off
+        };
         let (slot_id, record) = self.reserve_slot()?;
         let outbox = StateTransferResultSlot::new(slot_id, Arc::clone(resources.identity()));
         let mut reservation = TransferReservation {
@@ -436,6 +477,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             record,
             resources: Some(resources),
             lane: Arc::clone(&lane),
+            timing_mode,
             outbox,
             submission_started: false,
             finished: false,
@@ -444,7 +486,8 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             .resources
             .as_mut()
             .expect("reservation owns native resources");
-        let commands = resources.encode(&lane)?;
+        let kind = resources.identity().kind;
+        let (commands, geometry) = resources.encode(&lane, timing_mode)?;
         let mut enqueue = lane.reserve_enqueue()?;
         resources.mark_possibly_submitted()?;
         reservation.submission_started = true;
@@ -452,6 +495,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         drop(enqueue);
         match submitted {
             LaneSubmitOutcome::Submitted(fence) => {
+                self.checkpoint_timings.record_copies(kind, geometry, false);
                 let transition = reservation.install(TransferPhase::InFlight {
                     fence,
                     recovery: CompletionRecoveryState::Unobserved,
@@ -476,6 +520,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 )))
             }
             LaneSubmitOutcome::PossiblySubmittedPanic => {
+                self.checkpoint_timings.record_copies(kind, geometry, true);
                 reservation.install(TransferPhase::SubmissionIndeterminate)?;
                 Ok(StateTransferSubmission::Indeterminate(reservation.handle()))
             }

@@ -11,6 +11,7 @@ pub struct Fixture {
     lane: Arc<ExecutionLane<Runtime>>,
     reaper: Arc<CompletionReaper<Runtime>>,
     states: Vec<StateSpec>,
+    checkpoint_timing_mode: DeviceTimingMode,
 }
 
 impl Fixture {
@@ -157,6 +158,39 @@ impl Fixture {
             lane,
             reaper: CompletionReaper::new(),
             states,
+            checkpoint_timing_mode: DeviceTimingMode::Off,
+        }
+    }
+
+    pub fn with_checkpoint_timing(mut self, mode: DeviceTimingMode) -> Self {
+        self.checkpoint_timing_mode = mode;
+        self
+    }
+
+    fn assert_checkpoint_timing(&self, operation: CheckpointOperationTimings, bytes: u64) {
+        assert_eq!(operation.submitted_copies.samples, 1);
+        assert_eq!(operation.submitted_copies.total_bytes, bytes);
+        assert!(operation.submitted_copies.total_commands > 0);
+        let device = operation.device_execution;
+        assert_eq!(device.failed_or_unproven, 0);
+        if self.checkpoint_timing_mode == DeviceTimingMode::Off {
+            assert_eq!(device.not_requested, 1);
+            assert_eq!(device.measured.samples, 0);
+            assert_eq!(device.unavailable, 0);
+        } else {
+            assert_eq!(device.not_requested, 0);
+            if device.unavailable == 0 {
+                assert_eq!(device.measured.samples, 1);
+            } else {
+                assert_eq!(device.measured.samples, 0);
+                assert_eq!(device.unavailable, 1);
+                assert_eq!(
+                    device.last_unavailable_reason,
+                    Some(DeviceTimingUnavailableReason::BackendUnsupported)
+                );
+                eprintln!("checkpoint device timestamp unavailable: backend unsupported");
+            }
+            eprintln!("checkpoint terminal timing and copy ranges: {operation:?}");
         }
     }
 
@@ -485,11 +519,12 @@ impl Fixture {
         assert_eq!(before.pending_growth_bytes, 0);
         let start = self
             .reaper
-            .try_capture_sequence_checkpoint(
+            .try_capture_sequence_checkpoint_with_timing(
                 self.compilation.executable().execution_plan(),
                 &binding,
                 Arc::clone(source),
                 Arc::clone(&self.lane),
+                self.checkpoint_timing_mode,
             )
             .unwrap();
         let NativeCheckpointStart::CapacityMaintenance {
@@ -538,15 +573,20 @@ impl Fixture {
         // source reservation. Re-enter the complete authenticated capture path.
         let start = self
             .reaper
-            .try_capture_sequence_checkpoint(
+            .try_capture_sequence_checkpoint_with_timing(
                 self.compilation.executable().execution_plan(),
                 &binding,
                 Arc::clone(source),
                 Arc::clone(&self.lane),
+                self.checkpoint_timing_mode,
             )
             .unwrap();
         match finish(start) {
             NativeCheckpointResult::Captured(value) => {
+                self.assert_checkpoint_timing(
+                    self.reaper.checkpoint_timing_snapshot().capture,
+                    value.logical_bytes(),
+                );
                 let captured = CapacitySnapshot::observe(&self.resources);
                 assert!(captured.checkpoint_claims > 0);
                 assert!(captured.checkpoint_bytes > 0);
@@ -567,12 +607,13 @@ impl Fixture {
     ) {
         let start = self
             .reaper
-            .try_restore_sequence_checkpoint(
+            .try_restore_sequence_checkpoint_with_timing(
                 self.compilation.executable().execution_plan(),
                 Arc::clone(target),
                 checkpoint,
                 tokens,
                 Arc::clone(&self.lane),
+                self.checkpoint_timing_mode,
             )
             .unwrap();
         match finish(start) {
@@ -583,6 +624,10 @@ impl Fixture {
                     checkpoint.completed_tokens()
                 );
                 publication.acknowledge().unwrap();
+                self.assert_checkpoint_timing(
+                    self.reaper.checkpoint_timing_snapshot().restore,
+                    checkpoint.logical_bytes(),
+                );
             }
             _ => panic!("restore did not publish its exact target frontier"),
         }
