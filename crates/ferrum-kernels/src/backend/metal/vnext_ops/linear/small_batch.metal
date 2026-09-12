@@ -1,6 +1,7 @@
 // Small decode batches reuse packed weights across independent activation rows.
 // Quantized dot-product order follows q4_k_gemv_v2.metal / q6_k_gemv.metal;
-// F16 input/output, FP32 arithmetic and SIMD reduction remain unchanged.
+// Input/output retain their declared F16 or F32 type; arithmetic and SIMD
+// reduction remain FP32, including the model's F32 vocabulary boundary.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -15,9 +16,9 @@ struct Params {
     uint output_column_offset;
 };
 
-template <ushort B>
-void q4_shared(device const half * input, device const Q4Block * weights,
-               device half * output, constant Params & p,
+template <ushort B, typename T>
+void q4_shared(device const T * input, device const Q4Block * weights,
+               device T * output, constant Params & p,
                uint group, ushort lane, ushort simdgroup) {
     const uint first = (group * 2 + simdgroup) * 2;
     if (first >= p.out_features) return;
@@ -44,7 +45,7 @@ void q4_shared(device const half * input, device const Q4Block * weights,
             const float d = w.d;
             const float dmin = w.dmin;
             UNROLL (ushort batch = 0; batch < B; ++batch) {
-                device const half * y = input + ulong(batch) * p.in_features
+                device const T * y = input + ulong(batch) * p.in_features
                     + block * 256 + 64 * iq + 8 * ir;
                 float yl[16], yh[16];
                 float4 sumy = 0.0f;
@@ -79,14 +80,14 @@ void q4_shared(device const half * input, device const Q4Block * weights,
         UNROLL (ushort row = 0; row < 2; ++row) {
             if (first + row >= p.out_features) continue;
             const float sum = simd_sum(sums[batch][row]);
-            if (lane == 0) output[ulong(batch) * p.output_stride + p.output_column_offset + first + row] = half(sum);
+            if (lane == 0) output[ulong(batch) * p.output_stride + p.output_column_offset + first + row] = T(sum);
         }
     }
 }
 
-template <ushort B>
-void q6_shared(device const half * input, device const Q6Block * weights,
-               device half * output, constant Params & p,
+template <ushort B, typename T>
+void q6_shared(device const T * input, device const Q6Block * weights,
+               device T * output, constant Params & p,
                uint group, ushort lane, ushort simdgroup) {
     const uint first = (group * 2 + simdgroup) * 2;
     if (first >= p.out_features) return;
@@ -114,7 +115,7 @@ void q6_shared(device const half * input, device const Q6Block * weights,
             const float4 scale = float4(sc[0], sc[2], sc[4], sc[6]);
             const float d = w.d;
             UNROLL (ushort batch = 0; batch < B; ++batch) {
-                device const half * y = input + ulong(batch) * p.in_features
+                device const T * y = input + ulong(batch) * p.in_features
                     + block * 256 + 128 * ip + l0;
                 float4 partial = 0.0f;
                 UNROLL (ushort l = 0; l < 4; ++l) {
@@ -132,30 +133,33 @@ void q6_shared(device const half * input, device const Q6Block * weights,
         UNROLL (ushort row = 0; row < 2; ++row) {
             if (first + row >= p.out_features) continue;
             const float sum = simd_sum(sums[batch][row]);
-            if (lane == 0) output[ulong(batch) * p.output_stride + p.output_column_offset + first + row] = half(sum);
+            if (lane == 0) output[ulong(batch) * p.output_stride + p.output_column_offset + first + row] = T(sum);
         }
     }
 }
 
-#define ENTRY(FORMAT, B) \
-kernel void FORMAT##_shared_b##B( \
-    device const half * input [[buffer(0)]], \
+#define ENTRY(FORMAT, B, T, NAME) \
+kernel void NAME( \
+    device const T * input [[buffer(0)]], \
     device const FORMAT##Block * weights [[buffer(1)]], \
-    device half * output [[buffer(2)]], \
+    device T * output [[buffer(2)]], \
     constant Params & p [[buffer(3)]], \
     uint3 group [[threadgroup_position_in_grid]], \
     ushort lane [[thread_index_in_simdgroup]], \
     ushort simdgroup [[simdgroup_index_in_threadgroup]]) { \
     if (p.rows != B) return; \
-    FORMAT##_shared<B>(input, weights, output, p, group.x, lane, simdgroup); \
+    FORMAT##_shared<B, T>(input, weights, output, p, group.x, lane, simdgroup); \
 }
 
 // Token aliases keep the exported pipeline names lower-case.
 typedef Q4Block q4Block;
 typedef Q6Block q6Block;
-ENTRY(q4, 2)
-ENTRY(q4, 3)
-ENTRY(q4, 4)
-ENTRY(q6, 2)
-ENTRY(q6, 3)
-ENTRY(q6, 4)
+ENTRY(q4, 2, half, q4_shared_b2)
+ENTRY(q4, 3, half, q4_shared_b3)
+ENTRY(q4, 4, half, q4_shared_b4)
+ENTRY(q6, 2, half, q6_shared_b2)
+ENTRY(q6, 3, half, q6_shared_b3)
+ENTRY(q6, 4, half, q6_shared_b4)
+ENTRY(q6, 2, float, q6_shared_f32_b2)
+ENTRY(q6, 3, float, q6_shared_f32_b3)
+ENTRY(q6, 4, float, q6_shared_f32_b4)

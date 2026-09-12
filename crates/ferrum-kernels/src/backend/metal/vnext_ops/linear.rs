@@ -216,6 +216,21 @@ impl MetalLinearPipelines {
             }
         }
     }
+
+    fn f32_linear_dispatch(
+        &self,
+        format: LinearPhysicalFormat,
+        rows: u32,
+        out_features: u32,
+    ) -> Option<(&ComputePipelineState, LinearDispatchKind)> {
+        if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+            if let Some(pipeline) = self.small_batch.f32_pipeline(format, rows) {
+                return Some((pipeline, LinearDispatchKind::SharedWeightGemv));
+            }
+        }
+        self.f32_linear_pipeline(format)
+            .map(|pipeline| (pipeline, LinearDispatchKind::CooperativeGemv))
+    }
 }
 
 pub(super) struct MetalDenseLinearProvider {
@@ -1462,12 +1477,13 @@ pub(super) fn dispatch_linear(
             launch.params.rows,
             launch.params.out_features,
         ),
-        ElementType::F32 => (
-            pipelines
-                .f32_linear_pipeline(launch.format)
-                .expect("validated Metal F32 linear format"),
-            LinearDispatchKind::CooperativeGemv,
-        ),
+        ElementType::F32 => pipelines
+            .f32_linear_dispatch(
+                launch.format,
+                launch.params.rows,
+                launch.params.out_features,
+            )
+            .expect("validated Metal F32 linear format"),
         _ => unreachable!("validated Metal linear activation ABI"),
     };
     encoder.set_compute_pipeline_state(pipeline);
