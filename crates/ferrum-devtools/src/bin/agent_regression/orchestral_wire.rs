@@ -267,6 +267,7 @@ fn project_exchange(
         "public exchange roles changed"
     );
     let mut texts = Vec::new();
+    let mut reasoning = None;
     for block in exchange.assistant["content"]
         .as_array()
         .context("missing public assistant content")?
@@ -285,12 +286,28 @@ fn project_exchange(
                     .to_string(),
             ),
             Some("tool_call") => {}
+            Some("continuation") => {
+                ensure!(
+                    block["namespace"] == "openai-compatible/reasoning-content/v1"
+                        && reasoning.is_none(),
+                    "unknown or duplicate public continuation"
+                );
+                reasoning = Some(
+                    block["value"]
+                        .as_str()
+                        .context("invalid public reasoning")?,
+                );
+            }
             _ => anyhow::bail!("unsupported public assistant content"),
         }
     }
     ensure!(
         texts.join("\n") == response.text,
         "raw visible assistant content differs from public exchange"
+    );
+    ensure!(
+        reasoning == response.reasoning.as_deref(),
+        "raw/public message continuation differs"
     );
     ensure!(
         !exchange.calls.is_empty() && exchange.calls.len() == response.calls.len(),
@@ -342,13 +359,14 @@ fn project_exchange(
         ordered.push(results.remove(id).context("unpaired public tool result")?);
     }
     ensure!(results.is_empty(), "public tool result was not replayed");
-    Ok((
-        json!({
-            "role":"assistant", "content":if texts.is_empty() {Value::Null} else {Value::String(texts.join("\n"))},
-            "tool_calls":calls,
-        }),
-        ordered,
-    ))
+    let mut assistant = json!({
+        "role":"assistant", "content":if texts.is_empty() {Value::Null} else {Value::String(texts.join("\n"))},
+        "tool_calls":calls,
+    });
+    if let Some(reasoning) = reasoning {
+        assistant["reasoning_content"] = reasoning.into();
+    }
+    Ok((assistant, ordered))
 }
 
 fn tool_result_content(
@@ -384,6 +402,7 @@ fn sha(bytes: &[u8]) -> String {
 struct Response {
     id: String,
     text: String,
+    reasoning: Option<String>,
     calls: Vec<Call>,
     finish: String,
     sha256: String,
@@ -407,6 +426,7 @@ struct CallFragments {
 struct Frames {
     id: Option<String>,
     text: String,
+    reasoning: Option<String>,
     calls: BTreeMap<u64, CallFragments>,
     finish: Option<String>,
     done: bool,
@@ -438,11 +458,32 @@ impl Frames {
             let delta = &choice["delta"];
             let text = delta.get("content").and_then(Value::as_str).unwrap_or("");
             let calls = delta.get("tool_calls").filter(|calls| !calls.is_null());
+            let mut reasoning = None;
+            for field in ["reasoning_content", "reasoning", "reasoning_text"] {
+                if let Some(value) = delta.get(field).filter(|value| !value.is_null()) {
+                    let fragment = value.as_str().context("non-text SSE reasoning")?;
+                    ensure!(
+                        reasoning.is_none_or(|previous: &str| previous.is_empty()
+                            || fragment.is_empty()
+                            || previous == fragment),
+                        "conflicting SSE reasoning aliases"
+                    );
+                    if reasoning.is_none() || !fragment.is_empty() {
+                        reasoning = Some(fragment);
+                    }
+                }
+            }
             ensure!(
-                self.finish.is_none() || (text.is_empty() && calls.is_none()),
+                self.finish.is_none()
+                    || (text.is_empty() && calls.is_none() && reasoning.is_none()),
                 "content follows finish reason"
             );
             self.text.push_str(text);
+            if let Some(fragment) = reasoning {
+                self.reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(fragment);
+            }
             if let Some(calls) = calls {
                 for fragment in calls.as_array().context("SSE tool_calls is not an array")? {
                     let index = fragment["index"]
@@ -512,6 +553,7 @@ impl Frames {
         Ok(Response {
             id: self.id.context("raw SSE omitted response identity")?,
             text: self.text,
+            reasoning: self.reasoning,
             calls,
             finish: self.finish.context("raw SSE omitted finish reason")?,
             sha256,
@@ -551,6 +593,10 @@ fn read_sse(path: &Path) -> Result<Response> {
 mod tests {
     use super::*;
     use std::fs;
+
+    mod reasoning_tests {
+        include!("orchestral_wire/reasoning_tests.rs");
+    }
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -706,7 +752,7 @@ mod tests {
         let arguments = arguments.to_string();
         let (first, second) = arguments.split_at(arguments.len() / 2);
         let frames = [
-            json!({"id":format!("http-response-{index}"),"choices":[{"index":0,"delta":{"content":text,"reasoning_content":"private thinking is not visible context","tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"file_read","arguments":first}}]},"finish_reason":null}]}),
+            json!({"id":format!("http-response-{index}"),"choices":[{"index":0,"delta":{"content":text,"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"file_read","arguments":first}}]},"finish_reason":null}]}),
             json!({"id":format!("http-response-{index}"),"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":second}}]},"finish_reason":"tool_calls"}]}),
         ];
         write_frames(dir, index, &frames);
