@@ -18,6 +18,8 @@ pub struct HttpRequestSampling {
     pub top_k: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
     /// Generation seed, independent of the benchmark's prompt-generation seed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
@@ -29,6 +31,7 @@ impl HttpRequestSampling {
             temperature: self.temperature,
             top_k: self.top_k,
             top_p: self.top_p.unwrap_or(1.0),
+            repetition_penalty: self.repetition_penalty.unwrap_or(1.0),
             seed: self.seed,
             ..ferrum_types::SamplingParams::greedy()
         }
@@ -343,6 +346,16 @@ mod tests {
         assert_eq!(restored.http_request_sampling, None);
         assert_eq!(restored.hash(), old.hash());
 
+        let legacy_sampling: HttpRequestSampling = serde_json::from_value(serde_json::json!({
+            "temperature": 0.6, "top_k": 20, "top_p": 0.95, "seed": 42
+        }))
+        .unwrap();
+        assert_eq!(legacy_sampling.repetition_penalty, None);
+        assert!(serde_json::to_value(legacy_sampling)
+            .unwrap()
+            .get("repetition_penalty")
+            .is_none());
+
         let mut baseline = old.clone();
         baseline.http_request_sampling = Some(HttpRequestSampling::default());
         assert_ne!(baseline.hash(), old.hash());
@@ -357,6 +370,10 @@ mod tests {
             },
             HttpRequestSampling {
                 top_p: Some(0.95),
+                ..Default::default()
+            },
+            HttpRequestSampling {
+                repetition_penalty: Some(1.0),
                 ..Default::default()
             },
             HttpRequestSampling {

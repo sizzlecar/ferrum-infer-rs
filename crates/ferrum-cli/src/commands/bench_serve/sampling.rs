@@ -16,6 +16,10 @@ pub struct BenchSamplingArgs {
     #[arg(long)]
     pub top_p: Option<f32>,
 
+    /// Positive repetition penalty; 1 disables it. Omitted unless set.
+    #[arg(long)]
+    pub repetition_penalty: Option<f32>,
+
     /// Generation seed sent unchanged in every request; separate from --seed.
     #[arg(long)]
     pub sampling_seed: Option<u64>,
@@ -27,6 +31,7 @@ impl BenchSamplingArgs {
             temperature: self.temperature,
             top_k: self.top_k,
             top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
             seed: self.sampling_seed,
         }
     }
@@ -110,6 +115,8 @@ mod tests {
             "20",
             "--top-p",
             "0.95",
+            "--repetition-penalty",
+            "1.0",
         ]);
         validate_command(&command).unwrap();
         assert_eq!(command.seed, Some(11));
@@ -117,6 +124,7 @@ mod tests {
             temperature: 0.6,
             top_k: Some(20),
             top_p: Some(0.95),
+            repetition_penalty: Some(1.0),
             seed: Some(37),
         };
         let wire = body(&command);
@@ -138,6 +146,8 @@ mod tests {
             "20",
             "--top-p",
             "0.95",
+            "--repetition-penalty",
+            "1.0",
         ]);
         assert_eq!(body(&changed_prompt_seed), wire);
     }
@@ -156,6 +166,11 @@ mod tests {
             "--top-p=inf",
             "--top-p=-inf",
             "--top-k=0",
+            "--repetition-penalty=0",
+            "--repetition-penalty=-0.1",
+            "--repetition-penalty=NaN",
+            "--repetition-penalty=inf",
+            "--repetition-penalty=-inf",
         ] {
             let command = parse(&[argument]);
             assert!(validate_command(&command).is_err(), "accepted {argument}");
@@ -174,5 +189,13 @@ mod tests {
         assert_eq!(body(&boundary)["seed"], 0);
         assert_eq!(body(&boundary)["top_k"], 1);
         assert_eq!(body(&boundary)["top_p"], 1.0);
+        for value in ["0.5", "1.0", "2.0"] {
+            let command = parse(&["--repetition-penalty", value]);
+            validate_command(&command).unwrap();
+            assert_eq!(
+                body(&command)["repetition_penalty"],
+                json!(value.parse::<f32>().unwrap())
+            );
+        }
     }
 }

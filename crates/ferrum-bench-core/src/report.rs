@@ -351,6 +351,7 @@ mod tests {
             temperature: 0.6,
             top_k: Some(20),
             top_p: Some(0.95),
+            repetition_penalty: Some(1.0),
             seed: Some(37),
         };
         report.env.http_request_sampling = Some(sampling);

@@ -966,6 +966,7 @@ mod tests {
         cmd.sampling.temperature = 0.6;
         cmd.sampling.top_k = Some(20);
         cmd.sampling.top_p = Some(0.95);
+        cmd.sampling.repetition_penalty = Some(1.0);
         cmd.sampling.sampling_seed = Some(37);
         cmd.seed = Some(11);
         cmd
@@ -990,6 +991,7 @@ mod tests {
         );
         assert_eq!(requests.len(), measured + 1);
         for (_, _, body) in requests.iter() {
+            assert_eq!(body["repetition_penalty"], 1.0);
             for (name, value) in expected.as_object().unwrap() {
                 assert_eq!(body.get(name), Some(value), "{name}: {body}");
             }
