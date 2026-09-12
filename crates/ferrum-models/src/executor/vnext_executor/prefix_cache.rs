@@ -12,10 +12,19 @@ pub(super) struct PrefixCacheMetrics {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    coalesced_entries: AtomicU64,
+    coalesced_bytes: AtomicU64,
     saved_prefill_tokens: AtomicU64,
 }
 
 impl PrefixCacheMetrics {
+    fn record_coalescing(&self, entries: usize, retained_bytes: u64) {
+        self.coalesced_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        self.coalesced_bytes
+            .fetch_add(retained_bytes, Ordering::Relaxed);
+    }
+
     fn acknowledge_restore(
         &self,
         restored_tokens: usize,
@@ -36,6 +45,8 @@ impl PrefixCacheMetrics {
             &self.hits,
             &self.misses,
             &self.evictions,
+            &self.coalesced_entries,
+            &self.coalesced_bytes,
             &self.saved_prefill_tokens,
         ] {
             counter.store(0, Ordering::Relaxed);
@@ -47,6 +58,23 @@ struct Entry<C> {
     prefix: Arc<[u32]>,
     input: Arc<[u32]>,
     checkpoint: C,
+    /// Admitted product prompt length, before executed generation was appended
+    /// to `input`. This is retention evidence, not restore authority.
+    original_prompt_tokens: Option<usize>,
+}
+
+impl<C> Entry<C> {
+    fn original_prompt(&self) -> Option<&[u32]> {
+        let count = self.original_prompt_tokens?;
+        if count == 0
+            || self.prefix.is_empty()
+            || !self.input.starts_with(&self.prefix)
+            || (self.prefix.len() < self.input.len() && count != self.input.len())
+        {
+            return None;
+        }
+        self.input.get(..count)
+    }
 }
 
 /// Oldest at the front. This is an index, not a second byte or slot budget.
@@ -85,6 +113,9 @@ impl<C> PrefixIndex<C> {
             "misses_scope": "enabled-index-lookups-without-reusable-entry",
             "evictions": metrics.evictions.load(Ordering::Relaxed),
             "evictions_scope": "pressure-removed-index-entries",
+            "coalesced_entries": metrics.coalesced_entries.load(Ordering::Relaxed),
+            "coalesced_bytes": metrics.coalesced_bytes.load(Ordering::Relaxed),
+            "coalescing_scope": "growth-chain-removed-index-owners; bytes are aligned extents, not necessarily reclaimed backing or released in-flight pins",
             "saved_prefill_tokens": metrics.saved_prefill_tokens.load(Ordering::Relaxed),
         });
         let fields = snapshot
@@ -137,14 +168,142 @@ impl<C> PrefixIndex<C> {
         removed
     }
 
-    fn insert(&mut self, prefix: Arc<[u32]>, input: Arc<[u32]>, checkpoint: C) -> Vec<C> {
+    fn insert(
+        &mut self,
+        prefix: Arc<[u32]>,
+        input: Arc<[u32]>,
+        checkpoint: C,
+        original_prompt_tokens: Option<usize>,
+    ) -> Vec<C> {
         let replaced = self.remove_replaced(&input, prefix.len());
         self.entries.push_back(Entry {
             prefix,
             input,
             checkpoint,
+            original_prompt_tokens,
         });
         replaced
+    }
+
+    /// Called only after inserting a successfully published capture, while the
+    /// same index lock is held. Keep observed branches, their repeat-capable
+    /// partials and a legal early fallback; retire intermediate growth states.
+    /// This trades longer historical hits for retained memory, not equivalent
+    /// state at different N. In particular, boundary state is never truncated.
+    fn coalesce(&mut self, layout: &SequenceCheckpointLayout) -> Vec<C> {
+        if layout.input_dependency() != CheckpointInputDependency::ExactTokenPrefix {
+            return Vec::new();
+        }
+        let Some(published) = self.entries.back() else {
+            return Vec::new();
+        };
+        if published.original_prompt().is_none() {
+            return Vec::new();
+        }
+        let mut ancestors = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.prefix.len() < published.prefix.len()
+                    && published.prefix.starts_with(&entry.prefix)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        ancestors.sort_by_key(|index| self.entries[*index].prefix.len());
+        if ancestors.is_empty() {
+            return Vec::new();
+        }
+        let mut keep = vec![true; self.entries.len()];
+        for &index in &ancestors {
+            keep[index] = self.entries[index].original_prompt().is_none();
+        }
+        keep[ancestors[0]] = true;
+
+        // Full inputs also identify a branch whose partial checkpoint has not
+        // reached the divergence yet. Prefix-only leaf detection would lose it.
+        let frontiers = self.entries.iter().enumerate().filter(|(index, entry)| {
+            *index == self.entries.len() - 1
+                || !self.entries.iter().any(|other| {
+                    other.input.len() > entry.input.len() && other.input.starts_with(&entry.input)
+                })
+        });
+        for (frontier_index, frontier) in frontiers {
+            keep[frontier_index] = true;
+            let partial = frontier.original_prompt().and_then(|prompt| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        entry.input.as_ref() == prompt
+                            && entry.original_prompt() == Some(prompt)
+                            && entry.prefix.len() < prompt.len()
+                            && layout.permits_suffix(entry.prefix.len() as u64, prompt.len() as u64)
+                    })
+                    .max_by_key(|(_, entry)| entry.prefix.len())
+                    .map(|(index, _)| index)
+            });
+            if let Some(partial) = partial {
+                keep[partial] = true;
+            } else {
+                // Missing origin/partial evidence is not proof that an older
+                // checkpoint is dispensable for this frontier's exact repeat.
+                for &index in &ancestors {
+                    if frontier.input.starts_with(&self.entries[index].prefix) {
+                        keep[index] = true;
+                    }
+                }
+            }
+            if !frontier.input.starts_with(&published.input)
+                && !published.input.starts_with(&frontier.input)
+            {
+                // Preserve the deepest captured common branch point, not all
+                // intermediate snapshots preceding that fork.
+                if let Some(index) = ancestors
+                    .iter()
+                    .rev()
+                    .find(|index| frontier.input.starts_with(&self.entries[**index].prefix))
+                {
+                    keep[*index] = true;
+                }
+            }
+        }
+
+        for &index in &ancestors {
+            if keep[index] {
+                continue;
+            }
+            let boundary = self.entries[index].prefix.len();
+            // A shorter fallback preserves legal suffix lengths only when the
+            // N difference respects every provider's alignment. Suffix minima
+            // remain satisfied because the fallback executes more tokens.
+            let fallback = ancestors.iter().copied().any(|earlier| {
+                let earlier_boundary = self.entries[earlier].prefix.len();
+                keep[earlier]
+                    && self.entries[earlier].original_prompt().is_some()
+                    && earlier_boundary < boundary
+                    && layout.providers().iter().all(|provider| {
+                        ((boundary - earlier_boundary) as u64).is_multiple_of(
+                            provider.contract().boundaries().suffix().alignment().get(),
+                        )
+                    })
+            });
+            if !fallback {
+                keep[index] = true;
+            }
+        }
+        let mut removed = Vec::new();
+        for index in (0..self.entries.len()).rev() {
+            if !keep[index] {
+                removed.push(
+                    self.entries
+                        .remove(index)
+                        .expect("selected ancestor")
+                        .checkpoint,
+                );
+            }
+        }
+        removed
     }
 
     fn evict(&mut self) -> Option<C> {
@@ -794,10 +953,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 let publication_started = Instant::now();
-                let removed = self.prefix_cache.lock().insert(
-                    Arc::from(checkpoint.token_prefix()),
-                    Arc::from(checkpoint.full_input()),
-                    checkpoint,
+                let (removed, coalesced) = {
+                    let mut index = self.prefix_cache.lock();
+                    let removed = index.insert(
+                        Arc::from(checkpoint.token_prefix()),
+                        Arc::from(checkpoint.full_input()),
+                        checkpoint,
+                        usize::try_from(sequence.product_prompt_tokens).ok(),
+                    );
+                    let coalesced = usable_layout(self.resolved_plan.execution_plan())
+                        .map(|layout| index.coalesce(layout))
+                        .unwrap_or_default();
+                    (removed, coalesced)
+                };
+                self.metrics.prefix_cache.record_coalescing(
+                    coalesced.len(),
+                    coalesced
+                        .iter()
+                        .map(SequenceCheckpoint::retained_bytes)
+                        .sum(),
                 );
                 self.reaper.record_checkpoint_cache_timing(
                     CheckpointCacheTimingPhase::IndexPublication,
@@ -805,6 +979,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 );
                 let replacement_started = Instant::now();
                 drop(removed);
+                drop(coalesced);
                 self.reaper.record_checkpoint_cache_timing(
                     CheckpointCacheTimingPhase::ReplacementDrop,
                     replacement_started.elapsed(),

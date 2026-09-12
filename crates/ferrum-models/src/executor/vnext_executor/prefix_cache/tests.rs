@@ -8,6 +8,9 @@ mod vnext_core_contract;
 #[path = "completion_guard_tests.rs"]
 mod completion_guard_tests;
 
+#[path = "retention_tests.rs"]
+mod retention_tests;
+
 fn insert(
     index: &mut PrefixIndex<Arc<str>>,
     prefix: &[u32],
@@ -15,7 +18,12 @@ fn insert(
     name: &str,
 ) -> Arc<str> {
     let owner: Arc<str> = Arc::from(name);
-    drop(index.insert(Arc::from(prefix), Arc::from(input), Arc::clone(&owner)));
+    drop(index.insert(
+        Arc::from(prefix),
+        Arc::from(input),
+        Arc::clone(&owner),
+        Some(input.len()),
+    ));
     owner
 }
 
@@ -58,7 +66,12 @@ fn replacement_and_eviction_drop_index_ownership_but_not_restore_pins() {
     let mut index = PrefixIndex::default();
     let first = insert(&mut index, &[1], &[1, 2, 3], "first");
     let pin = index.longest(&[1, 2, 4], false, |_| true).unwrap();
-    let replaced = index.insert(Arc::from([1, 2]), Arc::from([1, 2, 3]), Arc::from("second"));
+    let replaced = index.insert(
+        Arc::from([1, 2]),
+        Arc::from([1, 2, 3]),
+        Arc::from("second"),
+        Some(3),
+    );
     assert_eq!(Arc::strong_count(&first), 3);
     drop(replaced);
     assert_eq!(Arc::strong_count(&first), 2);
@@ -748,7 +761,12 @@ fn native_snapshot_reports_index_extents_after_replacement_and_pinned_eviction()
     let first = Arc::new(RetainedCheckpoint {
         extent_bytes: 65536,
     });
-    drop(index.insert(Arc::from([1]), Arc::from([1, 2, 3]), Arc::clone(&first)));
+    drop(index.insert(
+        Arc::from([1]),
+        Arc::from([1, 2, 3]),
+        Arc::clone(&first),
+        Some(3),
+    ));
     let pin = index.longest(&[1, 2, 4], false, |_| true).unwrap();
     assert_eq!(snapshot(&index)["entries"], 1);
     assert_eq!(snapshot(&index)["bytes"], 65536);
@@ -760,6 +778,7 @@ fn native_snapshot_reports_index_extents_after_replacement_and_pinned_eviction()
         Arc::new(RetainedCheckpoint {
             extent_bytes: 131072,
         }),
+        Some(3),
     ));
     let current = snapshot(&index);
     assert_eq!(current["entries"], 1);
@@ -792,6 +811,8 @@ fn native_snapshot_supplies_zero_health_fields_and_actual_capability_reasons() {
         "hits",
         "misses",
         "evictions",
+        "coalesced_entries",
+        "coalesced_bytes",
         "saved_prefill_tokens",
     ] {
         assert_eq!(snapshot[key].as_u64(), Some(0), "missing native {key}");
