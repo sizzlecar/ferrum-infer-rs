@@ -9,6 +9,9 @@ use super::*;
 #[path = "causal_attention_checkpoint_tests.rs"]
 mod checkpoint;
 
+#[path = "causal_attention_timing_tests.rs"]
+mod timing;
+
 const TOKENS: usize = 2;
 const QUERY_HEADS: usize = 2;
 const KV_HEADS: usize = 1;
@@ -221,13 +224,36 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         (128, 7, AttentionDispatchKind::General),
         (128, 8, AttentionDispatchKind::TiledPrefill),
         (128, 9, AttentionDispatchKind::TiledPrefill),
+        (256, 2, AttentionDispatchKind::General),
+        (256, 5, AttentionDispatchKind::General),
+        (256, 7, AttentionDispatchKind::General),
         (256, 8, AttentionDispatchKind::GqaTiledPrefill),
+        (64, 5, AttentionDispatchKind::General),
         (64, 9, AttentionDispatchKind::General),
     ] {
         assert_eq!(
             attention_dispatch_plan(&dispatch_test_params(tokens, head_dim)).kind,
             expected,
             "head_dim={head_dim} tokens={tokens}",
+        );
+    }
+
+    for tokens in [2, 5, 7] {
+        let mut short = dispatch_test_params(tokens, 256);
+        short.position_start = 511;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::General
+        );
+        short.position_start = 512;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::GqaTiledPrefill
+        );
+        short.page_elements -= 1;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::General
         );
     }
 
@@ -250,17 +276,23 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         head256_tile.threadgroup_memory_bytes.iter().sum::<u64>(),
         30_720,
     );
-    let exact_memory_limit =
-        attention_dispatch_plan_with_memory_limit(&dispatch_test_params(8, 256), 30_720);
-    assert_eq!(
-        exact_memory_limit.kind,
-        AttentionDispatchKind::GqaTiledPrefill,
-    );
-    let memory_limited =
-        attention_dispatch_plan_with_memory_limit(&dispatch_test_params(8, 256), 30_720 - 1);
-    assert_eq!(memory_limited.kind, AttentionDispatchKind::TiledPrefill);
-    assert_eq!(memory_limited.threads_per_threadgroup, [32, 4, 1]);
-    assert_eq!(memory_limited.threadgroup_memory_bytes, [4608, 9216]);
+    for tokens in [5, 8] {
+        let mut params = dispatch_test_params(tokens, 256);
+        params.position_start = 512;
+        let exact_memory_limit = attention_dispatch_plan_with_memory_limit(&params, 30_720);
+        assert_eq!(
+            exact_memory_limit.kind,
+            AttentionDispatchKind::GqaTiledPrefill,
+        );
+        let memory_limited = attention_dispatch_plan_with_memory_limit(&params, 30_720 - 1);
+        if tokens == 5 {
+            assert_eq!(memory_limited, general_attention_dispatch_plan(&params));
+        } else {
+            assert_eq!(memory_limited.kind, AttentionDispatchKind::TiledPrefill);
+            assert_eq!(memory_limited.threads_per_threadgroup, [32, 4, 1]);
+            assert_eq!(memory_limited.threadgroup_memory_bytes, [4608, 9216]);
+        }
+    }
 
     let query_tail = attention_dispatch_plan(&dispatch_test_params(9, 128));
     assert_eq!(query_tail.threadgroups, [2, 16, 1]);
@@ -387,19 +419,27 @@ fn packed_mixed_decode_and_prefill_keep_participant_local_dispatch_plans() {
     // Packed projections are shared, but attention is dispatched once per
     // participant. A decode participant must not inherit its prefill peer's
     // tiled launch shape (or vice versa).
-    let participant_params = [dispatch_test_params(1, 256), dispatch_test_params(9, 256)];
+    let mut short_continuation = dispatch_test_params(5, 256);
+    short_continuation.position_start = 512;
+    let participant_params = [
+        dispatch_test_params(1, 256),
+        short_continuation,
+        dispatch_test_params(9, 256),
+    ];
     let plans = participant_params.map(|params| attention_dispatch_plan(&params));
     assert_eq!(plans[0].kind, AttentionDispatchKind::GroupedDecode);
     assert_eq!(plans[0].threadgroups[0], 8);
     assert_eq!(plans[1].kind, AttentionDispatchKind::GqaTiledPrefill);
-    assert_eq!(plans[1].threadgroups[0], 2);
+    assert_eq!(plans[1].threadgroups[0], 1);
+    assert_eq!(plans[2].kind, AttentionDispatchKind::GqaTiledPrefill);
+    assert_eq!(plans[2].threadgroups[0], 2);
     let grouped_decode_reductions = plans
         .iter()
         .filter(|plan| plan.kind == AttentionDispatchKind::GroupedDecode)
         .count() as u64;
     assert_eq!(
         physical_dispatch_count(plans.len(), true) + grouped_decode_reductions,
-        11,
+        13,
     );
 }
 
@@ -414,6 +454,76 @@ fn tiled_prefill_head128_without_gate_matches_general_and_cpu_for_fresh_exact_ti
         0,
         8,
         AttentionDispatchKind::TiledPrefill,
+    );
+}
+
+#[test]
+fn short_prefill_head256_gqa_matches_general_and_cpu_across_page_and_key_tail_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 gated five-token continuation",
+        256,
+        16,
+        4,
+        true,
+        574,
+        5,
+        AttentionDispatchKind::GqaTiledPrefill,
+    );
+}
+
+#[test]
+fn short_prefill_head128_uses_general_across_long_prefix_page_and_query_tail_on_real_metal() {
+    run_prefill_cpu_case(
+        "head128 ungated seven-token continuation",
+        128,
+        16,
+        4,
+        false,
+        543,
+        7,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_general_for_two_fresh_tokens_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 ungated two-token fresh input",
+        256,
+        16,
+        4,
+        false,
+        0,
+        2,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_general_below_cached_prefix_threshold_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 seven-token continuation below prefix threshold",
+        256,
+        16,
+        4,
+        true,
+        511,
+        7,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_gqa_at_cached_prefix_threshold_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 two-token continuation at prefix threshold",
+        256,
+        16,
+        4,
+        true,
+        512,
+        2,
+        AttentionDispatchKind::GqaTiledPrefill,
     );
 }
 
@@ -474,6 +584,40 @@ fn gqa_tiled_prefill_head256_matches_general_and_cpu_across_129_keys_on_real_met
     );
 }
 
+struct ValidatedPrefillCase {
+    device: Device,
+    queue: metal::CommandQueue,
+    pipelines: MetalCausalAttentionPipelines,
+    query: Buffer,
+    query_raw: Buffer,
+    pages: Vec<Buffer>,
+    params: CausalAttentionParams,
+    state: Vec<f16>,
+    expected: Vec<f32>,
+}
+
+impl ValidatedPrefillCase {
+    fn assert_kv_unchanged(&self, label: &str) {
+        let page_elements = self.params.page_elements as usize;
+        for (page_index, (page, expected)) in self
+            .pages
+            .iter()
+            .zip(self.state.chunks_exact(page_elements))
+            .enumerate()
+        {
+            let actual =
+                unsafe { std::slice::from_raw_parts(page.contents().cast::<f16>(), page_elements) };
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{label}: attention modified KV page {page_index}, element {index}",
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_prefill_cpu_case(
     label: &str,
@@ -484,7 +628,7 @@ fn run_prefill_cpu_case(
     prefix: usize,
     tokens: usize,
     expected_kind: AttentionDispatchKind,
-) {
+) -> ValidatedPrefillCase {
     let context = prefix + tokens;
 
     let device =
@@ -609,6 +753,19 @@ fn run_prefill_cpu_case(
     eprintln!(
         "{label}: max_abs selected/cpu={selected_cpu_error} general/cpu={general_cpu_error} selected/tiled={selected_tiled_error} selected/general={selected_general_error}",
     );
+    let case = ValidatedPrefillCase {
+        device,
+        queue,
+        pipelines,
+        query: query_buffer,
+        query_raw: query_raw_buffer,
+        pages,
+        params,
+        state,
+        expected,
+    };
+    case.assert_kv_unchanged(label);
+    case
 }
 
 fn run_decode_cpu_case(
@@ -751,6 +908,61 @@ fn run_decode_cpu_case(
     );
 }
 
+struct GuardedAttentionOutput {
+    buffer: Buffer,
+    output_elements: usize,
+    guard_elements: usize,
+}
+
+impl GuardedAttentionOutput {
+    // A complete extra query tile catches writes to padded rows, including
+    // the seven inactive rows of a single-token dispatch.
+    fn new(device: &Device, params: &CausalAttentionParams) -> Self {
+        let output_elements =
+            params.tokens as usize * params.query_heads as usize * params.head_dim as usize;
+        let guard_elements = TILED_PREFILL_QUERY_TILE as usize
+            * params.query_heads as usize
+            * params.head_dim as usize;
+        let buffer = output_buffer::<f16>(device, output_elements + guard_elements);
+        let output = Self {
+            buffer,
+            output_elements,
+            guard_elements,
+        };
+        output.reset();
+        output
+    }
+
+    // Call only before submission or after the previous command completed.
+    fn reset(&self) {
+        let values = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.contents().cast::<f16>(),
+                self.output_elements + self.guard_elements,
+            )
+        };
+        values[..self.output_elements].fill(f16::NAN);
+        values[self.output_elements..].fill(f16::from_bits(0x3555));
+    }
+
+    fn read_after_completion(&self, kind: AttentionDispatchKind) -> Vec<f32> {
+        let guarded_output = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.contents().cast::<f16>(),
+                self.output_elements + self.guard_elements,
+            )
+        };
+        for (index, value) in guarded_output[self.output_elements..].iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                0x3555,
+                "{kind:?}: output guard changed at element {index}",
+            );
+        }
+        read_f16(&self.buffer, self.output_elements)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_attention_plan(
     device: &Device,
@@ -762,9 +974,7 @@ fn run_attention_plan(
     params: &CausalAttentionParams,
     plan: AttentionDispatchPlan,
 ) -> Vec<f32> {
-    let output_elements =
-        params.tokens as usize * params.query_heads as usize * params.head_dim as usize;
-    let output = output_buffer::<f16>(device, output_elements);
+    let output = GuardedAttentionOutput::new(device, params);
     let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
         // Unused capacity must not participate in the dynamic reduction.
         shared_buffer(
@@ -791,7 +1001,11 @@ fn run_attention_plan(
     let encoder = command.new_compute_command_encoder();
     set_raw(encoder, 0, query);
     set_raw(encoder, 1, query_raw);
-    set_raw(encoder, 2, grouped_partials.as_ref().unwrap_or(&output));
+    set_raw(
+        encoder,
+        2,
+        grouped_partials.as_ref().unwrap_or(&output.buffer),
+    );
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, params);
     use_raw_pages(encoder, pages);
@@ -800,7 +1014,7 @@ fn run_attention_plan(
         encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
         set_raw(encoder, 0, grouped_partials);
         set_raw(encoder, 1, query_raw);
-        set_raw(encoder, 2, &output);
+        set_raw(encoder, 2, &output.buffer);
         set_raw_params(encoder, 4, params);
         encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
         encoder.set_threadgroup_memory_length(1, 0);
@@ -815,7 +1029,7 @@ fn run_attention_plan(
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-    read_f16(&output, output_elements)
+    output.read_after_completion(plan.kind)
 }
 
 fn dispatch_test_params(tokens: u32, head_dim: u32) -> CausalAttentionParams {

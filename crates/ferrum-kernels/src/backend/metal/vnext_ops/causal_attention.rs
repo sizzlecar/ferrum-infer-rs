@@ -1934,7 +1934,13 @@ fn uses_gqa_tiled_prefill(params: &CausalAttentionParams) -> bool {
     let Some(query_heads_per_kv_head) = query_heads_per_kv_head(params) else {
         return false;
     };
-    params.tokens >= TILED_PREFILL_QUERY_TILE
+    // An incomplete query tile still pays for all eight rows and its scalar
+    // KV tail. Require eight full key tiles of existing context to amortize
+    // that work; one token retains the separate decode path.
+    params.tokens >= 2
+        && (params.tokens >= TILED_PREFILL_QUERY_TILE
+            || u64::from(params.position_start)
+                >= GQA_TILED_PREFILL_KEY_TILE * u64::from(TILED_PREFILL_QUERY_TILE))
         && params.head_dim == 256
         && query_heads_per_kv_head >= GQA_TILED_PREFILL_QUERY_HEADS
         && query_heads_per_kv_head.is_multiple_of(GQA_TILED_PREFILL_QUERY_HEADS)
