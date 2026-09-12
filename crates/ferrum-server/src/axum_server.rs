@@ -2783,6 +2783,10 @@ async fn handle_chat_completions_stream(
                                 .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
+                            // A token-limited response may contain only reasoning.
+                            // Preserve its terminal reason and usage, as sync does;
+                            // required tool and hard content contracts were checked above.
+                            && terminal_finish_reason != FinishReason::Length
                         {
                             let error_event = openai_error_sse_event(
                                 "model output did not satisfy tool/function call request",
@@ -5791,6 +5795,7 @@ mod tests {
     mod harmony_stops;
     mod reasoning_controls;
     mod tool_argument_strictness;
+    mod tool_length;
     use super::*;
     use async_trait::async_trait;
     use axum::{
