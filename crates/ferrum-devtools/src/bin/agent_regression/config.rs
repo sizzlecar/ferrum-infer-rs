@@ -33,6 +33,7 @@ pub(crate) enum OrchestralToolResultFormat {
     #[default]
     Json,
     Yaml,
+    TextParts,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -355,15 +355,19 @@ fn tool_result_content(
     format: OrchestralToolResultFormat,
     result: &Value,
     is_error: bool,
-) -> Result<String> {
+) -> Result<Value> {
     let envelope = json!({"result":result,"is_error":is_error});
     match format {
-        OrchestralToolResultFormat::Json => Ok(envelope.to_string()),
-        OrchestralToolResultFormat::Yaml => {
-            serde_yaml::to_string(&envelope).context("serialize declared YAML tool result")
-        }
+        OrchestralToolResultFormat::Json => Ok(envelope.to_string().into()),
+        OrchestralToolResultFormat::Yaml => serde_yaml::to_string(&envelope)
+            .map(Value::String)
+            .context("serialize declared YAML tool result"),
+        OrchestralToolResultFormat::TextParts => Ok(tool_text_parts::content(result, is_error)),
     }
 }
+
+#[path = "orchestral_wire/tool_text_parts.rs"]
+mod tool_text_parts;
 
 fn canonical_id(model_request_id: &str, native_id: &str) -> Result<String> {
     Ok(format!(
@@ -664,6 +668,23 @@ mod tests {
             }
             fixture
         }
+
+        fn text_parts() -> Self {
+            let mut fixture = Self::new();
+            for record in &mut fixture.records {
+                for message in &mut record.messages {
+                    if message["role"] == "tool" {
+                        let envelope: Value =
+                            serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+                        message["content"] = tool_text_parts::content(
+                            &envelope["result"],
+                            envelope["is_error"].as_bool().unwrap(),
+                        );
+                    }
+                }
+            }
+            fixture
+        }
     }
 
     fn record(index: u32, messages: Vec<Value>, finish: &str) -> RequestRecord {
@@ -830,10 +851,11 @@ mod tests {
         let result = json!({"content":code,"empty":"","crlf":"first\r\nsecond\r\n",
             "controls":"\u{0}\t\u{feff}","numeric_text":"001","bool_text":"false","none":null});
         let yaml = tool_result_content(OrchestralToolResultFormat::Yaml, &result, true).unwrap();
+        let yaml = yaml.as_str().unwrap();
         assert!(yaml.contains("content: |\n"));
         assert!(yaml.contains("    println!(\"<tool_call>\\\\path\");"));
         assert_eq!(
-            serde_yaml::from_str::<Value>(&yaml).unwrap(),
+            serde_yaml::from_str::<Value>(yaml).unwrap(),
             json!({"result":result,"is_error":true})
         );
         assert_eq!(
@@ -877,6 +899,55 @@ mod tests {
         let mut changed = Fixture::yaml();
         changed.public.tool_exchanges[0].calls[0].is_error = true;
         assert!(!changed.bind_as(OrchestralToolResultFormat::Yaml).complete());
+    }
+
+    #[test]
+    fn text_parts_binding_requires_exact_parts_metadata_and_declared_format() {
+        let fixture = Fixture::text_parts();
+        let evidence = fixture.bind_as(OrchestralToolResultFormat::TextParts);
+        assert!(evidence.complete(), "{:?}", evidence.unproven);
+        assert!(!fixture.bind().complete());
+        assert!(!fixture.bind_as(OrchestralToolResultFormat::Yaml).complete());
+        assert!(!Fixture::new()
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
+
+        let mut reordered = Fixture::text_parts();
+        reordered.records[1].messages[3]["content"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(!reordered
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
+
+        let mut flattened = Fixture::text_parts();
+        let text = flattened.records[1].messages[3]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| part["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        flattened.records[1].messages[3]["content"] = text.into();
+        assert!(!flattened
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
+
+        let mut modified = Fixture::text_parts();
+        let text = modified.records[1].messages[3]["content"][1]["text"]
+            .as_str()
+            .unwrap();
+        modified.records[1].messages[3]["content"][1]["text"] = format!("{text}\n").into();
+        assert!(!modified
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
+
+        let mut changed_status = Fixture::text_parts();
+        changed_status.public.tool_exchanges[0].calls[0].is_error = true;
+        assert!(!changed_status
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
     }
 
     #[test]

@@ -482,6 +482,7 @@ mod tests {
         for format in [
             OrchestralToolResultFormat::Json,
             OrchestralToolResultFormat::Yaml,
+            OrchestralToolResultFormat::TextParts,
         ] {
             let mut value = original.clone();
             bind_tool_result_format(&mut value, format).unwrap();
