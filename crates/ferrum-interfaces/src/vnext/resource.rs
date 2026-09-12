@@ -72,6 +72,12 @@ mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod checkpoint;
+pub(crate) use checkpoint::*;
+pub use checkpoint::{
+    CheckpointCapacityMaintenance, CheckpointCapacityMaintenanceOutcome,
+    CheckpointCapacityMaintenanceSkipReason,
+};
 mod request_state_hazard;
 pub use request_state_hazard::*;
 mod sequence_state;
@@ -81,8 +87,9 @@ pub use sequence::*;
 mod batch;
 pub use batch::*;
 mod backing_initialization;
-pub(crate) use backing_initialization::BackingInitializationEncodeError;
-use backing_initialization::PreparedBackingInitializations;
+pub(crate) use backing_initialization::{
+    BackingInitializationEncodeError, PreparedBackingInitializations,
+};
 mod invocation;
 pub use invocation::*;
 mod execution_session;

@@ -17,6 +17,9 @@ use std::{
     sync::Arc,
 };
 
+mod prefix_restore;
+pub use prefix_restore::{PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput};
+
 /// One model-owned KV slot reservation request.
 ///
 /// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
@@ -3098,6 +3101,25 @@ pub trait ModelExecutor: Send + Sync {
         false
     }
 
+    /// Whether this exact plan can retain and restore independent prefix state.
+    /// This must include resolved model/provider support and product policy.
+    fn supports_plan_runtime_prefix_restore(&self) -> bool {
+        false
+    }
+
+    /// Restore a proper prefix into a freshly admitted request before the
+    /// scheduler publishes any work for it. A miss submits no device work and
+    /// preserves the admitted target. Successful restoration remains gated
+    /// until the engine publishes the matching scheduler/executor progress and
+    /// acknowledges the returned owner. Cancellation must retain unknown native
+    /// writes until the existing completion path proves quiescence.
+    async fn try_restore_plan_runtime_prefix(
+        &self,
+        _input: PlanRuntimePrefixRestoreInput<'_>,
+    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+        Ok(None)
+    }
+
     /// Writes the exact availability sources advanced when this request
     /// authority is preempted for recompute.
     ///
@@ -3429,8 +3451,10 @@ pub trait ModelExecutor: Send + Sync {
     ///
     /// Legacy executors only need physical release and inherit that behavior.
     /// Plan runtimes with terminal journals override this method so completion
-    /// cannot be inferred from a generic release operation.
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    /// cannot be inferred from a generic release operation. Implementations may
+    /// await retention of the last completed native state before releasing its
+    /// source; sampled output alone is not evidence of an executed frontier.
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.release_cache(completion.cache_id());
         Ok(())
     }

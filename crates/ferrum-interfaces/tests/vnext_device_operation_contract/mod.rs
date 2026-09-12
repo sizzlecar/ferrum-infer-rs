@@ -319,6 +319,7 @@ impl ModelFamilyProvider for TestFamily {
                     StateCapacityDemand::FixedPerScope
                 },
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             }]
         } else {
             Vec::new()
@@ -335,6 +336,7 @@ impl ModelFamilyProvider for TestFamily {
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
                 initialization: StateInitialization::Zero,
+                checkpoint: StateCheckpointCapability::Unsupported,
             });
         }
         fixture_f32_profiles(
@@ -1037,6 +1039,7 @@ fn policy_with_reusable_execution_determinism_and_storage(
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 65_536,
             reserve_bytes: 128,
             maximum_active_sequences: 64,

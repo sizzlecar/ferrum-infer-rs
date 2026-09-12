@@ -2,25 +2,28 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
-    BatchedOperationInvocation, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    OperationBufferStorageKind, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderCheckpointStateLayout, ProviderCheckpointStatePort, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
+use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
-    ArgumentEncoder, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
+    ArgumentEncoder, ArgumentEncoderRef, CompileOptions, ComputeCommandEncoderRef,
+    ComputePipelineState, Device, Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
 };
 use sha2::{Digest, Sha256};
 
@@ -73,8 +76,9 @@ const GQA_TILED_PREFILL_KEY_TILE: u64 = 64;
 const TILED_PREFILL_SIMDGROUPS: u64 = 4;
 const GQA_TILED_PREFILL_QUERY_HEADS: u32 = 2;
 const GQA_TILED_PREFILL_SIMDGROUPS: u64 = 8;
-const GROUPED_DECODE_PARTITIONS: u64 = 8;
-const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = GROUPED_DECODE_PARTITIONS * TILED_PREFILL_KEY_TILE;
+// One SIMD lane reduces each partial, so the reduction supports at most 32.
+const GROUPED_DECODE_MAX_PARTITIONS: u64 = SIMD_THREADS;
+const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = 256;
 
 pub(super) struct MetalCausalAttentionPipelines {
     prepare: ComputePipelineState,
@@ -84,7 +88,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     grouped_decode_reduce_attention: ComputePipelineState,
     tiled_prefill_attention: ComputePipelineState,
     gqa_tiled_prefill_attention: ComputePipelineState,
-    prepare_function: Function,
+    binding_encoder: Mutex<ArgumentEncoder>,
     binding_encoded_length: u64,
     binding_alignment: u64,
     maximum_attention_simdgroups: u32,
@@ -236,7 +240,7 @@ impl MetalCausalAttentionPipelines {
             grouped_decode_reduce_attention,
             tiled_prefill_attention,
             gqa_tiled_prefill_attention,
-            prepare_function,
+            binding_encoder: Mutex::new(prepare_encoder),
             binding_encoded_length,
             binding_alignment,
             maximum_attention_simdgroups,
@@ -253,9 +257,48 @@ impl MetalCausalAttentionPipelines {
         align_up(self.binding_encoded_length, self.binding_alignment)
     }
 
-    fn new_binding_encoder(&self) -> ArgumentEncoder {
-        self.prepare_function
-            .new_argument_encoder(PREPARE_PAGE_TABLE_INDEX)
+    /// Reflection is immutable, but setting the destination is not. Only CPU
+    /// argument writes hold this lock; each command retains its own workspace
+    /// until its GPU fence completes.
+    fn with_binding_encoder<T>(
+        &self,
+        encode: impl FnOnce(&ArgumentEncoderRef) -> Result<T, MetalDeviceRuntimeError>,
+    ) -> Result<T, MetalDeviceRuntimeError> {
+        let guard = BindingEncoderGuard {
+            // An unwind can only leave partially written command-owned bytes.
+            // The guard always detaches that destination before unlocking, so
+            // the encoder's reusable state remains valid after poisoning.
+            encoder: self
+                .binding_encoder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
+        encode(&guard.encoder)
+    }
+}
+
+struct BindingEncoderGuard<'a> {
+    encoder: MutexGuard<'a, ArgumentEncoder>,
+}
+
+impl Drop for BindingEncoderGuard<'_> {
+    #[allow(
+        unexpected_cfgs,
+        reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+    )]
+    fn drop(&mut self) {
+        let encoder: &ArgumentEncoderRef = &self.encoder;
+        // SAFETY: MTLArgumentEncoder's setArgumentBuffer:offset: explicitly
+        // accepts nil (macOS 10.13+). metal 0.31 only exposes the non-null Rust
+        // overload. Detach before releasing the mutex, including during unwind,
+        // so the cached encoder cannot retain a previous invocation workspace.
+        // https://developer.apple.com/documentation/metal/mtlargumentencoder/setargumentbuffer(_:offset:)
+        let _: () = unsafe {
+            msg_send![encoder,
+                setArgumentBuffer: std::ptr::null_mut::<metal::objc::runtime::Object>()
+                offset: 0_u64
+            ]
+        };
     }
 }
 
@@ -285,7 +328,38 @@ impl MetalCausalPagedAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+        let mut provider =
+            Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)?;
+        // prepare writes [position_start, position_start + tokens) in the
+        // token-major [2, kv_heads, head_dim] F16 state. Attention reads only
+        // the causal prefix. Scratch and the page table are rebuilt per wave.
+        // A final one-token decode commits the same KV writes; no write is
+        // deferred until another input token becomes available.
+        let checkpoint = ProviderCheckpointContract::new(
+            CheckpointInputDependency::ExactTokenPrefix,
+            CheckpointBoundaryConstraint::any_positive(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        )
+        .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
+        .with_state_ports(vec![ProviderCheckpointStatePort::new(
+            ResolvedValueRole::Input,
+            8,
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::FixedBlockArena {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+                DynamicStorageView::PagedRegions {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+            )
+            .map_err(contract_error)?,
+            ProviderCheckpointStateLayout::TokenMajorPrefix,
+        )])
+        .map_err(contract_error)?;
+        provider.descriptor = provider.descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
+        );
+        Ok(provider)
     }
 
     fn new_with_hidden_type(
@@ -331,8 +405,7 @@ impl MetalCausalPagedAttentionProvider {
             implementation_fingerprint(&[
                 include_str!("causal_attention.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
-                include_str!("linear.rs").as_bytes(),
-                include_str!("linear.metal").as_bytes(),
+                super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
@@ -635,7 +708,7 @@ impl CausalAttentionShape {
             .head_dim
             .checked_add(2)
             .ok_or_else(|| "Metal grouped-decode partial width overflows".to_owned())?;
-        let elements = GROUPED_DECODE_PARTITIONS
+        let elements = GROUPED_DECODE_MAX_PARTITIONS
             .checked_mul(self.query_heads)
             .and_then(|value| value.checked_mul(elements_per_partial))
             .ok_or_else(|| "Metal grouped-decode partial workspace overflows".to_owned())?;
@@ -1252,12 +1325,14 @@ fn encode_attention(
         None
     };
 
-    let argument_encoder = attention.new_binding_encoder();
+    let binding_pipelines = Arc::clone(&attention);
     let binding_command = MetalDeviceCommand::operation(
         "vnext_causal_paged_attention_bindings",
         binding_regions,
         move |_encoder, regions| {
-            encode_page_bindings(&argument_encoder, binding_layout, &page_bindings, regions)
+            binding_pipelines.with_binding_encoder(|argument_encoder| {
+                encode_page_bindings(argument_encoder, binding_layout, &page_bindings, regions)
+            })
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1425,7 +1500,7 @@ fn dispatch_hidden_residual(
 }
 
 fn encode_page_bindings(
-    encoder: &ArgumentEncoder,
+    encoder: &ArgumentEncoderRef,
     layout: BindingLayout,
     bindings: &[PageBinding],
     regions: &[MetalBufferRegion],
@@ -1770,7 +1845,7 @@ fn grouped_decode_attention_dispatch_plan(params: &CausalAttentionParams) -> Att
     AttentionDispatchPlan {
         kind: AttentionDispatchKind::GroupedDecode,
         threadgroups: [
-            GROUPED_DECODE_PARTITIONS,
+            grouped_decode_partitions(params),
             u64::from(params.key_value_heads),
             1,
         ],
@@ -1864,6 +1939,13 @@ fn encode_attention_dispatch(
     encoder.set_threadgroup_memory_length(1, 0);
 }
 
+fn grouped_decode_partitions(params: &CausalAttentionParams) -> u64 {
+    // Split available key tiles across the reduction's lanes without launching
+    // empty partitions for short contexts. Keep this geometry in sync with MSL.
+    (u64::from(params.position_start) / TILED_PREFILL_KEY_TILE + 1)
+        .min(GROUPED_DECODE_MAX_PARTITIONS)
+}
+
 fn uses_grouped_decode(params: &CausalAttentionParams) -> bool {
     let Some(query_heads_per_kv_head) = query_heads_per_kv_head(params) else {
         return false;
@@ -1894,7 +1976,13 @@ fn uses_gqa_tiled_prefill(params: &CausalAttentionParams) -> bool {
     let Some(query_heads_per_kv_head) = query_heads_per_kv_head(params) else {
         return false;
     };
-    params.tokens >= TILED_PREFILL_QUERY_TILE
+    // An incomplete query tile still pays for all eight rows and its scalar
+    // KV tail. Require eight full key tiles of existing context to amortize
+    // that work; one token retains the separate decode path.
+    params.tokens >= 2
+        && (params.tokens >= TILED_PREFILL_QUERY_TILE
+            || u64::from(params.position_start)
+                >= GQA_TILED_PREFILL_KEY_TILE * u64::from(TILED_PREFILL_QUERY_TILE))
         && params.head_dim == 256
         && query_heads_per_kv_head >= GQA_TILED_PREFILL_QUERY_HEADS
         && query_heads_per_kv_head.is_multiple_of(GQA_TILED_PREFILL_QUERY_HEADS)
@@ -1980,7 +2068,7 @@ fn gqa_tiled_prefill_threadgroup_memory_bytes(params: &CausalAttentionParams) ->
 
 fn grouped_decode_reduce_threadgroup_memory_bytes() -> u64 {
     aligned_threadgroup_memory_bytes(
-        (GROUPED_DECODE_PARTITIONS + 1) * std::mem::size_of::<f32>() as u64,
+        (GROUPED_DECODE_MAX_PARTITIONS + 1) * std::mem::size_of::<f32>() as u64,
     )
 }
 
@@ -2006,11 +2094,17 @@ fn use_pages(
     let pages = regions
         .get(launch.first_page_region..page_end)
         .expect("validated Metal causal-attention page range changed during dispatch");
+    // Metal declares access to the whole buffer, including every page offset
+    // bound through the argument table. Repeat declarations only at a buffer
+    // change; each invocation still declares its own encoder's resources.
+    let mut previous_buffer: Option<&metal::BufferRef> = None;
     for page in pages {
-        encoder.use_resource(
-            page.buffer(),
-            MTLResourceUsage::Read | MTLResourceUsage::Write,
-        );
+        let buffer = page.buffer();
+        if previous_buffer.is_some_and(|previous| std::ptr::eq(previous, buffer)) {
+            continue;
+        }
+        encoder.use_resource(buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        previous_buffer = Some(buffer);
     }
 }
 
@@ -2302,7 +2396,7 @@ mod shape_tests {
         let shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
         let split_stride = shape.split_decode_partial_bytes_per_sequence().unwrap();
         let token_stride = shape.scratch_bytes_per_token().unwrap();
-        assert_eq!(split_stride, 132_096);
+        assert_eq!(split_stride, 528_384);
 
         for participant_count in [1_usize, 3] {
             for total_tokens in [1_u64, 2_048] {

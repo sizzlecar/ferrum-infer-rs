@@ -10,7 +10,7 @@ using namespace metal;
 #define VNEXT_PREFILL_KEY_TILE 32
 #define VNEXT_GQA_PREFILL_KEY_TILE 64
 #define VNEXT_PREFILL_SIMDGROUPS 4
-#define VNEXT_DECODE_PARTITIONS 8
+#define VNEXT_DECODE_MAX_PARTITIONS VNEXT_SIMD_WIDTH
 
 struct VNextKvPageTable {
     array<device half *, VNEXT_MAX_KV_PAGES> pages [[id(0)]];
@@ -579,11 +579,18 @@ kernel void vnext_causal_attention_decode_direct_f16(
     }
 }
 
+inline uint vnext_grouped_decode_partitions(
+    constant VNextCausalAttentionParams& params) {
+    return min(uint(VNEXT_DECODE_MAX_PARTITIONS),
+               params.position_start / VNEXT_PREFILL_KEY_TILE + 1u);
+}
+
 // First half of split-K GQA decode. Query heads that share one KV head are
 // rows of the same 8x8 SIMDgroup matrices, so K/V is fetched once for the
-// whole group. Eight context partitions keep one threadgroup resident per
-// GPU core on a 32-core device; the reduction kernel below merges their
-// independent online-softmax states.
+// whole group. Available key tiles are split across up to one partition per
+// reduction lane. More partitions expose parallelism in long contexts without
+// launching empty groups for short contexts. The reduction kernel below merges
+// their independent online-softmax states.
 kernel void vnext_causal_attention_decode_grouped_partial_f16(
     const device half *query [[buffer(0)]],
     const device half *query_raw [[buffer(1)]],
@@ -597,9 +604,10 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     const uint partition = group.x;
+    const uint partitions = vnext_grouped_decode_partitions(params);
     const uint kv_head = group.y;
     const uint token = 0u;
-    if (partition >= VNEXT_DECODE_PARTITIONS || params.tokens != 1u ||
+    if (partition >= partitions || params.tokens != 1u ||
         kv_head >= params.key_value_heads) {
         return;
     }
@@ -648,7 +656,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
 
     for (uint key_start = partition * VNEXT_PREFILL_KEY_TILE;
          key_start < maximum_key_end;
-         key_start += VNEXT_DECODE_PARTITIONS * VNEXT_PREFILL_KEY_TILE) {
+         key_start += partitions * VNEXT_PREFILL_KEY_TILE) {
         simdgroup_float8x8 score_matrix =
             make_filled_simdgroup_matrix<float, 8>(0.0f);
         const uint key_block_start = key_start + simdgroup * 8u;
@@ -917,7 +925,8 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
     }
 
     const uint partial_stride = params.head_dim + 2u;
-    const bool active = lane < VNEXT_DECODE_PARTITIONS;
+    const uint partitions = vnext_grouped_decode_partitions(params);
+    const bool active = lane < partitions;
     const ulong partial_base =
         ((ulong)lane * (ulong)params.query_heads + (ulong)query_head) *
         (ulong)partial_stride;
@@ -935,15 +944,15 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
         shared[lane] = scale;
     }
     if (lane == 0u) {
-        shared[VNEXT_DECODE_PARTITIONS] = global_sum;
+        shared[partitions] = global_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float inverse_sum = 1.0f / shared[VNEXT_DECODE_PARTITIONS];
+    const float inverse_sum = 1.0f / shared[partitions];
     for (uint dim = lane; dim < params.head_dim;
          dim += VNEXT_SIMD_WIDTH) {
         float value = 0.0f;
-        for (uint partition = 0; partition < VNEXT_DECODE_PARTITIONS;
+        for (uint partition = 0; partition < partitions;
              ++partition) {
             const ulong base =
                 ((ulong)partition * (ulong)params.query_heads +

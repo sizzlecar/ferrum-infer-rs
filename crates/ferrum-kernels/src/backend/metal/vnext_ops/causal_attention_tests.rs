@@ -6,6 +6,12 @@ use metal::{Buffer, BufferRef, CommandQueueRef, MTLCommandBufferStatus, MTLResou
 use super::super::numerical_tolerance;
 use super::*;
 
+#[path = "causal_attention_checkpoint_tests.rs"]
+mod checkpoint;
+
+#[path = "causal_attention_timing_tests.rs"]
+mod timing;
+
 const TOKENS: usize = 2;
 const QUERY_HEADS: usize = 2;
 const KV_HEADS: usize = 1;
@@ -22,6 +28,127 @@ const CPU_KV_STATE_TOLERANCE_ID: &str =
 // This stricter diagnostic never substitutes for a catalog-bound release comparison.
 const SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 const CPU_KV_STATE_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
+
+#[test]
+fn cached_argument_encoder_detaches_on_success_error_and_unwind() {
+    use metal::objc::rc::{autoreleasepool, WeakPtr};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let device = Device::system_default().expect("argument-encoder conformance requires Metal");
+    let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let mut encoder_identity = None;
+    // The last success exercises reuse after a poisoned Mutex. Each previous
+    // workspace must already be released, not only when the next one is bound.
+    for mode in [0, 1, 2, 0] {
+        let weak = autoreleasepool(|| {
+            let workspace = device.new_buffer(
+                pipelines.binding_slot_bytes().unwrap(),
+                MTLResourceOptions::StorageModeShared,
+            );
+            // SAFETY: workspace owns this live Objective-C MTLBuffer. WeakPtr
+            // uses the runtime's zeroing weak reference, not retainCount guesses.
+            let weak = unsafe { WeakPtr::new((&*workspace as *const BufferRef).cast_mut().cast()) };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                pipelines.with_binding_encoder(|encoder| {
+                    let identity = encoder as *const ArgumentEncoderRef as usize;
+                    assert_eq!(*encoder_identity.get_or_insert(identity), identity);
+                    encoder.set_argument_buffer(&workspace, 0);
+                    match mode {
+                        1 => Err(MetalDeviceRuntimeError::contract("fixture binding failure")),
+                        2 => panic!("fixture binding unwind"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match mode {
+                1 => assert!(outcome.unwrap().is_err()),
+                2 => assert!(outcome.is_err()),
+                _ => outcome.unwrap().unwrap(),
+            }
+            drop(workspace);
+            weak
+        });
+        assert!(
+            weak.load().is_null(),
+            "cached encoder retained a detached workspace"
+        );
+    }
+}
+
+#[test]
+fn cached_argument_encoder_serializes_distinct_workspace_writes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    let device = Device::system_default().expect("argument-encoder conformance requires Metal");
+    let pipelines = Arc::new(MetalCausalAttentionPipelines::new(&device).unwrap());
+    let active = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(3));
+    let workers = (0..3)
+        .map(|_| {
+            let (device, pipelines, active, start) = (
+                device.clone(),
+                pipelines.clone(),
+                active.clone(),
+                start.clone(),
+            );
+            std::thread::spawn(move || {
+                let workspace = device.new_buffer(
+                    pipelines.binding_slot_bytes().unwrap(),
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let page =
+                    device.new_buffer(VNEXT_KV_PAGE_BYTES, MTLResourceOptions::StorageModeShared);
+                // SAFETY: the CPU owns this shared buffer exclusively and initializes
+                // all bytes, including padding, before taking byte snapshots.
+                unsafe {
+                    std::ptr::write_bytes(
+                        workspace.contents().cast::<u8>(),
+                        0xa5,
+                        workspace.length() as usize,
+                    )
+                };
+                start.wait();
+                pipelines
+                    .with_binding_encoder(|encoder| {
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        encoder.set_argument_buffer(&workspace, 0);
+                        std::thread::yield_now();
+                        encoder.set_buffer(0, &page, 0);
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                // SAFETY: binding writes have completed; no GPU command uses it.
+                let snapshot = unsafe {
+                    std::slice::from_raw_parts(
+                        workspace.contents().cast::<u8>(),
+                        workspace.length() as usize,
+                    )
+                }
+                .to_vec();
+                (workspace, page, snapshot)
+            })
+        })
+        .collect::<Vec<_>>();
+    let completed = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    for (workspace, _page, snapshot) in completed {
+        // SAFETY: all writer threads have joined and the owning buffer is live.
+        let actual = unsafe {
+            std::slice::from_raw_parts(
+                workspace.contents().cast::<u8>(),
+                workspace.length() as usize,
+            )
+        };
+        assert_eq!(
+            actual, snapshot,
+            "another binding changed a completed workspace"
+        );
+    }
+}
 
 #[test]
 fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
@@ -154,6 +281,48 @@ fn grouped_decode_head256_with_gate_matches_direct_and_cpu_across_page_boundary_
 }
 
 #[test]
+fn grouped_decode_head256_matches_cpu_at_partition_limit_and_long_context_on_real_metal() {
+    for context in [1023, 1024, 1025, 4097] {
+        run_decode_cpu_case(
+            "head256 ratio4 grouped decode partition limit",
+            256,
+            16,
+            4,
+            true,
+            context,
+            AttentionDispatchKind::GroupedDecode,
+        );
+    }
+}
+
+#[test]
+fn grouped_decode_head128_matches_cpu_at_long_context_on_real_metal() {
+    run_decode_cpu_case(
+        "head128 ratio8 long grouped decode",
+        128,
+        32,
+        4,
+        false,
+        4097,
+        AttentionDispatchKind::GroupedDecode,
+    );
+}
+
+#[test]
+fn grouped_decode_dispatch_grows_to_the_simd_reduction_capacity() {
+    for (context, partitions) in [(256_u32, 8), (257, 9), (992, 31), (993, 32), (1025, 32)] {
+        let mut params = dispatch_test_params(1, 256);
+        params.position_start = context - 1;
+        let plan = attention_dispatch_plan(&params);
+        assert_eq!(plan.kind, AttentionDispatchKind::GroupedDecode);
+        assert_eq!(plan.threadgroups[0], partitions);
+    }
+    let mut params = dispatch_test_params(1, 256);
+    params.position_start = u32::MAX;
+    assert_eq!(grouped_decode_partitions(&params), SIMD_THREADS);
+}
+
+#[test]
 fn direct_decode_ratio_one_matches_general_and_cpu_across_page_boundary_on_real_metal() {
     run_decode_cpu_case(
         "head128 ratio1 direct decode",
@@ -176,13 +345,36 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         (128, 7, AttentionDispatchKind::General),
         (128, 8, AttentionDispatchKind::TiledPrefill),
         (128, 9, AttentionDispatchKind::TiledPrefill),
+        (256, 2, AttentionDispatchKind::General),
+        (256, 5, AttentionDispatchKind::General),
+        (256, 7, AttentionDispatchKind::General),
         (256, 8, AttentionDispatchKind::GqaTiledPrefill),
+        (64, 5, AttentionDispatchKind::General),
         (64, 9, AttentionDispatchKind::General),
     ] {
         assert_eq!(
             attention_dispatch_plan(&dispatch_test_params(tokens, head_dim)).kind,
             expected,
             "head_dim={head_dim} tokens={tokens}",
+        );
+    }
+
+    for tokens in [2, 5, 7] {
+        let mut short = dispatch_test_params(tokens, 256);
+        short.position_start = 511;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::General
+        );
+        short.position_start = 512;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::GqaTiledPrefill
+        );
+        short.page_elements -= 1;
+        assert_eq!(
+            attention_dispatch_plan(&short).kind,
+            AttentionDispatchKind::General
         );
     }
 
@@ -197,7 +389,7 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         .iter()
         .all(|bytes| *bytes > 0));
     assert_eq!(exact_tile.threadgroup_memory_bytes, [2560, 5120]);
-    assert_eq!(grouped_decode_reduce_threadgroup_memory_bytes(), 48);
+    assert_eq!(grouped_decode_reduce_threadgroup_memory_bytes(), 144);
 
     let head256_tile = attention_dispatch_plan(&dispatch_test_params(8, 256));
     assert_eq!(head256_tile.threadgroup_memory_bytes, [10240, 20480]);
@@ -205,17 +397,23 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
         head256_tile.threadgroup_memory_bytes.iter().sum::<u64>(),
         30_720,
     );
-    let exact_memory_limit =
-        attention_dispatch_plan_with_memory_limit(&dispatch_test_params(8, 256), 30_720);
-    assert_eq!(
-        exact_memory_limit.kind,
-        AttentionDispatchKind::GqaTiledPrefill,
-    );
-    let memory_limited =
-        attention_dispatch_plan_with_memory_limit(&dispatch_test_params(8, 256), 30_720 - 1);
-    assert_eq!(memory_limited.kind, AttentionDispatchKind::TiledPrefill);
-    assert_eq!(memory_limited.threads_per_threadgroup, [32, 4, 1]);
-    assert_eq!(memory_limited.threadgroup_memory_bytes, [4608, 9216]);
+    for tokens in [5, 8] {
+        let mut params = dispatch_test_params(tokens, 256);
+        params.position_start = 512;
+        let exact_memory_limit = attention_dispatch_plan_with_memory_limit(&params, 30_720);
+        assert_eq!(
+            exact_memory_limit.kind,
+            AttentionDispatchKind::GqaTiledPrefill,
+        );
+        let memory_limited = attention_dispatch_plan_with_memory_limit(&params, 30_720 - 1);
+        if tokens == 5 {
+            assert_eq!(memory_limited, general_attention_dispatch_plan(&params));
+        } else {
+            assert_eq!(memory_limited.kind, AttentionDispatchKind::TiledPrefill);
+            assert_eq!(memory_limited.threads_per_threadgroup, [32, 4, 1]);
+            assert_eq!(memory_limited.threadgroup_memory_bytes, [4608, 9216]);
+        }
+    }
 
     let query_tail = attention_dispatch_plan(&dispatch_test_params(9, 128));
     assert_eq!(query_tail.threadgroups, [2, 16, 1]);
@@ -287,7 +485,7 @@ fn attention_dispatch_plan_routes_supported_prefill_and_preserves_decode() {
 
     let decode = attention_dispatch_plan(&dispatch_test_params(1, 256));
     assert_eq!(decode.kind, AttentionDispatchKind::GroupedDecode);
-    assert_eq!(decode.threadgroups, [GROUPED_DECODE_PARTITIONS, 4, 1]);
+    assert_eq!(decode.threadgroups, [8, 4, 1]);
     assert_eq!(
         decode.threads_per_threadgroup,
         [SIMD_THREADS, TILED_PREFILL_SIMDGROUPS, 1],
@@ -342,19 +540,27 @@ fn packed_mixed_decode_and_prefill_keep_participant_local_dispatch_plans() {
     // Packed projections are shared, but attention is dispatched once per
     // participant. A decode participant must not inherit its prefill peer's
     // tiled launch shape (or vice versa).
-    let participant_params = [dispatch_test_params(1, 256), dispatch_test_params(9, 256)];
+    let mut short_continuation = dispatch_test_params(5, 256);
+    short_continuation.position_start = 512;
+    let participant_params = [
+        dispatch_test_params(1, 256),
+        short_continuation,
+        dispatch_test_params(9, 256),
+    ];
     let plans = participant_params.map(|params| attention_dispatch_plan(&params));
     assert_eq!(plans[0].kind, AttentionDispatchKind::GroupedDecode);
-    assert_eq!(plans[0].threadgroups[0], GROUPED_DECODE_PARTITIONS);
+    assert_eq!(plans[0].threadgroups[0], 8);
     assert_eq!(plans[1].kind, AttentionDispatchKind::GqaTiledPrefill);
-    assert_eq!(plans[1].threadgroups[0], 2);
+    assert_eq!(plans[1].threadgroups[0], 1);
+    assert_eq!(plans[2].kind, AttentionDispatchKind::GqaTiledPrefill);
+    assert_eq!(plans[2].threadgroups[0], 2);
     let grouped_decode_reductions = plans
         .iter()
         .filter(|plan| plan.kind == AttentionDispatchKind::GroupedDecode)
         .count() as u64;
     assert_eq!(
         physical_dispatch_count(plans.len(), true) + grouped_decode_reductions,
-        11,
+        13,
     );
 }
 
@@ -369,6 +575,76 @@ fn tiled_prefill_head128_without_gate_matches_general_and_cpu_for_fresh_exact_ti
         0,
         8,
         AttentionDispatchKind::TiledPrefill,
+    );
+}
+
+#[test]
+fn short_prefill_head256_gqa_matches_general_and_cpu_across_page_and_key_tail_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 gated five-token continuation",
+        256,
+        16,
+        4,
+        true,
+        574,
+        5,
+        AttentionDispatchKind::GqaTiledPrefill,
+    );
+}
+
+#[test]
+fn short_prefill_head128_uses_general_across_long_prefix_page_and_query_tail_on_real_metal() {
+    run_prefill_cpu_case(
+        "head128 ungated seven-token continuation",
+        128,
+        16,
+        4,
+        false,
+        543,
+        7,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_general_for_two_fresh_tokens_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 ungated two-token fresh input",
+        256,
+        16,
+        4,
+        false,
+        0,
+        2,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_general_below_cached_prefix_threshold_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 seven-token continuation below prefix threshold",
+        256,
+        16,
+        4,
+        true,
+        511,
+        7,
+        AttentionDispatchKind::General,
+    );
+}
+
+#[test]
+fn short_prefill_head256_uses_gqa_at_cached_prefix_threshold_on_real_metal() {
+    run_prefill_cpu_case(
+        "head256 two-token continuation at prefix threshold",
+        256,
+        16,
+        4,
+        true,
+        512,
+        2,
+        AttentionDispatchKind::GqaTiledPrefill,
     );
 }
 
@@ -429,6 +705,40 @@ fn gqa_tiled_prefill_head256_matches_general_and_cpu_across_129_keys_on_real_met
     );
 }
 
+struct ValidatedPrefillCase {
+    device: Device,
+    queue: metal::CommandQueue,
+    pipelines: MetalCausalAttentionPipelines,
+    query: Buffer,
+    query_raw: Buffer,
+    pages: Vec<Buffer>,
+    params: CausalAttentionParams,
+    state: Vec<f16>,
+    expected: Vec<f32>,
+}
+
+impl ValidatedPrefillCase {
+    fn assert_kv_unchanged(&self, label: &str) {
+        let page_elements = self.params.page_elements as usize;
+        for (page_index, (page, expected)) in self
+            .pages
+            .iter()
+            .zip(self.state.chunks_exact(page_elements))
+            .enumerate()
+        {
+            let actual =
+                unsafe { std::slice::from_raw_parts(page.contents().cast::<f16>(), page_elements) };
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{label}: attention modified KV page {page_index}, element {index}",
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_prefill_cpu_case(
     label: &str,
@@ -439,7 +749,7 @@ fn run_prefill_cpu_case(
     prefix: usize,
     tokens: usize,
     expected_kind: AttentionDispatchKind,
-) {
+) -> ValidatedPrefillCase {
     let context = prefix + tokens;
 
     let device =
@@ -564,6 +874,19 @@ fn run_prefill_cpu_case(
     eprintln!(
         "{label}: max_abs selected/cpu={selected_cpu_error} general/cpu={general_cpu_error} selected/tiled={selected_tiled_error} selected/general={selected_general_error}",
     );
+    let case = ValidatedPrefillCase {
+        device,
+        queue,
+        pipelines,
+        query: query_buffer,
+        query_raw: query_raw_buffer,
+        pages,
+        params,
+        state,
+        expected,
+    };
+    case.assert_kv_unchanged(label);
+    case
 }
 
 fn run_decode_cpu_case(
@@ -706,6 +1029,61 @@ fn run_decode_cpu_case(
     );
 }
 
+struct GuardedAttentionOutput {
+    buffer: Buffer,
+    output_elements: usize,
+    guard_elements: usize,
+}
+
+impl GuardedAttentionOutput {
+    // A complete extra query tile catches writes to padded rows, including
+    // the seven inactive rows of a single-token dispatch.
+    fn new(device: &Device, params: &CausalAttentionParams) -> Self {
+        let output_elements =
+            params.tokens as usize * params.query_heads as usize * params.head_dim as usize;
+        let guard_elements = TILED_PREFILL_QUERY_TILE as usize
+            * params.query_heads as usize
+            * params.head_dim as usize;
+        let buffer = output_buffer::<f16>(device, output_elements + guard_elements);
+        let output = Self {
+            buffer,
+            output_elements,
+            guard_elements,
+        };
+        output.reset();
+        output
+    }
+
+    // Call only before submission or after the previous command completed.
+    fn reset(&self) {
+        let values = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.contents().cast::<f16>(),
+                self.output_elements + self.guard_elements,
+            )
+        };
+        values[..self.output_elements].fill(f16::NAN);
+        values[self.output_elements..].fill(f16::from_bits(0x3555));
+    }
+
+    fn read_after_completion(&self, kind: AttentionDispatchKind) -> Vec<f32> {
+        let guarded_output = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.contents().cast::<f16>(),
+                self.output_elements + self.guard_elements,
+            )
+        };
+        for (index, value) in guarded_output[self.output_elements..].iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                0x3555,
+                "{kind:?}: output guard changed at element {index}",
+            );
+        }
+        read_f16(&self.buffer, self.output_elements)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_attention_plan(
     device: &Device,
@@ -717,32 +1095,42 @@ fn run_attention_plan(
     params: &CausalAttentionParams,
     plan: AttentionDispatchPlan,
 ) -> Vec<f32> {
-    let output_elements =
-        params.tokens as usize * params.query_heads as usize * params.head_dim as usize;
-    let output = output_buffer::<f16>(device, output_elements);
+    let output = GuardedAttentionOutput::new(device, params);
     let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
-        output_buffer::<f32>(
+        // Unused capacity must not participate in the dynamic reduction.
+        shared_buffer(
             device,
-            GROUPED_DECODE_PARTITIONS as usize
-                * params.query_heads as usize
-                * (params.head_dim as usize + 2),
+            &vec![
+                f32::NAN;
+                GROUPED_DECODE_MAX_PARTITIONS as usize
+                    * params.query_heads as usize
+                    * (params.head_dim as usize + 2)
+            ],
         )
     });
     let argument_buffer = device.new_buffer(
         pipelines.binding_slot_bytes().unwrap(),
         MTLResourceOptions::StorageModeShared,
     );
-    let argument_encoder = pipelines.new_binding_encoder();
-    argument_encoder.set_argument_buffer(&argument_buffer, 0);
     let page_refs = pages.iter().map(|page| &**page).collect::<Vec<_>>();
     let page_offsets = vec![0; pages.len()];
-    argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+    pipelines
+        .with_binding_encoder(|argument_encoder| {
+            argument_encoder.set_argument_buffer(&argument_buffer, 0);
+            argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+            Ok(())
+        })
+        .unwrap();
 
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
     set_raw(encoder, 0, query);
     set_raw(encoder, 1, query_raw);
-    set_raw(encoder, 2, grouped_partials.as_ref().unwrap_or(&output));
+    set_raw(
+        encoder,
+        2,
+        grouped_partials.as_ref().unwrap_or(&output.buffer),
+    );
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, params);
     use_raw_pages(encoder, pages);
@@ -751,7 +1139,7 @@ fn run_attention_plan(
         encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
         set_raw(encoder, 0, grouped_partials);
         set_raw(encoder, 1, query_raw);
-        set_raw(encoder, 2, &output);
+        set_raw(encoder, 2, &output.buffer);
         set_raw_params(encoder, 4, params);
         encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
         encoder.set_threadgroup_memory_length(1, 0);
@@ -766,7 +1154,7 @@ fn run_attention_plan(
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-    read_f16(&output, output_elements)
+    output.read_after_completion(plan.kind)
 }
 
 fn dispatch_test_params(tokens: u32, head_dim: u32) -> CausalAttentionParams {
@@ -918,22 +1306,67 @@ fn run_segment(
         epsilon: 1.0e-6,
         rope_theta: 10_000.0,
     };
+    run_segment_bits(
+        device,
+        queue,
+        pipelines,
+        inputs,
+        query_norm_values,
+        key_norm_values,
+        pages,
+        &params,
+        general_attention_dispatch_plan(&params),
+    )
+    .into_iter()
+    .map(|bits| f16::from_bits(bits).to_f32())
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_segment_bits(
+    device: &Device,
+    queue: &CommandQueueRef,
+    pipelines: &MetalCausalAttentionPipelines,
+    inputs: SegmentInputs<'_>,
+    query_norm_values: &[f16],
+    key_norm_values: &[f16],
+    pages: &[Buffer],
+    params: &CausalAttentionParams,
+    plan: AttentionDispatchPlan,
+) -> Vec<u16> {
+    let tokens = params.tokens as usize;
+    let query_features = (params.query_heads * params.head_dim) as usize;
     let query_raw = shared_buffer(device, inputs.query_raw);
     let key_raw = shared_buffer(device, inputs.key_raw);
     let value_raw = shared_buffer(device, inputs.value_raw);
     let query_norm = shared_buffer(device, query_norm_values);
     let key_norm = shared_buffer(device, key_norm_values);
-    let query = output_buffer::<f16>(device, tokens * QUERY_FEATURES);
-    let output = output_buffer::<f16>(device, tokens * QUERY_FEATURES);
+    let query = output_buffer::<f16>(device, tokens * query_features);
+    let output = output_buffer::<f16>(device, tokens * query_features);
+    let grouped_partials = (plan.kind == AttentionDispatchKind::GroupedDecode).then(|| {
+        shared_buffer(
+            device,
+            &vec![
+                f32::NAN;
+                GROUPED_DECODE_MAX_PARTITIONS as usize
+                    * params.query_heads as usize
+                    * (params.head_dim as usize + 2)
+            ],
+        )
+    });
     let argument_buffer = device.new_buffer(
         pipelines.binding_slot_bytes().unwrap(),
         MTLResourceOptions::StorageModeShared,
     );
-    let argument_encoder = pipelines.new_binding_encoder();
-    argument_encoder.set_argument_buffer(&argument_buffer, 0);
     let page_refs = pages.iter().map(|page| &**page).collect::<Vec<_>>();
     let page_offsets = vec![0; pages.len()];
-    argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+    pipelines
+        .with_binding_encoder(|argument_encoder| {
+            argument_encoder.set_argument_buffer(&argument_buffer, 0);
+            argument_encoder.set_buffers(0, &page_refs, &page_offsets);
+            Ok(())
+        })
+        .unwrap();
 
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
@@ -957,32 +1390,43 @@ fn run_segment(
     encoder.set_threadgroup_memory_length(0, 0);
     encoder.set_threadgroup_memory_length(1, 0);
     encoder.dispatch_thread_groups(
-        MTLSize::new(tokens as u64, (QUERY_HEADS + 2 * KV_HEADS) as u64, 1),
+        MTLSize::new(
+            tokens as u64,
+            u64::from(params.query_heads + 2 * params.key_value_heads),
+            1,
+        ),
         MTLSize::new(SIMD_THREADS, 1, 1),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.attention);
     set_raw(encoder, 0, &query);
     set_raw(encoder, 1, &query_raw);
-    set_raw(encoder, 2, &output);
+    set_raw(encoder, 2, grouped_partials.as_ref().unwrap_or(&output));
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, &params);
     use_raw_pages(encoder, pages);
-    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&params));
-    encoder.set_threadgroup_memory_length(1, 0);
-    encoder.dispatch_thread_groups(
-        MTLSize::new(tokens as u64, QUERY_HEADS as u64, 1),
-        MTLSize::new(
-            SIMD_THREADS,
-            u64::from(pipelines.attention_simdgroups_for_context((position_start + tokens) as u64)),
-            1,
-        ),
-    );
+    encode_attention_dispatch(pipelines, encoder, plan);
+    if let Some(grouped_partials) = grouped_partials.as_ref() {
+        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        set_raw(encoder, 0, grouped_partials);
+        set_raw(encoder, 1, &query_raw);
+        set_raw(encoder, 2, &output);
+        set_raw_params(encoder, 4, params);
+        encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
+        encoder.set_threadgroup_memory_length(1, 0);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.query_heads), 1, 1),
+            MTLSize::new(SIMD_THREADS, 1, 1),
+        );
+    }
     encoder.end_encoding();
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-    read_f16(&output, tokens * QUERY_FEATURES)
+    // SAFETY: the command is complete and this output allocation is shared.
+    unsafe {
+        std::slice::from_raw_parts(output.contents().cast::<u16>(), tokens * query_features)
+            .to_vec()
+    }
 }
 
 fn use_raw_pages(encoder: &ComputeCommandEncoderRef, pages: &[Buffer]) {

@@ -47,6 +47,9 @@ use metal::{
 
 use super::st;
 
+mod counter_readback;
+use counter_readback::CounterReadbackStats;
+
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_SUBMISSION_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -698,14 +701,30 @@ struct MetalCounterCaptureBuilder {
     cpu_anchor_start: u64,
     gpu_anchor_start: u64,
     unavailable: bool,
+    readback_stats: Arc<CounterReadbackStats>,
 }
 
 impl MetalCounterCaptureBuilder {
-    fn new(device: metal::Device, counter_set: CounterSet) -> Option<Self> {
+    fn new(
+        device: metal::Device,
+        counter_set: CounterSet,
+        readback_stats: Arc<CounterReadbackStats>,
+    ) -> Option<Self> {
         let mut cpu_anchor_start = 0;
         let mut gpu_anchor_start = 0;
         device.sample_timestamps(&mut cpu_anchor_start, &mut gpu_anchor_start);
         if cpu_anchor_start == 0 || gpu_anchor_start == 0 {
+            #[cfg(test)]
+            counter_diagnostic::report(
+                "initial_anchor_zero",
+                (cpu_anchor_start, gpu_anchor_start),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             return None;
         }
         Some(Self {
@@ -716,23 +735,26 @@ impl MetalCounterCaptureBuilder {
             cpu_anchor_start,
             gpu_anchor_start,
             unavailable: false,
+            readback_stats,
         })
     }
 
-    fn add_page(&mut self) -> Result<(), ()> {
+    fn add_page(&mut self) -> Result<(), &'static str> {
         if self.pages.len() >= METAL_COUNTER_MAX_PAGES {
-            return Err(());
+            return Err("page_limit");
         }
         let descriptor = CounterSampleBufferDescriptor::new();
         descriptor.set_counter_set(&self.counter_set);
         descriptor.set_storage_mode(MTLStorageMode::Shared);
         descriptor.set_sample_count(METAL_COUNTER_SAMPLES_PER_PAGE);
         descriptor.set_label("ferrum.vnext.command_timestamps");
-        let sample_buffer = new_counter_sample_buffer_checked(&self.device, &descriptor)?;
+        let sample_buffer = new_counter_sample_buffer_checked(&self.device, &descriptor)
+            .map_err(|_| "counter_sample_buffer_allocation")?;
         let byte_len = METAL_COUNTER_SAMPLES_PER_PAGE
             .checked_mul(std::mem::size_of::<u64>() as u64)
-            .ok_or(())?;
-        let resolved = new_shared_buffer_checked(&self.device, byte_len)?;
+            .ok_or("resolve_buffer_length_overflow")?;
+        let resolved = new_shared_buffer_checked(&self.device, byte_len)
+            .map_err(|_| "resolve_buffer_allocation")?;
         self.pages.push(MetalCounterPageBuilder {
             sample_buffer,
             resolved,
@@ -754,10 +776,22 @@ impl MetalCounterCaptureBuilder {
             .pages
             .last()
             .is_none_or(|page| page.used_samples + 2 > METAL_COUNTER_SAMPLES_PER_PAGE)
-            && self.add_page().is_err()
         {
-            self.unavailable = true;
-            return None;
+            if let Err(_cause) = self.add_page() {
+                #[cfg(test)]
+                counter_diagnostic::report(
+                    _cause,
+                    (self.cpu_anchor_start, self.gpu_anchor_start),
+                    None,
+                    Some(command_index),
+                    Some(self.pages.len()),
+                    None,
+                    None,
+                    None,
+                );
+                self.unavailable = true;
+                return None;
+            }
         }
         let page_index = self.pages.len() - 1;
         let page = &mut self.pages[page_index];
@@ -779,7 +813,21 @@ impl MetalCounterCaptureBuilder {
         })
     }
 
-    fn mark_unavailable(&mut self) {
+    fn mark_unavailable(&mut self, _cause: &'static str) {
+        #[cfg(test)]
+        if !self.unavailable {
+            let mapping = self.mappings.last();
+            counter_diagnostic::report(
+                _cause,
+                (self.cpu_anchor_start, self.gpu_anchor_start),
+                None,
+                mapping.map(|value| value.command_index),
+                mapping.map(|value| value.page_index),
+                mapping.map(|value| (value.start_sample_index, value.end_sample_index)),
+                None,
+                None,
+            );
+        }
         self.unavailable = true;
     }
 
@@ -818,6 +866,7 @@ impl MetalCounterCaptureBuilder {
             cpu_anchor_start: self.cpu_anchor_start,
             gpu_anchor_start: self.gpu_anchor_start,
             unavailable: self.unavailable,
+            readback_stats: self.readback_stats,
         }
     }
 }
@@ -836,6 +885,7 @@ struct MetalCounterCapture {
     cpu_anchor_start: u64,
     gpu_anchor_start: u64,
     unavailable: bool,
+    readback_stats: Arc<CounterReadbackStats>,
 }
 
 fn metal_submission_execution_timing(
@@ -873,6 +923,10 @@ fn metal_submission_execution_timing(
 impl MetalCounterCapture {
     fn resolve(&self) -> DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
         if self.unavailable || self.mappings.is_empty() {
+            #[cfg(test)]
+            if !self.unavailable {
+                self.diagnose("no_interval_mappings", None, None, &[]);
+            }
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
@@ -882,28 +936,71 @@ impl MetalCounterCapture {
         self.device
             .sample_timestamps(&mut cpu_anchor_end, &mut gpu_anchor_end);
         let Some(cpu_span) = cpu_anchor_end.checked_sub(self.cpu_anchor_start) else {
+            #[cfg(test)]
+            self.diagnose(
+                "cpu_anchor_reversed",
+                Some((cpu_anchor_end, gpu_anchor_end)),
+                None,
+                &[],
+            );
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
         };
         let Some(gpu_span) = gpu_anchor_end.checked_sub(self.gpu_anchor_start) else {
+            #[cfg(test)]
+            self.diagnose(
+                "gpu_anchor_reversed",
+                Some((cpu_anchor_end, gpu_anchor_end)),
+                None,
+                &[],
+            );
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
         };
         if cpu_span == 0 || gpu_span == 0 {
+            #[cfg(test)]
+            self.diagnose(
+                "anchor_span_zero",
+                Some((cpu_anchor_end, gpu_anchor_end)),
+                None,
+                &[],
+            );
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
         }
-        let mut page_samples = Vec::with_capacity(self.pages.len());
-        for page in &self.pages {
+        let mut resolved_pages = Vec::with_capacity(self.pages.len());
+        for (_page_index, page) in self.pages.iter().enumerate() {
             let Some(sample_count) = usize::try_from(page.used_samples).ok() else {
+                #[cfg(test)]
+                counter_diagnostic::report(
+                    "sample_count_overflow",
+                    (self.cpu_anchor_start, self.gpu_anchor_start),
+                    Some((cpu_anchor_end, gpu_anchor_end)),
+                    None,
+                    Some(_page_index),
+                    None,
+                    None,
+                    None,
+                );
                 return DeviceTimingMeasurement::Unavailable(
                     DeviceTimingUnavailableReason::DurationOverflow,
                 );
             };
             if page.resolved.contents().is_null() {
+                #[cfg(test)]
+                counter_diagnostic::report(
+                    "resolve_buffer_contents_null",
+                    (self.cpu_anchor_start, self.gpu_anchor_start),
+                    Some((cpu_anchor_end, gpu_anchor_end)),
+                    None,
+                    Some(_page_index),
+                    None,
+                    None,
+                    None,
+                );
                 return DeviceTimingMeasurement::Unavailable(
                     DeviceTimingUnavailableReason::BackendMeasurementFailed,
                 );
@@ -911,53 +1008,157 @@ impl MetalCounterCapture {
             let samples = unsafe {
                 std::slice::from_raw_parts(page.resolved.contents().cast::<u64>(), sample_count)
             };
-            page_samples.push(samples);
+            let samples = match counter_readback::resolve_missing_samples(
+                samples,
+                self.gpu_anchor_start,
+                gpu_anchor_end,
+                || counter_readback::resolve_cpu_page(page),
+            ) {
+                Ok(samples) => samples,
+                Err(_cause) => {
+                    tracing::debug!(
+                        cause = _cause,
+                        page_index = _page_index,
+                        "Metal counter readback unavailable"
+                    );
+                    #[cfg(test)]
+                    counter_diagnostic::report(
+                        _cause,
+                        (self.cpu_anchor_start, self.gpu_anchor_start),
+                        Some((cpu_anchor_end, gpu_anchor_end)),
+                        None,
+                        Some(_page_index),
+                        None,
+                        None,
+                        None,
+                    );
+                    return DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    );
+                }
+            };
+            if matches!(samples, std::borrow::Cow::Owned(_)) {
+                self.readback_stats.record_cpu_page(sample_count as u64);
+            }
+            resolved_pages.push(samples);
         }
-        let raw_interval = |mapping: &MetalCounterIntervalMapping| -> Option<(u64, u64)> {
-            let samples = *page_samples.get(mapping.page_index)?;
-            let start = *samples.get(usize::try_from(mapping.start_sample_index).ok()?)?;
-            let end = *samples.get(usize::try_from(mapping.end_sample_index).ok()?)?;
-            (start != METAL_COUNTER_ERROR_VALUE
-                && end != METAL_COUNTER_ERROR_VALUE
-                && start >= self.gpu_anchor_start
-                && end > start
-                && end <= gpu_anchor_end)
-                .then_some((start, end))
-        };
+        let page_samples = resolved_pages
+            .iter()
+            .map(|page| page.as_ref())
+            .collect::<Vec<_>>();
+        let raw_interval =
+            |mapping: &MetalCounterIntervalMapping| -> Result<(u64, u64), &'static str> {
+                let samples = *page_samples
+                    .get(mapping.page_index)
+                    .ok_or("sample_page_missing")?;
+                let start_index = usize::try_from(mapping.start_sample_index)
+                    .map_err(|_| "start_sample_index_overflow")?;
+                let end_index = usize::try_from(mapping.end_sample_index)
+                    .map_err(|_| "end_sample_index_overflow")?;
+                let start = *samples.get(start_index).ok_or("start_sample_missing")?;
+                let end = *samples.get(end_index).ok_or("end_sample_missing")?;
+                if start == METAL_COUNTER_ERROR_VALUE {
+                    return Err("start_sample_error_value");
+                }
+                if end == METAL_COUNTER_ERROR_VALUE {
+                    return Err("end_sample_error_value");
+                }
+                if start < self.gpu_anchor_start {
+                    return Err("start_before_gpu_anchor");
+                }
+                if end <= start {
+                    return Err("end_not_after_start");
+                }
+                if end > gpu_anchor_end {
+                    return Err("end_after_gpu_anchor");
+                }
+                Ok((start, end))
+            };
         let Some(origin) = self
             .mappings
             .iter()
-            .filter_map(|mapping| raw_interval(mapping).map(|(start, _)| start))
+            .filter_map(|mapping| raw_interval(mapping).ok().map(|(start, _)| start))
             .min()
         else {
+            #[cfg(test)]
+            if let Some(mapping) = self.mappings.first() {
+                self.diagnose(
+                    raw_interval(mapping)
+                        .err()
+                        .unwrap_or("valid_interval_origin_missing"),
+                    Some((cpu_anchor_end, gpu_anchor_end)),
+                    Some(mapping),
+                    &page_samples,
+                );
+            }
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
         };
-        let convert = |timestamp: u64| -> Option<u64> {
-            let delta = u128::from(timestamp.checked_sub(origin)?);
-            let numerator = delta.checked_mul(u128::from(cpu_span))?;
-            let rounded = numerator.checked_add(u128::from(gpu_span) / 2)?;
-            u64::try_from(rounded / u128::from(gpu_span)).ok()
+        let convert = |timestamp: u64| -> Result<u64, &'static str> {
+            let delta = u128::from(
+                timestamp
+                    .checked_sub(origin)
+                    .ok_or("timestamp_before_origin")?,
+            );
+            let numerator = delta
+                .checked_mul(u128::from(cpu_span))
+                .ok_or("timestamp_scale_overflow")?;
+            let rounded = numerator
+                .checked_add(u128::from(gpu_span) / 2)
+                .ok_or("timestamp_rounding_overflow")?;
+            u64::try_from(rounded / u128::from(gpu_span))
+                .map_err(|_| "converted_timestamp_overflow")
         };
         let mut commands = BTreeMap::<u32, Vec<DeviceExecutionInterval>>::new();
         for mapping in self.mappings.iter() {
-            let Some((start, end)) = raw_interval(mapping) else {
-                return DeviceTimingMeasurement::Unavailable(
-                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
-                );
+            let (start, end) = match raw_interval(mapping) {
+                Ok(interval) => interval,
+                Err(_cause) => {
+                    #[cfg(test)]
+                    self.diagnose(
+                        _cause,
+                        Some((cpu_anchor_end, gpu_anchor_end)),
+                        Some(mapping),
+                        &page_samples,
+                    );
+                    return DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    );
+                }
             };
-            let Some(interval) = convert(start).zip(convert(end)).and_then(|(start, end)| {
-                mapping.subwork_id.map_or_else(
-                    || DeviceExecutionInterval::new(mapping.kind, start, end),
-                    |subwork_id| {
-                        DeviceExecutionInterval::new_labeled(mapping.kind, start, end, subwork_id)
-                    },
-                )
-            }) else {
-                return DeviceTimingMeasurement::Unavailable(
-                    DeviceTimingUnavailableReason::DurationOverflow,
-                );
+            let interval = convert(start)
+                .and_then(|start| convert(end).map(|end| (start, end)))
+                .and_then(|(start, end)| {
+                    mapping
+                        .subwork_id
+                        .map_or_else(
+                            || DeviceExecutionInterval::new(mapping.kind, start, end),
+                            |subwork_id| {
+                                DeviceExecutionInterval::new_labeled(
+                                    mapping.kind,
+                                    start,
+                                    end,
+                                    subwork_id,
+                                )
+                            },
+                        )
+                        .ok_or("converted_interval_rejected")
+                });
+            let interval = match interval {
+                Ok(interval) => interval,
+                Err(_cause) => {
+                    #[cfg(test)]
+                    self.diagnose(
+                        _cause,
+                        Some((cpu_anchor_end, gpu_anchor_end)),
+                        Some(mapping),
+                        &page_samples,
+                    );
+                    return DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::DurationOverflow,
+                    );
+                }
             };
             commands
                 .entry(mapping.command_index)
@@ -965,6 +1166,13 @@ impl MetalCounterCapture {
                 .push(interval);
         }
         let Some(commands) = metal_submission_execution_timing(self.command_count, commands) else {
+            #[cfg(test)]
+            self.diagnose(
+                "submission_span_rejected",
+                Some((cpu_anchor_end, gpu_anchor_end)),
+                None,
+                &page_samples,
+            );
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
@@ -1093,7 +1301,7 @@ impl MetalSubmissionEncoder {
                         .to_owned()
                 } else {
                     if let Some(capture) = self.counter_capture.as_mut() {
-                        capture.mark_unavailable();
+                        capture.mark_unavailable("compute_sample_attachment_missing");
                     }
                     self.command_buffer.new_compute_command_encoder().to_owned()
                 }
@@ -1153,7 +1361,7 @@ impl MetalSubmissionEncoder {
                     .to_owned()
             } else {
                 if let Some(capture) = self.counter_capture.as_mut() {
-                    capture.mark_unavailable();
+                    capture.mark_unavailable("blit_sample_attachment_missing");
                 }
                 self.command_buffer.new_blit_command_encoder().to_owned()
             }
@@ -1617,6 +1825,7 @@ pub struct MetalDeviceRuntime {
     runtime_instance: u64,
     device: metal::Device,
     timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
+    counter_readback_stats: Arc<CounterReadbackStats>,
     static_weight_import_gate: Mutex<()>,
 }
 
@@ -1650,17 +1859,29 @@ impl MetalDeviceRuntime {
                 current.checked_add(1)
             })
             .map_err(|_| MetalDeviceRuntimeError::contract("Metal runtime identity exhausted"))?;
+        let counter_readback_stats =
+            Arc::new(CounterReadbackStats::new(runtime_instance, device.name()));
         Ok(Self {
             descriptor,
             runtime_instance,
             device,
             timestamp_counter_support: OnceLock::new(),
+            counter_readback_stats,
             static_weight_import_gate: Mutex::new(()),
         })
     }
 
     pub(crate) fn device(&self) -> &metal::Device {
         &self.device
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocate_test_region(
+        &self,
+        request: &BufferRequest,
+    ) -> Result<MetalBufferRegion, MetalDeviceRuntimeError> {
+        self.allocate_request(request)?
+            .region(0..request.size_bytes())
     }
 
     fn timestamp_counter_support(&self) -> MetalTimestampCounterSupport {
@@ -1762,6 +1983,26 @@ impl MetalDeviceRuntime {
     where
         S: DeviceSubmissionTimingSink,
     {
+        // Metal's autoreleased pass descriptors retain their counter sample
+        // buffers. Drain those temporary references after synchronous encoding,
+        // including when the caller runs on a long-lived Rust worker thread.
+        // The returned fence owns the command buffer, counter pages, and command
+        // resources needed until asynchronous device completion.
+        metal::objc::rc::autoreleasepool(|| {
+            self.submit_commands_inner(stream, entries, timing_mode, timing_sink)
+        })
+    }
+
+    fn submit_commands_inner<S>(
+        &self,
+        stream: &mut MetalDeviceStream,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
+        timing_mode: DeviceTimingMode,
+        timing_sink: &S,
+    ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
         let validate_stage = MetalSubmissionStageTimer::start(
             timing_sink,
             DeviceSubmissionStage::ValidateAndPrepare,
@@ -1826,7 +2067,11 @@ impl MetalDeviceRuntime {
         let counter_capture = if physical_span_attribution {
             match self.timestamp_counter_support() {
                 MetalTimestampCounterSupport::Supported(counter_set) => {
-                    MetalCounterCaptureBuilder::new(self.device.clone(), counter_set)
+                    MetalCounterCaptureBuilder::new(
+                        self.device.clone(),
+                        counter_set,
+                        Arc::clone(&self.counter_readback_stats),
+                    )
                 }
                 MetalTimestampCounterSupport::Unsupported => None,
             }
@@ -2339,6 +2584,12 @@ impl DeviceRuntime for MetalDeviceRuntime {
 }
 
 #[cfg(test)]
+mod counter_lifecycle_tests;
+
+#[cfg(test)]
+mod counter_diagnostic;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
@@ -2795,6 +3046,64 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
+    }
+
+    #[test]
+    fn shared_counter_cpu_resolve_uses_original_completed_samples() {
+        let runtime = runtime();
+        if !matches!(
+            runtime.timestamp_counter_support(),
+            MetalTimestampCounterSupport::Supported(_)
+        ) {
+            return;
+        }
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/cpu-counter-resolve"))
+            .unwrap();
+        let command = runtime.encode_zero(&destination, 0, 8).unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                compute_entries(vec![command]),
+                DeviceTimingMode::Kernel,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .unwrap();
+        // Wait for the same command, without invoking its production resolve.
+        // Capture the end anchors once; CPU resolution does not sample again.
+        fence.command_buffer.wait_until_completed();
+        assert_eq!(
+            fence.command_buffer.status(),
+            MTLCommandBufferStatus::Completed
+        );
+        let MetalFenceCommandTiming::Captured { capture, .. } = &fence.command_timing else {
+            panic!("timestamp support must produce a capture")
+        };
+        let mut cpu_end = 0;
+        let mut gpu_end = 0;
+        capture.device.sample_timestamps(&mut cpu_end, &mut gpu_end);
+        let page = &capture.pages[0];
+        let missing = vec![0; page.used_samples as usize];
+        // Exercise the official CPU API on real GPU-produced samples even on
+        // devices whose GPU resolve does not exhibit the reported zero result.
+        let recovered = counter_readback::resolve_missing_samples(
+            &missing,
+            capture.gpu_anchor_start,
+            gpu_end,
+            || counter_readback::resolve_cpu_page(page),
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0] >= capture.gpu_anchor_start);
+        assert!(recovered[1] > recovered[0] && recovered[1] <= gpu_end);
+        assert!(cpu_end > capture.cpu_anchor_start);
+        // The real terminal path also resolves only once and returns one
+        // immutable result on subsequent observations.
+        let terminal = runtime.wait_fence(&fence).unwrap();
+        assert!(terminal.terminal().is_succeeded());
+        let again = runtime.wait_fence(&fence).unwrap();
+        assert_eq!(terminal.submission_timing(), again.submission_timing());
     }
 
     #[test]

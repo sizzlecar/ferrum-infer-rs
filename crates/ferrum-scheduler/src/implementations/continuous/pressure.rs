@@ -121,6 +121,23 @@ impl LogicalWorkFrontier {
         self.scheduled_tokens = self.computed_tokens.saturating_add(tokens);
     }
 
+    pub(crate) fn can_restore_at(&self, expected_offset: usize) -> bool {
+        matches!(
+            self.work_kind,
+            LogicalWorkKind::Prefill | LogicalWorkKind::Recompute
+        ) && self.computed_tokens == expected_offset
+            && self.resident_tokens == expected_offset
+            && self.scheduled_tokens == self.computed_tokens
+    }
+
+    /// Imported state changes the resident frontier without pretending that
+    /// this request performed compute or made pressure-owner progress.
+    pub(crate) fn commit_restored_prefix(&mut self, boundary: usize) {
+        self.computed_tokens = boundary;
+        self.resident_tokens = boundary;
+        self.scheduled_tokens = boundary;
+    }
+
     pub(crate) fn commit_prefill(&mut self, computed_tokens: usize, delta: usize) {
         self.computed_tokens = computed_tokens;
         self.resident_tokens = computed_tokens;

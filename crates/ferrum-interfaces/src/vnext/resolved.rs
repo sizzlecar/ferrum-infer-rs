@@ -11,12 +11,12 @@ use super::model::PreparedModelFamilyWire;
 use super::numerical_resolution::NumericalProfileResolutionWire;
 use super::NumericalProfileResolution;
 use super::{
-    AdmissionFitPolicy, CapabilityCatalog, CompletionRetentionSpec, ContractVersion,
-    DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionDeterminismRequirement,
-    ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId,
-    ReusableExecutionPolicy, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
-    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
-    VNextError,
+    AdmissionFitPolicy, CapabilityCatalog, CheckpointCapacityPolicy, CompletionRetentionSpec,
+    ContractVersion, DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView,
+    ExecutionDeterminismRequirement, ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution,
+    PreparedModelFamily, ProviderId, ReusableExecutionPolicy, RuntimePolicy, SpecialTokenRole,
+    TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
+    UnvalidatedPreparedModelFamily, VNextError,
 };
 
 /// Maximum raw byte length accepted for one resolution source artifact.
@@ -997,6 +997,8 @@ pub struct RuntimeMemoryPolicy {
     pub reserve_bytes: u64,
     pub maximum_active_sequences: u32,
     pub dynamic_storage_profile_order: Vec<DynamicStorageProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_capacity: Option<CheckpointCapacityPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1291,6 +1293,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
 
     fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
         self.reusable_execution.as_ref()
+    }
+
+    fn checkpoint_capacity_policy(&self) -> Option<&CheckpointCapacityPolicy> {
+        self.memory.checkpoint_capacity.as_ref()
     }
 
     fn validate(&self) -> Result<(), VNextError> {

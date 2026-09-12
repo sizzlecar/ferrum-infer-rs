@@ -30,6 +30,9 @@ use std::time::Duration;
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 
+#[path = "prefix_restore_tests.rs"]
+mod prefix_restore_tests;
+
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
     wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
@@ -80,6 +83,7 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     release_epoch: AtomicU64,
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
+    prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
 }
 
 impl PlanRuntimeChunkedPrefillTestExecutor {
@@ -97,6 +101,7 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             release_epoch: AtomicU64::new(0),
             capacity_wait_registrations: AtomicU64::new(0),
             capacity_signal,
+            prefix_restore: None,
         }
     }
 
@@ -241,6 +246,18 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
 
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn supports_plan_runtime_prefix_restore(&self) -> bool {
+        self.prefix_restore.is_some()
+    }
+
+    async fn try_restore_plan_runtime_prefix(
+        &self,
+        input: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreInput<'_>,
+    ) -> Result<Option<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutput>> {
+        assert!(self.retained.lock().unwrap().contains(input.request_id));
+        self.prefix_restore.as_ref().unwrap().restore(input)
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -1002,7 +1019,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         self.inner.release_cache(cache_id);
     }
 
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.inner.release_cache(completion.cache_id());
         self.completions
             .lock()

@@ -2,6 +2,7 @@ mod attribute;
 mod backing_upload;
 mod buffer_view;
 mod catalog;
+mod checkpoint;
 mod compiled_identity;
 mod compiled_submission_wave;
 mod descriptor;
@@ -33,6 +34,12 @@ pub use buffer_view::{
 pub use catalog::{
     CapabilityCatalog, MAX_ENGINE_PROVIDER_ROWS, MAX_OPERATION_CATALOG_ROWS,
     MAX_OPERATION_PROVIDER_ROWS, MAX_REFERENCE_ORACLE_DEPTH,
+};
+pub use checkpoint::{
+    CheckpointBoundaryConstraint, CheckpointCompletedInputCapture, CheckpointPartitionNumerics,
+    CheckpointTokenSpanConstraint, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
+    PROVIDER_CHECKPOINT_CONTRACT_VERSION,
 };
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
 pub use descriptor::{

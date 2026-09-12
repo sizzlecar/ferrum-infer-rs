@@ -535,6 +535,12 @@ fn render_markdown(report: &DecodeIsolationReport) -> String {
         "# {} — decode isolation\n\nincumbents: {} · aggressor input: {} tokens\n\n",
         report.model, report.config.incumbents, report.config.aggressor_input_tokens
     );
+    if let Some(sampling) = report.env.http_request_sampling {
+        output.push_str(&format!(
+            "Request sampling: `{}`\n\n",
+            serde_json::to_string(&sampling).expect("validated sampling")
+        ));
+    }
     output.push_str("The output-event gap is measured between user-visible SSE text events; it is not token-level latency.\n\n");
     output.push_str("| repeat | baseline event-gap p50/p95 ms | interference event-gap p50/p95 ms | max event gap ms | observable output progress | time to first output event ms | valid |\n");
     output.push_str("|---:|---:|---:|---:|---:|---:|:---:|\n");
@@ -593,7 +599,7 @@ mod tests {
     #[test]
     fn markdown_names_output_event_evidence_without_token_latency_claims() {
         let env = ferrum_bench_core::Env::default();
-        let report = DecodeIsolationReport {
+        let mut report = DecodeIsolationReport {
             schema_version: 2,
             scenario: Scenario::DecodeIsolation,
             model: "test-model".to_string(),
@@ -613,6 +619,19 @@ mod tests {
         assert!(markdown.contains("time to first output event"));
         assert!(!markdown.contains("ITL"));
         assert!(!markdown.contains("TTFT"));
+        assert!(!markdown.contains("Request sampling:"));
+        let sampling = ferrum_bench_core::env::HttpRequestSampling {
+            temperature: 0.6,
+            top_k: Some(20),
+            top_p: Some(0.95),
+            repetition_penalty: Some(1.0),
+            seed: Some(37),
+        };
+        report.env.http_request_sampling = Some(sampling);
+        report.env_hash = report.env.hash();
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("Request sampling:"));
+        assert!(markdown.contains(&serde_json::to_string(&sampling).unwrap()));
     }
 
     #[test]

@@ -3073,6 +3073,24 @@ mod tests {
     }
 
     #[test]
+    fn run_prefix_state_cache_config_reaches_typed_engine_config() {
+        for enabled in [true, false] {
+            let config: CliConfig =
+                toml::from_str(&format!("[runtime]\nprefix_cache = {enabled}\n")).unwrap();
+            let base = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
+            let effective = run_effective_runtime_config(
+                &base,
+                &run_startup_cli_runtime_entries(&test_run_cmd(), None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.runtime.prefix_state_cache_enabled = !enabled;
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
+            assert!(!engine.runtime.prefix_cache_enabled);
+        }
+    }
+
+    #[test]
     fn run_full_profile_detail_reaches_typed_engine_config() {
         let mut cmd = test_run_cmd();
         cmd.profile_detail = crate::observability_product::ProfileDetailArg::Full;

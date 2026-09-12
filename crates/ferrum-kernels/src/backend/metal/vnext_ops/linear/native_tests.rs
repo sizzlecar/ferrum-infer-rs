@@ -96,7 +96,7 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
                 let command = queue.new_command_buffer();
                 let encoder = command.new_compute_command_encoder();
                 let (pipeline, kind) = if activation_type == ElementType::F16 {
-                    pipelines.linear_pipeline(physical, params.rows)
+                    pipelines.linear_pipeline(physical, params.rows, params.out_features)
                 } else {
                     (
                         pipelines.f32_linear_pipeline(physical).unwrap(),

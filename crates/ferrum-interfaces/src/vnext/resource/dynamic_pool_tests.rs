@@ -6,8 +6,9 @@ use crate::model_executor::{
 use crate::vnext::{
     BoundExecutionResourceMaintenance, CapacityAvailabilitySource, CopyRegion, DeferredAction,
     DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
-    DeviceErrorReport, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionTrim, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
+    DeviceErrorReport, DeviceExecutionTiming, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode, DynamicResourceDemand,
     ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ProgramValueId, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
     ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
@@ -16,6 +17,27 @@ use crate::vnext::{
 };
 use serde_json::{json, Value};
 use std::error::Error;
+
+#[path = "checkpoint/maintenance_tests.rs"]
+mod checkpoint_maintenance_tests;
+
+#[path = "capacity_pressure_tests.rs"]
+mod capacity_pressure_tests;
+
+#[path = "checkpoint/tests.rs"]
+mod checkpoint_backing_tests;
+
+#[path = "checkpoint/native_tests.rs"]
+mod native_checkpoint_tests;
+
+#[path = "backing_initialization/tests.rs"]
+mod restore_initialization_tests;
+
+#[path = "sequence/state_transfer/resource_tests.rs"]
+mod sequence_state_transfer_tests;
+
+#[path = "sequence/completed_boundary/tests.rs"]
+mod completed_boundary_tests;
 
 static NEXT_TEST_DEVICE: AtomicU64 = AtomicU64::new(1);
 const DYNAMIC_POOL_CONCURRENT_WORKERS: usize = 1;
@@ -80,6 +102,31 @@ struct TestRuntime {
     observed_close_return_during_allocation: AtomicBool,
     reusable_resident_executables: AtomicU64,
     reusable_trim_calls: AtomicU64,
+    fence_behavior: AtomicU8,
+    submit_behavior: AtomicU8,
+    device_timing: Mutex<DeviceTimingMeasurement<DeviceExecutionTiming>>,
+    timing_queries: AtomicU64,
+    submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
+    encoded_copy_regions: Mutex<Vec<CopyRegion>>,
+}
+
+struct TestFence {
+    timing_mode: DeviceTimingMode,
+}
+
+#[derive(Clone, Copy)]
+enum TestSubmitBehavior {
+    Submitted = 0,
+    DefinitelyNotSubmitted = 1,
+    PossiblySubmittedPanic = 2,
+}
+
+#[derive(Clone, Copy)]
+enum TestFenceBehavior {
+    Succeeded = 0,
+    FailedButQuiescent = 1,
+    Indeterminate = 2,
+    Pending = 3,
 }
 
 impl Drop for TestRuntime {
@@ -118,6 +165,43 @@ impl TestRuntime {
             observed_close_return_during_allocation: AtomicBool::new(false),
             reusable_resident_executables: AtomicU64::new(0),
             reusable_trim_calls: AtomicU64::new(0),
+            fence_behavior: AtomicU8::new(TestFenceBehavior::Succeeded as u8),
+            submit_behavior: AtomicU8::new(TestSubmitBehavior::Submitted as u8),
+            device_timing: Mutex::new(DeviceTimingMeasurement::NotRequested),
+            timing_queries: AtomicU64::new(0),
+            submitted_timing_modes: Mutex::new(Vec::new()),
+            encoded_copy_regions: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_fence_behavior(&self, behavior: TestFenceBehavior) {
+        self.fence_behavior.store(behavior as u8, Ordering::Release);
+    }
+
+    fn terminal_receipt(
+        &self,
+        fence: &TestFence,
+        terminal: DeviceTerminal<TestRuntimeError>,
+    ) -> DeviceTerminalReceipt<TestRuntimeError> {
+        if !fence.timing_mode.completion_enabled() {
+            return DeviceTerminalReceipt::unprofiled(terminal);
+        }
+        self.timing_queries.fetch_add(1, Ordering::Relaxed);
+        DeviceTerminalReceipt::profiled(terminal, *self.device_timing.lock().unwrap())
+    }
+
+    fn set_submit_behavior(&self, behavior: TestSubmitBehavior) {
+        self.submit_behavior
+            .store(behavior as u8, Ordering::Release);
+    }
+
+    fn fence_behavior(&self) -> TestFenceBehavior {
+        match self.fence_behavior.load(Ordering::Acquire) {
+            0 => TestFenceBehavior::Succeeded,
+            1 => TestFenceBehavior::FailedButQuiescent,
+            2 => TestFenceBehavior::Indeterminate,
+            3 => TestFenceBehavior::Pending,
+            _ => unreachable!("test fence behavior is set through its typed setter"),
         }
     }
 
@@ -184,7 +268,7 @@ impl DeviceRuntime for TestRuntime {
     type Buffer = TestBuffer;
     type Stream = TestStream;
     type Command = ();
-    type Fence = ();
+    type Fence = TestFence;
     type Error = TestRuntimeError;
 
     fn descriptor(&self) -> &DeviceDescriptor {
@@ -254,8 +338,9 @@ impl DeviceRuntime for TestRuntime {
         &self,
         _source: &Self::Buffer,
         _destination: &Self::Buffer,
-        _region: CopyRegion,
+        region: CopyRegion,
     ) -> Result<Self::Command, Self::Error> {
+        self.encoded_copy_regions.lock().unwrap().push(region);
         Ok(())
     }
 
@@ -281,20 +366,51 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _commands: DeviceCommandBatch<Self::Command>,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
-        Ok(())
+        self.submitted_timing_modes
+            .lock()
+            .unwrap()
+            .push(commands.timing_mode());
+        match self.submit_behavior.load(Ordering::Acquire) {
+            0 => Ok(TestFence {
+                timing_mode: commands.timing_mode(),
+            }),
+            1 => Err(DefinitelyNotSubmitted::new(TestRuntimeError)),
+            2 => panic!("injected native submit panic with unknown device visibility"),
+            _ => unreachable!("test submit behavior is set through its typed setter"),
+        }
     }
 
-    fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {
-        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+    fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
+        match self.fence_behavior() {
+            TestFenceBehavior::Succeeded => {
+                FenceQuery::Terminal(self.terminal_receipt(fence, DeviceTerminal::Succeeded))
+            }
+            TestFenceBehavior::FailedButQuiescent => FenceQuery::Terminal(
+                self.terminal_receipt(fence, DeviceTerminal::FailedButQuiescent(TestRuntimeError)),
+            ),
+            TestFenceBehavior::Indeterminate => FenceQuery::Indeterminate(TestRuntimeError),
+            TestFenceBehavior::Pending => FenceQuery::Pending,
+        }
     }
 
     fn wait_fence(
         &self,
-        _fence: &Self::Fence,
+        fence: &Self::Fence,
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
-        Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+        match self.fence_behavior() {
+            TestFenceBehavior::Succeeded => {
+                Ok(self.terminal_receipt(fence, DeviceTerminal::Succeeded))
+            }
+            TestFenceBehavior::FailedButQuiescent => {
+                Ok(self
+                    .terminal_receipt(fence, DeviceTerminal::FailedButQuiescent(TestRuntimeError)))
+            }
+            TestFenceBehavior::Indeterminate | TestFenceBehavior::Pending => {
+                Err(FenceIndeterminate::new(TestRuntimeError))
+            }
+        }
     }
 
     fn synchronize(&self, _stream: &mut Self::Stream) -> Result<(), Self::Error> {
@@ -645,6 +761,26 @@ fn harness_with_nodes_and_reusable(
     nodes: Arc<[PlanNode]>,
     reusable_execution: Option<ReusableExecutionMemoryPlan>,
 ) -> Harness {
+    harness_with_checkpoint_policy(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        nodes,
+        reusable_execution,
+        None,
+    )
+}
+
+fn harness_with_checkpoint_policy(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+    reusable_execution: Option<ReusableExecutionMemoryPlan>,
+    checkpoint_capacity: Option<crate::vnext::CheckpointCapacityPolicy>,
+) -> Harness {
     let generation = issue_generation().unwrap();
     let plan_id = PlanId::new(format!("plan/dynamic-pool-test/{generation}")).unwrap();
     let plan_hash: PlanHash = serde_json::from_value(json!("1".repeat(64))).unwrap();
@@ -688,6 +824,7 @@ fn harness_with_nodes_and_reusable(
         binding.maximum_active_sequences(),
         &catalog.pools,
         &catalog.descriptors,
+        checkpoint_capacity,
     )
     .unwrap();
     let logical_admission = if mismatched_coordinator {
@@ -1897,12 +2034,13 @@ fn maintenance_status_exposes_typed_pool_contract() {
     );
     for residency in ["transient", "lane_stable"] {
         let residency_wire = live_wire[residency].as_object().unwrap();
-        assert_eq!(residency_wire.len(), 7);
+        assert_eq!(residency_wire.len(), 8);
         for field in [
             "total",
             "plan",
             "request",
             "sequence",
+            "checkpoint",
             "step",
             "invocation",
             "initial_sequence_bundle",

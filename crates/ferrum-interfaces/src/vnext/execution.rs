@@ -80,6 +80,12 @@ pub use compiler::*;
 mod checkpoint;
 pub use checkpoint::*;
 
+mod sequence_checkpoint;
+pub use sequence_checkpoint::*;
+
+mod checkpoint_capacity;
+pub use checkpoint_capacity::CheckpointCapacityPolicy;
+
 mod determinism;
 pub use determinism::*;
 

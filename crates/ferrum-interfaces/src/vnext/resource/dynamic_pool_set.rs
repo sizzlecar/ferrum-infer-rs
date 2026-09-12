@@ -713,6 +713,32 @@ where
                             }
                         }
                     }
+                    DynamicPoolGrowthIntent::RevalidatedAdmissionPressure {
+                        required_free_bytes,
+                        ..
+                    } => {
+                        // A logical lease may precede its physical prepare;
+                        // conversely physical release precedes logical release.
+                        // Neither ledger alone proves that the demand now fits.
+                        let logical = self.logical_admission.snapshot()?;
+                        if logical.poisoned() {
+                            return Err(invalid_resource("logical admission is fail-closed"));
+                        }
+                        let available = logical
+                            .domains()
+                            .iter()
+                            .find(|domain| domain.domain() == pool.domain.domain_id)
+                            .ok_or_else(|| invalid_resource("pool has no logical capacity domain"))?
+                            .available()
+                            .get();
+                        let missing = required_free_bytes
+                            .saturating_sub(available)
+                            .max(required_free_bytes.saturating_sub(state.allocator.free_bytes));
+                        if missing == 0 {
+                            continue;
+                        }
+                        missing
+                    }
                 }
             };
             let chunk_bytes = align_up_resource(requested_bytes, pool.allocation_quantum())?;
@@ -1445,6 +1471,112 @@ where
         )
     }
 
+    /// Optional capture may grow only its certified State pools. Reuse the
+    /// same packing planner and atomic device-budget publication as ordinary
+    /// growth, without the foreground path's cross-pool pressure reclamation.
+    pub(in crate::vnext::resource) fn maintain_checkpoint_capacity(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.validate_checkpoint_requests(requests)?;
+        let mut by_pool = BTreeMap::<DynamicBackingPoolId, Vec<u64>>::new();
+        for request in requests {
+            by_pool
+                .entry(request.domain.pool_id().clone())
+                .or_default()
+                .push(request.capacity_size_bytes);
+        }
+        let mut intents = Vec::with_capacity(by_pool.len());
+        for (pool_id, mut claims) in by_pool {
+            claims.sort_unstable_by(|left, right| right.cmp(left));
+            let pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or_else(|| invalid_resource("checkpoint pool is absent"))?;
+            let state = pool
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("checkpoint pool is poisoned"))?;
+            if state.poisoned {
+                return Err(invalid_resource("checkpoint pool is fail-closed"));
+            }
+            let (growth, contiguous_claims) =
+                match pool.domain.pool.compatibility().profile().view() {
+                    DynamicStorageView::Contiguous => (
+                        contiguous_packing_growth_bytes(&state.allocator, &pool_id, &claims)?,
+                        Some(claims),
+                    ),
+                    DynamicStorageView::PagedRegions { .. } => (
+                        claims
+                            .iter()
+                            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+                            .ok_or_else(|| {
+                                invalid_resource("checkpoint pool demand overflows u64")
+                            })?
+                            .saturating_sub(state.allocator.free_bytes),
+                        None,
+                    ),
+                };
+            if growth != 0 {
+                intents.push(DynamicPoolGrowthIntent::RevalidatedDeferral(
+                    DynamicBackingBlocker {
+                        pool_id,
+                        domain_id: pool.domain.domain_id,
+                        reason: DynamicBackingDeferralReason::GrowthRequired,
+                        requested_bytes: growth,
+                        free_bytes: state.allocator.free_bytes,
+                        largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                        free_extent_layout_fingerprint: free_extent_layout_fingerprint(
+                            &state.allocator,
+                        ),
+                        contiguous_claim_bytes_descending: contiguous_claims,
+                    },
+                ));
+            }
+        }
+        // RevalidatedDeferral recomputes demand after acquiring the existing
+        // canonical maintenance locks. No stale free-space snapshot grants bytes.
+        self.maintain_pools_observed(intents, &mut None)
+    }
+
+    pub(in crate::vnext::resource) fn prepare_checkpoint_claim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        self.validate_checkpoint_requests(requests)?;
+        self.prepare_claim_scoped(
+            requests,
+            DynamicBackingClaimScope::Checkpoint,
+            DynamicBackingClaimResidency::Transient,
+        )
+    }
+
+    fn validate_checkpoint_requests(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<(), VNextError> {
+        if requests.is_empty()
+            || requests.iter().any(|request| {
+                !self
+                    .domains
+                    .iter()
+                    .any(|domain| std::ptr::eq(domain, request.domain))
+                    || request.reusable_execution_bucket_id.is_some()
+                    || request.projections.len() != 1
+                    || request.projections.iter().any(|projection| {
+                        projection.descriptor.lifetime() != AllocationLifetime::Sequence
+                            || projection.descriptor.usage() != super::BufferUsage::State
+                            || *projection.descriptor.kind() != super::AllocationKind::Value
+                    })
+            })
+        {
+            return Err(invalid_resource(
+                "checkpoint backing requires this plan's non-empty Sequence state projections",
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_claim_scoped(
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
@@ -1566,7 +1698,9 @@ where
                                         .is_ok_and(|bytes| bytes == projection.capacity_size_bytes)
                                 }
                                 None => {
-                                    projection.logical_size_bytes == projection.capacity_size_bytes
+                                    scope == DynamicBackingClaimScope::Checkpoint
+                                        || projection.logical_size_bytes
+                                            == projection.capacity_size_bytes
                                 }
                             };
                             projection.descriptor.pool_id() != pool.domain.pool_id()

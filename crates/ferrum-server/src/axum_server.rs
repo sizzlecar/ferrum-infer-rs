@@ -32,13 +32,14 @@ use ferrum_types::{
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
     should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
     FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
-    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
-    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
-    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
+    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, NativeChatOutputProjector,
+    ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
+    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
+    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
+    ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart,
+    TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
+    THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -65,7 +66,6 @@ const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
 const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 4096;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
-const PROMPT_OPENED_REASONING_METADATA_KEY: &str = "ferrum_prompt_opened_reasoning";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
@@ -2478,6 +2478,7 @@ async fn handle_chat_completions_stream(
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
     let started_in_think = request_started_in_reasoning(&inference_request);
+    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -2568,18 +2569,30 @@ async fn handle_chat_completions_stream(
                     }
                     if !chunk.text.is_empty() {
                         current_text.push_str(&chunk.text);
+                        if let Some(projector) = native_projector.as_mut() {
+                            projector.push(&chunk.text);
+                        }
 
-                        if !buffer_stream_output
-                            && !should_defer_model_reasoning_stream_delta(
-                                model_output_protocol,
-                                &current_text,
-                            )
+                        if native_projector.is_some()
+                            || (!buffer_stream_output
+                                && !should_defer_model_reasoning_stream_delta(
+                                    model_output_protocol,
+                                    &current_text,
+                                ))
                         {
-                            let parsed = match parse_model_reasoning_response(
-                                model_output_protocol,
-                                &current_text,
-                                started_in_think,
-                            ) {
+                            let parsed_result = if let Some(projector) = native_projector.as_ref() {
+                                Ok(ParsedReasoningResponse {
+                                    content: projector.visible_prefix().to_owned(),
+                                    reasoning: projector.reasoning_prefix().map(str::to_owned),
+                                })
+                            } else {
+                                parse_model_reasoning_response(
+                                    model_output_protocol,
+                                    &current_text,
+                                    started_in_think,
+                                )
+                            };
+                            let parsed = match parsed_result {
                                 Ok(parsed) => parsed,
                                 Err(error) => {
                                     let _ = tx.send(Ok(openai_error_sse_event(
@@ -2646,12 +2659,24 @@ async fn handle_chat_completions_stream(
                             warn!("failed to write chat stream prompt-token evidence: {}", err);
                         }
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                        let parsed_model_output = match parse_chat_model_output(
-                            model_output_protocol,
-                            &current_text,
-                            started_in_think,
-                            terminal_finish_reason,
-                        ) {
+                        let native_projected = native_projector
+                            .take()
+                            .map(|projector| projector.finish(terminal_finish_reason));
+                        let parsed_output_result =
+                            if let Some(projected) = native_projected.as_ref() {
+                                Ok(ParsedChatModelOutput {
+                                    visible: projected.visible.clone(),
+                                    harmony_response: None,
+                                })
+                            } else {
+                                parse_chat_model_output(
+                                    model_output_protocol,
+                                    &current_text,
+                                    started_in_think,
+                                    terminal_finish_reason,
+                                )
+                            };
+                        let parsed_model_output = match parsed_output_result {
                             Ok(parsed) => parsed,
                             Err(error) => {
                                 let error_event = openai_error_sse_event(
@@ -2669,7 +2694,7 @@ async fn handle_chat_completions_stream(
                             &openai_request,
                             &parsed_final.content,
                         );
-                        let structured_chat_response =
+                        let mut structured_chat_response =
                             finish_reason_allows_structured_api_response(terminal_finish_reason)
                                 .then(|| match chunk.api_response.as_ref() {
                                     // The native envelope owns the recipient and whether this is
@@ -2682,6 +2707,9 @@ async fn handle_chat_completions_stream(
                                     Some(ferrum_types::ApiResponse::Chat(response)) => {
                                         Some(response.clone())
                                     }
+                                    _ if native_projected.is_some() => native_projected
+                                        .as_ref()
+                                        .and_then(|projected| projected.api_response.clone()),
                                     _ if buffer_structured_api_stream => {
                                         chat_api_response_from_parsed_generated_text(
                                             &stream_api_request,
@@ -2692,6 +2720,29 @@ async fn handle_chat_completions_stream(
                                     _ => None,
                                 })
                                 .flatten();
+
+                        if native_projected.is_none()
+                            && matches!(
+                                chunk.api_response,
+                                Some(ferrum_types::ApiResponse::Chat(_))
+                            )
+                        {
+                            if let Some(response) = structured_chat_response.as_mut() {
+                                if let Err(error) = project_typed_tool_response_content(
+                                    response,
+                                    model_output_protocol,
+                                    started_in_think,
+                                ) {
+                                    let _ = tx.send(Ok(openai_error_sse_event(
+                                        stream_validation_error_message(error),
+                                        "internal_server_error",
+                                        Some("model_output"),
+                                    )));
+                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                    break;
+                                }
+                            }
+                        }
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             if let Err(e) =
@@ -2738,8 +2789,19 @@ async fn handle_chat_completions_stream(
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             let mut delta = openai_chat_delta_from_api(&chat_response.message);
+                            if native_projected.is_some() {
+                                delta.content =
+                                    stream_text_delta(&delta.content, &mut sent_content_len);
+                            }
                             if delta.reasoning.is_none() {
                                 delta.reasoning = parsed_final.reasoning.clone();
+                            }
+                            if native_projected.is_some() {
+                                let reasoning = stream_text_delta(
+                                    delta.reasoning.as_deref().unwrap_or(""),
+                                    &mut sent_reasoning_len,
+                                );
+                                delta.reasoning = (!reasoning.is_empty()).then_some(reasoning);
                             }
                             let response_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
@@ -2765,6 +2827,10 @@ async fn handle_chat_completions_stream(
                                 .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
+                            // A token-limited response may contain only reasoning.
+                            // Preserve its terminal reason and usage, as sync does;
+                            // required tool and hard content contracts were checked above.
+                            && terminal_finish_reason != FinishReason::Length
                         {
                             let error_event = openai_error_sse_event(
                                 "model output did not satisfy tool/function call request",
@@ -3023,6 +3089,7 @@ async fn handle_chat_completions_sync(
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = request_started_in_reasoning(&inference_request);
+    let mut native_projector = NativeChatOutputProjector::for_request(&inference_request);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -3052,12 +3119,23 @@ async fn handle_chat_completions_sync(
             // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&output_text, &stop_sequences);
-            let parsed_model_output = parse_chat_model_output(
-                model_output_protocol,
-                &content,
-                started_in_think,
-                finish_reason,
-            )?;
+            let native_projected = native_projector.take().map(|mut projector| {
+                projector.push(&content);
+                projector.finish(finish_reason)
+            });
+            let parsed_model_output = if let Some(projected) = native_projected.as_ref() {
+                ParsedChatModelOutput {
+                    visible: projected.visible.clone(),
+                    harmony_response: None,
+                }
+            } else {
+                parse_chat_model_output(
+                    model_output_protocol,
+                    &content,
+                    started_in_think,
+                    finish_reason,
+                )?
+            };
             let parsed = parsed_model_output.visible;
             let visible_content =
                 normalize_structured_response_content(&openai_request, &parsed.content);
@@ -3071,7 +3149,7 @@ async fn handle_chat_completions_sync(
                 function_call: None,
             };
             let mut openai_finish_reason = finish_reason_to_string(&finish_reason);
-            let structured_chat_response =
+            let mut structured_chat_response =
                 finish_reason_allows_structured_api_response(finish_reason)
                     .then(|| match api_response.as_ref() {
                         // The native envelope owns the recipient and whether this is
@@ -3082,6 +3160,9 @@ async fn handle_chat_completions_sync(
                         Some(ferrum_types::ApiResponse::Chat(chat_response)) => {
                             Some(chat_response.clone())
                         }
+                        _ if native_projected.is_some() => native_projected
+                            .as_ref()
+                            .and_then(|projected| projected.api_response.clone()),
                         _ => match request_chat_api.as_ref() {
                             Some(chat_request) => chat_api_response_from_parsed_generated_text(
                                 chat_request,
@@ -3092,6 +3173,17 @@ async fn handle_chat_completions_sync(
                         },
                     })
                     .flatten();
+            if native_projected.is_none()
+                && matches!(api_response, Some(ferrum_types::ApiResponse::Chat(_)))
+            {
+                if let Some(response) = structured_chat_response.as_mut() {
+                    project_typed_tool_response_content(
+                        response,
+                        model_output_protocol,
+                        started_in_think,
+                    )?;
+                }
+            }
             if let Some(chat_response) = structured_chat_response.as_ref() {
                 if let Err(error) =
                     validate_structured_tool_response(&openai_request, chat_response)
@@ -3971,6 +4063,27 @@ fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
     String::new()
 }
 
+fn project_typed_tool_response_content(
+    response: &mut ferrum_types::ApiChatResponse,
+    protocol: ModelOutputProtocol,
+    started_in_think: bool,
+) -> std::result::Result<(), ServerError> {
+    if protocol == ModelOutputProtocol::HarmonyGptOss
+        || response.message.tool_calls.is_empty()
+        || response.message.content.is_empty()
+    {
+        return Ok(());
+    }
+    // Engine tool parsing can precede reasoning projection. Its structural
+    // parser already removed the envelopes and owns every call and argument;
+    // project only the outside text, never a payload or classified final JSON.
+    response.message.content =
+        parse_model_reasoning_response(protocol, &response.message.content, started_in_think)
+            .map_err(|error| ServerError::InternalError(error.to_string()))?
+            .content;
+    Ok(())
+}
+
 fn chat_api_response_from_parsed_generated_text(
     chat_request: &ferrum_types::ApiChatRequest,
     parsed: &ParsedReasoningResponse,
@@ -3985,6 +4098,12 @@ fn chat_api_response_from_parsed_generated_text(
                 reasoning,
                 finish_reason,
             )
+        })
+        .map(|mut response| {
+            // Reasoning is published through its own channel. Detecting a tool
+            // there must not promote its surrounding text to visible content.
+            response.message.content.clear();
+            response
         })
         .or_else(|| {
             ferrum_types::chat_api_response_from_generated_text(
@@ -4704,7 +4823,16 @@ fn validate_structured_tool_response(
                 call.function.name
             )));
         }
-        if let Some(schema) = tool.function.parameters.as_ref() {
+        // Automatic Chat Completions tools are best effort unless the tool
+        // opts into strict mode. Keep non-strict arguments intact so clients
+        // can report validation errors through the normal tool-result turn.
+        // Required/forced calls retain their existing hard output contract.
+        if let Some(schema) = tool
+            .function
+            .parameters
+            .as_ref()
+            .filter(|_| required || tool.function.strict.unwrap_or(false))
+        {
             validate_json_text_against_schema(schema, &call.function.arguments).map_err(
                 |reason| {
                     ServerError::InternalError(format!(
@@ -5726,7 +5854,10 @@ mod tests {
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
+    mod native_tool_stream;
     mod reasoning_controls;
+    mod tool_argument_strictness;
+    mod tool_length;
     use super::*;
     use async_trait::async_trait;
     use axum::{
@@ -5877,6 +6008,8 @@ mod tests {
         execution_attribution: Option<Value>,
         lora_metrics: Option<Value>,
         pending_stream_drop_notify: Option<Arc<Notify>>,
+        stream_after_first_gate: Option<Arc<StreamGate>>,
+        stream_terminal_error: bool,
         shutdown_count: AtomicUsize,
     }
 
@@ -5896,6 +6029,8 @@ mod tests {
                 execution_attribution: None,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
+                stream_after_first_gate: None,
+                stream_terminal_error: false,
                 shutdown_count: AtomicUsize::new(0),
             }
         }
@@ -5976,6 +6111,12 @@ mod tests {
 
     struct PendingDropStream {
         drop_notify: Arc<Notify>,
+    }
+
+    #[derive(Default)]
+    struct StreamGate {
+        entered: Notify,
+        resume: Notify,
     }
 
     impl Stream for PendingDropStream {
@@ -6513,6 +6654,24 @@ mod tests {
                         api_response: self.api_response.clone(),
                         execution_evidence,
                     }));
+                }
+                if self.stream_terminal_error {
+                    *stream_chunks.last_mut().expect("nonempty fixture stream") = Err(
+                        ferrum_types::FerrumError::internal("fixture generation failed"),
+                    );
+                }
+                if let Some(gate) = self.stream_after_first_gate.clone() {
+                    return Ok(Box::pin(stream::unfold(
+                        (stream_chunks.into_iter().enumerate(), gate),
+                        |(mut chunks, gate)| async move {
+                            let (index, chunk) = chunks.next()?;
+                            if index == 1 {
+                                gate.entered.notify_one();
+                                gate.resume.notified().await;
+                            }
+                            Some((chunk, (chunks, gate)))
+                        },
+                    )));
                 }
                 return Ok(Box::pin(stream::iter(stream_chunks)));
             }
@@ -8907,6 +9066,8 @@ mod tests {
             "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
             "function-parameter-xml-template",
         );
+        let mut request = xml_object_argument_tool_request(false);
+        request["tools"][0]["function"]["strict"] = json!(true);
         let response = post_json(
             router_with_stub_and_template(
                 concat!(
@@ -8918,7 +9079,7 @@ mod tests {
                 template,
             ),
             "/v1/chat/completions",
-            xml_object_argument_tool_request(false),
+            request,
         )
         .await;
 
@@ -8939,6 +9100,8 @@ mod tests {
             "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
             "function-parameter-xml-template",
         );
+        let mut request = xml_object_argument_tool_request(true);
+        request["tools"][0]["function"]["strict"] = json!(true);
         let response = post_json(
             router_with_stub_and_template(
                 concat!(
@@ -8950,7 +9113,7 @@ mod tests {
                 template,
             ),
             "/v1/chat/completions",
-            xml_object_argument_tool_request(true),
+            request,
         )
         .await;
 

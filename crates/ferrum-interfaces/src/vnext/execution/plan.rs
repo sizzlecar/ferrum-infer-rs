@@ -38,6 +38,8 @@ pub struct ExecutionPlan {
     pub(super) operation_registry_authority: OperationRegistryAuthority,
     #[serde(skip)]
     pub(super) trusted_execution_weights: TrustedExecutionWeightPlan,
+    #[serde(skip)]
+    pub(super) checkpoint_unsupported_reasons: Vec<super::SequenceCheckpointUnsupportedReason>,
 }
 
 impl ExecutionPlan {
@@ -211,6 +213,19 @@ impl ExecutionPlan {
             &retained_completion_resources,
         )?;
 
+        let (sequence_checkpoint_layout, checkpoint_unsupported_reasons) =
+            super::sequence_checkpoint::derive_sequence_checkpoint(
+                program,
+                &nodes,
+                memory.dynamic_descriptors(),
+                request.capabilities,
+            )?;
+        let memory = memory.with_checkpoint_capacity(
+            request.policy.checkpoint_capacity_policy().copied(),
+            sequence_checkpoint_layout.as_ref(),
+            &nodes,
+            &retained_completion_resources,
+        )?;
         let mut payload = ExecutionPlanPayload {
             schema: EXECUTION_PLAN_SCHEMA,
             plan_id: PlanId::new("plan/unset")?,
@@ -230,6 +245,7 @@ impl ExecutionPlan {
             terminal_output_resources,
             nodes,
             memory,
+            sequence_checkpoint_layout,
         };
         let plan_hash = PlanHash::new(canonical_fingerprint(
             &PlanHashMaterial::from(&payload),
@@ -241,6 +257,7 @@ impl ExecutionPlan {
             plan_hash,
             operation_registry_authority,
             trusted_execution_weights: request.execution_weights,
+            checkpoint_unsupported_reasons,
         };
         plan.validate_internal()?;
         Ok(plan)
@@ -2088,12 +2105,19 @@ impl ExecutionPlan {
             .map(ReusableExecutionMemoryPlan::pool_workspace_ceilings)
             .transpose()?
             .unwrap_or_default();
-        let expected_pools = MemoryPlan::derive_dynamic_pools_with_reusable(
+        let checkpoint_growth_ceilings =
+            super::checkpoint_capacity::derive_checkpoint_growth_ceilings(
+                self.payload.memory.checkpoint_capacity.as_ref(),
+                self.payload.sequence_checkpoint_layout.as_ref(),
+                &self.payload.memory.dynamic_descriptors,
+            )?;
+        let expected_pools = MemoryPlan::derive_dynamic_pools_with_checkpoint(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
             &retained_completion_resources,
+            &checkpoint_growth_ceilings,
         )?;
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(

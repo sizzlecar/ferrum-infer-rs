@@ -5,7 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::watch;
 
-use super::{DynamicAdmissionFaultKind, VNextError};
+use super::{CheckpointCapacityPolicy, DynamicAdmissionFaultKind, VNextError};
+
+mod checkpoint;
+use checkpoint::CheckpointClaimLedger;
+pub use checkpoint::{
+    CheckpointAuthorityId, CheckpointCapacityClaimDecision, CheckpointRetentionSkipReason,
+    LogicalCheckpointLease,
+};
 
 fn invalid_admission(reason: impl Into<String>) -> VNextError {
     admission_fault(DynamicAdmissionFaultKind::InvalidContract, reason)
@@ -374,6 +381,7 @@ pub struct CapacitySnapshot {
     active_requests: u32,
     active_sequences: u32,
     active_child_claims: u64,
+    active_checkpoint_claims: u64,
     maximum_active_sequences: u32,
     release_epoch: u64,
     capacity_epoch: u64,
@@ -403,6 +411,12 @@ impl CapacitySnapshot {
 
     pub const fn active_child_claims(&self) -> u64 {
         self.active_child_claims
+    }
+
+    /// Independent checkpoint claims; these consume domain capacity, not
+    /// request or sequence execution slots.
+    pub const fn active_checkpoint_claims(&self) -> u64 {
+        self.active_checkpoint_claims
     }
 
     pub const fn maximum_active_sequences(&self) -> u32 {
@@ -901,6 +915,7 @@ struct CoordinatorState {
     active_requests: u32,
     active_sequences: u32,
     active_child_claims: u64,
+    checkpoint_claims: CheckpointClaimLedger,
     live_requests: Vec<Option<LiveRequestRecord>>,
     reusable_request_ids: Vec<u32>,
     live_sequences: Vec<Option<LiveSequenceRecord>>,
@@ -935,6 +950,7 @@ impl CoordinatorState {
             active_requests: self.active_requests,
             active_sequences: self.active_sequences,
             active_child_claims: self.active_child_claims,
+            active_checkpoint_claims: self.checkpoint_claims.count(),
             maximum_active_sequences: self.maximum_active_sequences,
             release_epoch: self.release_epoch,
             capacity_epoch: self.capacity_epoch,
@@ -1408,6 +1424,16 @@ impl LogicalAdmissionCoordinator {
         domains: Vec<(CapacityDomainId, CapacityDomainSpec)>,
         maximum_active_sequences: u32,
     ) -> Result<Self, VNextError> {
+        Self::with_checkpoint_capacity(domains, maximum_active_sequences, None)
+    }
+
+    /// The trusted plan provisioning adapter supplies this immutable policy.
+    /// Ordinary coordinator construction leaves checkpoint admission disabled.
+    pub(crate) fn with_checkpoint_capacity(
+        domains: Vec<(CapacityDomainId, CapacityDomainSpec)>,
+        maximum_active_sequences: u32,
+        checkpoint_capacity: Option<CheckpointCapacityPolicy>,
+    ) -> Result<Self, VNextError> {
         if maximum_active_sequences == 0 {
             return Err(invalid_admission(
                 "coordinator requires a non-zero sequence ceiling",
@@ -1445,6 +1471,7 @@ impl LogicalAdmissionCoordinator {
                     active_requests: 0,
                     active_sequences: 0,
                     active_child_claims: 0,
+                    checkpoint_claims: CheckpointClaimLedger::new(checkpoint_capacity),
                     live_requests: Vec::new(),
                     reusable_request_ids: Vec::new(),
                     live_sequences: Vec::new(),
@@ -1540,6 +1567,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(next_active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(state.active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -1751,6 +1779,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(next_active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -1898,6 +1927,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(state.active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
             .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,
@@ -2144,6 +2174,7 @@ impl LogicalAdmissionCoordinator {
             .checked_add(u64::from(state.active_requests))
             .and_then(|epoch| epoch.checked_add(u64::from(state.active_sequences)))
             .and_then(|epoch| epoch.checked_add(next_child_claims))
+            .and_then(|epoch| epoch.checked_add(state.checkpoint_claims.count()))
             .ok_or_else(|| {
                 admission_fault(
                     DynamicAdmissionFaultKind::EpochExhausted,

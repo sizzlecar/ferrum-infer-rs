@@ -8,9 +8,9 @@ use super::{
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
     DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
-    DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus, DynamicPoolSet,
-    DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest, ExecutionLane,
-    ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
+    DynamicPoolGrowthBatchReceipt, DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus,
+    DynamicPoolSet, DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest,
+    ExecutionLane, ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
     LaneBackingPrepareDecision, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
     NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
     ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
@@ -837,6 +837,21 @@ where
             .maintain_for_admission_deferred(deferred)
     }
 
+    /// Attempts currently needed foreground pool growth without reclaiming
+    /// other pools or increasing execution slots. `None` means a slot or
+    /// non-pool blocker is inapplicable. Any receipt, including an empty one,
+    /// requires a fresh admission probe; it does not reserve the free capacity.
+    /// Device/pool capacity errors remain typed so the caller can next apply
+    /// its existing cache-eviction or waiting policy.
+    pub fn try_maintain_for_capacity_pressure(
+        self: &Arc<Self>,
+        deferred: &AdmissionDeferred,
+    ) -> Result<Option<DynamicPoolGrowthBatchReceipt>, VNextError> {
+        let _lifecycle = self.read_lifecycle("maintain foreground capacity pressure")?;
+        self.maintenance_controller
+            .try_maintain_for_capacity_pressure(deferred)
+    }
+
     /// Returns a point-in-time view of the exact dynamic pools owned by this
     /// plan. Product telemetry consumes this instead of maintaining a second
     /// allocator ledger that can drift from admission decisions.
@@ -894,6 +909,13 @@ where
                 .lifecycle
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The write gate excludes checkpoint prepare/claim/commit. A
+            // poisoned coordinator is already fail-closed; existing owners
+            // still keep the plan alive and may release their backing.
+            let _ = resources
+                .dynamic_pools
+                .logical_admission
+                .close_checkpoint_admission();
             match resources.phase.compare_exchange(
                 PLAN_RUNTIME_OPEN,
                 PLAN_RUNTIME_CLOSING,

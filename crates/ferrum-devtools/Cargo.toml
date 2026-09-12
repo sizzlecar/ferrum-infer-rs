@@ -19,12 +19,17 @@ path = "src/bin/contract_checks.rs"
 name = "model_regression"
 path = "src/bin/model_regression.rs"
 
+[[bin]]
+name = "agent_regression"
+path = "src/bin/agent_regression.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
 ferrum-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 sha2 = "0.10"
 semver = "1.0"
 reqwest = { workspace = true }
@@ -34,5 +39,8 @@ libc = "0.2"
 rand = { workspace = true }
 tempfile = "3"
 chrono = { workspace = true }
+axum = "0.7"
+futures = { workspace = true }
+tokio-stream = { workspace = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"

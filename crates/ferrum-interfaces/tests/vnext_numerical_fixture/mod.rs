@@ -61,5 +61,6 @@ pub(crate) fn fixture_byte_state(width: u64) -> StateSpec {
         lifetime: StateLifetime::Sequence,
         capacity_demand: StateCapacityDemand::FixedPerScope,
         initialization: StateInitialization::Zero,
+        checkpoint: StateCheckpointCapability::Unsupported,
     }
 }

@@ -1,6 +1,10 @@
 //! Request and response types for inference
 
+mod native_projection;
 mod xml_parameter_schema;
+mod xml_tool_calls;
+
+pub use native_projection::{NativeChatOutputProjection, NativeChatOutputProjector};
 
 use crate::{
     ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
@@ -9,10 +13,11 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use xml_parameter_schema::XmlParameterSchemaProbe;
 
 pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
 pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
+/// Actual rendered generation-suffix state, supplied by the prompt renderer.
+pub const PROMPT_OPENED_REASONING_METADATA_KEY: &str = "ferrum_prompt_opened_reasoning";
 
 /// Explicit request for execution evidence that is expensive or sensitive to retain.
 ///
@@ -451,6 +456,13 @@ pub fn api_response_from_generated_text(
     text: &str,
     finish_reason: FinishReason,
 ) -> Option<ApiResponse> {
+    if let Some(mut projector) = NativeChatOutputProjector::for_request(request) {
+        projector.push(text);
+        return projector
+            .finish(finish_reason)
+            .api_response
+            .map(ApiResponse::Chat);
+    }
     let ApiRequest::Chat(chat_request) = request.api_request.as_ref()? else {
         return None;
     };
@@ -582,11 +594,13 @@ pub fn chat_api_response_from_generated_text(
     }
 
     if !chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request) {
-        if let Some(tool_calls) = parse_tool_calls_from_generated_text(text, chat_request) {
+        if let Some((content, tool_calls)) =
+            parse_tool_calls_from_generated_text(text, chat_request)
+        {
             return Some(ApiChatResponse {
                 message: ApiChatMessage {
                     role: ApiMessageRole::Assistant,
-                    content: String::new(),
+                    content,
                     name: None,
                     tool_calls,
                     tool_call_id: None,
@@ -636,20 +650,22 @@ fn api_function_call_choice_is_none(chat_request: &ApiChatRequest) -> bool {
 fn parse_tool_calls_from_generated_text(
     text: &str,
     chat_request: &ApiChatRequest,
-) -> Option<Vec<ApiToolCall>> {
+) -> Option<(String, Vec<ApiToolCall>)> {
     if chat_request.automatic_tools_with_hard_response_format()
         || chat_request.requires_native_tool_call()
     {
-        return parse_explicit_tool_call_envelopes(text, chat_request);
+        return parse_explicit_tool_call_envelopes(text, chat_request)
+            .map(|calls| (String::new(), calls));
     }
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
-        if let Some(calls) = parse_function_parameter_xml_tool_calls(text, chat_request, false) {
-            return validate_parsed_tool_calls(calls);
-        }
+        // Only native framing establishes tool intent for this protocol.
+        // Ordinary JSON or JSON inside malformed framing is not a fallback.
+        return xml_tool_calls::parse_with_content(text, chat_request, false)
+            .map(|parsed| (parsed.content, parsed.calls));
     }
 
     let value = parse_json_value_from_generated_text(text)?;
-    parse_json_tool_call_value(&value, chat_request, 0, true)
+    parse_json_tool_call_value(&value, chat_request, 0, true).map(|calls| (String::new(), calls))
 }
 
 fn parse_json_tool_call_value(
@@ -691,6 +707,9 @@ fn parse_explicit_tool_call_envelopes(
     text: &str,
     chat_request: &ApiChatRequest,
 ) -> Option<Vec<ApiToolCall>> {
+    if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
+        return xml_tool_calls::parse(text, chat_request, true);
+    }
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let mut remaining = text.trim();
@@ -700,31 +719,16 @@ fn parse_explicit_tool_call_envelopes(
             return None;
         }
         let payload = remaining.strip_prefix(OPEN)?.trim_start();
-        let parsed = match chat_request.tool_call_protocol {
-            ApiToolCallProtocol::Json => {
-                // The closing marker can legitimately occur inside a JSON
-                // argument string; consume JSON before interpreting framing.
-                let mut values =
-                    serde_json::Deserializer::from_str(payload).into_iter::<serde_json::Value>();
-                let value = values.next()?.ok()?;
-                remaining = payload[values.byte_offset()..]
-                    .trim_start()
-                    .strip_prefix(CLOSE)?
-                    .trim_start();
-                parse_json_tool_call_value(&value, chat_request, calls.len(), false)?
-            }
-            ApiToolCallProtocol::FunctionParameterXml => {
-                let end = remaining.find(CLOSE)? + CLOSE.len();
-                let envelope = &remaining[..end];
-                remaining = remaining[end..].trim_start();
-                let mut parsed =
-                    parse_function_parameter_xml_tool_calls(envelope, chat_request, true)?;
-                for (index, call) in parsed.iter_mut().enumerate() {
-                    call.id = format!("call_{}", calls.len() + index);
-                }
-                parsed
-            }
-        };
+        // The closing marker can legitimately occur inside a JSON
+        // argument string; consume JSON before interpreting framing.
+        let mut values =
+            serde_json::Deserializer::from_str(payload).into_iter::<serde_json::Value>();
+        let value = values.next()?.ok()?;
+        remaining = payload[values.byte_offset()..]
+            .trim_start()
+            .strip_prefix(CLOSE)?
+            .trim_start();
+        let parsed = parse_json_tool_call_value(&value, chat_request, calls.len(), false)?;
         if calls.len() + parsed.len() > MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
             return None;
         }
@@ -754,133 +758,6 @@ fn validate_parsed_tool_calls(calls: Vec<ApiToolCall>) -> Option<Vec<ApiToolCall
         }
     }
     Some(calls)
-}
-
-fn parse_function_parameter_xml_tool_calls(
-    text: &str,
-    chat_request: &ApiChatRequest,
-    require_complete_parameters: bool,
-) -> Option<Vec<ApiToolCall>> {
-    const TOOL_START: &str = "<tool_call>";
-    const TOOL_END: &str = "</tool_call>";
-    const FUNCTION_START: &str = "<function=";
-    const FUNCTION_END: &str = "</function>";
-
-    let mut remaining = text;
-    let mut calls = Vec::new();
-    while let Some(tool_start) = remaining.find(TOOL_START) {
-        if calls.len() == MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
-            return None;
-        }
-        remaining = &remaining[tool_start + TOOL_START.len()..];
-        let tool_end = remaining.find(TOOL_END)?;
-        let block = &remaining[..tool_end];
-        remaining = &remaining[tool_end + TOOL_END.len()..];
-
-        let Some(function_start) = block.find(FUNCTION_START) else {
-            return None;
-        };
-        if !block[..function_start].trim().is_empty() {
-            return None;
-        }
-        let function = &block[function_start + FUNCTION_START.len()..];
-        let Some(name_end) = function.find('>') else {
-            return None;
-        };
-        let name = function[..name_end].trim();
-        if !api_tool_name_allowed(chat_request, name) {
-            return None;
-        }
-        let arguments_end = function[name_end + 1..]
-            .find(FUNCTION_END)
-            .map(|offset| name_end + 1 + offset)?;
-        if !function[arguments_end + FUNCTION_END.len()..]
-            .trim()
-            .is_empty()
-        {
-            return None;
-        }
-        let parameter_schema = chat_request
-            .tools
-            .iter()
-            .find(|tool| tool.tool_type == "function" && tool.function.name == name)
-            .and_then(|tool| tool.function.parameters.as_ref());
-        let arguments = parse_function_parameter_xml_arguments(
-            &function[name_end + 1..arguments_end],
-            parameter_schema,
-            require_complete_parameters,
-        )?;
-        let arguments = serde_json::to_string(&arguments).ok()?;
-        calls.push(ApiToolCall {
-            id: format!("call_{}", calls.len()),
-            tool_type: "function".to_string(),
-            function: ApiFunctionCall {
-                name: name.to_string(),
-                arguments,
-            },
-        });
-    }
-
-    (!calls.is_empty()).then_some(calls)
-}
-
-fn parse_function_parameter_xml_arguments(
-    text: &str,
-    parameter_schema: Option<&serde_json::Value>,
-    require_complete_parameters: bool,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    const PARAMETER_START: &str = "<parameter=";
-    const PARAMETER_END: &str = "</parameter>";
-
-    let mut arguments = serde_json::Map::new();
-    let mut schema_probe = parameter_schema.map(XmlParameterSchemaProbe::new);
-    let mut remaining = text;
-    while let Some(parameter_start) = remaining.find(PARAMETER_START) {
-        if require_complete_parameters && !remaining[..parameter_start].trim().is_empty() {
-            return None;
-        }
-        remaining = &remaining[parameter_start + PARAMETER_START.len()..];
-        let Some(name_end) = remaining.find('>') else {
-            return None;
-        };
-        let name = remaining[..name_end].trim();
-        remaining = &remaining[name_end + 1..];
-        if name.is_empty() {
-            return None;
-        }
-        let value_end = remaining.find(PARAMETER_END)?;
-        if arguments.contains_key(name) {
-            return None;
-        }
-        let value = strip_xml_parameter_wrapper_newlines(&remaining[..value_end]);
-        let value = schema_probe.as_mut().map_or_else(
-            || serde_json::Value::String(value.to_string()),
-            |probe| probe.decode(name, value),
-        );
-        arguments.insert(name.to_string(), value);
-        remaining = &remaining[value_end + PARAMETER_END.len()..];
-    }
-    if require_complete_parameters && !remaining.trim().is_empty() {
-        return None;
-    }
-    Some(arguments)
-}
-
-/// Qwen-style function XML renders one structural newline immediately inside
-/// each parameter tag. Remove only that framing while preserving whitespace
-/// that belongs to the argument itself, such as code indentation or a final
-/// newline used by exact-match edit tools.
-fn strip_xml_parameter_wrapper_newlines(value: &str) -> &str {
-    if let Some(value) = value.strip_prefix("\r\n") {
-        return value.strip_suffix("\r\n").unwrap_or(value);
-    }
-    if let Some(value) = value.strip_prefix('\n') {
-        if value.ends_with("\r\n") {
-            return value;
-        }
-        return value.strip_suffix('\n').unwrap_or(value);
-    }
-    value
 }
 
 fn parse_wrapped_tool_call_value(

@@ -684,6 +684,8 @@ impl EngineInner {
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
                 let api_response = classified_api_response.take().or_else(|| {
+                    // Declared native chat uses the same output projection as
+                    // HTTP streaming; an authoritative grammar result wins.
                     ferrum_types::api_response_from_generated_text(
                         &seq.original_request,
                         &text,

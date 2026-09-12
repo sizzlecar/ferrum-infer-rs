@@ -15,15 +15,15 @@ use ferrum_interfaces::vnext::{
     GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
     ModelProgram, ModelSemanticMetadata, NodeId, NumericalExecutionProfile, OperationId,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
-    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
-    ProgramValueId, QuantizationFormatId, QuantizationGrouping, QuantizationPacking,
-    QuantizationSpec, QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
-    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
-    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
-    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode, ProgramNodeWorkSpec,
+    ProgramTensorSpec, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
+    QuantizationPacking, QuantizationSpec, QuantizedProviderAttributionDenominator,
+    ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId, StateInitialization,
+    StateLifetime, StateSpec, TypedFamilyRegistration, VNextError, WeightComponentRole,
+    WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
+    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F32_F16_OPERATION_ID,
@@ -1143,6 +1143,14 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             attributes: BTreeMap::from([attribute("vocab_size", config.vocab_size)?]),
         });
 
+        let checkpoint_inputs =
+            ProgramCheckpointInputs::new(value_id("value.input.token_ids")?, BTreeSet::new())?
+                .with_output_only_inputs(BTreeSet::from([
+                    greedy_mask.clone(),
+                    greedy_repetition_token_ids.clone(),
+                    greedy_repetition_offsets.clone(),
+                    greedy_repetition_penalty.clone(),
+                ]))?;
         ModelProgram::new(
             self.family_id.clone(),
             vec![
@@ -1159,7 +1167,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             states,
             weight_refs,
             vec![logits, greedy_token],
-        )
+        )?
+        .with_checkpoint_inputs(checkpoint_inputs)
     }
 
     fn semantic_metadata(
@@ -8355,6 +8364,55 @@ mod tests {
             ]
         );
         assert_eq!(greedy.outputs[0].as_str(), "value.output.greedy_token");
+        let checkpoint_inputs = prepared.program().checkpoint_inputs().unwrap();
+        assert_eq!(
+            checkpoint_inputs.token_input().as_str(),
+            "value.input.token_ids"
+        );
+        assert!(checkpoint_inputs.conditioning_inputs().is_empty());
+        assert_eq!(
+            checkpoint_inputs.output_only_inputs(),
+            &greedy.inputs[1..].iter().cloned().collect()
+        );
+        for input in checkpoint_inputs.output_only_inputs() {
+            assert!(prepared
+                .program()
+                .blocks()
+                .iter()
+                .flat_map(|block| &block.nodes)
+                .filter(|node| node.inputs.contains(input))
+                .all(|node| node.id == greedy.id));
+        }
+        // Verify state semantics against their actual consuming operation;
+        // selected backend/storage support is established by plan validation.
+        for state in prepared.program().states() {
+            use ferrum_interfaces::vnext::{
+                CheckpointInputDependency, StateCheckpointCapability, StateCheckpointContents,
+            };
+            let owners = prepared.program().blocks()[0]
+                .nodes
+                .iter()
+                .filter(|node| node.inputs.contains(&state.value_id))
+                .collect::<Vec<_>>();
+            let [owner] = owners.as_slice() else {
+                panic!("each attention state must have one semantic owner")
+            };
+            let expected = match owner.operation_id.as_str() {
+                CAUSAL_PAGED_ATTENTION_OPERATION_ID => StateCheckpointContents::PrefixPositions,
+                GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID => {
+                    StateCheckpointContents::BoundaryValue
+                }
+                other => panic!("unexpected persistent state owner {other}"),
+            };
+            let StateCheckpointCapability::CompletedBoundary(contract) = state.checkpoint else {
+                panic!("attention continuation state must be explicitly declared")
+            };
+            assert_eq!(contract.contents(), expected);
+            assert_eq!(
+                contract.input_dependency(),
+                CheckpointInputDependency::ExactTokenPrefix
+            );
+        }
         assert_eq!(
             prepared
                 .program()

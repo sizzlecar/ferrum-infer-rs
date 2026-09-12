@@ -7,6 +7,7 @@ mod batch;
 mod completion;
 mod decode;
 mod prefill;
+mod prefix_restore;
 
 #[derive(Debug)]
 pub(super) enum PlanRuntimeBatchPrefillDisposition {
@@ -1649,7 +1650,50 @@ impl EngineInner {
             return Ok(EngineIterationOutcome::Progressed);
         }
         let mut prefill_maintenance = Vec::new();
-        let nb_result = if plan_runtime_managed {
+        let nb_result = if plan_runtime_managed
+            && self.model_executor.supports_plan_runtime_prefix_restore()
+        {
+            let (_, maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+            prefill_maintenance = maintenance;
+            let scheduled = async {
+                self.complete_typed_admission_failures().await?;
+                self.restore_admitted_prefixes().await?;
+                let mut availability = self.dynamic_admission_availability.lock();
+                let epochs = self
+                    .model_executor
+                    .write_execution_capacity_snapshot(&mut availability)?
+                    .ok_or_else(|| FerrumError::scheduler("plan runtime lost admission epochs"))?;
+                let wake = AdmissionWakeSnapshot::new(
+                    AdmissionWakeEpochs::new(
+                        epochs.coordinator_id,
+                        epochs.release_epoch,
+                        epochs.capacity_epoch,
+                        0,
+                    ),
+                    &availability,
+                );
+                let mut observations = Vec::new();
+                let scheduled = self.scheduler.next_batch_with_prepared_admission_observed(
+                    hint,
+                    wake,
+                    &mut |observation| observations.push(observation),
+                );
+                drop(availability);
+                for observation in observations {
+                    self.trace_executor_admission_queue_observation(observation);
+                }
+                scheduled
+            }
+            .await;
+            if scheduled.is_err() {
+                for deferral in &prefill_maintenance {
+                    self.model_executor
+                        .cancel_prefill_admission(deferral.request_id());
+                }
+                prefill_maintenance.clear();
+            }
+            scheduled?
+        } else if plan_runtime_managed {
             let mut availability = self.dynamic_admission_availability.lock();
             let epochs = self
                 .model_executor

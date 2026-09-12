@@ -1135,6 +1135,9 @@ pub enum DynamicBackingClaimScope {
     Plan,
     Request,
     Sequence,
+    /// Independent immutable storage of Sequence state, without a live
+    /// request/sequence execution slot or a sequence parent authority.
+    Checkpoint,
     Step,
     Invocation,
     InitialSequenceBundle,
@@ -1146,6 +1149,7 @@ impl DynamicBackingClaimScope {
             Self::Plan => matches!(lifetime, AllocationLifetime::Plan),
             Self::Request => matches!(lifetime, AllocationLifetime::Request),
             Self::Sequence => matches!(lifetime, AllocationLifetime::Sequence),
+            Self::Checkpoint => matches!(lifetime, AllocationLifetime::Sequence),
             Self::Step => matches!(lifetime, AllocationLifetime::Step),
             Self::Invocation => matches!(lifetime, AllocationLifetime::Invocation),
             Self::InitialSequenceBundle => matches!(
@@ -1160,6 +1164,7 @@ impl DynamicBackingClaimScope {
             Self::Plan => Some(AllocationLifetime::Plan),
             Self::Request => Some(AllocationLifetime::Request),
             Self::Sequence => Some(AllocationLifetime::Sequence),
+            Self::Checkpoint => None,
             Self::Step => Some(AllocationLifetime::Step),
             Self::Invocation => Some(AllocationLifetime::Invocation),
             Self::InitialSequenceBundle => None,
@@ -1248,6 +1253,7 @@ pub struct DynamicPoolResidencyOccupancyStatus {
     pub(super) plan: DynamicPoolOccupancyCounter,
     pub(super) request: DynamicPoolOccupancyCounter,
     pub(super) sequence: DynamicPoolOccupancyCounter,
+    pub(super) checkpoint: DynamicPoolOccupancyCounter,
     pub(super) step: DynamicPoolOccupancyCounter,
     pub(super) invocation: DynamicPoolOccupancyCounter,
     pub(super) initial_sequence_bundle: DynamicPoolOccupancyCounter,
@@ -1270,6 +1276,10 @@ impl DynamicPoolResidencyOccupancyStatus {
         &self.sequence
     }
 
+    pub const fn checkpoint(&self) -> &DynamicPoolOccupancyCounter {
+        &self.checkpoint
+    }
+
     pub const fn step(&self) -> &DynamicPoolOccupancyCounter {
         &self.step
     }
@@ -1290,6 +1300,7 @@ impl DynamicPoolResidencyOccupancyStatus {
             DynamicBackingClaimScope::Plan => &mut self.plan,
             DynamicBackingClaimScope::Request => &mut self.request,
             DynamicBackingClaimScope::Sequence => &mut self.sequence,
+            DynamicBackingClaimScope::Checkpoint => &mut self.checkpoint,
             DynamicBackingClaimScope::Step => &mut self.step,
             DynamicBackingClaimScope::Invocation => &mut self.invocation,
             DynamicBackingClaimScope::InitialSequenceBundle => &mut self.initial_sequence_bundle,
@@ -1529,6 +1540,12 @@ pub(super) enum DynamicPoolGrowthIntent {
     Additional(DynamicPoolGrowthRequest),
     Minimum(DynamicBackingPoolId),
     RevalidatedDeferral(DynamicBackingBlocker),
+    /// Logical admission has not acquired this demand. Recheck both ledgers
+    /// under the pool maintenance authority before deciding any growth.
+    RevalidatedAdmissionPressure {
+        pool_id: DynamicBackingPoolId,
+        required_free_bytes: u64,
+    },
 }
 
 impl DynamicPoolGrowthIntent {
@@ -1537,6 +1554,7 @@ impl DynamicPoolGrowthIntent {
             Self::Additional(request) => request.pool_id(),
             Self::Minimum(pool_id) => pool_id,
             Self::RevalidatedDeferral(blocker) => blocker.pool_id(),
+            Self::RevalidatedAdmissionPressure { pool_id, .. } => pool_id,
         }
     }
 }

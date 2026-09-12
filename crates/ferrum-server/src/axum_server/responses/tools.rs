@@ -182,7 +182,9 @@ fn parse_function_tool(
         name: name.clone(),
         description: description.clone(),
         parameters: parameters.clone(),
-        strict,
+        // Preserve this adapter's existing default argument validation when
+        // Chat Completions defaults to best effort. Explicit false opts out.
+        strict: Some(strict.unwrap_or(true)),
     };
     let mut normalized = Map::new();
     normalized.insert("type".to_string(), json!("function"));

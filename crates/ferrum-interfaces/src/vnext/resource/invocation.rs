@@ -1,6 +1,6 @@
 use super::{
     begin_participant_flights_dispatch, begin_submission_wave_participant_flights_dispatch,
-    finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id,
+    finalize_session_frames_with_boundary, fmt, invalid_resource, issue_batch_invocation_id,
     poison_session_frame, prepare_participant_flights, prepare_submission_wave_participant_flights,
     reset_participant_flights_after_definitely_not_submitted,
     reset_submission_wave_participant_flights_after_definitely_not_submitted,
@@ -192,6 +192,7 @@ where
             execution_lane,
             reusable_execution_bucket,
             batch_step_id,
+            completed_boundary: super::Mutex::new(super::StepCompletedBoundarySlot::default()),
             finalized: false,
         })
     }
@@ -290,7 +291,13 @@ where
             .iter_mut()
             .map(|participant| &mut participant.frame)
             .collect::<Vec<_>>();
-        let dispositions = finalize_session_frames(&mut holds, finalization)?;
+        let completed = self
+            .completed_boundary
+            .get_mut()
+            .map_err(|_| invalid_resource("step completed-boundary mutex is poisoned"))?;
+        let dispositions =
+            finalize_session_frames_with_boundary(&mut holds, finalization, completed.proof())?;
+        completed.consume();
         self.finalized = true;
         Ok(dispositions)
     }
@@ -1180,7 +1187,8 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut participant_frames = Vec::with_capacity(participant_sessions.len());
         let mut flight_candidates = Vec::with_capacity(participant_sessions.len());
-        for participant in &participant_sessions {
+        let mut canonical_work = None;
+        for (request_index, participant) in participant_sessions.iter().enumerate() {
             let key = session_participant_key(participant);
             let index = self
                 .participants
@@ -1191,6 +1199,42 @@ where
                     invalid_resource("invocation participant lost its execution-frame assignment")
                 })?;
             let step_participant = &self.participants[index];
+            let frame = ActiveSequenceFrame {
+                frame_id: step_participant.frame.frame_id,
+                batch_step_id: self.batch_step_id,
+            };
+            let admitted = self.work_shape().participant_work()[index].token_span();
+            // Imported Step admission requires retained token evidence and
+            // stores that same immutable work Arc. Default untracked execution
+            // keeps its existing flight-stage validation without another lock.
+            if admitted.checkpoint_tokens().is_some() {
+                // The held frame prevents frontier advancement or restore.
+                let state =
+                    participant.slot.state.lock().map_err(|_| {
+                        invalid_resource("sequence session state mutex is poisoned")
+                    })?;
+                let super::SequenceSessionSlotState::Active(active) = &*state else {
+                    return Err(invalid_resource("invocation session is no longer active"));
+                };
+                if active.epoch != participant.epoch
+                    || active.fingerprint != participant.fingerprint
+                    || active.active_frame != Some(frame)
+                {
+                    return Err(invalid_resource("invocation lost its exact Step frame"));
+                }
+                if let Some(span) = active.completed_boundary.bind_imported_invocation_work(
+                    admitted,
+                    work_shape.participant_work()[request_index].token_span(),
+                    participant.resources().request.plan.plan_hash(),
+                )? {
+                    let work = canonical_work
+                        .get_or_insert_with(|| work_shape.participant_work().to_vec());
+                    work[request_index] = BatchParticipantTokenSpan::new(
+                        work_shape.participants()[request_index],
+                        span,
+                    );
+                }
+            }
             participant_frames.push(StepParticipantFrameAssignment::new(
                 participant.sequence_authority(),
                 participant.request_authority(),
@@ -1200,10 +1244,7 @@ where
                 slot: Arc::clone(&participant.slot),
                 epoch: participant.epoch,
                 fingerprint: participant.fingerprint.clone(),
-                frame: ActiveSequenceFrame {
-                    frame_id: step_participant.frame.frame_id,
-                    batch_step_id: self.batch_step_id,
-                },
+                frame,
                 participant: BatchParticipantAuthority::new(
                     participant.sequence_authority(),
                     participant.request_authority(),
@@ -1242,6 +1283,10 @@ where
             .iter()
             .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
+        let work_shape = match canonical_work {
+            Some(work) => Arc::new(BatchWorkShape::new(work)?),
+            None => work_shape,
+        };
         Ok(PreparedParticipantAuthority {
             plan_evidence: self.plan_evidence(),
             participants,
@@ -1673,6 +1718,13 @@ where
 
     pub(crate) const fn purpose(&self) -> SubmissionWavePurpose {
         self.purpose
+    }
+
+    pub(crate) fn record_full_plan_success(
+        &self,
+        seal: &crate::vnext::SuccessfulWaveCompletionSeal,
+    ) -> Result<(), VNextError> {
+        super::record_completed_wave(self, seal)
     }
 
     pub fn claimed_backing(&self) -> &ClaimedSubmissionWaveBacking {
