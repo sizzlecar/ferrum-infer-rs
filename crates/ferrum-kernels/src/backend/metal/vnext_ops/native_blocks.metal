@@ -79,15 +79,21 @@ static inline void native_linear(
     uint3 group, uint lane, uint subgroup) {
     const uint row = group.y;
     const uint first = group.x * 4 + subgroup * 2;
-    const uint blocks_per_row = p.in_features / block.values;
+    // NativeBlockParams admits only 32- or 256-value blocks. Keep the lane
+    // traversal and ulong byte addresses unchanged while sharing this index
+    // calculation between the two output columns.
+    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint blocks_per_row = p.in_features >> block_shift;
     float sums[2] = {0.0f, 0.0f};
     for (uint col = lane; col < p.in_features; col += 32) {
         const float x = float(input[ulong(row) * p.in_features + col]);
+        const uint block_index = col >> block_shift;
+        const uint in_block = col & (block.values - 1);
         for (uint part = 0; part < 2; ++part) {
             const uint out_col = first + part;
             if (out_col < p.out_features) {
-                const ulong offset = (ulong(out_col) * blocks_per_row + col / block.values) * block.bytes;
-                sums[part] += x * native_block_value(weight + offset, col % block.values, block.format);
+                const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                sums[part] += x * native_block_value(weight + offset, in_block, block.format);
             }
         }
     }

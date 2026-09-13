@@ -16,6 +16,7 @@ use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     Buffer, CommandBufferRef, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions,
 };
+use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 const WARMUP_ROUNDS: usize = 2;
@@ -239,6 +240,10 @@ impl Case<'_> {
                 &self.pipelines.native.linear_f16,
                 LinearDispatchKind::CooperativeGemv,
             ),
+            (Dispatch::NativeGemv, _, ElementType::F32) => (
+                &self.pipelines.native.linear_f32,
+                LinearDispatchKind::CooperativeGemv,
+            ),
             (Dispatch::NativeGemm, _, ElementType::F16) => (
                 &self.pipelines.native.gemm_f16_f32,
                 LinearDispatchKind::NativeTiledGemm,
@@ -372,6 +377,101 @@ fn quantized_q5_shared_weight_microbench() {
         },
     ];
     measure_dispatch_shapes(&shapes, &[2, 3, 4], false);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_quantized_decode_dispatch_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    // Run this unchanged fixture in both builds. Each measures that build's
+    // native GEMV, not a second shader copy. These are wide FFN geometries;
+    // F32 coverage exercises the generic ABI, not an asserted model binding.
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+    ] {
+        for (input_width, output_width) in [(5120, 17408), (17408, 5120)] {
+            let shape = Shape {
+                name: "native_decode_projection",
+                input: input_width,
+                output: output_width,
+                format,
+            };
+            let weight_bytes = weights(shape);
+            let weight_buffers = [buffer(&device, &weight_bytes)];
+            for rows in [1, 3] {
+                for activation_type in [ElementType::F16, ElementType::F32] {
+                    let (input_values, mut nonzero) = inputs(rows, shape.input as usize);
+                    let (input, output) = if activation_type == ElementType::F16 {
+                        (
+                            buffer(&device, &input_values),
+                            buffer(&device, &vec![f16::NAN; rows * shape.output as usize]),
+                        )
+                    } else {
+                        let mut values = vec![0.0_f32; input_values.len()];
+                        for (row, entries) in nonzero.iter_mut().enumerate() {
+                            for (column, value) in entries {
+                                *value += 0.000_123;
+                                values[row * shape.input as usize + *column] = *value;
+                            }
+                        }
+                        (
+                            buffer(&device, &values),
+                            buffer(&device, &vec![f32::NAN; rows * shape.output as usize]),
+                        )
+                    };
+                    let reference = oracle(shape, &weight_bytes, &nonzero);
+                    let case = Case {
+                        queue: &queue,
+                        pipelines: &pipelines,
+                        shape,
+                        rows: rows as u32,
+                        activation_type,
+                        input: &input,
+                        weights: &weight_buffers,
+                        output: &output,
+                    };
+                    let samples = measure_case_with_rounds(
+                        &case,
+                        &[Dispatch::NativeGemv],
+                        &reference,
+                        1,
+                        8,
+                        1,
+                    );
+                    let mut output_digest = Sha256::new();
+                    for value in read_linear_values(&output, reference.len(), activation_type) {
+                        output_digest.update(value.to_bits().to_le_bytes());
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "kind": "metal_native_quantized_decode_dispatch_microbench",
+                            "device": device.name(), "rows": rows,
+                            "input_features": shape.input, "output_features": shape.output,
+                            "activation_type": format!("{activation_type:?}"),
+                            "weight_format": format.format_id(), "weight_bytes": weight_bytes.len(),
+                            "rotating_weight_allocations": 1,
+                            "gpu_buffer_bytes": weight_buffers[0].length() + input.length() + output.length(),
+                            "correctness_warmup_dispatches": 1, "additional_warmup_rounds": 1,
+                            "measured_rounds": 8, "dispatches_per_command": 1,
+                            "oracle": "full_output_sparse_input_cpu_block_decode_each_command",
+                            "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
+                            "output_elements": reference.len(),
+                            "scope": "single_hot_weight_buffer_native_GEMV_not_full_model_or_concurrent_requests",
+                            "comparison": "same_fixture_in_separately_frozen_baseline_and_candidate_builds",
+                            "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
+                            "samples": samples,
+                        })
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
