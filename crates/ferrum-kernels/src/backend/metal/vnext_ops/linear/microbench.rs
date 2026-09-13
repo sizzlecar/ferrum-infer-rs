@@ -86,6 +86,8 @@ enum Dispatch {
     NativeSharedGemv,
     NativeGemm,
     NativeGemmM64,
+    NativeSpecializedGemm,
+    NativeSpecializedGemmM64,
 }
 
 fn buffer<T>(device: &Device, data: &[T]) -> Buffer {
@@ -277,6 +279,18 @@ impl Case<'_> {
                 self.pipelines.native.gemm_f16_f32_m64.as_ref().unwrap(),
                 LinearDispatchKind::NativeTiledGemmM64,
             ),
+            (Dispatch::NativeSpecializedGemm, GgufBlockFormat::Iq4Xs, ElementType::F16) => (
+                &self.pipelines.native.iq4xs_gemm_f16_f32,
+                LinearDispatchKind::NativeTiledGemm,
+            ),
+            (Dispatch::NativeSpecializedGemmM64, GgufBlockFormat::Iq4Xs, ElementType::F16) => (
+                self.pipelines
+                    .native
+                    .iq4xs_gemm_f16_f32_m64
+                    .as_ref()
+                    .expect("specialization microbench requires a specialized M64 PSO"),
+                LinearDispatchKind::NativeTiledGemmM64,
+            ),
             (Dispatch::Gemv, _, ElementType::F32) => (
                 self.pipelines
                     .f32_linear_pipeline(physical(self.shape.format))
@@ -342,6 +356,8 @@ impl Case<'_> {
                         | Dispatch::NativeSharedGemv
                         | Dispatch::NativeGemm
                         | Dispatch::NativeGemmM64
+                        | Dispatch::NativeSpecializedGemm
+                        | Dispatch::NativeSpecializedGemmM64
                 ) {
                     LinearPhysicalFormat::Native(self.shape.format)
                 } else {
@@ -368,13 +384,13 @@ impl Case<'_> {
             "pso_max_total_threads_per_threadgroup": pipeline.max_total_threads_per_threadgroup(),
             "pso_static_threadgroup_memory_bytes": pipeline.static_threadgroup_memory_length(),
             "native_tile_rows": match dispatch {
-                Dispatch::NativeGemm => Some(32),
-                Dispatch::NativeGemmM64 => Some(64),
+                Dispatch::NativeGemm | Dispatch::NativeSpecializedGemm => Some(32),
+                Dispatch::NativeGemmM64 | Dispatch::NativeSpecializedGemmM64 => Some(64),
                 _ => None,
             },
             "native_dynamic_threadgroup_memory_bytes": match dispatch {
-                Dispatch::NativeGemm => Some(12288),
-                Dispatch::NativeGemmM64 => Some(16384),
+                Dispatch::NativeGemm | Dispatch::NativeSpecializedGemm => Some(12288),
+                Dispatch::NativeGemmM64 | Dispatch::NativeSpecializedGemmM64 => Some(16384),
                 _ => None,
             },
         })
@@ -744,6 +760,52 @@ fn native_quantized_prefill_fragment_dispatch_microbench() {
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_prefill_iq4xs_specialization_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let started = Instant::now();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let registry_ns = started.elapsed().as_nanos() as u64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "kind": "metal_native_iq4xs_gemm_initialization",
+            "linear_registry_ns": registry_ns,
+            "native_library_ns": pipelines.native.initialization.library_ns,
+            "specialized_gemm_ns": pipelines.native.initialization.specialized_gemm_ns,
+            "specialized_m64_available": pipelines.native.iq4xs_gemm_f16_f32_m64.is_some(),
+            "scope": "host_registry_construction_in_test_build_includes_generic_controls",
+        })
+    );
+    for (input, output) in [(5120, 17408), (17408, 5120)] {
+        for (rows, variants) in [
+            (256, [Dispatch::NativeGemm, Dispatch::NativeSpecializedGemm]),
+            (
+                1024,
+                [Dispatch::NativeGemmM64, Dispatch::NativeSpecializedGemmM64],
+            ),
+        ] {
+            // Fix the tile on both sides. Every preflight and timed command
+            // checks the full CPU oracle, generic output bits, and guards.
+            measure_native_prefill_shape(
+                &device,
+                &queue,
+                &pipelines,
+                Shape {
+                    name: "native_prefill_iq4xs_specialization",
+                    input,
+                    output,
+                    format: GgufBlockFormat::Iq4Xs,
+                },
+                &[rows],
+                &variants,
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_prefill_short_tail_dispatch_microbench() {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
@@ -931,7 +993,10 @@ fn measure_native_prefill_shape(
                 "dispatches_per_command": 1,
                 "production_dispatch": format!("{:?}", pipelines.linear_pipeline(physical(shape.format), rows as u32, shape.output).1),
                 "oracle": "full_output_sparse_input_cpu_block_decode_each_variant_independently",
-                "correctness": if variants.iter().any(|variant| matches!(variant, Dispatch::NativeGemmM64)) {
+                "correctness": if variants.iter().any(|variant| matches!(variant,
+                    Dispatch::NativeSpecializedGemm | Dispatch::NativeSpecializedGemmM64)) {
+                    "poison_before_each_command; full_output_CPU_tolerance_and_generic_same_tile_bitwise_equality_each_command"
+                } else if variants.iter().any(|variant| matches!(variant, Dispatch::NativeGemmM64)) {
                     "poison_before_each_command; full_output_CPU_tolerance_and_M32_bitwise_equality_each_command"
                 } else {
                     "poison_before_each_command; F16 tolerance, not cross-variant bitwise equality"
@@ -1041,12 +1106,19 @@ fn measure_case_with_rounds(
     measured_rounds: usize,
     dispatches_per_command: usize,
 ) -> Vec<serde_json::Value> {
-    let compare_m64_tiles = variants
+    let compare_gemm_variants = variants
         .iter()
-        .any(|variant| matches!(variant, Dispatch::NativeGemmM64))
-        && variants
-            .iter()
-            .any(|variant| matches!(variant, Dispatch::NativeGemm));
+        .filter(|variant| {
+            matches!(
+                variant,
+                Dispatch::NativeGemm
+                    | Dispatch::NativeGemmM64
+                    | Dispatch::NativeSpecializedGemm
+                    | Dispatch::NativeSpecializedGemmM64
+            )
+        })
+        .count()
+        > 1;
     let compare_native_variants = variants
         .iter()
         .filter(|variant| {
@@ -1057,7 +1129,7 @@ fn measure_case_with_rounds(
         })
         .count()
         > 1
-        || compare_m64_tiles;
+        || compare_gemm_variants;
     let mut native_reference: Option<Vec<u32>> = None;
     for &dispatch in variants {
         // A skipped write must not inherit a correct result from the previous
@@ -1073,6 +1145,8 @@ fn measure_case_with_rounds(
                     | Dispatch::NativeSharedGemv
                     | Dispatch::NativeGemm
                     | Dispatch::NativeGemmM64
+                    | Dispatch::NativeSpecializedGemm
+                    | Dispatch::NativeSpecializedGemmM64
             )
         {
             let bits = read_linear_values(case.output, reference.len(), case.activation_type)

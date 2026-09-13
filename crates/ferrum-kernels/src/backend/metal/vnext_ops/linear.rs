@@ -224,11 +224,16 @@ impl MetalLinearPipelines {
                         && rows >= NATIVE_SHORT_TILED_GEMM_MIN_ROWS
                         && out_features >= NATIVE_SHORT_TILED_GEMM_MIN_OUTPUT_FEATURES) =>
             {
-                // All smaller waves and other formats retain M32.
-                if format == GgufBlockFormat::Iq4Xs && rows >= NATIVE_M64_GEMM_MIN_ROWS {
-                    if let Some(pipeline) = self.native.gemm_f16_f32_m64.as_ref() {
-                        return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                if format == GgufBlockFormat::Iq4Xs {
+                    if rows >= NATIVE_M64_GEMM_MIN_ROWS {
+                        if let Some(pipeline) = self.native.iq4xs_gemm_f16_f32_m64.as_ref() {
+                            return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                        }
                     }
+                    return (
+                        &self.native.iq4xs_gemm_f16_f32,
+                        LinearDispatchKind::NativeTiledGemm,
+                    );
                 }
                 (
                     &self.native.gemm_f16_f32,

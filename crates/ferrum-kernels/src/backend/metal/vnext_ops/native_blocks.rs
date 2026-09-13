@@ -120,6 +120,7 @@ pub(super) struct NativePipelineInitialization {
     pub(super) specialized_gemv_ns: u64,
     pub(super) shared_gemv_ns: u64,
     pub(super) generic_gemv_ns: u64,
+    pub(super) specialized_gemm_ns: u64,
 }
 
 pub(super) struct MetalNativeBlockPipelines {
@@ -133,6 +134,9 @@ pub(super) struct MetalNativeBlockPipelines {
     iq4_xs: NativeGemvPipelines,
     shared: NativeSharedPipelines,
     pub(super) gemm_f16_f32: ComputePipelineState,
+    pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
+    pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
+    #[cfg(test)]
     pub(super) gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
     pub(super) generic_linear_f16: ComputePipelineState,
@@ -218,22 +222,27 @@ impl MetalNativeBlockPipelines {
         let generic_gemv_ns = generic_started.elapsed().as_nanos() as u64;
         // M64 is optional. Devices unable to create or execute this larger
         // threadgroup retain M32; no lazy compilation occurs during dispatch.
-        let gemm_f16_f32_m64 = if device.max_threads_per_threadgroup().width >= M64_THREADS
-            && device.max_threadgroup_memory_length() >= M64_THREADGROUP_BYTES
-        {
-            pipeline("vnext_native_block_gemm_f16_f32_m64")
-                .ok()
-                .filter(|pipeline| {
-                    supports_m64_threadgroup(
-                        pipeline.thread_execution_width(),
-                        pipeline.max_total_threads_per_threadgroup(),
-                        pipeline.static_threadgroup_memory_length(),
-                        device.max_threadgroup_memory_length(),
-                    )
-                })
-        } else {
-            None
-        };
+        #[cfg(test)]
+        let gemm_f16_f32_m64 =
+            optional_m64_pipeline(device, || pipeline("vnext_native_block_gemm_f16_f32_m64"));
+        #[cfg(test)]
+        let specialized_gemm_started = std::time::Instant::now();
+        let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
+            device,
+            &library,
+            "vnext_native_block_gemm_f16_f32_specialized",
+            GgufBlockFormat::Iq4Xs,
+        )?;
+        let iq4xs_gemm_f16_f32_m64 = optional_m64_pipeline(device, || {
+            gemm_format_pipeline(
+                device,
+                &library,
+                "vnext_native_block_gemm_f16_f32_m64_specialized",
+                GgufBlockFormat::Iq4Xs,
+            )
+        });
+        #[cfg(test)]
+        let specialized_gemm_ns = specialized_gemm_started.elapsed().as_nanos() as u64;
         Ok(Self {
             q3_k,
             q4_k,
@@ -245,6 +254,9 @@ impl MetalNativeBlockPipelines {
             iq4_xs,
             shared,
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
+            iq4xs_gemm_f16_f32,
+            iq4xs_gemm_f16_f32_m64,
+            #[cfg(test)]
             gemm_f16_f32_m64,
             #[cfg(test)]
             generic_linear_f16,
@@ -256,6 +268,7 @@ impl MetalNativeBlockPipelines {
                 specialized_gemv_ns,
                 shared_gemv_ns,
                 generic_gemv_ns,
+                specialized_gemm_ns,
             },
             #[cfg(test)]
             decode: pipeline("vnext_native_block_decode")?,
@@ -291,6 +304,53 @@ impl MetalNativeBlockPipelines {
     ) -> Option<&ComputePipelineState> {
         self.shared.pipeline(format, rows, activation_type)
     }
+}
+
+fn optional_m64_pipeline(
+    device: &Device,
+    create: impl FnOnce() -> Result<ComputePipelineState, MetalDeviceRuntimeError>,
+) -> Option<ComputePipelineState> {
+    if device.max_threads_per_threadgroup().width < M64_THREADS
+        || device.max_threadgroup_memory_length() < M64_THREADGROUP_BYTES
+    {
+        return None;
+    }
+    create().ok().filter(|pipeline| {
+        supports_m64_threadgroup(
+            pipeline.thread_execution_width(),
+            pipeline.max_total_threads_per_threadgroup(),
+            pipeline.static_threadgroup_memory_length(),
+            device.max_threadgroup_memory_length(),
+        )
+    })
+}
+
+fn gemm_format_pipeline(
+    device: &Device,
+    library: &metal::LibraryRef,
+    name: &str,
+    format: GgufBlockFormat,
+) -> Result<ComputePipelineState, MetalDeviceRuntimeError> {
+    let constants = FunctionConstantValues::new();
+    // The format and block geometry must match the native buffer ABI exactly.
+    let block = NativeBlockParams::from(format);
+    for (index, value) in [(1, block.format), (2, block.values), (3, block.bytes)] {
+        constants.set_constant_value_at_index(
+            &value as *const u32 as *const c_void,
+            MTLDataType::UInt,
+            index,
+        );
+    }
+    let function = library
+        .get_function(name, Some(constants))
+        .map_err(|error| {
+            MetalDeviceRuntimeError::contract(format!(
+                "specialize native GGUF GEMM `{name}` {format:?}: {error}"
+            ))
+        })?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalDeviceRuntimeError::contract)
 }
 
 fn format_pipeline(

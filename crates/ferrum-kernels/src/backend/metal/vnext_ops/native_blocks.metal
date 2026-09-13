@@ -12,6 +12,12 @@ struct NativeLinearParams {
 // bind a supported GgufBlockFormat; prefill and block decoding do not use this.
 constant uint NATIVE_GEMV_FORMAT [[function_constant(0)]];
 
+// Specialized GEMM entrypoints bind all three values from one typed format.
+// Generic entrypoints retain the runtime block parameters.
+constant uint NATIVE_GEMM_FORMAT [[function_constant(1)]];
+constant uint NATIVE_GEMM_BLOCK_VALUES [[function_constant(2)]];
+constant uint NATIVE_GEMM_BLOCK_BYTES [[function_constant(3)]];
+
 static inline float native_half(device const uchar * b, uint offset) {
     const ushort bits = ushort(b[offset]) | (ushort(b[offset + 1]) << 8);
     return float(as_type<half>(bits));
@@ -322,7 +328,7 @@ NATIVE_SHARED_LINEAR(float, f32, 4)
 // A 32- or 64-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
-template<uint ROW_TILE>
+template<uint ROW_TILE, bool SPECIALIZED = false>
 static inline void native_tiled_gemm(
     device const half * input, device const uchar * weight, device half * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
@@ -332,9 +338,12 @@ static inline void native_tiled_gemm(
     threadgroup float * weight_tile = workspace + ROW_TILE * 32;
     const ulong input_start = ulong(group.x) * ROW_TILE;
     const ulong output_start = ulong(group.y) * 64;
+    const uint format = SPECIALIZED ? NATIVE_GEMM_FORMAT : block.format;
+    const uint block_values = SPECIALIZED ? NATIVE_GEMM_BLOCK_VALUES : block.values;
+    const uint block_bytes = SPECIALIZED ? NATIVE_GEMM_BLOCK_BYTES : block.bytes;
     // Native GGUF blocks contain 32 or 256 values. A K32 tile cannot cross
     // a block boundary, so compute its block address once per K iteration.
-    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint block_shift = block_values == 256 ? 8 : 5;
     const ulong blocks_per_row = ulong(p.in_features >> block_shift);
     const uint matrix_row = (simdgroup_index / 2) * 16;
     const uint matrix_column = (simdgroup_index % 2) * 32;
@@ -345,7 +354,7 @@ static inline void native_tiled_gemm(
 
     for (ulong k = 0; k < ulong(p.in_features); k += 32) {
         const ulong block_index = ulong(uint(k) >> block_shift);
-        const uint in_block_base = uint(k) & (block.values - 1);
+        const uint in_block_base = uint(k) & (block_values - 1);
         for (uint i = thread_index; i < ROW_TILE * 32; i += THREADS) {
             const ulong row = input_start + i / 32;
             const ulong column = k + i % 32;
@@ -363,17 +372,17 @@ static inline void native_tiled_gemm(
             const ulong column = k + local_column;
             threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
             if (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features)) {
-                const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+                const ulong offset = (row * blocks_per_row + block_index) * ulong(block_bytes);
                 native_gemm_fragment16(weight + offset, in_block_base + local_column,
-                    block.format, weight_fragment);
+                    format, weight_fragment);
             } else {
                 // Keep every consumed tile element initialized, including tails.
                 for (uint j = 0; j < 16; ++j) {
                     float value = 0.0f;
                     if (row < ulong(p.out_features) && column + j < ulong(p.in_features)) {
-                        const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+                        const ulong offset = (row * blocks_per_row + block_index) * ulong(block_bytes);
                         value = native_block_value(weight + offset,
-                            in_block_base + local_column + j, block.format);
+                            in_block_base + local_column + j, format);
                     }
                     weight_fragment[j * 64] = value;
                 }
@@ -425,18 +434,20 @@ static inline void native_tiled_gemm(
     }
 }
 
-#define NATIVE_TILED_GEMM(NAME, ROW_TILE) \
+#define NATIVE_TILED_GEMM(NAME, ROW_TILE, SPECIALIZED) \
 kernel void NAME( \
     device const half * input [[buffer(0)]], device const uchar * weight [[buffer(1)]], \
     device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
     constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]], \
     uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]], \
     uint simdgroup_index [[simdgroup_index_in_threadgroup]]) { \
-    native_tiled_gemm<ROW_TILE>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index); \
+    native_tiled_gemm<ROW_TILE, SPECIALIZED>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index); \
 }
 
-NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32, 32)
-NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64, 64)
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32, 32, false)
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64, 64, false)
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_specialized, 32, true)
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64_specialized, 64, true)
 #undef NATIVE_TILED_GEMM
 
 kernel void vnext_native_block_decode(

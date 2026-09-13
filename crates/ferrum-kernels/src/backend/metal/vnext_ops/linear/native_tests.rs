@@ -382,6 +382,8 @@ enum PrefillTile {
     Production,
     M32,
     M64,
+    Iq4XsM32,
+    Iq4XsM64,
 }
 
 fn assert_native_prefill(
@@ -435,7 +437,7 @@ fn assert_native_prefill(
     let expected = if format == GgufBlockFormat::Iq4Xs
         && rows >= 1024
         && columns >= 1024
-        && pipelines.native.gemm_f16_f32_m64.is_some()
+        && pipelines.native.iq4xs_gemm_f16_f32_m64.is_some()
     {
         LinearDispatchKind::NativeTiledGemmM64
     } else if (rows >= 32 && columns >= 1024)
@@ -464,6 +466,18 @@ fn assert_native_prefill(
         PrefillTile::Production => pipeline,
         PrefillTile::M32 => &pipelines.native.gemm_f16_f32,
         PrefillTile::M64 => pipelines.native.gemm_f16_f32_m64.as_ref().unwrap(),
+        PrefillTile::Iq4XsM32 => {
+            assert_eq!(format, GgufBlockFormat::Iq4Xs);
+            &pipelines.native.iq4xs_gemm_f16_f32
+        }
+        PrefillTile::Iq4XsM64 => {
+            assert_eq!(format, GgufBlockFormat::Iq4Xs);
+            pipelines
+                .native
+                .iq4xs_gemm_f16_f32_m64
+                .as_ref()
+                .expect("IQ4_XS numerical conformance requires a specialized M64 PSO")
+        }
     };
     let command = queue.new_command_buffer();
     let encoder = command.new_compute_command_encoder();
@@ -474,10 +488,10 @@ fn assert_native_prefill(
     bind_linear_params(encoder, params, physical, ElementType::F16);
     match tile {
         PrefillTile::Production => dispatch_linear_grid(encoder, params, kind),
-        PrefillTile::M32 => {
+        PrefillTile::M32 | PrefillTile::Iq4XsM32 => {
             dispatch_linear_grid(encoder, params, LinearDispatchKind::NativeTiledGemm)
         }
-        PrefillTile::M64 => {
+        PrefillTile::M64 | PrefillTile::Iq4XsM64 => {
             dispatch_linear_grid(encoder, params, LinearDispatchKind::NativeTiledGemmM64)
         }
     }
@@ -575,13 +589,18 @@ fn native_prefill_short_tail_production_matches_m32_with_output_guards() {
     let format = GgufBlockFormat::Iq4Xs;
     let blocks = oracle_blocks(format);
     for rows in [8, 12, 31] {
+        let blocks = if rows == 12 {
+            &blocks[..]
+        } else {
+            &blocks[..format.block_bytes()]
+        };
         let run = |tile| {
             assert_native_prefill(
                 &device,
                 &pipelines,
                 &queue,
                 format,
-                &blocks[..format.block_bytes()],
+                blocks,
                 rows,
                 4097,
                 |row, column| f16::from_f32(((row * 17 + column) as f32 * 0.073).sin() * 0.03125),
@@ -589,8 +608,8 @@ fn native_prefill_short_tail_production_matches_m32_with_output_guards() {
             )
         };
         // Both executions independently check the original dense CPU bound
-        // and guards. Production must select the explicit M32 control here;
-        // this is not a GEMV/MMA bitwise-equivalence assertion.
+        // and guards. Production selects specialized M32, compared against
+        // the generic same-tile control, never a second production lookup.
         assert_eq!(run(PrefillTile::Production), run(PrefillTile::M32));
     }
 }
@@ -694,16 +713,25 @@ fn native_prefill_m64_selection_preserves_shape_format_and_capability_fallback()
                     LinearDispatchKind::CooperativeGemv
                 } else if format == GgufBlockFormat::Iq4Xs
                     && rows >= 1024
-                    && pipelines.native.gemm_f16_f32_m64.is_some()
+                    && pipelines.native.iq4xs_gemm_f16_f32_m64.is_some()
                 {
                     LinearDispatchKind::NativeTiledGemmM64
                 } else {
                     LinearDispatchKind::NativeTiledGemm
                 };
-                assert_eq!(
-                    pipelines.linear_pipeline(physical, rows, columns).1,
-                    expected
-                );
+                let selected = pipelines.linear_pipeline(physical, rows, columns);
+                assert_eq!(selected.1, expected);
+                let expected_pipeline = match expected {
+                    LinearDispatchKind::NativeTiledGemmM64 => {
+                        pipelines.native.iq4xs_gemm_f16_f32_m64.as_ref().unwrap()
+                    }
+                    LinearDispatchKind::NativeTiledGemm if format == GgufBlockFormat::Iq4Xs => {
+                        &pipelines.native.iq4xs_gemm_f16_f32
+                    }
+                    LinearDispatchKind::NativeTiledGemm => &pipelines.native.gemm_f16_f32,
+                    _ => pipelines.native.linear_f16(format),
+                };
+                assert!(std::ptr::eq(selected.0, expected_pipeline));
                 assert_eq!(
                     pipelines
                         .f32_linear_dispatch(physical, rows, columns)
@@ -747,21 +775,21 @@ fn native_prefill_m64_selection_preserves_shape_format_and_capability_fallback()
     }
     // The same production selector must retain M32 if optional registration
     // could not retain a compatible M64 pipeline.
-    pipelines.native.gemm_f16_f32_m64 = None;
-    assert_eq!(
-        pipelines
-            .linear_pipeline(
-                LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs),
-                1024,
-                1024
-            )
-            .1,
-        LinearDispatchKind::NativeTiledGemm
+    pipelines.native.iq4xs_gemm_f16_f32_m64 = None;
+    let fallback = pipelines.linear_pipeline(
+        LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs),
+        1024,
+        1024,
     );
+    assert_eq!(fallback.1, LinearDispatchKind::NativeTiledGemm);
+    assert!(std::ptr::eq(
+        fallback.0,
+        &pipelines.native.iq4xs_gemm_f16_f32
+    ));
 }
 
 #[test]
-fn native_prefill_m64_production_matches_explicit_m32_with_row_and_output_tails() {
+fn native_prefill_m64_production_matches_same_tile_with_row_and_output_tails() {
     let device =
         Device::system_default().expect("native M64 production conformance requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
@@ -770,6 +798,11 @@ fn native_prefill_m64_production_matches_explicit_m32_with_row_and_output_tails(
         .gemm_f16_f32_m64
         .as_ref()
         .expect("M64 production conformance requires a valid M64 PSO");
+    pipelines
+        .native
+        .iq4xs_gemm_f16_f32_m64
+        .as_ref()
+        .expect("M64 production conformance requires a specialized M64 PSO");
     let queue = device.new_command_queue();
     let format = GgufBlockFormat::Iq4Xs;
     let blocks = oracle_blocks(format);
@@ -792,10 +825,10 @@ fn native_prefill_m64_production_matches_explicit_m32_with_row_and_output_tails(
             tile,
         )
     };
-    let baseline = run(PrefillTile::M32);
+    let baseline = run(PrefillTile::M64);
     let production = run(PrefillTile::Production);
     for (index, (old, new)) in baseline.iter().zip(&production).enumerate() {
-        assert_eq!(old, new, "production M32/M64 output[{index}]");
+        assert_eq!(old, new, "production/generic M64 output[{index}]");
     }
 }
 
@@ -804,42 +837,63 @@ fn native_prefill_retains_decoded_weights_beyond_the_f16_range() {
     let device = Device::system_default().expect("native prefill conformance requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    let format = GgufBlockFormat::Iq4Nl;
     // Positive/negative coefficients exceed half's finite range, while their
     // products and final output remain finite. A half weight staging route
     // would create infinities and destroy cancellation in this valid input.
-    let mut block = vec![0x0f; format.block_bytes()];
-    block[..2].copy_from_slice(&f16::from_f32(1024.0).to_le_bytes());
-    let mut decoded = vec![0.0; format.block_values()];
-    format.decode(&block, &mut decoded).unwrap();
-    assert!(decoded.iter().any(|value| value.abs() > f16::MAX.to_f32()));
-    let run = |tile| {
-        assert_native_prefill(
-            &device,
-            &pipelines,
-            &queue,
-            format,
-            &block,
-            33,
-            65,
-            |row, _| {
-                f16::from_f32(if row % 2 == 0 {
-                    1.0 / 1024.0
-                } else {
-                    -1.0 / 1024.0
-                })
-            },
-            tile,
-        )
-    };
-    let baseline = run(PrefillTile::Production);
-    pipelines
-        .native
-        .gemm_f16_f32_m64
-        .as_ref()
-        .expect("wide weight conformance requires a valid M64 PSO");
-    let candidate = run(PrefillTile::M64);
-    for (index, (old, new)) in baseline.iter().zip(&candidate).enumerate() {
-        assert_eq!(old, new, "wide decoded weight M32/M64 output[{index}]");
+    for format in [GgufBlockFormat::Iq4Nl, GgufBlockFormat::Iq4Xs] {
+        let mut block = vec![0x0f; format.block_bytes()];
+        block[..2].copy_from_slice(&f16::from_f32(1024.0).to_le_bytes());
+        if format == GgufBlockFormat::Iq4Xs {
+            // All eight block groups use -32, while each group retains both
+            // positive and negative LUT coefficients. No decoded weight is half.
+            block[2..8].fill(0);
+        }
+        let mut decoded = vec![0.0; format.block_values()];
+        format.decode(&block, &mut decoded).unwrap();
+        assert!(decoded.iter().any(|value| value.abs() > f16::MAX.to_f32()));
+        let run = |tile| {
+            assert_native_prefill(
+                &device,
+                &pipelines,
+                &queue,
+                format,
+                &block,
+                33,
+                65,
+                |row, _| {
+                    f16::from_f32(if row % 2 == 0 {
+                        1.0 / 1024.0
+                    } else {
+                        -1.0 / 1024.0
+                    })
+                },
+                tile,
+            )
+        };
+        let baseline = run(PrefillTile::M32);
+        pipelines
+            .native
+            .gemm_f16_f32_m64
+            .as_ref()
+            .expect("wide weight conformance requires a valid M64 PSO");
+        let candidate = run(PrefillTile::M64);
+        for (index, (old, new)) in baseline.iter().zip(&candidate).enumerate() {
+            assert_eq!(
+                old, new,
+                "{format:?} wide decoded weight M32/M64 output[{index}]"
+            );
+        }
+        if format == GgufBlockFormat::Iq4Xs {
+            assert_eq!(
+                baseline,
+                run(PrefillTile::Iq4XsM32),
+                "wide IQ4_XS generic/specialized M32"
+            );
+            assert_eq!(
+                candidate,
+                run(PrefillTile::Iq4XsM64),
+                "wide IQ4_XS generic/specialized M64"
+            );
+        }
     }
 }
