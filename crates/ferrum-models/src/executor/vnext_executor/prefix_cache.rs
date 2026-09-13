@@ -77,6 +77,12 @@ struct Entry<C> {
 }
 
 impl<C> Entry<C> {
+    fn is_generated_head(&self) -> bool {
+        self.original_prompt().is_some_and(|prompt| {
+            self.prefix.len() == self.input.len() && self.input.len() > prompt.len()
+        })
+    }
+
     fn original_prompt(&self) -> Option<&[u32]> {
         let count = self.original_prompt_tokens?;
         if count == 0
@@ -88,6 +94,13 @@ impl<C> Entry<C> {
         }
         self.input.get(..count)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrefixEvictionPurpose {
+    Foreground,
+    PromptCapture,
+    GeneratedCapture,
 }
 
 /// Oldest at the front. This is an index, not a second byte or slot budget.
@@ -319,8 +332,23 @@ impl<C> PrefixIndex<C> {
         removed
     }
 
+    #[cfg(test)]
     fn evict(&mut self) -> Option<C> {
-        self.entries.pop_front().map(|entry| entry.checkpoint)
+        self.evict_for(PrefixEvictionPurpose::Foreground)
+    }
+
+    fn evict_for(&mut self, purpose: PrefixEvictionPurpose) -> Option<C> {
+        // A later input can preserve the entire original prompt while changing
+        // generated tokens, for example when structured output is rendered
+        // again. Under pressure, retain that repeat-capable input before an
+        // opportunistic generated head. LRU still orders each class.
+        let victim = self.entries.iter().position(Entry::is_generated_head);
+        let victim = victim.or_else(|| {
+            (!matches!(purpose, PrefixEvictionPurpose::GeneratedCapture)
+                && !self.entries.is_empty())
+            .then_some(0)
+        })?;
+        self.entries.remove(victim).map(|entry| entry.checkpoint)
     }
 }
 
@@ -725,14 +753,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     pub(super) fn evict_prefix_checkpoint(&self) -> bool {
+        self.evict_prefix_for_purpose(PrefixEvictionPurpose::Foreground)
+    }
+
+    fn evict_prefix_for_purpose(&self, purpose: PrefixEvictionPurpose) -> bool {
         let started = Instant::now();
-        let removed = self.prefix_cache.lock().evict();
+        let removed = self.prefix_cache.lock().evict_for(purpose);
         let evicted = removed.is_some();
         if evicted {
             self.metrics
                 .prefix_cache
                 .evictions
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(checkpoint) = &removed {
+            tracing::debug!(
+                checkpoint_authority = ?checkpoint.authority(),
+                completed_tokens = checkpoint.completed_tokens(),
+                input_tokens = checkpoint.full_input().len(),
+                retained_bytes = checkpoint.retained_bytes(),
+                ?purpose,
+                "prefix checkpoint evicted"
+            );
         }
         // Physical/logical release takes place outside the index lock. A clone
         // pinned by a transfer continues to count against the native ledger.
@@ -856,6 +898,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         completed_tokens: usize,
     ) -> Result<()> {
+        let purpose = if completed_tokens == tokens.len()
+            && (tokens.len() as u64) > sequence.product_prompt_tokens
+        {
+            PrefixEvictionPurpose::GeneratedCapture
+        } else {
+            PrefixEvictionPurpose::PromptCapture
+        };
+        tracing::debug!(
+            request_id = %sequence.request_id(),
+            completed_tokens,
+            input_tokens = tokens.len(),
+            original_prompt_tokens = sequence.product_prompt_tokens,
+            ?purpose,
+            "prefix checkpoint capture requested"
+        );
         // Replacing a candidate must not require holding both copies at once.
         let replacement_started = Instant::now();
         let replaced = self
@@ -959,7 +1016,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         })
                         .await
                         .map_err(|error| FerrumError::backend(error.to_string()))?
-        }, || self.evict_prefix_checkpoint()).await?;
+        }, || self.evict_prefix_for_purpose(purpose)).await?;
         match result {
             Some(NativeCheckpointResult::Captured(checkpoint)) => {
                 if checkpoint.completed_tokens() != completed_tokens
@@ -971,6 +1028,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 let publication_started = Instant::now();
+                tracing::debug!(
+                    request_id = %sequence.request_id(),
+                    checkpoint_authority = ?checkpoint.authority(),
+                    completed_tokens,
+                    input_tokens = tokens.len(),
+                    retained_bytes = checkpoint.retained_bytes(),
+                    ?purpose,
+                    "prefix checkpoint captured"
+                );
                 rendezvous::publish(sequence, &checkpoint);
                 let (removed, coalesced) = {
                     let mut index = self.prefix_cache.lock();
@@ -992,6 +1058,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map(SequenceCheckpoint::retained_bytes)
                         .sum(),
                 );
+                for checkpoint in &coalesced {
+                    tracing::debug!(
+                        checkpoint_authority = ?checkpoint.authority(),
+                        completed_tokens = checkpoint.completed_tokens(),
+                        retained_bytes = checkpoint.retained_bytes(),
+                        "prefix checkpoint coalesced"
+                    );
+                }
                 self.reaper.record_checkpoint_cache_timing(
                     CheckpointCacheTimingPhase::IndexPublication,
                     publication_started.elapsed(),
@@ -1005,7 +1079,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 );
                 Ok(())
             }
-            None => Ok(()),
+            None => {
+                tracing::debug!(
+                    request_id = %sequence.request_id(),
+                    completed_tokens,
+                    input_tokens = tokens.len(),
+                    ?purpose,
+                    "prefix checkpoint capture unavailable"
+                );
+                Ok(())
+            }
             Some(NativeCheckpointResult::Failed(reason)) => Err(FerrumError::backend(format!(
                 "capture completion contract failed: {reason:?}"
             ))),
