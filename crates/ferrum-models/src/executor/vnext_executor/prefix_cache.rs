@@ -1009,25 +1009,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     pub(super) async fn restore_prefix(
         &self,
         input: PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
-            return Ok(None);
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
-        let observer = PrefixRestoreObserver::new(
-            self.event_sink.read().clone(),
-            input.request_id.clone(),
+        let source = input.retry.map(|retry| retry.source()).unwrap_or_else(|| {
             if input.checkpoint.is_some() {
                 PrefixRestoreSource::Rendezvous
             } else {
                 PrefixRestoreSource::Index
-            },
+            }
+        });
+        let observer = PrefixRestoreObserver::new(
+            self.event_sink.read().clone(),
+            input.request_id.clone(),
+            source,
         );
         let tokens = input
             .input_tokens
             .iter()
             .map(|token| token.get())
             .collect::<Vec<_>>();
-        let checkpoint = if let Some(source) = input.checkpoint {
+        let checkpoint = if let Some(source) = input
+            .retry
+            .map(|retry| retry.checkpoint().as_ref())
+            .or(input.checkpoint)
+        {
             self.retained_rendezvous_checkpoint(source)
                 .filter(|checkpoint| {
                     tokens.starts_with(checkpoint.token_prefix())
@@ -1049,7 +1056,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .misses
                 .fetch_add(1, Ordering::Relaxed);
             observer.record(PrefixRestoreDecision::NoReusableEntry);
-            return Ok(None);
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
         let (slot, sequence) = self
             .sequences
@@ -1078,12 +1085,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         .map_err(|error| FerrumError::backend(error.to_string()))?;
         let work = ResourceWorkShape::single(span)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        if !observer.capacity_ready(
-            restored_tokens,
-            &self.extend_sequence_with_capacity(&sequence, work)?,
-        ) {
+        let capacity = self.extend_sequence_with_capacity(&sequence, work)?;
+        if !observer.capacity_ready(restored_tokens, &capacity) {
             execution.restore_ready()?;
-            return Ok(None);
+            return Ok(match capacity {
+                VNextExecutionCapacityDecision::Deferred(capacity) => {
+                    PlanRuntimePrefixRestoreOutcome::Deferred(
+                        PlanRuntimePrefixRestoreDeferral::new(
+                            capacity,
+                            self.retain_restore_checkpoint(checkpoint),
+                            source,
+                        ),
+                    )
+                }
+                _ => PlanRuntimePrefixRestoreOutcome::Unavailable,
+            });
         }
         if slot.cancelled.load(Ordering::Acquire) || !sequence.active.load(Ordering::Acquire) {
             return Err(FerrumError::cancelled(
@@ -1120,7 +1136,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 observer.record(PrefixRestoreDecision::NativeRestoreSkipped {
                     candidate_prefix_tokens: restored_tokens,
                 });
-                return Ok(None);
+                return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
             }
             Some(NativeCheckpointResult::Restored(publication)) => publication,
             Some(NativeCheckpointResult::Failed(reason)) => {
@@ -1157,7 +1173,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             self.cache_handle(&sequence, restored_tokens),
             move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
         )
-        .map(Some)
+        .map(PlanRuntimePrefixRestoreOutcome::Restored)
     }
 }
 

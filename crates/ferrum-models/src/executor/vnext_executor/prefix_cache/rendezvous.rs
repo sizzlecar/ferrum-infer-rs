@@ -73,7 +73,44 @@ pub(super) fn select_boundary(
     })
 }
 
+/// An already completed immutable source retained across target capacity
+/// reprobes. It does not keep the producer or an index entry alive.
+struct RetainedRestoreCheckpoint<R: DeviceRuntime> {
+    owner: Arc<()>,
+    checkpoint: SequenceCheckpoint<R>,
+}
+
+impl<R: DeviceRuntime> std::fmt::Debug for RetainedRestoreCheckpoint<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedRestoreCheckpoint")
+            .field("boundary", &self.checkpoint.completed_tokens())
+            .finish()
+    }
+}
+
+impl<R: DeviceRuntime> PrefixCaptureLease for RetainedRestoreCheckpoint<R> {
+    fn boundary(&self) -> usize {
+        self.checkpoint.completed_tokens()
+    }
+    fn status(&self) -> PrefixCaptureStatus {
+        PrefixCaptureStatus::Ready
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    pub(super) fn retain_restore_checkpoint(
+        &self,
+        checkpoint: SequenceCheckpoint<R>,
+    ) -> Arc<dyn PrefixCaptureLease> {
+        Arc::new(RetainedRestoreCheckpoint {
+            owner: Arc::clone(&self.prefix_capture_identity),
+            checkpoint,
+        })
+    }
+
     pub(in super::super) fn rendezvous_boundary(
         &self,
         input: PrefixCaptureBoundary<'_>,
@@ -143,6 +180,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         lease: &dyn PrefixCaptureLease,
     ) -> Option<SequenceCheckpoint<R>> {
+        if let Some(retained) = lease
+            .as_any()
+            .downcast_ref::<RetainedRestoreCheckpoint<R>>()
+        {
+            return Arc::ptr_eq(&retained.owner, &self.prefix_capture_identity)
+                .then(|| retained.checkpoint.clone());
+        }
         let native = lease.as_any().downcast_ref::<NativePrefixCapture<R>>()?;
         if !Arc::ptr_eq(&native.owner, &self.prefix_capture_identity)
             || native.status() != PrefixCaptureStatus::Ready

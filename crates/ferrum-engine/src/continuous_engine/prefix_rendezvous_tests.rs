@@ -2,8 +2,8 @@
 //! Native numerical copy correctness remains a backend/runtime test obligation.
 use super::*;
 use ferrum_interfaces::model_executor::{
-    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput, PrefixCaptureBoundary,
-    PrefixCaptureLease, PrefixCaptureRequest, PrefixCaptureStatus,
+    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCaptureRequest, PrefixCaptureStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,18 +135,18 @@ impl CaptureState {
     pub(super) fn restore(
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         let Some(lease) = input
             .checkpoint
             .and_then(|lease| lease.as_any().downcast_ref::<TestCapture>())
         else {
-            return Ok(None);
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
         assert!(Arc::ptr_eq(&lease.owner, self));
         assert_eq!(lease.status(), PrefixCaptureStatus::Ready);
         assert!(input.input_tokens.starts_with(&lease.prefix));
         if self.skip_restore.load(Ordering::Relaxed) {
-            return Ok(None);
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         }
         let boundary = lease.boundary();
         let target = input.request_id.clone();
@@ -169,7 +169,7 @@ impl CaptureState {
                 Ok(())
             },
         )
-        .map(Some)
+        .map(PlanRuntimePrefixRestoreOutcome::Restored)
     }
 }
 

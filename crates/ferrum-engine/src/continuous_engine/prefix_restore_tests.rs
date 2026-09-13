@@ -2,7 +2,7 @@
 //! by the runtime tests; this fixture detects scheduling and ownership errors.
 use super::*;
 use ferrum_interfaces::model_executor::{
-    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput,
+    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
 };
 
 #[test]
@@ -127,9 +127,9 @@ impl RestoreState {
     pub(super) fn restore(
         self: &Arc<Self>,
         input: PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         if matches!(self.behavior, RestoreBehavior::Miss) {
-            return Ok(None);
+            return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         }
         let request_id = if matches!(self.behavior, RestoreBehavior::ForeignRequest) {
             RequestId::new()
@@ -159,7 +159,7 @@ impl RestoreState {
                 Ok(())
             },
         )
-        .map(Some)
+        .map(PlanRuntimePrefixRestoreOutcome::Restored)
     }
 }
 

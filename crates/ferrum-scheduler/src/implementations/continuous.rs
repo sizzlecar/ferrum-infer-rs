@@ -17,6 +17,7 @@ mod pressure;
 #[cfg(test)]
 mod historical_replay_tests;
 
+pub use prefix_restore::PrefixRestoreCapacityStatus;
 use prefix_restore::PrefixRestoreState;
 use pressure::{
     LogicalWorkFrontier, PressureCandidate, PressureCoordinator, PressureDecision,
@@ -3199,6 +3200,7 @@ impl ContinuousBatchScheduler {
             if scheduled_request_ids.contains(&req.inner.request.id) {
                 continue;
             }
+            prefix_restore::release_orphaned_capacity_hold(req);
             if req.prefix_restore.is_pending() {
                 continue;
             }

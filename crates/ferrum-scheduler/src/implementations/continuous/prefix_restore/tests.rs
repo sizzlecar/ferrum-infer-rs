@@ -366,3 +366,240 @@ async fn prefix_restore_foreign_scheduler_and_invalid_boundary_fail_closed() {
     let foreign = PreparedPrefixRestore::new(id.clone(), 0, 128, ());
     assert!(first.commit_prefix_restored(foreign, 96).is_err());
 }
+
+fn restore_capacity(
+    epoch: u64,
+) -> (
+    ExecutorExecutionCapacityDeferral,
+    Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+) {
+    use ferrum_interfaces::model_executor::{
+        ExecutorAdmissionEpochs, ExecutorExecutionCapacityStage,
+    };
+    use ferrum_interfaces::vnext::{
+        CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+        DeviceCapacityPressure, DeviceCapacityPressureScope,
+    };
+    let availability =
+        vec![
+            CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::PlanDeviceBudget, epoch)
+                .unwrap(),
+        ];
+    let deferred = ExecutorExecutionCapacityDeferral::from_backing_pressure(
+        ExecutorAdmissionEpochs::new(NonZeroU64::new(1).unwrap(), 1, 1),
+        CapacityWaitCondition::from_observation(1, availability.clone()).unwrap(),
+        DeviceCapacityPressure::new(
+            DeviceCapacityPressureScope::PlanBudget,
+            "device.restore".to_owned(),
+            1,
+            1,
+            1,
+            1,
+            1,
+        )
+        .unwrap()
+        .into(),
+        ExecutorExecutionCapacityStage::SequenceExtension,
+    )
+    .unwrap();
+    (deferred, availability)
+}
+
+fn releasers(ids: &[RequestId]) -> ExecutionCapacityReleaseSnapshot {
+    ExecutionCapacityReleaseSnapshot::new(ids.iter().cloned().map(|id| {
+        (
+            id,
+            vec![ferrum_interfaces::vnext::CapacityAvailabilitySource::PlanDeviceBudget],
+        )
+    }))
+}
+
+fn capacity_wake(
+    availability: &[ferrum_interfaces::vnext::CapacityAvailabilityEpoch],
+) -> AdmissionWakeSnapshot<'_> {
+    AdmissionWakeSnapshot::new(
+        AdmissionWakeEpochs::new(NonZeroU64::new(1).unwrap(), 1, 1, 0),
+        availability,
+    )
+}
+
+// Admission does not publish an exact prompt extent. Give the peer real
+// scheduled/retired progress before advertising its releasable state; metadata
+// alone is not proof that this active frontier can run.
+async fn progress_releaser(scheduler: &ContinuousBatchScheduler, peer: &RequestId) {
+    let batch = scheduler.next_batch(hint(1)).await.unwrap();
+    assert_eq!(batch.requests.len(), 1);
+    assert_eq!(&batch.requests[0].request.id, peer);
+    assert_eq!(batch.requests[0].tokens_processed, 0);
+    assert_eq!(batch.requests[0].tokens_to_process, Some(1));
+    assert!(!scheduler.mark_prefill_chunk_processed(peer, 128, 1));
+    let peer = snapshot(scheduler, peer);
+    assert_eq!(peer.inner.state, RequestState::Running);
+    assert_eq!(peer.prefill_tokens, 128);
+    assert_eq!(peer.prefill_chunk_offset, 1);
+}
+
+#[tokio::test]
+async fn prefix_restore_capacity_wait_reprobes_only_after_exact_source_change() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let target = scheduler.submit(request()).await.unwrap();
+    let peer = scheduler.submit(request()).await.unwrap();
+    admit(&scheduler, 2);
+    let prepared = scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .unwrap();
+    progress_releaser(&scheduler, &peer).await;
+    let (deferral, availability) = restore_capacity(1);
+    let release = releasers(&[peer.clone()]);
+    assert!(scheduler
+        .defer_prefix_restore_for_capacity(&prepared, &deferral, &release)
+        .unwrap());
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&prepared, capacity_wake(&availability), &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Pending
+    );
+    assert_eq!(snapshot(&scheduler, &target).prefill_chunk_offset, 0);
+    // A global audit epoch is not a change in the observed source.
+    let audit_only = AdmissionWakeSnapshot::new(
+        AdmissionWakeEpochs::new(NonZeroU64::new(1).unwrap(), 9, 9, 0),
+        &availability,
+    );
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&prepared, audit_only, &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Pending
+    );
+    let (_, changed) = restore_capacity(2);
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&prepared, capacity_wake(&changed), &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Retry
+    );
+    scheduler.commit_prefix_restored(prepared, 120).unwrap();
+    let batch = scheduler.next_batch(hint(256)).await.unwrap();
+    let restored = batch
+        .requests
+        .iter()
+        .find(|work| work.request.id == target)
+        .unwrap();
+    assert_eq!(restored.tokens_processed, 120);
+    assert_eq!(restored.tokens_to_process, Some(8));
+    assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 0);
+}
+
+#[tokio::test]
+async fn prefix_restore_capacity_loses_blocked_releaser_and_chooses_cold_once() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let target = scheduler.submit(request()).await.unwrap();
+    let peer = scheduler.submit(request()).await.unwrap();
+    admit(&scheduler, 2);
+    let prepared = scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .unwrap();
+    progress_releaser(&scheduler, &peer).await;
+    let (deferral, availability) = restore_capacity(1);
+    let release = releasers(&[peer.clone()]);
+    assert!(scheduler
+        .defer_prefix_restore_for_capacity(&prepared, &deferral, &release)
+        .unwrap());
+    let peer_prepared = scheduler
+        .prepare_prefix_restore(&peer, 1, 128)
+        .unwrap()
+        .unwrap();
+    // Both still own releasable physical state, but neither may execute while
+    // reserved. The optional target must not wait for an impossible producer.
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&prepared, capacity_wake(&availability), &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Fallback
+    );
+    drop(prepared);
+    assert!(scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .is_none());
+    let batch = scheduler.next_batch(hint(128)).await.unwrap();
+    assert_eq!(batch.requests.len(), 1);
+    assert_eq!(batch.requests[0].request.id, target);
+    assert_eq!(batch.requests[0].tokens_processed, 0);
+    assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 0);
+    drop(peer_prepared);
+}
+
+#[tokio::test]
+async fn prefix_restore_dropped_capacity_preparation_releases_gate_without_waiting() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let target = scheduler.submit(request()).await.unwrap();
+    let peer = scheduler.submit(request()).await.unwrap();
+    admit(&scheduler, 2);
+    let prepared = scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .unwrap();
+    progress_releaser(&scheduler, &peer).await;
+    let (deferral, _) = restore_capacity(1);
+    assert!(scheduler
+        .defer_prefix_restore_for_capacity(&prepared, &deferral, &releasers(&[peer]))
+        .unwrap());
+    drop(prepared);
+    let batch = scheduler.next_batch(hint(256)).await.unwrap();
+    assert!(batch
+        .requests
+        .iter()
+        .any(|work| work.request.id == target && work.tokens_processed == 0));
+    assert!(snapshot(&scheduler, &target)
+        .execution_capacity_deferral
+        .is_none());
+}
+
+#[tokio::test]
+async fn prefix_restore_stale_wait_cannot_clear_replacement_gate() {
+    let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+    let original = request();
+    let target = scheduler.submit(original.clone()).await.unwrap();
+    let peer = scheduler.submit(request()).await.unwrap();
+    admit(&scheduler, 2);
+    let old = scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .unwrap();
+    progress_releaser(&scheduler, &peer).await;
+    let (deferral, availability) = restore_capacity(1);
+    let release = releasers(&[peer]);
+    assert!(scheduler
+        .defer_prefix_restore_for_capacity(&old, &deferral, &release)
+        .unwrap());
+    assert!(scheduler.cancel(target.clone()).await.unwrap());
+    scheduler.submit(original).await.unwrap();
+    admit(&scheduler, 1);
+    let current = scheduler
+        .prepare_prefix_restore(&target, 0, 128)
+        .unwrap()
+        .unwrap();
+    assert!(scheduler
+        .defer_prefix_restore_for_capacity(&current, &deferral, &release)
+        .unwrap());
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&old, capacity_wake(&availability), &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Stale
+    );
+    scheduler.abandon_prefix_restore_capacity(&old).unwrap();
+    drop(old);
+    assert_eq!(
+        scheduler
+            .resume_prefix_restore_after_capacity(&current, capacity_wake(&availability), &release)
+            .unwrap(),
+        PrefixRestoreCapacityStatus::Pending
+    );
+    scheduler.abandon_prefix_restore_capacity(&current).unwrap();
+    drop(current);
+}

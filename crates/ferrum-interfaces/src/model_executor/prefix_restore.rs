@@ -51,6 +51,52 @@ pub struct PlanRuntimePrefixRestoreInput<'a> {
     /// An authenticated ready source retained by an earlier rendezvous. This
     /// bypasses index lookup, never target admission or native compatibility.
     pub checkpoint: Option<&'a dyn PrefixCaptureLease>,
+    /// Exact retained source from a prior capacity deferral; never reselect the index.
+    pub retry: Option<&'a PlanRuntimePrefixRestoreDeferral>,
+}
+
+/// A capacity deferral submits no restore and retains one immutable source. It
+/// grants neither target admission nor permission to wait without a progress
+/// source. Dropping it releases the optional checkpoint pin.
+#[derive(Debug)]
+pub struct PlanRuntimePrefixRestoreDeferral {
+    capacity: super::ExecutorExecutionCapacityDeferral,
+    checkpoint: Arc<dyn PrefixCaptureLease>,
+    source: PrefixRestoreSource,
+}
+
+impl PlanRuntimePrefixRestoreDeferral {
+    pub fn new(
+        capacity: super::ExecutorExecutionCapacityDeferral,
+        checkpoint: Arc<dyn PrefixCaptureLease>,
+        source: PrefixRestoreSource,
+    ) -> Self {
+        Self {
+            capacity,
+            checkpoint,
+            source,
+        }
+    }
+
+    pub fn capacity(&self) -> &super::ExecutorExecutionCapacityDeferral {
+        &self.capacity
+    }
+
+    pub fn checkpoint(&self) -> &Arc<dyn PrefixCaptureLease> {
+        &self.checkpoint
+    }
+
+    pub fn source(&self) -> PrefixRestoreSource {
+        self.source
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "restore publication or a retained capacity deferral must be handled"]
+pub enum PlanRuntimePrefixRestoreOutcome {
+    Unavailable,
+    Restored(PlanRuntimePrefixRestoreOutput),
+    Deferred(PlanRuntimePrefixRestoreDeferral),
 }
 
 /// Independently restored state whose execution gate remains closed while the

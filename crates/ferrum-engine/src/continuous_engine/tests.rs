@@ -32,6 +32,8 @@ mod stop_boundary_tests;
 
 #[path = "prefix_rendezvous_tests.rs"]
 mod prefix_rendezvous_tests;
+#[path = "prefix_restore_deferred_tests.rs"]
+mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
@@ -86,6 +88,7 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
     prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
+    prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
     rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
 }
 
@@ -105,6 +108,7 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             capacity_wait_registrations: AtomicU64::new(0),
             capacity_signal,
             prefix_restore: None,
+            prefix_retry: None,
             rendezvous: None,
         }
     }
@@ -253,7 +257,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     }
 
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
-        self.prefix_restore.is_some() || self.rendezvous.is_some()
+        self.prefix_restore.is_some() || self.prefix_retry.is_some() || self.rendezvous.is_some()
     }
 
     fn plan_prefix_capture_boundary(
@@ -284,8 +288,11 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     async fn try_restore_plan_runtime_prefix(
         &self,
         input: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutput>> {
+    ) -> Result<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutcome> {
         assert!(self.retained.lock().unwrap().contains(input.request_id));
+        if let Some(state) = &self.prefix_retry {
+            return state.restore(input, self.epochs(), self.wait_condition());
+        }
         if let Some(state) = &self.rendezvous {
             return state.restore(input);
         }
@@ -307,6 +314,23 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         availability.clear();
         availability.push(self.availability());
         Ok(Some(self.epochs()))
+    }
+
+    fn write_execution_capacity_release_sources(
+        &self,
+        preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        if self
+            .prefix_retry
+            .as_ref()
+            .is_some_and(|state| state.release_capable(preemption.request_id()))
+        {
+            sources.push(ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn register_execution_capacity_waiter(
@@ -442,6 +466,9 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             .lock()
             .expect("chunked prefill attempt mutex poisoned")
             .push(chunk);
+        if let Some(state) = &self.prefix_retry {
+            state.computed(request_id, chunk);
+        }
 
         if self.defer_next_prefill.swap(false, Ordering::AcqRel) {
             return Ok(ExecutorPrefillOutcome::Deferred(

@@ -24,7 +24,8 @@ pub use prefix_capture::{
     PrefixCaptureStatus,
 };
 pub use prefix_restore::{
-    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
+    PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
+    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
     PrefixRestoreObservation, PrefixRestoreSource,
 };
 
@@ -3143,8 +3144,8 @@ pub trait ModelExecutor: Send + Sync {
     async fn try_restore_plan_runtime_prefix(
         &self,
         _input: PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
-        Ok(None)
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        Ok(PlanRuntimePrefixRestoreOutcome::Unavailable)
     }
 
     /// Writes the exact availability sources advanced when this request

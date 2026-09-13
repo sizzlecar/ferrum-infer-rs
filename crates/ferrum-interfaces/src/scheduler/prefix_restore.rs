@@ -48,6 +48,14 @@ impl PreparedPrefixRestore {
         self.prompt_tokens
     }
 
+    /// Inspect an implementation proof without consuming its scheduling hold.
+    /// A foreign proof remains an error, never authority for a matching id.
+    pub fn proof_ref<T: Any + Send + Sync>(&self) -> Result<&T> {
+        self.proof.downcast_ref::<T>().ok_or_else(|| {
+            FerrumError::scheduler("Prefix restore preparation belongs to another scheduler type")
+        })
+    }
+
     /// Consume the implementation's private proof. A foreign scheduler or
     /// proof type cannot silently become authority for a matching request id.
     pub fn into_proof<T: Any + Send + Sync>(self) -> Result<T> {

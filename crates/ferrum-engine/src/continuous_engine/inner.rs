@@ -8,7 +8,7 @@ mod completion;
 mod decode;
 mod prefill;
 pub(super) mod prefix_rendezvous;
-mod prefix_restore;
+pub(super) mod prefix_restore;
 
 #[derive(Debug)]
 pub(super) enum PlanRuntimeBatchPrefillDisposition {
@@ -1252,11 +1252,12 @@ impl EngineInner {
         let mut prefix_pressure = false;
         let mut probe = |request: &InferenceRequest| {
             let result = self.probe_executor_prefill_admission(request, capture_trace);
-            if self
+            if (self
                 .config
                 .scheduler
                 .prefix_rendezvous_max_wait_ms
                 .is_some()
+                || !self.prefix_restore_pending.lock().is_empty())
                 && matches!(&result.outcome, AdmissionProbeOutcome::Deferred(_))
                 && result.maintenance.is_none()
             {

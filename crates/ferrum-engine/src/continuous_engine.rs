@@ -1438,6 +1438,7 @@ struct EngineInner {
     dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
     execution_readiness_waiters: ExecutionReadinessWaitRegistry,
     prefix_rendezvous: Mutex<Vec<inner::prefix_rendezvous::PrefixRendezvous>>,
+    prefix_restore_pending: Mutex<HashMap<RequestId, inner::prefix_restore::PendingPrefixRestore>>,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -2862,6 +2863,7 @@ impl ContinuousBatchEngine {
                 dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
                 execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
                 prefix_rendezvous: Mutex::new(Vec::new()),
+                prefix_restore_pending: Mutex::new(HashMap::new()),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -3291,6 +3293,8 @@ impl InferenceEngine for ContinuousBatchEngine {
         // resource shutdown. No pending dependency survives engine shutdown.
         let prefix_cohorts = std::mem::take(&mut *self.inner.prefix_rendezvous.lock());
         drop(prefix_cohorts);
+        let prefix_restores = std::mem::take(&mut *self.inner.prefix_restore_pending.lock());
+        drop(prefix_restores);
 
         let mut trace_journals = Vec::with_capacity(2);
         if let Some(journal) = self.inner.profile_trace_jsonl.clone() {

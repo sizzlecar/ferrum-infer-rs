@@ -28,10 +28,10 @@ use ferrum_interfaces::model_executor::{
     MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
     PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
     PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
-    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreInput,
-    PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput,
-    PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan,
-    PrefixCaptureRequest,
+    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreDeferral,
+    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
+    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary,
+    PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -9721,7 +9721,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     async fn try_restore_plan_runtime_prefix(
         &self,
         input: PlanRuntimePrefixRestoreInput<'_>,
-    ) -> Result<Option<PlanRuntimePrefixRestoreOutput>> {
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
         self.restore_prefix(input).await
     }
 

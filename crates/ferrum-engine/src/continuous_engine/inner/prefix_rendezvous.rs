@@ -210,6 +210,7 @@ impl EngineInner {
     /// materialization preserves sharing. Call only outside scheduler/capacity
     /// locks; releasing a pin grants no admission or physical allocation.
     pub(super) fn release_prefix_rendezvous_for_capacity_pressure(&self) {
+        self.release_pending_prefix_restores_for_capacity_pressure();
         if self
             .config
             .scheduler
