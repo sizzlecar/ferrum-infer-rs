@@ -17,6 +17,9 @@ mod extension_tests;
 #[path = "eviction_tests.rs"]
 mod eviction_tests;
 
+#[path = "active_coverage_tests.rs"]
+mod active_coverage_tests;
+
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};

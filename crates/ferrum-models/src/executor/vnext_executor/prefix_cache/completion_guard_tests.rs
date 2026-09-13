@@ -56,6 +56,73 @@ fn assert_aborted(sequence: &VNextSequence<TestRuntime>) {
     assert!(sequence.session.try_complete().is_err());
 }
 
+#[test]
+fn active_prefix_snapshot_uses_original_inputs_and_filters_terminal_incarnations() {
+    let (_current_fixture, current_root, current) = completion_sequence("coverage-current");
+    let (_peer_fixture, peer_root, mut peer) = completion_sequence("coverage-peer");
+    // Same public request id is insufficient to exclude another incarnation.
+    let request = VNextRequestRoot::bind_initial(
+        current.request_id().clone(),
+        peer.session.resources().request_id(),
+        &peer.session,
+    )
+    .unwrap();
+    Arc::get_mut(&mut peer).unwrap().request = request;
+    *peer.tokens.lock() = vec![2, 90, 91];
+    let registry = Mutex::new(VNextSequenceRegistry::default());
+    registry
+        .lock()
+        .active
+        .insert(current.cache_id.clone(), Arc::clone(&current));
+    let slot = VNextPrefillSlot::new(
+        peer.request_id().clone(),
+        ResourceWorkShape::single(resource_support::one_token_span()).unwrap(),
+    );
+    registry
+        .lock()
+        .prefills
+        .insert(peer.request_id().clone(), Arc::clone(&slot));
+    assert!(active_prefix_inputs(&registry, &current).is_empty()); // Probing
+    *slot.state.lock() = VNextPrefillSlotState::Ready(Arc::clone(&peer));
+    let peer_owners = Arc::strong_count(&peer);
+    let input = active_prefix_inputs(&registry, &current);
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0].tokens, vec![2]); // Executed generation is not the prompt.
+    assert_eq!(Arc::strong_count(&peer), peer_owners);
+    *slot.state.lock() = VNextPrefillSlotState::Executing(Arc::clone(&peer));
+    assert_eq!(active_prefix_inputs(&registry, &current).len(), 1);
+    slot.cancelled.store(true, Ordering::Release);
+    assert!(active_prefix_inputs(&registry, &current).is_empty());
+    slot.cancelled.store(false, Ordering::Release);
+    *slot.state.lock() = VNextPrefillSlotState::Terminal;
+    assert!(active_prefix_inputs(&registry, &current).is_empty());
+    registry
+        .lock()
+        .active
+        .insert(peer.cache_id.clone(), Arc::clone(&peer));
+    assert_eq!(active_prefix_inputs(&registry, &current).len(), 1);
+    peer.active.store(false, Ordering::Release);
+    assert!(active_prefix_inputs(&registry, &current).is_empty());
+    registry.lock().active.remove(&peer.cache_id);
+    Arc::get_mut(&mut peer).unwrap().request_origin = ExecutorRequestOrigin::Diagnostic;
+    peer.active.store(true, Ordering::Release);
+    registry
+        .lock()
+        .active
+        .insert(peer.cache_id.clone(), Arc::clone(&peer));
+    assert!(active_prefix_inputs(&registry, &current).is_empty());
+    drop(registry);
+    drop(slot);
+    current.abort();
+    peer.abort();
+    drop(current);
+    drop(peer);
+    close_plan_runtime(current_root);
+    close_plan_runtime(peer_root);
+    // The retained result contains no sequence/slot/checkpoint owner.
+    assert_eq!(input[0].tokens, vec![2]);
+}
+
 #[tokio::test]
 async fn dropping_completion_waiting_for_operation_cancels_a_still_retained_sequence() {
     let (_fixture, root, sequence) = completion_sequence("completion-waiting");

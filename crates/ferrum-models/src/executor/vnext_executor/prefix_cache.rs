@@ -4,6 +4,8 @@
 
 use super::*;
 use std::collections::VecDeque;
+mod active_coverage;
+use active_coverage::{active_prefix_inputs, CaptureEviction};
 pub(super) mod rendezvous;
 mod restore_observation;
 use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
@@ -28,6 +30,7 @@ pub(super) struct PrefixCacheMetrics {
     coalesced_entries: AtomicU64,
     coalesced_bytes: AtomicU64,
     saved_prefill_tokens: AtomicU64,
+    capture_active_coverage_skips: AtomicU64,
 }
 
 impl PrefixCacheMetrics {
@@ -61,6 +64,7 @@ impl PrefixCacheMetrics {
             &self.coalesced_entries,
             &self.coalesced_bytes,
             &self.saved_prefill_tokens,
+            &self.capture_active_coverage_skips,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -77,6 +81,19 @@ struct Entry<C> {
 }
 
 impl<C> Entry<C> {
+    fn matches_restore(
+        &self,
+        input: &[u32],
+        entire_input: bool,
+        permits_suffix: &impl Fn(usize) -> bool,
+    ) -> bool {
+        !self.prefix.is_empty()
+            && self.prefix.len() < input.len()
+            && input.starts_with(&self.prefix)
+            && (!entire_input || self.input.as_ref() == input)
+            && permits_suffix(self.prefix.len())
+    }
+
     fn is_generated_head(&self) -> bool {
         self.original_prompt().is_some_and(|prompt| {
             self.prefix.len() == self.input.len() && self.input.len() > prompt.len()
@@ -143,6 +160,8 @@ impl<C> PrefixIndex<C> {
             "coalesced_bytes": metrics.coalesced_bytes.load(Ordering::Relaxed),
             "coalescing_scope": "growth-chain-removed-index-owners; bytes are aligned extents, not necessarily reclaimed backing or released in-flight pins",
             "saved_prefill_tokens": metrics.saved_prefill_tokens.load(Ordering::Relaxed),
+            "capture_active_coverage_skips": metrics.capture_active_coverage_skips.load(Ordering::Relaxed),
+            "capture_active_coverage_skips_scope": "optional-capture-stopped-because-every-eligible-victim-protects-a-deepest-active-input-prefix",
         });
         let fields = snapshot
             .as_object_mut()
@@ -338,15 +357,27 @@ impl<C> PrefixIndex<C> {
     }
 
     fn evict_for(&mut self, purpose: PrefixEvictionPurpose) -> Option<C> {
+        self.evict_unprotected(purpose, &BTreeSet::new())
+    }
+
+    fn evict_unprotected(
+        &mut self,
+        purpose: PrefixEvictionPurpose,
+        protected: &BTreeSet<usize>,
+    ) -> Option<C> {
         // A later input can preserve the entire original prompt while changing
         // generated tokens, for example when structured output is rendered
         // again. Under pressure, retain that repeat-capable input before an
         // opportunistic generated head. LRU still orders each class.
-        let victim = self.entries.iter().position(Entry::is_generated_head);
+        let victim = self.entries.iter().enumerate().find_map(|(index, entry)| {
+            (!protected.contains(&index) && entry.is_generated_head()).then_some(index)
+        });
         let victim = victim.or_else(|| {
-            (!matches!(purpose, PrefixEvictionPurpose::GeneratedCapture)
-                && !self.entries.is_empty())
-            .then_some(0)
+            if matches!(purpose, PrefixEvictionPurpose::GeneratedCapture) {
+                None
+            } else {
+                (0..self.entries.len()).find(|index| !protected.contains(index))
+            }
         })?;
         self.entries.remove(victim).map(|entry| entry.checkpoint)
     }
@@ -363,13 +394,7 @@ impl<C: Clone> PrefixIndex<C> {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
-                !entry.prefix.is_empty()
-                    && entry.prefix.len() < input.len()
-                    && input.starts_with(&entry.prefix)
-                    && (!entire_input || entry.input.as_ref() == input)
-                    && permits_suffix(entry.prefix.len())
-            })
+            .filter(|(_, entry)| entry.matches_restore(input, entire_input, &permits_suffix))
             .max_by_key(|(_, entry)| entry.prefix.len())
             .map(|(index, _)| index)?;
         let entry = self.entries.remove(index).expect("selected entry");
@@ -759,6 +784,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn evict_prefix_for_purpose(&self, purpose: PrefixEvictionPurpose) -> bool {
         let started = Instant::now();
         let removed = self.prefix_cache.lock().evict_for(purpose);
+        self.finish_prefix_eviction(removed, purpose, started)
+    }
+
+    fn finish_prefix_eviction(
+        &self,
+        removed: Option<SequenceCheckpoint<R>>,
+        purpose: PrefixEvictionPurpose,
+        started: Instant,
+    ) -> bool {
         let evicted = removed.is_some();
         if evicted {
             self.metrics
@@ -784,6 +818,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             started.elapsed(),
         );
         evicted
+    }
+
+    fn evict_prefix_for_capture(
+        &self,
+        purpose: PrefixEvictionPurpose,
+        sequence: &Arc<VNextSequence<R>>,
+        completed_tokens: usize,
+    ) -> bool {
+        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+            return false;
+        };
+        // Registry/slot/token guards and temporary sequence owners are all
+        // released before taking the index lock or dropping a checkpoint.
+        let inputs = active_prefix_inputs(&self.sequences, sequence);
+        let started = Instant::now();
+        let decision = self
+            .prefix_cache
+            .lock()
+            .evict_with_active_coverage(purpose, &inputs, layout);
+        match decision {
+            CaptureEviction::Evicted(checkpoint) => {
+                self.finish_prefix_eviction(Some(checkpoint), purpose, started)
+            }
+            CaptureEviction::Protected(coverage) => {
+                self.metrics
+                    .prefix_cache
+                    .capture_active_coverage_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    request_id = %sequence.request_id(),
+                    completed_tokens,
+                    ?purpose,
+                    protected_prefixes = ?coverage.iter()
+                        .map(|prefix| (&prefix.request_id, prefix.prefix_tokens))
+                        .collect::<Vec<_>>(),
+                    outcome = "active_prefix_coverage_protected",
+                    "prefix checkpoint capture eviction skipped"
+                );
+                false
+            }
+            CaptureEviction::Unavailable => false,
+        }
     }
 
     pub(super) fn prefix_checkpoint_may_block(&self, wait: &CapacityWaitCondition) -> bool {
@@ -1019,7 +1095,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         })
                         .await
                         .map_err(|error| FerrumError::backend(error.to_string()))?
-        }, || self.evict_prefix_for_purpose(purpose)).await?;
+        }, || self.evict_prefix_for_capture(purpose, sequence, completed_tokens)).await?;
         match result {
             Some(NativeCheckpointResult::Captured(checkpoint)) => {
                 if checkpoint.completed_tokens() != completed_tokens
