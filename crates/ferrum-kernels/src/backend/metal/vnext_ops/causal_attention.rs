@@ -1952,7 +1952,9 @@ fn uses_grouped_decode(params: &CausalAttentionParams) -> bool {
     };
     params.tokens == 1
         && matches!(params.head_dim, 128 | 256)
-        && matches!(query_heads_per_kv_head, 4 | TILED_PREFILL_QUERY_TILE)
+        // Six 256-dimensional heads use the eight-row tile with two masked rows.
+        && (matches!(query_heads_per_kv_head, 4 | TILED_PREFILL_QUERY_TILE)
+            || (query_heads_per_kv_head == 6 && params.head_dim == 256))
         && u64::from(params.position_start).saturating_add(u64::from(params.tokens))
             >= GROUPED_DECODE_MINIMUM_CONTEXT
         && page_supports_eight_token_matrix(params)

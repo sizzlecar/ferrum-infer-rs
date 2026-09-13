@@ -8,16 +8,15 @@ use std::{mem::size_of, ops::Range};
 #[path = "checkpoint_copy_test_support.rs"]
 mod native;
 
-const QUERY_HEADS: usize = 16;
 const KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 256;
-const QUERY_WIDTH: usize = QUERY_HEADS * HEAD_DIM * 2;
 const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
 const KV_BYTES_PER_TOKEN: usize = 2 * KV_WIDTH * size_of::<f16>();
 
 #[test]
 fn private_native_checkpoint_preserves_causal_state_and_continuation_bits() {
     verify_checkpoint_continuation(
+        16,
         &[0..15, 15..17],
         &[17..25, 25..34, 34..35],
         AttentionDispatchKind::DirectDecode,
@@ -31,6 +30,17 @@ fn private_native_checkpoint_preserves_grouped_decode_across_partition_stride_an
     // The production dispatch must use grouped decode across the partition
     // stride; a direct-decode fallback cannot satisfy this fixture.
     verify_checkpoint_continuation(
+        16,
+        &[0..1022, 1022..1023],
+        &[1023..1024, 1024..1025, 1025..1033, 1033..1034],
+        AttentionDispatchKind::GroupedDecode,
+    );
+}
+
+#[test]
+fn ratio_six_private_checkpoint_preserves_grouped_decode_across_partition_and_page_boundary() {
+    verify_checkpoint_continuation(
+        24,
         &[0..1022, 1022..1023],
         &[1023..1024, 1024..1025, 1025..1033, 1033..1034],
         AttentionDispatchKind::GroupedDecode,
@@ -38,18 +48,21 @@ fn private_native_checkpoint_preserves_grouped_decode_across_partition_stride_an
 }
 
 fn verify_checkpoint_continuation(
+    query_heads: usize,
     prefix: &[Range<usize>],
     suffix: &[Range<usize>],
     expected_decode_kind: AttentionDispatchKind,
 ) {
     let prefix_tokens = prefix.last().unwrap().end;
     let total = suffix.last().unwrap().end;
+    let query_width = query_heads * HEAD_DIM * 2;
     metal::objc::rc::autoreleasepool(|| {
         let device = Device::system_default().expect("checkpoint continuation requires Metal");
         let queue = device.new_command_queue();
         let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
         let inputs = Inputs {
-            query: half_values(total * QUERY_WIDTH, 0.013, 0.31),
+            query_heads,
+            query: half_values(total * query_width, 0.013, 0.31),
             key: half_values(total * KV_WIDTH, 0.017, 0.27),
             value: half_values(total * KV_WIDTH, 0.019, 0.22),
             query_norm: half_values(HEAD_DIM, 0.019, 0.94),
@@ -58,7 +71,9 @@ fn verify_checkpoint_continuation(
         };
         // Each pair has one participant, the same token spans, page ABI,
         // packing (none), and production attention-dispatch selection.
-        eprintln!("causal native continuation: prefix={prefix:?}, suffix={suffix:?}, participants=1, projected-input ABI, Hq=16 Hkv=4 D=256 RoPE=64/interleaved, page_bytes={VNEXT_KV_PAGE_BYTES}");
+        eprintln!(
+            "causal native continuation: prefix={prefix:?}, suffix={suffix:?}, participants=1, projected-input ABI, Hq={query_heads} Hkv=4 D=256 RoPE=64/interleaved, page_bytes={VNEXT_KV_PAGE_BYTES}"
+        );
         let source = private_pages(&device, &queue, total);
         let cold = private_pages(&device, &queue, total);
         let restored = private_pages(&device, &queue, total);
@@ -126,6 +141,7 @@ fn verify_checkpoint_continuation(
 }
 
 struct Inputs {
+    query_heads: usize,
     query: Vec<f16>,
     key: Vec<f16>,
     value: Vec<f16>,
@@ -143,6 +159,7 @@ impl Inputs {
         pages: &[Buffer],
         spans: &[Range<usize>],
     ) -> Vec<u16> {
+        let query_width = self.query_heads * HEAD_DIM * 2;
         spans
             .iter()
             .flat_map(|span| {
@@ -151,11 +168,11 @@ impl Inputs {
                     page_count: pages.len() as u32,
                     position_start: span.start as u32,
                     tokens: span.len() as u32,
-                    query_heads: QUERY_HEADS as u32,
+                    query_heads: self.query_heads as u32,
                     key_value_heads: KV_HEADS as u32,
                     head_dim: HEAD_DIM as u32,
                     rope_dim: 64,
-                    query_projection_stride: QUERY_WIDTH as u32,
+                    query_projection_stride: query_width as u32,
                     query_head_stride: (2 * HEAD_DIM) as u32,
                     kv_projection_stride: KV_WIDTH as u32,
                     output_gate: 1,
@@ -187,7 +204,7 @@ impl Inputs {
                     queue,
                     pipelines,
                     SegmentInputs {
-                        query_raw: &self.query[span.start * QUERY_WIDTH..span.end * QUERY_WIDTH],
+                        query_raw: &self.query[span.start * query_width..span.end * query_width],
                         key_raw: &self.key[span.start * KV_WIDTH..span.end * KV_WIDTH],
                         value_raw: &self.value[span.start * KV_WIDTH..span.end * KV_WIDTH],
                     },

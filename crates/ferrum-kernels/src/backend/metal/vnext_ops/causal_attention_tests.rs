@@ -296,6 +296,25 @@ fn grouped_decode_head256_matches_cpu_at_partition_limit_and_long_context_on_rea
 }
 
 #[test]
+fn ratio_six_head256_decode_matches_direct_general_and_cpu_on_real_metal() {
+    for (context, expected) in [
+        (255, AttentionDispatchKind::DirectDecode),
+        (257, AttentionDispatchKind::GroupedDecode),
+        (1025, AttentionDispatchKind::GroupedDecode),
+    ] {
+        run_decode_cpu_case(
+            "head256 ratio6 gated decode with two padded query rows",
+            256,
+            24,
+            4,
+            true,
+            context,
+            expected,
+        );
+    }
+}
+
+#[test]
 fn grouped_decode_head128_matches_cpu_at_long_context_on_real_metal() {
     run_decode_cpu_case(
         "head128 ratio8 long grouped decode",
@@ -320,6 +339,42 @@ fn grouped_decode_dispatch_grows_to_the_simd_reduction_capacity() {
     let mut params = dispatch_test_params(1, 256);
     params.position_start = u32::MAX;
     assert_eq!(grouped_decode_partitions(&params), SIMD_THREADS);
+}
+
+#[test]
+fn ratio_six_decode_dispatch_preserves_context_and_eight_row_capacity_limits() {
+    let mut params = dispatch_test_params(1, 256);
+    params.query_heads = 24;
+    params.query_projection_stride = 2 * params.query_heads * params.head_dim;
+    for (context, expected, partitions) in [
+        (255, AttentionDispatchKind::DirectDecode, 1),
+        (256, AttentionDispatchKind::GroupedDecode, 8),
+        (257, AttentionDispatchKind::GroupedDecode, 9),
+        (1025, AttentionDispatchKind::GroupedDecode, 32),
+    ] {
+        params.position_start = context - 1;
+        let plan = attention_dispatch_plan(&params);
+        assert_eq!(plan.kind, expected, "context={context}");
+        assert_eq!(plan.threadgroups[0], partitions, "context={context}");
+    }
+    // The shader owns eight query rows; more heads must retain direct decode.
+    params.query_heads = 36;
+    params.query_projection_stride = 2 * params.query_heads * params.head_dim;
+    assert_eq!(
+        attention_dispatch_plan(&params).kind,
+        AttentionDispatchKind::DirectDecode,
+    );
+    // This candidate adds the 256-dimensional shape only.
+    params.query_heads = 24;
+    params.head_dim = 128;
+    params.rope_dim = params.head_dim;
+    params.query_projection_stride = 2 * params.query_heads * params.head_dim;
+    params.query_head_stride = 2 * params.head_dim;
+    params.kv_projection_stride = params.key_value_heads * params.head_dim;
+    assert_eq!(
+        attention_dispatch_plan(&params).kind,
+        AttentionDispatchKind::DirectDecode,
+    );
 }
 
 #[test]
@@ -703,6 +758,22 @@ fn gqa_tiled_prefill_head256_matches_general_and_cpu_across_129_keys_on_real_met
         8,
         AttentionDispatchKind::GqaTiledPrefill,
     );
+}
+
+#[test]
+fn ratio_six_head256_prefill_matches_general_and_cpu_across_page_and_query_tails_on_real_metal() {
+    for (prefix, tokens) in [(62, 9), (512, 2)] {
+        run_prefill_cpu_case(
+            "head256 ratio6 gated prefill with three head pairs per KV head",
+            256,
+            24,
+            4,
+            true,
+            prefix,
+            tokens,
+            AttentionDispatchKind::GqaTiledPrefill,
+        );
+    }
 }
 
 struct ValidatedPrefillCase {
