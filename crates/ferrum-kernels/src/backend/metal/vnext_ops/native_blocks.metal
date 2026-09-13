@@ -76,6 +76,80 @@ static inline float native_block_value(device const uchar * b, uint i, uint form
     return NAN;
 }
 
+// Decode one aligned 16-value fragment directly into the unchanged K x N tile.
+// A fragment stays within one scale group for these four native formats. Keep
+// scale products and IQ3 signs in the scalar decoder's FP32 evaluation order.
+// Byte loads also support the two-byte-aligned 110- and 18-byte block layouts.
+static inline void native_gemm_fragment16(
+    device const uchar * b, uint first, uint format, threadgroup float * tile) {
+    switch (format) {
+        case 11: {
+            const uint group = first / 16;
+            const uint lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;
+            const uint hi = (b[104 + group % 4] >> (2 * (group / 4))) & 3;
+            const float scale = native_half(b, 108) * float(int(lo | (hi << 4)) - 32);
+            const uint q_base = 32 + (first / 128) * 32 + first % 32;
+            const uint q_shift = 2 * ((first % 128) / 32);
+            const uint h_base = first % 32;
+            const uint h_mask = 1 << (first / 32);
+            for (uint j = 0; j < 16; ++j) {
+                const uint q = (b[q_base + j] >> q_shift) & 3;
+                const int offset = (b[h_base + j] & h_mask) ? 0 : 4;
+                tile[j * 64] = scale * float(int(q) - offset);
+            }
+            return;
+        }
+        case 20:
+        case 23: {
+            float scale = native_half(b, 0);
+            uint q_base = 2;
+            if (format == 23) {
+                const uint group = first / 32;
+                const uint scales_h = uint(b[2]) | (uint(b[3]) << 8);
+                const uint lo = (b[4 + group / 2] >> (4 * (group % 2))) & 15;
+                const uint hi = (scales_h >> (2 * group)) & 3;
+                scale = scale * float(int(lo | (hi << 4)) - 32);
+                q_base = 8 + group * 16;
+            }
+            const uint shift = 4 * ((first % 32) / 16);
+            for (uint j = 0; j < 16; j += 4) {
+                const uint packed = uint(b[q_base + j])
+                    | (uint(b[q_base + j + 1]) << 8)
+                    | (uint(b[q_base + j + 2]) << 16)
+                    | (uint(b[q_base + j + 3]) << 24);
+                for (uint component = 0; component < 4; ++component) {
+                    const uint q = (packed >> (8 * component + shift)) & 15;
+                    tile[(j + component) * 64] = scale * float(iq4_nl_values[q]);
+                }
+            }
+            return;
+        }
+        case 21: {
+            const uint group = first / 32;
+            const uint packed_high = b[66 + group];
+            const uint scale_bits = 1 + 2 * ((b[106 + group / 2] >> (4 * (group % 2))) & 15);
+            const float scale = native_half(b, 0) * float(scale_bits);
+            for (uint j = 0; j < 16; j += 4) {
+                const uint i = first + j;
+                const uint lo = b[2 + i / 4];
+                const uint hi = (packed_high >> ((i % 32) / 4)) & 1;
+                const uint grid = iq3_s_grid[lo | (hi << 8)];
+                const uint signs = b[74 + i / 8];
+                for (uint component = 0; component < 4; ++component) {
+                    const float q = float((grid >> (8 * component)) & 255);
+                    const float sign = (signs & (1 << ((i + component) % 8))) ? -1.0f : 1.0f;
+                    tile[(j + component) * 64] = (scale * q) * sign;
+                }
+            }
+            return;
+        }
+        default:
+            for (uint j = 0; j < 16; ++j) {
+                tile[j * 64] = native_block_value(b, first + j, format);
+            }
+    }
+}
+
 template<typename T>
 static inline void native_linear(
     device const T * input, device const uchar * weight, device T * output,
@@ -162,22 +236,28 @@ kernel void vnext_native_block_gemm_f16_f32(
             input_tile[i] = row < ulong(p.rows) && column < ulong(p.in_features)
                 ? float(input[row * ulong(p.in_features) + column]) : 0.0f;
         }
-        // The physical weight is output-major; the shared tile is K x N.
-        // The decoder supports both 32-value and 256-value native blocks.
-        for (uint i = thread_index; i < 32 * 64; i += 128) {
-            // Neighboring lanes decode consecutive K values of one source row.
-            const uint local_row = i / 32;
-            const uint local_column = i % 32;
-            const ulong row = output_start + local_row;
-            const ulong column = k + local_column;
-            float value = 0.0f;
-            if (row < ulong(p.out_features) && column < ulong(p.in_features)) {
-                const ulong offset = (row * blocks_per_row + block_index)
-                    * ulong(block.bytes);
-                value = native_block_value(
-                    weight + offset, in_block_base + local_column, block.format);
+        // Two threads own the two 16-value fragments of each physical row.
+        // Reuse decoded headers within a thread while keeping the K x N tile.
+        const uint local_row = thread_index / 2;
+        const uint local_column = (thread_index % 2) * 16;
+        const ulong row = output_start + local_row;
+        const ulong column = k + local_column;
+        threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
+        if (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features)) {
+            const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+            native_gemm_fragment16(weight + offset, in_block_base + local_column,
+                block.format, weight_fragment);
+        } else {
+            // Keep every consumed tile element initialized, including tails.
+            for (uint j = 0; j < 16; ++j) {
+                float value = 0.0f;
+                if (row < ulong(p.out_features) && column + j < ulong(p.in_features)) {
+                    const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+                    value = native_block_value(weight + offset,
+                        in_block_base + local_column + j, block.format);
+                }
+                weight_fragment[j * 64] = value;
             }
-            weight_tile[local_column * 64 + local_row] = value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

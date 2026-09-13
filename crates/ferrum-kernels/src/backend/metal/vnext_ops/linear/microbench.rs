@@ -548,8 +548,70 @@ fn native_quantized_prefill_dispatch_microbench() {
                 output: output_width,
                 format,
             };
-            measure_native_prefill_shape(&device, &queue, &pipelines, shape, row_counts);
+            measure_native_prefill_shape(
+                &device,
+                &queue,
+                &pipelines,
+                shape,
+                row_counts,
+                &[Dispatch::NativeGemv, Dispatch::NativeGemm],
+            );
         }
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_quantized_prefill_fragment_dispatch_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    // Use this identical fixture in separately frozen baseline and candidate
+    // builds. Twelve M1024 cases cover both FFN directions and native GDN
+    // projections without repeating the expensive large-M GEMV control.
+    // Each case runs one oracle/warmup dispatch and two measured
+    // single-dispatch commands, all validated.
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+    ] {
+        for (input, output) in [(5120, 17408), (17408, 5120)] {
+            measure_native_prefill_shape(
+                &device,
+                &queue,
+                &pipelines,
+                Shape {
+                    name: "native_prefill_fragment",
+                    input,
+                    output,
+                    format,
+                },
+                &[1024],
+                &[Dispatch::NativeGemm],
+            );
+        }
+    }
+    for (format, input, output) in [
+        (GgufBlockFormat::Iq4Xs, 5120, 10240),
+        (GgufBlockFormat::Iq4Xs, 5120, 6144),
+        (GgufBlockFormat::Iq4Xs, 6144, 5120),
+        (GgufBlockFormat::Iq4Nl, 5120, 10240),
+    ] {
+        measure_native_prefill_shape(
+            &device,
+            &queue,
+            &pipelines,
+            Shape {
+                name: "native_gated_delta_fragment",
+                input,
+                output,
+                format,
+            },
+            &[1024],
+            &[Dispatch::NativeGemm],
+        );
     }
 }
 
@@ -599,6 +661,7 @@ fn native_quantized_prefill_small_shape_microbench() {
                 format,
             },
             &[rows],
+            &[Dispatch::NativeGemv, Dispatch::NativeGemm],
         );
     }
 }
@@ -609,6 +672,7 @@ fn measure_native_prefill_shape(
     pipelines: &MetalLinearPipelines,
     shape: Shape,
     row_counts: &[usize],
+    variants: &[Dispatch],
 ) {
     let weight_bytes = weights(shape);
     let weight_buffers = [buffer(device, &weight_bytes)];
@@ -627,14 +691,14 @@ fn measure_native_prefill_shape(
             weights: &weight_buffers,
             output: &output,
         };
-        let samples = measure_case_with_rounds(
-            &case,
-            &[Dispatch::NativeGemv, Dispatch::NativeGemm],
-            &reference,
-            0,
-            2,
-            1,
-        );
+        let samples = measure_case_with_rounds(&case, variants, &reference, 0, 2, 1);
+        // Hash the validated final output outside every timed GPU command.
+        // F16 -> F32 is exact for these finite outputs, so the digest retains
+        // all output bits (including signed zero) for cross-build comparison.
+        let mut output_digest = Sha256::new();
+        for value in read_linear_values(&output, reference.len(), ElementType::F16) {
+            output_digest.update(value.to_bits().to_le_bytes());
+        }
         println!(
             "{}",
             serde_json::json!({
@@ -647,11 +711,20 @@ fn measure_native_prefill_shape(
                 "rotating_weight_allocations": 1,
                 "gpu_buffer_bytes": weight_buffers[0].length() + input.length() + output.length(),
                 "correctness_warmup_dispatches_per_variant": 1,
-                "additional_warmup_rounds": 0, "measured_paired_rounds": 2,
+                "additional_warmup_rounds": 0, "measured_rounds": 2,
+                "measured_paired_rounds": (variants.len() == 2).then_some(2),
                 "dispatches_per_command": 1,
                 "production_dispatch": format!("{:?}", pipelines.linear_pipeline(physical(shape.format), rows as u32, shape.output).1),
                 "oracle": "full_output_sparse_input_cpu_block_decode_each_variant_independently",
                 "correctness": "poison_before_each_command; F16 tolerance, not cross-variant bitwise equality",
+                "final_output_dispatch": samples.last().map(|sample| &sample["dispatch"]),
+                "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
+                "output_elements": reference.len(),
+                "comparison": if variants.len() == 1 {
+                    "same_fixture_in_separately_frozen_baseline_and_candidate_builds"
+                } else {
+                    "dispatch_variants_in_the_same_process_with_rotating_round_order"
+                },
                 "scope": "synthetic_native_projection_not_full_model_or_admission",
                 "timing_scope": "GPU completed-command interval; host encode and submit/wait reported separately, never added to GPU time",
                 "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
