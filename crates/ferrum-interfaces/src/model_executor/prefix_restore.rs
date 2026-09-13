@@ -4,6 +4,43 @@ use super::{KvCacheHandle, PlanRuntimePrefillAuthority, PrefixCaptureLease};
 use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 use std::{fmt, sync::Arc};
 
+/// Observation only: neither an index hit nor a completed copy authorizes use
+/// of restored state. `Restored` is emitted after publication acknowledgement.
+#[derive(Debug, serde::Serialize)]
+pub struct PrefixRestoreObservation<'a> {
+    pub request_id: &'a RequestId,
+    pub source: PrefixRestoreSource,
+    pub decision: PrefixRestoreDecision<'a>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixRestoreSource {
+    Index,
+    Rendezvous,
+}
+
+/// Contains lengths and typed resource evidence, never prompt/token contents.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PrefixRestoreDecision<'a> {
+    NoReusableEntry,
+    SequenceCapacityNotReady {
+        candidate_prefix_tokens: usize,
+        capacity: &'a super::ExecutorExecutionCapacityDeferral,
+    },
+    RequestStateNotReady {
+        candidate_prefix_tokens: usize,
+        request_state: &'a super::ExecutorRequestStateDeferral,
+    },
+    NativeRestoreSkipped {
+        candidate_prefix_tokens: usize,
+    },
+    Restored {
+        candidate_prefix_tokens: usize,
+    },
+}
+
 /// The exact input already admitted by the plan runtime. Restoration does not
 /// replace admission or authorize a different request incarnation.
 #[derive(Debug, Clone, Copy)]

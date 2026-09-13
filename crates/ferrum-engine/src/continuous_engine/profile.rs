@@ -1705,6 +1705,71 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         self.enqueue_profile_batch(vec![event])
     }
 
+    fn records_prefix_restore_decisions(&self) -> bool {
+        true
+    }
+
+    fn record_prefix_restore_decision(
+        &self,
+        observation: &ferrum_interfaces::model_executor::PrefixRestoreObservation<'_>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let timestamp = chrono::Utc::now();
+        let timestamp_nanos = timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000);
+        let decision = serde_json::to_value(&observation.decision)
+            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
+        let mut shape = BTreeMap::from([
+            ("outcome".to_string(), decision["outcome"].clone()),
+            ("source".to_string(), serde_json::json!(observation.source)),
+        ]);
+        if let Some(tokens) = decision.get("candidate_prefix_tokens") {
+            shape.insert("candidate_prefix_tokens".to_string(), tokens.clone());
+        }
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp_nanos,
+            event_id: format!(
+                "evt-prefix-restore-{}-{timestamp_nanos}",
+                observation.request_id
+            ),
+            request_id: observation.request_id.to_string(),
+            correlation_id: Some(observation.request_id.to_string()),
+            entrypoint: self.context.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: "vnext.prefix_restore_decision".to_string(),
+            event_kind: ProfileEventKind::Instant,
+            timestamp,
+            // A cache miss is a valid decision; only outcome=restored proves
+            // publication. It must not be classified as a request failure.
+            status: ProfileStatus::Ok,
+            model: Some(self.context.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: None,
+            replay: None,
+            shape,
+            backend_detail: None,
+            attributes: BTreeMap::from([
+                (
+                    "execution_trace_source".to_string(),
+                    serde_json::json!("vnext_prefix_restore"),
+                ),
+                ("restore_decision".to_string(), decision),
+                (
+                    "profile_detail".to_string(),
+                    serde_json::json!(self.context.profile_detail.as_str()),
+                ),
+            ]),
+        };
+        event
+            .validate()
+            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
+        self.enqueue_profile_batch(vec![event])
+    }
+
     fn record(
         &self,
         permit: EventEmissionPermit,

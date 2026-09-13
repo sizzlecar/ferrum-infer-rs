@@ -23,7 +23,10 @@ pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
     PrefixCaptureStatus,
 };
-pub use prefix_restore::{PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput};
+pub use prefix_restore::{
+    PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
+    PrefixRestoreObservation, PrefixRestoreSource,
+};
 
 /// One model-owned KV slot reservation request.
 ///

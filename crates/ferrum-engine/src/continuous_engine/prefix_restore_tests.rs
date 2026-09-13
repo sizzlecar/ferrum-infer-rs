@@ -5,6 +5,96 @@ use ferrum_interfaces::model_executor::{
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput,
 };
 
+#[test]
+fn prefix_restore_decisions_reach_run_and_serve_journals_with_capacity_evidence() {
+    use ferrum_interfaces::model_executor::{
+        PrefixRestoreDecision, PrefixRestoreObservation, PrefixRestoreSource,
+    };
+    use ferrum_interfaces::vnext::{
+        CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+    };
+    use std::num::NonZeroU64;
+    let capacity = test_execution_capacity_deferral(
+        ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
+        CapacityWaitCondition::from_observation(
+            19,
+            vec![CapacityAvailabilityEpoch::new(
+                CapacityAvailabilitySource::ActiveSequenceSlots,
+                7,
+            )
+            .unwrap()],
+        )
+        .unwrap(),
+        ExecutorExecutionCapacityStage::SequenceExtension,
+    );
+    for entrypoint in [ProfileEntrypoint::Run, ProfileEntrypoint::Serve] {
+        let profile_path = resource_trace_temp_path("prefix-restore-decisions-profile");
+        let scheduler_path = resource_trace_temp_path("prefix-restore-decisions-scheduler");
+        let profile = create_scheduler_trace_sink(Some(&profile_path)).unwrap();
+        let scheduler = create_scheduler_trace_sink(Some(&scheduler_path)).unwrap();
+        let sink = VNextProfileExecutionEventSink::with_journals(
+            vec![profile.clone(), scheduler.clone()],
+            entrypoint,
+            &EngineConfig::default(),
+        );
+        let request_id = RequestId::new();
+        for decision in [
+            PrefixRestoreDecision::NoReusableEntry,
+            PrefixRestoreDecision::SequenceCapacityNotReady {
+                candidate_prefix_tokens: 128,
+                capacity: &capacity,
+            },
+            PrefixRestoreDecision::Restored {
+                candidate_prefix_tokens: 128,
+            },
+        ] {
+            sink.record_prefix_restore_decision(&PrefixRestoreObservation {
+                request_id: &request_id,
+                source: PrefixRestoreSource::Index,
+                decision,
+            })
+            .unwrap();
+        }
+        profile.flush().unwrap();
+        scheduler.flush().unwrap();
+        let events = read_engine_profile_events(&profile_path);
+        assert_eq!(events, read_engine_profile_events(&scheduler_path));
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.shape["outcome"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "no_reusable_entry",
+                "sequence_capacity_not_ready",
+                "restored"
+            ]
+        );
+        assert!(events[0].shape.get("candidate_prefix_tokens").is_none());
+        assert_eq!(events[1].shape["candidate_prefix_tokens"], 128);
+        assert_eq!(
+            events[1].attributes["restore_decision"]["capacity"],
+            serde_json::to_value(&capacity).unwrap()
+        );
+        assert_eq!(
+            events[1].attributes["restore_decision"]["capacity"]["stage"],
+            "sequence_extension"
+        );
+        for event in &events {
+            assert_eq!(event.request_id, request_id.to_string());
+            assert_eq!(event.entrypoint, entrypoint);
+            assert_eq!(event.phase, "vnext.prefix_restore_decision");
+            assert_eq!(event.shape["source"], "index");
+            event.validate().unwrap();
+        }
+        drop(sink);
+        profile.close().unwrap();
+        scheduler.close().unwrap();
+        std::fs::remove_file(profile_path).unwrap();
+        std::fs::remove_file(scheduler_path).unwrap();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RestoreBehavior {
     Hit,

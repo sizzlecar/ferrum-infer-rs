@@ -177,6 +177,19 @@ pub trait ExecutionEventSink: Send + Sync {
         Ok(())
     }
 
+    /// Prefix lookup precedes a per-request execution cursor. Opt-in sinks
+    /// receive resource-only decisions through their existing trace transport.
+    fn records_prefix_restore_decisions(&self) -> bool {
+        false
+    }
+
+    fn record_prefix_restore_decision(
+        &self,
+        _observation: &crate::model_executor::PrefixRestoreObservation<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
     fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError>;
 
     /// Records one cursor-ordered batch. Sinks with a buffered transport should

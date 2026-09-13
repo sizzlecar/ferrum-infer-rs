@@ -5,6 +5,9 @@
 use super::*;
 use std::collections::VecDeque;
 pub(super) mod rendezvous;
+mod restore_observation;
+use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
+use restore_observation::PrefixRestoreObserver;
 
 /// Request counters are shared with the consuming publication callback. Index
 /// occupancy is read from owners instead of estimated from token/text lengths.
@@ -1010,6 +1013,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
             return Ok(None);
         };
+        let observer = PrefixRestoreObserver::new(
+            self.event_sink.read().clone(),
+            input.request_id.clone(),
+            if input.checkpoint.is_some() {
+                PrefixRestoreSource::Rendezvous
+            } else {
+                PrefixRestoreSource::Index
+            },
+        );
         let tokens = input
             .input_tokens
             .iter()
@@ -1036,6 +1048,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .prefix_cache
                 .misses
                 .fetch_add(1, Ordering::Relaxed);
+            observer.record(PrefixRestoreDecision::NoReusableEntry);
             return Ok(None);
         };
         let (slot, sequence) = self
@@ -1065,9 +1078,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         .map_err(|error| FerrumError::backend(error.to_string()))?;
         let work = ResourceWorkShape::single(span)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        if !matches!(
-            self.extend_sequence_with_capacity(&sequence, work)?,
-            VNextExecutionCapacityDecision::Ready(())
+        if !observer.capacity_ready(
+            restored_tokens,
+            &self.extend_sequence_with_capacity(&sequence, work)?,
         ) {
             execution.restore_ready()?;
             return Ok(None);
@@ -1104,6 +1117,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let publication = match result {
             None => {
                 execution.restore_ready()?;
+                observer.record(PrefixRestoreDecision::NativeRestoreSkipped {
+                    candidate_prefix_tokens: restored_tokens,
+                });
                 return Ok(None);
             }
             Some(NativeCheckpointResult::Restored(publication)) => publication,
@@ -1139,7 +1155,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             restored_tokens,
             tokens.len(),
             self.cache_handle(&sequence, restored_tokens),
-            move || metrics.acknowledge_restore(restored_tokens, || callback.acknowledge()),
+            move || observer.acknowledge(&metrics, restored_tokens, || callback.acknowledge()),
         )
         .map(Some)
     }
