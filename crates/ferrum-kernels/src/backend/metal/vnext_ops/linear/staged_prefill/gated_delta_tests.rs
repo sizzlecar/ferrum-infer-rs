@@ -27,8 +27,9 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
         .sum::<u64>();
     let guard = f16::from_f32(123.0);
     let staging_bytes = hidden * u64::from(leaves[0].0) * 2;
-    // 767/768 straddle the candidate policy; decode remains on the old route.
-    for rows in [1_u64, 767, 768] {
+    // 767/768 straddle the staging policy; three decode rows share Q5/Q4
+    // weights without using the staging workspace.
+    for rows in [1_u64, 3, 767, 768] {
         let normalized_offset = 64_u64;
         let output_offset = normalized_offset + rows * hidden * 2;
         let staging_offset = output_offset + rows * output_width * 2;
@@ -96,6 +97,30 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
             StagingPolicy::GatedDelta,
         )
         .unwrap();
+        if rows == 3 {
+            // An existing scratch region can be present at small row counts;
+            // selection must leave it unused by every projection.
+            assert!(launches
+                .iter()
+                .all(|launch| !selected_for(*launch, StagingPolicy::GatedDelta)));
+            for (launch, expected) in launches.iter().zip([
+                LinearDispatchKind::SharedWeightGemv,
+                LinearDispatchKind::SharedWeightGemv,
+                LinearDispatchKind::CooperativeGemv,
+                LinearDispatchKind::CooperativeGemv,
+            ]) {
+                assert_eq!(
+                    pipelines
+                        .linear_pipeline(
+                            launch.format,
+                            launch.params.rows,
+                            launch.params.out_features
+                        )
+                        .1,
+                    expected,
+                );
+            }
+        }
         if rows == 768 {
             for (offset, size) in [
                 (staging_offset, staging_bytes - 2),

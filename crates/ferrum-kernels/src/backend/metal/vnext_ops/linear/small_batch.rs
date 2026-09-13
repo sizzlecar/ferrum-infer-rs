@@ -4,6 +4,7 @@ pub(super) const SHADER_SOURCE: &str = include_str!("small_batch.metal");
 
 pub(super) struct SmallBatchPipelines {
     q4: [ComputePipelineState; 3],
+    q5: [ComputePipelineState; 3],
     q6: [ComputePipelineState; 3],
     q6_f32: [ComputePipelineState; 3],
 }
@@ -31,6 +32,11 @@ impl SmallBatchPipelines {
                 pipeline("q4_shared_b3")?,
                 pipeline("q4_shared_b4")?,
             ],
+            q5: [
+                pipeline("q5_shared_b2")?,
+                pipeline("q5_shared_b3")?,
+                pipeline("q5_shared_b4")?,
+            ],
             q6: [
                 pipeline("q6_shared_b2")?,
                 pipeline("q6_shared_b3")?,
@@ -52,6 +58,7 @@ impl SmallBatchPipelines {
         let index = rows.checked_sub(2)? as usize;
         match format {
             LinearPhysicalFormat::Q4K => self.q4.get(index),
+            LinearPhysicalFormat::Q5K => self.q5.get(index),
             LinearPhysicalFormat::Q6K => self.q6.get(index),
             _ => None,
         }

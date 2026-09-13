@@ -17,7 +17,7 @@ use metal::{
 use std::time::Instant;
 
 const WARMUP_ROUNDS: usize = 2;
-const MEASURED_ROUNDS: usize = 7;
+const MEASURED_ROUNDS: usize = 8;
 const DISPATCHES_PER_COMMAND: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -240,12 +240,20 @@ impl Case<'_> {
                 &self.pipelines.q4_k_gemv,
                 LinearDispatchKind::CooperativeGemv,
             ),
+            (Dispatch::Gemv, GgufBlockFormat::Q5K, ElementType::F16) => (
+                &self.pipelines.q5_k_gemv,
+                LinearDispatchKind::CooperativeGemv,
+            ),
             (Dispatch::Gemv, GgufBlockFormat::Q6K, ElementType::F16) => (
                 &self.pipelines.q6_k_gemv,
                 LinearDispatchKind::CooperativeGemv,
             ),
             (Dispatch::Gemm, GgufBlockFormat::Q4K, ElementType::F16) => (
                 &self.pipelines.k_quant_gemm.q4_k,
+                LinearDispatchKind::TiledGemm,
+            ),
+            (Dispatch::Gemm, GgufBlockFormat::Q5K, ElementType::F16) => (
+                &self.pipelines.k_quant_gemm.q5_k,
                 LinearDispatchKind::TiledGemm,
             ),
             (Dispatch::Gemm, GgufBlockFormat::Q6K, ElementType::F16) => (
@@ -298,6 +306,9 @@ impl Case<'_> {
             "host_encode_ns": encode_ns,
             "host_submit_wait_ns": submit_wait_ns,
             "device_command_ns": gpu_elapsed_ns(command),
+            "pso_thread_execution_width": pipeline.thread_execution_width(),
+            "pso_max_total_threads_per_threadgroup": pipeline.max_total_threads_per_threadgroup(),
+            "pso_static_threadgroup_memory_bytes": pipeline.static_threadgroup_memory_length(),
         })
     }
 
@@ -325,6 +336,29 @@ fn quantized_decode_dispatch_microbench() {
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn quantized_shared_weight_microbench() {
     measure_dispatches(&[2, 3, 4], false);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_q5_shared_weight_microbench() {
+    // The first geometry matches the observed Q5 GDN input projection. The
+    // smaller tail tests whether sharing also pays at a much smaller grid.
+    // Neither dimension is a production selector or a correctness threshold.
+    let shapes = [
+        Shape {
+            name: "q5_gdn_qkv",
+            input: 4096,
+            output: 8192,
+            format: GgufBlockFormat::Q5K,
+        },
+        Shape {
+            name: "q5_smaller_output_tail",
+            input: 4096,
+            output: 1025,
+            format: GgufBlockFormat::Q5K,
+        },
+    ];
+    measure_dispatch_shapes(&shapes, &[2, 3, 4], false);
 }
 
 #[test]
@@ -380,6 +414,7 @@ fn quantized_f32_shared_head_microbench() {
                     "activation_type": "f32", "weight_format": shape.format.format_id(),
                     "weight_bytes": weight_bytes.len(), "rotating_weight_allocations": matrices,
                     "warmup_rounds": WARMUP_ROUNDS,
+                    "measured_rounds": MEASURED_ROUNDS,
                     "oracle": "full_output_sparse_input_cpu_block_decode",
                     "scope": "synthetic_projection_command_buffer_not_end_to_end_decode",
                     "samples": samples,
@@ -403,7 +438,9 @@ fn measure_case(
     }
     for _ in 0..WARMUP_ROUNDS {
         for &dispatch in variants {
+            case.poison_output();
             case.run(dispatch, DISPATCHES_PER_COMMAND);
+            case.validate(reference);
         }
     }
     let mut samples = Vec::new();
@@ -412,7 +449,11 @@ fn measure_case(
         let shift = round % order.len();
         order.rotate_left(shift);
         for dispatch in order {
+            case.poison_output();
             let mut sample = case.run(dispatch, DISPATCHES_PER_COMMAND);
+            // Full output validation is outside the timed command. This
+            // checks each command's final output, not every repeated dispatch.
+            case.validate(reference);
             sample["round"] = serde_json::json!(round);
             samples.push(sample);
         }
@@ -422,10 +463,14 @@ fn measure_case(
 }
 
 fn measure_dispatches(row_counts: &[usize], include_gemm: bool) {
+    measure_dispatch_shapes(SHAPES, row_counts, include_gemm);
+}
+
+fn measure_dispatch_shapes(shapes: &[Shape], row_counts: &[usize], include_gemm: bool) {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
-    for &shape in SHAPES {
+    for &shape in shapes {
         let weight_bytes = weights(shape);
         // Four distinct allocations expose sensitivity to repeatedly reusing
         // one matrix. Even rotation is not the full 9B model's cache behavior.
@@ -464,6 +509,7 @@ fn measure_dispatches(row_counts: &[usize], include_gemm: bool) {
                         "input_features": shape.input, "output_features": shape.output,
                         "weight_format": shape.format.format_id(), "weight_bytes": weight_bytes.len(),
                         "rotating_weight_allocations": matrices, "warmup_rounds": WARMUP_ROUNDS,
+                        "measured_rounds": MEASURED_ROUNDS,
                         "production_dispatch": format!("{:?}", pipelines.linear_pipeline(physical(shape.format), rows as u32, shape.output).1),
                         "oracle": "full_output_sparse_input_cpu_block_decode",
                         "scope": "synthetic_projection_command_buffer_not_end_to_end_decode",
@@ -478,6 +524,66 @@ fn measure_dispatches(row_counts: &[usize], include_gemm: bool) {
 #[test]
 fn shared_weight_gemv_preserves_rows_offsets_and_output_guards() {
     shared_weight_conformance(7, false, ElementType::F16);
+}
+
+#[test]
+fn q5_shared_weight_preserves_dense_rows_offsets_and_guards() {
+    for input_width in [256, 768, 1280] {
+        for output_width in [7, 1025] {
+            for production_dispatch in [true, false] {
+                shared_weight_format_conformance(
+                    input_width,
+                    output_width,
+                    production_dispatch,
+                    ElementType::F16,
+                    &[GgufBlockFormat::Q5K],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn q5_shared_weight_selection_preserves_shape_and_f32_boundaries() {
+    let device = Device::system_default().expect("Q5 selection requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    for rows in [0, 1, 2, 3, 4, 5, 8] {
+        assert_eq!(
+            pipelines
+                .small_batch
+                .pipeline(LinearPhysicalFormat::Q5K, rows)
+                .is_some(),
+            (2..=4).contains(&rows)
+        );
+        assert!(pipelines
+            .small_batch
+            .f32_pipeline(LinearPhysicalFormat::Q5K, rows)
+            .is_none());
+    }
+    for rows in [1, 2, 3, 4, 5, 7, 8] {
+        for output_width in [7, 1023, 1024, 1025, 8192] {
+            let expected = match (rows, output_width) {
+                (2..=4, 1024..) => LinearDispatchKind::SharedWeightGemv,
+                (8.., _) => LinearDispatchKind::TiledGemm,
+                _ => LinearDispatchKind::CooperativeGemv,
+            };
+            assert_eq!(
+                pipelines
+                    .linear_pipeline(LinearPhysicalFormat::Q5K, rows, output_width)
+                    .1,
+                expected,
+                "F16 rows={rows} out={output_width}",
+            );
+            assert_eq!(
+                pipelines
+                    .f32_linear_dispatch(LinearPhysicalFormat::Q5K, rows, output_width)
+                    .unwrap()
+                    .1,
+                LinearDispatchKind::CooperativeGemv,
+                "F32 rows={rows} out={output_width}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -904,18 +1010,38 @@ fn shared_weight_conformance(
     production_dispatch: bool,
     activation_type: ElementType,
 ) {
-    let device = Device::system_default().expect("small-batch conformance requires Metal");
-    let queue = device.new_command_queue();
-    let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let formats: &[GgufBlockFormat] = if activation_type == ElementType::F32 {
         &[GgufBlockFormat::Q6K]
     } else {
-        &[GgufBlockFormat::Q4K, GgufBlockFormat::Q6K]
+        &[
+            GgufBlockFormat::Q4K,
+            GgufBlockFormat::Q5K,
+            GgufBlockFormat::Q6K,
+        ]
     };
+    shared_weight_format_conformance(
+        1280,
+        output_width,
+        production_dispatch,
+        activation_type,
+        formats,
+    );
+}
+
+fn shared_weight_format_conformance(
+    input_width: u32,
+    output_width: u32,
+    production_dispatch: bool,
+    activation_type: ElementType,
+    formats: &[GgufBlockFormat],
+) {
+    let device = Device::system_default().expect("small-batch conformance requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
     for &format in formats {
         let shape = Shape {
             name: "strided_tail",
-            input: 1280,
+            input: input_width,
             output: output_width,
             format,
         };
@@ -956,7 +1082,12 @@ fn shared_weight_conformance(
             let prefix = 8;
             let sentinel = 123.0;
             let elements = prefix + rows * stride + 8;
-            let output = linear_values_buffer(&device, &vec![sentinel; elements], activation_type);
+            let mut initial_output = vec![sentinel; elements];
+            for row in 0..rows {
+                let start = prefix + row * stride + column_offset;
+                initial_output[start..start + output_width as usize].fill(f32::NAN);
+            }
+            let output = linear_values_buffer(&device, &initial_output, activation_type);
             let params = LinearParams {
                 rows: rows as u32,
                 in_features: shape.input,
@@ -991,7 +1122,13 @@ fn shared_weight_conformance(
                     LinearDispatchKind::SharedWeightGemv,
                 )
             };
-            assert_eq!(dispatch_kind, LinearDispatchKind::SharedWeightGemv);
+            let expected_dispatch =
+                if production_dispatch && output_width < SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+                    LinearDispatchKind::CooperativeGemv
+                } else {
+                    LinearDispatchKind::SharedWeightGemv
+                };
+            assert_eq!(dispatch_kind, expected_dispatch);
             encoder.set_compute_pipeline_state(pipeline);
             let scalar_bytes = if activation_type == ElementType::F32 {
                 4
@@ -1007,6 +1144,16 @@ fn shared_weight_conformance(
             command.commit();
             command.wait_until_completed();
             assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+            assert_eq!(
+                read_linear_values(&input, padded_input.len(), activation_type),
+                padded_input
+            );
+            // SAFETY: the immutable weight buffer has this byte length; the
+            // preceding wait completed the only command that referenced it.
+            let actual_weights = unsafe {
+                std::slice::from_raw_parts(weight.contents().cast::<u8>(), padded_weights.len())
+            };
+            assert_eq!(actual_weights, padded_weights);
             let actual = read_linear_values(&output, elements, activation_type);
             for (index, &value) in actual.iter().enumerate() {
                 let relative = index.saturating_sub(prefix);
