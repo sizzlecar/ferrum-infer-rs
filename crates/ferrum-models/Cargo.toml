@@ -79,6 +79,11 @@ rustfft = "6"
 rubato = "2.0.0"
 audioadapter-buffers = "3.0.0"
 
+# AArch64 acceleration is opt-in in sha2 0.10 and detects CPU support at runtime.
+# Limit assembly integration to macOS/Linux; other targets retain portable hashing.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.8"
