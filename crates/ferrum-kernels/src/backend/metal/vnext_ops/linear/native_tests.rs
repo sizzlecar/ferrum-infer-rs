@@ -438,7 +438,9 @@ fn assert_native_prefill(
         && pipelines.native.gemm_f16_f32_m64.is_some()
     {
         LinearDispatchKind::NativeTiledGemmM64
-    } else if rows >= 32 && columns >= 1024 {
+    } else if (rows >= 32 && columns >= 1024)
+        || (format == GgufBlockFormat::Iq4Xs && rows >= 8 && columns >= 4096)
+    {
         LinearDispatchKind::NativeTiledGemm
     } else {
         LinearDispatchKind::CooperativeGemv
@@ -532,6 +534,65 @@ fn assert_native_prefill(
         );
     }
     actual.iter().map(|value| value.to_bits()).collect()
+}
+
+#[test]
+fn native_prefill_short_tail_m32_preserves_cpu_bound_and_guards() {
+    let device = Device::system_default().expect("native short-tail conformance requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+    ] {
+        let blocks = oracle_blocks(format);
+        for rows in [7, 8, 12, 16, 24, 31] {
+            // This narrow output grid retains production GEMV; exercise M32 directly.
+            // The helper independently checks the dense CPU bound, all buffer
+            // guards, output offset/stride, and input/weight immutability.
+            let _ = assert_native_prefill(
+                &device,
+                &pipelines,
+                &queue,
+                format,
+                &blocks,
+                rows,
+                65,
+                |row, column| f16::from_f32(((row * 17 + column) as f32 * 0.073).sin() * 0.03125),
+                PrefillTile::M32,
+            );
+        }
+    }
+}
+
+#[test]
+fn native_prefill_short_tail_production_matches_m32_with_output_guards() {
+    let device = Device::system_default().expect("native short-tail production requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    let format = GgufBlockFormat::Iq4Xs;
+    let blocks = oracle_blocks(format);
+    for rows in [8, 12, 31] {
+        let run = |tile| {
+            assert_native_prefill(
+                &device,
+                &pipelines,
+                &queue,
+                format,
+                &blocks[..format.block_bytes()],
+                rows,
+                4097,
+                |row, column| f16::from_f32(((row * 17 + column) as f32 * 0.073).sin() * 0.03125),
+                tile,
+            )
+        };
+        // Both executions independently check the original dense CPU bound
+        // and guards. Production must select the explicit M32 control here;
+        // this is not a GEMV/MMA bitwise-equivalence assertion.
+        assert_eq!(run(PrefillTile::Production), run(PrefillTile::M32));
+    }
 }
 
 #[test]
@@ -651,6 +712,37 @@ fn native_prefill_m64_selection_preserves_shape_format_and_capability_fallback()
                     LinearDispatchKind::CooperativeGemv
                 );
             }
+        }
+    }
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+    ] {
+        for (rows, columns, iq4xs_kind) in [
+            (7, 4096, LinearDispatchKind::CooperativeGemv),
+            (8, 4095, LinearDispatchKind::CooperativeGemv),
+            (8, 4096, LinearDispatchKind::NativeTiledGemm),
+            (12, 4097, LinearDispatchKind::NativeTiledGemm),
+            (31, 4096, LinearDispatchKind::NativeTiledGemm),
+        ] {
+            let physical = LinearPhysicalFormat::Native(format);
+            assert_eq!(
+                pipelines.linear_pipeline(physical, rows, columns).1,
+                if format == GgufBlockFormat::Iq4Xs {
+                    iq4xs_kind
+                } else {
+                    LinearDispatchKind::CooperativeGemv
+                }
+            );
+            assert_eq!(
+                pipelines
+                    .f32_linear_dispatch(physical, rows, columns)
+                    .unwrap()
+                    .1,
+                LinearDispatchKind::CooperativeGemv
+            );
         }
     }
     // The same production selector must retain M32 if optional registration

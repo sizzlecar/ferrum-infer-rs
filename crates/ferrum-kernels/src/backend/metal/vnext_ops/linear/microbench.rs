@@ -22,6 +22,8 @@ use std::time::Instant;
 const WARMUP_ROUNDS: usize = 2;
 const MEASURED_ROUNDS: usize = 8;
 const DISPATCHES_PER_COMMAND: usize = 8;
+const OUTPUT_GUARD: f32 = -123.0;
+const OUTPUT_GUARD_ELEMENTS: usize = 8;
 
 #[derive(Clone, Copy)]
 pub(super) struct Shape {
@@ -379,7 +381,12 @@ impl Case<'_> {
     }
 
     fn validate(&self, reference: &[f32]) {
-        let values = read_linear_values(self.output, reference.len(), self.activation_type);
+        // Cases may reserve a trailing guard after their dense logical output.
+        // Exact-size allocations have no trailing elements to check.
+        let allocated_elements =
+            (self.output.length() / self.activation_type.size_bytes()) as usize;
+        assert!(allocated_elements >= reference.len());
+        let values = read_linear_values(self.output, allocated_elements, self.activation_type);
         for (index, (&actual, &expected)) in values.iter().zip(reference).enumerate() {
             let tolerance = linear_tolerance(self.activation_type, expected);
             assert!(
@@ -387,6 +394,13 @@ impl Case<'_> {
                 "{} rows={} output[{index}] actual={actual} oracle={expected}",
                 self.shape.name,
                 self.rows
+            );
+        }
+        for (index, value) in values.iter().enumerate().skip(reference.len()) {
+            assert_eq!(
+                *value, OUTPUT_GUARD,
+                "{} rows={} output guard[{index}] overwritten",
+                self.shape.name, self.rows
             );
         }
     }
@@ -730,6 +744,66 @@ fn native_quantized_prefill_fragment_dispatch_microbench() {
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_prefill_short_tail_dispatch_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    for (input, output) in [(5120, 17408), (17408, 5120)] {
+        measure_native_prefill_shape(
+            &device,
+            &queue,
+            &pipelines,
+            Shape {
+                name: "native_prefill_short_tail_candidate",
+                input,
+                output,
+                format: GgufBlockFormat::Iq4Xs,
+            },
+            &[8, 12, 16, 24],
+            // Compare typed GEMV and generic M32 on the same buffers. Their
+            // reductions need not agree bitwise; each command independently
+            // checks the CPU bound and output guards.
+            &[Dispatch::NativeSpecializedGemv, Dispatch::NativeGemm],
+        );
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_prefill_short_tail_boundary_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    // Vary K independently of the output grid, include equal-area matrices
+    // with different output-group counts, then increase the live row fraction.
+    for (rows, input, output) in [
+        (8, 256, 1024),
+        (8, 1024, 1024),
+        (8, 5120, 1024),
+        (8, 1024, 4096),
+        (8, 4096, 1024),
+        (8, 4096, 11008),
+        (8, 11008, 4096),
+        (24, 5120, 1024),
+    ] {
+        measure_native_prefill_shape(
+            &device,
+            &queue,
+            &pipelines,
+            Shape {
+                name: "native_prefill_short_tail_boundary_candidate",
+                input,
+                output,
+                format: GgufBlockFormat::Iq4Xs,
+            },
+            &[rows],
+            &[Dispatch::NativeSpecializedGemv, Dispatch::NativeGemm],
+        );
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_prefill_m64_dispatch_microbench() {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
@@ -819,7 +893,9 @@ fn measure_native_prefill_shape(
         let (input_values, nonzero) = inputs(rows, shape.input as usize);
         let reference = oracle(shape, &weight_bytes, &nonzero);
         let input = buffer(device, &input_values);
-        let output = buffer(device, &vec![f16::NAN; rows * shape.output as usize]);
+        let mut output_values = vec![f16::NAN; rows * shape.output as usize];
+        output_values.extend([f16::from_f32(OUTPUT_GUARD); OUTPUT_GUARD_ELEMENTS]);
+        let output = buffer(device, &output_values);
         let case = Case {
             queue,
             pipelines,
@@ -863,6 +939,8 @@ fn measure_native_prefill_shape(
                 "final_output_dispatch": samples.last().map(|sample| &sample["dispatch"]),
                 "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
                 "output_elements": reference.len(),
+                "output_guard_elements": OUTPUT_GUARD_ELEMENTS,
+                "output_guard_scope": "trailing_allocation_elements_checked_after_each_command",
                 "comparison": if variants.len() == 1 {
                     "same_fixture_in_separately_frozen_baseline_and_candidate_builds"
                 } else {

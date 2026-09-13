@@ -69,6 +69,9 @@ const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
 // Amortize float tile loading while retaining enough independent output tiles.
 const NATIVE_TILED_GEMM_MIN_ROWS: u32 = 32;
 const NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 1024;
+// Short IQ4_XS waves need a wider output grid; retain GEMV for narrow grids.
+const NATIVE_SHORT_TILED_GEMM_MIN_ROWS: u32 = 8;
+const NATIVE_SHORT_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 4096;
 // Conservative lower end of measured IQ4_XS M64 prefill; not a crossover estimate.
 const NATIVE_M64_GEMM_MIN_ROWS: u32 = 1024;
 // Small output grids do not provide enough parallelism after sharing weights.
@@ -215,8 +218,11 @@ impl MetalLinearPipelines {
                 (&self.q8_0, LinearDispatchKind::CooperativeGemv)
             }
             (LinearPhysicalFormat::Native(format), _)
-                if rows >= NATIVE_TILED_GEMM_MIN_ROWS
-                    && out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES =>
+                if (rows >= NATIVE_TILED_GEMM_MIN_ROWS
+                    && out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES)
+                    || (format == GgufBlockFormat::Iq4Xs
+                        && rows >= NATIVE_SHORT_TILED_GEMM_MIN_ROWS
+                        && out_features >= NATIVE_SHORT_TILED_GEMM_MIN_OUTPUT_FEATURES) =>
             {
                 // All smaller waves and other formats retain M32.
                 if format == GgufBlockFormat::Iq4Xs && rows >= NATIVE_M64_GEMM_MIN_ROWS {
