@@ -27,13 +27,32 @@ pub(crate) struct OrchestralSpec {
     pub tool_result_format: OrchestralToolResultFormat,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
 pub(crate) enum OrchestralToolResultFormat {
     #[default]
     Json,
     Yaml,
+    /// Legacy envelope: every top-level string becomes a text part.
     TextParts,
+    /// Only top-level strings containing LF or CR become text parts.
+    TextPartsV2,
+}
+
+impl OrchestralToolResultFormat {
+    /// The product selects a presentation style; its binary fixes the codec
+    /// revision. The harness separately declares the exact replay contract.
+    pub(crate) fn profile_format(self) -> Self {
+        match self {
+            Self::TextPartsV2 => Self::TextParts,
+            other => other,
+        }
+    }
+
+    pub(crate) fn is_text_parts(self) -> bool {
+        matches!(self, Self::TextParts | Self::TextPartsV2)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -421,6 +440,24 @@ mod tests {
         assert_eq!(serde_json::to_value(selected).unwrap(), value);
         value["tool_result_format"] = json!("auto");
         assert!(serde_json::from_value::<OrchestralSpec>(value).is_err());
+    }
+
+    #[test]
+    fn text_parts_revisions_are_distinct_but_select_the_same_product_style() {
+        for (name, expected) in [
+            ("text_parts", OrchestralToolResultFormat::TextParts),
+            ("text_parts_v2", OrchestralToolResultFormat::TextPartsV2),
+        ] {
+            let value = json!({"program":"orchestral","config_template":"agent.json",
+                "tool_result_format":name});
+            let spec: OrchestralSpec = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(spec.tool_result_format, expected);
+            assert_eq!(serde_json::to_value(&spec).unwrap(), value);
+            assert_eq!(
+                spec.tool_result_format.profile_format(),
+                OrchestralToolResultFormat::TextParts
+            );
+        }
     }
 
     #[test]

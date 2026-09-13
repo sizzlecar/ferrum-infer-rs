@@ -189,58 +189,20 @@ fn final_continuation_must_match_raw_sse_even_when_visible_delivery_is_unchanged
 #[test]
 fn saved_journals_and_wire_are_reaudited_without_changing_original_results() {
     let fixture = with_reasoning("  Ω\nprivate");
-    let report = tempfile::tempdir().unwrap();
+    let report = fixture.save_report(OrchestralToolResultFormat::Json);
     let task_dir = report.path().join("coding");
-    let journals = task_dir.join("journals");
     let requests = report.path().join("requests");
-    fs::create_dir_all(&journals).unwrap();
-    fs::create_dir(&requests).unwrap();
-    fs::copy(
-        fixture.public.run_path.as_ref().unwrap(),
-        journals.join("run-saved.json"),
-    )
-    .unwrap();
-    fs::copy(
-        fixture.public.session_path.as_ref().unwrap(),
-        journals.join("session-saved.json"),
-    )
-    .unwrap();
-    let original = json!({"id":"coding", "orchestral":{"session_id":"session"},
-        "completed":false, "validation":{"exit_code":0}})
-    .to_string();
-    fs::write(task_dir.join("result.json"), &original).unwrap();
-    fs::write(
-        report.path().join("manifest.json"),
-        json!({"schema_version":2,
-        "agent":{"kind":"orchestral","tool_result_format":"json"}})
-        .to_string(),
-    )
-    .unwrap();
-    for record in &fixture.records {
-        let stem = format!("coding-{}", record.request_index);
-        fs::write(
-            requests.join(format!("{stem}.json")),
-            serde_json::to_vec(record).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            requests.join(format!("{stem}.request.json")),
-            json!({"messages":record.messages}).to_string(),
-        )
-        .unwrap();
-        fs::copy(
-            fixture.dir.path().join(format!("{stem}.response.sse")),
-            requests.join(format!("{stem}.response.sse")),
-        )
-        .unwrap();
-    }
+    let original = fs::read_to_string(task_dir.join("result.json")).unwrap();
     let output = report.path().join("audit.json");
-    assert_eq!(audit_saved(report.path(), "coding", &output).unwrap(), 0);
+    assert_eq!(
+        audit_saved(report.path(), "coding", &output, None).unwrap(),
+        0
+    );
     let audit: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
     assert_eq!(audit["closed_loop_evidence"], true);
     assert_eq!(audit["public"]["output"], "Changed and checked.");
     assert_eq!(audit["wire"]["receipts"].as_array().unwrap().len(), 2);
-    assert!(audit_saved(report.path(), "coding", &task_dir.join("result.json")).is_err());
+    assert!(audit_saved(report.path(), "coding", &task_dir.join("result.json"), None).is_err());
     assert_eq!(
         fs::read_to_string(task_dir.join("result.json")).unwrap(),
         original
@@ -256,7 +218,8 @@ fn saved_journals_and_wire_are_reaudited_without_changing_original_results() {
         audit_saved(
             report.path(),
             "coding",
-            &report.path().join("changed-audit.json")
+            &report.path().join("changed-audit.json"),
+            None,
         )
         .unwrap(),
         1

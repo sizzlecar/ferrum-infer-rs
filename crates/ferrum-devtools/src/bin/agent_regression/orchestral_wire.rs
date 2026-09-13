@@ -406,6 +406,9 @@ fn tool_result_content(
             .map(Value::String)
             .context("serialize declared YAML tool result"),
         OrchestralToolResultFormat::TextParts => Ok(tool_text_parts::content(result, is_error)),
+        OrchestralToolResultFormat::TextPartsV2 => {
+            Ok(tool_text_parts::content_v2(result, is_error))
+        }
     }
 }
 
@@ -627,6 +630,10 @@ mod tests {
         include!("orchestral_wire/reasoning_tests.rs");
     }
 
+    mod text_parts_version_tests {
+        include!("orchestral_wire/text_parts_version_tests.rs");
+    }
+
     struct Fixture {
         dir: tempfile::TempDir,
         public: orchestral_evidence::Evidence,
@@ -759,6 +766,59 @@ mod tests {
                 }
             }
             fixture
+        }
+
+        fn save_report(&self, format: OrchestralToolResultFormat) -> tempfile::TempDir {
+            let report = tempfile::tempdir().unwrap();
+            let task = report.path().join("coding");
+            let journals = task.join("journals");
+            let requests = report.path().join("requests");
+            fs::create_dir_all(&journals).unwrap();
+            fs::create_dir(&requests).unwrap();
+            fs::copy(
+                self.public.run_path.as_ref().unwrap(),
+                journals.join("run-saved.json"),
+            )
+            .unwrap();
+            fs::copy(
+                self.public.session_path.as_ref().unwrap(),
+                journals.join("session-saved.json"),
+            )
+            .unwrap();
+            fs::write(
+                task.join("result.json"),
+                json!({"id":"coding",
+                "orchestral":{"session_id":"session"}, "completed":false,
+                "validation":{"exit_code":0}})
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                report.path().join("manifest.json"),
+                json!({"schema_version":2,
+                "agent":{"kind":"orchestral","tool_result_format":format}})
+                .to_string(),
+            )
+            .unwrap();
+            for record in &self.records {
+                let stem = format!("coding-{}", record.request_index);
+                fs::write(
+                    requests.join(format!("{stem}.json")),
+                    serde_json::to_vec(record).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    requests.join(format!("{stem}.request.json")),
+                    json!({"messages":record.messages}).to_string(),
+                )
+                .unwrap();
+                fs::copy(
+                    self.dir.path().join(format!("{stem}.response.sse")),
+                    requests.join(format!("{stem}.response.sse")),
+                )
+                .unwrap();
+            }
+            report
         }
     }
 

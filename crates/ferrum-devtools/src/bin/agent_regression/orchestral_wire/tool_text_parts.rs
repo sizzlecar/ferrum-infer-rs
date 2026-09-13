@@ -5,10 +5,19 @@
 use serde_json::{json, Value};
 
 pub(super) fn content(result: &Value, is_error: bool) -> Value {
+    content_with_strings(result, is_error, false)
+}
+
+pub(super) fn content_v2(result: &Value, is_error: bool) -> Value {
+    content_with_strings(result, is_error, true)
+}
+
+fn content_with_strings(result: &Value, is_error: bool, multiline_only: bool) -> Value {
+    let extract = |text: &str| !multiline_only || text.contains(['\n', '\r']);
     let mut metadata = json!({"is_error": is_error, "result": result});
     let mut texts = Vec::new();
     match result {
-        Value::String(text) => {
+        Value::String(text) if extract(text) => {
             metadata.as_object_mut().unwrap().remove("result");
             texts.push(("Result text".to_owned(), text.as_str()));
         }
@@ -16,7 +25,7 @@ pub(super) fn content(result: &Value, is_error: bool) -> Value {
             let mut fields = fields.iter().collect::<Vec<_>>();
             fields.sort_by(|(a, _), (b, _)| a.cmp(b));
             for (key, value) in fields {
-                if let Some(text) = value.as_str() {
+                if let Some(text) = value.as_str().filter(|text| extract(text)) {
                     metadata["result"].as_object_mut().unwrap().remove(key);
                     texts.push((format!("Text field {}", json!(key)), text));
                 }
@@ -63,6 +72,39 @@ fn sorted_objects(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_keeps_scalars_in_exact_metadata_and_only_extracts_lf_or_cr_text() {
+        let result = json!({
+            "empty":"", "path":"src/λ.rs", "count":2, "alive":false,
+            "optional":null, "nested":{"text":"kept\ninside JSON"},
+            "stdout":"α\n````\nend", "stderr":"warning\r"
+        });
+        assert_eq!(
+            content_v2(&result, false),
+            json!([
+                {"type":"text","text":"Tool result metadata:\n{\"is_error\":false,\"result\":{\"alive\":false,\"count\":2,\"empty\":\"\",\"nested\":{\"text\":\"kept\\ninside JSON\"},\"optional\":null,\"path\":\"src/λ.rs\"}}\n"},
+                {"type":"text","text":"Text field \"stderr\" (final newline: no)\n```text\nwarning\r\n```\n"},
+                {"type":"text","text":"Text field \"stdout\" (final newline: no)\n`````text\nα\n````\nend\n`````\n"}
+            ])
+        );
+        assert_ne!(content(&result, false), content_v2(&result, false));
+        for text in ["", "one line", "λ"] {
+            assert_eq!(
+                content_v2(&json!(text), true),
+                json!([
+                    {"type":"text","text":format!("Tool result metadata:\n{}\n", json!({"is_error":true,"result":text}))}
+                ])
+            );
+            assert_ne!(content(&json!(text), true), content_v2(&json!(text), true));
+        }
+        for text in ["LF\n", "CR\r", "CRLF\r\n", "no\nfinal newline"] {
+            assert_eq!(
+                content_v2(&json!(text), false),
+                content(&json!(text), false)
+            );
+        }
+    }
 
     #[test]
     fn source_and_non_text_metadata_are_preserved_without_escaped_duplicates() {

@@ -50,7 +50,10 @@ pub(crate) fn prepare(
         ("{model}", json!(manifest.server.model)),
         ("{context_window}", json!(manifest.server.context_window)),
         ("{max_tokens}", json!(manifest.server.max_tokens)),
-        ("{tool_result_format}", json!(spec.tool_result_format)),
+        (
+            "{tool_result_format}",
+            json!(spec.tool_result_format.profile_format()),
+        ),
         (
             "{request_timeout_secs}",
             json!(manifest.server.request_timeout_secs),
@@ -147,7 +150,7 @@ fn validate_config(
         .context("invalid Orchestral tool result format")?
         .unwrap_or_default();
     ensure!(
-        actual_format == tool_result_format,
+        actual_format == tool_result_format.profile_format(),
         "Orchestral tool result format differs from manifest"
     );
     ensure!(
@@ -229,6 +232,7 @@ fn validate_config(
 }
 
 fn bind_tool_result_format(config: &mut Value, format: OrchestralToolResultFormat) -> Result<()> {
+    let format = format.profile_format();
     let models = config
         .get_mut("providers")
         .and_then(|providers| providers.get_mut("models"))
@@ -483,12 +487,13 @@ mod tests {
             OrchestralToolResultFormat::Json,
             OrchestralToolResultFormat::Yaml,
             OrchestralToolResultFormat::TextParts,
+            OrchestralToolResultFormat::TextPartsV2,
         ] {
             let mut value = original.clone();
             bind_tool_result_format(&mut value, format).unwrap();
             assert_eq!(
                 value["providers"]["models"][0]["config"]["tool_result_format"],
-                json!(format)
+                json!(format.profile_format())
             );
             validate_config(
                 &value,
@@ -515,15 +520,34 @@ mod tests {
             Path::new("/log"),
         )
         .is_err());
+        assert!(
+            bind_tool_result_format(&mut explicit, OrchestralToolResultFormat::TextPartsV2)
+                .is_err()
+        );
+        let mut invalid_revision = original.clone();
+        invalid_revision["providers"]["models"][0]["config"]["tool_result_format"] =
+            json!("text_parts_v2");
+        assert!(bind_tool_result_format(
+            &mut invalid_revision,
+            OrchestralToolResultFormat::TextPartsV2
+        )
+        .is_err());
         let mut template = original;
         template["providers"]["models"][0]["config"]["tool_result_format"] =
             json!("{tool_result_format}");
         let mut rendered = render(
             &template,
-            &BTreeMap::from([("{tool_result_format}", json!("yaml"))]),
+            &BTreeMap::from([(
+                "{tool_result_format}",
+                json!(OrchestralToolResultFormat::TextPartsV2.profile_format()),
+            )]),
         )
         .unwrap();
-        bind_tool_result_format(&mut rendered, OrchestralToolResultFormat::Yaml).unwrap();
+        bind_tool_result_format(&mut rendered, OrchestralToolResultFormat::TextPartsV2).unwrap();
+        assert_eq!(
+            rendered["providers"]["models"][0]["config"]["tool_result_format"],
+            "text_parts"
+        );
         assert!(bind_tool_result_format(
             &mut json!({"providers":false}),
             OrchestralToolResultFormat::Json

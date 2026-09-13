@@ -64,6 +64,10 @@ enum Command {
         report_dir: PathBuf,
         #[arg(long)]
         task_id: String,
+        /// Explicit codec revision for saved text-parts evidence. Omit to retain
+        /// the manifest's interpretation; this never changes the saved manifest.
+        #[arg(long, value_enum)]
+        tool_result_format: Option<config::OrchestralToolResultFormat>,
         /// New evidence file; existing reports are never overwritten.
         #[arg(long)]
         output: PathBuf,
@@ -105,8 +109,9 @@ async fn main() {
         Command::AuditOrchestral {
             report_dir,
             task_id,
+            tool_result_format,
             output,
-        } => orchestral_wire::audit_saved(&report_dir, &task_id, &output),
+        } => orchestral_wire::audit_saved(&report_dir, &task_id, &output, tool_result_format),
     };
     let code = match result {
         Ok(code) => code,
@@ -121,6 +126,42 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_audit_codec_override_is_typed_and_not_implicit() {
+        let args = [
+            "agent_regression",
+            "audit-orchestral",
+            "--report-dir",
+            "report",
+            "--task-id",
+            "coding",
+            "--output",
+            "new-audit.json",
+        ];
+        assert!(matches!(
+            Args::try_parse_from(args).unwrap().command,
+            Command::AuditOrchestral {
+                tool_result_format: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Args::try_parse_from(
+                args.into_iter()
+                    .chain(["--tool-result-format", "text_parts_v2"])
+            )
+            .unwrap()
+            .command,
+            Command::AuditOrchestral {
+                tool_result_format: Some(config::OrchestralToolResultFormat::TextPartsV2),
+                ..
+            }
+        ));
+        assert!(
+            Args::try_parse_from(args.into_iter().chain(["--tool-result-format", "auto"])).is_err()
+        );
+    }
+
     #[test]
     fn repairs_are_explicit_and_default_to_the_original_print_run() {
         let args = [
