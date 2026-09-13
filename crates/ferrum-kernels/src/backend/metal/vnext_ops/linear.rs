@@ -24,7 +24,7 @@ use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Devi
 use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
 use crate::gguf_blocks::GgufBlockFormat;
 
-use super::native_blocks::{bind_native_block, MetalNativeBlockPipelines};
+use super::native_blocks::{bind_native_block, dispatch_m64_grid, MetalNativeBlockPipelines};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -69,6 +69,8 @@ const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
 // Amortize float tile loading while retaining enough independent output tiles.
 const NATIVE_TILED_GEMM_MIN_ROWS: u32 = 32;
 const NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 1024;
+// Conservative lower end of measured IQ4_XS M64 prefill; not a crossover estimate.
+const NATIVE_M64_GEMM_MIN_ROWS: u32 = 1024;
 // Small output grids do not provide enough parallelism after sharing weights.
 // Keep the existing GEMV there; the opt-in microbench covers both regimes.
 const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
@@ -117,6 +119,7 @@ enum LinearDispatchKind {
     SharedWeightGemv,
     TiledGemm,
     NativeTiledGemm,
+    NativeTiledGemmM64,
 }
 
 impl MetalLinearPipelines {
@@ -211,10 +214,16 @@ impl MetalLinearPipelines {
             (LinearPhysicalFormat::Q8_0, false) => {
                 (&self.q8_0, LinearDispatchKind::CooperativeGemv)
             }
-            (LinearPhysicalFormat::Native(_), _)
+            (LinearPhysicalFormat::Native(format), _)
                 if rows >= NATIVE_TILED_GEMM_MIN_ROWS
                     && out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES =>
             {
+                // All smaller waves and other formats retain M32.
+                if format == GgufBlockFormat::Iq4Xs && rows >= NATIVE_M64_GEMM_MIN_ROWS {
+                    if let Some(pipeline) = self.native.gemm_f16_f32_m64.as_ref() {
+                        return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                    }
+                }
                 (
                     &self.native.gemm_f16_f32,
                     LinearDispatchKind::NativeTiledGemm,
@@ -1606,6 +1615,9 @@ fn dispatch_linear_grid(
                 ),
                 MTLSize::new(128, 1, 1),
             );
+        }
+        LinearDispatchKind::NativeTiledGemmM64 => {
+            dispatch_m64_grid(encoder, params.rows, params.out_features);
         }
     }
 }

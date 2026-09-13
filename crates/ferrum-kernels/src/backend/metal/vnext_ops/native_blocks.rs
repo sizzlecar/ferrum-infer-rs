@@ -19,6 +19,22 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("../../../gguf_blocks/mod.rs"),
 );
 
+const M64_THREADGROUP_BYTES: u64 = 16384;
+const M64_THREADS: u64 = 256;
+
+pub(super) fn supports_m64_threadgroup(
+    execution_width: u64,
+    maximum_threads: u64,
+    static_bytes: u64,
+    maximum_bytes: u64,
+) -> bool {
+    execution_width == 32
+        && maximum_threads >= M64_THREADS
+        && static_bytes
+            .checked_add(M64_THREADGROUP_BYTES)
+            .is_some_and(|required| required <= maximum_bytes)
+}
+
 #[repr(C)]
 pub(super) struct NativeBlockParams {
     format: u32,
@@ -117,6 +133,7 @@ pub(super) struct MetalNativeBlockPipelines {
     iq4_xs: NativeGemvPipelines,
     shared: NativeSharedPipelines,
     pub(super) gemm_f16_f32: ComputePipelineState,
+    pub(super) gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
     pub(super) generic_linear_f16: ComputePipelineState,
     #[cfg(test)]
@@ -199,6 +216,24 @@ impl MetalNativeBlockPipelines {
         let generic_linear_f32 = gemv_pipeline("vnext_native_block_linear_f32", 0)?;
         #[cfg(test)]
         let generic_gemv_ns = generic_started.elapsed().as_nanos() as u64;
+        // M64 is optional. Devices unable to create or execute this larger
+        // threadgroup retain M32; no lazy compilation occurs during dispatch.
+        let gemm_f16_f32_m64 = if device.max_threads_per_threadgroup().width >= M64_THREADS
+            && device.max_threadgroup_memory_length() >= M64_THREADGROUP_BYTES
+        {
+            pipeline("vnext_native_block_gemm_f16_f32_m64")
+                .ok()
+                .filter(|pipeline| {
+                    supports_m64_threadgroup(
+                        pipeline.thread_execution_width(),
+                        pipeline.max_total_threads_per_threadgroup(),
+                        pipeline.static_threadgroup_memory_length(),
+                        device.max_threadgroup_memory_length(),
+                    )
+                })
+        } else {
+            None
+        };
         Ok(Self {
             q3_k,
             q4_k,
@@ -210,6 +245,7 @@ impl MetalNativeBlockPipelines {
             iq4_xs,
             shared,
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
+            gemm_f16_f32_m64,
             #[cfg(test)]
             generic_linear_f16,
             #[cfg(test)]
@@ -291,6 +327,19 @@ pub(super) fn bind_native_block(
         index,
         std::mem::size_of::<NativeBlockParams>() as u64,
         &params as *const _ as *const c_void,
+    );
+}
+
+pub(super) fn dispatch_m64_grid(encoder: &ComputeCommandEncoderRef, rows: u32, out_features: u32) {
+    // X[64][32] + W[32][64] floats, reused as the full Y[64][64] tile.
+    encoder.set_threadgroup_memory_length(0, M64_THREADGROUP_BYTES);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize::new(
+            u64::from(rows).div_ceil(64),
+            u64::from(out_features).div_ceil(64),
+            1,
+        ),
+        metal::MTLSize::new(M64_THREADS, 1, 1),
     );
 }
 

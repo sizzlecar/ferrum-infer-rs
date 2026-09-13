@@ -254,22 +254,18 @@ NATIVE_SHARED_LINEAR(float, f32, 3)
 NATIVE_SHARED_LINEAR(float, f32, 4)
 #undef NATIVE_SHARED_LINEAR
 
-// One 32-token x 64-output tile. Decode directly into float so the native
+// A 32- or 64-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
-kernel void vnext_native_block_gemm_f16_f32(
-    device const half * input [[buffer(0)]],
-    device const uchar * weight [[buffer(1)]],
-    device half * output [[buffer(2)]],
-    constant NativeLinearParams & p [[buffer(3)]],
-    constant NativeBlockParams & block [[buffer(4)]],
-    threadgroup float * workspace [[threadgroup(0)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+template<uint ROW_TILE>
+static inline void native_tiled_gemm(
+    device const half * input, device const uchar * weight, device half * output,
+    constant NativeLinearParams & p, constant NativeBlockParams & block,
+    threadgroup float * workspace, uint3 group, uint thread_index, uint simdgroup_index) {
+    constexpr uint THREADS = ROW_TILE * 4;
     threadgroup float * input_tile = workspace;
-    threadgroup float * weight_tile = workspace + 32 * 32;
-    const ulong input_start = ulong(group.x) * 32;
+    threadgroup float * weight_tile = workspace + ROW_TILE * 32;
+    const ulong input_start = ulong(group.x) * ROW_TILE;
     const ulong output_start = ulong(group.y) * 64;
     // Native GGUF blocks contain 32 or 256 values. A K32 tile cannot cross
     // a block boundary, so compute its block address once per K iteration.
@@ -285,7 +281,7 @@ kernel void vnext_native_block_gemm_f16_f32(
     for (ulong k = 0; k < ulong(p.in_features); k += 32) {
         const ulong block_index = ulong(uint(k) >> block_shift);
         const uint in_block_base = uint(k) & (block.values - 1);
-        for (uint i = thread_index; i < 32 * 32; i += 128) {
+        for (uint i = thread_index; i < ROW_TILE * 32; i += THREADS) {
             const ulong row = input_start + i / 32;
             const ulong column = k + i % 32;
             input_tile[i] = row < ulong(p.rows) && column < ulong(p.in_features)
@@ -293,25 +289,29 @@ kernel void vnext_native_block_gemm_f16_f32(
         }
         // Two threads own the two 16-value fragments of each physical row.
         // Reuse decoded headers within a thread while keeping the K x N tile.
-        const uint local_row = thread_index / 2;
-        const uint local_column = (thread_index % 2) * 16;
-        const ulong row = output_start + local_row;
-        const ulong column = k + local_column;
-        threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
-        if (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features)) {
-            const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
-            native_gemm_fragment16(weight + offset, in_block_base + local_column,
-                block.format, weight_fragment);
-        } else {
-            // Keep every consumed tile element initialized, including tails.
-            for (uint j = 0; j < 16; ++j) {
-                float value = 0.0f;
-                if (row < ulong(p.out_features) && column + j < ulong(p.in_features)) {
-                    const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
-                    value = native_block_value(weight + offset,
-                        in_block_base + local_column + j, block.format);
+        // Additional M64 SIMD groups reuse this same weight tile. Every thread
+        // still reaches both barriers, including those without a weight load.
+        if (thread_index < 128) {
+            const uint local_row = thread_index / 2;
+            const uint local_column = (thread_index % 2) * 16;
+            const ulong row = output_start + local_row;
+            const ulong column = k + local_column;
+            threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
+            if (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features)) {
+                const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+                native_gemm_fragment16(weight + offset, in_block_base + local_column,
+                    block.format, weight_fragment);
+            } else {
+                // Keep every consumed tile element initialized, including tails.
+                for (uint j = 0; j < 16; ++j) {
+                    float value = 0.0f;
+                    if (row < ulong(p.out_features) && column + j < ulong(p.in_features)) {
+                        const ulong offset = (row * blocks_per_row + block_index) * ulong(block.bytes);
+                        value = native_block_value(weight + offset,
+                            in_block_base + local_column + j, block.format);
+                    }
+                    weight_fragment[j * 64] = value;
                 }
-                weight_fragment[j * 64] = value;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -338,25 +338,41 @@ kernel void vnext_native_block_gemm_f16_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // All K tiles are consumed. Reuse the 8 KiB weight tile for the 32 x 64
-    // float result; every SIMD owns a disjoint 16 x 32 rectangle.
+    // The last K barrier retires all reads. M32 retains its 8 KiB weight-tile
+    // reuse; M64 needs the entire 16 KiB workspace for its 64 x 64 result.
+    // Every SIMD owns a disjoint 16 x 32 rectangle in either case.
+    threadgroup float * result_tile = ROW_TILE == 32 ? weight_tile : workspace;
     for (uint m = 0; m < 2; ++m) {
         for (uint n = 0; n < 4; ++n) {
             simdgroup_store(accumulators[m * 4 + n],
-                weight_tile + (matrix_row + m * 8) * 64 + matrix_column + n * 8,
+                result_tile + (matrix_row + m * 8) * 64 + matrix_column + n * 8,
                 64, 0, false);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = thread_index; i < 32 * 64; i += 128) {
+    for (uint i = thread_index; i < ROW_TILE * 64; i += THREADS) {
         const ulong row = input_start + i / 64;
         const ulong column = output_start + i % 64;
         if (row < ulong(p.rows) && column < ulong(p.out_features)) {
             output[row * ulong(p.output_stride) + ulong(p.output_column_offset) + column]
-                = half(weight_tile[i]);
+                = half(result_tile[i]);
         }
     }
 }
+
+#define NATIVE_TILED_GEMM(NAME, ROW_TILE) \
+kernel void NAME( \
+    device const half * input [[buffer(0)]], device const uchar * weight [[buffer(1)]], \
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]], \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) { \
+    native_tiled_gemm<ROW_TILE>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index); \
+}
+
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32, 32)
+NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64, 64)
+#undef NATIVE_TILED_GEMM
 
 kernel void vnext_native_block_decode(
     device const uchar * input [[buffer(0)]], device float * output [[buffer(1)]],
