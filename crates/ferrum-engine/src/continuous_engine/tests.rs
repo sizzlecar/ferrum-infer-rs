@@ -30,6 +30,8 @@ use std::time::Duration;
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 
+#[path = "prefix_rendezvous_tests.rs"]
+mod prefix_rendezvous_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
@@ -80,10 +82,11 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     completed_chunks: AtomicU64,
     defer_next_prefill: AtomicBool,
     narrow_next_prefill: AtomicBool,
-    release_epoch: AtomicU64,
+    release_epoch: Arc<AtomicU64>,
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
     prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
+    rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
 }
 
 impl PlanRuntimeChunkedPrefillTestExecutor {
@@ -98,10 +101,11 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             completed_chunks: AtomicU64::new(0),
             defer_next_prefill: AtomicBool::new(defer_first_prefill),
             narrow_next_prefill: AtomicBool::new(false),
-            release_epoch: AtomicU64::new(0),
+            release_epoch: Arc::new(AtomicU64::new(0)),
             capacity_wait_registrations: AtomicU64::new(0),
             capacity_signal,
             prefix_restore: None,
+            rendezvous: None,
         }
     }
 
@@ -249,7 +253,32 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     }
 
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
-        self.prefix_restore.is_some()
+        self.prefix_restore.is_some() || self.rendezvous.is_some()
+    }
+
+    fn plan_prefix_capture_boundary(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixCaptureBoundary<'_>,
+    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        self.rendezvous.as_ref()?.boundary(input)
+    }
+
+    fn retain_prefix_capture_interest(
+        &self,
+        input: ferrum_interfaces::model_executor::PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn ferrum_interfaces::model_executor::PrefixCaptureLease>>> {
+        assert!(self
+            .retained
+            .lock()
+            .unwrap()
+            .contains(input.source_request_id));
+        Ok(self.rendezvous.as_ref().and_then(|state| {
+            state.arm(
+                input,
+                Arc::clone(&self.release_epoch),
+                self.capacity_signal.clone(),
+            )
+        }))
     }
 
     async fn try_restore_plan_runtime_prefix(
@@ -257,6 +286,9 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         input: ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreInput<'_>,
     ) -> Result<Option<ferrum_interfaces::model_executor::PlanRuntimePrefixRestoreOutput>> {
         assert!(self.retained.lock().unwrap().contains(input.request_id));
+        if let Some(state) = &self.rendezvous {
+            return state.restore(input);
+        }
         self.prefix_restore.as_ref().unwrap().restore(input)
     }
 
@@ -325,6 +357,18 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
                 "duplicate chunked prefill test admission",
             ));
         }
+        if let Some(state) = &self.rendezvous {
+            if state.defer_admission_once() {
+                return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
+                    ExecutorPrefillMaintenanceDeferral::new(input.request_id.clone(), self.epochs(), self.wait_condition(),
+                        ExecutorPrefillMaintenanceStage::PhysicalBacking,
+                        vec![ExecutorPrefillMaintenanceBlocker::Capacity { domain_id: Some(1),
+                            kind: ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
+                            requested: 4096, available: 0, current_total: 0, maximum_total: 8192 }])?,
+                ));
+            }
+            state.admitted(input.request_id);
+        }
         Ok(ExecutorPrefillAdmissionDecision::Admitted(
             ExecutorPrefillAdmissionReceipt {
                 request_id: input.request_id.clone(),
@@ -337,6 +381,39 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             .lock()
             .expect("chunked prefill retained mutex poisoned")
             .remove(request_id)
+    }
+
+    fn maintain_prefill_backing(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        let state = self
+            .rendezvous
+            .as_ref()
+            .ok_or_else(|| FerrumError::unsupported("no fixture maintenance"))?;
+        assert!(self.retained.lock().unwrap().remove(request_id));
+        state.maintained(request_id);
+        if state.wait_for_release.load(Ordering::Acquire) && state.has_ready_capture() {
+            return Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                current: self.epochs(),
+                wait_condition: self.wait_condition(),
+                pressure: ferrum_interfaces::vnext::DeviceCapacityPressure::new(
+                    ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+                    "device.prefix-fixture".to_owned(),
+                    4096,
+                    4096,
+                    4096,
+                    4096,
+                    4096,
+                )
+                .unwrap()
+                .into(),
+            });
+        }
+        self.publish_release();
+        Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
+            current: self.epochs(),
+        })
     }
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
@@ -389,6 +466,9 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
         let mut completed_input = input.clone();
         completed_input.chunk = Some(completed_chunk);
         let output = self.inner.prefill(&completed_input).await?;
+        if let Some(state) = &self.rendezvous {
+            state.retired(request_id, completed_chunk);
+        }
         self.completed_chunks.fetch_add(1, Ordering::Relaxed);
         if completed_chunk.is_final() {
             assert!(self

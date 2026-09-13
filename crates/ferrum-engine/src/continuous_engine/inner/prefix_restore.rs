@@ -34,12 +34,14 @@ impl EngineInner {
                 continue;
             };
             let started = Instant::now();
+            let checkpoint = self.take_rendezvous_checkpoint(&request_id);
             let output = match self
                 .model_executor
                 .try_restore_plan_runtime_prefix(PlanRuntimePrefixRestoreInput {
                     request_id: &request_id,
                     input_tokens: &tokens,
                     maximum_sequence_tokens,
+                    checkpoint: checkpoint.as_deref(),
                 })
                 .await
             {

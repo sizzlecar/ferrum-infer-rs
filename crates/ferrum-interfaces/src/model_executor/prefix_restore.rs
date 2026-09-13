@@ -1,6 +1,6 @@
 //! Publication of restored state before constructing a prefill batch.
 
-use super::{KvCacheHandle, PlanRuntimePrefillAuthority};
+use super::{KvCacheHandle, PlanRuntimePrefillAuthority, PrefixCaptureLease};
 use ferrum_types::{FerrumError, RequestId, Result, TokenId};
 use std::{fmt, sync::Arc};
 
@@ -11,6 +11,9 @@ pub struct PlanRuntimePrefixRestoreInput<'a> {
     pub request_id: &'a RequestId,
     pub input_tokens: &'a [TokenId],
     pub maximum_sequence_tokens: usize,
+    /// An authenticated ready source retained by an earlier rendezvous. This
+    /// bypasses index lookup, never target admission or native compatibility.
+    pub checkpoint: Option<&'a dyn PrefixCaptureLease>,
 }
 
 /// Independently restored state whose execution gate remains closed while the

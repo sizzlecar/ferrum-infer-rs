@@ -4,6 +4,7 @@
 
 use super::*;
 use std::collections::VecDeque;
+pub(super) mod rendezvous;
 
 /// Request counters are shared with the consuming publication callback. Index
 /// occupancy is read from owners instead of estimated from token/text lengths.
@@ -790,18 +791,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
             return Ok(());
         };
+        let interests = rendezvous::interests_at(sequence, chunk.end());
         if sequence.request_origin != ExecutorRequestOrigin::Product
-            || !capture_candidate(chunk)
+            || (!capture_candidate(chunk) && interests.is_empty())
             || !layout.permits_capture_from(
                 chunk.tokens_processed() as u64,
                 chunk.end() as u64,
                 tokens.len() as u64,
             )
         {
+            rendezvous::finish(&interests);
             return Ok(());
         }
-        self.retain_sequence_boundary(sequence, tokens, chunk.end())
-            .await
+        let result = self
+            .retain_sequence_boundary(sequence, tokens, chunk.end())
+            .await;
+        rendezvous::finish(&interests);
+        result
     }
 
     pub(super) async fn retain_completed_sequence_boundary(
@@ -953,6 +959,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 let publication_started = Instant::now();
+                rendezvous::publish(sequence, &checkpoint);
                 let (removed, coalesced) = {
                     let mut index = self.prefix_cache.lock();
                     let removed = index.insert(
@@ -1008,11 +1015,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|token| token.get())
             .collect::<Vec<_>>();
-        let checkpoint = self.prefix_cache.lock().longest(
-            &tokens,
-            layout.input_dependency() == CheckpointInputDependency::EntireTokenInput,
-            |boundary| layout.permits_suffix(boundary as u64, tokens.len() as u64),
-        );
+        let checkpoint = if let Some(source) = input.checkpoint {
+            self.retained_rendezvous_checkpoint(source)
+                .filter(|checkpoint| {
+                    tokens.starts_with(checkpoint.token_prefix())
+                        && layout.permits_suffix(
+                            checkpoint.completed_tokens() as u64,
+                            tokens.len() as u64,
+                        )
+                })
+        } else {
+            self.prefix_cache.lock().longest(
+                &tokens,
+                layout.input_dependency() == CheckpointInputDependency::EntireTokenInput,
+                |boundary| layout.permits_suffix(boundary as u64, tokens.len() as u64),
+            )
+        };
         let Some(checkpoint) = checkpoint else {
             self.metrics
                 .prefix_cache

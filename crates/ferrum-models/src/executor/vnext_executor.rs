@@ -30,7 +30,8 @@ use ferrum_interfaces::model_executor::{
     PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
     PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput,
-    PrefillOutput,
+    PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan,
+    PrefixCaptureRequest,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -3419,6 +3420,8 @@ impl VNextExecutionJournal {
 }
 
 struct VNextSequence<R: DeviceRuntime> {
+    prefix_capture_interests:
+        Mutex<Vec<std::sync::Weak<prefix_cache::rendezvous::NativePrefixCapture<R>>>>,
     cache_id: String,
     request: Arc<VNextRequestRoot<R>>,
     session: Arc<SequenceSession<R>>,
@@ -4431,6 +4434,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
     prefix_cache: Mutex<prefix_cache::PrefixIndex<SequenceCheckpoint<R>>>,
+    prefix_capture_identity: Arc<()>,
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
@@ -4979,6 +4983,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             prefix_cache: Mutex::new(prefix_cache::PrefixIndex::default()),
+            prefix_capture_identity: Arc::new(()),
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
@@ -6117,6 +6122,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         };
         let sequence = Arc::new(VNextSequence {
+            prefix_capture_interests: Mutex::new(Vec::new()),
             cache_id: format!(
                 "vnext-cache-{request_id}-{}-{}",
                 session.sequence_authority().sparse_id(),
@@ -9694,6 +9700,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn plan_prefix_capture_boundary(
+        &self,
+        input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        self.rendezvous_boundary(input)
+    }
+
+    fn retain_prefix_capture_interest(
+        &self,
+        input: PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn PrefixCaptureLease>>> {
+        self.arm_prefix_capture(input)
+    }
+
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
         self.prefix_restore_enabled()
     }

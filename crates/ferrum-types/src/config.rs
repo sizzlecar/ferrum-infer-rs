@@ -421,6 +421,10 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
+    /// Opt in to one bounded wait for another request's exact in-flight prefix.
+    /// Expiry releases the optional dependency and resumes cold admission.
+    #[serde(default)]
+    pub prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
     /// Optional hard cap for per-request prefill chunks. `None` spends the
     /// live per-step token budget and lets capacity feedback narrow or regrow
     /// each request independently.
@@ -449,6 +453,7 @@ impl Default for SchedulerConfig {
             enable_sla_enforcement: false,
             prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
+            prefix_rendezvous_max_wait_ms: None,
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
@@ -466,6 +471,14 @@ impl SchedulerConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
+        {
+            self.prefix_rendezvous_max_wait_ms = Some(
+                value
+                    .parse::<std::num::NonZeroU64>()
+                    .map_err(|error| format!("FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS: {error}"))?,
+            );
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
             self.prompt_token_estimate = parse_bool_env_value(value)
                 .map_err(|reason| format!("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE: {reason}"))?;

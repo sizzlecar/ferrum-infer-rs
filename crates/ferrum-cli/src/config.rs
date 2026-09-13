@@ -235,6 +235,9 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
     pub scheduler_prefill_first_until_active: Option<usize>,
+    /// Bound one optional wait for an in-flight exact prefix. Disabled when absent.
+    #[serde(default)]
+    pub prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 
     /// Cap prefill chunks while decode requests are active, equivalent to
     /// `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`.
@@ -423,6 +426,13 @@ pub struct RuntimeCliConfig {
 impl RuntimeCliConfig {
     pub fn runtime_config_entries(&self) -> Vec<RuntimeConfigEntry> {
         let mut entries = Vec::new();
+        if let Some(wait) = self.prefix_rendezvous_max_wait_ms {
+            push_string_entry(
+                &mut entries,
+                "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS",
+                Some(&wait.to_string()),
+            );
+        }
         push_string_entry(&mut entries, "FERRUM_KV_DTYPE", self.kv_dtype.as_deref());
         push_usize_entry(&mut entries, "FERRUM_KV_MAX_BLOCKS", self.kv_max_blocks);
         push_usize_entry(&mut entries, "FERRUM_KV_CAPACITY", self.kv_capacity);
@@ -999,6 +1009,7 @@ mod tests {
             attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
             scheduler_prefill_first_until_active: Some(16),
+            prefix_rendezvous_max_wait_ms: std::num::NonZeroU64::new(321),
             scheduler_active_decode_prefill_chunk: Some(24),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
@@ -1046,6 +1057,19 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_entries(
+                entries.clone(),
+            ))
+            .unwrap();
+        assert_eq!(
+            engine
+                .scheduler
+                .prefix_rendezvous_max_wait_ms
+                .map(std::num::NonZeroU64::get),
+            Some(321)
+        );
         assert_eq!(
             entries
                 .iter()

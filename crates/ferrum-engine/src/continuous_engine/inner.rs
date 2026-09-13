@@ -7,6 +7,7 @@ mod batch;
 mod completion;
 mod decode;
 mod prefill;
+pub(super) mod prefix_rendezvous;
 mod prefix_restore;
 
 #[derive(Debug)]
@@ -1197,6 +1198,15 @@ impl EngineInner {
                             deferral.request_id()
                         )));
                     }
+                    if matches!(
+                        &outcome,
+                        ExecutorPrefillMaintenanceOutcome::WaitForRelease { .. }
+                    ) {
+                        // A normal GrowthRequired deferral may simply be cold
+                        // materialization. Only authoritative pressure abandons
+                        // optional sharing; drops happen after scheduler locks.
+                        self.release_prefix_rendezvous_for_capacity_pressure();
+                    }
                     Ok(outcome)
                 });
             self.trace_executor_prefill_maintenance(
@@ -1239,8 +1249,19 @@ impl EngineInner {
         let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
         let capture_trace = self.scheduler_trace_jsonl.is_some();
         let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
+        let mut prefix_pressure = false;
         let mut probe = |request: &InferenceRequest| {
             let result = self.probe_executor_prefill_admission(request, capture_trace);
+            if self
+                .config
+                .scheduler
+                .prefix_rendezvous_max_wait_ms
+                .is_some()
+                && matches!(&result.outcome, AdmissionProbeOutcome::Deferred(_))
+                && result.maintenance.is_none()
+            {
+                prefix_pressure = true;
+            }
             if let Some(deferral) = result.maintenance {
                 maintenance.push(deferral);
             }
@@ -1264,6 +1285,9 @@ impl EngineInner {
             );
         drop(probe);
         drop(availability);
+        if prefix_pressure {
+            self.release_prefix_rendezvous_for_capacity_pressure();
+        }
 
         for record in records.into_inner() {
             match record {
@@ -1603,6 +1627,7 @@ impl EngineInner {
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
         self.cancel_abandoned_requests().await?;
         self.complete_execution_readiness_failures().await?;
+        self.prepare_prefix_rendezvous()?;
 
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
@@ -1654,10 +1679,12 @@ impl EngineInner {
             && self.model_executor.supports_plan_runtime_prefix_restore()
         {
             let (_, maintenance) = self.prepare_dynamic_admission_round(hint.max_batch_size)?;
+            self.refresh_prefix_rendezvous()?;
             prefill_maintenance = maintenance;
             let scheduled = async {
                 self.complete_typed_admission_failures().await?;
                 self.restore_admitted_prefixes().await?;
+                self.refresh_prefix_rendezvous()?;
                 let mut availability = self.dynamic_admission_availability.lock();
                 let epochs = self
                     .model_executor

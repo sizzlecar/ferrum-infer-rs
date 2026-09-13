@@ -11,6 +11,117 @@ mod completion_guard_tests;
 #[path = "retention_tests.rs"]
 mod retention_tests;
 
+#[test]
+fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
+    use checkpoint_fixture::{Fixture, Spec};
+    use ferrum_interfaces::model_executor::PrefixCaptureBoundary;
+    let span = CheckpointTokenSpanConstraint::new(
+        std::num::NonZeroU64::new(4).unwrap(),
+        std::num::NonZeroU64::new(4).unwrap(),
+    )
+    .unwrap();
+    let suffix = CheckpointTokenSpanConstraint::new(
+        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::new(3).unwrap(),
+    )
+    .unwrap();
+    let fixture = Fixture::build(Spec {
+        dependency: CheckpointInputDependency::ExactTokenPrefix,
+        boundaries: CheckpointBoundaryConstraint::new(span, suffix).unwrap(),
+        checkpoint_capacity: Some(CheckpointCapacityPolicy::new(1 << 20).unwrap()),
+        ..Spec::default()
+    })
+    .unwrap();
+    let layout = usable_layout(&fixture.plan).unwrap();
+    let input = PrefixCaptureBoundary {
+        processed_tokens: 2,
+        source_prompt_tokens: 13,
+        common_prefix_tokens: 11,
+        follower_prompt_tokens: &[16, 19],
+    };
+    let plan = rendezvous::select_boundary(layout, input).unwrap();
+    assert_eq!(plan.boundary, 10);
+    assert_eq!(plan.span, span);
+    assert!(rendezvous::select_boundary(
+        layout,
+        PrefixCaptureBoundary {
+            follower_prompt_tokens: &[16, 17],
+            ..input
+        }
+    )
+    .is_none());
+    assert!(rendezvous::select_boundary(
+        layout,
+        PrefixCaptureBoundary {
+            processed_tokens: 7,
+            ..input
+        }
+    )
+    .is_none());
+    assert!(rendezvous::select_boundary(
+        layout,
+        PrefixCaptureBoundary {
+            common_prefix_tokens: 5,
+            ..input
+        }
+    )
+    .is_none());
+    // Incompatible suffix residues are rejected before scanning the prefix,
+    // including lengths that cannot be represented by allocated token arrays.
+    assert!(layout
+        .shared_prefix_boundary(0, u64::MAX, u64::MAX - 1, &[u64::MAX - 1])
+        .is_none());
+    assert!(layout
+        .shared_prefix_boundary(u64::MAX - 1, u64::MAX, u64::MAX, &[u64::MAX])
+        .is_none());
+}
+
+#[test]
+fn rendezvous_boundary_matches_selected_provider_contract_for_mixed_alignments() {
+    use checkpoint_fixture::{Fixture, Spec};
+    use std::num::NonZeroU64;
+    for (minimum, prefix_alignment, suffix_alignment) in
+        [(1, 1, 1), (3, 2, 4), (4, 4, 3), (2, 3, 8)]
+    {
+        let fixture = Fixture::build(Spec {
+            dependency: CheckpointInputDependency::ExactTokenPrefix,
+            boundaries: CheckpointBoundaryConstraint::new(
+                CheckpointTokenSpanConstraint::new(
+                    NonZeroU64::new(minimum).unwrap(),
+                    NonZeroU64::new(prefix_alignment).unwrap(),
+                )
+                .unwrap(),
+                CheckpointTokenSpanConstraint::new(
+                    NonZeroU64::new(2).unwrap(),
+                    NonZeroU64::new(suffix_alignment).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            checkpoint_capacity: Some(CheckpointCapacityPolicy::new(1 << 20).unwrap()),
+            ..Spec::default()
+        })
+        .unwrap();
+        let layout = usable_layout(&fixture.plan).unwrap();
+        for processed in [0, 2, 7] {
+            for prompt in [13, 19] {
+                for followers in [[16, 19], [17, 18]] {
+                    let common = 12;
+                    let expected = (processed + 1..=common).rev().find(|&boundary| {
+                        boundary < prompt
+                            && layout.permits_capture_from(processed, boundary, prompt)
+                            && followers
+                                .iter()
+                                .all(|&length| layout.permits_suffix(boundary, length))
+                    });
+                    assert_eq!(layout.shared_prefix_boundary(processed, prompt, common, &followers), expected,
+                        "prefix={prefix_alignment} suffix={suffix_alignment} minimum={minimum} processed={processed} prompt={prompt} followers={followers:?}");
+                }
+            }
+        }
+    }
+}
+
 fn insert(
     index: &mut PrefixIndex<Arc<str>>,
     prefix: &[u32],

@@ -9,7 +9,9 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+mod prefix_rendezvous;
 mod prefix_restore;
+pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
 
 #[cfg(test)]
@@ -432,6 +434,7 @@ pub struct ContinuousBatchRequest {
     logical_work_frontier: LogicalWorkFrontier,
     /// Optional restore state for this admission, separate from compute work.
     prefix_restore: PrefixRestoreState,
+    prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState,
     /// KV cache blocks allocated
     pub kv_blocks: Vec<ferrum_types::BlockId>,
     /// Whether prefill is chunked
@@ -479,6 +482,7 @@ impl ContinuousBatchRequest {
             decode_tokens: 0,
             logical_work_frontier: LogicalWorkFrontier::default(),
             prefix_restore: PrefixRestoreState::default(),
+            prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
             kv_blocks: Vec::new(),
             chunked_prefill: false,
             prefill_chunk_offset: 0,
@@ -1446,6 +1450,9 @@ impl ContinuousBatchScheduler {
                 maximum_admissions,
                 &mut events,
                 |request, ticket| {
+                    if request.prefix_rendezvous.held() {
+                        return AdmissionQueueEligibility::Held;
+                    }
                     let request_id = &request.inner.request.id;
                     if !self.pressure_active.load(Ordering::Acquire) {
                         return AdmissionQueueEligibility::Eligible;
@@ -1718,6 +1725,9 @@ impl ContinuousBatchScheduler {
         let mut admitted_tokens = 0usize;
         let mut admitted = 0usize;
         for request in waiting.iter() {
+            if request.prefix_rendezvous.held() {
+                continue;
+            }
             if admitted >= limit {
                 break;
             }
@@ -3013,10 +3023,12 @@ impl ContinuousBatchScheduler {
     }
 
     fn apply_prefill_execution_chunk_ceiling(req: &ContinuousBatchRequest, tokens: usize) -> usize {
-        req.prefill_execution_chunk_ceiling
+        let tokens = req
+            .prefill_execution_chunk_ceiling
             .map(|ceiling| tokens.min(ceiling))
             .unwrap_or(tokens)
-            .max(1)
+            .max(1);
+        req.prefix_rendezvous.cap(req.prefill_chunk_offset, tokens)
     }
 
     fn prefill_budget_tokens(
@@ -3542,6 +3554,8 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+            && (self.config.prefix_rendezvous_max_wait_ms.is_none()
+                || self.prefix_held_waiting_count() == 0)
             && prefill_first_target > 0
             && decoding_count < prefill_first_target
             && active_count < prefill_first_target

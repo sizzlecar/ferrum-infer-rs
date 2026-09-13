@@ -29,6 +29,7 @@ fn completion_sequence(
     .unwrap();
     let active_binding = Arc::new(TrustedActiveSequenceBinding::from_session(&session).unwrap());
     let sequence = Arc::new(VNextSequence {
+        prefix_capture_interests: Mutex::new(Vec::new()),
         cache_id: suffix.to_owned(),
         request,
         session,

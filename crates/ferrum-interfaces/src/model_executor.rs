@@ -17,7 +17,12 @@ use std::{
     sync::Arc,
 };
 
+mod prefix_capture;
 mod prefix_restore;
+pub use prefix_capture::{
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
+    PrefixCaptureStatus,
+};
 pub use prefix_restore::{PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutput};
 
 /// One model-owned KV slot reservation request.
@@ -2990,6 +2995,25 @@ pub enum ExecutorPrefillAdmissionDecision {
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Pure boundary planning for optional sharing. None leaves normal scheduling
+    /// unchanged; a returned boundary never grants request or resource authority.
+    fn plan_prefix_capture_boundary(
+        &self,
+        _input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        None
+    }
+
+    /// Arm interest only against an already-admitted, exact source incarnation.
+    /// No device allocation, capacity reservation, provider encoding, or device
+    /// submission is allowed here.
+    fn retain_prefix_capture_interest(
+        &self,
+        _input: PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn PrefixCaptureLease>>> {
+        Ok(None)
+    }
+
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 

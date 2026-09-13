@@ -870,6 +870,9 @@ pub struct RunCommand {
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
     pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
+    /// Wait at most this long for another request's exact in-flight prefix.
+    #[arg(long, value_name = "MS")]
+    pub prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 
     /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_batched_graph")]
@@ -2686,6 +2689,13 @@ fn run_startup_cli_runtime_entries(
         cmd.runtime_memory_budget_bytes
             .map(std::num::NonZeroUsize::get),
     );
+    if let Some(wait) = cmd.prefix_rendezvous_max_wait_ms {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS",
+            wait.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(enabled) = bool_cli_override(cmd.batched_graph, cmd.disable_batched_graph) {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
@@ -2890,6 +2900,7 @@ mod tests {
             max_num_seqs: None,
             max_num_batched_tokens: None,
             sequence_fit_policy: None,
+            prefix_rendezvous_max_wait_ms: None,
             batched_graph: false,
             disable_batched_graph: false,
             reusable_execution: false,
@@ -2991,6 +3002,51 @@ mod tests {
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_prefix_rendezvous_has_explicit_cli_authority_and_no_default_wait() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+        let parsed = TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--prefix-rendezvous-max-wait-ms",
+            "123",
+        ])
+        .unwrap();
+        let snapshot =
+            RuntimeConfigSnapshot::from_entries(run_startup_cli_runtime_entries(&parsed.run, None));
+        let mut config = ferrum_types::EngineConfig::default();
+        assert!(config.scheduler.prefix_rendezvous_max_wait_ms.is_none());
+        config.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            config
+                .scheduler
+                .prefix_rendezvous_max_wait_ms
+                .map(std::num::NonZeroU64::get),
+            Some(123)
+        );
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
+                .unwrap()
+                .source,
+            RuntimeConfigSource::Cli
+        );
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "test-model",
+            "--prefix-rendezvous-max-wait-ms",
+            "0"
+        ])
+        .is_err());
     }
 
     #[test]
