@@ -2726,6 +2726,246 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
     drop(prepared.commit());
 }
 
+fn idle_target_replacement_harness(
+    chunks: &[u64],
+    capacity: u64,
+    resource_count: usize,
+) -> Harness {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'e',
+        resource_count,
+        capacity,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, capacity);
+    let h = harness(runtime, catalog, capacity, false);
+    for &bytes in chunks {
+        h.root
+            .maintenance_controller
+            .grow_pool(&h.pool_ids[0], bytes)
+            .unwrap();
+    }
+    h
+}
+
+#[test]
+fn idle_target_replacement_admits_larger_frontier_and_keeps_previous_extent() {
+    // Reduced analogue of progressively larger scratch buckets: the total
+    // free space is sufficient, but no old extent can hold the new wave.
+    let h = idle_target_replacement_harness(&[128, 160, 192, 192], 800, 2);
+    let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+    let request = evaluated_request(&pool, 320);
+    let BackingPrepareDecision::Deferred(deferred) =
+        h.root.dynamic_pools.prepare_claim(&[request]).unwrap()
+    else {
+        panic!("separate idle chunks cannot hold a larger contiguous wave")
+    };
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) = h
+        .root
+        .maintenance_controller
+        .maintain_for_live_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("redundant target chunks must release the exact growth deficit")
+    };
+    let rebalance = growth.rebalance().unwrap();
+    assert_eq!(rebalance.reclaimed_bytes(), 192);
+    assert_eq!(rebalance.reclaimed_chunks(), 1);
+    let boundary = &growth.maintenance_boundary().unwrap().pools()[0];
+    assert!(!boundary.protected_packing_satisfied());
+    let keeper = boundary.idle_target_replacement_kept_chunk().unwrap();
+    assert!(!rebalance.pools()[0].chunks().contains(keeper));
+    assert!(pool
+        .state
+        .lock()
+        .unwrap()
+        .chunks
+        .contains_key(&keeper.ordinal()));
+    // Fresh physical admission, not the maintenance receipt, grants both
+    // the requested larger frontier and the previously available extent.
+    let larger = claim_size(&h.root.dynamic_pools, &pool, 320);
+    let previous = claim_size(&h.root.dynamic_pools, &pool, 192);
+    drop((larger, previous));
+    let state = pool.state.lock().unwrap();
+    assert_eq!(state.resident_bytes, 800);
+    assert_eq!(state.allocator.free_bytes, 800);
+}
+
+#[test]
+fn idle_target_replacement_preserves_live_partial_referenced_and_multi_claim_pools() {
+    for blocked in ["live", "partial", "reference", "multiple claims"] {
+        let h = idle_target_replacement_harness(&[128, 160, 192, 192], 800, 2);
+        let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+        let held = match blocked {
+            "live" => Some(claim_size(&h.root.dynamic_pools, &pool, 128)),
+            "partial" => Some(claim_size(&h.root.dynamic_pools, &pool, 16)),
+            _ => None,
+        };
+        let referenced = (blocked == "reference").then(|| {
+            Arc::clone(
+                &pool
+                    .state
+                    .lock()
+                    .unwrap()
+                    .chunks
+                    .values()
+                    .next()
+                    .unwrap()
+                    .backing,
+            )
+        });
+        let mut requests = vec![evaluated_request(&pool, 320)];
+        if blocked == "multiple claims" {
+            requests.push(evaluated_descriptor_request(&pool, 1, 16));
+        }
+        let BackingPrepareDecision::Deferred(deferred) =
+            h.root.dynamic_pools.prepare_claim(&requests).unwrap()
+        else {
+            panic!("{blocked}: the larger contiguous wave must defer")
+        };
+        let before = h.root.maintenance_controller.status().unwrap();
+        assert!(
+            matches!(
+                h.root
+                    .maintenance_controller
+                    .maintain_for_live_deferred(&deferred)
+                    .unwrap(),
+                DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+            ),
+            "{blocked}"
+        );
+        assert_eq!(
+            h.root.maintenance_controller.status().unwrap(),
+            before,
+            "{blocked}"
+        );
+        drop((held, referenced));
+    }
+}
+
+#[test]
+fn idle_target_replacement_keeps_minimum_and_never_reclaims_insufficient_subset() {
+    for (chunks, capacity, resources, request_bytes) in [
+        // No single old extent preserves the compiled runnable minimum.
+        (vec![128, 128, 128], 512, 3, 256),
+        // All redundant chunks together still cannot pay for the new claim.
+        (vec![128, 160, 192], 512, 2, 512),
+    ] {
+        let h = idle_target_replacement_harness(&chunks, capacity, resources);
+        let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+        let request = evaluated_request(&pool, request_bytes);
+        let BackingPrepareDecision::Deferred(deferred) =
+            h.root.dynamic_pools.prepare_claim(&[request]).unwrap()
+        else {
+            panic!("larger frontier must defer")
+        };
+        let before = h.root.maintenance_controller.status().unwrap();
+        assert!(matches!(
+            h.root
+                .maintenance_controller
+                .maintain_for_live_deferred(&deferred)
+                .unwrap(),
+            DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+        ));
+        assert_eq!(h.root.maintenance_controller.status().unwrap(), before);
+    }
+}
+
+#[test]
+fn idle_target_replacement_allocation_failure_keeps_old_frontier_and_releases_grant() {
+    let h = idle_target_replacement_harness(&[128, 160, 192, 192], 800, 2);
+    let pool = Arc::clone(&h.root.dynamic_pools.pools[&h.pool_ids[0]]);
+    let request = evaluated_request(&pool, 320);
+    let BackingPrepareDecision::Deferred(deferred) =
+        h.root.dynamic_pools.prepare_claim(&[request]).unwrap()
+    else {
+        panic!("larger frontier must defer")
+    };
+    let runtime = &h.runtime;
+    runtime.fail_on_call(runtime.allocate_calls() + 1);
+    assert!(h
+        .root
+        .maintenance_controller
+        .maintain_for_live_deferred(&deferred)
+        .is_err());
+    let previous = claim_size(&h.root.dynamic_pools, &pool, 192);
+    drop(previous);
+    let state = pool.state.lock().unwrap();
+    assert_eq!(state.resident_bytes, 480);
+    assert_eq!(state.pending_growth_bytes, 0);
+    assert_eq!(
+        h.root
+            .dynamic_pools
+            .budget
+            .account
+            .state
+            .lock()
+            .unwrap()
+            .claimed_bytes,
+        state.resident_bytes
+    );
+    drop(state);
+    runtime.fail_on_call(0);
+    assert!(matches!(
+        h.root
+            .maintenance_controller
+            .maintain_for_live_deferred(&deferred)
+            .unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    drop(claim_size(&h.root.dynamic_pools, &pool, 320));
+}
+
+#[test]
+fn idle_target_replacement_rechecks_budget_after_a_competing_reservation() {
+    let h = idle_target_replacement_harness(&[128, 160, 192, 192], 800, 2);
+    let pools = &h.root.dynamic_pools;
+    let pool = Arc::clone(&pools.pools[&h.pool_ids[0]]);
+    let request = evaluated_request(&pool, 320);
+    let BackingPrepareDecision::Deferred(deferred) = pools.prepare_claim(&[request]).unwrap()
+    else {
+        panic!("larger frontier must defer")
+    };
+    let pressure = match DeviceCapacityReservation::reserve(&pools.budget, 320) {
+        Err(VNextError::DeviceCapacityUnavailable(pressure)) => pressure,
+        _ => panic!("the original growth must exceed available device budget"),
+    };
+    let rebalanced = pools
+        .reclaim_idle_chunks_for_pressure(
+            &pressure,
+            pools.budget.availability_snapshot().unwrap(),
+            &[pool.domain.domain_id],
+            deferred.protected_immediate(),
+            deferred.protected_packing_envelopes(),
+        )
+        .unwrap();
+    assert!(rebalanced.rebalance.is_some());
+    // Interleave another real reservation after reclaim and before the
+    // maintenance retry. Reclaim is not a permit for the pending allocation.
+    let competing = DeviceCapacityReservation::reserve(&pools.budget, 320).unwrap();
+    let before = h.root.maintenance_controller.status().unwrap();
+    assert!(matches!(
+        h.root
+            .maintenance_controller
+            .maintain_for_live_deferred(&deferred)
+            .unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(h.root.maintenance_controller.status().unwrap(), before);
+    drop(claim_size(pools, &pool, 192));
+    drop(competing);
+    assert!(matches!(
+        h.root
+            .maintenance_controller
+            .maintain_for_live_deferred(&deferred)
+            .unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    drop(claim_size(pools, &pool, 320));
+}
+
 #[test]
 fn rebalance_preserves_physical_occupancy_plus_pending_bundle_demand() {
     let first_catalog = pool_catalog(

@@ -204,7 +204,9 @@ where
         Ok(epochs)
     }
 
-    /// Rebalances only whole, unreferenced chunks from non-target pools. The
+    /// Rebalances only whole, unreferenced chunks. An entirely idle contiguous
+    /// target may replace redundant undersized chunks while retaining its
+    /// largest runnable extent; other targets remain excluded. The
     /// batch is selected before mutation, logical totals publish atomically,
     /// and physical grants are returned only after every pool lock is dropped.
     pub(in crate::vnext::resource) fn reclaim_idle_chunks_for_pressure(
@@ -279,7 +281,7 @@ where
             if state.poisoned {
                 return Err(invalid_resource("dynamic backing pool is fail-closed"));
             }
-            let excluded_from_reclaim = excluded_domains.contains(&pool.domain.domain_id);
+            let growth_target = excluded_domains.contains(&pool.domain.domain_id);
             let used = used_by_domain
                 .get(&pool.domain.domain_id)
                 .copied()
@@ -300,7 +302,8 @@ where
                 .copied()
                 .unwrap_or(0);
             let mut protected_packing_satisfied = true;
-            let protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id) {
+            let mut protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id)
+            {
                 Some(envelope) => {
                     if envelope.pool_id() != pool.domain.pool_id()
                         || envelope.total_bytes()? != protected
@@ -334,13 +337,80 @@ where
                 // an exact physical packing attempt exists.
                 None => std::collections::BTreeSet::new(),
             };
+            // A larger single contiguous claim cannot use any undersized old
+            // chunk. Keeping all of them while allocating one more can trap
+            // an otherwise idle pool at the device ceiling. Preserve the
+            // largest old extent, including the runnable minimum, and only
+            // offer redundant chunks when no physical or logical owner exists.
+            let replacement_keeper = if growth_target
+                && !protected_packing_satisfied
+                && used == 0
+                && physically_occupied == 0
+                && state.pending_growth_bytes == 0
+                && matches!(
+                    pool.domain.pool.compatibility().profile().view(),
+                    DynamicStorageView::Contiguous
+                )
+                && protected_packing_by_domain
+                    .get(&pool.domain.domain_id)
+                    .is_some_and(|envelope| envelope.claim_bytes_descending() == [protected])
+                && state.chunks.values().all(|chunk| {
+                    let bytes = chunk.backing._grant.bytes();
+                    chunk.live_segments == 0
+                        && Arc::strong_count(&chunk.backing) == 1
+                        && chunk.backing.descriptor.size_bytes == bytes
+                        && state
+                            .allocator
+                            .by_offset
+                            .get(&(chunk.backing.identity.ordinal(), 0))
+                            .is_some_and(|extent| {
+                                extent.chunk_generation == chunk.backing.identity.generation()
+                                    && extent.length_bytes == bytes
+                            })
+                }) {
+                state
+                    .chunks
+                    .values()
+                    .max_by_key(|chunk| chunk.backing._grant.bytes())
+                    .filter(|chunk| {
+                        let bytes = chunk.backing._grant.bytes();
+                        bytes >= pool.domain.pool.provisioning().minimum_resident_bytes()
+                            && bytes < protected
+                    })
+                    .map(|chunk| (chunk.backing.identity.clone(), chunk.backing._grant.bytes()))
+            } else {
+                None
+            };
+            if let Some((keeper, _)) = &replacement_keeper {
+                // Revalidate the exact packing need. Since every old extent
+                // is smaller than the sole claim, removing any non-keeper
+                // cannot increase this growth. This is no capacity permit:
+                // the ordinary post-reclaim maintenance must reserve anew.
+                if contiguous_packing_growth_bytes(
+                    &state.allocator,
+                    pool.domain.pool_id(),
+                    &[protected],
+                )? != protected
+                {
+                    return Err(invalid_resource(
+                        "idle target replacement changed its packing need",
+                    ));
+                }
+                protected_chunks.insert(keeper.ordinal());
+            }
+            let excluded_from_reclaim = growth_target && replacement_keeper.is_none();
             // Logical admission does not own lane-stable or not-yet-committed
             // physical extents. Reclaim must preserve whichever ownership view
             // is larger before adding this bundle's uncommitted demand.
             let owned = used.max(physically_occupied);
-            let coherent_runnable_floor = owned.checked_add(protected).ok_or_else(|| {
-                invalid_resource("dynamic pool protected runnable floor overflows u64")
-            })?;
+            let coherent_runnable_floor = match &replacement_keeper {
+                // The pending large claim already cannot run. Keep the whole
+                // previous largest extent runnable even if new growth fails.
+                Some((_, bytes)) => *bytes,
+                None => owned.checked_add(protected).ok_or_else(|| {
+                    invalid_resource("dynamic pool protected runnable floor overflows u64")
+                })?,
+            };
             let resident_floor = pool
                 .domain
                 .pool
@@ -363,7 +433,7 @@ where
                 let resident_floor_allows_reclaim = chunk_bytes <= reclaimable;
                 let reclaim_candidate = !excluded_from_reclaim
                     && state.pending_growth_bytes == 0
-                    && protected_packing_satisfied
+                    && (protected_packing_satisfied || replacement_keeper.is_some())
                     && chunk.live_segments == 0
                     && external_references == 0
                     && !protected_packing
@@ -402,6 +472,7 @@ where
                 maximum_resident_bytes: pool.domain.pool.provisioning().maximum_resident_bytes(),
                 protected_immediate_bytes: protected,
                 protected_packing_satisfied,
+                idle_target_replacement_kept_chunk: replacement_keeper.map(|(keeper, _)| keeper),
                 coherent_runnable_floor_bytes: coherent_runnable_floor,
                 resident_floor_bytes: resident_floor,
                 reclaimable_bytes: reclaimable,

@@ -75,6 +75,11 @@ pub struct DynamicPoolMaintenanceBoundaryPool {
     pub(in crate::vnext::resource) maximum_resident_bytes: u64,
     pub(in crate::vnext::resource) protected_immediate_bytes: u64,
     pub(in crate::vnext::resource) protected_packing_satisfied: bool,
+    /// A fully idle single-claim target can retain its previous largest extent
+    /// while replacing redundant smaller chunks. The pending larger claim
+    /// still requires ordinary budget reservation; it is not currently packed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::vnext::resource) idle_target_replacement_kept_chunk: Option<BackingChunkIdentity>,
     pub(in crate::vnext::resource) coherent_runnable_floor_bytes: u64,
     pub(in crate::vnext::resource) resident_floor_bytes: u64,
     pub(in crate::vnext::resource) reclaimable_bytes: u64,
@@ -136,6 +141,10 @@ impl DynamicPoolMaintenanceBoundaryPool {
 
     pub const fn protected_packing_satisfied(&self) -> bool {
         self.protected_packing_satisfied
+    }
+
+    pub fn idle_target_replacement_kept_chunk(&self) -> Option<&BackingChunkIdentity> {
+        self.idle_target_replacement_kept_chunk.as_ref()
     }
 
     pub const fn coherent_runnable_floor_bytes(&self) -> u64 {
