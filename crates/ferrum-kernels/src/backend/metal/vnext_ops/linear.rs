@@ -214,9 +214,10 @@ impl MetalLinearPipelines {
                     LinearDispatchKind::NativeTiledGemm,
                 )
             }
-            (LinearPhysicalFormat::Native(_), _) => {
-                (&self.native.linear_f16, LinearDispatchKind::CooperativeGemv)
-            }
+            (LinearPhysicalFormat::Native(format), _) => (
+                self.native.linear_f16(format),
+                LinearDispatchKind::CooperativeGemv,
+            ),
         }
     }
 
@@ -226,9 +227,8 @@ impl MetalLinearPipelines {
             LinearPhysicalFormat::Q4K => Some(&self.q4_k_gemv_f32),
             LinearPhysicalFormat::Q6K => Some(&self.q6_k_gemv_f32),
             LinearPhysicalFormat::Q8_0 => Some(&self.q8_0_f32),
-            LinearPhysicalFormat::Q5K | LinearPhysicalFormat::Native(_) => {
-                Some(&self.native.linear_f32)
-            }
+            LinearPhysicalFormat::Q5K => Some(self.native.linear_f32(GgufBlockFormat::Q5K)),
+            LinearPhysicalFormat::Native(format) => Some(self.native.linear_f32(format)),
         }
     }
 

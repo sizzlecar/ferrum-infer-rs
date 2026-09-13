@@ -8,6 +8,10 @@ struct NativeLinearParams {
     uint output_stride; uint output_column_offset;
 };
 
+// Zero retains the runtime decoder only for test PSOs. Production GEMV PSOs
+// bind a supported GgufBlockFormat; prefill and block decoding do not use this.
+constant uint NATIVE_GEMV_FORMAT [[function_constant(0)]];
+
 static inline float native_half(device const uchar * b, uint offset) {
     const ushort bits = ushort(b[offset]) | (ushort(b[offset + 1]) << 8);
     return float(as_type<half>(bits));
@@ -79,6 +83,7 @@ static inline void native_linear(
     uint3 group, uint lane, uint subgroup) {
     const uint row = group.y;
     const uint first = group.x * 4 + subgroup * 2;
+    const uint format = NATIVE_GEMV_FORMAT == 0 ? block.format : NATIVE_GEMV_FORMAT;
     // NativeBlockParams admits only 32- or 256-value blocks. Keep the lane
     // traversal and ulong byte addresses unchanged while sharing this index
     // calculation between the two output columns.
@@ -93,7 +98,7 @@ static inline void native_linear(
             const uint out_col = first + part;
             if (out_col < p.out_features) {
                 const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
-                sums[part] += x * native_block_value(weight + offset, in_block, block.format);
+                sums[part] += x * native_block_value(weight + offset, in_block, format);
             }
         }
     }

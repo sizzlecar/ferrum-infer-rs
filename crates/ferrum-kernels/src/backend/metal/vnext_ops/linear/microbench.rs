@@ -80,6 +80,7 @@ enum Dispatch {
     Gemm,
     SharedWeight,
     NativeGemv,
+    NativeSpecializedGemv,
     NativeGemm,
 }
 
@@ -237,11 +238,19 @@ impl Case<'_> {
         };
         let (pipeline, kind) = match (dispatch, self.shape.format, self.activation_type) {
             (Dispatch::NativeGemv, _, ElementType::F16) => (
-                &self.pipelines.native.linear_f16,
+                &self.pipelines.native.generic_linear_f16,
                 LinearDispatchKind::CooperativeGemv,
             ),
             (Dispatch::NativeGemv, _, ElementType::F32) => (
-                &self.pipelines.native.linear_f32,
+                &self.pipelines.native.generic_linear_f32,
+                LinearDispatchKind::CooperativeGemv,
+            ),
+            (Dispatch::NativeSpecializedGemv, format, ElementType::F16) => (
+                self.pipelines.native.linear_f16(format),
+                LinearDispatchKind::CooperativeGemv,
+            ),
+            (Dispatch::NativeSpecializedGemv, format, ElementType::F32) => (
+                self.pipelines.native.linear_f32(format),
                 LinearDispatchKind::CooperativeGemv,
             ),
             (Dispatch::NativeGemm, _, ElementType::F16) => (
@@ -306,7 +315,14 @@ impl Case<'_> {
             bind_linear_params(
                 encoder,
                 params,
-                physical(self.shape.format),
+                if matches!(
+                    dispatch,
+                    Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv | Dispatch::NativeGemm
+                ) {
+                    LinearPhysicalFormat::Native(self.shape.format)
+                } else {
+                    physical(self.shape.format)
+                },
                 self.activation_type,
             );
             dispatch_linear_grid(encoder, params, kind);
@@ -384,10 +400,24 @@ fn quantized_q5_shared_weight_microbench() {
 fn native_quantized_decode_dispatch_microbench() {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
+    let initialization_started = Instant::now();
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
-    // Run this unchanged fixture in both builds. Each measures that build's
-    // native GEMV, not a second shader copy. These are wide FFN geometries;
-    // F32 coverage exercises the generic ABI, not an asserted model binding.
+    let initialization_ns = initialization_started.elapsed().as_nanos() as u64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "kind": "metal_native_gemv_pipeline_initialization",
+            "all_linear_pipelines_host_ns": initialization_ns,
+            "native_library_host_ns": pipelines.native.initialization.library_ns,
+            "specialized_gemv_host_ns": pipelines.native.initialization.specialized_gemv_ns,
+            "specialized_gemv_pipeline_count": 16,
+            "test_generic_gemv_host_ns": pipelines.native.initialization.generic_gemv_ns,
+            "test_generic_gemv_pipeline_count": 2,
+            "scope": "one_test_registry_initialization_including_generic_controls_not_old_new_startup_comparison",
+        })
+    );
+    // Same shader source and buffers; alternate runtime-format and specialized
+    // PSOs in one process. F32 is generic ABI coverage, not a model FFN binding.
     for format in [
         GgufBlockFormat::Q3K,
         GgufBlockFormat::Iq3S,
@@ -437,7 +467,7 @@ fn native_quantized_decode_dispatch_microbench() {
                     };
                     let samples = measure_case_with_rounds(
                         &case,
-                        &[Dispatch::NativeGemv],
+                        &[Dispatch::NativeGemv, Dispatch::NativeSpecializedGemv],
                         &reference,
                         1,
                         8,
@@ -457,13 +487,15 @@ fn native_quantized_decode_dispatch_microbench() {
                             "weight_format": format.format_id(), "weight_bytes": weight_bytes.len(),
                             "rotating_weight_allocations": 1,
                             "gpu_buffer_bytes": weight_buffers[0].length() + input.length() + output.length(),
-                            "correctness_warmup_dispatches": 1, "additional_warmup_rounds": 1,
-                            "measured_rounds": 8, "dispatches_per_command": 1,
+                            "correctness_warmup_dispatches_per_variant": 1, "additional_warmup_rounds": 1,
+                            "measured_paired_rounds": 8, "dispatches_per_command": 1,
                             "oracle": "full_output_sparse_input_cpu_block_decode_each_command",
+                            "pair_preflight": "full_output_bitwise_comparison",
                             "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
+                            "final_output_dispatch": samples.last().map(|sample| sample["dispatch"].clone()),
                             "output_elements": reference.len(),
                             "scope": "single_hot_weight_buffer_native_GEMV_not_full_model_or_concurrent_requests",
-                            "comparison": "same_fixture_in_separately_frozen_baseline_and_candidate_builds",
+                            "comparison": "same_process_generic_vs_format_specialized_alternating_order",
                             "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
                             "samples": samples,
                         })
@@ -715,12 +747,41 @@ fn measure_case_with_rounds(
     measured_rounds: usize,
     dispatches_per_command: usize,
 ) -> Vec<serde_json::Value> {
+    let compare_native_variants = variants
+        .iter()
+        .any(|variant| matches!(variant, Dispatch::NativeGemv))
+        && variants
+            .iter()
+            .any(|variant| matches!(variant, Dispatch::NativeSpecializedGemv));
+    let mut native_reference: Option<Vec<u32>> = None;
     for &dispatch in variants {
         // A skipped write must not inherit a correct result from the previous
         // variant. Reset outside all measured command-buffer intervals.
         case.poison_output();
         case.run(dispatch, 1);
         case.validate(reference);
+        if compare_native_variants
+            && matches!(
+                dispatch,
+                Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv
+            )
+        {
+            let bits = read_linear_values(case.output, reference.len(), case.activation_type)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            if let Some(expected) = &native_reference {
+                for (index, (actual, expected)) in bits.iter().zip(expected).enumerate() {
+                    assert_eq!(
+                        actual, expected,
+                        "{} {:?} rows={} native GEMV output[{index}]",
+                        case.shape.name, case.activation_type, case.rows
+                    );
+                }
+            } else {
+                native_reference = Some(bits);
+            }
+        }
     }
     for _ in 0..warmup_rounds {
         for &dispatch in variants {
