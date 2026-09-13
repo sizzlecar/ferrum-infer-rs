@@ -1,6 +1,8 @@
 use std::ffi::c_void;
 use std::fmt::Write;
 
+use ferrum_interfaces::vnext::ElementType;
+
 use metal::{
     CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, FunctionConstantValues,
     MTLDataType,
@@ -39,10 +41,68 @@ struct NativeGemvPipelines {
     f32: ComputePipelineState,
 }
 
+struct NativeSharedPipelines {
+    formats: Vec<(GgufBlockFormat, ElementType, [ComputePipelineState; 3])>,
+}
+
+impl NativeSharedPipelines {
+    fn new(device: &Device, library: &metal::LibraryRef) -> Result<Self, MetalDeviceRuntimeError> {
+        let batch = |format: GgufBlockFormat, suffix, rows| {
+            format_pipeline(
+                device,
+                library,
+                &format!("vnext_native_shared_linear_{suffix}_b{rows}"),
+                format.ggml_type_id(),
+            )
+        };
+        // Standard Q4/Q5/Q6/Q8 F16 linears retain their dedicated kernels.
+        // Q5 F32 is the one standard format using native_linear.
+        let mut formats = Vec::new();
+        for format in [
+            GgufBlockFormat::Q3K,
+            GgufBlockFormat::Iq3S,
+            GgufBlockFormat::Iq4Nl,
+            GgufBlockFormat::Iq4Xs,
+            GgufBlockFormat::Q5K,
+        ] {
+            for (dtype, suffix) in [(ElementType::F16, "f16"), (ElementType::F32, "f32")] {
+                if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
+                    continue;
+                }
+                formats.push((
+                    format,
+                    dtype,
+                    [
+                        batch(format, suffix, 2)?,
+                        batch(format, suffix, 3)?,
+                        batch(format, suffix, 4)?,
+                    ],
+                ));
+            }
+        }
+        Ok(Self { formats })
+    }
+
+    fn pipeline(
+        &self,
+        format: GgufBlockFormat,
+        rows: u32,
+        activation_type: ElementType,
+    ) -> Option<&ComputePipelineState> {
+        let index = rows.checked_sub(2)? as usize;
+        let (_, _, batches) = self
+            .formats
+            .iter()
+            .find(|(candidate, dtype, _)| *candidate == format && *dtype == activation_type)?;
+        batches.get(index)
+    }
+}
+
 #[cfg(test)]
 pub(super) struct NativePipelineInitialization {
     pub(super) library_ns: u64,
     pub(super) specialized_gemv_ns: u64,
+    pub(super) shared_gemv_ns: u64,
     pub(super) generic_gemv_ns: u64,
 }
 
@@ -55,6 +115,7 @@ pub(super) struct MetalNativeBlockPipelines {
     iq3_s: NativeGemvPipelines,
     iq4_nl: NativeGemvPipelines,
     iq4_xs: NativeGemvPipelines,
+    shared: NativeSharedPipelines,
     pub(super) gemm_f16_f32: ComputePipelineState,
     #[cfg(test)]
     pub(super) generic_linear_f16: ComputePipelineState,
@@ -101,24 +162,8 @@ impl MetalNativeBlockPipelines {
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(MetalDeviceRuntimeError::contract)
         };
-        let gemv_pipeline = |name: &str, format: u32| {
-            let constants = FunctionConstantValues::new();
-            constants.set_constant_value_at_index(
-                &format as *const u32 as *const c_void,
-                MTLDataType::UInt,
-                0,
-            );
-            let function = library
-                .get_function(name, Some(constants))
-                .map_err(|error| {
-                    MetalDeviceRuntimeError::contract(format!(
-                        "specialize native GGUF GEMV `{name}` format={format}: {error}"
-                    ))
-                })?;
-            device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(MetalDeviceRuntimeError::contract)
-        };
+        let gemv_pipeline =
+            |name: &str, format: u32| format_pipeline(device, &library, name, format);
         let specialized = |format: GgufBlockFormat| {
             Ok::<_, MetalDeviceRuntimeError>(NativeGemvPipelines {
                 f16: gemv_pipeline("vnext_native_block_linear_f16", format.ggml_type_id())?,
@@ -139,6 +184,11 @@ impl MetalNativeBlockPipelines {
         let iq4_xs = specialized(GgufBlockFormat::Iq4Xs)?;
         #[cfg(test)]
         let specialized_gemv_ns = specialized_started.elapsed().as_nanos() as u64;
+        #[cfg(test)]
+        let shared_started = std::time::Instant::now();
+        let shared = NativeSharedPipelines::new(device, &library)?;
+        #[cfg(test)]
+        let shared_gemv_ns = shared_started.elapsed().as_nanos() as u64;
         // Zero is not a GGUF type supported by this decoder. It preserves the
         // runtime-format control only in conformance and performance tests.
         #[cfg(test)]
@@ -158,6 +208,7 @@ impl MetalNativeBlockPipelines {
             iq3_s,
             iq4_nl,
             iq4_xs,
+            shared,
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
             #[cfg(test)]
             generic_linear_f16,
@@ -167,6 +218,7 @@ impl MetalNativeBlockPipelines {
             initialization: NativePipelineInitialization {
                 library_ns,
                 specialized_gemv_ns,
+                shared_gemv_ns,
                 generic_gemv_ns,
             },
             #[cfg(test)]
@@ -194,6 +246,39 @@ impl MetalNativeBlockPipelines {
     pub(super) fn linear_f32(&self, format: GgufBlockFormat) -> &ComputePipelineState {
         &self.gemv(format).f32
     }
+
+    pub(super) fn shared_linear(
+        &self,
+        format: GgufBlockFormat,
+        rows: u32,
+        activation_type: ElementType,
+    ) -> Option<&ComputePipelineState> {
+        self.shared.pipeline(format, rows, activation_type)
+    }
+}
+
+fn format_pipeline(
+    device: &Device,
+    library: &metal::LibraryRef,
+    name: &str,
+    format: u32,
+) -> Result<ComputePipelineState, MetalDeviceRuntimeError> {
+    let constants = FunctionConstantValues::new();
+    constants.set_constant_value_at_index(
+        &format as *const u32 as *const c_void,
+        MTLDataType::UInt,
+        0,
+    );
+    let function = library
+        .get_function(name, Some(constants))
+        .map_err(|error| {
+            MetalDeviceRuntimeError::contract(format!(
+                "specialize native GGUF GEMV `{name}` format={format}: {error}"
+            ))
+        })?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalDeviceRuntimeError::contract)
 }
 
 pub(super) fn bind_native_block(

@@ -199,6 +199,61 @@ kernel void vnext_native_block_linear_f32(
     native_linear(x, w, y, p, b, group, lane, subgroup);
 }
 
+// Decode one coefficient for all B independent rows without rounding the
+// weight to half. The typed selector restricts this path to small batches.
+// Each row retains native_linear's lane/column order and FP32 SIMD reduction.
+template<typename T, ushort B>
+static inline void native_shared_linear(
+    device const T * input, device const uchar * weight, device T * output,
+    constant NativeLinearParams & p, constant NativeBlockParams & block,
+    uint group, uint lane, uint subgroup) {
+    const uint first = group * 4 + subgroup * 2;
+    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint blocks_per_row = p.in_features >> block_shift;
+    // Complete each independent output before starting the next, keeping only
+    // B independent accumulator variables live across the column loop.
+    #pragma clang loop unroll(disable)
+    for (ushort part = 0; part < 2; ++part) {
+        const uint out_col = first + part;
+        if (out_col >= p.out_features) continue;
+        float sums[B] = {};
+        for (uint col = lane; col < p.in_features; col += 32) {
+            const uint block_index = col >> block_shift;
+            const uint in_block = col & (block.values - 1);
+            const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+            const float w = native_block_value(weight + offset, in_block, NATIVE_GEMV_FORMAT);
+            #pragma clang loop unroll(full)
+            for (ushort batch = 0; batch < B; ++batch) {
+                const float x = float(input[ulong(batch) * p.in_features + col]);
+                sums[batch] += x * w;
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (ushort batch = 0; batch < B; ++batch) {
+            const float value = simd_sum(sums[batch]);
+            if (lane == 0) {
+                output[ulong(batch) * p.output_stride + p.output_column_offset + out_col] = T(value);
+            }
+        }
+    }
+}
+
+#define NATIVE_SHARED_LINEAR(T, SUFFIX, B) \
+kernel void vnext_native_shared_linear_##SUFFIX##_b##B( \
+    device const T * x [[buffer(0)]], device const uchar * w [[buffer(1)]], device T * y [[buffer(2)]], \
+    constant NativeLinearParams & p [[buffer(3)]], constant NativeBlockParams & b [[buffer(4)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint subgroup [[simdgroup_index_in_threadgroup]]) { \
+    if (p.rows != B) return; \
+    native_shared_linear<T, B>(x, w, y, p, b, group.x, lane, subgroup); \
+}
+NATIVE_SHARED_LINEAR(half, f16, 2)
+NATIVE_SHARED_LINEAR(half, f16, 3)
+NATIVE_SHARED_LINEAR(half, f16, 4)
+NATIVE_SHARED_LINEAR(float, f32, 2)
+NATIVE_SHARED_LINEAR(float, f32, 3)
+NATIVE_SHARED_LINEAR(float, f32, 4)
+#undef NATIVE_SHARED_LINEAR
+
 // One 32-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.

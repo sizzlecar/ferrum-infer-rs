@@ -16,11 +16,110 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
     let device = Device::system_default().expect("native block linear conformance requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
+    assert_native_linears(&device, &pipelines, &queue, false, 7);
+}
+
+#[test]
+fn native_shared_linears_preserve_independent_rows_offsets_and_precision() {
+    let device = Device::system_default().expect("native shared linears require Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    for output_width in [7, 1025] {
+        assert_native_linears(&device, &pipelines, &queue, true, output_width);
+    }
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+        GgufBlockFormat::Q5K,
+    ] {
+        for dtype in [ElementType::F16, ElementType::F32] {
+            if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
+                continue;
+            }
+            let physical = if format == GgufBlockFormat::Q5K {
+                LinearPhysicalFormat::Q5K
+            } else {
+                LinearPhysicalFormat::Native(format)
+            };
+            for rows in [0, 1, 2, 3, 4, 5, 7, 8, 31, 32] {
+                assert_eq!(
+                    pipelines
+                        .native
+                        .shared_linear(format, rows, dtype)
+                        .is_some(),
+                    (2..=4).contains(&rows),
+                );
+                for output_width in [1023, 1024] {
+                    let (_, kind) = if dtype == ElementType::F16 {
+                        pipelines.linear_pipeline(physical, rows, output_width)
+                    } else {
+                        pipelines
+                            .f32_linear_dispatch(physical, rows, output_width)
+                            .unwrap()
+                    };
+                    let expected = if (2..=4).contains(&rows) && output_width >= 1024 {
+                        LinearDispatchKind::SharedWeightGemv
+                    } else if dtype == ElementType::F16 && rows >= 32 && output_width >= 1024 {
+                        LinearDispatchKind::NativeTiledGemm
+                    } else {
+                        LinearDispatchKind::CooperativeGemv
+                    };
+                    assert_eq!(
+                        kind, expected,
+                        "{format:?} {dtype:?} B{rows} N{output_width}"
+                    );
+                }
+            }
+        }
+    }
+    for format in [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q5K,
+        GgufBlockFormat::Q6K,
+        GgufBlockFormat::Q8_0,
+    ] {
+        assert!(pipelines
+            .native
+            .shared_linear(format, 3, ElementType::F16)
+            .is_none());
+    }
+    for format in [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q6K,
+        GgufBlockFormat::Q8_0,
+    ] {
+        assert!(pipelines
+            .native
+            .shared_linear(format, 3, ElementType::F32)
+            .is_none());
+    }
+}
+
+fn assert_native_linears(
+    device: &Device,
+    pipelines: &MetalLinearPipelines,
+    queue: &CommandQueueRef,
+    shared: bool,
+    output_width: usize,
+) {
     for format in FORMATS {
         let blocks = oracle_blocks(format);
+        // Five blocks exercise both 32- and 256-value formats without assuming
+        // a multiple-of-four block count in the shared kernel.
+        let blocks = if shared {
+            blocks
+                .chunks_exact(format.block_bytes())
+                .cycle()
+                .take(5)
+                .flat_map(|block| block.iter().copied())
+                .collect::<Vec<_>>()
+        } else {
+            blocks
+        };
         let input_width = blocks.len() / format.block_bytes() * format.block_values();
-        let output_width = 7;
-        let output_stride = 11;
+        let output_stride = output_width + 4;
         let mut weight_bytes = vec![0x55_u8; 16];
         let block_rows: Vec<Vec<u8>> = (0..output_width)
             .map(|row| {
@@ -40,9 +139,17 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
                 values
             })
             .collect();
-        let weight = buffer(&device, &weight_bytes);
-        for rows in [1, 3, 9] {
+        let weight = buffer(device, &weight_bytes);
+        for rows in if shared { [2, 3, 4] } else { [1, 3, 9] } {
             for activation_type in [ElementType::F16, ElementType::F32] {
+                if shared
+                    && pipelines
+                        .native
+                        .shared_linear(format, rows as u32, activation_type)
+                        .is_none()
+                {
+                    continue;
+                }
                 // F32 inputs deliberately contain values not representable
                 // in F16, so an accidental narrowing changes this oracle.
                 let input: Vec<f32> = (0..rows * input_width)
@@ -62,7 +169,7 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
                 padded_input.extend_from_slice(&input);
                 let input_buffer = if activation_type == ElementType::F16 {
                     buffer(
-                        &device,
+                        device,
                         &padded_input
                             .iter()
                             .copied()
@@ -70,13 +177,13 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
                             .collect::<Vec<_>>(),
                     )
                 } else {
-                    buffer(&device, &padded_input)
+                    buffer(device, &padded_input)
                 };
                 let total = prefix + rows * output_stride + prefix;
                 let output = if activation_type == ElementType::F16 {
-                    buffer(&device, &vec![f16::from_f32(-123.0); total])
+                    buffer(device, &vec![f16::from_f32(-123.0); total])
                 } else {
-                    buffer(&device, &vec![-123.0_f32; total])
+                    buffer(device, &vec![-123.0_f32; total])
                 };
                 // Q5 F32 exercises the production selector added for its
                 // formerly missing master-precision projection kernel.
@@ -93,30 +200,90 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
                     output_stride: output_stride as u32,
                     output_column_offset: 2,
                 };
-                let command = queue.new_command_buffer();
-                let encoder = command.new_compute_command_encoder();
-                let (pipeline, kind) = if activation_type == ElementType::F16 {
-                    pipelines.linear_pipeline(physical, params.rows, params.out_features)
+                // Keep the comparison explicitly on the original format-specialized
+                // per-row PSO, even when the production selector chooses shared.
+                let pipeline = if activation_type == ElementType::F16 {
+                    pipelines.native.linear_f16(format)
                 } else {
-                    (
-                        pipelines.f32_linear_pipeline(physical).unwrap(),
-                        LinearDispatchKind::CooperativeGemv,
-                    )
+                    pipelines.native.linear_f32(format)
                 };
-                encoder.set_compute_pipeline_state(pipeline);
-                encoder.set_buffer(0, Some(&input_buffer), 16);
-                encoder.set_buffer(1, Some(&weight), 16);
-                encoder.set_buffer(2, Some(&output), 16);
-                bind_linear_params(encoder, params, physical, activation_type);
-                dispatch_linear_grid(encoder, params, kind);
-                encoder.end_encoding();
-                command.commit();
-                command.wait_until_completed();
-                assert_eq!(
-                    command.status(),
-                    MTLCommandBufferStatus::Completed,
-                    "{format:?} {activation_type:?}"
-                );
+                let kind = LinearDispatchKind::CooperativeGemv;
+                let execute = |pipeline: &metal::ComputePipelineState, kind| {
+                    let command = queue.new_command_buffer();
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(pipeline);
+                    encoder.set_buffer(0, Some(&input_buffer), 16);
+                    encoder.set_buffer(1, Some(&weight), 16);
+                    encoder.set_buffer(2, Some(&output), 16);
+                    bind_linear_params(encoder, params, physical, activation_type);
+                    dispatch_linear_grid(encoder, params, kind);
+                    encoder.end_encoding();
+                    command.commit();
+                    command.wait_until_completed();
+                    assert_eq!(
+                        command.status(),
+                        MTLCommandBufferStatus::Completed,
+                        "{format:?} {activation_type:?}"
+                    );
+                };
+                execute(pipeline, kind);
+                if shared {
+                    // SAFETY: the previous command completed; all buffers are
+                    // shared, fully sized, and retained until both runs finish.
+                    let bytes = |buffer: &Buffer| unsafe {
+                        std::slice::from_raw_parts(
+                            buffer.contents().cast::<u8>(),
+                            buffer.length() as usize,
+                        )
+                        .to_vec()
+                    };
+                    let baseline = bytes(&output);
+                    let input_before = bytes(&input_buffer);
+                    let weight_before = bytes(&weight);
+                    let selected = if activation_type == ElementType::F16 {
+                        pipelines.linear_pipeline(physical, params.rows, params.out_features)
+                    } else {
+                        pipelines
+                            .f32_linear_dispatch(physical, params.rows, params.out_features)
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        selected.1 == LinearDispatchKind::SharedWeightGemv,
+                        output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES as usize
+                    );
+                    let (shared_pipeline, dispatch) =
+                        if selected.1 == LinearDispatchKind::SharedWeightGemv {
+                            selected
+                        } else {
+                            // Exercise the output tail directly below the selector's
+                            // profitability floor without changing that floor.
+                            (
+                                pipelines
+                                    .native
+                                    .shared_linear(format, params.rows, activation_type)
+                                    .unwrap(),
+                                LinearDispatchKind::SharedWeightGemv,
+                            )
+                        };
+                    // Poison only writable output cells; a missing shared
+                    // write cannot pass by inheriting the baseline's result.
+                    unsafe {
+                        for row in 0..rows {
+                            for column in 0..output_width {
+                                let index = prefix + row * output_stride + 2 + column;
+                                if activation_type == ElementType::F16 {
+                                    *output.contents().cast::<f16>().add(index) = f16::NAN;
+                                } else {
+                                    *output.contents().cast::<f32>().add(index) = f32::NAN;
+                                }
+                            }
+                        }
+                    }
+                    execute(shared_pipeline, dispatch);
+                    assert_eq!(bytes(&output), baseline, "shared kernel changed per-row result/guards: {format:?} {activation_type:?} B{rows}");
+                    assert_eq!(bytes(&input_buffer), input_before);
+                    assert_eq!(bytes(&weight), weight_before);
+                }
                 // SAFETY: Shared, correctly sized aligned buffers; the GPU
                 // completed all writes and the buffers remain owned here.
                 let actual: Vec<f32> = if activation_type == ElementType::F16 {

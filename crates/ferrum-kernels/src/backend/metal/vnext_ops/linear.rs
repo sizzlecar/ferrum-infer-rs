@@ -175,6 +175,12 @@ impl MetalLinearPipelines {
             if let Some(pipeline) = self.small_batch.pipeline(format, rows) {
                 return (pipeline, LinearDispatchKind::SharedWeightGemv);
             }
+            if let Some(pipeline) = format
+                .native_block(ElementType::F16)
+                .and_then(|format| self.native.shared_linear(format, rows, ElementType::F16))
+            {
+                return (pipeline, LinearDispatchKind::SharedWeightGemv);
+            }
         }
         let tiled = rows >= QUANTIZED_TILED_GEMM_MIN_ROWS;
         match (format, tiled) {
@@ -240,6 +246,12 @@ impl MetalLinearPipelines {
     ) -> Option<(&ComputePipelineState, LinearDispatchKind)> {
         if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
             if let Some(pipeline) = self.small_batch.f32_pipeline(format, rows) {
+                return Some((pipeline, LinearDispatchKind::SharedWeightGemv));
+            }
+            if let Some(pipeline) = format
+                .native_block(ElementType::F32)
+                .and_then(|format| self.native.shared_linear(format, rows, ElementType::F32))
+            {
                 return Some((pipeline, LinearDispatchKind::SharedWeightGemv));
             }
         }

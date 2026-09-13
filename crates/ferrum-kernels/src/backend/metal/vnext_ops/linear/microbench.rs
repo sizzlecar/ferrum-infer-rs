@@ -81,6 +81,7 @@ enum Dispatch {
     SharedWeight,
     NativeGemv,
     NativeSpecializedGemv,
+    NativeSharedGemv,
     NativeGemm,
 }
 
@@ -237,6 +238,18 @@ impl Case<'_> {
             output_column_offset: 0,
         };
         let (pipeline, kind) = match (dispatch, self.shape.format, self.activation_type) {
+            (Dispatch::NativeSharedGemv, format, activation_type) => {
+                let selected = if activation_type == ElementType::F16 {
+                    self.pipelines
+                        .linear_pipeline(physical(format), self.rows, self.shape.output)
+                } else {
+                    self.pipelines
+                        .f32_linear_dispatch(physical(format), self.rows, self.shape.output)
+                        .unwrap()
+                };
+                assert_eq!(selected.1, LinearDispatchKind::SharedWeightGemv);
+                selected
+            }
             (Dispatch::NativeGemv, _, ElementType::F16) => (
                 &self.pipelines.native.generic_linear_f16,
                 LinearDispatchKind::CooperativeGemv,
@@ -317,7 +330,10 @@ impl Case<'_> {
                 params,
                 if matches!(
                     dispatch,
-                    Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv | Dispatch::NativeGemm
+                    Dispatch::NativeGemv
+                        | Dispatch::NativeSpecializedGemv
+                        | Dispatch::NativeSharedGemv
+                        | Dispatch::NativeGemm
                 ) {
                     LinearPhysicalFormat::Native(self.shape.format)
                 } else {
@@ -398,6 +414,16 @@ fn quantized_q5_shared_weight_microbench() {
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_quantized_decode_dispatch_microbench() {
+    measure_native_decode(false);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_shared_weight_decode_microbench() {
+    measure_native_decode(true);
+}
+
+fn measure_native_decode(shared_weights: bool) {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
     let initialization_started = Instant::now();
@@ -413,18 +439,28 @@ fn native_quantized_decode_dispatch_microbench() {
             "specialized_gemv_pipeline_count": 16,
             "test_generic_gemv_host_ns": pipelines.native.initialization.generic_gemv_ns,
             "test_generic_gemv_pipeline_count": 2,
+            "shared_gemv_host_ns": pipelines.native.initialization.shared_gemv_ns,
+            "shared_gemv_pipeline_count": 27,
             "scope": "one_test_registry_initialization_including_generic_controls_not_old_new_startup_comparison",
         })
     );
-    // Same shader source and buffers; alternate runtime-format and specialized
-    // PSOs in one process. F32 is generic ABI coverage, not a model FFN binding.
-    for format in [
+    // Controls use explicit per-row PSOs, never the production selector.
+    // F32 is generic ABI coverage, not a model FFN binding.
+    let mut formats = vec![
         GgufBlockFormat::Q3K,
         GgufBlockFormat::Iq3S,
         GgufBlockFormat::Iq4Nl,
         GgufBlockFormat::Iq4Xs,
-    ] {
-        for (input_width, output_width) in [(5120, 17408), (17408, 5120)] {
+    ];
+    if shared_weights {
+        formats.push(GgufBlockFormat::Q5K);
+    }
+    let mut shapes = vec![(5120, 17408), (17408, 5120)];
+    if shared_weights {
+        shapes.push((1280, 1025));
+    }
+    for format in formats {
+        for &(input_width, output_width) in &shapes {
             let shape = Shape {
                 name: "native_decode_projection",
                 input: input_width,
@@ -433,8 +469,17 @@ fn native_quantized_decode_dispatch_microbench() {
             };
             let weight_bytes = weights(shape);
             let weight_buffers = [buffer(&device, &weight_bytes)];
-            for rows in [1, 3] {
+            let row_counts: &[usize] = if shared_weights { &[2, 3, 4] } else { &[1, 3] };
+            for &rows in row_counts {
                 for activation_type in [ElementType::F16, ElementType::F32] {
+                    if shared_weights
+                        && pipelines
+                            .native
+                            .shared_linear(format, rows as u32, activation_type)
+                            .is_none()
+                    {
+                        continue;
+                    }
                     let (input_values, mut nonzero) = inputs(rows, shape.input as usize);
                     let (input, output) = if activation_type == ElementType::F16 {
                         (
@@ -465,14 +510,12 @@ fn native_quantized_decode_dispatch_microbench() {
                         weights: &weight_buffers,
                         output: &output,
                     };
-                    let samples = measure_case_with_rounds(
-                        &case,
-                        &[Dispatch::NativeGemv, Dispatch::NativeSpecializedGemv],
-                        &reference,
-                        1,
-                        8,
-                        1,
-                    );
+                    let variants = if shared_weights {
+                        [Dispatch::NativeSpecializedGemv, Dispatch::NativeSharedGemv]
+                    } else {
+                        [Dispatch::NativeGemv, Dispatch::NativeSpecializedGemv]
+                    };
+                    let samples = measure_case_with_rounds(&case, &variants, &reference, 1, 8, 1);
                     let mut output_digest = Sha256::new();
                     for value in read_linear_values(&output, reference.len(), activation_type) {
                         output_digest.update(value.to_bits().to_le_bytes());
@@ -480,7 +523,7 @@ fn native_quantized_decode_dispatch_microbench() {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "kind": "metal_native_quantized_decode_dispatch_microbench",
+                            "kind": if shared_weights { "metal_native_shared_weight_decode_microbench" } else { "metal_native_quantized_decode_dispatch_microbench" },
                             "device": device.name(), "rows": rows,
                             "input_features": shape.input, "output_features": shape.output,
                             "activation_type": format!("{activation_type:?}"),
@@ -495,7 +538,7 @@ fn native_quantized_decode_dispatch_microbench() {
                             "final_output_dispatch": samples.last().map(|sample| sample["dispatch"].clone()),
                             "output_elements": reference.len(),
                             "scope": "single_hot_weight_buffer_native_GEMV_not_full_model_or_concurrent_requests",
-                            "comparison": "same_process_generic_vs_format_specialized_alternating_order",
+                            "comparison": if shared_weights { "same_process_specialized_vs_production_shared_alternating_order" } else { "same_process_generic_vs_format_specialized_alternating_order" },
                             "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
                             "samples": samples,
                         })
@@ -822,7 +865,7 @@ fn measure_case_with_rounds(
 ) -> Vec<serde_json::Value> {
     let compare_native_variants = variants
         .iter()
-        .any(|variant| matches!(variant, Dispatch::NativeGemv))
+        .any(|variant| matches!(variant, Dispatch::NativeGemv | Dispatch::NativeSharedGemv))
         && variants
             .iter()
             .any(|variant| matches!(variant, Dispatch::NativeSpecializedGemv));
@@ -836,7 +879,7 @@ fn measure_case_with_rounds(
         if compare_native_variants
             && matches!(
                 dispatch,
-                Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv
+                Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv | Dispatch::NativeSharedGemv
             )
         {
             let bits = read_linear_values(case.output, reference.len(), case.activation_type)
@@ -999,7 +1042,12 @@ fn q5_shared_weight_selection_preserves_shape_and_f32_boundaries() {
                     .f32_linear_dispatch(LinearPhysicalFormat::Q5K, rows, output_width)
                     .unwrap()
                     .1,
-                LinearDispatchKind::CooperativeGemv,
+                if (2..=4).contains(&rows) && output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES
+                {
+                    LinearDispatchKind::SharedWeightGemv
+                } else {
+                    LinearDispatchKind::CooperativeGemv
+                },
                 "F32 rows={rows} out={output_width}",
             );
         }
