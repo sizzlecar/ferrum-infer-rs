@@ -17,7 +17,7 @@ fn native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_meta
     let device = Device::system_default().expect("native block linear conformance requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    assert_native_linears(&device, &pipelines, &queue, false, 7);
+    assert_native_linears(&device, &pipelines, &queue, false, 7, &FORMATS);
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn native_shared_linears_preserve_independent_rows_offsets_and_precision() {
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
     for output_width in [7, 1025] {
-        assert_native_linears(&device, &pipelines, &queue, true, output_width);
+        assert_native_linears(&device, &pipelines, &queue, true, output_width, &FORMATS);
     }
     for format in [
         GgufBlockFormat::Q3K,
@@ -98,14 +98,44 @@ fn native_shared_linears_preserve_independent_rows_offsets_and_precision() {
     }
 }
 
+#[test]
+fn native_iq4xs_block_header_candidate_matches_generic_and_cpu() {
+    let device = Device::system_default().expect("IQ4_XS header conformance requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    // This focused contract must execute each affected shared variant. The
+    // all-format helper may skip unsupported combinations for other formats.
+    for rows in [2, 3, 4] {
+        for activation_type in [ElementType::F16, ElementType::F32] {
+            pipelines
+                .native
+                .shared_linear(GgufBlockFormat::Iq4Xs, rows, activation_type)
+                .expect("IQ4_XS header conformance requires the shared PSO");
+        }
+    }
+    for output_width in [7, 1025] {
+        for shared in [false, true] {
+            assert_native_linears(
+                &device,
+                &pipelines,
+                &queue,
+                shared,
+                output_width,
+                &[GgufBlockFormat::Iq4Xs],
+            );
+        }
+    }
+}
+
 fn assert_native_linears(
     device: &Device,
     pipelines: &MetalLinearPipelines,
     queue: &CommandQueueRef,
     shared: bool,
     output_width: usize,
+    formats: &[GgufBlockFormat],
 ) {
-    for format in FORMATS {
+    for &format in formats {
         let blocks = oracle_blocks(format);
         // Five blocks exercise both 32- and 256-value formats without assuming
         // a multiple-of-four block count in the shared kernel.
@@ -227,8 +257,20 @@ fn assert_native_linears(
                         "{format:?} {activation_type:?}"
                     );
                 };
-                execute(pipeline, kind);
-                if shared {
+                // FORMAT0 must stay on the pre-candidate scalar decoder. The
+                // IQ4_XS specialized and shared paths both change, so comparing
+                // only those two would not preserve an independent control.
+                let baseline_pipeline = if format == GgufBlockFormat::Iq4Xs {
+                    if activation_type == ElementType::F16 {
+                        &pipelines.native.generic_linear_f16
+                    } else {
+                        &pipelines.native.generic_linear_f32
+                    }
+                } else {
+                    pipeline
+                };
+                execute(baseline_pipeline, kind);
+                if shared || format == GgufBlockFormat::Iq4Xs {
                     // SAFETY: the previous command completed; all buffers are
                     // shared, fully sized, and retained until both runs finish.
                     let bytes = |buffer: &Buffer| unsafe {
@@ -248,24 +290,27 @@ fn assert_native_linears(
                             .f32_linear_dispatch(physical, params.rows, params.out_features)
                             .unwrap()
                     };
-                    assert_eq!(
-                        selected.1 == LinearDispatchKind::SharedWeightGemv,
-                        output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES as usize
-                    );
-                    let (shared_pipeline, dispatch) =
-                        if selected.1 == LinearDispatchKind::SharedWeightGemv {
-                            selected
-                        } else {
-                            // Exercise the output tail directly below the selector's
-                            // profitability floor without changing that floor.
-                            (
-                                pipelines
-                                    .native
-                                    .shared_linear(format, params.rows, activation_type)
-                                    .unwrap(),
-                                LinearDispatchKind::SharedWeightGemv,
-                            )
-                        };
+                    if shared {
+                        assert_eq!(
+                            selected.1 == LinearDispatchKind::SharedWeightGemv,
+                            output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES as usize
+                        );
+                    }
+                    let (shared_pipeline, dispatch) = if !shared {
+                        (pipeline, kind)
+                    } else if selected.1 == LinearDispatchKind::SharedWeightGemv {
+                        selected
+                    } else {
+                        // Exercise the output tail directly below the selector's
+                        // profitability floor without changing that floor.
+                        (
+                            pipelines
+                                .native
+                                .shared_linear(format, params.rows, activation_type)
+                                .unwrap(),
+                            LinearDispatchKind::SharedWeightGemv,
+                        )
+                    };
                     // Poison only writable output cells; a missing shared
                     // write cannot pass by inheriting the baseline's result.
                     unsafe {
@@ -281,7 +326,7 @@ fn assert_native_linears(
                         }
                     }
                     execute(shared_pipeline, dispatch);
-                    assert_eq!(bytes(&output), baseline, "shared kernel changed per-row result/guards: {format:?} {activation_type:?} B{rows}");
+                    assert_eq!(bytes(&output), baseline, "native kernel changed per-row result/guards: {format:?} {activation_type:?} B{rows} shared={shared}");
                     assert_eq!(bytes(&input_buffer), input_before);
                     assert_eq!(bytes(&weight), weight_before);
                 }

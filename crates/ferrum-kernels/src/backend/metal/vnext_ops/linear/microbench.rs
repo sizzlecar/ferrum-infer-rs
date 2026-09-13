@@ -443,16 +443,32 @@ fn quantized_q5_shared_weight_microbench() {
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_quantized_decode_dispatch_microbench() {
-    measure_native_decode(false);
+    measure_native_decode(false, None);
 }
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_shared_weight_decode_microbench() {
-    measure_native_decode(true);
+    measure_native_decode(true, None);
 }
 
-fn measure_native_decode(shared_weights: bool) {
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_iq4xs_block_header_candidate_microbench() {
+    // Run this same four-cell entry on the bench-only base and candidate.
+    // Generic versus specialized/shared within one build also includes earlier
+    // optimizations; that ratio alone cannot isolate the header change.
+    measure_native_decode(false, Some(&[1, 3]));
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_iq4xs_block_header_b2_microbench() {
+    measure_native_decode(false, Some(&[2]));
+}
+
+fn measure_native_decode(shared_weights: bool, iq4xs_header_rows: Option<&[usize]>) {
+    let iq4xs_header = iq4xs_header_rows.is_some();
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
     let initialization_started = Instant::now();
@@ -484,6 +500,9 @@ fn measure_native_decode(shared_weights: bool) {
     if shared_weights {
         formats.push(GgufBlockFormat::Q5K);
     }
+    if iq4xs_header {
+        formats.retain(|format| *format == GgufBlockFormat::Iq4Xs);
+    }
     let mut shapes = vec![(5120, 17408), (17408, 5120)];
     if shared_weights {
         shapes.push((1280, 1025));
@@ -498,9 +517,13 @@ fn measure_native_decode(shared_weights: bool) {
             };
             let weight_bytes = weights(shape);
             let weight_buffers = [buffer(&device, &weight_bytes)];
-            let row_counts: &[usize] = if shared_weights { &[2, 3, 4] } else { &[1, 3] };
+            let row_counts =
+                iq4xs_header_rows.unwrap_or(if shared_weights { &[2, 3, 4] } else { &[1, 3] });
             for &rows in row_counts {
                 for activation_type in [ElementType::F16, ElementType::F32] {
+                    if iq4xs_header && activation_type != ElementType::F16 {
+                        continue;
+                    }
                     if shared_weights
                         && pipelines
                             .native
@@ -539,12 +562,29 @@ fn measure_native_decode(shared_weights: bool) {
                         weights: &weight_buffers,
                         output: &output,
                     };
-                    let variants = if shared_weights {
+                    let variants = if iq4xs_header {
+                        [
+                            Dispatch::NativeGemv,
+                            if rows == 1 {
+                                Dispatch::NativeSpecializedGemv
+                            } else {
+                                Dispatch::NativeSharedGemv
+                            },
+                        ]
+                    } else if shared_weights {
                         [Dispatch::NativeSpecializedGemv, Dispatch::NativeSharedGemv]
                     } else {
                         [Dispatch::NativeGemv, Dispatch::NativeSpecializedGemv]
                     };
-                    let samples = measure_case_with_rounds(&case, &variants, &reference, 1, 8, 1);
+                    let measured_rounds = if iq4xs_header { 2 } else { 8 };
+                    let samples = measure_case_with_rounds(
+                        &case,
+                        &variants,
+                        &reference,
+                        1,
+                        measured_rounds,
+                        1,
+                    );
                     let mut output_digest = Sha256::new();
                     for value in read_linear_values(&output, reference.len(), activation_type) {
                         output_digest.update(value.to_bits().to_le_bytes());
@@ -552,7 +592,7 @@ fn measure_native_decode(shared_weights: bool) {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "kind": if shared_weights { "metal_native_shared_weight_decode_microbench" } else { "metal_native_quantized_decode_dispatch_microbench" },
+                            "kind": if iq4xs_header { "metal_native_iq4xs_block_header_candidate_microbench" } else if shared_weights { "metal_native_shared_weight_decode_microbench" } else { "metal_native_quantized_decode_dispatch_microbench" },
                             "device": device.name(), "rows": rows,
                             "input_features": shape.input, "output_features": shape.output,
                             "activation_type": format!("{activation_type:?}"),
@@ -560,14 +600,15 @@ fn measure_native_decode(shared_weights: bool) {
                             "rotating_weight_allocations": 1,
                             "gpu_buffer_bytes": weight_buffers[0].length() + input.length() + output.length(),
                             "correctness_warmup_dispatches_per_variant": 1, "additional_warmup_rounds": 1,
-                            "measured_paired_rounds": 8, "dispatches_per_command": 1,
+                            "measured_paired_rounds": measured_rounds, "dispatches_per_command": 1,
                             "oracle": "full_output_sparse_input_cpu_block_decode_each_command",
                             "pair_preflight": "full_output_bitwise_comparison",
+                            "each_command_bitwise_comparison": true,
                             "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
                             "final_output_dispatch": samples.last().map(|sample| sample["dispatch"].clone()),
                             "output_elements": reference.len(),
                             "scope": "single_hot_weight_buffer_native_GEMV_not_full_model_or_concurrent_requests",
-                            "comparison": if shared_weights { "same_process_specialized_vs_production_shared_alternating_order" } else { "same_process_generic_vs_format_specialized_alternating_order" },
+                            "comparison": if iq4xs_header { "same_process_generic_control_vs_current_production_compare_identical_bench_on_base_and_candidate_builds" } else if shared_weights { "same_process_specialized_vs_production_shared_alternating_order" } else { "same_process_generic_vs_format_specialized_alternating_order" },
                             "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
                             "samples": samples,
                         })
@@ -928,12 +969,16 @@ fn measure_case_with_rounds(
         && variants
             .iter()
             .any(|variant| matches!(variant, Dispatch::NativeGemm));
-    let compare_native_variants = (variants
+    let compare_native_variants = variants
         .iter()
-        .any(|variant| matches!(variant, Dispatch::NativeGemv | Dispatch::NativeSharedGemv))
-        && variants
-            .iter()
-            .any(|variant| matches!(variant, Dispatch::NativeSpecializedGemv)))
+        .filter(|variant| {
+            matches!(
+                variant,
+                Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv | Dispatch::NativeSharedGemv
+            )
+        })
+        .count()
+        > 1
         || compare_m64_tiles;
     let mut native_reference: Option<Vec<u32>> = None;
     for &dispatch in variants {
@@ -974,7 +1019,7 @@ fn measure_case_with_rounds(
             case.poison_output();
             case.run(dispatch, dispatches_per_command);
             case.validate(reference);
-            if compare_m64_tiles {
+            if compare_native_variants {
                 case.validate_bits(native_reference.as_ref().unwrap());
             }
         }
@@ -990,7 +1035,7 @@ fn measure_case_with_rounds(
             // Full output validation is outside the timed command. This
             // checks each command's final output, not every repeated dispatch.
             case.validate(reference);
-            if compare_m64_tiles {
+            if compare_native_variants {
                 case.validate_bits(native_reference.as_ref().unwrap());
             }
             sample["round"] = serde_json::json!(round);

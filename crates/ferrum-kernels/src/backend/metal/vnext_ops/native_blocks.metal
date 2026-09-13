@@ -150,6 +150,24 @@ static inline void native_gemm_fragment16(
     }
 }
 
+// IQ4_XS has one half scale and six packed scale bytes per 256 values.
+// Keep only this header live; each g still evaluates (d * scale) * q in FP32.
+struct NativeIq4XsHeader { float d; uint scales_h; uint scales_l; };
+
+static inline NativeIq4XsHeader native_iq4xs_header(device const uchar * b) {
+    return {native_half(b, 0), uint(b[2]) | (uint(b[3]) << 8),
+        uint(b[4]) | (uint(b[5]) << 8) | (uint(b[6]) << 16) | (uint(b[7]) << 24)};
+}
+
+static inline float native_iq4xs_lane_value(
+    device const uchar * b, thread const NativeIq4XsHeader & header, uint g, uint lane) {
+    const uint lo = (header.scales_l >> (4 * g)) & 15;
+    const uint hi = (header.scales_h >> (2 * g)) & 3;
+    const int scale = int(lo | (hi << 4)) - 32;
+    const uint q = (b[8 + g * 16 + (lane & 15)] >> (4 * (lane >> 4))) & 15;
+    return (header.d * float(scale)) * float(iq4_nl_values[q]);
+}
+
 template<typename T>
 static inline void native_linear(
     device const T * input, device const uchar * weight, device T * output,
@@ -164,15 +182,45 @@ static inline void native_linear(
     const uint block_shift = block.values == 256 ? 8 : 5;
     const uint blocks_per_row = p.in_features >> block_shift;
     float sums[2] = {0.0f, 0.0f};
-    for (uint col = lane; col < p.in_features; col += 32) {
-        const float x = float(input[ulong(row) * p.in_features + col]);
-        const uint block_index = col >> block_shift;
-        const uint in_block = col & (block.values - 1);
-        for (uint part = 0; part < 2; ++part) {
-            const uint out_col = first + part;
-            if (out_col < p.out_features) {
-                const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
-                sums[part] += x * native_block_value(weight + offset, in_block, format);
+    if (NATIVE_GEMV_FORMAT == 23) {
+        // The typed IQ4_XS binding guarantees K % 256 == 0 and 136 bytes/block.
+        // g=0..7 is exactly the old per-lane col+=32 order. In particular, keep
+        // both outputs inside g so their input load remains shared.
+        for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+            NativeIq4XsHeader headers[2] = {};
+            #pragma clang loop unroll(full)
+            for (uint part = 0; part < 2; ++part) {
+                const uint out_col = first + part;
+                if (out_col < p.out_features) {
+                    const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                    headers[part] = native_iq4xs_header(weight + offset);
+                }
+            }
+            for (uint g = 0; g < 8; ++g) {
+                const uint col = block_index * 256 + g * 32 + lane;
+                const float x = float(input[ulong(row) * p.in_features + col]);
+                #pragma clang loop unroll(full)
+                for (uint part = 0; part < 2; ++part) {
+                    const uint out_col = first + part;
+                    if (out_col < p.out_features) {
+                        const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                        sums[part] += x * native_iq4xs_lane_value(weight + offset, headers[part], g, lane);
+                    }
+                }
+            }
+        }
+    } else {
+        // FORMAT0 remains the original scalar decoder, including IQ4_XS.
+        for (uint col = lane; col < p.in_features; col += 32) {
+            const float x = float(input[ulong(row) * p.in_features + col]);
+            const uint block_index = col >> block_shift;
+            const uint in_block = col & (block.values - 1);
+            for (uint part = 0; part < 2; ++part) {
+                const uint out_col = first + part;
+                if (out_col < p.out_features) {
+                    const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                    sums[part] += x * native_block_value(weight + offset, in_block, format);
+                }
             }
         }
     }
@@ -217,15 +265,32 @@ static inline void native_shared_linear(
         const uint out_col = first + part;
         if (out_col >= p.out_features) continue;
         float sums[B] = {};
-        for (uint col = lane; col < p.in_features; col += 32) {
-            const uint block_index = col >> block_shift;
-            const uint in_block = col & (block.values - 1);
-            const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
-            const float w = native_block_value(weight + offset, in_block, NATIVE_GEMV_FORMAT);
-            #pragma clang loop unroll(full)
-            for (ushort batch = 0; batch < B; ++batch) {
-                const float x = float(input[ulong(batch) * p.in_features + col]);
-                sums[batch] += x * w;
+        if (NATIVE_GEMV_FORMAT == 23) {
+            for (uint block_index = 0; block_index < blocks_per_row; ++block_index) {
+                const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                device const uchar * b = weight + offset;
+                const NativeIq4XsHeader header = native_iq4xs_header(b);
+                for (uint g = 0; g < 8; ++g) {
+                    const uint col = block_index * 256 + g * 32 + lane;
+                    const float w = native_iq4xs_lane_value(b, header, g, lane);
+                    #pragma clang loop unroll(full)
+                    for (ushort batch = 0; batch < B; ++batch) {
+                        const float x = float(input[ulong(batch) * p.in_features + col]);
+                        sums[batch] += x * w;
+                    }
+                }
+            }
+        } else {
+            for (uint col = lane; col < p.in_features; col += 32) {
+                const uint block_index = col >> block_shift;
+                const uint in_block = col & (block.values - 1);
+                const ulong offset = (ulong(out_col) * blocks_per_row + block_index) * block.bytes;
+                const float w = native_block_value(weight + offset, in_block, NATIVE_GEMV_FORMAT);
+                #pragma clang loop unroll(full)
+                for (ushort batch = 0; batch < B; ++batch) {
+                    const float x = float(input[ulong(batch) * p.in_features + col]);
+                    sums[batch] += x * w;
+                }
             }
         }
         #pragma clang loop unroll(full)
