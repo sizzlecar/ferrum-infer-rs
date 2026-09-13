@@ -985,16 +985,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }, |maintenance: CheckpointCapacityMaintenance<R>| async move {
                     let source = Arc::clone(&sequence.session);
                     let reaper = Arc::clone(&self.reaper);
+                    let resources = Arc::clone(&self.plan_resources);
                     self
                         .completion_worker
                         .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
                             // No capture guard survives in this owner. Budget
                             // and packing are rechecked by the resource layer,
-                            // without waiting for or reclaiming foreground work.
+                            // without waiting for foreground work. The resource
+                            // root explicitly permits reclaiming unreferenced
+                            // non-target chunks above committed use and minima.
                             source.write_release_capacity_sources(&mut Vec::new())
                                 .map_err(|error| FerrumError::backend(format!("capture source became unavailable before maintenance: {error}")))?;
                             let maintenance_started = Instant::now();
-                            let result = maintenance.try_maintain();
+                            let result = resources.try_maintain_checkpoint_with_idle_reclaim(maintenance);
                             reaper.record_checkpoint_cache_timing(
                                 CheckpointCacheTimingPhase::Maintenance,
                                 maintenance_started.elapsed(),

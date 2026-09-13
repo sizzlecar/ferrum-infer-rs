@@ -100,6 +100,12 @@ pub(in crate::vnext::resource) struct DynamicPoolRebalanceAttempt {
     pub(in crate::vnext::resource) rebalance: Option<DynamicPoolRebalanceReceipt>,
 }
 
+#[derive(Clone, Copy)]
+enum ReclaimTargetPolicy {
+    PreserveRunnableExtent,
+    PreserveAll,
+}
+
 impl<R> DynamicPoolSet<R>
 where
     R: DeviceRuntime,
@@ -216,6 +222,25 @@ where
         excluded_domains: &[CapacityDomainId],
         protected_immediate: &CapacityVector,
         protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
+    ) -> Result<DynamicPoolRebalanceAttempt, VNextError> {
+        self.reclaim_idle_chunks(
+            pressure,
+            capacity_availability,
+            excluded_domains,
+            protected_immediate,
+            protected_packing_envelopes,
+            ReclaimTargetPolicy::PreserveRunnableExtent,
+        )
+    }
+
+    fn reclaim_idle_chunks(
+        &self,
+        pressure: &DeviceCapacityPressure,
+        capacity_availability: DeviceCapacityAvailabilitySnapshot,
+        excluded_domains: &[CapacityDomainId],
+        protected_immediate: &CapacityVector,
+        protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
+        target_policy: ReclaimTargetPolicy,
     ) -> Result<DynamicPoolRebalanceAttempt, VNextError> {
         if pressure.device_id() != self.runtime.descriptor().id.to_string() {
             return Err(invalid_resource(
@@ -342,7 +367,10 @@ where
             // an otherwise idle pool at the device ceiling. Preserve the
             // largest old extent, including the runnable minimum, and only
             // offer redundant chunks when no physical or logical owner exists.
+            let may_replace_target =
+                matches!(target_policy, ReclaimTargetPolicy::PreserveRunnableExtent);
             let replacement_keeper = if growth_target
+                && may_replace_target
                 && !protected_packing_satisfied
                 && used == 0
                 && physically_occupied == 0
@@ -1549,6 +1577,103 @@ where
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.maintain_checkpoint_capacity_observed(requests, &mut None)
+    }
+
+    pub(in crate::vnext::resource) fn maintain_checkpoint_capacity_with_idle_reclaim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        let mut capacity_blocked = None;
+        match self.maintain_checkpoint_capacity_observed(requests, &mut capacity_blocked) {
+            Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
+                let blocked = capacity_blocked.as_ref().ok_or_else(|| {
+                    invalid_resource("checkpoint growth lost its device capacity observation")
+                })?;
+                // Use the entire certified byte plan, including target pools
+                // whose current free extents already suffice. Reclaiming those
+                // would invalidate capture's other claims on the next attempt.
+                let targets = requests
+                    .iter()
+                    .map(|request| request.domain.domain_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let attempt = self.reclaim_idle_chunks(
+                    &pressure,
+                    blocked.availability,
+                    &targets,
+                    &CapacityVector::empty(),
+                    &[],
+                    ReclaimTargetPolicy::PreserveAll,
+                )?;
+                tracing::debug!(
+                    coordinator_id = ?attempt.boundary.coordinator_id(),
+                    ?pressure,
+                    protected_target_domains = ?targets,
+                    reclaim_sufficient = attempt.boundary.reclaim_sufficient(),
+                    candidate_chunks = attempt.boundary.reclaim_candidate_chunks(),
+                    candidate_bytes = attempt.boundary.reclaim_candidate_bytes(),
+                    selected_bytes = attempt.boundary.selected_bytes(),
+                    reclaimed_bytes = attempt.rebalance.as_ref().map_or(0, |r| r.reclaimed_bytes()),
+                    reclaimed_chunks = attempt.rebalance.as_ref().map_or(0, |r| r.reclaimed_chunks()),
+                    "optional checkpoint idle reclaim evaluated"
+                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    for pool in attempt.boundary.pools() {
+                        let reclaimed_bytes = attempt
+                            .rebalance
+                            .as_ref()
+                            .and_then(|rebalance| {
+                                rebalance
+                                    .pools()
+                                    .iter()
+                                    .find(|reclaimed| reclaimed.pool_id() == pool.pool_id())
+                            })
+                            .map_or(0, |reclaimed| reclaimed.reclaimed_bytes());
+                        tracing::debug!(
+                            coordinator_id = ?attempt.boundary.coordinator_id(),
+                            domain = ?pool.domain_id(),
+                            pool_id = pool.pool_id().as_str(),
+                            excluded = pool.excluded_from_reclaim(),
+                            resident_bytes = pool.resident_bytes(),
+                            free_bytes = pool.free_bytes(),
+                            logical_used_bytes = pool.logical_used_bytes(),
+                            physical_live_bytes = pool.live_occupancy().total().physical_bytes(),
+                            pending_growth_bytes = pool.pending_growth_bytes(),
+                            resident_floor_bytes = pool.resident_floor_bytes(),
+                            bytes_above_floor = pool.reclaimable_bytes(),
+                            reclaimed_bytes,
+                            "optional checkpoint idle reclaim pool boundary"
+                        );
+                    }
+                }
+                let Some(rebalance) = attempt.rebalance else {
+                    return Err(VNextError::DeviceCapacityUnavailable(pressure));
+                };
+                // Recompute every target's packing from current state and
+                // reserve anew. A competitor or allocation failure can still
+                // reject this single retry; reclamation grants no capacity.
+                let mut receipt = self.maintain_checkpoint_capacity(requests)?;
+                tracing::debug!(
+                    coordinator_id = ?receipt.coordinator_id(),
+                    reclaimed_bytes = rebalance.reclaimed_bytes(),
+                    growths = ?receipt.growths(),
+                    "optional checkpoint idle reclaim followed by fresh growth"
+                );
+                receipt.rebalance = Some(rebalance);
+                receipt.maintenance_boundary = Some(attempt.boundary);
+                Ok(receipt)
+            }
+            result => result,
+        }
+    }
+
+    fn maintain_checkpoint_capacity_observed(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+        capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         self.validate_checkpoint_requests(requests)?;
         let mut by_pool = BTreeMap::<DynamicBackingPoolId, Vec<u64>>::new();
         for request in requests {
@@ -1607,7 +1732,7 @@ where
         }
         // RevalidatedDeferral recomputes demand after acquiring the existing
         // canonical maintenance locks. No stale free-space snapshot grants bytes.
-        self.maintain_pools_observed(intents, &mut None)
+        self.maintain_pools_observed(intents, capacity_blocked)
     }
 
     pub(in crate::vnext::resource) fn prepare_checkpoint_claim(

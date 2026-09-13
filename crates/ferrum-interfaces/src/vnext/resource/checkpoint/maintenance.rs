@@ -31,6 +31,33 @@ pub enum CheckpointCapacityMaintenanceOutcome {
     Skipped(CheckpointCapacityMaintenanceSkipReason),
 }
 
+#[derive(Clone, Copy)]
+enum CheckpointMaintenanceMode {
+    AvailableCapacityOnly,
+    ReclaimIdleNonTargets,
+}
+
+impl<R: DeviceRuntime> PlanRuntimeResources<R> {
+    /// Explicitly permits one idle-chunk reclaim attempt after ordinary
+    /// checkpoint growth fails at the device budget. All capture target pools
+    /// remain protected, as do committed occupancy and resident minima. This
+    /// does not reserve capacity for future, unadmitted foreground work.
+    ///
+    /// The owner must belong to this exact resource root. No sequence is
+    /// evicted or waited on, and a Ready receipt still requires a fresh claim.
+    pub fn try_maintain_checkpoint_with_idle_reclaim(
+        self: &Arc<Self>,
+        maintenance: CheckpointCapacityMaintenance<R>,
+    ) -> Result<CheckpointCapacityMaintenanceOutcome, VNextError> {
+        if !Arc::ptr_eq(self, &maintenance.binding.resources) {
+            return Err(invalid_resource(
+                "checkpoint maintenance belongs to another resource root",
+            ));
+        }
+        maintenance.maintain_with_mode(CheckpointMaintenanceMode::ReclaimIdleNonTargets)
+    }
+}
+
 impl<R: DeviceRuntime> TrustedPlanRuntimeBinding<R> {
     pub fn prepare_checkpoint_capacity_maintenance(
         &self,
@@ -65,6 +92,13 @@ impl<R: DeviceRuntime> CheckpointCapacityMaintenance<R> {
     /// actual pools. Only presently available device capacity may be used:
     /// no cross-pool reclamation, waiting, or foreground admission mutation.
     pub fn try_maintain(self) -> Result<CheckpointCapacityMaintenanceOutcome, VNextError> {
+        self.maintain_with_mode(CheckpointMaintenanceMode::AvailableCapacityOnly)
+    }
+
+    fn maintain_with_mode(
+        self,
+        mode: CheckpointMaintenanceMode,
+    ) -> Result<CheckpointCapacityMaintenanceOutcome, VNextError> {
         let _lifecycle = self
             .binding
             .resources
@@ -96,11 +130,16 @@ impl<R: DeviceRuntime> CheckpointCapacityMaintenance<R> {
                 ),
             ));
         }
-        match self
-            .binding
-            .dynamic_pools()
-            .maintain_checkpoint_capacity(&evaluated.slices)
-        {
+        let pools = self.binding.dynamic_pools();
+        let result = match mode {
+            CheckpointMaintenanceMode::AvailableCapacityOnly => {
+                pools.maintain_checkpoint_capacity(&evaluated.slices)
+            }
+            CheckpointMaintenanceMode::ReclaimIdleNonTargets => {
+                pools.maintain_checkpoint_capacity_with_idle_reclaim(&evaluated.slices)
+            }
+        };
+        match result {
             Ok(receipt) => Ok(CheckpointCapacityMaintenanceOutcome::Ready(receipt)),
             Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
                 Ok(CheckpointCapacityMaintenanceOutcome::Skipped(
