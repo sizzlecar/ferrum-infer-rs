@@ -11,6 +11,9 @@ mod completion_guard_tests;
 #[path = "retention_tests.rs"]
 mod retention_tests;
 
+#[path = "extension_tests.rs"]
+mod extension_tests;
+
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};

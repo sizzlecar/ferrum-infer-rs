@@ -9,6 +9,15 @@ mod restore_observation;
 use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
 use restore_observation::PrefixRestoreObserver;
 
+fn prefix_restore_extension_work(token_prefix: &[u32]) -> Result<ResourceWorkShape> {
+    // Physical coverage ends at the copied checkpoint boundary, as it does at
+    // the current cold-prefill frontier. The admitted full input and output-fit
+    // ceiling remain unchanged and are authenticated separately by restore.
+    let span = TokenSpanWork::from_token_ids(token_prefix, 0..token_prefix.len())
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+    ResourceWorkShape::single(span).map_err(|error| FerrumError::backend(error.to_string()))
+}
+
 /// Request counters are shared with the consuming publication callback. Index
 /// occupancy is read from owners instead of estimated from token/text lengths.
 #[derive(Default)]
@@ -1077,14 +1086,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ));
         }
         let restored_tokens = checkpoint.completed_tokens();
-        let span = TokenSpanWork::from_token_ids_with_fit(
-            &tokens,
-            0..restored_tokens,
-            input.maximum_sequence_tokens,
-        )
-        .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let work = ResourceWorkShape::single(span)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let work = prefix_restore_extension_work(checkpoint.token_prefix())?;
         let capacity = self.extend_sequence_with_capacity(&sequence, work)?;
         if !observer.capacity_ready(restored_tokens, &capacity) {
             execution.restore_ready()?;
