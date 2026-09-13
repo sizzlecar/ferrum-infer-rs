@@ -33,6 +33,7 @@ impl From<GgufBlockFormat> for NativeBlockParams {
 
 pub(super) struct MetalNativeBlockPipelines {
     pub(super) linear_f16: ComputePipelineState,
+    pub(super) gemm_f16_f32: ComputePipelineState,
     pub(super) linear_f32: ComputePipelineState,
     #[cfg(test)]
     pub(super) decode: ComputePipelineState,
@@ -41,7 +42,7 @@ pub(super) struct MetalNativeBlockPipelines {
 impl MetalNativeBlockPipelines {
     pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
         let mut shader = String::from(
-            "#include <metal_stdlib>\nusing namespace metal;\nconstant uint iq3_s_grid[512] = {\n",
+            "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\nconstant uint iq3_s_grid[512] = {\n",
         );
         for value in IQ3_S_GRID {
             write!(&mut shader, "0x{value:08x},").expect("writing a String cannot fail");
@@ -71,6 +72,7 @@ impl MetalNativeBlockPipelines {
         };
         Ok(Self {
             linear_f16: pipeline("vnext_native_block_linear_f16")?,
+            gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
             linear_f32: pipeline("vnext_native_block_linear_f32")?,
             #[cfg(test)]
             decode: pipeline("vnext_native_block_decode")?,

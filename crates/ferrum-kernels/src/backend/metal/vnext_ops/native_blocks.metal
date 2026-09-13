@@ -114,6 +114,99 @@ kernel void vnext_native_block_linear_f32(
     native_linear(x, w, y, p, b, group, lane, subgroup);
 }
 
+// One 32-token x 64-output tile. Decode directly into float so the native
+// weight values do not acquire a half rounding before multiplication.
+// MMA changes the reduction grouping relative to native_linear's lane sums.
+kernel void vnext_native_block_gemm_f16_f32(
+    device const half * input [[buffer(0)]],
+    device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]],
+    threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float * input_tile = workspace;
+    threadgroup float * weight_tile = workspace + 32 * 32;
+    const ulong input_start = ulong(group.x) * 32;
+    const ulong output_start = ulong(group.y) * 64;
+    const ulong blocks_per_row = ulong(p.in_features) / block.values;
+    const uint matrix_row = (simdgroup_index / 2) * 16;
+    const uint matrix_column = (simdgroup_index % 2) * 32;
+    simdgroup_float8x8 accumulators[8];
+    for (uint i = 0; i < 8; ++i) {
+        accumulators[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (ulong k = 0; k < ulong(p.in_features); k += 32) {
+        for (uint i = thread_index; i < 32 * 32; i += 128) {
+            const ulong row = input_start + i / 32;
+            const ulong column = k + i % 32;
+            input_tile[i] = row < ulong(p.rows) && column < ulong(p.in_features)
+                ? float(input[row * ulong(p.in_features) + column]) : 0.0f;
+        }
+        // The physical weight is output-major; the shared tile is K x N.
+        // The decoder supports both 32-value and 256-value native blocks.
+        for (uint i = thread_index; i < 32 * 64; i += 128) {
+            // Neighboring lanes decode consecutive K values of one source row.
+            const uint local_row = i / 32;
+            const uint local_column = i % 32;
+            const ulong row = output_start + local_row;
+            const ulong column = k + local_column;
+            float value = 0.0f;
+            if (row < ulong(p.out_features) && column < ulong(p.in_features)) {
+                const ulong offset = (row * blocks_per_row + column / block.values)
+                    * ulong(block.bytes);
+                value = native_block_value(
+                    weight + offset, uint(column % block.values), block.format);
+            }
+            weight_tile[local_column * 64 + local_row] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint chunk = 0; chunk < 32; chunk += 8) {
+            simdgroup_float8x8 input_matrices[2];
+            simdgroup_float8x8 weight_matrices[4];
+            for (uint m = 0; m < 2; ++m) {
+                simdgroup_load(input_matrices[m],
+                    input_tile + (matrix_row + m * 8) * 32 + chunk, 32, 0, false);
+            }
+            for (uint n = 0; n < 4; ++n) {
+                simdgroup_load(weight_matrices[n],
+                    weight_tile + chunk * 64 + matrix_column + n * 8, 64, 0, false);
+            }
+            for (uint m = 0; m < 2; ++m) {
+                for (uint n = 0; n < 4; ++n) {
+                    simdgroup_multiply_accumulate(accumulators[m * 4 + n],
+                        input_matrices[m], weight_matrices[n], accumulators[m * 4 + n]);
+                }
+            }
+        }
+        // No thread can overwrite the next K tile while another SIMD reads it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // All K tiles are consumed. Reuse the 8 KiB weight tile for the 32 x 64
+    // float result; every SIMD owns a disjoint 16 x 32 rectangle.
+    for (uint m = 0; m < 2; ++m) {
+        for (uint n = 0; n < 4; ++n) {
+            simdgroup_store(accumulators[m * 4 + n],
+                weight_tile + (matrix_row + m * 8) * 64 + matrix_column + n * 8,
+                64, 0, false);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = thread_index; i < 32 * 64; i += 128) {
+        const ulong row = input_start + i / 64;
+        const ulong column = output_start + i % 64;
+        if (row < ulong(p.rows) && column < ulong(p.out_features)) {
+            output[row * ulong(p.output_stride) + ulong(p.output_column_offset) + column]
+                = half(weight_tile[i]);
+        }
+    }
+}
+
 kernel void vnext_native_block_decode(
     device const uchar * input [[buffer(0)]], device float * output [[buffer(1)]],
     constant NativeBlockParams & b [[buffer(2)]], constant uint & count [[buffer(3)]],

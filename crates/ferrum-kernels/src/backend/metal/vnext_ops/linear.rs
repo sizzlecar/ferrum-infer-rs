@@ -66,6 +66,9 @@ const LAST_TOKEN_F32_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_dense_linear.f32.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
+// Amortize float tile loading while retaining enough independent output tiles.
+const NATIVE_TILED_GEMM_MIN_ROWS: u32 = 32;
+const NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 1024;
 // Small output grids do not provide enough parallelism after sharing weights.
 // Keep the existing GEMV there; the opt-in microbench covers both regimes.
 const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
@@ -113,6 +116,7 @@ enum LinearDispatchKind {
     CooperativeGemv,
     SharedWeightGemv,
     TiledGemm,
+    NativeTiledGemm,
 }
 
 impl MetalLinearPipelines {
@@ -200,6 +204,15 @@ impl MetalLinearPipelines {
             }
             (LinearPhysicalFormat::Q8_0, false) => {
                 (&self.q8_0, LinearDispatchKind::CooperativeGemv)
+            }
+            (LinearPhysicalFormat::Native(_), _)
+                if rows >= NATIVE_TILED_GEMM_MIN_ROWS
+                    && out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES =>
+            {
+                (
+                    &self.native.gemm_f16_f32,
+                    LinearDispatchKind::NativeTiledGemm,
+                )
             }
             (LinearPhysicalFormat::Native(_), _) => {
                 (&self.native.linear_f16, LinearDispatchKind::CooperativeGemv)
@@ -1561,6 +1574,18 @@ fn dispatch_linear_grid(
         ),
         LinearDispatchKind::TiledGemm => {
             encoder.set_threadgroup_memory_length(0, 8192);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::from(params.rows).div_ceil(32),
+                    u64::from(params.out_features).div_ceil(64),
+                    1,
+                ),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+        LinearDispatchKind::NativeTiledGemm => {
+            // F32 X[32][32] and W[32][64]; W is reused for the output tile.
+            encoder.set_threadgroup_memory_length(0, 12288);
             encoder.dispatch_thread_groups(
                 MTLSize::new(
                     u64::from(params.rows).div_ceil(32),

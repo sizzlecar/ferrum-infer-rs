@@ -1,10 +1,12 @@
-//! Opt-in comparison of existing Metal linear dispatches at decode batch widths.
+//! Opt-in comparisons of Metal linear dispatches at decode and prefill widths.
 //!
 //! Run after coordinating exclusive GPU access:
 //! `cargo test --release -p ferrum-kernels --features metal --lib
 //! quantized_decode_dispatch_microbench -- --ignored --nocapture --test-threads=1`
 //! This measures synthetic weights with real Qwen3.5-9B projection dimensions,
 //! not model quality or end-to-end decode. No timing threshold gates correctness.
+//! Native-format prefill uses `native_quantized_prefill_dispatch_microbench`
+//! with 27B FFN dimensions and a separate, bounded two-round paired schedule.
 
 use super::*;
 use crate::gguf_blocks::fixtures::oracle_blocks;
@@ -76,6 +78,8 @@ enum Dispatch {
     Gemv,
     Gemm,
     SharedWeight,
+    NativeGemv,
+    NativeGemm,
 }
 
 fn buffer<T>(device: &Device, data: &[T]) -> Buffer {
@@ -91,7 +95,7 @@ fn physical(format: GgufBlockFormat) -> LinearPhysicalFormat {
         GgufBlockFormat::Q4K => LinearPhysicalFormat::Q4K,
         GgufBlockFormat::Q5K => LinearPhysicalFormat::Q5K,
         GgufBlockFormat::Q6K => LinearPhysicalFormat::Q6K,
-        _ => unreachable!("bounded K-quant experiment"),
+        native => LinearPhysicalFormat::Native(native),
     }
 }
 
@@ -99,15 +103,16 @@ pub(super) fn weights(shape: Shape) -> Vec<u8> {
     let blocks_per_row = shape.input as usize / shape.format.block_values();
     let templates = oracle_blocks(shape.format);
     let block_bytes = shape.format.block_bytes();
+    let template_count = templates.len() / block_bytes;
     let mut data = vec![0; shape.output as usize * blocks_per_row * block_bytes];
     for (index, block) in data.chunks_exact_mut(block_bytes).enumerate() {
         let row = index / blocks_per_row;
-        let source = ((index + row / 3) % 2) * block_bytes;
+        let source = ((index + row / 3) % template_count) * block_bytes;
         block.copy_from_slice(&templates[source..source + block_bytes]);
-        let scale_offset = if shape.format == GgufBlockFormat::Q6K {
-            208
-        } else {
-            0
+        let scale_offset = match shape.format {
+            GgufBlockFormat::Q3K => 108,
+            GgufBlockFormat::Q6K => 208,
+            _ => 0,
         };
         let scale = if (index + row) % 3 == 0 {
             -1.0 / 512.0
@@ -230,6 +235,14 @@ impl Case<'_> {
             output_column_offset: 0,
         };
         let (pipeline, kind) = match (dispatch, self.shape.format, self.activation_type) {
+            (Dispatch::NativeGemv, _, ElementType::F16) => (
+                &self.pipelines.native.linear_f16,
+                LinearDispatchKind::CooperativeGemv,
+            ),
+            (Dispatch::NativeGemm, _, ElementType::F16) => (
+                &self.pipelines.native.gemm_f16_f32,
+                LinearDispatchKind::NativeTiledGemm,
+            ),
             (Dispatch::Gemv, _, ElementType::F32) => (
                 self.pipelines
                     .f32_linear_pipeline(physical(self.shape.format))
@@ -363,6 +376,161 @@ fn quantized_q5_shared_weight_microbench() {
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_quantized_prefill_dispatch_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    // Real 27B FFN dimensions, synthetic native-format weights. Keep the large
+    // GEMV reference bounded: one correctness/warmup dispatch per variant,
+    // then two paired rounds with one dispatch each, rather than 8 x 8.
+    for format in [
+        GgufBlockFormat::Q3K,
+        GgufBlockFormat::Iq3S,
+        GgufBlockFormat::Iq4Nl,
+        GgufBlockFormat::Iq4Xs,
+    ] {
+        for (input_width, output_width, name, row_counts, include) in [
+            (
+                5120,
+                17408,
+                "native_ffn_gate_or_up",
+                &[32, 256, 1024][..],
+                true,
+            ),
+            (
+                17408,
+                5120,
+                "native_ffn_down",
+                &[256][..],
+                matches!(format, GgufBlockFormat::Q3K | GgufBlockFormat::Iq4Xs),
+            ),
+        ] {
+            // Representative reverse matrices cover linear and nonlinear
+            // native block decoding without doubling the full sweep.
+            if !include {
+                continue;
+            }
+            let shape = Shape {
+                name,
+                input: input_width,
+                output: output_width,
+                format,
+            };
+            measure_native_prefill_shape(&device, &queue, &pipelines, shape, row_counts);
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_quantized_prefill_small_shape_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    // Partial output tiles, the 32/33-row boundary, and short/long reductions.
+    // Retain the small-output references while probing intermediate output
+    // widths and short-K/wider-N work. Do not repeat the large FFN sweep.
+    // GPU samples, not host wait, compare paths.
+    for (format, rows, input, output) in [
+        (GgufBlockFormat::Q3K, 32, 256, 1),
+        (GgufBlockFormat::Q3K, 33, 5120, 65),
+        (GgufBlockFormat::Iq3S, 33, 256, 7),
+        (GgufBlockFormat::Iq3S, 256, 5120, 31),
+        (GgufBlockFormat::Iq4Nl, 32, 256, 31),
+        (GgufBlockFormat::Iq4Nl, 33, 5120, 63),
+        (GgufBlockFormat::Iq4Xs, 256, 5120, 1),
+        (GgufBlockFormat::Iq4Xs, 33, 256, 65),
+        (GgufBlockFormat::Iq4Xs, 33, 5120, 512),
+        (GgufBlockFormat::Iq4Xs, 33, 5120, 1024),
+        (GgufBlockFormat::Iq4Xs, 33, 5120, 2048),
+        (GgufBlockFormat::Iq4Xs, 256, 5120, 512),
+        (GgufBlockFormat::Iq4Xs, 256, 5120, 1024),
+        (GgufBlockFormat::Iq4Xs, 256, 5120, 2048),
+        (GgufBlockFormat::Iq4Nl, 33, 5120, 512),
+        (GgufBlockFormat::Iq4Nl, 33, 5120, 1024),
+        (GgufBlockFormat::Iq4Nl, 33, 5120, 2048),
+        (GgufBlockFormat::Q3K, 33, 5120, 1024),
+        (GgufBlockFormat::Iq3S, 33, 5120, 1024),
+        (GgufBlockFormat::Q3K, 33, 256, 2048),
+        (GgufBlockFormat::Iq3S, 33, 256, 2048),
+        (GgufBlockFormat::Iq4Nl, 33, 256, 2048),
+        (GgufBlockFormat::Iq4Xs, 33, 256, 2048),
+    ] {
+        measure_native_prefill_shape(
+            &device,
+            &queue,
+            &pipelines,
+            Shape {
+                name: "native_small_nk",
+                input,
+                output,
+                format,
+            },
+            &[rows],
+        );
+    }
+}
+
+fn measure_native_prefill_shape(
+    device: &Device,
+    queue: &CommandQueueRef,
+    pipelines: &MetalLinearPipelines,
+    shape: Shape,
+    row_counts: &[usize],
+) {
+    let weight_bytes = weights(shape);
+    let weight_buffers = [buffer(device, &weight_bytes)];
+    for &rows in row_counts {
+        let (input_values, nonzero) = inputs(rows, shape.input as usize);
+        let reference = oracle(shape, &weight_bytes, &nonzero);
+        let input = buffer(device, &input_values);
+        let output = buffer(device, &vec![f16::NAN; rows * shape.output as usize]);
+        let case = Case {
+            queue,
+            pipelines,
+            shape,
+            rows: rows as u32,
+            activation_type: ElementType::F16,
+            input: &input,
+            weights: &weight_buffers,
+            output: &output,
+        };
+        let samples = measure_case_with_rounds(
+            &case,
+            &[Dispatch::NativeGemv, Dispatch::NativeGemm],
+            &reference,
+            0,
+            2,
+            1,
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "metal_native_quantized_prefill_dispatch_microbench",
+                "device": device.name(), "shape": shape.name, "rows": rows,
+                "input_features": shape.input, "output_features": shape.output,
+                "activation_type": "f16", "candidate_accumulation": "f32",
+                "weight_format": shape.format.format_id(),
+                "weight_bytes": weight_bytes.len(),
+                "rotating_weight_allocations": 1,
+                "gpu_buffer_bytes": weight_buffers[0].length() + input.length() + output.length(),
+                "correctness_warmup_dispatches_per_variant": 1,
+                "additional_warmup_rounds": 0, "measured_paired_rounds": 2,
+                "dispatches_per_command": 1,
+                "production_dispatch": format!("{:?}", pipelines.linear_pipeline(physical(shape.format), rows as u32, shape.output).1),
+                "oracle": "full_output_sparse_input_cpu_block_decode_each_variant_independently",
+                "correctness": "poison_before_each_command; F16 tolerance, not cross-variant bitwise equality",
+                "scope": "synthetic_native_projection_not_full_model_or_admission",
+                "timing_scope": "GPU completed-command interval; host encode and submit/wait reported separately, never added to GPU time",
+                "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
+                "samples": samples,
+            })
+        );
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn quantized_f32_shared_head_microbench() {
     let device = Device::system_default().expect("microbench requires Metal");
     let queue = device.new_command_queue();
@@ -429,6 +597,24 @@ fn measure_case(
     variants: &[Dispatch],
     reference: &[f32],
 ) -> Vec<serde_json::Value> {
+    measure_case_with_rounds(
+        case,
+        variants,
+        reference,
+        WARMUP_ROUNDS,
+        MEASURED_ROUNDS,
+        DISPATCHES_PER_COMMAND,
+    )
+}
+
+fn measure_case_with_rounds(
+    case: &Case<'_>,
+    variants: &[Dispatch],
+    reference: &[f32],
+    warmup_rounds: usize,
+    measured_rounds: usize,
+    dispatches_per_command: usize,
+) -> Vec<serde_json::Value> {
     for &dispatch in variants {
         // A skipped write must not inherit a correct result from the previous
         // variant. Reset outside all measured command-buffer intervals.
@@ -436,21 +622,21 @@ fn measure_case(
         case.run(dispatch, 1);
         case.validate(reference);
     }
-    for _ in 0..WARMUP_ROUNDS {
+    for _ in 0..warmup_rounds {
         for &dispatch in variants {
             case.poison_output();
-            case.run(dispatch, DISPATCHES_PER_COMMAND);
+            case.run(dispatch, dispatches_per_command);
             case.validate(reference);
         }
     }
     let mut samples = Vec::new();
-    for round in 0..MEASURED_ROUNDS {
+    for round in 0..measured_rounds {
         let mut order = variants.to_vec();
         let shift = round % order.len();
         order.rotate_left(shift);
         for dispatch in order {
             case.poison_output();
-            let mut sample = case.run(dispatch, DISPATCHES_PER_COMMAND);
+            let mut sample = case.run(dispatch, dispatches_per_command);
             // Full output validation is outside the timed command. This
             // checks each command's final output, not every repeated dispatch.
             case.validate(reference);
