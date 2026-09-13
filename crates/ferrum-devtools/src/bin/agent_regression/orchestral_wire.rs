@@ -977,6 +977,44 @@ mod tests {
     }
 
     #[test]
+    fn persisted_float_metadata_binds_exact_wire_and_rejects_an_adjacent_value() {
+        let mut fixture = Fixture::text_parts();
+        let session_path = fixture.dir.path().join("session-test.json");
+        let mut session: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+        // This observed duration loses one ULP with serde_json's default
+        // decimal parser. The producer's journal and metadata text agree;
+        // parsing the journal must not change the value before reconstruction.
+        let original = 1.1254992910000001_f64;
+        let result = &mut session[2]["payload"]["tool"]["content"][0]["result"];
+        result["wall_time_seconds"] = json!(original);
+        let original_wire = tool_text_parts::content(result, false);
+        fs::write(&session_path, serde_json::to_vec(&session).unwrap()).unwrap();
+        fixture.records[2].messages.last_mut().unwrap()["content"] = original_wire;
+
+        // Exercise the public disk reader, not an in-memory Evidence shortcut.
+        fixture.public = orchestral_evidence::read(fixture.dir.path(), "session");
+        assert!(fixture.public.complete(), "{:?}", fixture.public.errors);
+        let restored = &fixture.public.tool_exchanges[1].calls[0].result;
+        assert_eq!(
+            restored["wall_time_seconds"].as_f64().unwrap().to_bits(),
+            original.to_bits()
+        );
+        let evidence = fixture.bind_as(OrchestralToolResultFormat::TextParts);
+        assert!(evidence.complete(), "{:?}", evidence.unproven);
+        assert_eq!(evidence.receipts.len(), 2);
+
+        // An actual one-ULP change must still fail; no epsilon or numeric
+        // normalization is permitted inside the model-visible metadata text.
+        let mut changed = restored.clone();
+        changed["wall_time_seconds"] = json!(f64::from_bits(original.to_bits() - 1));
+        fixture.records[2].messages.last_mut().unwrap()["content"] =
+            tool_text_parts::content(&changed, false);
+        assert!(!fixture
+            .bind_as(OrchestralToolResultFormat::TextParts)
+            .complete());
+    }
+
+    #[test]
     fn text_parts_binding_requires_exact_parts_metadata_and_declared_format() {
         let fixture = Fixture::text_parts();
         let evidence = fixture.bind_as(OrchestralToolResultFormat::TextParts);
