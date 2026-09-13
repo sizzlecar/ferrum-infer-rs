@@ -339,7 +339,10 @@ mod tests {
                 libc::signal(libc::SIGINT, libc::SIG_IGN);
             }
         }
-        fs::write(ready, std::process::id().to_string()).unwrap();
+        // Publish readiness only after the complete PID is visible to the parent.
+        let pending = Path::new(&ready).with_extension("pending");
+        fs::write(&pending, std::process::id().to_string()).unwrap();
+        fs::rename(pending, ready).unwrap();
         std::thread::sleep(Duration::from_secs(60));
     }
 
@@ -376,7 +379,12 @@ mod tests {
                 child.stop().await;
                 panic!("fixture did not become ready");
             }
-            assert_eq!(fs::read_to_string(&ready).unwrap(), child.pid.to_string());
+            let expected_pid = child.pid.to_string();
+            let observed_pid = fs::read_to_string(&ready);
+            if observed_pid.as_deref().ok() != Some(expected_pid.as_str()) {
+                child.stop().await;
+            }
+            assert_eq!(observed_pid.unwrap(), expected_pid);
             let result =
                 tokio::time::timeout(Duration::from_secs(6), child.interrupt_then_stop()).await;
             if result.is_err() {
