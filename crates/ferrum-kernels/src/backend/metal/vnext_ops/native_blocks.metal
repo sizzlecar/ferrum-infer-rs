@@ -131,7 +131,10 @@ kernel void vnext_native_block_gemm_f16_f32(
     threadgroup float * weight_tile = workspace + 32 * 32;
     const ulong input_start = ulong(group.x) * 32;
     const ulong output_start = ulong(group.y) * 64;
-    const ulong blocks_per_row = ulong(p.in_features) / block.values;
+    // Native GGUF blocks contain 32 or 256 values. A K32 tile cannot cross
+    // a block boundary, so compute its block address once per K iteration.
+    const uint block_shift = block.values == 256 ? 8 : 5;
+    const ulong blocks_per_row = ulong(p.in_features >> block_shift);
     const uint matrix_row = (simdgroup_index / 2) * 16;
     const uint matrix_column = (simdgroup_index % 2) * 32;
     simdgroup_float8x8 accumulators[8];
@@ -140,6 +143,8 @@ kernel void vnext_native_block_gemm_f16_f32(
     }
 
     for (ulong k = 0; k < ulong(p.in_features); k += 32) {
+        const ulong block_index = ulong(uint(k) >> block_shift);
+        const uint in_block_base = uint(k) & (block.values - 1);
         for (uint i = thread_index; i < 32 * 32; i += 128) {
             const ulong row = input_start + i / 32;
             const ulong column = k + i % 32;
@@ -156,10 +161,10 @@ kernel void vnext_native_block_gemm_f16_f32(
             const ulong column = k + local_column;
             float value = 0.0f;
             if (row < ulong(p.out_features) && column < ulong(p.in_features)) {
-                const ulong offset = (row * blocks_per_row + column / block.values)
+                const ulong offset = (row * blocks_per_row + block_index)
                     * ulong(block.bytes);
                 value = native_block_value(
-                    weight + offset, uint(column % block.values), block.format);
+                    weight + offset, in_block_base + local_column, block.format);
             }
             weight_tile[local_column * 64 + local_row] = value;
         }
