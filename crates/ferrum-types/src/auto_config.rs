@@ -899,6 +899,8 @@ impl FerrumConfigBuilder {
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
         let default_prefill_first_until_active =
             self.default_prefill_first_until_active(&max_sequences);
+        let default_active_decode_prefill_chunk =
+            self.default_active_decode_prefill_chunk(&max_sequences);
         if !plan_runtime {
             self.validate_attention(
                 use_vllm_paged_attn.value,
@@ -1030,6 +1032,15 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if let Some(chunk) = default_active_decode_prefill_chunk.as_ref() {
+            if self.entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").is_none() {
+                runtime_config.upsert(
+                    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+                    chunk.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
         if let Some(slots) = recurrent_state_max_slots.as_ref() {
             if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none() {
                 runtime_config.upsert(
@@ -1078,7 +1089,10 @@ impl FerrumConfigBuilder {
             ));
         }
         decisions.push(self.prefix_cache_decision(prefix_cache));
-        decisions.push(self.scheduler_decision(default_prefill_first_until_active)?);
+        decisions.push(self.scheduler_decision(
+            default_prefill_first_until_active,
+            default_active_decode_prefill_chunk,
+        )?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -1203,6 +1217,25 @@ impl FerrumConfigBuilder {
         }
         Some(ResolvedValue {
             value: max_sequences.value,
+            source: AutoConfigSource::Default,
+            source_key: None,
+        })
+    }
+
+    fn default_active_decode_prefill_chunk(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        if self.execution_resource_authority != ExecutionResourceAuthority::PlanRuntime
+            || !self.hardware.backend.eq_ignore_ascii_case("metal")
+            || max_sequences.value <= 1
+        {
+            return None;
+        }
+        // Bound mixed-prefill work even with only one active decoder. Cold
+        // prefills keep their elastic token budget; explicit limits still win.
+        Some(ResolvedValue {
+            value: 128,
             source: AutoConfigSource::Default,
             source_key: None,
         })
@@ -2306,6 +2339,7 @@ impl FerrumConfigBuilder {
     fn scheduler_decision(
         &self,
         default_prefill_first_until_active: Option<ResolvedValue<usize>>,
+        default_active_decode_prefill_chunk: Option<ResolvedValue<usize>>,
     ) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
         let prompt_scheduler =
@@ -2340,7 +2374,22 @@ impl FerrumConfigBuilder {
         let prefill_first = explicit_prefill_first
             .copied()
             .or(implicit_prefill_first.as_deref());
-        let active_decode_chunk = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
+        let explicit_active_decode_chunk = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
+        let implicit_active_decode_chunk = default_active_decode_prefill_chunk
+            .as_ref()
+            .map(|chunk| chunk.value.to_string());
+        let active_decode_chunk = explicit_active_decode_chunk
+            .copied()
+            .or(implicit_active_decode_chunk.as_deref());
+        let active_decode_chunk_source = if explicit_active_decode_chunk.is_some() {
+            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            (
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_owned()),
+            )
+        } else {
+            (AutoConfigSource::Default, None)
+        };
         if let Some(chunk) = active_decode_chunk {
             let chunk_value = parse_usize_env_value(chunk).map_err(|reason| {
                 AutoConfigError::InvalidOverride {
@@ -2381,22 +2430,30 @@ impl FerrumConfigBuilder {
                 key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
                 reason,
             })?;
-            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            let (source, source_key) =
+                if explicit_active_decode_chunk.is_none() && explicit_prefill_first_present {
+                    let key = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+                    (
+                        self.source_for_key(key, AutoConfigSource::Default),
+                        Some(key.to_owned()),
+                    )
+                } else {
+                    active_decode_chunk_source.clone()
+                };
             (
                 format!("prefill_first_until_active:{until}+active_decode_prefill_chunk:{chunk}"),
-                self.source_for_key(key, AutoConfigSource::Default),
-                Some(key.to_string()),
+                source,
+                source_key,
             )
         } else if let Some(chunk) = active_decode_chunk {
             parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
                 reason,
             })?;
-            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
             (
                 format!("active_decode_prefill_chunk:{chunk}"),
-                self.source_for_key(key, AutoConfigSource::Default),
-                Some(key.to_string()),
+                active_decode_chunk_source.0,
+                active_decode_chunk_source.1,
             )
         } else if let Some(until) = prefill_first {
             parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
@@ -4716,6 +4773,171 @@ mod tests {
             .expect("explicit prefill-step chunk should be preserved");
         assert_eq!(step_entry.effective_value, "128");
         assert_eq!(step_entry.source, RuntimeConfigSource::Env);
+    }
+
+    fn scheduler_resolution(
+        backend: &str,
+        authority: ExecutionResourceAuthority,
+        sequences: usize,
+        runtime_config: RuntimeConfigSnapshot,
+    ) -> ResolvedFerrumConfig {
+        let mut hardware = HardwareCapabilities::unknown();
+        hardware.backend = backend.to_owned();
+        let mut workload = WorkloadProfile::serving_default();
+        workload.target_concurrency = sequences;
+        FerrumConfigBuilder::new(runtime_config)
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .with_execution_resource_authority(authority)
+            .resolve()
+            .unwrap()
+    }
+
+    #[test]
+    fn metal_plan_active_prefill_default_reaches_engine_and_decision_trace() {
+        let resolved = scheduler_resolution(
+            "metal",
+            ExecutionResourceAuthority::PlanRuntime,
+            4,
+            snapshot(&[]),
+        );
+        let mut engine = crate::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.scheduler.active_decode_prefill_chunk, Some(128));
+        assert_eq!(engine.scheduler.prefill_step_chunk, None);
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+            .unwrap();
+        assert_eq!(entry.source, RuntimeConfigSource::Default);
+        assert_eq!(
+            entry.effective_value.parse::<usize>().unwrap(),
+            engine.scheduler.active_decode_prefill_chunk.unwrap()
+        );
+        let policy = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(policy.selected,
+            "prefill_first_until_active:4+active_decode_prefill_chunk:128+prefill_token_budget:elastic");
+        assert_eq!(policy.source, AutoConfigSource::Default);
+        assert_eq!(policy.source_key, None);
+    }
+
+    #[test]
+    fn active_prefill_default_does_not_change_other_execution_paths() {
+        for (backend, authority, sequences) in [
+            ("metal", ExecutionResourceAuthority::PlanRuntime, 1),
+            ("metal", ExecutionResourceAuthority::LegacyEngine, 4),
+            ("cpu", ExecutionResourceAuthority::PlanRuntime, 4),
+            ("cuda", ExecutionResourceAuthority::PlanRuntime, 4),
+        ] {
+            let resolved = scheduler_resolution(backend, authority, sequences, snapshot(&[]));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(engine.scheduler.active_decode_prefill_chunk, None);
+            assert!(resolved
+                .runtime_config
+                .entries
+                .iter()
+                .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+            assert!(resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap()
+                .selected
+                .split('+')
+                .all(|part| !part.starts_with("active_decode_prefill_chunk:")));
+        }
+    }
+
+    #[test]
+    fn explicit_active_prefill_limits_keep_their_value_and_source() {
+        for (value, runtime_source, source) in [
+            (
+                "24",
+                RuntimeConfigSource::ConfigFile,
+                AutoConfigSource::ConfigFile,
+            ),
+            ("96", RuntimeConfigSource::Cli, AutoConfigSource::Cli),
+            ("256", RuntimeConfigSource::Env, AutoConfigSource::Env),
+        ] {
+            let resolved = scheduler_resolution(
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                snapshot_with_sources(&[(
+                    "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+                    value,
+                    runtime_source,
+                )]),
+            );
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine.scheduler.active_decode_prefill_chunk,
+                Some(value.parse().unwrap())
+            );
+            let entry = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+                .unwrap();
+            assert_eq!(entry.effective_value, value);
+            assert_eq!(entry.source, runtime_source);
+            let policy = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap();
+            assert!(policy
+                .selected
+                .split('+')
+                .any(|part| part == format!("active_decode_prefill_chunk:{value}")));
+            assert_eq!(policy.source, source);
+            assert_eq!(
+                policy.source_key.as_deref(),
+                Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+            );
+        }
+    }
+
+    #[test]
+    fn default_active_prefill_limit_preserves_explicit_scheduler_decision_source() {
+        for (key, value) in [
+            ("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", "3"),
+            ("FERRUM_SCHED_PREFILL_STEP_CHUNK", "24"),
+        ] {
+            let resolved = scheduler_resolution(
+                "metal",
+                ExecutionResourceAuthority::PlanRuntime,
+                4,
+                snapshot_with_sources(&[(key, value, RuntimeConfigSource::Cli)]),
+            );
+            let policy = resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == "scheduler_admission_policy")
+                .unwrap();
+            assert_eq!(policy.source, AutoConfigSource::Cli);
+            assert_eq!(policy.source_key.as_deref(), Some(key));
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(engine.scheduler.active_decode_prefill_chunk, Some(128));
+        }
     }
 
     #[test]

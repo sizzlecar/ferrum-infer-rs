@@ -462,6 +462,7 @@ impl EngineInner {
     }
 
     async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
+        self.discard_pending_prefix_restore(request_id);
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
         let (completion_resources, terminal_token_trace) = {
             let mut sequences = self.sequences.write();
@@ -637,6 +638,7 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
+        self.discard_pending_prefix_restore(request_id);
         let mut classified_api_response = None;
         if explicit_terminal_error.is_none() {
             explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
@@ -684,6 +686,8 @@ impl EngineInner {
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
                 let api_response = classified_api_response.take().or_else(|| {
+                    // Declared native chat uses the same output projection as
+                    // HTTP streaming; an authoritative grammar result wins.
                     ferrum_types::api_response_from_generated_text(
                         &seq.original_request,
                         &text,

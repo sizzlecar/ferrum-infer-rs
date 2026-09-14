@@ -158,6 +158,9 @@ pub struct RuntimeKnobs {
     pub profile_detail: ObservabilityProfileDetail,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
+    /// Retain independent vNext sequence-state checkpoints across requests.
+    #[serde(default)]
+    pub prefix_state_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
     pub attention_execution_policy: AttentionExecutionPolicy,
 
@@ -332,6 +335,10 @@ impl EngineConfig {
             runtime_config_value(snapshot, "FERRUM_WHOLE_PROMPT_PREFIX_CACHE")
                 .map(|v| v == "1")
                 .unwrap_or(false);
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_CACHE") {
+            self.runtime.prefix_state_cache_enabled = parse_bool_env_value(value)
+                .map_err(|reason| format!("FERRUM_PREFIX_CACHE: {reason}"))?;
+        }
 
         // Engine-build composition knobs (previously read by builder.rs /
         // registry.rs from env). Only overwrite when the key is present so a
@@ -414,6 +421,10 @@ pub struct SchedulerConfig {
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
+    /// Opt in to one bounded wait for another request's exact in-flight prefix.
+    /// Expiry releases the optional dependency and resumes cold admission.
+    #[serde(default)]
+    pub prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
     /// Optional hard cap for per-request prefill chunks. `None` spends the
     /// live per-step token budget and lets capacity feedback narrow or regrow
     /// each request independently.
@@ -442,6 +453,7 @@ impl Default for SchedulerConfig {
             enable_sla_enforcement: false,
             prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
+            prefix_rendezvous_max_wait_ms: None,
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
@@ -459,6 +471,14 @@ impl SchedulerConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
+        {
+            self.prefix_rendezvous_max_wait_ms = Some(
+                value
+                    .parse::<std::num::NonZeroU64>()
+                    .map_err(|error| format!("FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS: {error}"))?,
+            );
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
             self.prompt_token_estimate = parse_bool_env_value(value)
                 .map_err(|reason| format!("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE: {reason}"))?;
@@ -1114,6 +1134,60 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_state_cache_canonical_boolean_overrides_and_missing_key_preserves() {
+        let mut config = EngineConfig::default();
+        for (value, expected) in [("1", true), ("0", false), ("true", true), ("false", false)] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    "FERRUM_PREFIX_CACHE",
+                    value,
+                )]))
+                .unwrap();
+            assert_eq!(config.runtime.prefix_state_cache_enabled, expected);
+            assert!(!config.runtime.prefix_cache_enabled);
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.runtime.prefix_state_cache_enabled, expected);
+        }
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_PREFIX_CACHE",
+                "invalid"
+            ),]))
+            .is_err());
+    }
+
+    #[test]
+    fn prefix_state_cache_is_independent_of_whole_prompt_flag_and_defaults_on_old_wire() {
+        let mut config = EngineConfig::default();
+        config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_WHOLE_PROMPT_PREFIX_CACHE",
+                "1",
+            )]))
+            .unwrap();
+        assert!(config.runtime.prefix_cache_enabled);
+        assert!(!config.runtime.prefix_state_cache_enabled);
+        config.runtime.prefix_state_cache_enabled = true;
+        config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_PREFIX_CACHE",
+                "false",
+            )]))
+            .unwrap();
+        assert!(config.runtime.prefix_cache_enabled);
+        assert!(!config.runtime.prefix_state_cache_enabled);
+        let mut old = serde_json::to_value(&config.runtime).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("prefix_state_cache_enabled");
+        let restored: RuntimeKnobs = serde_json::from_value(old).unwrap();
+        assert!(!restored.prefix_state_cache_enabled);
+        assert!(restored.prefix_cache_enabled);
+    }
 
     #[test]
     fn scheduler_keeps_immediate_fit_default_until_full_input_policy_is_gated() {

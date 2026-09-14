@@ -1,0 +1,193 @@
+//! Publication of restored state before constructing a prefill batch.
+
+use super::{KvCacheHandle, PlanRuntimePrefillAuthority, PrefixCaptureLease};
+use ferrum_types::{FerrumError, RequestId, Result, TokenId};
+use std::{fmt, sync::Arc};
+
+/// Observation only: neither an index hit nor a completed copy authorizes use
+/// of restored state. `Restored` is emitted after publication acknowledgement.
+#[derive(Debug, serde::Serialize)]
+pub struct PrefixRestoreObservation<'a> {
+    pub request_id: &'a RequestId,
+    pub source: PrefixRestoreSource,
+    pub decision: PrefixRestoreDecision<'a>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixRestoreSource {
+    Index,
+    Rendezvous,
+}
+
+/// Contains lengths and typed resource evidence, never prompt/token contents.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PrefixRestoreDecision<'a> {
+    NoReusableEntry,
+    SequenceCapacityNotReady {
+        candidate_prefix_tokens: usize,
+        capacity: &'a super::ExecutorExecutionCapacityDeferral,
+    },
+    RequestStateNotReady {
+        candidate_prefix_tokens: usize,
+        request_state: &'a super::ExecutorRequestStateDeferral,
+    },
+    NativeRestoreSkipped {
+        candidate_prefix_tokens: usize,
+    },
+    Restored {
+        candidate_prefix_tokens: usize,
+    },
+}
+
+/// The exact input already admitted by the plan runtime. Restoration does not
+/// replace admission or authorize a different request incarnation.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanRuntimePrefixRestoreInput<'a> {
+    pub request_id: &'a RequestId,
+    pub input_tokens: &'a [TokenId],
+    pub maximum_sequence_tokens: usize,
+    /// An authenticated ready source retained by an earlier rendezvous. This
+    /// bypasses index lookup, never target admission or native compatibility.
+    pub checkpoint: Option<&'a dyn PrefixCaptureLease>,
+    /// Exact retained source from a prior capacity deferral; never reselect the index.
+    pub retry: Option<&'a PlanRuntimePrefixRestoreDeferral>,
+}
+
+/// A capacity deferral submits no restore and retains one immutable source. It
+/// grants neither target admission nor permission to wait without a progress
+/// source. Dropping it releases the optional checkpoint pin.
+#[derive(Debug)]
+pub struct PlanRuntimePrefixRestoreDeferral {
+    capacity: super::ExecutorExecutionCapacityDeferral,
+    checkpoint: Arc<dyn PrefixCaptureLease>,
+    source: PrefixRestoreSource,
+}
+
+impl PlanRuntimePrefixRestoreDeferral {
+    pub fn new(
+        capacity: super::ExecutorExecutionCapacityDeferral,
+        checkpoint: Arc<dyn PrefixCaptureLease>,
+        source: PrefixRestoreSource,
+    ) -> Self {
+        Self {
+            capacity,
+            checkpoint,
+            source,
+        }
+    }
+
+    pub fn capacity(&self) -> &super::ExecutorExecutionCapacityDeferral {
+        &self.capacity
+    }
+
+    pub fn checkpoint(&self) -> &Arc<dyn PrefixCaptureLease> {
+        &self.checkpoint
+    }
+
+    pub fn source(&self) -> PrefixRestoreSource {
+        self.source
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "restore publication or a retained capacity deferral must be handled"]
+pub enum PlanRuntimePrefixRestoreOutcome {
+    Unavailable,
+    Restored(PlanRuntimePrefixRestoreOutput),
+    Deferred(PlanRuntimePrefixRestoreDeferral),
+}
+
+/// Independently restored state whose execution gate remains closed while the
+/// engine installs its physical cache authority and advances scheduler progress.
+///
+/// The executor callback owns the native publication guard. Dropping this value
+/// must drop that guard and cancel its exact target; the callback must never
+/// retain only a request id or a later registry lookup. No logits are cached:
+/// at least one remaining prompt token must execute before sampling.
+#[must_use = "publish matching progress and acknowledge, or drop to cancel the restored target"]
+pub struct PlanRuntimePrefixRestoreOutput {
+    authority: PlanRuntimePrefillAuthority,
+    prompt_tokens: usize,
+    acknowledge: Box<dyn FnOnce() -> Result<()> + Send>,
+}
+
+impl PlanRuntimePrefixRestoreOutput {
+    /// Implementer constructor. The callback must own and acknowledge the
+    /// exact native restoration, revalidating cancellation and target identity.
+    /// Rejected construction drops the callback and its retained guard.
+    pub fn new(
+        request_id: RequestId,
+        restored_tokens: usize,
+        prompt_tokens: usize,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        acknowledge: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
+        let output = Self {
+            authority: PlanRuntimePrefillAuthority {
+                request_id,
+                committed_tokens: restored_tokens,
+                kv_cache,
+            },
+            prompt_tokens,
+            acknowledge: Box::new(acknowledge),
+        };
+        output.validate_for(output.request_id(), prompt_tokens)?;
+        Ok(output)
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        self.authority.request_id()
+    }
+
+    pub fn restored_tokens(&self) -> usize {
+        self.authority.committed_tokens()
+    }
+
+    pub fn kv_cache(&self) -> &Arc<dyn KvCacheHandle> {
+        self.authority.kv_cache()
+    }
+
+    pub fn validate_for(&self, request_id: &RequestId, prompt_tokens: usize) -> Result<()> {
+        if self.request_id() != request_id || self.prompt_tokens != prompt_tokens {
+            return Err(FerrumError::backend(
+                "prefix restore publication does not match the admitted request",
+            ));
+        }
+        let restored = self.restored_tokens();
+        if restored == 0 || restored >= prompt_tokens {
+            return Err(FerrumError::backend(
+                "prefix restore must leave a nonempty prompt suffix for execution",
+            ));
+        }
+        if self.kv_cache().num_tokens() != restored || !self.kv_cache().is_valid() {
+            return Err(FerrumError::backend(
+                "prefix restore cache authority does not match the restored extent",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Opens the native execution gate only after outer progress is installed.
+    /// An error requires cancellation of the corresponding outer request; it
+    /// does not authorize falling back to execution on the restored target.
+    pub fn acknowledge(self) -> Result<PlanRuntimePrefillAuthority> {
+        let Self {
+            authority,
+            acknowledge,
+            ..
+        } = self;
+        acknowledge()?;
+        Ok(authority)
+    }
+}
+
+impl fmt::Debug for PlanRuntimePrefixRestoreOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlanRuntimePrefixRestoreOutput")
+            .field("authority", &self.authority)
+            .field("prompt_tokens", &self.prompt_tokens)
+            .finish_non_exhaustive()
+    }
+}

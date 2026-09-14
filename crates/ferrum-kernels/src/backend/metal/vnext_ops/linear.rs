@@ -6,24 +6,25 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    last_token_dense_linear_f32_contract, BatchedOperationInvocation, DeviceBatchingForm,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    last_token_dense_linear_f32_contract, BatchedOperationInvocation, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    DeviceBatchingForm, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    OperationFailure, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
-    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    ResolvedTensorLayout, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, VNextError, WeightEncoding, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
 use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
 use crate::gguf_blocks::GgufBlockFormat;
 
-use super::native_blocks::{bind_native_block, MetalNativeBlockPipelines};
+use super::native_blocks::{bind_native_block, dispatch_m64_grid, MetalNativeBlockPipelines};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -43,6 +44,17 @@ use super::{
 };
 
 const SHADER_SOURCE: &str = include_str!("linear.metal");
+pub(super) const FINGERPRINT_SOURCE: &str = concat!(
+    include_str!("linear.rs"),
+    include_str!("linear.metal"),
+    include_str!("linear/small_batch.rs"),
+    include_str!("linear/small_batch.metal"),
+    include_str!("linear/staged_prefill.rs"),
+    include_str!("../q4_k_gemv_v2.metal"),
+    include_str!("../q5_k_gemv.metal"),
+    include_str!("../q6_k_gemv.metal"),
+    include_str!("../k_quant_gemm.metal"),
+);
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.metal.dense_linear.f16.native";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_linear.f16.native";
 const DENSE_SWIGLU_PROVIDER_ID: &str = "provider.metal.dense_swiglu.f16.native";
@@ -54,8 +66,22 @@ const LAST_TOKEN_F32_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_dense_linear.f32.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
+// Amortize float tile loading while retaining enough independent output tiles.
+const NATIVE_TILED_GEMM_MIN_ROWS: u32 = 32;
+const NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 1024;
+// Short IQ4_XS waves need a wider output grid; retain GEMV for narrow grids.
+const NATIVE_SHORT_TILED_GEMM_MIN_ROWS: u32 = 8;
+const NATIVE_SHORT_TILED_GEMM_MIN_OUTPUT_FEATURES: u32 = 4096;
+// Conservative lower end of measured IQ4_XS M64 prefill; not a crossover estimate.
+const NATIVE_M64_GEMM_MIN_ROWS: u32 = 1024;
+// Small output grids do not provide enough parallelism after sharing weights.
+// Keep the existing GEMV there; the opt-in microbench covers both regimes.
+const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
+
+mod small_batch;
+pub(super) mod staged_prefill;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
@@ -83,6 +109,7 @@ pub(super) struct MetalLinearPipelines {
     q6_k_gemv: ComputePipelineState,
     q6_k_gemv_f32: ComputePipelineState,
     k_quant_gemm: MetalKQuantGemmPipelines,
+    small_batch: small_batch::SmallBatchPipelines,
     q8_0: ComputePipelineState,
     q8_0_f32: ComputePipelineState,
     swiglu: ComputePipelineState,
@@ -92,7 +119,10 @@ pub(super) struct MetalLinearPipelines {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinearDispatchKind {
     CooperativeGemv,
+    SharedWeightGemv,
     TiledGemm,
+    NativeTiledGemm,
+    NativeTiledGemmM64,
 }
 
 impl MetalLinearPipelines {
@@ -133,6 +163,7 @@ impl MetalLinearPipelines {
                 .map_err(MetalDeviceRuntimeError::contract)?,
             k_quant_gemm: MetalKQuantGemmPipelines::new(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
+            small_batch: small_batch::SmallBatchPipelines::new(device)?,
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
             q8_0_f32: pipeline(LINEAR_Q8_0_F32_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
@@ -144,7 +175,31 @@ impl MetalLinearPipelines {
         &self,
         format: LinearPhysicalFormat,
         rows: u32,
+        out_features: u32,
     ) -> (&ComputePipelineState, LinearDispatchKind) {
+        if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+            if format == LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs) {
+                if let Some(pipeline) = self.native.iq4xs_group_dot(rows) {
+                    return (
+                        pipeline,
+                        if rows == 1 {
+                            LinearDispatchKind::CooperativeGemv
+                        } else {
+                            LinearDispatchKind::SharedWeightGemv
+                        },
+                    );
+                }
+            }
+            if let Some(pipeline) = self.small_batch.pipeline(format, rows) {
+                return (pipeline, LinearDispatchKind::SharedWeightGemv);
+            }
+            if let Some(pipeline) = format
+                .native_block(ElementType::F16)
+                .and_then(|format| self.native.shared_linear(format, rows, ElementType::F16))
+            {
+                return (pipeline, LinearDispatchKind::SharedWeightGemv);
+            }
+        }
         let tiled = rows >= QUANTIZED_TILED_GEMM_MIN_ROWS;
         match (format, tiled) {
             (LinearPhysicalFormat::Q4K, true) => {
@@ -174,9 +229,33 @@ impl MetalLinearPipelines {
             (LinearPhysicalFormat::Q8_0, false) => {
                 (&self.q8_0, LinearDispatchKind::CooperativeGemv)
             }
-            (LinearPhysicalFormat::Native(_), _) => {
-                (&self.native.linear_f16, LinearDispatchKind::CooperativeGemv)
+            (LinearPhysicalFormat::Native(format), _)
+                if (rows >= NATIVE_TILED_GEMM_MIN_ROWS
+                    && out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES)
+                    || (format == GgufBlockFormat::Iq4Xs
+                        && rows >= NATIVE_SHORT_TILED_GEMM_MIN_ROWS
+                        && out_features >= NATIVE_SHORT_TILED_GEMM_MIN_OUTPUT_FEATURES) =>
+            {
+                if format == GgufBlockFormat::Iq4Xs {
+                    if rows >= NATIVE_M64_GEMM_MIN_ROWS {
+                        if let Some(pipeline) = self.native.iq4xs_gemm_f16_f32_m64.as_ref() {
+                            return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                        }
+                    }
+                    return (
+                        &self.native.iq4xs_gemm_f16_f32,
+                        LinearDispatchKind::NativeTiledGemm,
+                    );
+                }
+                (
+                    &self.native.gemm_f16_f32,
+                    LinearDispatchKind::NativeTiledGemm,
+                )
             }
+            (LinearPhysicalFormat::Native(format), _) => (
+                self.native.linear_f16(format),
+                LinearDispatchKind::CooperativeGemv,
+            ),
         }
     }
 
@@ -186,10 +265,30 @@ impl MetalLinearPipelines {
             LinearPhysicalFormat::Q4K => Some(&self.q4_k_gemv_f32),
             LinearPhysicalFormat::Q6K => Some(&self.q6_k_gemv_f32),
             LinearPhysicalFormat::Q8_0 => Some(&self.q8_0_f32),
-            LinearPhysicalFormat::Q5K | LinearPhysicalFormat::Native(_) => {
-                Some(&self.native.linear_f32)
+            LinearPhysicalFormat::Q5K => Some(self.native.linear_f32(GgufBlockFormat::Q5K)),
+            LinearPhysicalFormat::Native(format) => Some(self.native.linear_f32(format)),
+        }
+    }
+
+    fn f32_linear_dispatch(
+        &self,
+        format: LinearPhysicalFormat,
+        rows: u32,
+        out_features: u32,
+    ) -> Option<(&ComputePipelineState, LinearDispatchKind)> {
+        if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+            if let Some(pipeline) = self.small_batch.f32_pipeline(format, rows) {
+                return Some((pipeline, LinearDispatchKind::SharedWeightGemv));
+            }
+            if let Some(pipeline) = format
+                .native_block(ElementType::F32)
+                .and_then(|format| self.native.shared_linear(format, rows, ElementType::F32))
+            {
+                return Some((pipeline, LinearDispatchKind::SharedWeightGemv));
             }
         }
+        self.f32_linear_pipeline(format)
+            .map(|pipeline| (pipeline, LinearDispatchKind::CooperativeGemv))
     }
 }
 
@@ -271,9 +370,19 @@ impl MetalDenseSwiGluProvider {
             DENSE_SWIGLU_PROVIDER_ID,
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
-            3,
+            6,
             ALL_LINEAR_QUANTIZATION_FORMATS,
-        )?;
+        )?
+        // Gate/up and activation scratch are fully produced by this invocation.
+        // No state or previous scratch contents participate in its result.
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+        ));
         Ok(Self {
             descriptor,
             pipelines,
@@ -300,12 +409,17 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
         }
         let intermediate_size =
             unsigned_attribute(request.attributes(), "intermediate_size").map_err(invalid_plan)?;
+        let hidden_size =
+            unsigned_attribute(request.attributes(), "hidden_size").map_err(invalid_plan)?;
+        let staging_bytes =
+            staged_prefill::workspace_bytes(request.values(), hidden_size, intermediate_size)
+                .map_err(invalid_plan)?;
         let bytes_per_token = intermediate_size
             .checked_mul(SWIGLU_SCRATCH_PARTS)
             .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
             .ok_or_else(|| invalid_plan("Metal dense SwiGLU scratch size overflows"))?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?,
+            ProviderWorkspaceSizeFormula::affine(staging_bytes, 0, bytes_per_token)?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
@@ -365,7 +479,19 @@ impl MetalLastTokenDenseLinearProvider {
         runtime: &MetalDeviceRuntime,
         pipelines: Arc<MetalLinearPipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        Self::new_with_activation_type(runtime, pipelines, ElementType::F32)
+        let mut provider = Self::new_with_activation_type(runtime, pipelines, ElementType::F32)?;
+        // The selected final row and gather/output scratch are invocation-local.
+        provider.descriptor = provider.descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(
+                ProviderCheckpointContract::new(
+                    CheckpointInputDependency::ExactTokenPrefix,
+                    CheckpointBoundaryConstraint::any_positive(),
+                    CheckpointPartitionNumerics::CapturedExecutionContinuation,
+                )
+                .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+            ),
+        );
+        Ok(provider)
     }
 
     fn new_with_activation_type(
@@ -518,13 +644,8 @@ fn linear_provider_descriptor(
         &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
         accepted_quantization_formats,
         implementation_fingerprint(&[
-            include_str!("linear.rs").as_bytes(),
-            SHADER_SOURCE.as_bytes(),
+            FINGERPRINT_SOURCE.as_bytes(),
             super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
-            include_str!("../q4_k_gemv_v2.metal").as_bytes(),
-            include_str!("../q5_k_gemv.metal").as_bytes(),
-            include_str!("../q6_k_gemv.metal").as_bytes(),
-            crate::backend::metal::k_quant_gemm::SHADER_SOURCE.as_bytes(),
             provider_id.as_bytes(),
         ]),
     )
@@ -1152,9 +1273,14 @@ fn encode_dense_swiglu(
     let activation_bytes = activation_elements
         .checked_mul(ElementType::F16.size_bytes())
         .ok_or_else(|| "Metal dense SwiGLU activation scratch size overflows".to_owned())?;
-    let required_scratch_bytes = gate_up_bytes
+    let activation_scratch_bytes = gate_up_bytes
         .checked_add(activation_bytes)
         .ok_or_else(|| "Metal dense SwiGLU total scratch size overflows".to_owned())?;
+    let staging_bytes =
+        staged_prefill::workspace_bytes(first.bindings(), hidden_size, intermediate_size)?;
+    let required_scratch_bytes = activation_scratch_bytes
+        .checked_add(staging_bytes)
+        .ok_or_else(|| "Metal dense SwiGLU staged scratch size overflows".to_owned())?;
 
     if gate_up.regions.is_empty() || down.regions.is_empty() {
         return Err("Metal dense SwiGLU resolved empty weight storage".to_owned());
@@ -1224,23 +1350,27 @@ fn encode_dense_swiglu(
         "Metal dense SwiGLU scratch",
     )?;
     let swiglu = swiglu_launch(0, gate_up_bytes, tokens, intermediate_size, packed_width)?;
+    let staging = staged_prefill::Workspace::new(
+        &regions,
+        scratch_region,
+        activation_scratch_bytes,
+        staging_bytes,
+        gate_launches.iter().copied().chain([down_launch]),
+    )?;
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal dense SwiGLU participant count",
     )?;
-    let dispatch_count = gate_launches.len() as u64 + 2;
+    let sequence = staged_prefill::Sequence {
+        gate_up: gate_launches,
+        down: down_launch,
+        activation: swiglu,
+        scratch_region,
+        workspace: staging,
+    };
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(dispatch_count);
-        for launch in &gate_launches {
-            dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
-        }
-        dispatch_swiglu(
-            &pipelines,
-            encoder.compute_encoder(),
-            &regions[scratch_region],
-            swiglu,
-        );
-        dispatch_linear(&pipelines, encoder.compute_encoder(), regions, down_launch);
+        encoder.record_compute_dispatches(sequence.dispatch_count());
+        sequence.encode(&pipelines, encoder.compute_encoder(), regions);
         Ok(())
     })
     .map_err(|error| error.to_string())?
@@ -1415,13 +1545,18 @@ pub(super) fn dispatch_linear(
     launch: LinearLaunch,
 ) {
     let (pipeline, dispatch_kind) = match launch.activation_type {
-        ElementType::F16 => pipelines.linear_pipeline(launch.format, launch.params.rows),
-        ElementType::F32 => (
-            pipelines
-                .f32_linear_pipeline(launch.format)
-                .expect("validated Metal F32 linear format"),
-            LinearDispatchKind::CooperativeGemv,
+        ElementType::F16 => pipelines.linear_pipeline(
+            launch.format,
+            launch.params.rows,
+            launch.params.out_features,
         ),
+        ElementType::F32 => pipelines
+            .f32_linear_dispatch(
+                launch.format,
+                launch.params.rows,
+                launch.params.out_features,
+            )
+            .expect("validated Metal F32 linear format"),
         _ => unreachable!("validated Metal linear activation ABI"),
     };
     encoder.set_compute_pipeline_state(pipeline);
@@ -1477,6 +1612,10 @@ fn dispatch_linear_grid(
             ),
             MTLSize::new(32, 2, 1),
         ),
+        LinearDispatchKind::SharedWeightGemv => encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.out_features).div_ceil(4), 1, 1),
+            MTLSize::new(32, 2, 1),
+        ),
         LinearDispatchKind::TiledGemm => {
             encoder.set_threadgroup_memory_length(0, 8192);
             encoder.dispatch_thread_groups(
@@ -1487,6 +1626,21 @@ fn dispatch_linear_grid(
                 ),
                 MTLSize::new(128, 1, 1),
             );
+        }
+        LinearDispatchKind::NativeTiledGemm => {
+            // F32 X[32][32] and W[32][64]; W is reused for the output tile.
+            encoder.set_threadgroup_memory_length(0, 12288);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    u64::from(params.rows).div_ceil(32),
+                    u64::from(params.out_features).div_ceil(64),
+                    1,
+                ),
+                MTLSize::new(128, 1, 1),
+            );
+        }
+        LinearDispatchKind::NativeTiledGemmM64 => {
+            dispatch_m64_grid(encoder, params.rows, params.out_features);
         }
     }
 }
@@ -2018,6 +2172,9 @@ fn validate_swiglu_participant(
 mod native_tests;
 
 #[cfg(test)]
+mod microbench;
+
+#[cfg(test)]
 mod tests {
     use super::super::numerical_tolerance;
     use super::*;
@@ -2370,7 +2527,8 @@ mod tests {
             (GgmlDType::Q6K, LinearPhysicalFormat::Q6K),
             (GgmlDType::Q8_0, LinearPhysicalFormat::Q8_0),
         ] {
-            let (_, dispatch_kind) = pipelines.linear_pipeline(format, rows as u32);
+            let (_, dispatch_kind) =
+                pipelines.linear_pipeline(format, rows as u32, output_width as u32);
             assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
             let quantized = QTensor::quantize(&dense, dtype).unwrap();
             let reference = input_tensor
@@ -2477,7 +2635,8 @@ mod tests {
         let output = output_buffer::<f16>(&device, rows * output_width);
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        let (_, dispatch_kind) = pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32);
+        let (_, dispatch_kind) =
+            pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32, output_width as u32);
         assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
         dispatch_raw_linear(
             &pipelines,
@@ -2942,8 +3101,11 @@ mod tests {
         gather.end_encoding();
 
         let encoder = command.new_compute_command_encoder();
-        let (_, dispatch_kind) =
-            pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, participant_count as u32);
+        let (_, dispatch_kind) = pipelines.linear_pipeline(
+            LinearPhysicalFormat::Q6K,
+            participant_count as u32,
+            output_width as u32,
+        );
         assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
         dispatch_raw_linear_with_offsets(
             &pipelines,
@@ -3057,7 +3219,8 @@ mod tests {
         output_offset_bytes: u64,
         params: LinearParams,
     ) {
-        let (pipeline, dispatch_kind) = pipelines.linear_pipeline(format, params.rows);
+        let (pipeline, dispatch_kind) =
+            pipelines.linear_pipeline(format, params.rows, params.out_features);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(input), input_offset_bytes);
         encoder.set_buffer(1, Some(weight), 0);

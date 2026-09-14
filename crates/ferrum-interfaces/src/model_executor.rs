@@ -17,6 +17,18 @@ use std::{
     sync::Arc,
 };
 
+mod prefix_capture;
+mod prefix_restore;
+pub use prefix_capture::{
+    PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
+    PrefixCaptureStatus,
+};
+pub use prefix_restore::{
+    PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
+    PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
+    PrefixRestoreObservation, PrefixRestoreSource,
+};
+
 /// One model-owned KV slot reservation request.
 ///
 /// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
@@ -2987,6 +2999,34 @@ pub enum ExecutorPrefillAdmissionDecision {
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Plan an optional prompt-tail checkpoint before a prefill chunk is
+    /// dispatched. The boundary must lie after this chunk's start and no later
+    /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning
+    /// grants no capacity or capture authority and does not report a failed
+    /// capacity probe; the caller dispatches the resulting chunk explicitly.
+    fn plan_prompt_tail_capture_boundary(&self, _chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
+        None
+    }
+
+    /// Pure boundary planning for optional sharing. None leaves normal scheduling
+    /// unchanged; a returned boundary never grants request or resource authority.
+    fn plan_prefix_capture_boundary(
+        &self,
+        _input: PrefixCaptureBoundary<'_>,
+    ) -> Option<PrefixCapturePlan> {
+        None
+    }
+
+    /// Arm interest only against an already-admitted, exact source incarnation.
+    /// No device allocation, capacity reservation, provider encoding, or device
+    /// submission is allowed here.
+    fn retain_prefix_capture_interest(
+        &self,
+        _input: PrefixCaptureRequest<'_>,
+    ) -> Result<Option<Arc<dyn PrefixCaptureLease>>> {
+        Ok(None)
+    }
+
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
 
@@ -3096,6 +3136,25 @@ pub trait ModelExecutor: Send + Sync {
     /// Returns true only when a retained authority was found and released.
     fn cancel_prefill_admission(&self, _request_id: &RequestId) -> bool {
         false
+    }
+
+    /// Whether this exact plan can retain and restore independent prefix state.
+    /// This must include resolved model/provider support and product policy.
+    fn supports_plan_runtime_prefix_restore(&self) -> bool {
+        false
+    }
+
+    /// Restore a proper prefix into a freshly admitted request before the
+    /// scheduler publishes any work for it. A miss submits no device work and
+    /// preserves the admitted target. Successful restoration remains gated
+    /// until the engine publishes the matching scheduler/executor progress and
+    /// acknowledges the returned owner. Cancellation must retain unknown native
+    /// writes until the existing completion path proves quiescence.
+    async fn try_restore_plan_runtime_prefix(
+        &self,
+        _input: PlanRuntimePrefixRestoreInput<'_>,
+    ) -> Result<PlanRuntimePrefixRestoreOutcome> {
+        Ok(PlanRuntimePrefixRestoreOutcome::Unavailable)
     }
 
     /// Writes the exact availability sources advanced when this request
@@ -3429,8 +3488,10 @@ pub trait ModelExecutor: Send + Sync {
     ///
     /// Legacy executors only need physical release and inherit that behavior.
     /// Plan runtimes with terminal journals override this method so completion
-    /// cannot be inferred from a generic release operation.
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    /// cannot be inferred from a generic release operation. Implementations may
+    /// await retention of the last completed native state before releasing its
+    /// source; sampled output alone is not evidence of an executed frontier.
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.release_cache(completion.cache_id());
         Ok(())
     }

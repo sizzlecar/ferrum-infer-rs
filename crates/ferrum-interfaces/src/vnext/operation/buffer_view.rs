@@ -309,6 +309,9 @@ enum OperationRegionSource<'a, B> {
     },
 }
 
+mod copy;
+pub(crate) use copy::OperationBufferCopy;
+
 /// A checked logical range translated to physical device-buffer regions.
 /// Dynamic buffers never expose an arena buffer without its physical offsets.
 pub struct OperationBufferRegions<'a, B> {
@@ -594,7 +597,7 @@ impl<'a, B> OperationBufferView<'a, B> {
         )
     }
 
-    pub(super) fn from_backing_prefix(
+    pub(crate) fn from_backing_prefix(
         descriptor: BufferDescriptor,
         backing: LogicalBackingBufferView<'a, B>,
         allocation_lifetime: AllocationLifetime,

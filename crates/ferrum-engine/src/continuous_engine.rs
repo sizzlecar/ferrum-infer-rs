@@ -265,9 +265,11 @@ fn validate_request_context_budget(
         return Ok(());
     }
 
-    Err(FerrumError::request_validation(format!(
-        "This model context is limited to {capacity} tokens, but this request needs {input_tokens} input tokens + {output_tokens} output tokens. Reduce max_tokens or shorten the messages."
-    )))
+    Err(FerrumError::ContextLengthExceeded {
+        capacity,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 fn clamp_default_max_tokens_to_context(
@@ -1437,6 +1439,8 @@ struct EngineInner {
     resource_trace_event_counter: AtomicU64,
     dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
     execution_readiness_waiters: ExecutionReadinessWaitRegistry,
+    prefix_rendezvous: Mutex<Vec<inner::prefix_rendezvous::PrefixRendezvous>>,
+    prefix_restore_pending: Mutex<HashMap<RequestId, inner::prefix_restore::PendingPrefixRestore>>,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -2410,7 +2414,7 @@ impl EngineInner {
                 usage.completion_tokens,
             );
             let result = match completion {
-                Ok(completion) => self.model_executor.complete_cache(completion),
+                Ok(completion) => self.model_executor.complete_cache(completion).await,
                 Err(error) => {
                     self.model_executor.release_cache(&cache_id);
                     Err(error)
@@ -2860,6 +2864,8 @@ impl ContinuousBatchEngine {
                 resource_trace_event_counter: AtomicU64::new(0),
                 dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
                 execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
+                prefix_rendezvous: Mutex::new(Vec::new()),
+                prefix_restore_pending: Mutex::new(HashMap::new()),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -2952,12 +2958,14 @@ impl ContinuousBatchEngine {
                     EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
                     EngineIterationOutcome::Idle => {
                         tokio::select! {
+                            _ = inner.wait_for_prefix_deadline() => {}
                             _ = inner.shutdown_notify.notified() => {}
                             _ = inner.work_notify.notified() => {}
                         }
                     }
                     EngineIterationOutcome::CapacityBlocked(registration) => {
                         tokio::select! {
+                            _ = inner.wait_for_prefix_deadline() => {}
                             _ = inner.shutdown_notify.notified() => {}
                             _ = inner.work_notify.notified() => {}
                             result = registration.wait_for_change() => {
@@ -3283,6 +3291,12 @@ impl InferenceEngine for ContinuousBatchEngine {
             .execution_readiness_waiters
             .abort_and_join()
             .await;
+        // Drop immutable checkpoint pins outside the cohort mutex before native
+        // resource shutdown. No pending dependency survives engine shutdown.
+        let prefix_cohorts = std::mem::take(&mut *self.inner.prefix_rendezvous.lock());
+        drop(prefix_cohorts);
+        let prefix_restores = std::mem::take(&mut *self.inner.prefix_restore_pending.lock());
+        drop(prefix_restores);
 
         let mut trace_journals = Vec::with_capacity(2);
         if let Some(journal) = self.inner.profile_trace_jsonl.clone() {

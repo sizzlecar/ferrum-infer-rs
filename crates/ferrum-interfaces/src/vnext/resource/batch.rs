@@ -10,7 +10,8 @@ use super::{
     ProgramBindingLayout, ProgramBindingNodeBinding, RequestAuthorityId, SequenceAuthorityId,
     SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
     SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
-    StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    StepCompletedBoundaryProof, StepCompletedBoundarySlot, StepParticipantFrameAssignment,
+    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
@@ -31,6 +32,7 @@ where
     pub(super) execution_lane: Arc<ExecutionLane<R>>,
     pub(super) reusable_execution_bucket: Option<ReusableExecutionBucketSpec>,
     pub(super) batch_step_id: BatchStepId,
+    pub(super) completed_boundary: Mutex<StepCompletedBoundarySlot>,
     pub(super) finalized: bool,
 }
 
@@ -865,6 +867,7 @@ pub(super) fn acquire_session_frames(
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame.is_none()
+                    && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.epoch
@@ -925,11 +928,13 @@ pub(super) fn session_frame_candidates<R: DeviceRuntime>(
 pub(super) fn acquire_session_frames_with_backing<R>(
     candidates: &[SequenceFrameCaptureCandidate<R>],
     batch_step_id: BatchStepId,
+    work_shape: &BatchWorkShape,
 ) -> Result<Vec<CapturedSessionFrame<R>>, VNextError>
 where
     R: DeviceRuntime,
 {
     if candidates.is_empty()
+        || candidates.len() != work_shape.participant_work().len()
         || candidates.iter().enumerate().any(|(index, candidate)| {
             candidates[..index]
                 .iter()
@@ -958,6 +963,7 @@ where
                     && active.fingerprint == candidate.frame.fingerprint
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame.is_none()
+                    && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.frame.epoch
@@ -976,6 +982,19 @@ where
                 ));
             }
         }
+    }
+    for ((candidate, state), work) in candidates
+        .iter()
+        .zip(&states)
+        .zip(work_shape.participant_work())
+    {
+        let SequenceSessionSlotState::Active(active) = &**state else {
+            unreachable!("all session frame candidates were validated");
+        };
+        active.completed_boundary.validate_imported_work(
+            work.token_span(),
+            candidate.resources.request.plan.plan_hash(),
+        )?;
     }
     // Frame capture and extension publication use the same slot -> backing
     // lock order. Allocator, device, copy, and fence work stay outside it.
@@ -1060,6 +1079,14 @@ pub(super) fn finalize_session_frames(
     holds: &mut [&mut SessionFrameHold],
     finalization: StepFrameFinalization,
 ) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
+    finalize_session_frames_with_boundary(holds, finalization, None)
+}
+
+pub(super) fn finalize_session_frames_with_boundary(
+    holds: &mut [&mut SessionFrameHold],
+    finalization: StepFrameFinalization,
+    completed: Option<&StepCompletedBoundaryProof>,
+) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
     let slots = holds
         .iter()
         .map(|hold| Arc::clone(&hold.slot))
@@ -1112,12 +1139,18 @@ pub(super) fn finalize_session_frames(
             StepFrameFinalization::Commit => StepParticipantRetirementDisposition::Committed,
         });
     }
-    for (hold, state) in holds.iter().zip(&mut states) {
+    // Compute all frontier updates before changing any participant. A private
+    // Step proof cannot partially commit a batch whose later member is stale.
+    let frontiers = super::completed_frontier_updates(&holds, &states, &dispositions, completed)?;
+    for ((hold, state), frontier) in holds.iter().zip(&mut states).zip(frontiers) {
         let hold = &**hold;
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all step participant sessions were validated");
         };
         active.active_frame = None;
+        if let Some(frontier) = frontier {
+            active.completed_boundary = frontier;
+        }
         match finalization {
             StepFrameFinalization::Abort => active.phase = SequenceSessionPhase::Poisoned,
             StepFrameFinalization::Commit => active.retired_frames += 1,

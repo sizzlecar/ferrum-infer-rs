@@ -11,6 +11,9 @@ use ferrum_types::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
 
+mod prefix_restore;
+pub use prefix_restore::PreparedPrefixRestore;
+
 /// Main scheduler trait for request management and batching
 #[async_trait]
 pub trait Scheduler: Send + Sync {
@@ -39,6 +42,33 @@ pub trait Scheduler: Send + Sync {
     fn request_state(&self, request_id: &RequestId) -> Option<RequestState> {
         let _ = request_id;
         None
+    }
+
+    /// Reserve the current admitted, unscheduled prefill incarnation before
+    /// starting an asynchronous state restore. Unsupported schedulers return
+    /// `None`. Dropping the preparation must release its scheduling hold
+    /// without advancing progress; no scheduler lock may span device work.
+    fn prepare_prefix_restore(
+        &self,
+        _request_id: &RequestId,
+        _expected_offset: usize,
+        _prompt_tokens: usize,
+    ) -> Result<Option<PreparedPrefixRestore>> {
+        Ok(None)
+    }
+
+    /// Conditionally publish the boundary returned by a completed restore.
+    /// Implementations must revalidate the preparation's admission and work
+    /// identities, and require `expected_offset < restored_boundary < prompt`.
+    /// This is state progress, not model execution or capacity-fit feedback.
+    fn commit_prefix_restored(
+        &self,
+        _prepared: PreparedPrefixRestore,
+        _restored_boundary: usize,
+    ) -> Result<()> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "Prefix state restoration is not supported by this scheduler",
+        ))
     }
 
     /// Preempt running request (if supported)

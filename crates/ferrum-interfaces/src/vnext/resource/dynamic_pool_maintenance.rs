@@ -488,6 +488,72 @@ where
         }
     }
 
+    /// Attempts growth for a real foreground demand, including occupied pools
+    /// whose total is sufficient but whose current availability is not.
+    /// This does not change the deferral action, acquire claims, or reclaim
+    /// another pool. The caller must repeat admission after any receipt.
+    pub(super) fn try_maintain_for_capacity_pressure(
+        &self,
+        deferred: &AdmissionDeferred,
+    ) -> Result<Option<DynamicPoolGrowthBatchReceipt>, VNextError> {
+        let coordinator_id = self.pools.logical_admission.id();
+        if coordinator_id != deferred.epochs().coordinator_id()
+            || coordinator_id != deferred.wait_condition().coordinator_id()
+        {
+            return Err(invalid_resource(
+                "logical admission pressure belongs to another coordinator",
+            ));
+        }
+        if self.pools.logical_admission.snapshot()?.poisoned() {
+            return Err(invalid_resource("logical admission is fail-closed"));
+        }
+        let pools_by_domain = self
+            .pools
+            .pools
+            .values()
+            .map(|pool| (pool.domain.domain_id, pool.domain.pool_id().clone()))
+            .collect::<BTreeMap<_, _>>();
+        // More bytes cannot release an execution slot, even when the same
+        // observation also contains a growable byte-domain shortfall.
+        if deferred.blockers().iter().any(|blocker| {
+            blocker.kind() == CapacityShortfallKind::ActiveSequenceCeiling
+                || blocker
+                    .domain()
+                    .is_none_or(|domain| !pools_by_domain.contains_key(&domain))
+        }) {
+            return Ok(None);
+        }
+        let mut required = BTreeMap::<DynamicBackingPoolId, u64>::new();
+        for entry in deferred
+            .immediate_requested()
+            .entries()
+            .iter()
+            .chain(deferred.fit_requested().entries())
+        {
+            let Some(pool_id) = pools_by_domain.get(&entry.domain()) else {
+                return Ok(None);
+            };
+            // FullInputMustFit is an availability condition, not a claim.
+            // ImmediateOnly's typed demand guarantees fit == immediate.
+            required
+                .entry(pool_id.clone())
+                .and_modify(|bytes| *bytes = (*bytes).max(entry.units().get()))
+                .or_insert(entry.units().get());
+        }
+        let intents = required
+            .into_iter()
+            .map(|(pool_id, required_free_bytes)| {
+                DynamicPoolGrowthIntent::RevalidatedAdmissionPressure {
+                    pool_id,
+                    required_free_bytes,
+                }
+            })
+            .collect();
+        self.pools
+            .maintain_pools_observed(intents, &mut None)
+            .map(Some)
+    }
+
     /// Materializes fit capacity that logical admission identified as
     /// growable but that immediate backing preparation does not yet claim.
     pub fn maintain_for_admission_deferred(

@@ -10,6 +10,7 @@ fn attention_provider_policy_is_sealed_into_runtime_fingerprint() {
             ContractVersion::new(3, 0),
             SchedulingDiscipline::FirstReady,
             RuntimeMemoryPolicy {
+                checkpoint_capacity: None,
                 capacity_bytes: 4096,
                 reserve_bytes: 128,
                 maximum_active_sequences: 32,
@@ -257,6 +258,7 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
         ContractVersion::new(2, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 3,
@@ -362,6 +364,7 @@ fn legacy_reusable_memory_plan_wire_round_trips_without_program_policy() {
         ContractVersion::new(2, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 3,
@@ -774,6 +777,7 @@ fn state_capacity_demand_is_explicit_checked_and_wire_closed() {
             maximum_tokens: 128,
         },
         initialization: StateInitialization::Zero,
+        checkpoint: StateCheckpointCapability::Unsupported,
     };
     let restored: StateSpec =
         serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();

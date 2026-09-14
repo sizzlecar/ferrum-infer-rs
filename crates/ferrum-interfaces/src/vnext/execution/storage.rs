@@ -334,6 +334,8 @@ pub struct DynamicBackingPoolSpec {
     pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
     pub(super) reusable_workspace_ceiling_bytes: u64,
+    #[serde(skip_serializing_if = "is_zero_bytes")]
+    pub(super) checkpoint_growth_ceiling_bytes: u64,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -351,6 +353,7 @@ impl DynamicBackingPoolSpec {
         step_resource_slots: Vec<StepResourceSlot>,
         theoretical_ceiling_bytes: u128,
         reusable_workspace_ceiling_bytes: u64,
+        checkpoint_growth_ceiling_bytes: u64,
         dynamic_capacity_bytes: u64,
         invocation_liveness_mode: InvocationLivenessMode,
         invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -364,6 +367,7 @@ impl DynamicBackingPoolSpec {
             .ok_or_else(|| invalid_plan("dynamic pool runnable minimum overflows u64"))?;
         let combined_ceiling_bytes = theoretical_ceiling_bytes
             .checked_add(u128::from(reusable_workspace_ceiling_bytes))
+            .and_then(|bytes| bytes.checked_add(u128::from(checkpoint_growth_ceiling_bytes)))
             .ok_or_else(|| invalid_plan("dynamic pool combined ceiling overflows u128"))?;
         let maximum_resident_bytes =
             u64::try_from(combined_ceiling_bytes.min(u128::from(dynamic_capacity_bytes)))
@@ -379,6 +383,7 @@ impl DynamicBackingPoolSpec {
             step_resource_slots,
             theoretical_ceiling_bytes: CanonicalU128::new(theoretical_ceiling_bytes),
             reusable_workspace_ceiling_bytes,
+            checkpoint_growth_ceiling_bytes,
             provisioning: DynamicPoolProvisioningPolicy::demand_driven(
                 minimum_resident_bytes,
                 maximum_resident_bytes,
@@ -405,6 +410,8 @@ impl DynamicBackingPoolSpec {
             .ok_or_else(|| invalid_plan("dynamic pool runnable minimum overflows u64"))?;
         if self.pool_id != DynamicBackingPoolId::from_compatibility(&self.compatibility)?
             || self.resource_ids.is_empty()
+            || (self.checkpoint_growth_ceiling_bytes != 0
+                && self.compatibility.usage != BufferUsage::State)
             || self.resource_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || minimum_resident_bytes != self.provisioning.minimum_resident_bytes
             || u128::from(self.provisioning.maximum_resident_bytes)
@@ -412,6 +419,9 @@ impl DynamicBackingPoolSpec {
                     .theoretical_ceiling_bytes
                     .get()
                     .checked_add(u128::from(self.reusable_workspace_ceiling_bytes))
+                    .and_then(|bytes| {
+                        bytes.checked_add(u128::from(self.checkpoint_growth_ceiling_bytes))
+                    })
                     .ok_or_else(|| invalid_plan("dynamic pool combined ceiling overflows u128"))?
             || self
                 .step_resource_slots
@@ -499,6 +509,12 @@ impl DynamicBackingPoolSpec {
         self.reusable_workspace_ceiling_bytes
     }
 
+    /// Optional growth beyond ordinary live-resource demand. Each pool's
+    /// ceiling shares one aggregate checkpoint cap; these are not reservations.
+    pub const fn checkpoint_growth_ceiling_bytes(&self) -> u64 {
+        self.checkpoint_growth_ceiling_bytes
+    }
+
     pub fn provisioning(&self) -> &DynamicPoolProvisioningPolicy {
         &self.provisioning
     }
@@ -525,6 +541,8 @@ pub(super) struct DynamicBackingPoolSpecWire {
     pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
     pub(super) reusable_workspace_ceiling_bytes: u64,
+    #[serde(default)]
+    pub(super) checkpoint_growth_ceiling_bytes: u64,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -547,6 +565,7 @@ impl<'de> Deserialize<'de> for DynamicBackingPoolSpec {
             step_resource_slots: wire.step_resource_slots,
             theoretical_ceiling_bytes: wire.theoretical_ceiling_bytes,
             reusable_workspace_ceiling_bytes: wire.reusable_workspace_ceiling_bytes,
+            checkpoint_growth_ceiling_bytes: wire.checkpoint_growth_ceiling_bytes,
             provisioning: wire.provisioning,
             invocation_liveness_mode: wire.invocation_liveness_mode,
             invocation_liveness: wire.invocation_liveness,
@@ -554,6 +573,10 @@ impl<'de> Deserialize<'de> for DynamicBackingPoolSpec {
         spec.validate_local().map_err(serde::de::Error::custom)?;
         Ok(spec)
     }
+}
+
+fn is_zero_bytes(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

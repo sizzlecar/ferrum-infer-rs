@@ -1,3 +1,4 @@
+use super::sequence_checkpoint::{SequenceCheckpointLayout, SequenceCheckpointLayoutData};
 use super::{
     AttributeId, BTreeMap, BTreeSet, CapabilityId, ContractVersion, Deserialize, Deserializer,
     ExecutionWeightPlan, MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId,
@@ -43,6 +44,8 @@ pub struct ExecutionPlanPayload {
     pub(super) terminal_output_resources: Vec<ResourceId>,
     pub(super) nodes: Vec<PlanNode>,
     pub(super) memory: MemoryPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sequence_checkpoint_layout: Option<SequenceCheckpointLayout>,
 }
 
 impl ExecutionPlanPayload {
@@ -138,6 +141,8 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) terminal_output_resources: &'a [ResourceId],
     pub(super) nodes: &'a [PlanNode],
     pub(super) memory: &'a MemoryPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sequence_checkpoint_layout: Option<&'a SequenceCheckpointLayout>,
 }
 
 impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
@@ -161,6 +166,7 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             terminal_output_resources: &payload.terminal_output_resources,
             nodes: &payload.nodes,
             memory: &payload.memory,
+            sequence_checkpoint_layout: payload.sequence_checkpoint_layout.as_ref(),
         }
     }
 }
@@ -227,6 +233,8 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) terminal_output_resources: Vec<ResourceId>,
     pub(super) nodes: Vec<UnvalidatedPlanNode>,
     pub(super) memory: MemoryPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) sequence_checkpoint_layout: Option<SequenceCheckpointLayoutData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +264,11 @@ impl<'de> Deserialize<'de> for UnvalidatedExecutionPlanWire {
         let raw = serde_json::Value::deserialize(deserializer)?;
         let fields = UnvalidatedExecutionPlanWireFields::deserialize(&raw)
             .map_err(serde::de::Error::custom)?;
+        if let Some(layout) = &fields.payload.sequence_checkpoint_layout {
+            layout
+                .validate_version()
+                .map_err(serde::de::Error::custom)?;
+        }
         let canonical = serde_json::to_value(&fields).map_err(serde::de::Error::custom)?;
         if canonical != raw {
             return Err(serde::de::Error::custom(

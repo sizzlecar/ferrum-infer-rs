@@ -510,11 +510,13 @@ fn fingerprint_loaded_file(relative_path: &str, bytes: &[u8]) -> Result<FileFing
 }
 
 fn hash_file(path: &Path) -> Result<String> {
+    let started = std::time::Instant::now();
     let file = File::open(path)
         .map_err(|error| FerrumError::model(format!("open {}: {error}", path.display())))?;
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    let mut bytes_hashed = 0_u64;
     loop {
         let count = reader
             .read(&mut buffer)
@@ -523,8 +525,18 @@ fn hash_file(path: &Path) -> Result<String> {
             break;
         }
         hasher.update(&buffer[..count]);
+        bytes_hashed = bytes_hashed.saturating_add(count as u64);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let fingerprint = format!("{:x}", hasher.finalize());
+    tracing::debug!(
+        target: "ferrum.startup",
+        phase = "source_fingerprint",
+        source_path = %path.display(),
+        bytes_hashed,
+        duration_us = started.elapsed().as_micros() as u64,
+        "Product source content fingerprint completed"
+    );
+    Ok(fingerprint)
 }
 
 fn resolved_source(

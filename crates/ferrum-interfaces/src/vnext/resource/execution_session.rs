@@ -235,7 +235,11 @@ where
         let phase_started = step_admission_profile_start::<PROFILE>();
         let batch_step_id = issue_batch_step_id()?;
         let candidates = session_frame_capture_candidates(&self.sessions);
-        let captured_frames = acquire_session_frames_with_backing(&candidates, batch_step_id)?;
+        let captured_frames = acquire_session_frames_with_backing(
+            &candidates,
+            batch_step_id,
+            claimed_backing.work_shape(),
+        )?;
         let participants = self
             .sessions
             .iter()

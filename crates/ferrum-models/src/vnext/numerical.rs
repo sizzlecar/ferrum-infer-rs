@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use ferrum_interfaces::vnext::{
     ContractVersion, ElementType, FamilyNumericalProfiles, ModelFamilyId,
     NumericalExecutionProfile, NumericalOperationContract, NumericalProfileId, OperationId,
-    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, StateCapacityDemand, StateId,
-    StateInitialization, StateLifetime, StateSpec, VNextError,
+    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, StateCapacityDemand,
+    StateCheckpointCapability, StateId, StateInitialization, StateLifetime, StateSpec, VNextError,
 };
 
 pub(super) fn kv_state(
@@ -32,6 +32,7 @@ pub(super) fn kv_state(
             maximum_tokens,
         },
         initialization: StateInitialization::None,
+        checkpoint: StateCheckpointCapability::Unsupported,
     })
 }
 

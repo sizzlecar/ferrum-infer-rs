@@ -97,6 +97,7 @@ fn reusable_sequential_scratch_plan() -> (
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 3,
@@ -135,6 +136,7 @@ fn reusable_token_scaled_plan() -> (
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 3,

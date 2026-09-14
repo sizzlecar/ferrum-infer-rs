@@ -294,17 +294,28 @@ impl TopKProcessor {
 impl LogitsProcessor for TopKProcessor {
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.k > 0 && self.k < ctx.logits.len() {
-            // Find k-th largest logit
-            let mut indices: Vec<usize> = (0..ctx.logits.len()).collect();
-            indices.sort_by(|&a, &b| {
-                ctx.logits[b]
-                    .partial_cmp(&ctx.logits[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let threshold = if ctx.logits.iter().any(|logit| logit.is_nan()) {
+                // Preserve the legacy stable-sort behavior for NaNs. Its
+                // comparator is not a total ordering, so it cannot be used
+                // with selection on these inputs.
+                let mut indices: Vec<usize> = (0..ctx.logits.len()).collect();
+                indices.sort_by(|&a, &b| {
+                    ctx.logits[b]
+                        .partial_cmp(&ctx.logits[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                ctx.logits[indices[self.k - 1]]
+            } else {
+                // Only the k-th value is needed. Partition a scratch copy so
+                // the sampler still sees logits in their original token order.
+                let mut candidates = ctx.logits.to_vec();
+                let (_, threshold, _) = candidates.select_nth_unstable_by(self.k - 1, |a, b| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                *threshold
+            };
 
-            let threshold = ctx.logits[indices[self.k - 1]];
-
-            // Mask tokens below threshold
+            // Retain every threshold tie, including both signs of zero.
             for logit in ctx.logits.iter_mut() {
                 if *logit < threshold {
                     *logit = f32::NEG_INFINITY;

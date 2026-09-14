@@ -34,6 +34,195 @@ fn topk_masks_tail() {
     assert!(masked >= 2);
 }
 
+fn apply_top_k(mut logits: Vec<f32>, k: usize) -> Vec<f32> {
+    let params = SamplingParams::default();
+    let frequencies = std::collections::HashMap::new();
+    let vocab_size = logits.len();
+    let mut context = SamplingContext::new(0, &params, &mut logits, &[], &frequencies, vocab_size);
+    TopKProcessor::new(k).process(&mut context).unwrap();
+    logits
+}
+
+fn logit_bits(logits: &[f32]) -> Vec<u32> {
+    logits.iter().map(|value| value.to_bits()).collect()
+}
+
+// Compatibility oracle for the pre-selection implementation. In particular,
+// NaN compares equal here, which is not a total ordering. An optimization must
+// not silently replace that legacy behavior with total_cmp or drop NaNs.
+fn legacy_top_k(logits: &mut [f32], k: usize) {
+    if k == 0 || k >= logits.len() {
+        return;
+    }
+    let mut indices = (0..logits.len()).collect::<Vec<_>>();
+    indices.sort_by(|&left, &right| {
+        logits[right]
+            .partial_cmp(&logits[left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let threshold = logits[indices[k - 1]];
+    for logit in logits {
+        if *logit < threshold {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+}
+
+#[test]
+fn topk_keeps_all_threshold_ties_in_original_token_positions() {
+    let logits = vec![2.0, -3.0, 9.0, 2.0, 1.0, 2.0];
+    let filtered = apply_top_k(logits, 2);
+    assert_eq!(
+        filtered,
+        [2.0, f32::NEG_INFINITY, 9.0, 2.0, f32::NEG_INFINITY, 2.0]
+    );
+}
+
+#[test]
+fn topk_preserves_signed_zero_bits_and_infinite_thresholds() {
+    let logits = vec![f32::NEG_INFINITY, -0.0, f32::INFINITY, 0.0, -2.0];
+    assert_eq!(
+        logit_bits(&apply_top_k(logits.clone(), 2)),
+        logit_bits(&[
+            f32::NEG_INFINITY,
+            -0.0,
+            f32::INFINITY,
+            0.0,
+            f32::NEG_INFINITY
+        ])
+    );
+    assert_eq!(
+        apply_top_k(
+            vec![f32::INFINITY, 5.0, f32::INFINITY, f32::NEG_INFINITY],
+            1
+        ),
+        [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY
+        ]
+    );
+    assert_eq!(
+        apply_top_k(vec![f32::NEG_INFINITY; 4], 2),
+        [f32::NEG_INFINITY; 4]
+    );
+}
+
+#[test]
+fn topk_disabled_or_out_of_range_preserves_every_bit() {
+    let logits = vec![f32::from_bits(0x7fc0_1234), -0.0, 0.0, f32::INFINITY, -5.0];
+    for k in [0, logits.len(), usize::MAX] {
+        assert_eq!(
+            logit_bits(&apply_top_k(logits.clone(), k)),
+            logit_bits(&logits)
+        );
+    }
+    assert!(apply_top_k(Vec::new(), 0).is_empty());
+    assert!(apply_top_k(Vec::new(), 20).is_empty());
+}
+
+#[test]
+fn topk_retention_matches_order_statistics_for_finite_logits() {
+    // Repeated values exercise both threshold ties and every valid partition,
+    // without relying on a second selection/sorting implementation as oracle.
+    let logits = (0..97)
+        .map(|i| ((i * 37) % 17) as f32 - 8.0)
+        .collect::<Vec<_>>();
+    for k in 1..logits.len() {
+        let filtered = apply_top_k(logits.clone(), k);
+        for (index, (&before, &after)) in logits.iter().zip(&filtered).enumerate() {
+            let greater = logits.iter().filter(|&&value| value > before).count();
+            let expected = if greater < k {
+                before
+            } else {
+                f32::NEG_INFINITY
+            };
+            assert_eq!(after.to_bits(), expected.to_bits(), "k={k}, token={index}");
+        }
+    }
+}
+
+#[test]
+fn topk_nan_inputs_keep_legacy_mask_and_nan_payloads() {
+    let nan = f32::from_bits(0x7fc0_1234);
+    let negative_nan = f32::from_bits(0xffc0_5678);
+    for logits in [
+        vec![nan, 3.0, 1.0, 2.0],
+        vec![3.0, nan, 1.0, 2.0],
+        vec![3.0, 1.0, 2.0, negative_nan],
+        vec![
+            nan,
+            f32::INFINITY,
+            -0.0,
+            negative_nan,
+            0.0,
+            f32::NEG_INFINITY,
+        ],
+    ] {
+        for k in 1..logits.len() {
+            let mut expected = logits.clone();
+            legacy_top_k(&mut expected, k);
+            assert_eq!(
+                logit_bits(&apply_top_k(logits.clone(), k)),
+                logit_bits(&expected),
+                "k={k}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stochastic_sampling_keeps_seeded_draws_and_temperature_topk_topp_order() {
+    let params = SamplingParams {
+        temperature: 0.6,
+        top_p: 0.95,
+        top_k: Some(20),
+        repetition_penalty: 1.0,
+        seed: Some(20_260_912),
+        ..Default::default()
+    };
+    let config = SamplingConfig::from_params(&params);
+    assert_eq!(
+        config.processor_chain.processor_names(),
+        ["temperature", "top_k", "top_p"]
+    );
+    let frequencies = std::collections::HashMap::new();
+    let mut actual_rng = SamplingRng::seeded(params.seed.unwrap());
+    let mut expected_rng = actual_rng.clone();
+
+    for step in 0..32 {
+        let mut actual = (0..127)
+            .map(|i| ((i * 37 + step * 11) % 53) as f32 / 8.0)
+            .collect::<Vec<_>>();
+        let mut expected = actual.clone();
+        let vocab_size = actual.len();
+        let context =
+            SamplingContext::new(step, &params, &mut actual, &[], &frequencies, vocab_size);
+        let actual_token = config.sample(context, &mut actual_rng).unwrap();
+
+        for value in &mut expected {
+            *value /= params.temperature;
+        }
+        legacy_top_k(&mut expected, 20);
+        let mut context =
+            SamplingContext::new(step, &params, &mut expected, &[], &frequencies, vocab_size);
+        TopPProcessor::new(params.top_p)
+            .process(&mut context)
+            .unwrap();
+        let expected_token = MultinomialSampler
+            .sample_with_context(&context, &mut expected_rng)
+            .unwrap();
+        assert_eq!(logit_bits(&actual), logit_bits(&expected), "step={step}");
+        assert_eq!(actual_token, expected_token, "step={step}");
+    }
+    assert_eq!(
+        actual_rng.next_u64(),
+        expected_rng.next_u64(),
+        "RNG consumption changed"
+    );
+}
+
 #[test]
 fn topp_masks_beyond_p() {
     let mut logits = vec![0.0, 0.0, 10.0, 9.0];

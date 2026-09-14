@@ -9,11 +9,16 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+mod prefix_rendezvous;
+mod prefix_restore;
+pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
 
 #[cfg(test)]
 mod historical_replay_tests;
 
+pub use prefix_restore::PrefixRestoreCapacityStatus;
+use prefix_restore::PrefixRestoreState;
 use pressure::{
     LogicalWorkFrontier, PressureCandidate, PressureCoordinator, PressureDecision,
     PressureHoldStatus, PressureReleaseFenceDisposition,
@@ -37,7 +42,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::model_executor::{
     ExecutorExecutionMaintenanceRetry, ExecutorPrefillAdmissionReceipt,
 };
-use ferrum_interfaces::scheduler::SchedulerMetrics;
+use ferrum_interfaces::scheduler::{PreparedPrefixRestore, SchedulerMetrics};
 use ferrum_interfaces::vnext::{
     AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
 };
@@ -428,6 +433,9 @@ pub struct ContinuousBatchRequest {
     pub decode_tokens: usize,
     /// Phase-independent logical progress and resident-work state.
     logical_work_frontier: LogicalWorkFrontier,
+    /// Optional restore state for this admission, separate from compute work.
+    prefix_restore: PrefixRestoreState,
+    prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState,
     /// KV cache blocks allocated
     pub kv_blocks: Vec<ferrum_types::BlockId>,
     /// Whether prefill is chunked
@@ -474,6 +482,8 @@ impl ContinuousBatchRequest {
             prefill_tokens: 0,
             decode_tokens: 0,
             logical_work_frontier: LogicalWorkFrontier::default(),
+            prefix_restore: PrefixRestoreState::default(),
+            prefix_rendezvous: prefix_rendezvous::PrefixRendezvousRequestState::default(),
             kv_blocks: Vec::new(),
             chunked_prefill: false,
             prefill_chunk_offset: 0,
@@ -583,6 +593,10 @@ type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
 
 enum WaitingAdmissionMode<'a> {
     Legacy,
+    Prepared {
+        wake: AdmissionWakeSnapshot<'a>,
+        observer: &'a mut dyn FnMut(ExecutorAdmissionQueueObservation),
+    },
     Dynamic {
         wake: AdmissionWakeSnapshot<'a>,
         probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
@@ -594,17 +608,18 @@ impl<'a> WaitingAdmissionMode<'a> {
     fn wake(&self) -> Option<AdmissionWakeSnapshot<'a>> {
         match self {
             Self::Legacy => None,
-            Self::Dynamic { wake, .. } => Some(*wake),
+            Self::Dynamic { wake, .. } | Self::Prepared { wake, .. } => Some(*wake),
         }
     }
 
     fn observe(&mut self, observation: ExecutorAdmissionQueueObservation) {
-        if let Self::Dynamic {
-            observer: Some(observer),
-            ..
-        } = self
-        {
-            observer(observation);
+        match self {
+            Self::Dynamic {
+                observer: Some(observer),
+                ..
+            }
+            | Self::Prepared { observer, .. } => observer(observation),
+            _ => {}
         }
     }
 
@@ -614,7 +629,7 @@ impl<'a> WaitingAdmissionMode<'a> {
             Self::Dynamic {
                 observer: Some(_),
                 ..
-            }
+            } | Self::Prepared { .. }
         )
     }
 }
@@ -858,8 +873,11 @@ impl ContinuousBatchMetrics {
     }
 
     fn record_completion(&self, req: &ContinuousBatchRequest) {
-        self.total_prefill_tokens
-            .fetch_add(req.prefill_tokens as u64, Ordering::Relaxed);
+        self.total_prefill_tokens.fetch_add(
+            req.prefill_tokens
+                .saturating_sub(req.prefix_restore.restored_tokens()) as u64,
+            Ordering::Relaxed,
+        );
         self.total_decode_tokens
             .fetch_add(req.decode_tokens as u64, Ordering::Relaxed);
         self.total_prefill_time_ms
@@ -1320,6 +1338,7 @@ impl ContinuousBatchScheduler {
             }
             req.logical_work_frontier
                 .begin_prefill(req.capacity_deferred_from_decode);
+            req.prefix_restore.begin_admission();
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
             let started_at = chrono::Utc::now();
@@ -1363,6 +1382,7 @@ impl ContinuousBatchScheduler {
         request
             .logical_work_frontier
             .begin_prefill(request.capacity_deferred_from_decode);
+        request.prefix_restore.begin_admission();
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
         let started_at = chrono::Utc::now();
@@ -1431,6 +1451,9 @@ impl ContinuousBatchScheduler {
                 maximum_admissions,
                 &mut events,
                 |request, ticket| {
+                    if request.prefix_rendezvous.held() {
+                        return AdmissionQueueEligibility::Held;
+                    }
                     let request_id = &request.inner.request.id;
                     if !self.pressure_active.load(Ordering::Acquire) {
                         return AdmissionQueueEligibility::Eligible;
@@ -1623,6 +1646,21 @@ impl ContinuousBatchScheduler {
         )
     }
 
+    /// Construct work only from retained admissions after an asynchronous
+    /// prefix-restore stage. Existing deferred work still observes current
+    /// capacity epochs, but waiting requests cannot bypass that stage here.
+    pub fn next_batch_with_prepared_admission_observed(
+        &self,
+        hint: BatchHint,
+        wake: AdmissionWakeSnapshot<'_>,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+    ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_admission(
+            hint,
+            WaitingAdmissionMode::Prepared { wake, observer },
+        )
+    }
+
     /// Retain dynamically admitted work without constructing an execution
     /// batch. The engine uses this bounded phase to converge backing growth
     /// for a fill-first cohort before any participant is submitted. Capacity
@@ -1688,6 +1726,9 @@ impl ContinuousBatchScheduler {
         let mut admitted_tokens = 0usize;
         let mut admitted = 0usize;
         for request in waiting.iter() {
+            if request.prefix_rendezvous.held() {
+                continue;
+            }
             if admitted >= limit {
                 break;
             }
@@ -2983,10 +3024,12 @@ impl ContinuousBatchScheduler {
     }
 
     fn apply_prefill_execution_chunk_ceiling(req: &ContinuousBatchRequest, tokens: usize) -> usize {
-        req.prefill_execution_chunk_ceiling
+        let tokens = req
+            .prefill_execution_chunk_ceiling
             .map(|ceiling| tokens.min(ceiling))
             .unwrap_or(tokens)
-            .max(1)
+            .max(1);
+        req.prefix_rendezvous.cap(req.prefill_chunk_offset, tokens)
     }
 
     fn prefill_budget_tokens(
@@ -3155,6 +3198,10 @@ impl ContinuousBatchScheduler {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+            prefix_restore::release_orphaned_capacity_hold(req);
+            if req.prefix_restore.is_pending() {
                 continue;
             }
             if Self::execution_readiness_is_blocked(req) {
@@ -3509,6 +3556,8 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+            && (self.config.prefix_rendezvous_max_wait_ms.is_none()
+                || self.prefix_held_waiting_count() == 0)
             && prefill_first_target > 0
             && decoding_count < prefill_first_target
             && active_count < prefill_first_target
@@ -3667,7 +3716,7 @@ impl ContinuousBatchScheduler {
             for (req_id, empty_retry_epoch) in requests_to_admit {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
             }
-        } else {
+        } else if matches!(&waiting_admission, WaitingAdmissionMode::Dynamic { .. }) {
             self.admit_waiting_dynamically(usize::MAX, available_slots, &mut waiting_admission)?;
         }
 
@@ -3995,6 +4044,23 @@ impl ContinuousBatchScheduler {
 
 #[async_trait]
 impl Scheduler for ContinuousBatchScheduler {
+    fn prepare_prefix_restore(
+        &self,
+        request_id: &RequestId,
+        expected_offset: usize,
+        prompt_tokens: usize,
+    ) -> Result<Option<PreparedPrefixRestore>> {
+        self.prepare_prefix_restore_inner(request_id, expected_offset, prompt_tokens)
+    }
+
+    fn commit_prefix_restored(
+        &self,
+        prepared: PreparedPrefixRestore,
+        restored_boundary: usize,
+    ) -> Result<()> {
+        self.commit_prefix_restored_inner(prepared, restored_boundary)
+    }
+
     async fn submit(&self, request: InferenceRequest) -> Result<RequestId> {
         let request_id = request.id.clone();
         debug!(
@@ -4016,6 +4082,12 @@ impl Scheduler for ContinuousBatchScheduler {
 
         // Add to waiting queue
         let mut waiting_queue = self.waiting_queue.write();
+        let mut request_index = self.request_index.write();
+        if request_index.contains_key(&request_id) {
+            return Err(FerrumError::scheduler(format!(
+                "Request {request_id} is already tracked by the scheduler"
+            )));
+        }
         let queue_position = waiting_queue.len();
 
         let mut req = cb_request;
@@ -4033,7 +4105,6 @@ impl Scheduler for ContinuousBatchScheduler {
         // starts a new cohort after every prior request has left. Doing both
         // under the index write lock makes the idle transition exact with
         // respect to concurrent completion and submission.
-        let mut request_index = self.request_index.write();
         if request_index.is_empty() {
             self.fill_first_initial_cohort_armed
                 .store(true, Ordering::Release);
@@ -8547,6 +8618,89 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(mixed_batch.requests.len(), 2);
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (1 + 64) * 16);
+    }
+
+    #[tokio::test]
+    async fn metal_plan_default_limits_low_concurrency_prefill_until_decoder_finishes() {
+        let mut hardware = ferrum_types::HardwareCapabilities::unknown();
+        hardware.backend = "metal".into();
+        let mut workload = ferrum_types::WorkloadProfile::serving_default();
+        workload.target_concurrency = 16;
+        let resolved = ferrum_types::FerrumConfigBuilder::new(
+            ferrum_types::RuntimeConfigSnapshot::from_env_vars(std::iter::empty::<(&str, &str)>()),
+        )
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .with_execution_resource_authority(ferrum_types::ExecutionResourceAuthority::PlanRuntime)
+        .resolve()
+        .unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        let cap = engine.scheduler.active_decode_prefill_chunk.unwrap();
+        let scheduler = ContinuousBatchScheduler::new(engine.scheduler);
+        let hint = BatchHint {
+            max_batch_size: 16,
+            max_tokens: cap * 16,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let cold_tokens = cap * 4 + 3;
+        let decoder = create_test_request_with_prompt_tokens(Priority::Normal, cold_tokens);
+        let decoder_id = decoder.id.clone();
+        enqueue_waiting(&scheduler, decoder);
+        let cold = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(cold.requests.len(), 1);
+        assert_eq!(cold.requests[0].tokens_to_process, Some(cold_tokens));
+        scheduler.mark_prefill_complete(&decoder_id, cold_tokens);
+        let decoding = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(decoding.requests.len(), 1);
+        assert_eq!(decoding.requests[0].request.id, decoder_id);
+        scheduler.update_decode_progress(&decoder_id, 1);
+
+        let long_tokens = cap * 8 + 7;
+        let prefill = create_test_request_with_prompt_tokens(Priority::Normal, long_tokens);
+        let prefill_id = prefill.id.clone();
+        enqueue_waiting(&scheduler, prefill);
+        let mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert!(mixed.requests.iter().any(|r| r.request.id == decoder_id));
+        let first_chunk = mixed
+            .requests
+            .iter()
+            .find(|r| r.request.id == prefill_id)
+            .unwrap()
+            .tokens_to_process
+            .unwrap();
+        assert!(first_chunk > 0 && first_chunk <= cap && first_chunk < long_tokens);
+        assert!(!scheduler.mark_prefill_chunk_processed(&prefill_id, long_tokens, first_chunk));
+
+        scheduler
+            .complete(
+                decoder_id.clone(),
+                &InferenceResponse {
+                    request_id: decoder_id,
+                    text: String::new(),
+                    tokens: Vec::new(),
+                    finish_reason: ferrum_types::FinishReason::Length,
+                    usage: ferrum_types::TokenUsage::new(cold_tokens, 1),
+                    latency_ms: 0,
+                    created_at: chrono::Utc::now(),
+                    metadata: Default::default(),
+                    api_response: None,
+                    execution_evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        let resumed = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(resumed.requests.len(), 1);
+        assert_eq!(resumed.requests[0].request.id, prefill_id);
+        assert_eq!(
+            resumed.requests[0].tokens_to_process,
+            Some(long_tokens - first_chunk)
+        );
     }
 
     #[test]

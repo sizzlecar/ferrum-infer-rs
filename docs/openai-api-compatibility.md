@@ -172,11 +172,21 @@ separate final SSE chunk before `[DONE]`.
 |---|---:|---|
 | Invalid request JSON or invalid field combination | 400 | `invalid_request_error` |
 | Unsupported explicit feature | 400 | `invalid_request_error` |
+| Input plus requested output exceeds the effective model/KV context capacity | 400 | `invalid_request_error` with `code=context_length_exceeded` |
 | No compatible engine loaded for the endpoint | 503 | `service_unavailable_error` |
-| Generation failure | 500 for non-streaming; OpenAI-shaped SSE error event plus `[DONE]` for streaming | `internal_server_error` |
+| Generation failure | 500 before a response/stream is established; OpenAI-shaped SSE error event plus `[DONE]` after streaming starts | `internal_server_error` |
 
 Every explicit rejection should include the relevant OpenAI-style `param` when
 the failing field is known.
+
+Context-capacity rejection uses the same structured code on Chat Completions,
+Completions, and Responses, including requests with `stream=true`. The rejection
+happens before generation and before SSE headers; clients must shorten the input
+or change the requested output budget before retrying. Ordinary validation errors
+do not receive this code. The shared engine uses the same capacity boundary for
+`ferrum run`, which reports the capacity and requested input/output counts as a
+CLI error. Failures after a stream starts cannot certify that no generation took
+place and must not be treated as a pre-generation capacity rejection.
 
 ## Test Evidence
 

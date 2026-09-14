@@ -1,78 +1,85 @@
-# Repository Guidelines
+# Ferrum Repository Guidelines
 
-## Scope
+## Scope and workflow
 
-- Ferrum is a Rust workspace. Workspace members are declared in the root
-  `Cargo.toml`; implementation crates live under `crates/`.
-- Keep changes small and focused. Preserve unrelated user changes in a dirty
-  worktree.
-- Tests should fail for product code or protocol behavior, not repository
-  process policy. Do not gate tests on a machine identifier, git commit, dirty
-  status, artifact directory, exact PASS text, or a fixed benchmark matrix.
-- Do not add Python or shell test wrappers. Put reusable test logic in the
-  relevant crate's Rust unit or integration tests.
+- Ferrum is a Rust workspace. `Cargo.toml` defines membership; crates live in
+  `crates/`. Keep membership synchronized when adding or removing crates.
+- Inspect current code, worktree status, and upstream state before acting.
+  Preserve unrelated changes and keep each fix focused on its original issue.
+  Report additional fixes separately; they do not complete the original task.
+- Keep reusable tests and benchmark logic in Rust. Do not add Python or shell
+  test wrappers or one-off validation scripts.
 
 ## Product behavior
 
-- When a change affects user-visible inference behavior, cover both product
-  entrypoints: `ferrum run` and `ferrum serve`.
-- Product behavior must be reachable through typed defaults, CLI/config
-  options, or documented presets. Hidden environment combinations are not a
-  product interface.
-- Keep correctness tests hardware-independent when practical. Hardware-specific
-  tests should exercise backend code, not identify a particular host.
-- Do not claim accelerator performance without actual same-hardware benchmark
-  evidence and the command/config used to produce it.
+- Expose behavior through typed defaults, CLI/config options, or documented
+  presets. Hidden environment combinations are not a product interface.
+- Prefer protocol rules and declared model capabilities over client-name or
+  model-name special cases. Preserve the model template's intended behavior.
+- For shared inference changes, cover both `ferrum run` and `ferrum serve`.
+  For entrypoint-specific changes, test the affected flow and explain why the
+  other entrypoint is unaffected.
 
-## Repository size and Rust hygiene
+## Tests and validation
 
-- Git stores source and small deterministic fixtures, not build products,
-  benchmark output, logs, profiles, model weights, archives, core dumps, or
-  copied third-party binaries. Keep those outside the repository and cover
-  local output paths in `.gitignore`.
-- Before adding any file larger than 1 MiB, reduce it to the smallest fixture
-  that reproduces the code behavior. If the full asset is genuinely required,
-  document why it must be versioned and obtain explicit review approval.
-- Keep Rust modules cohesive. Split oversized hand-written modules by
-  responsibility instead of accumulating unrelated implementations in one
-  file; do not split mechanically when it would make the code harder to follow.
-- Treat module size and signature length as review guidance. Do not add tests
-  that fail on arbitrary line counts, parameter counts, file counts, fixed
-  repetition totals, or required PASS ratios.
-- Prefer typed Rust fixtures and builders over duplicated JSON blobs. Keep
-  checked-in JSON only when parsing or wire compatibility is the behavior under
-  test, and remove metadata that does not affect that behavior.
-- Do not commit generated dependency trees or vendored crates by default. Use
-  Cargo's lockfile and registry/cache mechanisms; vendor only for an explicit
-  offline or supply-chain requirement.
-- Treat Git LFS as an exception, not a way to preserve disposable artifacts.
-  Model and benchmark assets belong in external artifact storage unless they
-  are intentionally shipped as repository content.
-- Derive stress cases from real code boundaries and invariants. A test may
-  enforce a safety or capacity limit implemented by the product, but it must
-  not fail merely because a process checklist, machine identity, commit, or
-  expected run count changed.
+- Test code, protocol behavior, and real safety/capacity boundaries. Do not gate
+  on machine IDs, commits, dirty status, artifact paths, exact PASS text, fixed
+  benchmark matrices, arbitrary style counts, repetition totals, or PASS ratios.
+- Prefer hardware-independent correctness tests. Backend tests should exercise
+  the affected backend; select hardware/model samples from the change's reach.
+- Start with the smallest affected test. At a stable code milestone, run the
+  workspace checks below and relevant backend checks before calling a PR validated.
+  Documentation-only edits need content/link and diff checks, not a full build.
+- Distinguish compilation, protocol validity, semantic correctness, and measured
+  performance. Report failures and skipped checks explicitly; a green CI job with
+  tolerated failures is not proof that every check passed.
 
-## Test commands
+Workspace checks (Clippy currently permits warnings and is non-blocking in CI):
 
 - `cargo fmt --all -- --check`
 - `cargo check --workspace --all-targets`
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -A warnings`
-- macOS Metal: `cargo check --workspace --all-targets --features metal`
-- CUDA: `cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2`
 
-Run the smallest affected test first after a failure. Run the workspace gate at
-a stable milestone before presenting a PR as validated.
+Backend compile checks (not runtime regression tests):
 
-## Repository structure
+- Metal, on macOS: `cargo check --workspace --all-targets --features metal`
+- CUDA CLI: `cargo check -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2`
+  Requires a configured CUDA host and the pinned native operator-set lock via
+  `FERRUM_NATIVE_OPERATOR_SET_LOCK`, as in `.github/workflows/ci.yml`.
 
-- Core contracts: `crates/ferrum-types`, `crates/ferrum-interfaces`.
-- Runtime and product: `ferrum-engine`, `ferrum-models`, `ferrum-kernels`,
-  `ferrum-quantization`, `ferrum-server`, `ferrum-cli`.
-- Benchmark schema and aggregation: `crates/ferrum-bench-core`.
-- Shared Rust test utilities: `crates/ferrum-testkit`.
-- Integration tests: `crates/*/tests`.
+## Performance evidence
 
-Keep workspace membership synchronized with actual crate directories. Store
-test fixtures beside the Rust tests or source modules that consume them.
+- Support performance claims with same-hardware measurements. Record model and
+  precision, server/client versions, dataset, input/output lengths, commands,
+  configuration, and repetitions. State intentional differences in comparisons.
+- Check output validity and report errors alongside timing. Distinguish usage
+  tokens from SSE text events; report latency/throughput tradeoffs and uncertainty.
+  Do not generalize one model or backend result to all supported configurations.
+
+## Repository size and Rust hygiene
+
+- Version source and small deterministic fixtures. Keep model weights, benchmark
+  results, logs, profiles, archives, dumps, and copied binaries outside the repo.
+  Cover build/local output paths in `.gitignore`; reuse Cargo caches instead of
+  duplicating builds.
+- Before adding a file over 1 MiB, minimize the reproducer. A required full asset
+  needs a documented reason and explicit review approval. Git LFS is an exception,
+  not storage for disposable output.
+- Keep modules cohesive and split by responsibility when needed. Module/signature
+  size is review guidance; avoid mechanical splits that make code harder to follow.
+- Prefer typed Rust fixtures/builders. Keep JSON for parsing or wire compatibility,
+  omit irrelevant metadata, and store fixtures beside their consuming tests/modules.
+- Use Cargo.lock and registry/cache mechanisms. Do not commit generated dependency
+  trees or vendor crates without an explicit offline or supply-chain requirement.
+
+## Code map
+
+All paths below are under `crates/`:
+
+- Contracts: `ferrum-types`, `ferrum-interfaces`.
+- Execution: `ferrum-engine`, `ferrum-scheduler`, `ferrum-kv`, `ferrum-models`,
+  `ferrum-kernels`, `ferrum-quantization`, `ferrum-tokenizer`, `ferrum-sampler`.
+- Product entrypoints: `ferrum-cli`, `ferrum-server`.
+- Native operators: `ferrum-native-ops`, `ferrum-native-ops-builder`.
+- Validation: `ferrum-bench-core`, `ferrum-testkit`, and `*/tests`.

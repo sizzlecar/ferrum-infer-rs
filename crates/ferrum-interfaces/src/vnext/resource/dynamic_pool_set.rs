@@ -100,6 +100,12 @@ pub(in crate::vnext::resource) struct DynamicPoolRebalanceAttempt {
     pub(in crate::vnext::resource) rebalance: Option<DynamicPoolRebalanceReceipt>,
 }
 
+#[derive(Clone, Copy)]
+enum ReclaimTargetPolicy {
+    PreserveRunnableExtent,
+    PreserveAll,
+}
+
 impl<R> DynamicPoolSet<R>
 where
     R: DeviceRuntime,
@@ -204,7 +210,9 @@ where
         Ok(epochs)
     }
 
-    /// Rebalances only whole, unreferenced chunks from non-target pools. The
+    /// Rebalances only whole, unreferenced chunks. An entirely idle contiguous
+    /// target may replace redundant undersized chunks while retaining its
+    /// largest runnable extent; other targets remain excluded. The
     /// batch is selected before mutation, logical totals publish atomically,
     /// and physical grants are returned only after every pool lock is dropped.
     pub(in crate::vnext::resource) fn reclaim_idle_chunks_for_pressure(
@@ -214,6 +222,25 @@ where
         excluded_domains: &[CapacityDomainId],
         protected_immediate: &CapacityVector,
         protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
+    ) -> Result<DynamicPoolRebalanceAttempt, VNextError> {
+        self.reclaim_idle_chunks(
+            pressure,
+            capacity_availability,
+            excluded_domains,
+            protected_immediate,
+            protected_packing_envelopes,
+            ReclaimTargetPolicy::PreserveRunnableExtent,
+        )
+    }
+
+    fn reclaim_idle_chunks(
+        &self,
+        pressure: &DeviceCapacityPressure,
+        capacity_availability: DeviceCapacityAvailabilitySnapshot,
+        excluded_domains: &[CapacityDomainId],
+        protected_immediate: &CapacityVector,
+        protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
+        target_policy: ReclaimTargetPolicy,
     ) -> Result<DynamicPoolRebalanceAttempt, VNextError> {
         if pressure.device_id() != self.runtime.descriptor().id.to_string() {
             return Err(invalid_resource(
@@ -279,7 +306,7 @@ where
             if state.poisoned {
                 return Err(invalid_resource("dynamic backing pool is fail-closed"));
             }
-            let excluded_from_reclaim = excluded_domains.contains(&pool.domain.domain_id);
+            let growth_target = excluded_domains.contains(&pool.domain.domain_id);
             let used = used_by_domain
                 .get(&pool.domain.domain_id)
                 .copied()
@@ -300,7 +327,8 @@ where
                 .copied()
                 .unwrap_or(0);
             let mut protected_packing_satisfied = true;
-            let protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id) {
+            let mut protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id)
+            {
                 Some(envelope) => {
                     if envelope.pool_id() != pool.domain.pool_id()
                         || envelope.total_bytes()? != protected
@@ -334,13 +362,83 @@ where
                 // an exact physical packing attempt exists.
                 None => std::collections::BTreeSet::new(),
             };
+            // A larger single contiguous claim cannot use any undersized old
+            // chunk. Keeping all of them while allocating one more can trap
+            // an otherwise idle pool at the device ceiling. Preserve the
+            // largest old extent, including the runnable minimum, and only
+            // offer redundant chunks when no physical or logical owner exists.
+            let may_replace_target =
+                matches!(target_policy, ReclaimTargetPolicy::PreserveRunnableExtent);
+            let replacement_keeper = if growth_target
+                && may_replace_target
+                && !protected_packing_satisfied
+                && used == 0
+                && physically_occupied == 0
+                && state.pending_growth_bytes == 0
+                && matches!(
+                    pool.domain.pool.compatibility().profile().view(),
+                    DynamicStorageView::Contiguous
+                )
+                && protected_packing_by_domain
+                    .get(&pool.domain.domain_id)
+                    .is_some_and(|envelope| envelope.claim_bytes_descending() == [protected])
+                && state.chunks.values().all(|chunk| {
+                    let bytes = chunk.backing._grant.bytes();
+                    chunk.live_segments == 0
+                        && Arc::strong_count(&chunk.backing) == 1
+                        && chunk.backing.descriptor.size_bytes == bytes
+                        && state
+                            .allocator
+                            .by_offset
+                            .get(&(chunk.backing.identity.ordinal(), 0))
+                            .is_some_and(|extent| {
+                                extent.chunk_generation == chunk.backing.identity.generation()
+                                    && extent.length_bytes == bytes
+                            })
+                }) {
+                state
+                    .chunks
+                    .values()
+                    .max_by_key(|chunk| chunk.backing._grant.bytes())
+                    .filter(|chunk| {
+                        let bytes = chunk.backing._grant.bytes();
+                        bytes >= pool.domain.pool.provisioning().minimum_resident_bytes()
+                            && bytes < protected
+                    })
+                    .map(|chunk| (chunk.backing.identity.clone(), chunk.backing._grant.bytes()))
+            } else {
+                None
+            };
+            if let Some((keeper, _)) = &replacement_keeper {
+                // Revalidate the exact packing need. Since every old extent
+                // is smaller than the sole claim, removing any non-keeper
+                // cannot increase this growth. This is no capacity permit:
+                // the ordinary post-reclaim maintenance must reserve anew.
+                if contiguous_packing_growth_bytes(
+                    &state.allocator,
+                    pool.domain.pool_id(),
+                    &[protected],
+                )? != protected
+                {
+                    return Err(invalid_resource(
+                        "idle target replacement changed its packing need",
+                    ));
+                }
+                protected_chunks.insert(keeper.ordinal());
+            }
+            let excluded_from_reclaim = growth_target && replacement_keeper.is_none();
             // Logical admission does not own lane-stable or not-yet-committed
             // physical extents. Reclaim must preserve whichever ownership view
             // is larger before adding this bundle's uncommitted demand.
             let owned = used.max(physically_occupied);
-            let coherent_runnable_floor = owned.checked_add(protected).ok_or_else(|| {
-                invalid_resource("dynamic pool protected runnable floor overflows u64")
-            })?;
+            let coherent_runnable_floor = match &replacement_keeper {
+                // The pending large claim already cannot run. Keep the whole
+                // previous largest extent runnable even if new growth fails.
+                Some((_, bytes)) => *bytes,
+                None => owned.checked_add(protected).ok_or_else(|| {
+                    invalid_resource("dynamic pool protected runnable floor overflows u64")
+                })?,
+            };
             let resident_floor = pool
                 .domain
                 .pool
@@ -363,7 +461,7 @@ where
                 let resident_floor_allows_reclaim = chunk_bytes <= reclaimable;
                 let reclaim_candidate = !excluded_from_reclaim
                     && state.pending_growth_bytes == 0
-                    && protected_packing_satisfied
+                    && (protected_packing_satisfied || replacement_keeper.is_some())
                     && chunk.live_segments == 0
                     && external_references == 0
                     && !protected_packing
@@ -402,6 +500,7 @@ where
                 maximum_resident_bytes: pool.domain.pool.provisioning().maximum_resident_bytes(),
                 protected_immediate_bytes: protected,
                 protected_packing_satisfied,
+                idle_target_replacement_kept_chunk: replacement_keeper.map(|(keeper, _)| keeper),
                 coherent_runnable_floor_bytes: coherent_runnable_floor,
                 resident_floor_bytes: resident_floor,
                 reclaimable_bytes: reclaimable,
@@ -712,6 +811,32 @@ where
                                 }
                             }
                         }
+                    }
+                    DynamicPoolGrowthIntent::RevalidatedAdmissionPressure {
+                        required_free_bytes,
+                        ..
+                    } => {
+                        // A logical lease may precede its physical prepare;
+                        // conversely physical release precedes logical release.
+                        // Neither ledger alone proves that the demand now fits.
+                        let logical = self.logical_admission.snapshot()?;
+                        if logical.poisoned() {
+                            return Err(invalid_resource("logical admission is fail-closed"));
+                        }
+                        let available = logical
+                            .domains()
+                            .iter()
+                            .find(|domain| domain.domain() == pool.domain.domain_id)
+                            .ok_or_else(|| invalid_resource("pool has no logical capacity domain"))?
+                            .available()
+                            .get();
+                        let missing = required_free_bytes
+                            .saturating_sub(available)
+                            .max(required_free_bytes.saturating_sub(state.allocator.free_bytes));
+                        if missing == 0 {
+                            continue;
+                        }
+                        missing
                     }
                 }
             };
@@ -1445,6 +1570,209 @@ where
         )
     }
 
+    /// Optional capture may grow only its certified State pools. Reuse the
+    /// same packing planner and atomic device-budget publication as ordinary
+    /// growth, without the foreground path's cross-pool pressure reclamation.
+    pub(in crate::vnext::resource) fn maintain_checkpoint_capacity(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.maintain_checkpoint_capacity_observed(requests, &mut None)
+    }
+
+    pub(in crate::vnext::resource) fn maintain_checkpoint_capacity_with_idle_reclaim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        let mut capacity_blocked = None;
+        match self.maintain_checkpoint_capacity_observed(requests, &mut capacity_blocked) {
+            Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
+                let blocked = capacity_blocked.as_ref().ok_or_else(|| {
+                    invalid_resource("checkpoint growth lost its device capacity observation")
+                })?;
+                // Use the entire certified byte plan, including target pools
+                // whose current free extents already suffice. Reclaiming those
+                // would invalidate capture's other claims on the next attempt.
+                let targets = requests
+                    .iter()
+                    .map(|request| request.domain.domain_id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let attempt = self.reclaim_idle_chunks(
+                    &pressure,
+                    blocked.availability,
+                    &targets,
+                    &CapacityVector::empty(),
+                    &[],
+                    ReclaimTargetPolicy::PreserveAll,
+                )?;
+                tracing::debug!(
+                    coordinator_id = ?attempt.boundary.coordinator_id(),
+                    ?pressure,
+                    protected_target_domains = ?targets,
+                    reclaim_sufficient = attempt.boundary.reclaim_sufficient(),
+                    candidate_chunks = attempt.boundary.reclaim_candidate_chunks(),
+                    candidate_bytes = attempt.boundary.reclaim_candidate_bytes(),
+                    selected_bytes = attempt.boundary.selected_bytes(),
+                    reclaimed_bytes = attempt.rebalance.as_ref().map_or(0, |r| r.reclaimed_bytes()),
+                    reclaimed_chunks = attempt.rebalance.as_ref().map_or(0, |r| r.reclaimed_chunks()),
+                    "optional checkpoint idle reclaim evaluated"
+                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    for pool in attempt.boundary.pools() {
+                        let reclaimed_bytes = attempt
+                            .rebalance
+                            .as_ref()
+                            .and_then(|rebalance| {
+                                rebalance
+                                    .pools()
+                                    .iter()
+                                    .find(|reclaimed| reclaimed.pool_id() == pool.pool_id())
+                            })
+                            .map_or(0, |reclaimed| reclaimed.reclaimed_bytes());
+                        tracing::debug!(
+                            coordinator_id = ?attempt.boundary.coordinator_id(),
+                            domain = ?pool.domain_id(),
+                            pool_id = pool.pool_id().as_str(),
+                            excluded = pool.excluded_from_reclaim(),
+                            resident_bytes = pool.resident_bytes(),
+                            free_bytes = pool.free_bytes(),
+                            logical_used_bytes = pool.logical_used_bytes(),
+                            physical_live_bytes = pool.live_occupancy().total().physical_bytes(),
+                            pending_growth_bytes = pool.pending_growth_bytes(),
+                            resident_floor_bytes = pool.resident_floor_bytes(),
+                            bytes_above_floor = pool.reclaimable_bytes(),
+                            reclaimed_bytes,
+                            "optional checkpoint idle reclaim pool boundary"
+                        );
+                    }
+                }
+                let Some(rebalance) = attempt.rebalance else {
+                    return Err(VNextError::DeviceCapacityUnavailable(pressure));
+                };
+                // Recompute every target's packing from current state and
+                // reserve anew. A competitor or allocation failure can still
+                // reject this single retry; reclamation grants no capacity.
+                let mut receipt = self.maintain_checkpoint_capacity(requests)?;
+                tracing::debug!(
+                    coordinator_id = ?receipt.coordinator_id(),
+                    reclaimed_bytes = rebalance.reclaimed_bytes(),
+                    growths = ?receipt.growths(),
+                    "optional checkpoint idle reclaim followed by fresh growth"
+                );
+                receipt.rebalance = Some(rebalance);
+                receipt.maintenance_boundary = Some(attempt.boundary);
+                Ok(receipt)
+            }
+            result => result,
+        }
+    }
+
+    fn maintain_checkpoint_capacity_observed(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+        capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.validate_checkpoint_requests(requests)?;
+        let mut by_pool = BTreeMap::<DynamicBackingPoolId, Vec<u64>>::new();
+        for request in requests {
+            by_pool
+                .entry(request.domain.pool_id().clone())
+                .or_default()
+                .push(request.capacity_size_bytes);
+        }
+        let mut intents = Vec::with_capacity(by_pool.len());
+        for (pool_id, mut claims) in by_pool {
+            claims.sort_unstable_by(|left, right| right.cmp(left));
+            let pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or_else(|| invalid_resource("checkpoint pool is absent"))?;
+            let state = pool
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("checkpoint pool is poisoned"))?;
+            if state.poisoned {
+                return Err(invalid_resource("checkpoint pool is fail-closed"));
+            }
+            let (growth, contiguous_claims) =
+                match pool.domain.pool.compatibility().profile().view() {
+                    DynamicStorageView::Contiguous => (
+                        contiguous_packing_growth_bytes(&state.allocator, &pool_id, &claims)?,
+                        Some(claims),
+                    ),
+                    DynamicStorageView::PagedRegions { .. } => (
+                        claims
+                            .iter()
+                            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+                            .ok_or_else(|| {
+                                invalid_resource("checkpoint pool demand overflows u64")
+                            })?
+                            .saturating_sub(state.allocator.free_bytes),
+                        None,
+                    ),
+                };
+            if growth != 0 {
+                intents.push(DynamicPoolGrowthIntent::RevalidatedDeferral(
+                    DynamicBackingBlocker {
+                        pool_id,
+                        domain_id: pool.domain.domain_id,
+                        reason: DynamicBackingDeferralReason::GrowthRequired,
+                        requested_bytes: growth,
+                        free_bytes: state.allocator.free_bytes,
+                        largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                        free_extent_layout_fingerprint: free_extent_layout_fingerprint(
+                            &state.allocator,
+                        ),
+                        contiguous_claim_bytes_descending: contiguous_claims,
+                    },
+                ));
+            }
+        }
+        // RevalidatedDeferral recomputes demand after acquiring the existing
+        // canonical maintenance locks. No stale free-space snapshot grants bytes.
+        self.maintain_pools_observed(intents, capacity_blocked)
+    }
+
+    pub(in crate::vnext::resource) fn prepare_checkpoint_claim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        self.validate_checkpoint_requests(requests)?;
+        self.prepare_claim_scoped(
+            requests,
+            DynamicBackingClaimScope::Checkpoint,
+            DynamicBackingClaimResidency::Transient,
+        )
+    }
+
+    fn validate_checkpoint_requests(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<(), VNextError> {
+        if requests.is_empty()
+            || requests.iter().any(|request| {
+                !self
+                    .domains
+                    .iter()
+                    .any(|domain| std::ptr::eq(domain, request.domain))
+                    || request.reusable_execution_bucket_id.is_some()
+                    || request.projections.len() != 1
+                    || request.projections.iter().any(|projection| {
+                        projection.descriptor.lifetime() != AllocationLifetime::Sequence
+                            || projection.descriptor.usage() != super::BufferUsage::State
+                            || *projection.descriptor.kind() != super::AllocationKind::Value
+                    })
+            })
+        {
+            return Err(invalid_resource(
+                "checkpoint backing requires this plan's non-empty Sequence state projections",
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_claim_scoped(
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
@@ -1566,7 +1894,9 @@ where
                                         .is_ok_and(|bytes| bytes == projection.capacity_size_bytes)
                                 }
                                 None => {
-                                    projection.logical_size_bytes == projection.capacity_size_bytes
+                                    scope == DynamicBackingClaimScope::Checkpoint
+                                        || projection.logical_size_bytes
+                                            == projection.capacity_size_bytes
                                 }
                             };
                             projection.descriptor.pool_id() != pool.domain.pool_id()

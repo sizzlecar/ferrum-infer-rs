@@ -37,6 +37,7 @@ fn legacy_reusable_runtime_policy_wire_and_fingerprint_remain_stable() {
         ContractVersion::new(2, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 4,
@@ -98,6 +99,7 @@ fn reusable_runtime_policy(
         ContractVersion::new(3, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences,

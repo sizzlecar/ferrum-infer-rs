@@ -259,7 +259,7 @@ impl ModelExecutor for ScriptedExecutor {
         Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs))
     }
 
-    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+    async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         {
             let active = self.active.lock().unwrap();
             let cursor = active

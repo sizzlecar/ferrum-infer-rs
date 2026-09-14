@@ -334,6 +334,7 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: 4096,
             reserve_bytes: 128,
             maximum_active_sequences: 2,

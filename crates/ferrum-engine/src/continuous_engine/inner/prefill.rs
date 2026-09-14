@@ -370,6 +370,68 @@ impl EngineInner {
 
     // ── batch prefill ─────────────────────────────────────────────────
 
+    fn plan_prompt_tail_prefill_chunk(
+        &self,
+        request_id: &RequestId,
+        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+        original_prompt: bool,
+    ) -> Result<ferrum_interfaces::model_executor::PrefillChunk> {
+        if !original_prompt {
+            return Ok(chunk);
+        }
+        let Some(plan) = self.model_executor.plan_prompt_tail_capture_boundary(chunk) else {
+            return Ok(chunk);
+        };
+        let span = plan.boundary.checked_sub(chunk.tokens_processed());
+        if plan.boundary >= chunk.total_prompt_tokens()
+            || plan.boundary > chunk.end()
+            || !span.is_some_and(|span| plan.span.permits(span as u64))
+        {
+            return Err(FerrumError::backend(
+                "invalid prompt-tail capture boundary for scheduled prefill",
+            ));
+        }
+        if plan.boundary == chunk.end() {
+            return Ok(chunk);
+        }
+        let planned = ferrum_interfaces::model_executor::PrefillChunk::new(
+            chunk.tokens_processed(),
+            span.expect("validated positive capture span"),
+            chunk.total_prompt_tokens(),
+        )?;
+        if self.scheduler_trace_jsonl.is_some() {
+            self.write_executor_scheduler_profile_event(
+                request_id,
+                "vnext.prefill_prompt_tail_boundary_planned",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "tokens_processed".to_owned(),
+                        serde_json::json!(chunk.tokens_processed()),
+                    ),
+                    (
+                        "scheduled_tokens".to_owned(),
+                        serde_json::json!(chunk.tokens_to_process()),
+                    ),
+                    (
+                        "planned_tokens".to_owned(),
+                        serde_json::json!(planned.tokens_to_process()),
+                    ),
+                    (
+                        "capture_boundary".to_owned(),
+                        serde_json::json!(plan.boundary),
+                    ),
+                    ("capture_span".to_owned(), serde_json::json!(plan.span)),
+                ]),
+                BTreeMap::new(),
+                None,
+            );
+        }
+        Ok(planned)
+    }
+
     pub(super) async fn run_plan_runtime_prefill(
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
@@ -378,11 +440,12 @@ impl EngineInner {
 
         let request_id = &scheduled.request.id;
 
-        let Some((input_tokens, maximum_sequence_tokens)) =
+        let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
             self.sequences.read().get(request_id).map(|seq| {
                 (
                     seq.prefill_context_tokens(),
                     seq.model_maximum_sequence_tokens(),
+                    seq.generated_tokens.is_empty(),
                 )
             })
         else {
@@ -397,6 +460,7 @@ impl EngineInner {
             })?,
             input_tokens.len(),
         )?;
+        let chunk = self.plan_prompt_tail_prefill_chunk(request_id, chunk, original_prompt)?;
         let input_token_count = input_tokens.len();
         let input = PlanRuntimePrefillInput::new(
             request_id.clone(),
@@ -624,6 +688,7 @@ impl EngineInner {
                 .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total")
                 .increment(chunk.tokens_to_process() as u64);
+            self.trace_plan_runtime_prefill_completion(request_id, chunk);
             return Ok(());
         }
 
@@ -690,6 +755,7 @@ impl EngineInner {
             .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
         counter!("ferrum.engine.prefill_tokens_total").increment(chunk.tokens_to_process() as u64);
         counter!("ferrum.engine.prefills_total").increment(1);
+        self.trace_plan_runtime_prefill_completion(request_id, chunk);
 
         let stop_reason = self.stop_reason_for_request(request_id);
         if self.should_stream_generated_token(request_id, first_token, stop_reason) {
@@ -699,6 +765,43 @@ impl EngineInner {
             self.complete_request(request_id, reason).await?;
         }
         Ok(())
+    }
+
+    fn trace_plan_runtime_prefill_completion(
+        &self,
+        request_id: &RequestId,
+        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+    ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
+        // Emit only after the executor result and both outer progress owners
+        // have committed. Imported tokens are recorded by prefix_restore;
+        // these ranges account exclusively for work actually executed here.
+        self.write_executor_scheduler_profile_event(
+            request_id,
+            "vnext.prefill_chunk_completed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "start_token".to_owned(),
+                    serde_json::json!(chunk.tokens_processed()),
+                ),
+                ("end_token".to_owned(), serde_json::json!(chunk.end())),
+                (
+                    "computed_tokens".to_owned(),
+                    serde_json::json!(chunk.tokens_to_process()),
+                ),
+                (
+                    "prompt_tokens".to_owned(),
+                    serde_json::json!(chunk.total_prompt_tokens()),
+                ),
+            ]),
+            BTreeMap::new(),
+            None,
+        );
     }
 
     fn discard_plan_runtime_prefill_completion(
@@ -753,11 +856,12 @@ impl EngineInner {
         let mut inputs = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
             let request_id = &scheduled.request.id;
-            let Some((input_tokens, maximum_sequence_tokens)) =
+            let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
                 self.sequences.read().get(request_id).map(|sequence| {
                     (
                         sequence.prefill_context_tokens(),
                         sequence.model_maximum_sequence_tokens(),
+                        sequence.generated_tokens.is_empty(),
                     )
                 })
             else {
@@ -772,6 +876,8 @@ impl EngineInner {
                 })?,
                 input_tokens.len(),
             )?;
+            let planned_chunk =
+                self.plan_prompt_tail_prefill_chunk(request_id, planned_chunk, original_prompt)?;
             let input_token_count = input_tokens.len();
             inputs.push(PlanRuntimePrefillInput::new(
                 request_id.clone(),

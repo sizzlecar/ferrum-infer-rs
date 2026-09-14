@@ -249,6 +249,7 @@ fn runtime_policy<R: DeviceRuntime>(runtime: &R) -> ResolvedRuntimePolicy {
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
+            checkpoint_capacity: None,
             capacity_bytes: runtime.descriptor().total_memory_bytes,
             reserve_bytes: 1 << 20,
             maximum_active_sequences: 4,

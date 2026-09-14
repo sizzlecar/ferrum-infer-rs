@@ -799,6 +799,151 @@ impl BatchOperationIdentity {
 }
 
 #[cfg(test)]
+impl BatchOperationIdentity {
+    /// Resource unit fixtures do not construct an executable provider catalog.
+    /// Derive their completion identity from an actual prepared wave and its
+    /// plan nodes; this never issues a successful completion seal.
+    pub(crate) fn test_only_for_wave<R: crate::vnext::DeviceRuntime>(
+        wave: &crate::vnext::PreparedStepSubmissionWave<R>,
+        plan_nodes: &[crate::vnext::PlanNode],
+        active: &[crate::vnext::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        let resources = wave
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(node_index, prepared)| {
+                let node = plan_nodes
+                    .get(prepared.plan_node_index())
+                    .ok_or_else(|| invalid_operation("test wave plan node is absent"))?;
+                Ok((
+                    super::invocation::OperationInvocationResources::Wave { wave, node_index },
+                    node,
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        Self::test_only_for_resources(&resources, active)
+    }
+
+    pub(crate) fn test_only_for_invocation<R: crate::vnext::DeviceRuntime>(
+        invocation: &crate::vnext::InvocationResourceLease<R>,
+        node: &crate::vnext::PlanNode,
+        active: &[crate::vnext::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        Self::test_only_for_resources(
+            &[(
+                super::invocation::OperationInvocationResources::Invocation(invocation),
+                node,
+            )],
+            active,
+        )
+    }
+
+    fn test_only_for_resources<R: crate::vnext::DeviceRuntime>(
+        resources: &[(
+            super::invocation::OperationInvocationResources<'_, R>,
+            &crate::vnext::PlanNode,
+        )],
+        active: &[crate::vnext::TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError> {
+        use crate::vnext::{
+            ExecutionIdentityParts, NodeInvocationId, SpanId, EXECUTION_IDENTITY_VERSION,
+        };
+        let first = resources
+            .first()
+            .ok_or_else(|| invalid_operation("test operation resources are empty"))?
+            .0;
+        let plan = first.step_resources().plan_evidence();
+        let mut nodes = Vec::new();
+        let mut participant_index = 0_u32;
+        for (index, (prepared, node)) in resources.iter().enumerate() {
+            if prepared.node_id()? != node.id()
+                || active.len() != prepared.participant_frames()?.len()
+            {
+                return Err(invalid_operation("test wave nodes or participants differ"));
+            }
+            let mut participants = Vec::new();
+            for (binding, frame) in active.iter().zip(prepared.participant_frames()?) {
+                if binding.sequence_authority() != frame.participant().sequence_authority()
+                    || binding.plan().plan_hash() != plan.plan_hash()
+                {
+                    return Err(invalid_operation("test wave active binding differs"));
+                }
+                let invocation = NodeInvocationId::try_from(index as u64 + 1)?;
+                let identity = ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+                    version: EXECUTION_IDENTITY_VERSION,
+                    run_id: binding.run_id().clone(),
+                    request_id: binding.request_id().clone(),
+                    sequence: u64::from(participant_index) + 1,
+                    plan_id: Some(plan.plan_id().clone()),
+                    plan_hash: Some(plan.plan_hash().clone()),
+                    frame_id: Some(frame.frame_id()),
+                    node_invocation_id: Some(invocation),
+                    node_id: Some(node.id().clone()),
+                    operation_id: Some(node.operation_id().clone()),
+                    provider_id: Some(node.selection().selected_provider().clone()),
+                    device_id: Some(plan.device_id().clone()),
+                    resource_pool_id: None,
+                    resource_pool_identity_fingerprint: None,
+                    provisioning_run_id: None,
+                    provisioning_request_id: None,
+                    transaction_id: None,
+                    active_sequence_slot: Some(binding.sequence_authority().sparse_id()),
+                    admission_generation: Some(binding.sequence_authority().generation()),
+                    activation_epoch: Some(binding.activation_epoch()),
+                    runtime_implementation_fingerprint: Some(
+                        plan.runtime_implementation_fingerprint().to_owned(),
+                    ),
+                    active_sequence_fingerprint: Some(binding.fingerprint().to_owned()),
+                    completed_sequence_fingerprint: None,
+                    aborted_sequence_fingerprint: None,
+                    resource_id: None,
+                    resource_generation: None,
+                    resource_batch_fingerprint: None,
+                    span_id: SpanId::new(format!(
+                        "test/completion/{}/{participant_index}",
+                        first.batch_invocation_id().get()
+                    ))?,
+                    parent_span_id: None,
+                    async_links: Vec::new(),
+                })?;
+                participants.push(BatchOperationParticipantIdentity::new(
+                    participant_index,
+                    ParticipantNodeKey::new(
+                        frame.participant(),
+                        frame.frame_id(),
+                        node.id().clone(),
+                    ),
+                    identity,
+                ));
+                participant_index += 1;
+            }
+            nodes.push(BatchOperationNodeIdentity::from_validated(
+                index as u32,
+                node.id().clone(),
+                node.operation_id().clone(),
+                node.selection().selected_provider().clone(),
+                node.provider_implementation_fingerprint().to_owned(),
+                node.provider_execution_semantics(),
+                prepared.work_shape()?.fingerprint().to_owned(),
+                participants,
+            )?);
+        }
+        Self::from_validated(
+            first.batch_step_id(),
+            first.batch_invocation_id(),
+            plan.plan_id().clone(),
+            plan.plan_hash().clone(),
+            plan.device_id().clone(),
+            plan.runtime_implementation_fingerprint().to_owned(),
+            first.step_resources().execution_lane().id(),
+            first.backing_fingerprint().to_owned(),
+            nodes,
+        )
+    }
+}
+
+#[cfg(test)]
 mod batch_operation_identity_fingerprint_tests {
     use super::{
         canonical_operation_fingerprint, BatchOperationNodeFingerprints,

@@ -320,6 +320,9 @@ pub struct ServeCommand {
 pub struct ServeCliCommand {
     #[command(flatten)]
     command: ServeCommand,
+    /// Wait at most this long for another request's exact in-flight prefix.
+    #[arg(long, value_name = "MS")]
+    prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 
     /// Enable the compatibility retry that coalesces non-leading system
     /// messages when a model-owned chat template rejects their original order.
@@ -347,7 +350,7 @@ fn resolve_interleaved_system_coalescing(
 }
 
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
-    execute_with_compatibility(cmd, config, false, false, true).await
+    execute_with_compatibility(cmd, config, false, false, true, None).await
 }
 
 pub async fn execute_cli(
@@ -361,6 +364,7 @@ pub async fn execute_cli(
         cmd.enable_interleaved_system_coalescing,
         cmd.disable_interleaved_system_coalescing,
         configured_interleaved_system_coalescing,
+        cmd.prefix_rendezvous_max_wait_ms,
     )
     .await
 }
@@ -371,6 +375,7 @@ async fn execute_with_compatibility(
     enable_interleaved_system_coalescing: bool,
     disable_interleaved_system_coalescing: bool,
     configured_interleaved_system_coalescing: bool,
+    prefix_rendezvous_max_wait_ms: Option<std::num::NonZeroU64>,
 ) -> Result<()> {
     let ServeCommand {
         model,
@@ -849,6 +854,13 @@ async fn execute_with_compatibility(
         profile_detail.as_str(),
         RuntimeConfigSource::Cli,
     ));
+    if let Some(wait) = prefix_rendezvous_max_wait_ms {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS",
+            wait.to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
     push_cli_runtime_entry(
         &mut startup_cli_runtime_entries,
         "FERRUM_VNEXT_DIAGNOSTIC_FAULT",
@@ -1213,9 +1225,7 @@ async fn execute_with_compatibility(
     println!();
     println!("Endpoints:");
     println!("  POST /v1/chat/completions      - OpenAI-compatible chat");
-    println!("  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)");
-    println!("  POST /v1/audio/speech          - Text-to-speech (TTS)");
-    println!("  POST /v1/embeddings            - Text/image embeddings");
+    println!("  POST /v1/responses             - OpenAI Responses API");
     println!("  GET  /v1/models                - List models");
     println!("  GET  /health                   - Health check");
     println!();
@@ -2359,6 +2369,44 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_prefix_rendezvous_is_explicit_and_rejects_zero_wait() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCliCommand,
+        }
+        assert!(TestCli::try_parse_from(["ferrum", "--model", "test-model"])
+            .unwrap()
+            .serve
+            .prefix_rendezvous_max_wait_ms
+            .is_none());
+        let parsed = TestCli::try_parse_from([
+            "ferrum",
+            "--model",
+            "test-model",
+            "--prefix-rendezvous-max-wait-ms",
+            "123",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed
+                .serve
+                .prefix_rendezvous_max_wait_ms
+                .map(std::num::NonZeroU64::get),
+            Some(123)
+        );
+        assert!(TestCli::try_parse_from([
+            "ferrum",
+            "--model",
+            "test-model",
+            "--prefix-rendezvous-max-wait-ms",
+            "0"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn serve_exposes_typed_diagnostic_fault() {
@@ -3551,6 +3599,31 @@ mod tests {
 
         assert_eq!(enabled_entries, product_enabled_entries);
         assert_eq!(disabled_entries, product_disabled_entries);
+        for (entries, enabled) in [
+            (enabled_entries, true),
+            (product_enabled_entries, true),
+            (disabled_entries, false),
+            (product_disabled_entries, false),
+        ] {
+            // Explicit serve flags must reach the actual typed vNext switch,
+            // including disabling an already enabled config/environment value.
+            let config_entries = crate::config::RuntimeCliConfig {
+                prefix_cache: Some(!enabled),
+                ..Default::default()
+            }
+            .runtime_config_entries();
+            let environment = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_PREFIX_CACHE",
+                if enabled { "0" } else { "1" },
+                RuntimeConfigSource::Env,
+            )]);
+            let effective = merge_runtime_config_sources(config_entries, environment, entries);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.runtime.prefix_state_cache_enabled = !enabled;
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
+            assert!(!engine.runtime.prefix_cache_enabled);
+        }
     }
 
     #[test]

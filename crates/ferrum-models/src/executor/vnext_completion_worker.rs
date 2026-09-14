@@ -18,6 +18,7 @@ pub(super) enum VNextCompletionTaskKind {
     WaveReadback,
     PostSubmitDrain,
     IndeterminateRecovery,
+    CheckpointTransfer,
 }
 
 impl VNextCompletionTaskKind {
@@ -26,6 +27,7 @@ impl VNextCompletionTaskKind {
             Self::WaveReadback => "wave_readback",
             Self::PostSubmitDrain => "post_submit_drain",
             Self::IndeterminateRecovery => "indeterminate_recovery",
+            Self::CheckpointTransfer => "checkpoint_transfer",
         }
     }
 }
@@ -68,6 +70,7 @@ struct VNextCompletionWorkerCounters {
     wave_readback: VNextCompletionTaskClassMetrics,
     post_submit_drain: VNextCompletionTaskClassMetrics,
     indeterminate_recovery: VNextCompletionTaskClassMetrics,
+    checkpoint_transfer: VNextCompletionTaskClassMetrics,
 }
 
 impl VNextCompletionWorkerCounters {
@@ -76,6 +79,7 @@ impl VNextCompletionWorkerCounters {
             VNextCompletionTaskKind::WaveReadback => &self.wave_readback,
             VNextCompletionTaskKind::PostSubmitDrain => &self.post_submit_drain,
             VNextCompletionTaskKind::IndeterminateRecovery => &self.indeterminate_recovery,
+            VNextCompletionTaskKind::CheckpointTransfer => &self.checkpoint_transfer,
         }
     }
 }
@@ -222,6 +226,7 @@ impl VNextCompletionWorker {
                 VNextCompletionTaskKind::WaveReadback.as_str(): self.counters.wave_readback.snapshot(),
                 VNextCompletionTaskKind::PostSubmitDrain.as_str(): self.counters.post_submit_drain.snapshot(),
                 VNextCompletionTaskKind::IndeterminateRecovery.as_str(): self.counters.indeterminate_recovery.snapshot(),
+                VNextCompletionTaskKind::CheckpointTransfer.as_str(): self.counters.checkpoint_transfer.snapshot(),
             },
         })
     }
@@ -236,6 +241,7 @@ impl VNextCompletionWorker {
         self.counters.wave_readback.reset();
         self.counters.post_submit_drain.reset();
         self.counters.indeterminate_recovery.reset();
+        self.counters.checkpoint_transfer.reset();
         true
     }
 }

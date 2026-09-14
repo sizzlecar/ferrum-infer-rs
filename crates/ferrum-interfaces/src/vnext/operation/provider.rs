@@ -10,7 +10,8 @@ use super::super::{
 };
 use super::foundation::{canonical_sha256, invalid_operation};
 use super::{
-    DynamicStorageRequirement, ProfilePhase, ProviderStorageBindingRequirement, ResolvedValueRole,
+    DynamicStorageRequirement, ProfilePhase, ProviderCheckpointCapability,
+    ProviderStorageBindingRequirement, ResolvedValueRole,
 };
 
 pub const PROVIDER_EXECUTION_SEMANTICS_VERSION: ContractVersion = ContractVersion::new(1, 0);
@@ -239,6 +240,8 @@ pub struct OperationProviderDescriptor {
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
     execution_semantics: ProviderExecutionSemantics,
+    #[serde(skip_serializing_if = "ProviderCheckpointCapability::is_unsupported")]
+    checkpoint: ProviderCheckpointCapability,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -258,6 +261,8 @@ struct OperationProviderDescriptorWire {
     operation_fingerprint: String,
     provider_implementation_fingerprint: String,
     execution_semantics: ProviderExecutionSemantics,
+    #[serde(default)]
+    checkpoint: ProviderCheckpointCapability,
     version: ContractVersion,
     device_id: DeviceId,
     capabilities: BTreeSet<CapabilityId>,
@@ -292,7 +297,8 @@ impl<'de> Deserialize<'de> for OperationProviderDescriptor {
             wire.resource_estimator_version,
             wire.resource_estimator_implementation_fingerprint,
         )
-        .map_err(serde::de::Error::custom)?;
+        .map_err(serde::de::Error::custom)?
+        .with_checkpoint_capability(wire.checkpoint);
         if descriptor.dynamic_storage_bindings != original_bindings {
             return Err(serde::de::Error::custom(
                 "provider storage binding requirements are not canonical",
@@ -351,6 +357,7 @@ impl OperationProviderDescriptor {
             operation_fingerprint,
             provider_implementation_fingerprint,
             execution_semantics,
+            checkpoint: ProviderCheckpointCapability::Unsupported,
             version,
             device_id,
             capabilities,
@@ -381,6 +388,18 @@ impl OperationProviderDescriptor {
 
     pub const fn execution_semantics(&self) -> ProviderExecutionSemantics {
         self.execution_semantics
+    }
+
+    /// Declares checkpoint behavior for this exact implementation and operation
+    /// fingerprint. This does not bypass layout, state-closure, or oracle checks
+    /// when a plan derives its actual checkpoint eligibility.
+    pub fn with_checkpoint_capability(mut self, capability: ProviderCheckpointCapability) -> Self {
+        self.checkpoint = capability;
+        self
+    }
+
+    pub fn checkpoint_capability(&self) -> &ProviderCheckpointCapability {
+        &self.checkpoint
     }
 
     pub fn version(&self) -> ContractVersion {
