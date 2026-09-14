@@ -5,6 +5,7 @@
 //! hot-path env reads are migrated to typed config structs.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::sync::RwLock;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -46,7 +47,22 @@ pub struct RuntimeConfigSnapshot {
 impl RuntimeConfigSnapshot {
     /// Capture all currently set `FERRUM_*` env overrides.
     pub fn capture_current() -> Self {
-        Self::from_env_vars(std::env::vars())
+        Self::from_os_env_vars(std::env::vars_os())
+    }
+
+    fn from_os_env_vars(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Self::from_env_vars(vars.into_iter().filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            if !key.starts_with("FERRUM_") {
+                return None;
+            }
+            // Unrelated OS values need not be Unicode. Ferrum overrides retain
+            // their original text so the typed parser can reject invalid values.
+            let value = value
+                .into_string()
+                .unwrap_or_else(|_| panic!("environment variable {key} must contain Unicode"));
+            Some((key, value))
+        }))
     }
 
     /// Build a snapshot from a supplied environment map or iterator.
@@ -332,6 +348,64 @@ mod tests {
         let entry = snapshot.entries.first().expect("attention policy entry");
         assert!(entry.affects.contains(&RuntimeConfigEffect::Correctness));
         assert!(entry.affects.contains(&RuntimeConfigEffect::Performance));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_ignores_unrelated_non_unicode_environment() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let snapshot = RuntimeConfigSnapshot::from_os_env_vars([
+            (
+                OsString::from("PATH"),
+                OsString::from_vec(b"/bin:\xff".to_vec()),
+            ),
+            (
+                OsString::from_vec(b"OTHER_\xff".to_vec()),
+                OsString::from("ignored"),
+            ),
+            (
+                OsString::from("FERRUM_KV_MAX_BLOCKS"),
+                OsString::from(" 4096 "),
+            ),
+            (
+                OsString::from("FERRUM_ATTENTION_POLICY"),
+                OsString::from("native-adaptive"),
+            ),
+        ]);
+
+        assert_eq!(
+            snapshot,
+            RuntimeConfigSnapshot::from_env_vars([
+                ("FERRUM_ATTENTION_POLICY", "native-adaptive"),
+                ("FERRUM_KV_MAX_BLOCKS", " 4096 "),
+            ])
+        );
+    }
+
+    #[test]
+    fn os_environment_preserves_invalid_override_for_typed_validation() {
+        let snapshot = RuntimeConfigSnapshot::from_os_env_vars([(
+            OsString::from("FERRUM_KV_MAX_BLOCKS"),
+            OsString::from("many"),
+        )]);
+        assert_eq!(snapshot.entries[0].effective_value, "many");
+        let error = crate::EngineConfig::default()
+            .apply_runtime_config_snapshot(&snapshot)
+            .unwrap_err();
+        assert!(error.contains("FERRUM_KV_MAX_BLOCKS"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "environment variable FERRUM_KV_MAX_BLOCKS must contain Unicode")]
+    fn snapshot_rejects_non_unicode_ferrum_override() {
+        use std::os::unix::ffi::OsStringExt;
+
+        RuntimeConfigSnapshot::from_os_env_vars([(
+            OsString::from("FERRUM_KV_MAX_BLOCKS"),
+            OsString::from_vec(vec![0xff]),
+        )]);
     }
 
     #[test]
