@@ -9,12 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reported context-capacity failures as structured HTTP 400 errors before streaming begins, so clients can distinguish them from transient server failures.
 - Honored Chat Completions `reasoning_effort` and Responses `reasoning.effort`, preserving model defaults when omitted and respecting declared model capabilities.
 - Allowed automatic tool calls alongside strict final JSON schemas in Chat Completions and Responses, including streaming, while giving schema-valid final answers precedence over ambiguous tool-call JSON.
 - Recovered incomplete model downloads in `run` and `serve` by fetching missing weights, tokenizer, and chat-template files while reusing completed cache entries; `list` now identifies incomplete snapshots.
 
+### Changed
+
+- Enabled independent staging of eligible Q4/Q5 FFN projections in mixed-format Metal prefill, with storage-layout checks and reusable scratch capacity.
+
 ### Added
 
+- Added native profile summaries that distinguish shared GPU work from per-request observations and avoid duplicate accounting.
 - Added one-command installation on Apple Silicon macOS, Linux x86_64, and Windows x64, with PATH setup and upgrades that keep existing processes running while new launches use the updated version.
 - Added a native Windows EXE installer and portable CUDA package for a single NVIDIA sm89 GPU, bundling CUDA and VC runtimes and using the installed NVIDIA driver.
 
