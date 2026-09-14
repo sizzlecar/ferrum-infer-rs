@@ -178,6 +178,18 @@ impl MetalLinearPipelines {
         out_features: u32,
     ) -> (&ComputePipelineState, LinearDispatchKind) {
         if out_features >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES {
+            if format == LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs) {
+                if let Some(pipeline) = self.native.iq4xs_group_dot(rows) {
+                    return (
+                        pipeline,
+                        if rows == 1 {
+                            LinearDispatchKind::CooperativeGemv
+                        } else {
+                            LinearDispatchKind::SharedWeightGemv
+                        },
+                    );
+                }
+            }
             if let Some(pipeline) = self.small_batch.pipeline(format, rows) {
                 return (pipeline, LinearDispatchKind::SharedWeightGemv);
             }

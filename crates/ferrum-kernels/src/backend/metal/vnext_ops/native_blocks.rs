@@ -14,6 +14,7 @@ use crate::gguf_blocks::{GgufBlockFormat, IQ3_S_GRID, IQ4_NL_VALUES};
 pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("native_blocks.rs"),
     include_str!("native_blocks.metal"),
+    include_str!("group_dot.metal"),
     include_str!("../../../gguf_blocks/iq3s_grid.rs"),
     include_str!("../../../gguf_blocks/iq4nl_values.rs"),
     include_str!("../../../gguf_blocks/mod.rs"),
@@ -85,6 +86,12 @@ impl NativeSharedPipelines {
                 if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
                     continue;
                 }
+                // The former IQ4_XS F16 shared PSOs remain numerical controls
+                // in tests. Production uses grouped dots for this same scope.
+                #[cfg(not(test))]
+                if format == GgufBlockFormat::Iq4Xs && dtype == ElementType::F16 {
+                    continue;
+                }
                 formats.push((
                     format,
                     dtype,
@@ -133,6 +140,7 @@ pub(super) struct MetalNativeBlockPipelines {
     iq4_nl: NativeGemvPipelines,
     iq4_xs: NativeGemvPipelines,
     shared: NativeSharedPipelines,
+    iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
@@ -162,6 +170,7 @@ impl MetalNativeBlockPipelines {
         }
         shader.push_str("};\n");
         shader.push_str(include_str!("native_blocks.metal"));
+        shader.push_str(include_str!("group_dot.metal"));
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         #[cfg(test)]
@@ -253,6 +262,12 @@ impl MetalNativeBlockPipelines {
             iq4_nl,
             iq4_xs,
             shared,
+            iq4xs_group_dot_f16: [
+                pipeline("vnext_iq4_group_dot_b1")?,
+                pipeline("vnext_iq4_group_dot_b2")?,
+                pipeline("vnext_iq4_group_dot_b3")?,
+                pipeline("vnext_iq4_group_dot_b4")?,
+            ],
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
@@ -294,6 +309,10 @@ impl MetalNativeBlockPipelines {
 
     pub(super) fn linear_f32(&self, format: GgufBlockFormat) -> &ComputePipelineState {
         &self.gemv(format).f32
+    }
+
+    pub(super) fn iq4xs_group_dot(&self, rows: u32) -> Option<&ComputePipelineState> {
+        self.iq4xs_group_dot_f16.get(rows.checked_sub(1)? as usize)
     }
 
     pub(super) fn shared_linear(

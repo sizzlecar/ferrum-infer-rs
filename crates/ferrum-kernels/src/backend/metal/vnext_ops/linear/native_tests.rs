@@ -135,8 +135,83 @@ fn assert_native_linears(
     output_width: usize,
     formats: &[GgufBlockFormat],
 ) {
+    assert_native_linears_mode(
+        device,
+        pipelines,
+        queue,
+        shared,
+        output_width,
+        formats,
+        None,
+    );
+}
+
+#[test]
+fn native_iq4xs_group_dot_preserves_cpu_rows_tails_offsets_and_wide_weights() {
+    let device = Device::system_default().expect("IQ4_XS grouped dots require Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    for rows in [0, 1, 2, 3, 4, 5, 8, 32] {
+        assert_eq!(
+            pipelines.native.iq4xs_group_dot(rows).is_some(),
+            (1..=4).contains(&rows)
+        );
+        if let Some(group_dot) = pipelines.native.iq4xs_group_dot(rows) {
+            let (f32_pipeline, _) = pipelines
+                .f32_linear_dispatch(
+                    LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs),
+                    rows,
+                    1025,
+                )
+                .unwrap();
+            assert!(
+                !std::ptr::eq(group_dot, f32_pipeline),
+                "F32 must retain its existing PSO"
+            );
+        }
+    }
+    for output_width in [7, 1023, 1024, 1025] {
+        assert_native_linears_mode(
+            &device,
+            &pipelines,
+            &queue,
+            false,
+            output_width,
+            &[GgufBlockFormat::Iq4Xs],
+            Some(false),
+        );
+    }
+    assert_native_linears_mode(
+        &device,
+        &pipelines,
+        &queue,
+        false,
+        1025,
+        &[GgufBlockFormat::Iq4Xs],
+        Some(true),
+    );
+}
+
+// Some(wide_weights) additionally exercises the grouped-dot production PSOs;
+// None keeps the existing per-row/shared conformance controls.
+fn assert_native_linears_mode(
+    device: &Device,
+    pipelines: &MetalLinearPipelines,
+    queue: &CommandQueueRef,
+    shared: bool,
+    output_width: usize,
+    formats: &[GgufBlockFormat],
+    group_dot: Option<bool>,
+) {
     for &format in formats {
-        let blocks = oracle_blocks(format);
+        let mut blocks = oracle_blocks(format);
+        if group_dot == Some(true) {
+            assert_eq!(format, GgufBlockFormat::Iq4Xs);
+            for (index, block) in blocks.chunks_exact_mut(format.block_bytes()).enumerate() {
+                let scale = if index % 2 == 0 { 1024.0 } else { -1024.0 };
+                block[..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+            }
+        }
         // Five blocks exercise both 32- and 256-value formats without assuming
         // a multiple-of-four block count in the shared kernel.
         let blocks = if shared {
@@ -171,8 +246,26 @@ fn assert_native_linears(
             })
             .collect();
         let weight = buffer(device, &weight_bytes);
-        for rows in if shared { [2, 3, 4] } else { [1, 3, 9] } {
-            for activation_type in [ElementType::F16, ElementType::F32] {
+        if group_dot == Some(true) {
+            assert!(weights
+                .iter()
+                .flatten()
+                .any(|value| value.abs() > f16::MAX.to_f32()));
+        }
+        let row_counts: &[usize] = if group_dot.is_some() {
+            &[1, 2, 3, 4]
+        } else if shared {
+            &[2, 3, 4]
+        } else {
+            &[1, 3, 9]
+        };
+        let types: &[ElementType] = if group_dot.is_some() {
+            &[ElementType::F16]
+        } else {
+            &[ElementType::F16, ElementType::F32]
+        };
+        for &rows in row_counts {
+            for &activation_type in types {
                 if shared
                     && pipelines
                         .native
@@ -185,8 +278,11 @@ fn assert_native_linears(
                 // in F16, so an accidental narrowing changes this oracle.
                 let input: Vec<f32> = (0..rows * input_width)
                     .map(|i| {
-                        let value = (i as f32 * 0.071).sin() * 0.03125
+                        let mut value = (i as f32 * 0.071).sin() * 0.03125
                             + (i / input_width) as f32 * 0.0012345;
+                        if group_dot == Some(true) {
+                            value /= 32768.0;
+                        }
                         if activation_type == ElementType::F16 {
                             f16::from_f32(value).to_f32()
                         } else {
@@ -270,6 +366,7 @@ fn assert_native_linears(
                     pipeline
                 };
                 execute(baseline_pipeline, kind);
+                let mut regrouped_baseline = None;
                 if shared || format == GgufBlockFormat::Iq4Xs {
                     // SAFETY: the previous command completed; all buffers are
                     // shared, fully sized, and retained until both runs finish.
@@ -296,7 +393,22 @@ fn assert_native_linears(
                             output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES as usize
                         );
                     }
-                    let (shared_pipeline, dispatch) = if !shared {
+                    let (shared_pipeline, dispatch) = if group_dot.is_some() {
+                        let candidate = pipelines.native.iq4xs_group_dot(params.rows).unwrap();
+                        assert_eq!(
+                            std::ptr::eq(candidate, selected.0),
+                            output_width >= SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES as usize,
+                            "grouped-dot selector threshold changed"
+                        );
+                        (
+                            candidate,
+                            if rows == 1 {
+                                LinearDispatchKind::CooperativeGemv
+                            } else {
+                                LinearDispatchKind::SharedWeightGemv
+                            },
+                        )
+                    } else if !shared {
                         (pipeline, kind)
                     } else if selected.1 == LinearDispatchKind::SharedWeightGemv {
                         selected
@@ -313,7 +425,7 @@ fn assert_native_linears(
                     };
                     // Poison only writable output cells; a missing shared
                     // write cannot pass by inheriting the baseline's result.
-                    unsafe {
+                    let poison = || unsafe {
                         for row in 0..rows {
                             for column in 0..output_width {
                                 let index = prefix + row * output_stride + 2 + column;
@@ -324,9 +436,27 @@ fn assert_native_linears(
                                 }
                             }
                         }
-                    }
+                    };
+                    poison();
                     execute(shared_pipeline, dispatch);
-                    assert_eq!(bytes(&output), baseline, "native kernel changed per-row result/guards: {format:?} {activation_type:?} B{rows} shared={shared}");
+                    let regrouped = format == GgufBlockFormat::Iq4Xs
+                        && activation_type == ElementType::F16
+                        && pipelines
+                            .native
+                            .iq4xs_group_dot(params.rows)
+                            .is_some_and(|candidate| std::ptr::eq(candidate, shared_pipeline));
+                    if regrouped {
+                        // Grouped dot changes multiplication/reduction order.
+                        // Check both variants against the CPU below; retain
+                        // exact repeatability within the new implementation.
+                        regrouped_baseline = Some(baseline);
+                        let first = bytes(&output);
+                        poison();
+                        execute(shared_pipeline, dispatch);
+                        assert_eq!(bytes(&output), first, "grouped dot is not repeatable");
+                    } else {
+                        assert_eq!(bytes(&output), baseline, "native kernel changed per-row result/guards: {format:?} {activation_type:?} B{rows} shared={shared}");
+                    }
                     assert_eq!(bytes(&input_buffer), input_before);
                     assert_eq!(bytes(&weight), weight_before);
                 }
@@ -370,6 +500,19 @@ fn assert_native_linears(
                     } else {
                         0.0
                     };
+                    if let Some(baseline) = &regrouped_baseline {
+                        let original = f16::from_bits(u16::from_ne_bytes([
+                            baseline[index * 2],
+                            baseline[index * 2 + 1],
+                        ]))
+                        .to_f32();
+                        assert!(
+                            original.is_finite()
+                                && (f64::from(original) - expected).abs()
+                                    <= accumulation + rounding,
+                            "original IQ4_XS output differs from CPU at ({row},{column})"
+                        );
+                    }
                     assert!(actual.is_finite() && (f64::from(actual) - expected).abs() <= accumulation + rounding, "{format:?} {activation_type:?} rows={rows} ({row},{column}): {actual} != {expected}; bound={}", accumulation + rounding);
                 }
             }

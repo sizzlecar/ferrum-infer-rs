@@ -84,6 +84,7 @@ enum Dispatch {
     NativeGemv,
     NativeSpecializedGemv,
     NativeSharedGemv,
+    NativeSharedControl,
     NativeGemm,
     NativeGemmM64,
     NativeSpecializedGemm,
@@ -215,6 +216,28 @@ struct Case<'a> {
 }
 
 impl Case<'_> {
+    fn uses_grouped_dot(&self, dispatch: Dispatch) -> bool {
+        matches!(dispatch, Dispatch::NativeSharedGemv)
+            && self.activation_type == ElementType::F16
+            && self.shape.format == GgufBlockFormat::Iq4Xs
+            && self
+                .pipelines
+                .native
+                .iq4xs_group_dot(self.rows)
+                .is_some_and(|candidate| {
+                    std::ptr::eq(
+                        candidate,
+                        self.pipelines
+                            .linear_pipeline(
+                                physical(self.shape.format),
+                                self.rows,
+                                self.shape.output,
+                            )
+                            .0,
+                    )
+                })
+    }
+
     fn poison_output(&self) {
         let len = self.rows as usize * self.shape.output as usize;
         // SAFETY: the shared allocation has this declared scalar type and
@@ -252,7 +275,16 @@ impl Case<'_> {
                         .f32_linear_dispatch(physical(format), self.rows, self.shape.output)
                         .unwrap()
                 };
-                assert_eq!(selected.1, LinearDispatchKind::SharedWeightGemv);
+                // This variant follows the production selector, including
+                // B1, whose cooperative grid has exactly one input row.
+                assert_eq!(
+                    selected.1,
+                    if self.rows == 1 {
+                        LinearDispatchKind::CooperativeGemv
+                    } else {
+                        LinearDispatchKind::SharedWeightGemv
+                    }
+                );
                 selected
             }
             (Dispatch::NativeGemv, _, ElementType::F16) => (
@@ -270,6 +302,13 @@ impl Case<'_> {
             (Dispatch::NativeSpecializedGemv, format, ElementType::F32) => (
                 self.pipelines.native.linear_f32(format),
                 LinearDispatchKind::CooperativeGemv,
+            ),
+            (Dispatch::NativeSharedControl, format, activation_type) => (
+                self.pipelines
+                    .native
+                    .shared_linear(format, self.rows, activation_type)
+                    .expect("old production shared control must be retained in tests"),
+                LinearDispatchKind::SharedWeightGemv,
             ),
             (Dispatch::NativeGemm, _, ElementType::F16) => (
                 &self.pipelines.native.gemm_f16_f32,
@@ -354,6 +393,7 @@ impl Case<'_> {
                     Dispatch::NativeGemv
                         | Dispatch::NativeSpecializedGemv
                         | Dispatch::NativeSharedGemv
+                        | Dispatch::NativeSharedControl
                         | Dispatch::NativeGemm
                         | Dispatch::NativeGemmM64
                         | Dispatch::NativeSpecializedGemm
@@ -376,6 +416,7 @@ impl Case<'_> {
         assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
         serde_json::json!({
             "dispatch": format!("{dispatch:?}"),
+            "dispatch_kind": format!("{kind:?}"),
             "dispatches": dispatches,
             "host_encode_ns": encode_ns,
             "host_submit_wait_ns": submit_wait_ns,
@@ -480,6 +521,93 @@ fn native_quantized_decode_dispatch_microbench() {
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn native_shared_weight_decode_microbench() {
     measure_native_decode(true, None);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn native_iq4xs_hot_and_streaming_decode_microbench() {
+    let device = Device::system_default().expect("microbench requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    const MATRIX_COUNT: usize = 8;
+    const ROUNDS: usize = 6;
+    for (name, input_width, output_width) in
+        [("ffn_gate_or_up", 5120, 17408), ("ffn_down", 17408, 5120)]
+    {
+        let shape = Shape {
+            name,
+            input: input_width,
+            output: output_width,
+            format: GgufBlockFormat::Iq4Xs,
+        };
+        let encoded = weights(shape);
+        // Independent allocations with identical coefficients give every
+        // dispatch the same CPU oracle while rotating actual weight addresses.
+        let matrices = (0..MATRIX_COUNT)
+            .map(|_| buffer(&device, &encoded))
+            .collect::<Vec<_>>();
+        for rows in [1, 3] {
+            let (input_values, nonzero) = inputs(rows, shape.input as usize);
+            let input = buffer(&device, &input_values);
+            let reference = oracle(shape, &encoded, &nonzero);
+            let mut initial_output = vec![f16::NAN; reference.len()];
+            initial_output.extend([f16::from_f32(OUTPUT_GUARD); OUTPUT_GUARD_ELEMENTS]);
+            let output = buffer(&device, &initial_output);
+            let variants = [
+                if rows == 1 {
+                    Dispatch::NativeSpecializedGemv
+                } else {
+                    Dispatch::NativeSharedControl
+                },
+                Dispatch::NativeSharedGemv,
+            ];
+            for matrix_count in [1, MATRIX_COUNT] {
+                let case = Case {
+                    queue: &queue,
+                    pipelines: &pipelines,
+                    shape,
+                    rows: rows as u32,
+                    activation_type: ElementType::F16,
+                    input: &input,
+                    weights: &matrices[..matrix_count],
+                    output: &output,
+                };
+                assert!(
+                    case.uses_grouped_dot(variants[1]),
+                    "production route must select grouped dots"
+                );
+                // Both working sets issue eight dispatches per command. Hot
+                // repeats one address; streaming visits each of eight once.
+                let samples =
+                    measure_case_with_rounds(&case, &variants, &reference, 1, ROUNDS, MATRIX_COUNT);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "kind": "metal_native_iq4xs_hot_and_streaming_decode_microbench",
+                        "device": device.name(), "shape": name, "rows": rows,
+                        "input_features": shape.input, "output_features": shape.output,
+                        "activation_type": "F16", "weight_format": shape.format.format_id(),
+                        "weight_bytes_per_matrix": encoded.len(),
+                        "working_set": if matrix_count == 1 { "single_matrix_repeat" } else { "independent_matrix_rotation" },
+                        "working_set_weight_bytes": encoded.len() * matrix_count,
+                        "resident_weight_bytes": encoded.len() * MATRIX_COUNT,
+                        "rotating_weight_allocations": matrix_count,
+                        "dispatches_per_command": MATRIX_COUNT,
+                        "preflight_dispatches_per_variant": 1,
+                        "warmup_commands_per_variant": 1,
+                        "measured_paired_rounds": ROUNDS,
+                        "order": "AB_BA_alternating",
+                        "comparison": "old_production_format_PSO_vs_current_production_selector",
+                        "oracle": "full_output_sparse_input_CPU_each_command_final_dispatch_and_trailing_guards",
+                        "bitwise": "same_implementation_repeatability_not_old_new_equality",
+                        "scope": "synthetic_identical_matrices_at_distinct_addresses_not_full_model_cache_or_kernel_mix",
+                        "gpu_timing_unavailable_samples": samples.iter().filter(|sample| sample["device_command_ns"].is_null()).count(),
+                        "samples": samples,
+                    })
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -593,14 +721,7 @@ fn measure_native_decode(shared_weights: bool, iq4xs_header_rows: Option<&[usize
                         output: &output,
                     };
                     let variants = if iq4xs_header {
-                        [
-                            Dispatch::NativeGemv,
-                            if rows == 1 {
-                                Dispatch::NativeSpecializedGemv
-                            } else {
-                                Dispatch::NativeSharedGemv
-                            },
-                        ]
+                        [Dispatch::NativeGemv, Dispatch::NativeSharedGemv]
                     } else if shared_weights {
                         [Dispatch::NativeSpecializedGemv, Dispatch::NativeSharedGemv]
                     } else {
@@ -632,7 +753,7 @@ fn measure_native_decode(shared_weights: bool, iq4xs_header_rows: Option<&[usize
                             "correctness_warmup_dispatches_per_variant": 1, "additional_warmup_rounds": 1,
                             "measured_paired_rounds": measured_rounds, "dispatches_per_command": 1,
                             "oracle": "full_output_sparse_input_cpu_block_decode_each_command",
-                            "pair_preflight": "full_output_bitwise_comparison",
+                            "pair_preflight": if variants.iter().any(|&variant| case.uses_grouped_dot(variant)) { "full_output_cpu_oracle_and_same_implementation_bitwise_repeatability" } else { "full_output_bitwise_comparison" },
                             "each_command_bitwise_comparison": true,
                             "final_output_f32_bits_sha256": format!("{:x}", output_digest.finalize()),
                             "final_output_dispatch": samples.last().map(|sample| sample["dispatch"].clone()),
@@ -1124,13 +1245,19 @@ fn measure_case_with_rounds(
         .filter(|variant| {
             matches!(
                 variant,
-                Dispatch::NativeGemv | Dispatch::NativeSpecializedGemv | Dispatch::NativeSharedGemv
+                Dispatch::NativeGemv
+                    | Dispatch::NativeSpecializedGemv
+                    | Dispatch::NativeSharedGemv
+                    | Dispatch::NativeSharedControl
             )
         })
         .count()
         > 1
         || compare_gemm_variants;
-    let mut native_reference: Option<Vec<u32>> = None;
+    // Grouped IQ4 dots deliberately reassociate FP32 products. They retain
+    // their own exact repeatability reference; all other compatible native
+    // variants still compare bitwise against their original common reference.
+    let mut native_references: [Option<Vec<u32>>; 2] = [None, None];
     for &dispatch in variants {
         // A skipped write must not inherit a correct result from the previous
         // variant. Reset outside all measured command-buffer intervals.
@@ -1143,6 +1270,7 @@ fn measure_case_with_rounds(
                 Dispatch::NativeGemv
                     | Dispatch::NativeSpecializedGemv
                     | Dispatch::NativeSharedGemv
+                    | Dispatch::NativeSharedControl
                     | Dispatch::NativeGemm
                     | Dispatch::NativeGemmM64
                     | Dispatch::NativeSpecializedGemm
@@ -1153,7 +1281,9 @@ fn measure_case_with_rounds(
                 .into_iter()
                 .map(f32::to_bits)
                 .collect::<Vec<_>>();
-            if let Some(expected) = &native_reference {
+            let native_reference =
+                &mut native_references[usize::from(case.uses_grouped_dot(dispatch))];
+            if let Some(expected) = native_reference.as_ref() {
                 for (index, (actual, expected)) in bits.iter().zip(expected).enumerate() {
                     assert_eq!(
                         actual, expected,
@@ -1162,7 +1292,7 @@ fn measure_case_with_rounds(
                     );
                 }
             } else {
-                native_reference = Some(bits);
+                *native_reference = Some(bits);
             }
         }
     }
@@ -1172,7 +1302,11 @@ fn measure_case_with_rounds(
             case.run(dispatch, dispatches_per_command);
             case.validate(reference);
             if compare_native_variants {
-                case.validate_bits(native_reference.as_ref().unwrap());
+                case.validate_bits(
+                    native_references[usize::from(case.uses_grouped_dot(dispatch))]
+                        .as_ref()
+                        .unwrap(),
+                );
             }
         }
     }
@@ -1188,7 +1322,11 @@ fn measure_case_with_rounds(
             // checks each command's final output, not every repeated dispatch.
             case.validate(reference);
             if compare_native_variants {
-                case.validate_bits(native_reference.as_ref().unwrap());
+                case.validate_bits(
+                    native_references[usize::from(case.uses_grouped_dot(dispatch))]
+                        .as_ref()
+                        .unwrap(),
+                );
             }
             sample["round"] = serde_json::json!(round);
             samples.push(sample);
