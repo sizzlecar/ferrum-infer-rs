@@ -370,6 +370,47 @@ impl EngineInner {
 
     // ── batch prefill ─────────────────────────────────────────────────
 
+    fn plan_prompt_tail_prefill_chunk(
+        &self,
+        request_id: &RequestId,
+        chunk: ferrum_interfaces::model_executor::PrefillChunk,
+        original_prompt: bool,
+    ) -> Result<ferrum_interfaces::model_executor::PrefillChunk> {
+        if !original_prompt {
+            return Ok(chunk);
+        }
+        let Some(plan) = self.model_executor.plan_prompt_tail_capture_boundary(chunk) else {
+            return Ok(chunk);
+        };
+        let span = plan.boundary.checked_sub(chunk.tokens_processed());
+        if plan.boundary >= chunk.total_prompt_tokens()
+            || plan.boundary > chunk.end()
+            || !span.is_some_and(|span| plan.span.permits(span as u64))
+        {
+            return Err(FerrumError::backend(
+                "invalid prompt-tail capture boundary for scheduled prefill",
+            ));
+        }
+        if plan.boundary == chunk.end() {
+            return Ok(chunk);
+        }
+        let planned = ferrum_interfaces::model_executor::PrefillChunk::new(
+            chunk.tokens_processed(),
+            span.expect("validated positive capture span"),
+            chunk.total_prompt_tokens(),
+        )?;
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_prefill_prompt_tail_boundary_planned",
+            "request_id": request_id,
+            "tokens_processed": chunk.tokens_processed(),
+            "scheduled_tokens": chunk.tokens_to_process(),
+            "planned_tokens": planned.tokens_to_process(),
+            "capture_boundary": plan.boundary,
+            "capture_span": plan.span,
+        }));
+        Ok(planned)
+    }
+
     pub(super) async fn run_plan_runtime_prefill(
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
@@ -378,11 +419,12 @@ impl EngineInner {
 
         let request_id = &scheduled.request.id;
 
-        let Some((input_tokens, maximum_sequence_tokens)) =
+        let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
             self.sequences.read().get(request_id).map(|seq| {
                 (
                     seq.prefill_context_tokens(),
                     seq.model_maximum_sequence_tokens(),
+                    seq.generated_tokens.is_empty(),
                 )
             })
         else {
@@ -397,6 +439,7 @@ impl EngineInner {
             })?,
             input_tokens.len(),
         )?;
+        let chunk = self.plan_prompt_tail_prefill_chunk(request_id, chunk, original_prompt)?;
         let input_token_count = input_tokens.len();
         let input = PlanRuntimePrefillInput::new(
             request_id.clone(),
@@ -792,11 +835,12 @@ impl EngineInner {
         let mut inputs = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
             let request_id = &scheduled.request.id;
-            let Some((input_tokens, maximum_sequence_tokens)) =
+            let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
                 self.sequences.read().get(request_id).map(|sequence| {
                     (
                         sequence.prefill_context_tokens(),
                         sequence.model_maximum_sequence_tokens(),
+                        sequence.generated_tokens.is_empty(),
                     )
                 })
             else {
@@ -811,6 +855,8 @@ impl EngineInner {
                 })?,
                 input_tokens.len(),
             )?;
+            let planned_chunk =
+                self.plan_prompt_tail_prefill_chunk(request_id, planned_chunk, original_prompt)?;
             let input_token_count = input_tokens.len();
             inputs.push(PlanRuntimePrefillInput::new(
                 request_id.clone(),

@@ -73,6 +73,23 @@ pub(super) fn select_boundary(
     })
 }
 
+pub(super) fn select_prompt_tail_boundary(
+    layout: &SequenceCheckpointLayout,
+    chunk: PrefillChunk,
+) -> Option<PrefixCapturePlan> {
+    let boundary = layout.prompt_tail_boundary(
+        chunk.tokens_processed() as u64,
+        chunk.total_prompt_tokens() as u64,
+    )?;
+    if boundary > chunk.end() as u64 {
+        return None;
+    }
+    Some(PrefixCapturePlan {
+        boundary: usize::try_from(boundary).ok()?,
+        span: layout.capture_span_constraint(),
+    })
+}
+
 /// An already completed immutable source retained across target capacity
 /// reprobes. It does not keep the producer or an index entry alive.
 struct RetainedRestoreCheckpoint<R: DeviceRuntime> {
@@ -101,6 +118,13 @@ impl<R: DeviceRuntime> PrefixCaptureLease for RetainedRestoreCheckpoint<R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    pub(in super::super) fn prompt_tail_boundary(
+        &self,
+        chunk: PrefillChunk,
+    ) -> Option<PrefixCapturePlan> {
+        select_prompt_tail_boundary(usable_layout(self.resolved_plan.execution_plan())?, chunk)
+    }
+
     pub(super) fn retain_restore_checkpoint(
         &self,
         checkpoint: SequenceCheckpoint<R>,

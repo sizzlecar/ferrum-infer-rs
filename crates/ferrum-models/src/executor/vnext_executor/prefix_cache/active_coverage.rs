@@ -130,17 +130,11 @@ impl<C> PrefixIndex<C> {
             .collect()
     }
 
-    pub(super) fn evict_with_active_coverage(
-        &mut self,
-        purpose: PrefixEvictionPurpose,
+    pub(super) fn active_coverage(
+        &self,
         inputs: &[ActivePrefixInput],
         layout: &SequenceCheckpointLayout,
-    ) -> CaptureEviction<C> {
-        if matches!(purpose, PrefixEvictionPurpose::Foreground) {
-            return self
-                .evict_for_layout(purpose, layout)
-                .map_or(CaptureEviction::Unavailable, CaptureEviction::Evicted);
-        }
+    ) -> (BTreeSet<usize>, Vec<ProtectedPrefix>) {
         let entire_input = layout.input_dependency() == CheckpointInputDependency::EntireTokenInput;
         let mut protected = BTreeSet::new();
         let mut coverage = Vec::new();
@@ -165,6 +159,21 @@ impl<C> PrefixIndex<C> {
                 });
             }
         }
+        (protected, coverage)
+    }
+
+    pub(super) fn evict_with_active_coverage(
+        &mut self,
+        purpose: PrefixEvictionPurpose,
+        inputs: &[ActivePrefixInput],
+        layout: &SequenceCheckpointLayout,
+    ) -> CaptureEviction<C> {
+        if matches!(purpose, PrefixEvictionPurpose::Foreground) {
+            return self
+                .evict_for_layout(purpose, layout)
+                .map_or(CaptureEviction::Unavailable, CaptureEviction::Evicted);
+        }
+        let (mut protected, coverage) = self.active_coverage(inputs, layout);
         let shared = self.shared_fallbacks(inputs, layout);
         if matches!(purpose, PrefixEvictionPurpose::PromptCapture) {
             protected.extend(&shared);

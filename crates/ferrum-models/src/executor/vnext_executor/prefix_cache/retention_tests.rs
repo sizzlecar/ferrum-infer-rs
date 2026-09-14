@@ -39,7 +39,7 @@ fn publish(
         Arc::clone(&owner),
         original_prompt_tokens,
     ));
-    let removed = index.coalesce(layout);
+    let removed = index.coalesce(layout, &[]);
     (owner, removed)
 }
 
@@ -86,6 +86,144 @@ fn growing_input_coalesces_intermediate_states_and_keeps_repeat_and_endpoint_hit
         entry.checkpoint.as_ref(),
         "partial-4" | "partial-16" | "end-16"
     )));
+}
+
+#[test]
+fn prompt_tail_publication_preserves_an_observed_shared_boundary() {
+    let fixture = fixture(CheckpointInputDependency::ExactTokenPrefix, 1);
+    let layout = usable_layout(&fixture.plan).unwrap();
+    let a = (1..=10).collect::<Vec<u32>>();
+    let b = [1, 2, 3, 4, 5, 6, 90, 91, 92, 93];
+    let mut index = PrefixIndex::default();
+    for (prefix, input, name) in [
+        (&a[..2], a.as_slice(), "early"),
+        (&a[..6], a.as_slice(), "shared"),
+        (&b[..8], b.as_slice(), "branch-b"),
+        (&a[..9], a.as_slice(), "tail-a"),
+    ] {
+        drop(publish(
+            &mut index,
+            layout,
+            prefix,
+            input,
+            Some(input.len()),
+            name,
+        ));
+    }
+    assert_eq!(
+        index.longest(&a, false, |_| true).as_deref(),
+        Some("tail-a")
+    );
+    assert_eq!(
+        index.longest(&b, false, |_| true).as_deref(),
+        Some("branch-b")
+    );
+    assert_eq!(
+        index
+            .longest(&[1, 2, 3, 4, 5, 6, 80], false, |_| true)
+            .as_deref(),
+        Some("shared")
+    );
+}
+
+#[test]
+fn prompt_tail_coalescing_keeps_active_coverage_then_retires_redundant_points() {
+    let fixture = fixture(CheckpointInputDependency::ExactTokenPrefix, 1);
+    let layout = usable_layout(&fixture.plan).unwrap();
+    let input = (1..=10).collect::<Vec<u32>>();
+    let mut index = PrefixIndex::default();
+    for (boundary, name) in [(2, "early"), (6, "active"), (9, "tail")] {
+        drop(index.insert(
+            Arc::from(&input[..boundary]),
+            Arc::from(input.as_slice()),
+            Arc::<str>::from(name),
+            Some(input.len()),
+        ));
+    }
+    // A shorter active prompt is on the same growth chain, so shared-branch
+    // protection alone cannot retain its deepest legal restore point.
+    let inputs = [ActivePrefixInput {
+        request_id: RequestId::new(),
+        tokens: input[..8].to_vec(),
+    }];
+    assert!(index.shared_fallbacks(&inputs, layout).is_empty());
+    assert!(index.coalesce(layout, &inputs).is_empty());
+    let pin = index.longest(&inputs[0].tokens, false, |_| true).unwrap();
+    assert_eq!(pin.as_ref(), "active");
+
+    // Re-publishing the identical tail replaces one owner. Once the shorter
+    // request retires, the middle point is redundant and can be coalesced.
+    let replaced = index.insert(
+        Arc::from(&input[..9]),
+        Arc::from(input.as_slice()),
+        Arc::<str>::from("tail-new"),
+        Some(input.len()),
+    );
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced[0].as_ref(), "tail");
+    let removed = index.coalesce(layout, &[]);
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].as_ref(), "active");
+    drop(removed);
+    assert_eq!(Arc::strong_count(&pin), 1);
+    assert_eq!(
+        index.longest(&input, false, |_| true).as_deref(),
+        Some("tail-new")
+    );
+    assert_eq!(
+        index.longest(&inputs[0].tokens, false, |_| true).as_deref(),
+        Some("early")
+    );
+}
+
+#[tokio::test]
+async fn optional_prompt_tail_capacity_failure_preserves_shared_coverage() {
+    let fixture = fixture(CheckpointInputDependency::ExactTokenPrefix, 1);
+    let layout = usable_layout(&fixture.plan).unwrap();
+    let mut entries = PrefixIndex::default();
+    drop(entries.insert(
+        Arc::from([1, 2]),
+        Arc::from([1, 2, 3, 4]),
+        Arc::<str>::from("shared"),
+        Some(4),
+    ));
+    let inputs = [ActivePrefixInput {
+        request_id: RequestId::new(),
+        tokens: vec![1, 2, 9, 8],
+    }];
+    let index = Mutex::new(entries);
+    let result = capture_with_capacity(
+        1,
+        || {
+            assert_eq!(
+                index
+                    .lock()
+                    .longest(&inputs[0].tokens, false, |_| true)
+                    .as_deref(),
+                Some("shared")
+            );
+            std::future::ready(Ok(CaptureAttempt::<(), ()>::NeedsMaintenance(())))
+        },
+        |()| std::future::ready(Ok(CaptureMaintenanceDecision::CapacityLimited)),
+        || match index.lock().evict_with_active_coverage(
+            PrefixEvictionPurpose::PromptCapture,
+            &inputs,
+            layout,
+        ) {
+            CaptureEviction::SharedFallbackProtected(_) => false,
+            _ => panic!("a proposed tail must not consume protected fallback capacity"),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(
+        index
+            .lock()
+            .longest(&[1, 2, 3, 4], false, |_| true)
+            .as_deref(),
+        Some("shared")
+    );
 }
 
 #[test]
@@ -354,7 +492,7 @@ fn coalescing_returns_owners_without_releasing_restore_pins_and_has_separate_met
             }),
             Some(7),
         ));
-        locked.coalesce(layout)
+        locked.coalesce(layout, &[])
     };
     assert_eq!(
         Arc::strong_count(&middle),

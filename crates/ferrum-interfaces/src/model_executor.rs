@@ -2999,6 +2999,15 @@ pub enum ExecutorPrefillAdmissionDecision {
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Plan an optional prompt-tail checkpoint before a prefill chunk is
+    /// dispatched. The boundary must lie after this chunk's start and no later
+    /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning
+    /// grants no capacity or capture authority and does not report a failed
+    /// capacity probe; the caller dispatches the resulting chunk explicitly.
+    fn plan_prompt_tail_capture_boundary(&self, _chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
+        None
+    }
+
     /// Pure boundary planning for optional sharing. None leaves normal scheduling
     /// unchanged; a returned boundary never grants request or resource authority.
     fn plan_prefix_capture_boundary(

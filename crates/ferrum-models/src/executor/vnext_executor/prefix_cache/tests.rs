@@ -23,6 +23,9 @@ mod active_coverage_tests;
 #[path = "shared_fallback_tests.rs"]
 mod shared_fallback_tests;
 
+#[path = "prompt_tail_tests.rs"]
+mod prompt_tail_tests;
+
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};
@@ -190,7 +193,7 @@ fn replacement_and_eviction_drop_index_ownership_but_not_restore_pins() {
     let first = insert(&mut index, &[1], &[1, 2, 3], "first");
     let pin = index.longest(&[1, 2, 4], false, |_| true).unwrap();
     let replaced = index.insert(
-        Arc::from([1, 2]),
+        Arc::from([1]),
         Arc::from([1, 2, 3]),
         Arc::from("second"),
         Some(3),
@@ -230,13 +233,13 @@ fn completed_input_capture_preserves_a_prefix_for_exact_repeats() {
     assert_eq!(Arc::strong_count(&partial), 2);
     drop(pin);
     assert_eq!(Arc::strong_count(&completed), 1);
-    // A new partial capture can replace its predecessor without discarding
-    // the completed-input state used by an appended conversation.
+    // A different partial is not equivalent to the deeper existing point.
+    // Insertion preserves both until topology-aware coalescing or pressure.
     insert(&mut index, &[1], &input, "new-partial");
-    assert_eq!(Arc::strong_count(&partial), 1);
+    assert_eq!(Arc::strong_count(&partial), 2);
     assert_eq!(
         index.longest(&input, false, |_| true).as_deref(),
-        Some("new-partial")
+        Some("partial")
     );
     assert_eq!(
         index.longest(&[1, 2, 3, 4], false, |_| true).as_deref(),
@@ -893,10 +896,10 @@ fn native_snapshot_reports_index_extents_after_replacement_and_pinned_eviction()
     let pin = index.longest(&[1, 2, 4], false, |_| true).unwrap();
     assert_eq!(snapshot(&index)["entries"], 1);
     assert_eq!(snapshot(&index)["bytes"], 65536);
-    // A deeper capture replaces the same input, not an additional entry or a
-    // pressure eviction. The old native owner can remain pinned by a restore.
+    // An identical point replaces its owner without a pressure eviction.
+    // The old native owner can remain pinned by a restore.
     drop(index.insert(
-        Arc::from([1, 2]),
+        Arc::from([1]),
         Arc::from([1, 2, 3]),
         Arc::new(RetainedCheckpoint {
             extent_bytes: 131072,

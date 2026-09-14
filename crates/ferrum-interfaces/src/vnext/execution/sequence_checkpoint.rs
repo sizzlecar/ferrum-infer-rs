@@ -213,6 +213,26 @@ impl SequenceCheckpointLayout {
         {
             return None;
         }
+        self.latest_reusable_boundary(processed, source_prompt, common_prefix, follower_prompts)
+    }
+
+    /// Nearest boundary before the end of this input that can serve an exact
+    /// repeat while leaving a legal nonempty suffix to execute for logits.
+    /// This is pure planning, not a capture or capacity reservation.
+    pub fn prompt_tail_boundary(&self, processed: u64, prompt: u64) -> Option<u64> {
+        if self.input_dependency() != CheckpointInputDependency::ExactTokenPrefix {
+            return None;
+        }
+        self.latest_reusable_boundary(processed, prompt, prompt, &[])
+    }
+
+    fn latest_reusable_boundary(
+        &self,
+        processed: u64,
+        source_prompt: u64,
+        common_prefix: u64,
+        follower_prompts: &[u64],
+    ) -> Option<u64> {
         let prefix = self.data.boundaries.prefix();
         let suffix = self.data.boundaries.suffix();
         let prefix_alignment = prefix.alignment().get();

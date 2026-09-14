@@ -37,6 +37,9 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "prefix_prompt_tail_tests.rs"]
+mod prefix_prompt_tail_tests;
+
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
     wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
@@ -90,6 +93,8 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     prefix_restore: Option<Arc<prefix_restore_tests::RestoreState>>,
     prefix_retry: Option<Arc<prefix_restore_deferred_tests::RestoreState>>,
     rendezvous: Option<Arc<prefix_rendezvous_tests::CaptureState>>,
+    prompt_tail_reserve: Option<usize>,
+    tail_batch_prefill_calls: AtomicU64,
 }
 
 impl PlanRuntimeChunkedPrefillTestExecutor {
@@ -110,6 +115,8 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             prefix_restore: None,
             prefix_retry: None,
             rendezvous: None,
+            prompt_tail_reserve: None,
+            tail_batch_prefill_calls: AtomicU64::new(0),
         }
     }
 
@@ -248,6 +255,22 @@ impl PlanRuntimeBatchDecodeTestExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
+    fn plan_prompt_tail_capture_boundary(
+        &self,
+        chunk: PrefillChunk,
+    ) -> Option<ferrum_interfaces::model_executor::PrefixCapturePlan> {
+        let boundary = chunk
+            .total_prompt_tokens()
+            .checked_sub(self.prompt_tail_reserve?)?;
+        if boundary <= chunk.tokens_processed() || boundary > chunk.end() {
+            return None;
+        }
+        Some(ferrum_interfaces::model_executor::PrefixCapturePlan {
+            boundary,
+            span: ferrum_interfaces::vnext::CheckpointTokenSpanConstraint::any_positive(),
+        })
+    }
+
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
@@ -520,7 +543,41 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
     ) -> Result<PlanRuntimePrefillOutcome> {
         let mock_input = plan_runtime_prefill_to_mock_input(input);
         let outcome = self.prefill_with_capacity(&mock_input).await?;
-        plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)
+        let outcome = plan_runtime_prefill_outcome_from_mock(&input.request_id, outcome)?;
+        if self.prompt_tail_reserve.is_some() {
+            if let PlanRuntimePrefillOutcome::Completed(completion) = &outcome {
+                assert_eq!(completion.capacity_probe_count(), 0);
+                assert_eq!(completion.planned_chunk(), completion.completed_chunk());
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn plan_runtime_batch_prefill_with_capacity(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        if self.prompt_tail_reserve.is_none() {
+            return Ok(PlanRuntimeBatchPrefillOutcome::Unsupported);
+        }
+        self.tail_batch_prefill_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let mut completions = Vec::new();
+        for input in inputs {
+            let PlanRuntimePrefillOutcome::Completed(completion) =
+                self.plan_runtime_prefill_with_capacity(input).await?
+            else {
+                return Err(FerrumError::internal("tail fixture unexpectedly deferred"));
+            };
+            assert_eq!(
+                completion.capacity_probe_count(),
+                0,
+                "planned tail cuts are not capacity failures"
+            );
+            assert_eq!(completion.planned_chunk(), completion.completed_chunk());
+            completions.push(completion);
+        }
+        Ok(PlanRuntimeBatchPrefillOutcome::Completed(completions))
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {

@@ -5,7 +5,7 @@
 use super::*;
 use std::collections::VecDeque;
 mod active_coverage;
-use active_coverage::{active_prefix_inputs, CaptureEviction};
+use active_coverage::{active_prefix_inputs, ActivePrefixInput, CaptureEviction};
 pub(super) mod rendezvous;
 mod restore_observation;
 use ferrum_interfaces::model_executor::{PrefixRestoreDecision, PrefixRestoreSource};
@@ -203,12 +203,11 @@ impl<C> PrefixIndex<C> {
         let mut index = 0;
         while index < self.entries.len() {
             let entry = &self.entries[index];
-            // A checkpoint at the input end needs a longer future request.
-            // Preserve the partial checkpoint that can serve an exact repeat
-            // of this input. Replacements within either use retain one owner.
-            if entry.input.as_ref() == input
-                && (entry.prefix.len() == input.len()) == (completed_tokens == input.len())
-            {
+            // Equal inputs do not make different boundaries interchangeable:
+            // an older partial can still serve a branch that diverges before
+            // the new boundary. Only an identical point is redundant without
+            // consulting active coverage and the observed prefix topology.
+            if entry.input.as_ref() == input && entry.prefix.len() == completed_tokens {
                 removed.push(self.entries.remove(index).expect("known entry").checkpoint);
             } else {
                 index += 1;
@@ -239,7 +238,11 @@ impl<C> PrefixIndex<C> {
     /// partials and a legal early fallback; retire intermediate growth states.
     /// This trades longer historical hits for retained memory, not equivalent
     /// state at different N. In particular, boundary state is never truncated.
-    fn coalesce(&mut self, layout: &SequenceCheckpointLayout) -> Vec<C> {
+    fn coalesce(
+        &mut self,
+        layout: &SequenceCheckpointLayout,
+        inputs: &[ActivePrefixInput],
+    ) -> Vec<C> {
         if layout.input_dependency() != CheckpointInputDependency::ExactTokenPrefix {
             return Vec::new();
         }
@@ -263,9 +266,12 @@ impl<C> PrefixIndex<C> {
         if ancestors.is_empty() {
             return Vec::new();
         }
+        let (mut protected, _) = self.active_coverage(inputs, layout);
+        protected.extend(self.shared_fallbacks(inputs, layout));
         let mut keep = vec![true; self.entries.len()];
         for &index in &ancestors {
-            keep[index] = self.entries[index].original_prompt().is_none();
+            keep[index] =
+                self.entries[index].original_prompt().is_none() || protected.contains(&index);
         }
         keep[ancestors[0]] = true;
 
@@ -274,7 +280,8 @@ impl<C> PrefixIndex<C> {
         let frontiers = self.entries.iter().enumerate().filter(|(index, entry)| {
             *index == self.entries.len() - 1
                 || !self.entries.iter().any(|other| {
-                    other.input.len() > entry.input.len() && other.input.starts_with(&entry.input)
+                    (other.input.len() > entry.input.len() && other.input.starts_with(&entry.input))
+                        || (other.input == entry.input && other.prefix.len() > entry.prefix.len())
                 })
         });
         for (frontier_index, frontier) in frontiers {
@@ -446,6 +453,13 @@ fn capture_candidate(chunk: PrefillChunk) -> bool {
     !chunk.is_final()
         && chunk.end() > 0
         && chunk.total_prompt_tokens() - chunk.end() <= chunk.tokens_to_process()
+}
+
+fn prompt_tail_capture_candidate(layout: &SequenceCheckpointLayout, chunk: PrefillChunk) -> bool {
+    layout.prompt_tail_boundary(
+        chunk.tokens_processed() as u64,
+        chunk.total_prompt_tokens() as u64,
+    ) == Some(chunk.end() as u64)
 }
 
 enum CaptureAttempt<M, C> {
@@ -958,8 +972,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Ok(());
         };
         let interests = rendezvous::interests_at(sequence, chunk.end());
+        let prompt_tail = prompt_tail_capture_candidate(layout, chunk);
         if sequence.request_origin != ExecutorRequestOrigin::Product
-            || (!capture_candidate(chunk) && interests.is_empty())
+            || (!capture_candidate(chunk) && !prompt_tail && interests.is_empty())
             || !layout.permits_capture_from(
                 chunk.tokens_processed() as u64,
                 chunk.end() as u64,
@@ -1025,17 +1040,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ?purpose,
             "prefix checkpoint capture requested"
         );
-        // Replacing a candidate must not require holding both copies at once.
-        let replacement_started = Instant::now();
-        let replaced = self
-            .prefix_cache
-            .lock()
-            .remove_replaced(tokens, completed_tokens);
-        drop(replaced);
-        self.reaper.record_checkpoint_cache_timing(
-            CheckpointCacheTimingPhase::ReplacementDrop,
-            replacement_started.elapsed(),
-        );
+        // A proposed later point does not yet provide restore coverage. Keep
+        // existing owners until publication or the ordinary capacity path can
+        // select an unprotected victim. Optional capture may simply not fit.
         let entries = self.prefix_cache.lock().entries.len();
         let result = capture_with_capacity(entries, || async {
             let reaper = Arc::clone(&self.reaper);
@@ -1153,6 +1160,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "prefix checkpoint captured"
                 );
                 rendezvous::publish(sequence, &checkpoint);
+                let inputs = active_prefix_inputs(&self.sequences, sequence);
                 let (removed, coalesced) = {
                     let mut index = self.prefix_cache.lock();
                     let removed = index.insert(
@@ -1162,7 +1170,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         usize::try_from(sequence.product_prompt_tokens).ok(),
                     );
                     let coalesced = usable_layout(self.resolved_plan.execution_plan())
-                        .map(|layout| index.coalesce(layout))
+                        .map(|layout| index.coalesce(layout, &inputs))
                         .unwrap_or_default();
                     (removed, coalesced)
                 };

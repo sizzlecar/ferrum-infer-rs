@@ -9700,6 +9700,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
+        self.prompt_tail_boundary(chunk)
+    }
+
     fn plan_prefix_capture_boundary(
         &self,
         input: PrefixCaptureBoundary<'_>,
