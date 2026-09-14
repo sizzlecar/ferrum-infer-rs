@@ -410,6 +410,29 @@ impl<C> PrefixIndex<C> {
 }
 
 impl<C: Clone> PrefixIndex<C> {
+    /// Select an initial restore. The optional handoff has already passed
+    /// native lease and suffix validation. It must not hide a longer compatible
+    /// index entry; ties retain the existing handoff without refreshing another
+    /// entry's LRU position. Capacity retries keep their exact pin separately.
+    fn longest_or_rendezvous(
+        &mut self,
+        input: &[u32],
+        entire_input: bool,
+        permits_suffix: impl Fn(usize) -> bool,
+        rendezvous: Option<(usize, &C)>,
+    ) -> (Option<C>, PrefixRestoreSource) {
+        let minimum = rendezvous.as_ref().map_or(0, |(boundary, _)| *boundary);
+        if let Some(checkpoint) = self.longest(input, entire_input, |boundary| {
+            boundary > minimum && permits_suffix(boundary)
+        }) {
+            return (Some(checkpoint), PrefixRestoreSource::Index);
+        }
+        match rendezvous {
+            Some((_, checkpoint)) => (Some(checkpoint.clone()), PrefixRestoreSource::Rendezvous),
+            None => (None, PrefixRestoreSource::Index),
+        }
+    }
+
     fn longest(
         &mut self,
         input: &[u32],
@@ -1228,43 +1251,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
             return Ok(PlanRuntimePrefixRestoreOutcome::Unavailable);
         };
-        let source = input.retry.map(|retry| retry.source()).unwrap_or_else(|| {
-            if input.checkpoint.is_some() {
-                PrefixRestoreSource::Rendezvous
-            } else {
-                PrefixRestoreSource::Index
-            }
-        });
-        let observer = PrefixRestoreObserver::new(
-            self.event_sink.read().clone(),
-            input.request_id.clone(),
-            source,
-        );
         let tokens = input
             .input_tokens
             .iter()
             .map(|token| token.get())
             .collect::<Vec<_>>();
-        let checkpoint = if let Some(source) = input
-            .retry
-            .map(|retry| retry.checkpoint().as_ref())
-            .or(input.checkpoint)
-        {
-            self.retained_rendezvous_checkpoint(source)
-                .filter(|checkpoint| {
-                    tokens.starts_with(checkpoint.token_prefix())
-                        && layout.permits_suffix(
-                            checkpoint.completed_tokens() as u64,
-                            tokens.len() as u64,
-                        )
-                })
-        } else {
-            self.prefix_cache.lock().longest(
-                &tokens,
-                layout.input_dependency() == CheckpointInputDependency::EntireTokenInput,
-                |boundary| layout.permits_suffix(boundary as u64, tokens.len() as u64),
-            )
+        let compatible = |checkpoint: &SequenceCheckpoint<R>| {
+            tokens.starts_with(checkpoint.token_prefix())
+                && layout.permits_suffix(checkpoint.completed_tokens() as u64, tokens.len() as u64)
         };
+        let (checkpoint, source) = if let Some(retry) = input.retry {
+            // The scheduler's capacity gate belongs to this exact retained
+            // candidate. Do not reselect or move its reservation during retry.
+            (
+                self.retained_rendezvous_checkpoint(retry.checkpoint().as_ref())
+                    .filter(compatible),
+                retry.source(),
+            )
+        } else {
+            let rendezvous = input
+                .checkpoint
+                .and_then(|lease| self.retained_rendezvous_checkpoint(lease))
+                .filter(compatible);
+            let selected = {
+                let mut index = self.prefix_cache.lock();
+                index.longest_or_rendezvous(
+                    &tokens,
+                    layout.input_dependency() == CheckpointInputDependency::EntireTokenInput,
+                    |boundary| layout.permits_suffix(boundary as u64, tokens.len() as u64),
+                    rendezvous
+                        .as_ref()
+                        .map(|checkpoint| (checkpoint.completed_tokens(), checkpoint)),
+                )
+            };
+            // Drop an unused native handoff owner after releasing the index
+            // lock, before the selected candidate's capacity probe.
+            selected
+        };
+        let observer = PrefixRestoreObserver::new(
+            self.event_sink.read().clone(),
+            input.request_id.clone(),
+            source,
+        );
         let Some(checkpoint) = checkpoint else {
             self.metrics
                 .prefix_cache

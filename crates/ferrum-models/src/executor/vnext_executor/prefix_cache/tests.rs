@@ -26,6 +26,9 @@ mod shared_fallback_tests;
 #[path = "prompt_tail_tests.rs"]
 mod prompt_tail_tests;
 
+#[path = "restore_selection_tests.rs"]
+mod restore_selection_tests;
+
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};
