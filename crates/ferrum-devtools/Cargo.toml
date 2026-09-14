@@ -23,6 +23,10 @@ path = "src/bin/model_regression.rs"
 name = "agent_regression"
 path = "src/bin/agent_regression.rs"
 
+[[bin]]
+name = "native_profile"
+path = "src/bin/native_profile.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
