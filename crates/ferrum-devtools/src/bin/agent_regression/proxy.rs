@@ -392,12 +392,17 @@ async fn forward_for(
 }
 
 #[derive(Default)]
-struct SseObserver {
+pub(super) struct SseObserver {
     buffer: Vec<u8>,
     data: Vec<u8>,
 }
 impl SseObserver {
-    fn push(&mut self, bytes: &[u8], at: u64, record: &mut RequestRecord) -> std::io::Result<()> {
+    pub(super) fn push(
+        &mut self,
+        bytes: &[u8],
+        at: u64,
+        record: &mut RequestRecord,
+    ) -> std::io::Result<()> {
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() > 32 * 1024 * 1024 {
             return Err(std::io::Error::other("unterminated oversized SSE record"));

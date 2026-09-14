@@ -4,6 +4,8 @@
 mod config;
 #[path = "agent_regression/events.rs"]
 mod events;
+#[path = "agent_regression/http_replay.rs"]
+mod http_replay;
 #[path = "agent_regression/orchestral.rs"]
 mod orchestral;
 #[path = "agent_regression/orchestral_evidence.rs"]
@@ -42,6 +44,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Replay exact streaming OpenAI bodies concurrently, without an agent or tools.
+    ReplayHttp(http_replay::Args),
     Run {
         #[arg(long)]
         manifest: PathBuf,
@@ -89,6 +93,7 @@ pub(crate) fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Resu
 #[tokio::main]
 async fn main() {
     let result = match Args::parse().command {
+        Command::ReplayHttp(args) => http_replay::run(&args).await,
         Command::Run {
             manifest,
             report_dir,
