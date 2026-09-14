@@ -488,6 +488,7 @@ mod tests {
             OrchestralToolResultFormat::Yaml,
             OrchestralToolResultFormat::TextParts,
             OrchestralToolResultFormat::TextPartsV2,
+            OrchestralToolResultFormat::TextPartsV3,
         ] {
             let mut value = original.clone();
             bind_tool_result_format(&mut value, format).unwrap();
@@ -524,14 +525,15 @@ mod tests {
             bind_tool_result_format(&mut explicit, OrchestralToolResultFormat::TextPartsV2)
                 .is_err()
         );
-        let mut invalid_revision = original.clone();
-        invalid_revision["providers"]["models"][0]["config"]["tool_result_format"] =
-            json!("text_parts_v2");
-        assert!(bind_tool_result_format(
-            &mut invalid_revision,
-            OrchestralToolResultFormat::TextPartsV2
-        )
-        .is_err());
+        for revision in [
+            OrchestralToolResultFormat::TextPartsV2,
+            OrchestralToolResultFormat::TextPartsV3,
+        ] {
+            let mut invalid_revision = original.clone();
+            invalid_revision["providers"]["models"][0]["config"]["tool_result_format"] =
+                json!(revision);
+            assert!(bind_tool_result_format(&mut invalid_revision, revision).is_err());
+        }
         let mut template = original;
         template["providers"]["models"][0]["config"]["tool_result_format"] =
             json!("{tool_result_format}");

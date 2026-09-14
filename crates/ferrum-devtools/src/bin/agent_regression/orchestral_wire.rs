@@ -409,6 +409,9 @@ fn tool_result_content(
         OrchestralToolResultFormat::TextPartsV2 => {
             Ok(tool_text_parts::content_v2(result, is_error))
         }
+        OrchestralToolResultFormat::TextPartsV3 => {
+            Ok(tool_text_parts::content_v3(result, is_error))
+        }
     }
 }
 

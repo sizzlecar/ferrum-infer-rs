@@ -38,6 +38,8 @@ pub(crate) enum OrchestralToolResultFormat {
     TextParts,
     /// Only top-level strings containing LF or CR become text parts.
     TextPartsV2,
+    /// Multiline parts with compact labels and an omitted false error flag.
+    TextPartsV3,
 }
 
 impl OrchestralToolResultFormat {
@@ -45,13 +47,16 @@ impl OrchestralToolResultFormat {
     /// revision. The harness separately declares the exact replay contract.
     pub(crate) fn profile_format(self) -> Self {
         match self {
-            Self::TextPartsV2 => Self::TextParts,
+            Self::TextPartsV2 | Self::TextPartsV3 => Self::TextParts,
             other => other,
         }
     }
 
     pub(crate) fn is_text_parts(self) -> bool {
-        matches!(self, Self::TextParts | Self::TextPartsV2)
+        matches!(
+            self,
+            Self::TextParts | Self::TextPartsV2 | Self::TextPartsV3
+        )
     }
 }
 
@@ -447,6 +452,7 @@ mod tests {
         for (name, expected) in [
             ("text_parts", OrchestralToolResultFormat::TextParts),
             ("text_parts_v2", OrchestralToolResultFormat::TextPartsV2),
+            ("text_parts_v3", OrchestralToolResultFormat::TextPartsV3),
         ] {
             let value = json!({"program":"orchestral","config_template":"agent.json",
                 "tool_result_format":name});

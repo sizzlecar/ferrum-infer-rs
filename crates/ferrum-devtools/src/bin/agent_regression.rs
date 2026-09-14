@@ -150,18 +150,26 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            Args::try_parse_from(
-                args.into_iter()
-                    .chain(["--tool-result-format", "text_parts_v2"])
-            )
-            .unwrap()
-            .command,
-            Command::AuditOrchestral {
-                tool_result_format: Some(config::OrchestralToolResultFormat::TextPartsV2),
-                ..
-            }
-        ));
+        for (name, expected) in [
+            (
+                "text_parts_v2",
+                config::OrchestralToolResultFormat::TextPartsV2,
+            ),
+            (
+                "text_parts_v3",
+                config::OrchestralToolResultFormat::TextPartsV3,
+            ),
+        ] {
+            assert!(matches!(
+                Args::try_parse_from(args.into_iter().chain(["--tool-result-format", name]))
+                    .unwrap()
+                    .command,
+                Command::AuditOrchestral {
+                    tool_result_format: Some(selected),
+                    ..
+                } if selected == expected
+            ));
+        }
         assert!(
             Args::try_parse_from(args.into_iter().chain(["--tool-result-format", "auto"])).is_err()
         );
