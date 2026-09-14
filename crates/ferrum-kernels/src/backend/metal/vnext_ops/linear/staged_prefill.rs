@@ -19,8 +19,16 @@ pub(in super::super) enum StagingPolicy {
 }
 
 impl StagingPolicy {
-    fn minimum_rows(self, format: LinearPhysicalFormat) -> Option<u32> {
+    fn minimum_rows(self, format: LinearPhysicalFormat, input_features: u64) -> Option<u32> {
         match (self, format) {
+            // Short prefills amortize staging once there are at least two
+            // blocks per output. Retain Q4's prior threshold for narrower K;
+            // Q5 has no measured staged route at that width.
+            (Self::SwiGlu, LinearPhysicalFormat::Q4K | LinearPhysicalFormat::Q5K)
+                if input_features >= 512 =>
+            {
+                Some(256)
+            }
             (Self::SwiGlu, LinearPhysicalFormat::Q4K) => Some(768),
             (Self::SwiGlu, LinearPhysicalFormat::Q6K) => Some(256),
             // Candidate large-prefill policy; the recurrent core is unchanged.
@@ -30,17 +38,19 @@ impl StagingPolicy {
     }
 }
 
-fn leaf_format(
+fn quantized_leaf_format(
     weight: &ResolvedWeightBinding,
     layout: &PhysicalWeightLayout,
     logical_dimensions: &[u64],
     expected_axis: u32,
 ) -> Option<LinearPhysicalFormat> {
-    let format = quantized_leaf_format(weight, layout, logical_dimensions, expected_axis)?;
-    StagingPolicy::SwiGlu.minimum_rows(format).map(|_| format)
+    // Preserve the existing partitioned GatedDelta cohort. SwiGLU separately
+    // proves all native leaves before admitting any eligible projection.
+    let format = leaf_format(weight, layout, logical_dimensions, expected_axis)?;
+    (!matches!(format, LinearPhysicalFormat::Native(_))).then_some(format)
 }
 
-fn quantized_leaf_format(
+fn leaf_format(
     weight: &ResolvedWeightBinding,
     layout: &PhysicalWeightLayout,
     logical_dimensions: &[u64],
@@ -82,7 +92,7 @@ fn quantized_leaf_format(
         GgufBlockFormat::Q5K => Some(LinearPhysicalFormat::Q5K),
         GgufBlockFormat::Q6K => Some(LinearPhysicalFormat::Q6K),
         GgufBlockFormat::Q8_0 => Some(LinearPhysicalFormat::Q8_0),
-        _ => None,
+        native => Some(LinearPhysicalFormat::Native(native)),
     }
 }
 
@@ -142,28 +152,41 @@ fn weight_workspace_bytes(
     let PhysicalWeightLayout::Composite { parts } = gate_weight.physical_layout() else {
         return Ok(0);
     };
-    if parts.len() != 2
-        || ![0, 1].into_iter().all(|part_index| {
-            parts.iter().any(|part| {
-                part.logical_offsets == [part_index, 0, 0]
-                    && part.extents == [1, intermediate, hidden]
-                    && leaf_format(gate_weight, &part.layout, &part.extents, 2).is_some()
-            })
-        })
-        || leaf_format(
-            down_weight,
-            down_weight.physical_layout(),
-            &[hidden, intermediate],
-            1,
-        )
-        .is_none()
-    {
+    if parts.len() != 2 {
+        return Ok(0);
+    }
+    let mut eligible = false;
+    for part_index in [0, 1] {
+        let Some(part) = parts.iter().find(|part| {
+            part.logical_offsets == [part_index, 0, 0] && part.extents == [1, intermediate, hidden]
+        }) else {
+            return Ok(0);
+        };
+        let Some(format) = leaf_format(gate_weight, &part.layout, &part.extents, 2) else {
+            // Launches do not retain physical strides. Prove every leaf's
+            // layout before another leaf's scratch can enable staging.
+            return Ok(0);
+        };
+        eligible |= StagingPolicy::SwiGlu.minimum_rows(format, hidden).is_some();
+    }
+    let Some(down_format) = leaf_format(
+        down_weight,
+        down_weight.physical_layout(),
+        &[hidden, intermediate],
+        1,
+    ) else {
+        return Ok(0);
+    };
+    eligible |= StagingPolicy::SwiGlu
+        .minimum_rows(down_format, intermediate)
+        .is_some();
+    if !eligible {
         return Ok(0);
     }
     let elements = hidden
         .checked_mul(intermediate)
         .ok_or_else(|| "Metal staged SwiGLU matrix size overflows".to_owned())?;
-    if elements < MIN_STAGED_WEIGHT_ELEMENTS {
+    if elements < MIN_STAGED_WEIGHT_ELEMENTS || elements / 16 > u64::from(u32::MAX) {
         return Ok(0);
     }
     elements
@@ -213,7 +236,7 @@ pub(in super::super) fn partitioned_workspace_bytes(
             // must not accidentally enable staging for that unknown layout.
             return Ok(0);
         };
-        if policy.minimum_rows(format).is_none() {
+        if policy.minimum_rows(format, in_features).is_none() {
             continue;
         }
         let elements = in_features
@@ -236,7 +259,9 @@ pub(super) fn selected(launch: LinearLaunch) -> bool {
 }
 
 fn selected_for(launch: LinearLaunch, policy: StagingPolicy) -> bool {
-    let Some(minimum_rows) = policy.minimum_rows(launch.format) else {
+    let Some(minimum_rows) =
+        policy.minimum_rows(launch.format, u64::from(launch.params.in_features))
+    else {
         return false;
     };
     let elements = u64::from(launch.params.in_features) * u64::from(launch.params.out_features);

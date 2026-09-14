@@ -206,7 +206,7 @@ fn half_bytes(values: &[f16]) -> Vec<u8> {
 }
 
 #[test]
-fn gated_delta_staging_does_not_enable_new_swiglu_or_f32_routes() {
+fn gated_delta_staging_keeps_its_own_width_format_and_f32_boundaries() {
     let launch = LinearLaunch {
         input_region: 0,
         weight_region: 1,
@@ -224,10 +224,15 @@ fn gated_delta_staging_does_not_enable_new_swiglu_or_f32_routes() {
         },
     };
     assert!(selected_for(launch, StagingPolicy::GatedDelta));
-    assert!(
-        !selected(launch),
-        "Q5 support must not expand the SwiGLU route"
-    );
+    let shorter = LinearLaunch {
+        params: LinearParams {
+            rows: 256,
+            ..launch.params
+        },
+        ..launch
+    };
+    assert!(selected(shorter));
+    assert!(!selected_for(shorter, StagingPolicy::GatedDelta));
     assert!(!selected_for(
         LinearLaunch {
             activation_type: ElementType::F32,

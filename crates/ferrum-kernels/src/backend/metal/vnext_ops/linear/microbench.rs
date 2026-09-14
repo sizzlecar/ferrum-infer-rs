@@ -1791,6 +1791,65 @@ fn quantized_prefill_staging_microbench() {
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_prefill_staging_large_ffn_microbench() {
+    // Real mixed 27B FFN dimensions, including active-decode prefill chunks.
+    // Every candidate command pays for dequantization; the control is fused.
+    for format in [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q5K,
+        GgufBlockFormat::Q6K,
+    ] {
+        for (name, input, output) in [
+            ("large_ffn_gate_or_up", 5120, 17408),
+            ("large_ffn_down", 17408, 5120),
+        ] {
+            let shape = Shape {
+                name,
+                input,
+                output,
+                format,
+            };
+            let shapes = [256, 768, 1024].map(|rows| (shape, rows));
+            // Keep only one projection's fixtures resident at a time.
+            measure_prefill_staging(&shapes);
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_prefill_staging_short_cost_microbench() {
+    for format in [
+        GgufBlockFormat::Q4K,
+        GgufBlockFormat::Q5K,
+        GgufBlockFormat::Q6K,
+    ] {
+        let shapes = [
+            (512, 256),
+            (512, 2048),
+            (2048, 512),
+            (256, 4096),
+            (4096, 256),
+        ]
+        .into_iter()
+        .map(|(input, output)| {
+            (
+                Shape {
+                    name: "short_prefill_cost_boundary",
+                    input,
+                    output,
+                    format,
+                },
+                256,
+            )
+        })
+        .collect::<Vec<_>>();
+        measure_prefill_staging(&shapes);
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn quantized_prefill_staging_small_cost_microbench() {
     let shapes = [(GgufBlockFormat::Q4K, 768), (GgufBlockFormat::Q6K, 256)]
         .into_iter()

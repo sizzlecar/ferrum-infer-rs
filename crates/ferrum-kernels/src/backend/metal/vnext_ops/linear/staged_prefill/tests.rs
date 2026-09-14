@@ -12,13 +12,23 @@ use metal::MTLCommandBufferStatus;
 use serde_json::json;
 
 fn weight_metadata(gate: bool, composite: bool, format: GgufBlockFormat) -> ResolvedWeightBinding {
+    let formats = vec![format; if gate && composite { 2 } else { 1 }];
+    weight_metadata_parts(gate, composite, &formats)
+}
+
+fn weight_metadata_parts(
+    gate: bool,
+    composite: bool,
+    formats: &[GgufBlockFormat],
+) -> ResolvedWeightBinding {
     let (hidden, intermediate) = (512_u64, 2048_u64);
-    let spec = BlockQuantizationSpec {
+    let spec = |format: GgufBlockFormat| BlockQuantizationSpec {
         format_id: QuantizationFormatId::new(format.format_id()).unwrap(),
         logical_values_per_block: format.block_values() as u32,
         bytes_per_block: format.block_bytes() as u32,
     };
     let count = if gate && composite { 2 } else { 1 };
+    assert_eq!(formats.len(), count);
     let leaf = |index| PhysicalWeightLayout::BlockQuantized {
         blocks: PhysicalWeightComponentBinding::exact_contiguous(
             WeightId::new(format!("component.{index}")).unwrap(),
@@ -45,13 +55,13 @@ fn weight_metadata(gate: bool, composite: bool, format: GgufBlockFormat) -> Reso
         "weight_id": "weight.fixture", "format_id": "format.fixture",
         "layout_id": "layout.fixture", "schema_version": ContractVersion::new(1, 0),
         "physical_layout": layout,
-        "components": (0..count).map(|index| json!({
+        "components": formats.iter().enumerate().map(|(index, &format)| { let spec = spec(format); json!({
             "component_id": format!("component.{index}"), "role": WeightComponentRole::PackedValues,
             "physical_dimensions": if gate {
                 vec![if composite {1} else {2}, intermediate, hidden / spec.logical_values_per_block as u64]
             } else {vec![hidden, intermediate / spec.logical_values_per_block as u64]},
             "encoding": WeightEncoding::BlockQuantized(spec.clone()),
-        })).collect::<Vec<_>>(),
+        })}).collect::<Vec<_>>(),
     }))
     .unwrap()
 }
@@ -70,9 +80,108 @@ fn staged_swiglu_workspace_declaration_preserves_layout_and_format_boundaries() 
     let unsupported = weight_metadata(false, false, GgufBlockFormat::Q8_0);
     assert_eq!(
         weight_workspace_bytes(&gate, &unsupported, 512, 2048).unwrap(),
-        0
+        2 << 20
     );
     assert_eq!(weight_workspace_bytes(&gate, &down, 256, 2048).unwrap(), 0);
+}
+
+#[test]
+fn mixed_swiglu_workspace_admits_individual_proven_leaves() {
+    for (gate_formats, down_format, expected) in [
+        (
+            [GgufBlockFormat::Q5K, GgufBlockFormat::Iq4Xs],
+            GgufBlockFormat::Q6K,
+            2 << 20,
+        ),
+        (
+            [GgufBlockFormat::Iq4Xs, GgufBlockFormat::Q5K],
+            GgufBlockFormat::Iq4Xs,
+            2 << 20,
+        ),
+        (
+            [GgufBlockFormat::Iq4Xs, GgufBlockFormat::Iq3S],
+            GgufBlockFormat::Q5K,
+            2 << 20,
+        ),
+        (
+            [GgufBlockFormat::Iq4Xs, GgufBlockFormat::Iq3S],
+            GgufBlockFormat::Iq4Xs,
+            0,
+        ),
+    ] {
+        let gate = weight_metadata_parts(true, true, &gate_formats);
+        let down = weight_metadata(false, false, down_format);
+        assert_eq!(
+            weight_workspace_bytes(&gate, &down, 512, 2048).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn mixed_swiglu_staging_keeps_decode_small_work_and_unknown_layouts_on_existing_routes() {
+    let launch = |format, rows, input, output| {
+        linear_launch(
+            PreparedLinearPart {
+                region: 1,
+                format,
+                output_offset: 0,
+                out_features: output,
+            },
+            0,
+            2,
+            rows,
+            input,
+            u64::from(output),
+            0,
+            0,
+        )
+        .unwrap()
+    };
+    for format in [
+        LinearPhysicalFormat::Q4K,
+        LinearPhysicalFormat::Q5K,
+        LinearPhysicalFormat::Q6K,
+    ] {
+        assert!(!selected(launch(format, 255, 512, 2048)));
+        assert!(selected(launch(format, 256, 512, 2048)));
+        assert!(!selected(launch(format, 256, 512, 256)));
+        let mut f32 = launch(format, 768, 512, 2048);
+        f32.activation_type = ElementType::F32;
+        assert!(!selected(f32));
+    }
+    assert!(!selected(launch(LinearPhysicalFormat::Q4K, 256, 256, 4096)));
+    assert!(selected(launch(LinearPhysicalFormat::Q4K, 768, 256, 4096)));
+    assert!(!selected(launch(
+        LinearPhysicalFormat::Q5K,
+        1024,
+        256,
+        4096
+    )));
+    assert!(!selected(launch(
+        LinearPhysicalFormat::Native(GgufBlockFormat::Iq4Xs),
+        1024,
+        512,
+        2048
+    )));
+
+    let gate = weight_metadata_parts(true, true, &[GgufBlockFormat::Q5K, GgufBlockFormat::Iq4Xs]);
+    let down = weight_metadata(false, false, GgufBlockFormat::Q6K);
+    let mut layout = gate.physical_layout().clone();
+    let PhysicalWeightLayout::Composite { parts } = &mut layout else {
+        panic!("gate/up fixture has composite layout");
+    };
+    let PhysicalWeightLayout::BlockQuantized { blocks, .. } = parts[1].layout.as_mut() else {
+        panic!("up fixture has block-quantized layout");
+    };
+    blocks.storage = PhysicalStorageLayout::Strided {
+        strides_in_elements: vec![1, 1, 2048],
+        padding: PhysicalWeightPadding::Exact,
+    };
+    let mut malformed = serde_json::to_value(gate).unwrap();
+    malformed["physical_layout"] = serde_json::to_value(layout).unwrap();
+    let gate = serde_json::from_value(malformed).unwrap();
+    assert_eq!(weight_workspace_bytes(&gate, &down, 512, 2048).unwrap(), 0);
 }
 
 fn gguf_weight_metadata(
@@ -375,9 +484,10 @@ fn sequence_weights(shape: Shape) -> Vec<u8> {
     // A complete gate * up -> down sequence needs smaller scales to keep its
     // F16 intermediate and output finite, including the unchanged baseline.
     let scale_offsets: &[usize] = match shape.format {
-        GgufBlockFormat::Q4K => &[0, 2],
+        GgufBlockFormat::Q4K | GgufBlockFormat::Q5K => &[0, 2],
         GgufBlockFormat::Q6K => &[208],
-        _ => unreachable!("this sequence covers Q4_K gate/up and Q6_K down"),
+        GgufBlockFormat::Iq4Xs => &[0],
+        _ => unreachable!("bounded mixed-format sequence fixture"),
     };
     for block in values.chunks_exact_mut(shape.format.block_bytes()) {
         for &offset in scale_offsets {
@@ -391,6 +501,40 @@ fn sequence_weights(shape: Shape) -> Vec<u8> {
 
 #[test]
 fn staged_swiglu_sequence_preserves_thresholds_guards_and_workspace_reuse() {
+    staged_swiglu_sequence_case(
+        [
+            GgufBlockFormat::Q4K,
+            GgufBlockFormat::Q4K,
+            GgufBlockFormat::Q6K,
+        ],
+        &[(255, 0), (256, 3), (767, 3), (768, 3)],
+    );
+}
+
+#[test]
+fn mixed_swiglu_sequence_stages_q5_and_preserves_native_fallbacks() {
+    for formats in [
+        [
+            GgufBlockFormat::Q5K,
+            GgufBlockFormat::Iq4Xs,
+            GgufBlockFormat::Q6K,
+        ],
+        [
+            GgufBlockFormat::Iq4Xs,
+            GgufBlockFormat::Q5K,
+            GgufBlockFormat::Q5K,
+        ],
+        [
+            GgufBlockFormat::Q5K,
+            GgufBlockFormat::Q6K,
+            GgufBlockFormat::Iq4Xs,
+        ],
+    ] {
+        staged_swiglu_sequence_case(formats, &[(3, 0), (255, 0), (256, 2)]);
+    }
+}
+
+fn staged_swiglu_sequence_case(formats: [GgufBlockFormat; 3], row_cases: &[(u64, u64)]) {
     let composition =
         MetalVNextComposition::create(DeviceId::new("device.swiglu.staging").unwrap()).unwrap();
     let runtime = composition.runtime();
@@ -401,21 +545,32 @@ fn staged_swiglu_sequence_preserves_thresholds_guards_and_workspace_reuse() {
         name: "gate",
         input: hidden as u32,
         output: intermediate as u32,
-        format: GgufBlockFormat::Q4K,
+        format: formats[0],
     });
-    let mut up_values = gate_values.clone();
-    up_values.rotate_left(GgufBlockFormat::Q4K.block_bytes());
+    let mut up_values = sequence_weights(Shape {
+        name: "up",
+        input: hidden as u32,
+        output: intermediate as u32,
+        format: formats[1],
+    });
+    up_values.rotate_left(formats[1].block_bytes());
     assert_ne!(gate_values, up_values);
     let down_values = sequence_weights(Shape {
         name: "down",
         input: intermediate as u32,
         output: hidden as u32,
-        format: GgufBlockFormat::Q6K,
+        format: formats[2],
     });
     let guard = f16::from_f32(123.0);
     let staging_bytes = hidden * intermediate * 2;
 
-    for (rows, staged_dispatches) in [(255_u64, 0), (256, 1), (767, 1), (768, 3)] {
+    let physical = |format| match format {
+        GgufBlockFormat::Q4K => LinearPhysicalFormat::Q4K,
+        GgufBlockFormat::Q5K => LinearPhysicalFormat::Q5K,
+        GgufBlockFormat::Q6K => LinearPhysicalFormat::Q6K,
+        native => LinearPhysicalFormat::Native(native),
+    };
+    for &(rows, staged_dispatches) in row_cases {
         let mut input = vec![guard; 3];
         input.extend((0..rows * hidden).map(|i| f16::from_f32((i as f32 * 0.013).sin() * 0.125)));
         input.extend([guard; 5]);
@@ -441,7 +596,7 @@ fn staged_swiglu_sequence_preserves_thresholds_guards_and_workspace_reuse() {
                 linear_launch(
                     PreparedLinearPart {
                         region: weight_region,
-                        format: LinearPhysicalFormat::Q4K,
+                        format: physical(formats[index]),
                         output_offset: index as u32 * intermediate as u32,
                         out_features: intermediate as u32,
                     },
@@ -459,7 +614,7 @@ fn staged_swiglu_sequence_preserves_thresholds_guards_and_workspace_reuse() {
         let down = linear_launch(
             PreparedLinearPart {
                 region: 3,
-                format: LinearPhysicalFormat::Q6K,
+                format: physical(formats[2]),
                 output_offset: 0,
                 out_features: hidden as u32,
             },
