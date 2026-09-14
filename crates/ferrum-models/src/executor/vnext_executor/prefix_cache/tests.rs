@@ -20,6 +20,9 @@ mod eviction_tests;
 #[path = "active_coverage_tests.rs"]
 mod active_coverage_tests;
 
+#[path = "shared_fallback_tests.rs"]
+mod shared_fallback_tests;
+
 #[test]
 fn rendezvous_boundary_uses_actual_span_and_all_follower_suffix_constraints() {
     use checkpoint_fixture::{Fixture, Spec};

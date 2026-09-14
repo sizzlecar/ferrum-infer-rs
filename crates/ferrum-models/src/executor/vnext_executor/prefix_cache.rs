@@ -31,6 +31,7 @@ pub(super) struct PrefixCacheMetrics {
     coalesced_bytes: AtomicU64,
     saved_prefill_tokens: AtomicU64,
     capture_active_coverage_skips: AtomicU64,
+    capture_shared_fallback_skips: AtomicU64,
 }
 
 impl PrefixCacheMetrics {
@@ -65,6 +66,7 @@ impl PrefixCacheMetrics {
             &self.coalesced_bytes,
             &self.saved_prefill_tokens,
             &self.capture_active_coverage_skips,
+            &self.capture_shared_fallback_skips,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -162,6 +164,8 @@ impl<C> PrefixIndex<C> {
             "saved_prefill_tokens": metrics.saved_prefill_tokens.load(Ordering::Relaxed),
             "capture_active_coverage_skips": metrics.capture_active_coverage_skips.load(Ordering::Relaxed),
             "capture_active_coverage_skips_scope": "optional-capture-stopped-because-every-eligible-victim-protects-a-deepest-active-input-prefix",
+            "capture_shared_fallback_skips": metrics.capture_shared_fallback_skips.load(Ordering::Relaxed),
+            "capture_shared_fallback_skips_scope": "optional-capture-stopped-to-retain-a-legal-shared-branch-fallback; foreground-pressure-may-still-evict-it",
         });
         let fields = snapshot
             .as_object_mut()
@@ -356,19 +360,32 @@ impl<C> PrefixIndex<C> {
         self.evict_for(PrefixEvictionPurpose::Foreground)
     }
 
+    #[cfg(test)]
     fn evict_for(&mut self, purpose: PrefixEvictionPurpose) -> Option<C> {
-        self.evict_unprotected(purpose, &BTreeSet::new())
+        self.evict_unprotected(purpose, &BTreeSet::new(), &BTreeSet::new())
+    }
+
+    fn evict_for_layout(
+        &mut self,
+        purpose: PrefixEvictionPurpose,
+        layout: &SequenceCheckpointLayout,
+    ) -> Option<C> {
+        let shared = self.shared_fallbacks(&[], layout);
+        self.evict_unprotected(purpose, &BTreeSet::new(), &shared)
     }
 
     fn evict_unprotected(
         &mut self,
         purpose: PrefixEvictionPurpose,
         protected: &BTreeSet<usize>,
+        shared_fallbacks: &BTreeSet<usize>,
     ) -> Option<C> {
         // A later input can preserve the entire original prompt while changing
         // generated tokens, for example when structured output is rendered
         // again. Under pressure, retain that repeat-capable input before an
-        // opportunistic generated head. LRU still orders each class.
+        // opportunistic generated head. Shared branch fallbacks are the last
+        // class, but foreground pressure may still release every owner. LRU
+        // orders each class; no extra owner or capacity reservation is retained.
         let victim = self.entries.iter().enumerate().find_map(|(index, entry)| {
             (!protected.contains(&index) && entry.is_generated_head()).then_some(index)
         });
@@ -376,7 +393,9 @@ impl<C> PrefixIndex<C> {
             if matches!(purpose, PrefixEvictionPurpose::GeneratedCapture) {
                 None
             } else {
-                (0..self.entries.len()).find(|index| !protected.contains(index))
+                (0..self.entries.len())
+                    .filter(|index| !protected.contains(index))
+                    .min_by_key(|index| shared_fallbacks.contains(index))
             }
         })?;
         self.entries.remove(victim).map(|entry| entry.checkpoint)
@@ -782,8 +801,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn evict_prefix_for_purpose(&self, purpose: PrefixEvictionPurpose) -> bool {
+        let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
+            return false;
+        };
         let started = Instant::now();
-        let removed = self.prefix_cache.lock().evict_for(purpose);
+        let removed = self.prefix_cache.lock().evict_for_layout(purpose, layout);
         self.finish_prefix_eviction(removed, purpose, started)
     }
 
@@ -855,6 +877,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .collect::<Vec<_>>(),
                     outcome = "active_prefix_coverage_protected",
                     "prefix checkpoint capture eviction skipped"
+                );
+                false
+            }
+            CaptureEviction::SharedFallbackProtected(prefixes) => {
+                self.metrics
+                    .prefix_cache
+                    .capture_shared_fallback_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    request_id = %sequence.request_id(),
+                    completed_tokens,
+                    ?purpose,
+                    shared_prefix_tokens = ?prefixes,
+                    "prefix checkpoint capture skipped to retain shared fallback"
                 );
                 false
             }

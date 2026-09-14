@@ -55,8 +55,8 @@ fn active_prefix_coverage_preserves_deepest_hit_not_only_a_common_root() {
     let fixture = layout_fixture(CheckpointInputDependency::ExactTokenPrefix, 1);
     let layout = usable_layout(&fixture.plan).unwrap();
     let mut index = PrefixIndex::default();
-    // Distinct original inputs retain both captures under normal replacement.
-    add(&mut index, &[1], &[1, 6, 7], 3, "common-root");
+    // Two snapshots along one growth chain are not two observed branches.
+    add(&mut index, &[1], &[1, 2, 3], 3, "common-root");
     add(
         &mut index,
         &[1, 2, 3, 4],

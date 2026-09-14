@@ -15,6 +15,7 @@ pub(super) struct ProtectedPrefix {
 pub(super) enum CaptureEviction<C> {
     Evicted(C),
     Protected(Vec<ProtectedPrefix>),
+    SharedFallbackProtected(Vec<usize>),
     Unavailable,
 }
 
@@ -86,6 +87,49 @@ pub(super) fn active_prefix_inputs<R: DeviceRuntime>(
 }
 
 impl<C> PrefixIndex<C> {
+    /// A growth chain is one branch, irrespective of how many snapshots it
+    /// contains. A shared fallback must have two actually observed, divergent
+    /// product prompts that both permit restoration at this retained boundary.
+    /// This is eviction preference only, never a new restore authority or pin.
+    pub(super) fn shared_fallbacks(
+        &self,
+        inputs: &[ActivePrefixInput],
+        layout: &SequenceCheckpointLayout,
+    ) -> BTreeSet<usize> {
+        if layout.input_dependency() != CheckpointInputDependency::ExactTokenPrefix {
+            return BTreeSet::new();
+        }
+        let observed = self
+            .entries
+            .iter()
+            .filter_map(Entry::original_prompt)
+            .chain(inputs.iter().map(|input| input.tokens.as_slice()))
+            .collect::<Vec<_>>();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.is_generated_head() && entry.original_prompt().is_some())
+            .filter(|(_, entry)| {
+                let mut deepest: Option<&[u32]> = None;
+                for &input in &observed {
+                    if !entry.matches_restore(input, false, &|boundary| {
+                        layout.permits_suffix(boundary as u64, input.len() as u64)
+                    }) {
+                        continue;
+                    }
+                    match deepest {
+                        None => deepest = Some(input),
+                        Some(previous) if input.starts_with(previous) => deepest = Some(input),
+                        Some(previous) if !previous.starts_with(input) => return true,
+                        Some(_) => {}
+                    }
+                }
+                false
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub(super) fn evict_with_active_coverage(
         &mut self,
         purpose: PrefixEvictionPurpose,
@@ -94,7 +138,7 @@ impl<C> PrefixIndex<C> {
     ) -> CaptureEviction<C> {
         if matches!(purpose, PrefixEvictionPurpose::Foreground) {
             return self
-                .evict_for(purpose)
+                .evict_for_layout(purpose, layout)
                 .map_or(CaptureEviction::Unavailable, CaptureEviction::Evicted);
         }
         let entire_input = layout.input_dependency() == CheckpointInputDependency::EntireTokenInput;
@@ -121,8 +165,20 @@ impl<C> PrefixIndex<C> {
                 });
             }
         }
-        if let Some(checkpoint) = self.evict_unprotected(purpose, &protected) {
+        let shared = self.shared_fallbacks(inputs, layout);
+        if matches!(purpose, PrefixEvictionPurpose::PromptCapture) {
+            protected.extend(&shared);
+        }
+        if let Some(checkpoint) = self.evict_unprotected(purpose, &protected, &shared) {
             return CaptureEviction::Evicted(checkpoint);
+        }
+        if matches!(purpose, PrefixEvictionPurpose::PromptCapture) && !shared.is_empty() {
+            return CaptureEviction::SharedFallbackProtected(
+                shared
+                    .iter()
+                    .map(|index| self.entries[*index].prefix.len())
+                    .collect(),
+            );
         }
         if protected.iter().any(|index| {
             !matches!(purpose, PrefixEvictionPurpose::GeneratedCapture)
