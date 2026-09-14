@@ -399,15 +399,36 @@ impl EngineInner {
             span.expect("validated positive capture span"),
             chunk.total_prompt_tokens(),
         )?;
-        self.write_scheduler_trace_event(serde_json::json!({
-            "event": "scheduler_prefill_prompt_tail_boundary_planned",
-            "request_id": request_id,
-            "tokens_processed": chunk.tokens_processed(),
-            "scheduled_tokens": chunk.tokens_to_process(),
-            "planned_tokens": planned.tokens_to_process(),
-            "capture_boundary": plan.boundary,
-            "capture_span": plan.span,
-        }));
+        if self.scheduler_trace_jsonl.is_some() {
+            self.write_executor_scheduler_profile_event(
+                request_id,
+                "vnext.prefill_prompt_tail_boundary_planned",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "tokens_processed".to_owned(),
+                        serde_json::json!(chunk.tokens_processed()),
+                    ),
+                    (
+                        "scheduled_tokens".to_owned(),
+                        serde_json::json!(chunk.tokens_to_process()),
+                    ),
+                    (
+                        "planned_tokens".to_owned(),
+                        serde_json::json!(planned.tokens_to_process()),
+                    ),
+                    (
+                        "capture_boundary".to_owned(),
+                        serde_json::json!(plan.boundary),
+                    ),
+                    ("capture_span".to_owned(), serde_json::json!(plan.span)),
+                ]),
+                BTreeMap::new(),
+                None,
+            );
+        }
         Ok(planned)
     }
 
