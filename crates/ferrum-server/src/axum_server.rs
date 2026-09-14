@@ -4886,6 +4886,7 @@ fn stream_validation_error_message(error: ServerError) -> String {
         ServerError::InternalError(message)
         | ServerError::NotImplemented(message)
         | ServerError::ServiceUnavailable(message)
+        | ServerError::ContextLengthExceeded(message)
         | ServerError::InvalidRequest { message, .. }
         | ServerError::UnsupportedFeature { message, .. } => message,
     }
@@ -4894,6 +4895,9 @@ fn stream_validation_error_message(error: ServerError) -> String {
 fn server_error_from_ferrum_error(error: Error) -> ServerError {
     match error {
         Error::RequestValidation { message } => ServerError::invalid_request(message, None),
+        error @ Error::ContextLengthExceeded { .. } => {
+            ServerError::ContextLengthExceeded(error.to_string())
+        }
         Error::ResourceExhausted { message } => ServerError::ServiceUnavailable(message),
         other => ServerError::InternalError(other.to_string()),
     }
@@ -5057,7 +5061,7 @@ async fn handle_completions_sync(
         }
         Err(e) => {
             error!("Completion generation failed: {}", e);
-            Err(ServerError::InternalError(e.to_string()))
+            Err(server_error_from_ferrum_error(e))
         }
     }
 }
@@ -5073,75 +5077,67 @@ async fn handle_completions_stream(
     })?;
     let request_id = Uuid::new_v4().to_string();
 
+    // Resolve startup rejection before sending SSE headers, as on the Chat
+    // route. Once a stream exists, later failures remain SSE error events.
+    let mut stream = engine.infer_stream(inference_request).await.map_err(|e| {
+        error!("Failed to start completion stream: {}", e);
+        server_error_from_ferrum_error(e)
+    })?;
     tokio::spawn(async move {
-        match engine.infer_stream(inference_request).await {
-            Ok(mut stream) => {
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(chunk) => {
-                            let response_chunk = CompletionsResponse {
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(chunk) => {
+                    let response_chunk = CompletionsResponse {
+                        id: request_id.clone(),
+                        object: "text_completion".to_string(),
+                        created: chrono::Utc::now().timestamp() as u64,
+                        model: openai_request.model.clone(),
+                        choices: vec![CompletionChoice {
+                            text: chunk.text.clone(),
+                            index: 0,
+                            finish_reason: chunk
+                                .finish_reason
+                                .as_ref()
+                                .map(finish_reason_to_string),
+                        }],
+                        usage: None,
+                    };
+                    let event = Event::default()
+                        .json_data(&response_chunk)
+                        .unwrap_or_else(|_| Event::default().data("error"));
+                    if tx.send(Ok(event)).is_err() {
+                        break;
+                    }
+                    if chunk.finish_reason.is_some() {
+                        if let Some(usage) = chunk.usage.as_ref().map(openai_usage_from_token_usage)
+                        {
+                            let final_chunk = CompletionsResponse {
                                 id: request_id.clone(),
                                 object: "text_completion".to_string(),
                                 created: chrono::Utc::now().timestamp() as u64,
                                 model: openai_request.model.clone(),
-                                choices: vec![CompletionChoice {
-                                    text: chunk.text.clone(),
-                                    index: 0,
-                                    finish_reason: chunk
-                                        .finish_reason
-                                        .as_ref()
-                                        .map(finish_reason_to_string),
-                                }],
-                                usage: None,
+                                choices: vec![],
+                                usage: Some(usage),
                             };
                             let event = Event::default()
-                                .json_data(&response_chunk)
+                                .json_data(&final_chunk)
                                 .unwrap_or_else(|_| Event::default().data("error"));
-                            if tx.send(Ok(event)).is_err() {
-                                break;
-                            }
-                            if chunk.finish_reason.is_some() {
-                                if let Some(usage) =
-                                    chunk.usage.as_ref().map(openai_usage_from_token_usage)
-                                {
-                                    let final_chunk = CompletionsResponse {
-                                        id: request_id.clone(),
-                                        object: "text_completion".to_string(),
-                                        created: chrono::Utc::now().timestamp() as u64,
-                                        model: openai_request.model.clone(),
-                                        choices: vec![],
-                                        usage: Some(usage),
-                                    };
-                                    let event = Event::default()
-                                        .json_data(&final_chunk)
-                                        .unwrap_or_else(|_| Event::default().data("error"));
-                                    let _ = tx.send(Ok(event));
-                                }
-                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                                break;
-                            }
+                            let _ = tx.send(Ok(event));
                         }
-                        Err(e) => {
-                            error!("Completion stream generation error: {}", e);
-                            let _ = tx.send(Ok(openai_error_sse_event(
-                                e.to_string(),
-                                "internal_server_error",
-                                None,
-                            )));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        }
+                        let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                        break;
                     }
                 }
-            }
-            Err(e) => {
-                error!("Failed to start completion stream: {}", e);
-                let _ = tx.send(Ok(openai_error_sse_event(
-                    e.to_string(),
-                    "internal_server_error",
-                    None,
-                )));
-                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                Err(e) => {
+                    error!("Completion stream generation error: {}", e);
+                    let _ = tx.send(Ok(openai_error_sse_event(
+                        e.to_string(),
+                        "internal_server_error",
+                        None,
+                    )));
+                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                    break;
+                }
             }
         }
     });
@@ -5722,6 +5718,7 @@ enum ServerError {
         param: Option<String>,
     },
     InternalError(String),
+    ContextLengthExceeded(String),
     NotImplemented(String),
     ServiceUnavailable(String),
 }
@@ -5744,7 +5741,15 @@ impl ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        let code = matches!(&self, ServerError::ContextLengthExceeded(_))
+            .then(|| "context_length_exceeded".to_owned());
         let (status, message, error_type, param) = match self {
+            ServerError::ContextLengthExceeded(message) => (
+                AxumStatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                None,
+            ),
             ServerError::InvalidRequest { message, param } => (
                 AxumStatusCode::BAD_REQUEST,
                 message,
@@ -5782,7 +5787,7 @@ impl IntoResponse for ServerError {
                 message,
                 error_type: error_type.to_string(),
                 param,
-                code: None,
+                code,
             },
         };
 
@@ -6210,6 +6215,19 @@ mod tests {
                 infer_failure: failure.clone(),
                 stream_start_failure: failure.clone(),
                 stream_chunk_failure: failure,
+                ..Self::new()
+            }
+        }
+
+        fn context_length_exceeded() -> Self {
+            let failure = ferrum_types::FerrumError::ContextLengthExceeded {
+                capacity: 512,
+                input_tokens: 500,
+                output_tokens: 100,
+            };
+            Self {
+                infer_failure: failure.clone(),
+                stream_start_failure: failure,
                 ..Self::new()
             }
         }
@@ -11216,6 +11234,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_capacity_rejection_has_a_structured_code_on_openai_routes() {
+        for stream in [false, true] {
+            for (path, mut input) in [
+                (
+                    "/v1/chat/completions",
+                    json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":100}),
+                ),
+                (
+                    "/v1/completions",
+                    json!({"prompt":"hello","max_tokens":100}),
+                ),
+                (
+                    "/v1/responses",
+                    json!({"input":"hello","max_output_tokens":100}),
+                ),
+            ] {
+                input["model"] = json!("failing-model");
+                input["stream"] = json!(stream);
+                let router = AxumServer::from_llm(Arc::new(FailingLlm::context_length_exceeded()))
+                    .build_router();
+                let response = post_json(router, path, input).await;
+                assert_eq!(
+                    response.status(),
+                    AxumStatusCode::BAD_REQUEST,
+                    "{path}, stream={stream}"
+                );
+                let body = response_json(response).await;
+                assert_eq!(body["error"]["code"], "context_length_exceeded", "{body}");
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("500 input tokens + 100 output tokens"));
+            }
+        }
+        let ordinary =
+            server_error_from_ferrum_error(Error::request_validation("invalid parameter"))
+                .into_response();
+        assert_eq!(response_json(ordinary).await["error"]["code"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn route_chat_generation_failure_maps_to_500() {
         let response = post_json(
             router_with_failing_llm(),
@@ -12242,7 +12302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_completions_stream_generation_failure_emits_openai_error_event() {
+    async fn route_completions_stream_start_failure_maps_to_500_before_sse() {
         let response = post_json(
             router_with_failing_llm(),
             "/v1/completions",
@@ -12253,9 +12313,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_text(response).await;
-        assert_openai_stream_error(&body, "stub stream failed");
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stub stream failed"));
     }
 
     #[tokio::test]

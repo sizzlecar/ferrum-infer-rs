@@ -34,6 +34,15 @@ pub enum FerrumError {
     #[error("Request validation error: {message}")]
     RequestValidation { message: String },
 
+    /// Input plus requested generation exceeds the effective model/KV context.
+    /// Retrying the same request cannot succeed; the caller must change it.
+    #[error("This model context is limited to {capacity} tokens, but this request needs {input_tokens} input tokens + {output_tokens} output tokens. Reduce max_tokens or shorten the messages.")]
+    ContextLengthExceeded {
+        capacity: usize,
+        input_tokens: usize,
+        output_tokens: usize,
+    },
+
     /// Resource exhaustion errors
     #[error("Resource exhausted: {message}")]
     ResourceExhausted { message: String },
@@ -285,6 +294,7 @@ impl FerrumError {
         matches!(
             self,
             Self::RequestValidation { .. }
+                | Self::ContextLengthExceeded { .. }
                 | Self::Auth { .. }
                 | Self::RateLimit { .. }
                 | Self::NotFound { .. }
@@ -333,6 +343,7 @@ impl FerrumError {
             Self::Device { .. } => "device",
             Self::Scheduler { .. } => "scheduler",
             Self::RequestValidation { .. } => "request_validation",
+            Self::ContextLengthExceeded { .. } => "context_length_exceeded",
             Self::ResourceExhausted { .. } => "resource_exhausted",
             Self::Timeout { .. } => "timeout",
             Self::Auth { .. } => "auth",

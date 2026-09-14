@@ -265,9 +265,11 @@ fn validate_request_context_budget(
         return Ok(());
     }
 
-    Err(FerrumError::request_validation(format!(
-        "This model context is limited to {capacity} tokens, but this request needs {input_tokens} input tokens + {output_tokens} output tokens. Reduce max_tokens or shorten the messages."
-    )))
+    Err(FerrumError::ContextLengthExceeded {
+        capacity,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 fn clamp_default_max_tokens_to_context(

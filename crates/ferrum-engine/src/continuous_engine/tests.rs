@@ -8007,7 +8007,14 @@ fn explicit_request_budget_accepts_exact_capacity_and_rejects_one_token_over() {
     let error =
         validate_request_context_budget(&request, prompt_tokens, &config, &runtime, Some(capacity))
             .expect_err("one explicit output token beyond the context must be rejected");
-    assert!(matches!(error, FerrumError::RequestValidation { .. }));
+    assert!(matches!(
+        error,
+        FerrumError::ContextLengthExceeded {
+            capacity: 512,
+            input_tokens: 59,
+            output_tokens: 454,
+        }
+    ));
 }
 
 #[test]
