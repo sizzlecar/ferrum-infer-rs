@@ -47,6 +47,7 @@ fn selected(profile: ModelProfile, obligations: Vec<usize>) -> SelectedProfile {
 fn make_plan(obligations: Vec<Obligation>, selected: Vec<SelectedProfile>) -> Plan {
     Plan {
         release_cuda: None,
+        release_metal: None,
         extended_not_run: Vec::new(),
         deferred_performance: None,
         stage: Stage::Release,
@@ -81,6 +82,34 @@ fn observability_schedules_real_run_and_both_http_modes_on_each_required_backend
         );
         assert_eq!(plan.gaps, [Gap::ProductContractReview]);
     }
+}
+
+#[test]
+fn metal_schedule_rejects_an_extended_owner_instead_of_silently_executing_it() {
+    let owner = profile("local-metal", Backend::Metal);
+    let requirement = obligation(Behavior::ModelForward, &owner);
+    let mut plan = make_plan(vec![requirement], vec![selected(owner, vec![0])]);
+    plan.release_metal = Some(ReleaseMetalPolicy {
+        mandatory_local_profile_ids: vec!["local-metal".into()],
+        extended_profile_ids: vec!["extended-metal".into()],
+        reason: "Only the local representative is enabled.".into(),
+    });
+    let schedule = model_task_schedule(&plan);
+    assert!(schedule.unsupported_obligations.is_empty());
+    assert_eq!(schedule.runs[0].metal_lane, Some(MetalModelLane::Local));
+    assert!(schedule.runs[0].cuda_lane.is_none());
+    plan.release_metal
+        .as_mut()
+        .unwrap()
+        .mandatory_local_profile_ids = vec!["another-local".into()];
+    plan.release_metal
+        .as_mut()
+        .unwrap()
+        .extended_profile_ids
+        .push("local-metal".into());
+    let rejected = model_task_schedule(&plan);
+    assert!(rejected.runs.is_empty());
+    assert_eq!(rejected.unsupported_obligations, [0]);
 }
 
 #[test]
@@ -264,6 +293,7 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
     let owner = profile("selected", Backend::Cpu);
     let input = PlanInput {
         release_cuda: None,
+        release_metal: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,
@@ -350,6 +380,7 @@ fn reasoning_schedule_rejects_unknown_or_wrong_capability_owners() {
         owner.reasoning_protocol = capability;
         let mut plan = Plan {
             release_cuda: None,
+            release_metal: None,
             extended_not_run: Vec::new(),
             deferred_performance: None,
             stage: Stage::PullRequest,

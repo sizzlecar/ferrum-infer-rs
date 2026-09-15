@@ -192,6 +192,7 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
                 | "checks"
                 | "release_performance"
                 | "release_cuda"
+                | "release_metal"
         ) {
             return Err(format!("unknown catalog field {key:?}"));
         }
@@ -257,7 +258,7 @@ fn render_summary(document: &Value) -> String {
     let count = |key: &str| plan[key].as_array().map_or(0, Vec::len);
     format!(
         "## Regression plan\n\nPlanning only; no model or GPU execution is certified.\n\n\
-         Stage: `{}`. Required behaviors: {}. Extended CUDA model behaviors not run (not passed): {}. Deferred performance measurements (not passed): {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
+         Stage: `{}`. Required behaviors: {}. Extended model behaviors not run (not passed): {}. Deferred performance measurements (not passed): {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
          Missing estimates remain unknown. Review scope, selections and gaps before allocating hardware.\n\n\
          <details><summary>Complete plan and provenance</summary>\n\n```json\n{}\n```\n\n</details>\n",
         document["stage"].as_str().unwrap_or("unknown"), count("obligations"), count("extended_not_run"), plan["deferred_performance"]["obligations"].as_array().map_or(0, Vec::len), count("selected"), count("gaps"),
@@ -388,6 +389,52 @@ mod tests {
         .unwrap();
         assert!(select_cloud_mode(&mut input, true).is_err());
         select_cloud_mode(&mut input, false).unwrap();
+    }
+
+    #[test]
+    fn product_metal_policy_is_frozen_without_changing_cuda_opt_in_or_pr_scope() {
+        let mut catalog: Value = serde_json::from_str(include_str!(
+            "../../../docs/release-regression-catalog.json"
+        ))
+        .unwrap();
+        catalog.as_object_mut().unwrap().remove("readme_reviews");
+        for required in [false, true] {
+            let mut input = plan_input(
+                catalog.clone(),
+                "release",
+                analyze_paths(Vec::<String>::new()),
+            )
+            .unwrap();
+            let metal = input.release_metal.clone().unwrap();
+            select_cloud_mode(&mut input, required).unwrap();
+            assert_eq!(input.release_metal.as_ref(), Some(&metal));
+            let frozen = plan(&input).unwrap();
+            frozen.validate_release_policies().unwrap();
+            assert_eq!(frozen.release_metal.as_ref(), Some(&metal));
+            let schedule = model_task_schedule(&frozen);
+            assert!(schedule.unsupported_obligations.is_empty());
+            for id in &metal.mandatory_local_profile_ids {
+                assert!(schedule.runs.iter().any(|run| &run.profile.id == id
+                    && run.profile.target.backend
+                        == ferrum_bench_core::release_regression::Backend::Metal));
+            }
+            assert!(schedule
+                .runs
+                .iter()
+                .all(|run| !metal.extended_profile_ids.contains(&run.profile.id)));
+            assert!(frozen
+                .extended_not_run
+                .iter()
+                .all(|obligation| obligation.layer
+                    == ferrum_bench_core::release_regression::EvidenceLayer::ModelRuntime));
+            let roundtrip: ferrum_bench_core::release_regression::Plan =
+                serde_json::from_value(serde_json::to_value(&frozen).unwrap()).unwrap();
+            assert_eq!(frozen, roundtrip);
+        }
+        let input =
+            plan_input(catalog, "pull_request", analyze_paths(Vec::<String>::new())).unwrap();
+        let pr = plan(&input).unwrap();
+        assert!(pr.release_metal.is_none() && pr.extended_not_run.is_empty());
     }
 
     #[test]

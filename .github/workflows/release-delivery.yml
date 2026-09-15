@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-delivery-controller-rust-1.91
-      - name: Freeze required local and optional cloud validation before building
+      - name: Freeze required local Metal/CUDA and optional cloud validation before building
         id: plan
         env:
           EVENT: ${{ github.event_name }}
@@ -98,6 +98,7 @@ jobs:
           jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == [] and .performance_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
           cloud_cuda=$(jq -er '.plan.release_cuda.cloud | if . == "required" then "true" elif . == "disabled" then "false" else error("missing frozen CUDA policy") end' "$RUNNER_TEMP/release-plan.json")
           test "$cloud_cuda" = "$RUN_CLOUD_CUDA"
+          jq -e '.plan.release_metal | (.mandatory_local_profile_ids | length > 0) and (.extended_profile_ids | length > 0) and (.reason | length > 0)' "$RUNNER_TEMP/release-plan.json"
           # Freeze source selectors and latency policy before staging or rental.
           # Every newly selected performance target needs an explicit source;
           # a missing mapping cannot silently reuse a different model.
@@ -123,12 +124,18 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
+          printf '\n## CPU validation scope\n\nRequired functional representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
+          jq -r '.model_tasks.runs[] | select(.profile.target.backend == "cpu") | "- " + .profile.id + ": " + .profile.model' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+          printf '\nCPU protocol, per-format load/forward/state, numerical and safety checks remain required. Larger CPU model variants are not validated by these small-model results.\n' >> "$RUNNER_TEMP/release-notes.md"
           printf '\n## CUDA validation scope\n\nRequired: local small-model and device correctness regression.\n' >> "$RUNNER_TEMP/release-notes.md"
           if [ "$cloud_cuda" = true ]; then
             printf 'Extended cloud model regression: explicitly enabled and required.\n' >> "$RUNNER_TEMP/release-notes.md"
           else
             printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           fi
+          printf '\n## Metal validation scope\n\nRequired: serial representative-model regression on the local Apple Silicon release runner, plus real-device correctness checks.\n' >> "$RUNNER_TEMP/release-notes.md"
+          jq -r '"Required profiles: " + (.plan.release_metal.mandatory_local_profile_ids | join(", ")) + ".", "Not run: " + (.plan.release_metal.extended_profile_ids | join(", ")) + ".", .plan.release_metal.reason' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+          printf 'Local dense-model results do not certify the untested MoE, larger-model or mixed-precision profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\ncloud_cuda=%s\n' "$version" "$rc_tag" "$base" "$cloud_cuda" >> "$GITHUB_OUTPUT"
       - name: Reuse the immutable stable launcher from the formal baseline
         if: steps.plan.outputs.active == 'true'
@@ -346,9 +353,9 @@ jobs:
       group: ferrum-panda-hardware
       cancel-in-progress: false
       queue: max
-    # Two complete model suites can each consume the task allowance below.
-    # Keep time for artifact preparation and evidence upload after execution.
-    timeout-minutes: 420
+    # Use the small-model functional samples without expanding their deadline.
+    # Include artifact preparation and evidence upload outside the task budgets.
+    timeout-minutes: 150
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -388,8 +395,8 @@ jobs:
           release_delivery local --backend cpu \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cpu/ferrum" \
             --runner "$RUNNER_TEMP/staged-cpu/model_regression" --runner-sha256 "$runner_sha" \
-            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 10800 \
-            --request-timeout-secs 900
+            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 3600 \
+            --request-timeout-secs 300
       - name: Save CPU release evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -405,18 +412,21 @@ jobs:
   metal-models:
     name: Metal release models
     needs: [prepare, stage-metal]
-    runs-on: [self-hosted, macOS, ARM64, ferrum-metal-large]
-    timeout-minutes: 120
+    # One runner service on the release host serializes its own hardware jobs.
+    runs-on: [self-hosted, macOS, ARM64, ferrum-metal-release]
+    timeout-minutes: 240
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       BASELINE_TAG: ${{ needs.prepare.outputs.baseline_tag }}
     steps:
-      - uses: actions/download-artifact@v4
+      # Includes the upstream timeout-rejection fix (actions/toolkit#2124).
+      # Keep the immutable artifact IDs and subsequent archive/ABI verification.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-metal.outputs.metal_runner_id }},${{ needs.stage-metal.outputs.metal_controller_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-metal
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-plan
           path: ${{ runner.temp }}/plan
@@ -922,7 +932,7 @@ jobs:
       matrix:
         include:
           - backend: metal
-            runner: [self-hosted, macOS, ARM64, ferrum-metal]
+            runner: [self-hosted, macOS, ARM64, ferrum-metal-release]
             brew: /opt/homebrew/bin/brew
             formula: ferrum
           - backend: cuda
@@ -931,7 +941,7 @@ jobs:
             formula: ferrum-cuda
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-homebrew-{0}', github.run_id) }}
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-brew-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
       queue: max
     timeout-minutes: 30

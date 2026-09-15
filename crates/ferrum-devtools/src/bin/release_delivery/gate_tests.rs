@@ -4,7 +4,7 @@ use ferrum_bench_core::release_regression::model_basic::{
 };
 use ferrum_bench_core::release_regression::{
     model_tasks::ModelRunCapacity, CloudCudaMode, Entrypoint, ExecutionTarget, Impact,
-    ModelProfile, PlanCost, SelectedProfile,
+    ModelProfile, PlanCost, ReleaseMetalPolicy, SelectedProfile,
 };
 use serde_json::json;
 
@@ -39,6 +39,7 @@ fn task() -> ExpectedModelRun {
 fn make_plan(task: &ExpectedModelRun) -> Plan {
     Plan {
         release_cuda: None,
+        release_metal: None,
         extended_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
@@ -78,7 +79,7 @@ fn plan_document(plan: &Plan) -> Value {
 }
 
 #[test]
-fn cuda_policy_requires_committed_membership_and_complete_local_tasks() {
+fn release_policy_requires_committed_membership_and_complete_local_tasks() {
     let mut expected = task();
     expected.profile.model = format!("fixture/small@{}", "a".repeat(40));
     let mut large = expected.profile.clone();
@@ -90,9 +91,22 @@ fn cuda_policy_requires_committed_membership_and_complete_local_tasks() {
         extended_cloud_profile_ids: vec![large.id.clone()],
         reason: "Always validate local representatives; require cloud only when requested".into(),
     };
-    let catalog = json!({"release_cuda":policy,"profiles":[expected.profile,large],
-        "quick_start_profile_ids":[expected.profile.id], "release_profile_ids":[large.id],
-        "required_targets":[expected.profile.target]});
+    let mut metal = expected.profile.clone();
+    metal.id = "metal-local".into();
+    metal.target.backend = Backend::Metal;
+    let mut extended_metal = metal.clone();
+    extended_metal.id = "metal-extended".into();
+    extended_metal.model = format!("fixture/extended-metal@{}", "c".repeat(40));
+    let metal_policy = ReleaseMetalPolicy {
+        mandatory_local_profile_ids: vec![metal.id.clone()],
+        extended_profile_ids: vec![extended_metal.id.clone()],
+        reason: "Required small-host models; larger Metal profiles are explicitly not run".into(),
+    };
+    let catalog = json!({"release_cuda":policy, "release_metal":metal_policy,
+        "profiles":[expected.profile,large,metal,extended_metal],
+        "quick_start_profile_ids":[expected.profile.id,metal.id],
+        "release_profile_ids":[large.id,extended_metal.id],
+        "required_targets":[expected.profile.target,metal.target]});
     let mut input = catalog.clone();
     input["stage"] = json!("release");
     input["impact"] = serde_json::to_value(make_plan(&expected).impact).unwrap();
@@ -104,6 +118,19 @@ fn cuda_policy_requires_committed_membership_and_complete_local_tasks() {
     let mut absent = plan.clone();
     absent.release_cuda = None;
     assert!(cuda_gate::verify_policy(&absent, &catalog).is_err());
+    absent = plan.clone();
+    absent.release_metal = None;
+    assert!(cuda_gate::verify_policy(&absent, &catalog).is_err());
+    let mut changed_metal = plan.clone();
+    changed_metal.release_metal.as_mut().unwrap().reason = "Unreviewed replacement policy".into();
+    assert!(cuda_gate::verify_policy(&changed_metal, &catalog)
+        .unwrap_err()
+        .contains("committed"));
+    let mut missing_metal = plan.clone();
+    missing_metal
+        .selected
+        .retain(|selected| selected.profile.target.backend != Backend::Metal);
+    assert!(cuda_gate::verify_policy(&missing_metal, &catalog).is_err());
     let mut changed = plan.clone();
     changed
         .release_cuda
@@ -287,6 +314,69 @@ fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
                     .unwrap_err()
                     .contains("capacity")
             );
+        }
+    }
+}
+
+#[test]
+fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
+    for quick_start in [true, false] {
+        let mut expected = task();
+        expected.profile.id = "small-metal".into();
+        expected.profile.model = format!("fixture/small@{}", "a".repeat(40));
+        expected.profile.target.backend = Backend::Metal;
+        expected.disable_thinking = quick_start;
+        expected.use_default_backend = quick_start;
+        expected.runtime_capacity = (!quick_start).then_some(DEFAULT_METAL_FUNCTIONAL_CAPACITY);
+        let mut plan = make_plan(&expected);
+        plan.release_metal = Some(ReleaseMetalPolicy {
+            mandatory_local_profile_ids: vec![expected.profile.id.clone()],
+            extended_profile_ids: vec!["large-metal".into()],
+            reason: "Small-host functional workloads; larger models are not run".into(),
+        });
+        if !quick_start {
+            plan.obligations[0].behavior = Behavior::ModelForward;
+            plan.obligations[0].checkers = vec!["model-regression.basic.model-forward".into()];
+        }
+        let schedule = model_task_schedule(&plan);
+        assert_eq!(schedule.runs[0].metal_lane, Some(MetalModelLane::Local));
+        let mut prepared = PreparedTasks {
+            schema_version: 1,
+            expectations: vec![expected.clone()],
+            unsupported_obligations: vec![],
+            remaining_plan_gaps: vec![],
+        };
+        // Even identical binary hashes cannot substitute a CUDA distribution.
+        assert!(
+            validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4")
+                .unwrap_err()
+                .contains("backend")
+        );
+        let mut metal_distribution = distributions().into_values().next().unwrap();
+        metal_distribution.backend = Backend::Metal;
+        metal_distribution.target = "aarch64-apple-darwin".into();
+        let metal = BTreeMap::from([(
+            (Backend::Metal, metal_distribution.target.clone()),
+            metal_distribution,
+        )]);
+        validate_tasks(&plan, &schedule, &prepared, &metal, "2.3.4").unwrap();
+        for capacity in [
+            None,
+            Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY),
+            Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY),
+            Some(DEFAULT_FUNCTIONAL_CAPACITY),
+            Some(ModelRunCapacity {
+                max_num_seqs: DEFAULT_METAL_FUNCTIONAL_CAPACITY.max_num_seqs + 1,
+                ..DEFAULT_METAL_FUNCTIONAL_CAPACITY
+            }),
+        ] {
+            if capacity == expected.runtime_capacity {
+                continue;
+            }
+            prepared.expectations[0].runtime_capacity = capacity;
+            assert!(validate_tasks(&plan, &schedule, &prepared, &metal, "2.3.4")
+                .unwrap_err()
+                .contains("capacity"));
         }
     }
 }

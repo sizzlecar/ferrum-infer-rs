@@ -577,12 +577,19 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     if let Some(policy) = &input.release_cuda {
         policy.validate(&input.profiles)?;
     }
+    if let Some(policy) = &input.release_metal {
+        policy.validate(&input.profiles)?;
+    }
     let cuda_policy = (input.stage == Stage::Release)
         .then_some(input.release_cuda.as_ref())
+        .flatten();
+    let metal_policy = (input.stage == Stage::Release)
+        .then_some(input.release_metal.as_ref())
         .flatten();
     let mut result = Plan {
         stage: input.stage,
         release_cuda: cuda_policy.cloned(),
+        release_metal: metal_policy.cloned(),
         extended_not_run: Vec::new(),
         impact: input.impact.clone(),
         obligations: Vec::new(),
@@ -756,6 +763,34 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                 );
             }
         }
+        if let Some(policy) = metal_policy {
+            for id in policy
+                .mandatory_local_profile_ids
+                .iter()
+                .chain(&policy.extended_profile_ids)
+            {
+                if input.release_profile_ids.contains(id) {
+                    continue;
+                }
+                let profile = input
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .expect("Metal policy validated its profile inventory");
+                add(&mut result, Behavior::ModelForward, EvidenceLayer::ModelRuntime,
+                    ObligationScope::Profile { profile_id: id.clone(), target: profile.target.clone() },
+                    "explicit Metal release lane representative; extended coverage is not a local pass");
+            }
+            if input
+                .quick_start_profile_ids
+                .iter()
+                .any(|id| policy.lane(id) == Some(MetalModelLane::Extended))
+            {
+                return Err(
+                    "a release Quick Start cannot be assigned to extended Metal coverage".into(),
+                );
+            }
+        }
         for id in &input.quick_start_profile_ids {
             match input.profiles.iter().find(|profile| {
                 &profile.id == id && profile.available && valid_target(&profile.target)
@@ -876,17 +911,22 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         }
     }
 
-    if let Some(policy) = cuda_policy.filter(|policy| policy.cloud == CloudCudaMode::Disabled) {
+    let disabled_profile = |profile: &ModelProfile| {
+        cuda_policy.is_some_and(|policy| {
+            policy.cloud == CloudCudaMode::Disabled
+                && policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
+        }) || metal_policy
+            .is_some_and(|policy| policy.lane(&profile.id) == Some(MetalModelLane::Extended))
+    };
+    if cuda_policy.is_some() || metal_policy.is_some() {
         let (extended, required): (Vec<_>, Vec<_>) =
             result.obligations.drain(..).partition(|obligation| {
                 obligation.layer == EvidenceLayer::ModelRuntime
                     && input.profiles.iter().any(|profile| {
-                        policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
-                            && profile_covers(profile, obligation)
+                        disabled_profile(profile) && profile_covers(profile, obligation)
                     })
                     && !input.profiles.iter().any(|profile| {
-                        policy.lane(&profile.id) != Some(CudaModelLane::Cloud)
-                            && profile_covers(profile, obligation)
+                        !disabled_profile(profile) && profile_covers(profile, obligation)
                     })
             });
         result.extended_not_run = extended;
@@ -896,12 +936,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         .profiles
         .iter()
         .filter(|profile| profile.available && valid_target(&profile.target))
-        .filter(|profile| {
-            !cuda_policy.is_some_and(|policy| {
-                policy.cloud == CloudCudaMode::Disabled
-                    && policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
-            })
-        })
+        .filter(|profile| !disabled_profile(profile))
         .collect();
     profiles.sort_by(|left, right| left.id.cmp(&right.id));
     let covers = |profile: &ModelProfile, obligation: &Obligation| {
@@ -922,6 +957,14 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                         .mandatory_local_profile_ids
                         .iter()
                         .position(|id| id == &profile.id)
+                })
+                .or_else(|| {
+                    metal_policy.and_then(|policy| {
+                        policy
+                            .mandatory_local_profile_ids
+                            .iter()
+                            .position(|id| id == &profile.id)
+                    })
                 })
                 .unwrap_or(usize::MAX)
         };

@@ -296,6 +296,9 @@ pub struct PlanInput {
     /// Explicit release-only CUDA model sampling; device numerical targets remain intact.
     #[serde(default)]
     pub release_cuda: Option<ReleaseCudaPolicy>,
+    /// Resource-bounded release Metal sampling; larger model coverage stays not-run.
+    #[serde(default)]
+    pub release_metal: Option<ReleaseMetalPolicy>,
     /// Release scheduling only; correctness layers cannot be deferred by this policy.
     #[serde(default)]
     pub release_performance: ReleasePerformancePolicy,
@@ -380,7 +383,9 @@ pub struct Plan {
     pub stage: Stage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cuda: Option<ReleaseCudaPolicy>,
-    /// Optional CUDA model coverage not requested for this release. Never a pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_metal: Option<ReleaseMetalPolicy>,
+    /// Explicit model coverage outside enabled release lanes. Never a pass.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_not_run: Vec<Obligation>,
     pub impact: Impact,
@@ -502,14 +507,155 @@ impl ReleaseCudaPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetalModelLane {
+    Local,
+    Extended,
+}
+
+/// A bounded Metal release samples its mandatory representatives only. Extended
+/// profiles remain declared but are not enabled by this resource policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseMetalPolicy {
+    pub mandatory_local_profile_ids: Vec<String>,
+    pub extended_profile_ids: Vec<String>,
+    pub reason: String,
+}
+
+impl ReleaseMetalPolicy {
+    pub fn lane(&self, profile_id: &str) -> Option<MetalModelLane> {
+        if self
+            .mandatory_local_profile_ids
+            .iter()
+            .any(|id| id == profile_id)
+        {
+            Some(MetalModelLane::Local)
+        } else if self.extended_profile_ids.iter().any(|id| id == profile_id) {
+            Some(MetalModelLane::Extended)
+        } else {
+            None
+        }
+    }
+
+    fn validate_inventory(&self) -> Result<(), String> {
+        let ids: Vec<_> = self
+            .mandatory_local_profile_ids
+            .iter()
+            .chain(&self.extended_profile_ids)
+            .collect();
+        if self.reason.trim().is_empty()
+            || self.reason.trim() != self.reason
+            || self.mandatory_local_profile_ids.is_empty()
+            || self.extended_profile_ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.trim() != id.as_str())
+            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+        {
+            return Err("Metal release policy requires unique, disjoint local/extended profiles and a reason".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self, profiles: &[ModelProfile]) -> Result<(), String> {
+        self.validate_inventory()?;
+        for id in self
+            .mandatory_local_profile_ids
+            .iter()
+            .chain(&self.extended_profile_ids)
+        {
+            let profile = profiles
+                .iter()
+                .find(|profile| &profile.id == id)
+                .ok_or_else(|| format!("Metal lane profile {id} is absent from the catalog"))?;
+            if profile.target.backend != Backend::Metal {
+                return Err(format!("Metal lane profile {id} declares another backend"));
+            }
+            if self.lane(id) == Some(MetalModelLane::Local) {
+                super::model_sources::validate_profile_sources(profile)?;
+                if super::model_sources::pinned_hf_source(&profile.model)?.is_none() {
+                    return Err(format!(
+                        "local Metal profile {id} requires an immutable HF revision"
+                    ));
+                }
+            }
+        }
+        if profiles.iter().any(|profile| {
+            profile.target.backend == Backend::Metal && self.lane(&profile.id).is_none()
+        }) {
+            return Err(
+                "every Metal model profile requires an explicit local or extended lane".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Plan {
+    /// Compatibility entrypoint: consumers of the original CUDA policy must also
+    /// reject malformed Metal policy and never mistake its not-run coverage for CUDA.
     pub fn validate_cuda_policy(&self) -> Result<(), String> {
-        let Some(policy) = &self.release_cuda else {
-            return if self.extended_not_run.is_empty() {
-                Ok(())
-            } else {
-                Err("extended not-run coverage requires an explicit CUDA release policy".into())
+        self.validate_release_policies()
+    }
+
+    pub fn validate_release_policies(&self) -> Result<(), String> {
+        self.validate_cuda_lane_policy()?;
+        if let Some(policy) = &self.release_metal {
+            policy.validate_inventory()?;
+            if self.stage != Stage::Release {
+                return Err("Metal model sampling requires a release plan".into());
+            }
+            for selected in &self.selected {
+                if selected.profile.target.backend == Backend::Metal
+                    && policy.lane(&selected.profile.id) != Some(MetalModelLane::Local)
+                {
+                    return Err("selected Metal profile is outside its mandatory local lane".into());
+                }
+            }
+            for id in &policy.mandatory_local_profile_ids {
+                if !self.selected.iter().any(|selected| {
+                    selected.profile.id == *id && selected.profile.target.backend == Backend::Metal
+                }) {
+                    return Err(format!(
+                        "required Metal profile {id} has no selected Metal execution"
+                    ));
+                }
+            }
+        }
+        let cuda_disabled = self
+            .release_cuda
+            .as_ref()
+            .is_some_and(|policy| policy.cloud == CloudCudaMode::Disabled);
+        let metal_disabled = self.release_metal.is_some();
+        for obligation in &self.extended_not_run {
+            let permitted_backend = match &obligation.scope {
+                ObligationScope::Backend { backend }
+                | ObligationScope::ExecutionPath { backend, .. }
+                | ObligationScope::Protocol { backend, .. }
+                | ObligationScope::Reasoning { backend, .. } => Some(*backend),
+                ObligationScope::Target { target } | ObligationScope::Profile { target, .. } => {
+                    Some(target.backend)
+                }
+                ObligationScope::Global | ObligationScope::Architecture { .. } => None,
             };
+            let enabled_extension = match permitted_backend {
+                Some(Backend::Cuda) => cuda_disabled,
+                Some(Backend::Metal) => metal_disabled,
+                Some(_) => false,
+                None => cuda_disabled || metal_disabled,
+            };
+            if obligation.layer != EvidenceLayer::ModelRuntime || !enabled_extension {
+                return Err("extended not-run coverage requires an explicit disabled model lane for its backend".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cuda_lane_policy(&self) -> Result<(), String> {
+        let Some(policy) = &self.release_cuda else {
+            return Ok(());
         };
         let ids: Vec<_> = policy
             .mandatory_local_profile_ids
@@ -525,11 +671,6 @@ impl Plan {
                 .iter()
                 .any(|id| id.trim().is_empty() || id.trim() != id.as_str())
             || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
-            || self
-                .extended_not_run
-                .iter()
-                .any(|o| o.layer != EvidenceLayer::ModelRuntime)
-            || (policy.cloud == CloudCudaMode::Required && !self.extended_not_run.is_empty())
         {
             return Err("invalid frozen CUDA release policy or extended not-run evidence".into());
         }

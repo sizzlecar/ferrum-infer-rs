@@ -59,6 +59,12 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         )
     };
     let source = |name: &str| lib("ferrum-cli", &format!("source_resolver::tests::{name}"));
+    let transfer = |name: &str| {
+        lib(
+            "ferrum-models",
+            &format!("hf_download::transfer_tests::{name}"),
+        )
+    };
     let engine = |name: &str| {
         lib(
             "ferrum-engine",
@@ -137,7 +143,22 @@ pub fn contract_groups() -> Vec<ContractGroup> {
             source("pinned_hf_download_result_must_match_repository_and_commit"),
             lib("ferrum-bench-core", "release_regression::model_tasks::tests::pinned_model_reports_require_actual_sources_from_both_product_entrypoints"),
         ]),
-        ("download-recovery", DownloadRecovery, all.clone(), vec![download("indexed_transfer_failure_preserves_ref_and_retry_completes"), download("failed_template_download_does_not_publish_ref_and_can_retry")]),
+        ("download-recovery", DownloadRecovery, all.clone(), vec![
+            download("indexed_transfer_failure_preserves_ref_and_retry_completes"),
+            download("failed_template_download_does_not_publish_ref_and_can_retry"),
+            transfer("interrupted_body_resumes_the_saved_prefix_within_one_download"),
+            transfer("ignored_range_replaces_partial_bytes_instead_of_appending_a_full_body"),
+            transfer("invalid_partial_response_never_recombines_or_publishes_bytes"),
+            transfer("permanent_http_error_preserves_partial_without_retry_or_publication"),
+            transfer("retry_and_elapsed_budgets_leave_incomplete_bytes_unpublished"),
+            transfer("transient_http_statuses_retry_the_same_saved_range_and_complete"),
+            transfer("oversized_chunked_partial_body_rolls_back_to_the_original_prefix"),
+            transfer("short_chunked_partial_body_resumes_after_newly_saved_bytes"),
+            transfer("pending_body_exhausts_total_budget_and_flushes_new_partial_bytes"),
+            transfer("zero_elapsed_budget_is_rejected_before_any_request_or_cache_write"),
+            transfer("backoff_exhausting_total_budget_never_starts_another_request"),
+            integration("ferrum-cli", "download_jsonl", "run_and_serve_recover_transient_weight_download_before_reaching_the_loader"),
+        ]),
         ("cache-completeness", CacheCompleteness, all.clone(), vec![download("indexed_invalid_index_stops_before_weights_and_preserves_ref")]),
         ("template-history", TemplateHistory, all.clone(), vec![integration("ferrum-server", "chat_template_golden", "chat_template_goldens_match_transformers"), tiny("tiny_stack_multi_turn_five_rounds")]),
         ("protocol-framing", ProtocolFraming, all.clone(), vec![tiny("tiny_stack_stream_chunk_contract"), integration("ferrum-cli", "download_jsonl", "cold_and_blob_cached_safetensors_download_preserves_jsonl_stdout"), integration("ferrum-cli", "download_jsonl", "cold_and_blob_cached_gguf_alias_download_preserves_jsonl_stdout"), server("engine_stop_contract::wire_stop_halts_the_engine_before_the_natural_terminal")]),
