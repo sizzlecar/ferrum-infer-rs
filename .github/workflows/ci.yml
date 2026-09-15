@@ -432,7 +432,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     concurrency:
-      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-quality-{0}', github.run_id) }}
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || 'ferrum-mini-metal-hardware' }}
       cancel-in-progress: false
       queue: max
     permissions:

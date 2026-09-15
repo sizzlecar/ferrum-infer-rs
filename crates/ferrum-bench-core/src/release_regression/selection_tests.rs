@@ -31,6 +31,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
         release_cuda: None,
+        release_metal: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage,
@@ -230,6 +231,167 @@ fn frozen_cuda_policy_cannot_omit_required_profiles_or_change_their_backend() {
             .target
             .backend = Backend::Cpu;
         assert!(wrong_backend.validate_cuda_policy().is_err());
+    }
+}
+
+fn metal_lane_input() -> PlanInput {
+    let local_target = text_target("bf16", Backend::Metal);
+    let extended_target = target(
+        "mixture",
+        ModelOutputProtocol::Text,
+        "mixed-4bit",
+        Backend::Metal,
+    );
+    let mut local = profile("metal-local", local_target.clone());
+    local.model = format!("owner/local@{}", "c".repeat(40));
+    let mut extended = profile("metal-extended", extended_target.clone());
+    extended.model = format!("owner/extended@{}", "d".repeat(40));
+    let mut request = input(
+        Stage::Release,
+        vec![local_target, extended_target],
+        vec![local, extended],
+    );
+    request.release_metal = Some(ReleaseMetalPolicy {
+        mandatory_local_profile_ids: vec!["metal-local".into()],
+        extended_profile_ids: vec!["metal-extended".into()],
+        reason: "Run bounded local model representatives; larger model coverage is not run.".into(),
+    });
+    request.quick_start_profile_ids = vec!["metal-local".into()];
+    request.impact.areas = vec![
+        ChangeArea::Kernel,
+        ChangeArea::Template,
+        ChangeArea::Scheduler,
+    ];
+    request.release_performance = ReleasePerformancePolicy::Deferred {
+        reason: "Measurements remain separate.".into(),
+    };
+    request.checks = super::super::model_schedule::model_check_descriptors();
+    request
+}
+
+#[test]
+fn bounded_metal_keeps_numerics_and_records_only_unrepresented_model_runtime_as_not_run() {
+    let request = metal_lane_input();
+    let bounded = plan(&request).unwrap();
+    bounded.validate_release_policies().unwrap();
+    assert_eq!(selected_ids(&bounded), ["metal-local"]);
+    assert!(!bounded.extended_not_run.is_empty());
+    assert!(bounded
+        .extended_not_run
+        .iter()
+        .all(|o| o.layer == EvidenceLayer::ModelRuntime));
+    assert!(bounded.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "metal-extended")));
+    assert!(bounded.obligations.iter().any(|o| o.layer == EvidenceLayer::BackendNumerics && matches!(&o.scope, ObligationScope::Target { target } if target.architecture == "mixture")));
+    let mut unrestricted = request.clone();
+    unrestricted.release_metal = None;
+    let unrestricted = plan(&unrestricted).unwrap();
+    let non_model = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(non_model(&bounded), non_model(&unrestricted));
+    assert_eq!(
+        bounded.deferred_performance,
+        unrestricted.deferred_performance
+    );
+    let schedule = super::super::model_schedule::model_task_schedule(&bounded);
+    assert!(schedule.unsupported_obligations.is_empty());
+    assert!(schedule
+        .runs
+        .iter()
+        .all(|run| run.metal_lane == Some(MetalModelLane::Local) && run.cuda_lane.is_none()));
+    let mut same_target = request;
+    same_target.profiles[1].target = same_target.profiles[0].target.clone();
+    same_target.required_targets = vec![same_target.profiles[0].target.clone()];
+    let same_target = plan(&same_target).unwrap();
+    assert!(same_target.extended_not_run.iter().all(|o| matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "metal-extended")));
+}
+
+#[test]
+fn bounded_metal_rejects_missing_overlapping_unpinned_wrong_backend_and_optional_quick_start() {
+    let request = metal_lane_input();
+    let mut changed = request.clone();
+    changed
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .extended_profile_ids
+        .push("metal-local".into());
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed
+        .profiles
+        .push(profile("unclassified", text_target("bf16", Backend::Metal)));
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.profiles[0].model = "owner/unpinned".into();
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.profiles[0].target.backend = Backend::Cuda;
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.quick_start_profile_ids = vec!["metal-extended".into()];
+    assert!(plan(&changed).is_err());
+    let complete = plan(&request).unwrap();
+    let mut missing = complete.clone();
+    missing.selected.clear();
+    assert!(missing.validate_release_policies().is_err());
+    let mut forged = complete.clone();
+    forged.extended_not_run[0].layer = EvidenceLayer::BackendNumerics;
+    assert!(forged.validate_release_policies().is_err());
+    let mut forged = complete;
+    forged.release_metal = None;
+    assert!(forged.validate_release_policies().is_err());
+}
+
+#[test]
+fn metal_not_run_is_independent_of_both_cuda_cloud_modes_and_never_applies_to_prs() {
+    for cloud in [CloudCudaMode::Disabled, CloudCudaMode::Required] {
+        let mut request = cuda_lane_input();
+        request.release_cuda.as_mut().unwrap().cloud = cloud;
+        let cuda_only = plan(&request).unwrap();
+        let metal = metal_lane_input();
+        request.profiles.extend(metal.profiles);
+        request.required_targets.extend(metal.required_targets);
+        request
+            .quick_start_profile_ids
+            .extend(metal.quick_start_profile_ids);
+        request.release_metal = metal.release_metal;
+        let combined = plan(&request).unwrap();
+        combined.validate_release_policies().unwrap();
+        let cuda_runs = |plan: &Plan| {
+            super::super::model_schedule::model_task_schedule(plan)
+                .runs
+                .into_iter()
+                .filter(|run| run.profile.target.backend == Backend::Cuda)
+                .map(|run| (run.profile, run.cuda_lane, run.checks, run.quick_start))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cuda_runs(&cuda_only), cuda_runs(&combined));
+        assert!(combined.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Profile { target, .. } if target.backend == Backend::Metal)));
+        if cloud == CloudCudaMode::Required {
+            assert!(!combined.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Target { target } | ObligationScope::Profile { target, .. } if target.backend == Backend::Cuda)));
+            let mut forged = combined.clone();
+            let obligation = forged
+                .extended_not_run
+                .iter_mut()
+                .find(|o| matches!(&o.scope, ObligationScope::Profile { .. }))
+                .unwrap();
+            if let ObligationScope::Profile { target, .. } = &mut obligation.scope {
+                target.backend = Backend::Cuda;
+            }
+            assert!(forged.validate_release_policies().is_err());
+        }
+        request.stage = Stage::PullRequest;
+        let pr = plan(&request).unwrap();
+        assert!(
+            pr.release_metal.is_none()
+                && pr.release_cuda.is_none()
+                && pr.extended_not_run.is_empty()
+        );
     }
 }
 

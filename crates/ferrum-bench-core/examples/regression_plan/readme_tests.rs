@@ -25,6 +25,7 @@ fn input(impact: Impact) -> PlanInput {
     };
     PlanInput {
         release_cuda: None,
+        release_metal: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,

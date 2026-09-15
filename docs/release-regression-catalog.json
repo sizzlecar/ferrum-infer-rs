@@ -20,6 +20,20 @@
     ],
     "reason": "Require pinned local CUDA representatives and all device numerical/safety contracts. Larger CUDA model profiles require explicit cloud opt-in; disabled extension coverage is not run, not passed, and does not certify those models' end-to-end behavior or capacity."
   },
+  "release_metal": {
+    "mandatory_local_profile_ids": [
+      "release-qwen35-4b-gguf-metal",
+      "release-qwen35-2b-safetensors-metal",
+      "llama-dense-metal"
+    ],
+    "extended_profile_ids": [
+      "attention-moe-metal",
+      "hybrid-moe-metal",
+      "release-qwen35-9b-gguf-metal",
+      "release-qwen38-27b-gguf-metal"
+    ],
+    "reason": "Require pinned Metal representatives sized for a 16 GiB unified-memory host, with bounded functional workloads and unchanged product Quick Start defaults. Larger model coverage is explicitly not run, not passed; all backend numerical and safety obligations remain required."
+  },
   "release_performance": {
     "mode": "deferred",
     "reason": "Prioritize correct installation and first use for this release; complete comparative performance measurements after release. Numerical correctness, model behavior, capacity safety and installation remain required."
@@ -52,20 +66,6 @@
       "available": true,
       "estimate": null,
       "reasoning_protocol": "none"
-    },
-    {
-      "id": "quick-start-metal",
-      "model": "qwen3.5:4b-q4_k_m",
-      "target": {
-        "architecture": "qwen3_5_dense_hybrid",
-        "protocol": "text",
-        "precision": "gguf-q4_k_m",
-        "backend": "metal",
-        "execution_path": "production-plan-runtime"
-      },
-      "available": true,
-      "estimate": null,
-      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "quick-start-cuda",
@@ -125,7 +125,11 @@
     },
     {
       "id": "llama-dense-metal",
-      "model": "llama3.1:8b-q4_k_m",
+      "model": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF@4f0c246f125fc7594238ebe7beb1435a8335f519",
+      "gguf": {
+        "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "semantic_source": "unsloth/Meta-Llama-3.1-8B-Instruct@0f68888b9c8c55098bea14b4225237ebab9b1f5b"
+      },
       "target": {
         "architecture": "llama_dense",
         "protocol": "text",
@@ -377,7 +381,7 @@
     }
   ],
   "quick_start_profile_ids": [
-    "quick-start-metal",
+    "release-qwen35-4b-gguf-metal",
     "release-qwen35-4b-gguf-cuda"
   ],
   "required_targets": [

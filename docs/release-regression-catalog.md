@@ -21,11 +21,14 @@ binary and the actual installation and first-use paths.
   check. It is not zero cost. Record download, load, test, and paid resource costs
   separately when preparing the run.
 - `quick_start_profile_ids` contains two independent mandatory profiles.
-  Neither can be replaced by another precision, smaller model, or backend.
+  Both are pinned 4B Q4_K_M GGUF profiles, one per backend. Neither can be
+  replaced by another precision, smaller model, or backend. Metal has only
+  `release-qwen35-4b-gguf-metal` as its Quick Start profile.
 - `release_profile_ids` retains explicit model commitments beyond README examples.
   Release planning requires each enabled named profile; a cheaper model with the
-  same architecture cannot replace it. The explicit CUDA policy below determines
-  which CUDA lane is enabled. An unavailable or missing enabled profile is a gap.
+  same architecture cannot replace it. The explicit CUDA and Metal policies
+  below determine which release profiles are enabled. An unavailable or missing
+  enabled profile is a gap.
   PR and nightly sampling do not automatically repeat these release commitments.
 - `release_cuda` separates mandatory pinned local representatives from optional
   extended cloud profiles. Every CUDA profile belongs to exactly one lane.
@@ -34,6 +37,13 @@ binary and the actual installation and first-use paths.
   `extended_not_run` when disabled, not reported as passing. This policy cannot
   defer numerical, contract or installation obligations, remove local tasks, or
   change PR/nightly coverage.
+- `release_metal` separates three mandatory local profiles from larger extended
+  profiles. Every Metal profile belongs to exactly one lane. Extended Metal
+  model-runtime obligations remain in `extended_not_run`; there is no flag to
+  enable their execution in this release lane. They have not been regressed by
+  this lane and are not passing evidence. This policy does not defer numerical,
+  safety or installation checks, change PR/nightly coverage, or allow dense
+  models to represent MoE model behavior.
 - `required_targets` keeps advertised capability groups visible. Selection must
   consider stage and changed behavior; the number of profiles is not a gate.
   Additional precision-specific work belongs to affected loader/kernel changes.
@@ -42,10 +52,13 @@ binary and the actual installation and first-use paths.
   all other missing bindings remain gaps. Neither declaration nor model
   availability means a check ran or passed.
 
-The current default commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal,
-9B and Qwen3.8 27B mixed GGUF on Metal, and Qwen3.5 2B SafeTensors on CPU/Metal.
-Local CUDA additionally requires Qwen3.5 0.8B and Llama3.2 1B SafeTensors.
-CUDA 9B/27B and the other large CUDA profiles remain an explicit cloud extension.
+The current default commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal
+and Qwen3.5 2B SafeTensors on CPU/Metal. Local Metal additionally requires pinned
+Llama 3.1 8B Q4_K_M GGUF. Its 9B, 27B, 30B attention-only MoE and 35B hybrid MoE
+profiles remain unexecuted extended coverage, not release passes. Local CUDA
+continues to require Qwen3.5 0.8B and Llama3.2 1B SafeTensors on the RTX 4050.
+CUDA 9B/27B and the other large CUDA profiles remain an explicit cloud extension;
+the Metal policy does not change that opt-in.
 Each GGUF profile declares its exact file and independent semantic source;
 execution must observe those sources. These are planned checks, not completed
 support claims. Existing CUDA SafeTensors and other advertised architecture and
@@ -66,8 +79,10 @@ matches. Architecture baseline sampling may cross backends within the same
 execution path; a separate obligation retains actual execution on each backend.
 Affected compute/resource changes still use exact target combinations.
 
-Each model obligation is assigned to one profile. If the initial selection lacks
-a complete checker binding, the selector first adds an available, scope-compatible
+Each enabled model obligation is assigned to one profile. Excluded extended
+release obligations remain in `extended_not_run`, not in passing local results.
+If the initial selection lacks a complete checker binding, the selector first
+adds an available, scope-compatible
 profile with a complete binding when one exists. It then assigns the obligation
 once, preferring a complete binding, followed by declared estimates and a stable
 ID. Missing bindings remain gaps. Other compatible profiles do not implicitly
@@ -104,10 +119,21 @@ The CLI emits `model_tasks` alongside the plan. The
 [model-task gate](release-regression.md#verify-selected-model-tasks) groups assigned
 checks by profile without selecting replacement models. It uses staged metadata
 to prepare an expected task before execution, then consumes actual schema-2
-runner reports. Quick Start uses its own normal alias, default backend selection
+runner reports. Quick Start retains its own profile, default backend selection
 and disabled thinking with controlled prompts, sharing that profile's basic
 cases. Selected HTTP checks share one server; separate run baseline/replay cases
 retain their existing processes. There is no extra Quick Start model launch.
+
+The mandatory Metal tasks are `release-qwen35-4b-gguf-metal`,
+`release-qwen35-2b-safetensors-metal` and `llama-dense-metal`. The first is the
+sole Metal Quick Start: its entire assigned task retains product capacity
+defaults. The latter two bind typed `ModelRunCapacity` values of 2048 context
+tokens, one sequence and `runtime_memory_budget_bytes: 10737418240` (10 GiB),
+forwarded to both `run` and `serve`; the controlled output budget remains 512
+tokens. This runtime planning budget is not an RSS hard limit or proof of fit.
+The actual staged-candidate CI execution on the M4 16 GiB worker must establish
+the tested capacity and model behavior. Timeout, OOM and assertion failures
+remain failures. See the [Metal lane procedure](release-regression.md#required-16-gib-metal-model-lane).
 
 Missing or failed execution, wrong observed backend, mismatched task inputs and
 unsupported model obligations fail this limited gate. The target remains a
@@ -118,20 +144,31 @@ checks, fresh downloads and unimplemented behavior checks remain separate.
 
 ## Current representatives
 
-| Profile ID | Coverage contributed | Source |
-|---|---|---|
-| `quick-start-metal` | Dense hybrid, GGUF Q4_K_M, Metal | `qwen3.5:4b-q4_k_m` |
-| `quick-start-cuda` | Dense hybrid, safetensors BF16 + F32, CUDA | `qwen3.5:4b` |
-| `hybrid-moe-metal` | Hybrid MoE, GGUF Q4_K_S, Metal | `qwen3.5:35b-a3b-q4_k_s` |
-| `attention-moe-metal` | Attention-only MoE, GGUF Q4_K_M, Metal | `qwen3:30b-a3b-q4_k_m` |
-| `attention-moe-cuda` | Attention-only MoE, GPTQ INT4, CUDA | `Qwen/Qwen3-30B-A3B-GPTQ-Int4@9b534e4318b7ebc3c961a839f13eb18b1833f441` |
-| `llama-dense-metal` | Llama dense, GGUF Q4_K_M, legacy Metal path | `llama3.1:8b-q4_k_m` |
-| `llama-dense-cuda` | Llama dense, safetensors BF16, legacy CUDA path | `unsloth/Meta-Llama-3.1-8B-Instruct` |
-| `hybrid-dense-ct-int4-cuda` | Dense hybrid, compressed-tensors INT4, CUDA | `cyankiwi/Qwen3.8-27B-AWQ-INT4` |
-| `hybrid-dense-block-fp8-cuda` | Dense hybrid, block-FP8, CUDA | `Qwen/Qwen3.8-27B-FP8` |
-| `hybrid-moe-block-fp8-cuda` | Hybrid MoE, block-FP8, CUDA | `Qwen/Qwen3.6-35B-A3B-FP8` |
-| `harmony-mxfp4-cuda` | GPT-OSS MoE, MXFP4, Harmony, CUDA | `openai/gpt-oss-20b` |
-| `gemma-ct-w4a16-cuda` | Gemma dense, compressed-tensors W4A16, native thought, CUDA | `google/gemma-4-12B-it-qat-w4a16-ct` |
+| Profile ID | Declared coverage | Source (see catalog for pinned identities) | Release lane |
+|---|---|---|---|
+| `release-qwen35-4b-gguf-metal` | Dense hybrid, GGUF Q4_K_M, Metal | `unsloth/Qwen3.5-4B-GGUF` | Mandatory local; sole Metal Quick Start |
+| `release-qwen35-2b-safetensors-metal` | Dense hybrid, SafeTensors BF16 + F32, Metal | `Qwen/Qwen3.5-2B` | Mandatory local |
+| `llama-dense-metal` | Llama dense, GGUF Q4_K_M, legacy Metal path | `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` | Mandatory local |
+| `release-qwen35-9b-gguf-metal` | Dense hybrid, GGUF Q4_K_M, Metal | `unsloth/Qwen3.5-9B-GGUF` | Extended, not run |
+| `release-qwen38-27b-gguf-metal` | Dense hybrid, mixed GGUF 4-bit, Metal | `unsloth/Qwen3.8-27B-GGUF` | Extended, not run |
+| `hybrid-moe-metal` | Hybrid MoE, GGUF Q4_K_S, Metal | `qwen3.5:35b-a3b-q4_k_s` | Extended, not run |
+| `attention-moe-metal` | Attention-only MoE, GGUF Q4_K_M, Metal | `qwen3:30b-a3b-q4_k_m` | Extended, not run |
+| `release-qwen35-4b-gguf-cuda` | Dense hybrid, GGUF Q4_K_M, CUDA | `unsloth/Qwen3.5-4B-GGUF` | Mandatory local; CUDA Quick Start |
+| `release-qwen35-08b-safetensors-cuda` | Dense hybrid, SafeTensors BF16 + F32, CUDA | `Qwen/Qwen3.5-0.8B` | Mandatory local |
+| `release-llama32-1b-safetensors-cuda` | Llama dense, SafeTensors BF16, legacy CUDA path | `unsloth/Llama-3.2-1B-Instruct` | Mandatory local |
+| `quick-start-cuda` | Dense hybrid, SafeTensors BF16 + F32, CUDA | `qwen3.5:4b` | Cloud extension; not a current Quick Start binding |
+| `attention-moe-cuda` | Attention-only MoE, GPTQ INT4, CUDA | `Qwen/Qwen3-30B-A3B-GPTQ-Int4@9b534e4318b7ebc3c961a839f13eb18b1833f441` | Cloud extension |
+| `llama-dense-cuda` | Llama dense, SafeTensors BF16, legacy CUDA path | `unsloth/Meta-Llama-3.1-8B-Instruct` | Cloud extension |
+| `hybrid-dense-ct-int4-cuda` | Dense hybrid, compressed-tensors INT4, CUDA | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | Cloud extension |
+| `hybrid-dense-block-fp8-cuda` | Dense hybrid, block-FP8, CUDA | `Qwen/Qwen3.8-27B-FP8` | Cloud extension |
+| `hybrid-moe-block-fp8-cuda` | Hybrid MoE, block-FP8, CUDA | `Qwen/Qwen3.6-35B-A3B-FP8` | Cloud extension |
+| `harmony-mxfp4-cuda` | GPT-OSS MoE, MXFP4, Harmony, CUDA | `openai/gpt-oss-20b` | Cloud extension |
+| `gemma-ct-w4a16-cuda` | Gemma dense, compressed-tensors W4A16, native thought, CUDA | `google/gemma-4-12B-it-qat-w4a16-ct` | Cloud extension |
+
+This inventory declares potential coverage, not execution results. Extended
+Metal rows are explicitly unexecuted; cloud CUDA rows require the existing
+opt-in. A small dense-model pass does not qualify either Metal MoE architecture
+or any larger model's end-to-end behavior or capacity.
 
 The [alias table](../crates/ferrum-cli/src/source_resolver.rs) supplies the GGUF
 filenames and semantic sidecar repositories. The
@@ -152,6 +189,13 @@ family name proves interchangeability.
 - Qwen3.5 4B safetensors metadata at revision
   [851bf6e](https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a)
   reports BF16 weights and a small F32 component. The catalog preserves both.
+- The mandatory Llama Metal GGUF pins
+  [bartowski revision 4f0c246f](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/tree/4f0c246f125fc7594238ebe7beb1435a8335f519)
+  and the exact file `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`. Its independent
+  semantic and tokenizer source is
+  [Unsloth revision 0f68888b](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/tree/0f68888b9c8c55098bea14b4225237ebab9b1f5b),
+  which contains `config.json`, `tokenizer_config.json` and `tokenizer.json`
+  for Llama 3.1 8B Instruct. These source identities do not prove a runtime pass.
 - The Llama CUDA representative reports BF16 weights at
   [a2856192](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/tree/a2856192dd7c25b842431f39c179a6c2c2f627d1).
   The Qwen3 CUDA representative pins
@@ -195,8 +239,15 @@ The CUDA Ubuntu container type-checks the CUDA CLI and optionally builds PTX;
 it does not execute CUDA operators.
 
 The separate `GPU runtime` matrix schedules repository-controlled code on the
-`ferrum-metal` and `ferrum-cuda` self-hosted workers. Its Rust checker requires the
-selected backend, completed GPU work and finite outputs within a declared
+self-hosted Metal and CUDA workers. The M4 16 GiB Metal worker carries both
+`ferrum-metal` and `ferrum-metal-16gb`; Metal device Quality, release models and
+Homebrew verification select the 16 GiB label and share a single-host concurrency
+group with cancellation disabled. Model tasks run serially, with a 3600-second
+per-task timeout and a 240-minute model job limit. Those labels and limits select
+and schedule resources; they do not prove model fit or success. CUDA retains
+the mandatory local RTX 4050 lane and explicit cloud extension.
+The Rust checker requires the selected backend, completed GPU work and finite
+outputs within a declared
 numerical tolerance. Missing devices, missing reports and failed or skipped GPU
 jobs cannot satisfy `CI required` for code changes. See the
 [commands and current coverage](backend-numerics.md).

@@ -1,13 +1,13 @@
-//! Bind optional cloud execution to the committed policy and actual CI producers.
+//! Bind local Metal/CUDA and optional cloud execution to committed coverage.
 use ferrum_bench_core::release_regression::{
-    model_schedule::model_task_schedule, Backend, CloudCudaMode, CudaModelLane, ModelProfile, Plan,
-    PlanInput, ReleaseCudaPolicy,
+    model_schedule::model_task_schedule, Backend, CloudCudaMode, CudaModelLane, MetalModelLane,
+    ModelProfile, Plan, PlanInput, ReleaseCudaPolicy, ReleaseMetalPolicy,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> {
-    plan.validate_cuda_policy()?;
+    plan.validate_release_policies()?;
     let policy = plan
         .release_cuda
         .as_ref()
@@ -25,6 +25,28 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
     if &committed != policy {
         return Err("frozen CUDA lane membership differs from the committed catalog".into());
     }
+    let metal_policy = plan
+        .release_metal
+        .as_ref()
+        .ok_or("release plan omits the explicit local/extended Metal policy")?;
+    let committed_metal: ReleaseMetalPolicy =
+        serde_json::from_value(catalog["release_metal"].clone())
+            .map_err(|_| "candidate catalog omits its typed Metal policy")?;
+    committed_metal.validate(&profiles)?;
+    if &committed_metal != metal_policy {
+        return Err("frozen Metal lane membership differs from the committed catalog".into());
+    }
+    // A profile ID and target do not bind the immutable weights or independent
+    // GGUF semantic/tokenizer sources. Prepared tasks must not drift together
+    // with a forged selected profile while retaining the same lane membership.
+    for selected in &plan.selected {
+        if !profiles.iter().any(|profile| profile == &selected.profile) {
+            return Err(format!(
+                "selected profile {} differs from the committed catalog",
+                selected.profile.id
+            ));
+        }
+    }
     // Recompute the partition from committed model capabilities and the frozen
     // impact. A caller cannot move a local/safety obligation into `not_run`, or
     // silently remove an extended obligation from the disclosure.
@@ -40,10 +62,10 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
     input["release_cuda"] = serde_json::to_value(policy).map_err(|e| e.to_string())?;
     input["checks"] = serde_json::json!([]);
     let input: PlanInput = serde_json::from_value(input)
-        .map_err(|e| format!("candidate CUDA policy cannot be replanned: {e}"))?;
+        .map_err(|e| format!("candidate release policies cannot be replanned: {e}"))?;
     let recomputed = ferrum_bench_core::release_regression::plan(&input)?;
     if plan.extended_not_run != recomputed.extended_not_run {
-        return Err("extended CUDA not-run disclosure differs from committed coverage".into());
+        return Err("extended not-run disclosure differs from committed coverage".into());
     }
     let without_assignments =
         |obligations: &[ferrum_bench_core::release_regression::Obligation]| {
@@ -57,7 +79,7 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
                 .collect::<Vec<_>>()
         };
     if without_assignments(&plan.obligations) != without_assignments(&recomputed.obligations) {
-        return Err("required coverage differs from the committed CUDA policy partition".into());
+        return Err("required coverage differs from the committed release policy partition".into());
     }
     let schedule = model_task_schedule(plan);
     for lane in [CudaModelLane::Local, CudaModelLane::Cloud] {
@@ -87,6 +109,25 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
                 "CUDA {lane:?} tasks do not exactly cover the enabled lane"
             ));
         }
+    }
+    let actual_metal: BTreeSet<_> = schedule
+        .runs
+        .iter()
+        .filter(|run| run.profile.target.backend == Backend::Metal)
+        .map(|run| {
+            if run.metal_lane != Some(MetalModelLane::Local) {
+                return Err("Metal tasks include a profile outside the required local lane");
+            }
+            Ok(run.profile.id.as_str())
+        })
+        .collect::<Result<_, _>>()?;
+    let expected_metal: BTreeSet<_> = metal_policy
+        .mandatory_local_profile_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if actual_metal != expected_metal {
+        return Err("Metal tasks do not exactly cover the required local lane".into());
     }
     Ok(())
 }
@@ -158,6 +199,46 @@ mod tests {
             input.release_cuda.as_mut().unwrap().cloud = cloud;
             let plan = ferrum_bench_core::release_regression::plan(&input).unwrap();
             verify_policy(&plan, &catalog).unwrap();
+            let pinned_metal = plan
+                .selected
+                .iter()
+                .find(|selected| {
+                    selected.profile.target.backend == Backend::Metal
+                        && selected.profile.gguf.is_some()
+                })
+                .unwrap();
+            for change_semantic_source in [false, true] {
+                let mut drifted = plan.clone();
+                let profile = &mut drifted
+                    .selected
+                    .iter_mut()
+                    .find(|selected| selected.profile.id == pinned_metal.profile.id)
+                    .unwrap()
+                    .profile;
+                let other_source = format!("fixture/other-source@{}", "f".repeat(40));
+                if change_semantic_source {
+                    profile.gguf.as_mut().unwrap().semantic_source = other_source;
+                } else {
+                    profile.model = other_source;
+                }
+                assert!(verify_policy(&drifted, &catalog)
+                    .unwrap_err()
+                    .contains("selected profile"));
+            }
+            let mut missing_metal = plan.clone();
+            missing_metal.release_metal = None;
+            assert!(verify_policy(&missing_metal, &catalog).is_err());
+            let mut hidden_metal = plan.clone();
+            hidden_metal.extended_not_run.retain(|obligation| {
+                !matches!(
+                    &obligation.scope,
+                    ferrum_bench_core::release_regression::ObligationScope::Profile { target, .. }
+                        | ferrum_bench_core::release_regression::ObligationScope::Target { target }
+                        if target.backend == Backend::Metal
+                )
+            });
+            assert_ne!(hidden_metal.extended_not_run, plan.extended_not_run);
+            assert!(verify_policy(&hidden_metal, &catalog).is_err());
             let mut stripped = plan.clone();
             stripped.obligations.retain(|obligation| {
                 obligation.layer

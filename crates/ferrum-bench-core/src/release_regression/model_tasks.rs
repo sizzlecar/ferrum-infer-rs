@@ -105,6 +105,12 @@ pub const DEFAULT_CUDA_FUNCTIONAL_CAPACITY: ModelRunCapacity = ModelRunCapacity 
     runtime_memory_budget_bytes: Some(4 * 1024 * 1024 * 1024),
 };
 
+pub const DEFAULT_METAL_FUNCTIONAL_CAPACITY: ModelRunCapacity = ModelRunCapacity {
+    context_tokens: 2048,
+    max_num_seqs: 1,
+    runtime_memory_budget_bytes: Some(10 * 1024 * 1024 * 1024),
+};
+
 impl ModelRunCapacity {
     pub fn validate(self, max_tokens: u32) -> Result<(), String> {
         if self.runtime_memory_budget_bytes == Some(0) {

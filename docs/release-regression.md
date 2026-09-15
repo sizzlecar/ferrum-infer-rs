@@ -45,6 +45,17 @@ recomputes the partition from the committed catalog and requires local success
 even when cloud execution is enabled. See the [delivery procedure](release-candidate-automation.md)
 for resource limits and the distinction between capacity preflight and release evidence.
 
+Metal release model sampling uses the committed `release_metal` local lane on
+the 16 GiB Apple Silicon worker. It requires pinned Qwen3.5 4B Q4_K_M GGUF,
+Qwen3.5 2B SafeTensors and Llama 3.1 8B Q4_K_M GGUF. Only the 4B profile is the
+Metal Quick Start and retains product capacity defaults. The other two use the
+explicit workload below. The larger Metal 9B, 27B, 30B attention-only MoE and
+35B hybrid MoE profiles remain in `plan.extended_not_run`: they have not been
+regressed by this lane and do not count as passed. Small dense models cannot
+stand in for MoE model behavior. There is no extended-Metal enable flag; the
+CUDA local default and explicit cloud opt-in are independent and unchanged.
+Numerical, safety and installation requirements are not deferred by this policy.
+
 The catalog's optional `release_performance` policy defaults to
 `{"mode":"required"}`. A release may explicitly use
 `{"mode":"deferred","reason":"..."}` to schedule comparative measurements after
@@ -230,7 +241,7 @@ The currently advertised paths are:
 | Platform | MODEL | Source/format |
 |---|---|---|
 | Apple Silicon Metal | `qwen3.5:4b-q4_k_m` | `unsloth/Qwen3.5-4B-GGUF`, Q4_K_M; metadata from `Qwen/Qwen3.5-4B` |
-| Linux CUDA | `qwen3.5:4b` | `Qwen/Qwen3.5-4B`, official safetensors |
+| Linux CUDA | `qwen3.5:4b-q4_k_m` | `unsloth/Qwen3.5-4B-GGUF`, Q4_K_M; metadata from `Qwen/Qwen3.5-4B` |
 
 Run the README's `--version`, `--help`, `doctor`, interactive `run`, and `serve`
 commands, including `--disable-thinking` and `--served-model-name ferrum` where
@@ -241,6 +252,44 @@ Preserve the default context, memory and concurrency settings for these first-us
 checks. A smaller-model substitution or capacity override is diagnostic evidence,
 not completion of the advertised Quick Start. Capture startup/download failures,
 timeouts, output errors and resource limits instead of silently changing flags.
+
+## Required 16 GiB Metal model lane
+
+The release catalog requires these three independently identified profiles:
+
+| Profile | Model path | Capacity configuration |
+|---|---|---|
+| `release-qwen35-4b-gguf-metal` | Qwen3.5 4B Q4_K_M GGUF, production plan runtime | Sole Metal Quick Start; product context, concurrency and memory defaults |
+| `release-qwen35-2b-safetensors-metal` | Qwen3.5 2B BF16/F32 SafeTensors, production plan runtime | Context 2048, one sequence, 10 GiB runtime memory budget |
+| `llama-dense-metal` | Llama 3.1 8B Q4_K_M GGUF, legacy model executor | Context 2048, one sequence, 10 GiB runtime memory budget |
+
+The [catalog](release-regression-catalog.json) fixes weight revisions, GGUF
+filenames and independent semantic sources. These are release model tasks, not
+changes to README or other public first-use examples. All checks assigned to
+the 4B Quick Start share its default-capacity task; do not replace it with a
+bounded duplicate or treat another profile as its Quick Start evidence.
+
+For the two non-Quick-Start profiles, prepared expectations bind
+`--context-tokens 2048 --max-num-seqs 1 --runtime-memory-budget-bytes 10737418240`
+in both `run` and `serve`. The controlled output budget remains 512 tokens.
+The 10 GiB value is a typed runtime planning budget, not an operating-system
+RSS hard limit, a reservation of all other host memory, or proof that loading
+and execution fit. Only actual candidate CI results on the M4 16 GiB host can
+establish the tested capacity and semantics. OOM, timeout and invalid output
+remain failures; the policy does not waive them.
+
+The worker carries both `ferrum-metal` and `ferrum-metal-16gb` labels. Metal
+release model execution, device Quality checks and Homebrew verification select
+the 16 GiB worker and share a single-host concurrency group with cancellation
+disabled. Model tasks execute serially, with a 3600-second timeout per task and
+a 240-minute model job limit. These are execution ceilings, not measured
+durations. The [delivery workflow](../.github/workflows/release-delivery.yml)
+and [Quality workflow](../.github/workflows/ci.yml) define this scheduling.
+
+Qwen3.5 9B, Qwen3.8 27B, Qwen3 30B-A3B attention-only MoE and Qwen3.5 35B-A3B
+hybrid MoE remain explicitly unexecuted extended Metal coverage. A successful
+three-profile lane does not establish their end-to-end correctness or capacity,
+nor does it turn dense-model evidence into MoE evidence.
 
 ## Rust model runner
 
@@ -256,7 +305,7 @@ cargo build --release --locked -p ferrum-devtools --bin model_regression
   --checks basic,stop,structured,tools --disable-thinking --use-default-backend
 ```
 
-Use `--model qwen3.5:4b --backend cuda` for the CUDA Quick Start and a separate
+Use `--model qwen3.5:4b-q4_k_m --backend cuda` for the CUDA Quick Start and a separate
 report directory. Reports must use a new or empty directory. `--checks` defaults
 to `basic`; explicitly select the checks relevant to the release:
 
@@ -361,6 +410,9 @@ Sampling uses temperature 0, seed 7 and a controlled output budget (`--max-token
 default 512). Quick Start retains default capacity. Other prepared functional tasks
 use `--context-tokens 2048 --max-num-seqs 1`, binding the public KV/context and
 concurrency options in both entrypoints and checking their actual configuration.
+The mandatory local CUDA non-Quick-Start tasks additionally bind a 4 GiB typed
+runtime budget; the two local Metal non-Quick-Start tasks bind 10 GiB as described
+above. These bounds never override a Quick Start task's product defaults.
 Explicit-capacity `run` also disables context shifting so an oversized request
 cannot silently shrink its output budget or discard history. This is not download,
 general answer quality, throughput or numerical reference evidence.
@@ -373,7 +425,9 @@ binding reuses that profile's basic cases, without another model load.
 The Rust [model_gate example](../crates/ferrum-bench-core/examples/model_gate.rs)
 prepares typed expectations from the plan's assigned model obligations and staged
 asset metadata. It groups checks by profile, preserves each Quick Start's own
-profile, and rejects unsupported model obligations before hardware allocation.
+profile, and rejects unsupported enabled model obligations before hardware allocation.
+Explicitly excluded extended obligations remain visible as not run in the plan;
+they are neither prepared as local tasks nor verified as successful executions.
 It does not start runners or rent hardware itself. For example, using the actual
 candidate version and adjacent staging metadata:
 
@@ -400,11 +454,11 @@ supplied path before comparison and rejects a mismatch before loading. Public
 aliases retain their ordinary selector. A failed binary-version check also stops
 before model loading.
 
-Quick Start tasks retain the normal README alias, require automatic backend
-selection and `--disable-thinking`, and use the controlled prompts above. They
-exercise the default capacity and template configuration in the same basic
-run/serve cases; installed `--help`, `doctor`, literal README requests and fresh
-download checks remain separate obligations.
+Quick Start tasks retain their catalog-bound pinned profile, require automatic
+backend selection and `--disable-thinking`, and use the controlled prompts above.
+They exercise the default capacity and template configuration in the same basic
+run/serve cases; installed `--help`, `doctor`, literal README aliases and requests,
+and fresh download checks remain separate obligations.
 
 Then supply every actual schema-2 runner report:
 

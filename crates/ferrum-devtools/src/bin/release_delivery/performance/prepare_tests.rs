@@ -27,6 +27,7 @@ fn plan() -> Plan {
     let profile = profile();
     Plan {
         release_cuda: None,
+        release_metal: None,
         extended_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
