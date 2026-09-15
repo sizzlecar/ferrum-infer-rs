@@ -15,12 +15,38 @@ pub fn remember(code: &str) -> String {
     format!("The code to remember is {code}. Reply with only OK.")
 }
 
+/// The state probe distinguishes semantic controls from opaque remembered data.
+/// Control capitalization does not establish history isolation; a changed code
+/// does, so code comparisons must remain case-sensitive even for `OK` or `NONE`.
+#[derive(Debug, Clone, Copy)]
+pub enum StateAnswer {
+    Acknowledged,
+    NoMemory,
+    Code(&'static str),
+}
+
+impl StateAnswer {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Acknowledged => "OK",
+            Self::NoMemory => "NONE",
+            Self::Code(code) => code,
+        }
+    }
+
+    fn matches(self, content: &str) -> bool {
+        match self {
+            Self::Acknowledged | Self::NoMemory => {
+                probe_answer_matches(&content.to_ascii_uppercase(), self.text())
+            }
+            Self::Code(code) => probe_answer_matches(content, code),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RunStep {
-    Turn {
-        prompt: String,
-        answer: &'static str,
-    },
+    Turn { prompt: String, answer: StateAnswer },
     Reset,
 }
 
@@ -30,16 +56,16 @@ pub fn run_steps() -> Vec<RunStep> {
         steps.extend([
             RunStep::Turn {
                 prompt: remember(code),
-                answer: "OK",
+                answer: StateAnswer::Acknowledged,
             },
             RunStep::Turn {
                 prompt: RECALL.into(),
-                answer: code,
+                answer: StateAnswer::Code(code),
             },
             RunStep::Reset,
             RunStep::Turn {
                 prompt: EMPTY_RECALL.into(),
-                answer: "NONE",
+                answer: StateAnswer::NoMemory,
             },
         ]);
     }
@@ -48,16 +74,17 @@ pub fn run_steps() -> Vec<RunStep> {
 
 fn answer(
     observation: &Value,
-    expected: &str,
+    expected: StateAnswer,
     protocol: ModelReasoningProtocol,
     max_tokens: u32,
 ) -> Result<(), String> {
     let (content, reasoning, tokens) = boundary_observation(observation)?;
     if !matches!(observation["finish_reason"].as_str(), Some("stop" | "eos"))
-        || !probe_answer_matches(content, expected)
+        || !expected.matches(content)
         || tokens > u64::from(max_tokens)
         || (protocol == ModelReasoningProtocol::None && !reasoning.is_empty())
     {
+        let expected = expected.text();
         return Err(format!(
             "state probe expected a completed {expected:?}, received {content:?}"
         ));
@@ -172,7 +199,7 @@ pub struct ServeStateEvidence {
 fn exchange(
     exchange: &StateExchange,
     expected_messages: &[Value],
-    expected: &str,
+    expected: StateAnswer,
     stream: bool,
     ids: &mut BTreeSet<String>,
     protocol: ModelReasoningProtocol,
@@ -206,7 +233,7 @@ pub fn verify_serve(
         exchange(
             &evidence.writes[index],
             &messages,
-            "OK",
+            StateAnswer::Acknowledged,
             index == 1,
             &mut ids,
             protocol,
@@ -224,7 +251,7 @@ pub fn verify_serve(
             exchange(
                 &exchanges[index],
                 history,
-                CODES[index],
+                StateAnswer::Code(CODES[index]),
                 (index + round) % 2 == 1,
                 &mut ids,
                 protocol,
@@ -237,7 +264,7 @@ pub fn verify_serve(
         exchange(
             fresh,
             &[json!({"role": "user", "content": EMPTY_RECALL})],
-            "NONE",
+            StateAnswer::NoMemory,
             index == 1,
             &mut ids,
             protocol,

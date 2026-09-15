@@ -15,15 +15,19 @@ fn reset(records: &mut Vec<Value>, epoch: u64, before: u64) {
 }
 
 pub(crate) fn run_fixture() -> Vec<Value> {
+    run_fixture_with_controls("OK", "NONE")
+}
+
+fn run_fixture_with_controls(acknowledged: &str, no_memory: &str) -> Vec<Value> {
     let mut records = Vec::new();
-    turn(&mut records, 0, 0, &remember("cobalt-731"), "OK");
+    turn(&mut records, 0, 0, &remember("cobalt-731"), acknowledged);
     turn(&mut records, 0, 1, RECALL, "cobalt-731");
     reset(&mut records, 1, 4);
-    turn(&mut records, 1, 0, EMPTY_RECALL, "NONE");
-    turn(&mut records, 1, 1, &remember("amber-284"), "OK");
+    turn(&mut records, 1, 0, EMPTY_RECALL, no_memory);
+    turn(&mut records, 1, 1, &remember("amber-284"), acknowledged);
     turn(&mut records, 1, 2, RECALL, "amber-284");
     reset(&mut records, 2, 6);
-    turn(&mut records, 2, 0, EMPTY_RECALL, "NONE");
+    turn(&mut records, 2, 0, EMPTY_RECALL, no_memory);
     records
 }
 
@@ -76,6 +80,10 @@ fn run_reset_requires_forgotten_old_state_and_continuity_of_the_new_history() {
 }
 
 pub(crate) fn serve_fixture() -> ServeStateEvidence {
+    serve_fixture_with_controls("OK", "NONE")
+}
+
+fn serve_fixture_with_controls(acknowledged: &str, no_memory: &str) -> ServeStateEvidence {
     let mut evidence = ServeStateEvidence {
         writes: Vec::new(),
         recall_rounds: Vec::new(),
@@ -88,9 +96,9 @@ pub(crate) fn serve_fixture() -> ServeStateEvidence {
             request_id: format!("write-{index}"),
             messages: messages.clone(),
             stream: index == 1,
-            observation: observed("OK"),
+            observation: observed(acknowledged),
         });
-        messages.push(observed("OK")["message"].clone());
+        messages.push(observed(acknowledged)["message"].clone());
         histories.push(messages);
     }
     for round in 0..2 {
@@ -112,10 +120,100 @@ pub(crate) fn serve_fixture() -> ServeStateEvidence {
             request_id: format!("fresh-{stream}"),
             messages: vec![json!({"role": "user", "content": EMPTY_RECALL})],
             stream,
-            observation: observed("NONE"),
+            observation: observed(no_memory),
         });
     }
     evidence
+}
+
+#[test]
+fn state_controls_ignore_ascii_case_but_remembered_codes_do_not() {
+    for (acknowledged, no_memory) in [("ok", "None"), ("Ok.", "none"), ("**oK**", "`nOnE`.")] {
+        verify_run(
+            &run_fixture_with_controls(acknowledged, no_memory),
+            ModelReasoningProtocol::None,
+            16,
+        )
+        .unwrap();
+        verify_serve(
+            &serve_fixture_with_controls(acknowledged, no_memory),
+            ModelReasoningProtocol::None,
+            16,
+        )
+        .unwrap();
+    }
+
+    // An opaque code that happens to spell a control word is not a control.
+    for (code, changed) in [("NONE", "None"), ("OK", "ok"), ("cobalt-731", "Cobalt-731")] {
+        assert!(StateAnswer::Code(code).matches(code));
+        assert!(!StateAnswer::Code(code).matches(changed));
+    }
+    for changed in ["cobalt-732", "cobalt 731", "cobalt- 731", "amber-284"] {
+        assert!(!StateAnswer::Code("cobalt-731").matches(changed));
+    }
+}
+
+#[test]
+fn state_controls_reject_leaked_codes_extra_text_and_non_ascii_lookalikes() {
+    for no_memory in [
+        "",
+        "cobalt-731",
+        "amber-284",
+        "None cobalt-731",
+        "None of them",
+        "None\nOK",
+        "N O N E",
+        "N\u{039f}NE", // Greek omicron is not the ASCII control word.
+    ] {
+        assert!(verify_run(
+            &run_fixture_with_controls("ok", no_memory),
+            ModelReasoningProtocol::None,
+            16,
+        )
+        .is_err());
+        assert!(verify_serve(
+            &serve_fixture_with_controls("ok", no_memory),
+            ModelReasoningProtocol::None,
+            16,
+        )
+        .is_err());
+    }
+    for acknowledged in ["", "OK cobalt-731", "OK\nNONE", "\u{039f}K"] {
+        assert!(!StateAnswer::Acknowledged.matches(acknowledged));
+    }
+}
+
+#[test]
+fn mixed_case_state_controls_preserve_protocol_history_and_completion_checks() {
+    for mutate in [
+        |records: &mut Vec<Value>| records[6]["finish_reason"] = json!("length"),
+        |records: &mut Vec<Value>| records[6]["usage"]["total_tokens"] = json!(26),
+        |records: &mut Vec<Value>| records[6]["reasoning_content"] = Value::Null,
+        |records: &mut Vec<Value>| records[6]["history_epoch"] = json!(0),
+        |records: &mut Vec<Value>| records[3]["content"] = json!("Cobalt-731"),
+    ] {
+        let mut records = run_fixture_with_controls("ok", "None");
+        mutate(&mut records);
+        assert!(verify_run(&records, ModelReasoningProtocol::None, 16).is_err());
+    }
+    for mutate in [
+        |e: &mut ServeStateEvidence| e.fresh[0].observation["finish_reason"] = json!("length"),
+        |e: &mut ServeStateEvidence| {
+            e.fresh[0].observation["message"]["reasoning"] = json!("thought")
+        },
+        |e: &mut ServeStateEvidence| e.fresh[0].observation["usage"]["total_tokens"] = json!(26),
+        |e: &mut ServeStateEvidence| {
+            e.recall_rounds[0][0].messages[1] = observed("OK")["message"].clone()
+        },
+        |e: &mut ServeStateEvidence| e.fresh[0].request_id = e.writes[0].request_id.clone(),
+        |e: &mut ServeStateEvidence| {
+            e.recall_rounds[0][0].observation["message"]["content"] = json!("Cobalt-731")
+        },
+    ] {
+        let mut evidence = serve_fixture_with_controls("ok", "None");
+        mutate(&mut evidence);
+        assert!(verify_serve(&evidence, ModelReasoningProtocol::None, 16).is_err());
+    }
 }
 
 #[test]
