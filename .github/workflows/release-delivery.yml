@@ -989,17 +989,19 @@ jobs:
           - runner: macos-14
             platform: macos
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build the controller before invoking the public installer
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Build only acceptance helpers before invoking the public installer
+        timeout-minutes: 30
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
       - name: Verify deployed script and execute the README download pipeline
         run: |
           target/debug/release_delivery entry \
@@ -1014,28 +1016,47 @@ jobs:
           target/debug/release_delivery entry \
             --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
             --output "$RUNNER_TEMP/public-entry-after.json"
+      # This bounded CPU sample tests the public installation, not default GPU
+      # selection, Quick Start capacity, or another full release model matrix.
+      - name: Run the publicly installed CPU binary through real run and HTTP serve
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/public-bootstrap-runtime"
+          mkdir "$receipt"
+          target/debug/model_regression \
+            --ferrum-bin "$HOME/.local/bin/ferrum" --backend cpu \
+            --model "$PUBLIC_SMOKE_MODEL" --checks basic --profile-id public-install-cpu-basic \
+            --source-label "$PUBLIC_SMOKE_MODEL" --precision-label safetensors-bf16-f32 \
+            --context-tokens 2048 --max-num-seqs 1 --max-tokens 512 \
+            --run-timeout-secs 600 --startup-timeout-secs 600 --request-timeout-secs 300 \
+            --report-dir "$receipt/model" 2>&1 | tee "$receipt/model-runner.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-bootstrap-${{ matrix.platform }}
-          path: ${{ runner.temp }}/public-*.json
+          path: |
+            ${{ runner.temp }}/public-*.json
+            ${{ runner.temp }}/public-bootstrap-runtime/
           if-no-files-found: error
           retention-days: 30
 
   install-bootstrap-windows:
     needs: [prepare, publish]
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build the CPU controller before invoking the public installer
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Build only CPU acceptance helpers before invoking the public installer
+        timeout-minutes: 30
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
       - name: Execute the README pipeline in Windows PowerShell 5.1
         shell: powershell
         run: |
@@ -1049,11 +1070,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'The publicly installed Windows program failed startup checks' }
           & $controller entry --url https://ferrum.pandaailabs.com/install.ps1 --expected-script scripts/install.ps1 --output "$env:RUNNER_TEMP/public-entry-after.json"
           if ($LASTEXITCODE -ne 0) { throw 'The public PowerShell script changed during installation' }
+      # The hosted Windows image selects CPU through the unchanged README
+      # installer. Keep native stderr logging out of PowerShell 5.1 error records.
+      - name: Run the publicly installed Windows launcher through real run and HTTP serve
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($PSVersionTable.PSVersion -lt [version]'7.2') { throw 'Runtime log capture requires PowerShell 7.2 or later' }
+          $receipt = Join-Path $env:RUNNER_TEMP 'public-bootstrap-runtime'
+          $null = New-Item -ItemType Directory -Path $receipt -ErrorAction Stop
+          # Reuse the exact installed entrypoint verified in the previous PS 5.1
+          # process; a new step need not inherit its process-local PATH update.
+          $installed = Get-Content -Raw -LiteralPath "$env:RUNNER_TEMP/public-bootstrap-auto.json" | ConvertFrom-Json
+          $binary = $installed.requested_binary
+          & target/debug/model_regression.exe `
+            --ferrum-bin $binary --backend cpu `
+            --model $env:PUBLIC_SMOKE_MODEL --checks basic --profile-id public-install-cpu-basic `
+            --source-label $env:PUBLIC_SMOKE_MODEL --precision-label safetensors-bf16-f32 `
+            --context-tokens 2048 --max-num-seqs 1 --max-tokens 512 `
+            --run-timeout-secs 600 --startup-timeout-secs 600 --request-timeout-secs 300 `
+            --report-dir "$receipt/model" 2>&1 | Tee-Object -FilePath "$receipt/model-runner.log"
+          $runtimeExit = $LASTEXITCODE
+          $runtimeExit | Set-Content -LiteralPath "$receipt/model-runner.exit-code.txt"
+          if ($runtimeExit -ne 0) { throw "The installed Windows program failed real model regression (exit $runtimeExit)" }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-bootstrap-windows
-          path: ${{ runner.temp }}/public-*.json
+          path: |
+            ${{ runner.temp }}/public-*.json
+            ${{ runner.temp }}/public-bootstrap-runtime/
           if-no-files-found: error
           retention-days: 30
 
