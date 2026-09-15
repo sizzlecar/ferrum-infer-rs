@@ -23,9 +23,17 @@ binary and the actual installation and first-use paths.
 - `quick_start_profile_ids` contains two independent mandatory profiles.
   Neither can be replaced by another precision, smaller model, or backend.
 - `release_profile_ids` retains explicit model commitments beyond README examples.
-  Release planning requires each named profile; a cheaper model with the same
-  architecture cannot replace it. An unavailable or missing profile is a gap.
+  Release planning requires each enabled named profile; a cheaper model with the
+  same architecture cannot replace it. The explicit CUDA policy below determines
+  which CUDA lane is enabled. An unavailable or missing enabled profile is a gap.
   PR and nightly sampling do not automatically repeat these release commitments.
+- `release_cuda` separates mandatory pinned local representatives from optional
+  extended cloud profiles. Every CUDA profile belongs to exactly one lane.
+  The committed `cloud: "disabled"` default can be changed to `required` only by
+  explicit release opt-in. Cloud-only model-runtime obligations are disclosed as
+  `extended_not_run` when disabled, not reported as passing. This policy cannot
+  defer numerical, contract or installation obligations, remove local tasks, or
+  change PR/nightly coverage.
 - `required_targets` keeps advertised capability groups visible. Selection must
   consider stage and changed behavior; the number of profiles is not a gate.
   Additional precision-specific work belongs to affected loader/kernel changes.
@@ -34,10 +42,12 @@ binary and the actual installation and first-use paths.
   all other missing bindings remain gaps. Neither declaration nor model
   availability means a check ran or passed.
 
-The current release commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal,
-9B and Qwen3.8 27B mixed GGUF on CUDA/Metal, and Qwen3.5 2B SafeTensors on CPU/Metal.
+The current default commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal,
+9B and Qwen3.8 27B mixed GGUF on Metal, and Qwen3.5 2B SafeTensors on CPU/Metal.
+Local CUDA additionally requires Qwen3.5 0.8B and Llama3.2 1B SafeTensors.
+CUDA 9B/27B and the other large CUDA profiles remain an explicit cloud extension.
 Each GGUF profile declares its exact file and independent semantic source;
-execution must observe those sources. These are required checks, not completed
+execution must observe those sources. These are planned checks, not completed
 support claims. Existing CUDA SafeTensors and other advertised architecture and
 encoding representatives remain in the catalog.
 

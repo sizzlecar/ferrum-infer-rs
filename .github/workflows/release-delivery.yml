@@ -6,8 +6,13 @@ on:
     paths: [Cargo.toml]
   workflow_dispatch:
     inputs:
+      run_cloud_cuda:
+        description: "Opt in to rented CUDA hardware for extended large-model regression (local CUDA remains required)"
+        required: false
+        default: false
+        type: boolean
       reuse_cuda_run_id:
-        description: "Optional completed main release run whose original CUDA evidence can be reverified; otherwise execute CUDA normally"
+        description: "Optional cloud evidence source; requires run_cloud_cuda=true"
         required: false
         default: ''
         type: string
@@ -39,6 +44,7 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
       baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
+      cloud_cuda: ${{ steps.plan.outputs.cloud_cuda }}
       windows_launcher_url: ${{ steps.launcher.outputs.url }}
       windows_launcher_sha256: ${{ steps.launcher.outputs.sha256 }}
     steps:
@@ -51,12 +57,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-delivery-controller-rust-1.91
-      - name: Plan the complete release before building or renting hardware
+      - name: Freeze required local and optional cloud validation before building
         id: plan
         env:
           EVENT: ${{ github.event_name }}
+          RUN_CLOUD_CUDA: ${{ github.event_name == 'workflow_dispatch' && inputs.run_cloud_cuda }}
+          REUSE_CUDA_RUN_ID: ${{ inputs.reuse_cuda_run_id }}
           GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
         run: |
+          if [ "$RUN_CLOUD_CUDA" != true ] && [ -n "$REUSE_CUDA_RUN_ID" ]; then
+            echo '::error::reuse_cuda_run_id requires explicit run_cloud_cuda=true'
+            exit 1
+          fi
           git fetch origin main --tags
           git merge-base --is-ancestor HEAD origin/main
           version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
@@ -77,12 +89,15 @@ jobs:
           test -n "$base"
           cargo run --locked -p ferrum-bench-core --example regression_plan -- \
             --catalog docs/release-regression-catalog.json --base "$base" --candidate HEAD \
+            --run-cloud-cuda "$RUN_CLOUD_CUDA" \
             --stage release --output "$RUNNER_TEMP/release-plan.json" \
             --summary "$RUNNER_TEMP/release-plan.md"
           cat "$RUNNER_TEMP/release-plan.md" >> "$GITHUB_STEP_SUMMARY"
           # A missing executable binding is an implementation gap, not a reason
           # to rent a GPU and hope a broad smoke test covers it.
           jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == [] and .performance_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
+          cloud_cuda=$(jq -er '.plan.release_cuda.cloud | if . == "required" then "true" elif . == "disabled" then "false" else error("missing frozen CUDA policy") end' "$RUNNER_TEMP/release-plan.json")
+          test "$cloud_cuda" = "$RUN_CLOUD_CUDA"
           # Freeze source selectors and latency policy before staging or rental.
           # Every newly selected performance target needs an explicit source;
           # a missing mapping cannot silently reuse a different model.
@@ -108,7 +123,13 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
-          printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\n' "$version" "$rc_tag" "$base" >> "$GITHUB_OUTPUT"
+          printf '\n## CUDA validation scope\n\nRequired: local small-model and device correctness regression.\n' >> "$RUNNER_TEMP/release-notes.md"
+          if [ "$cloud_cuda" = true ]; then
+            printf 'Extended cloud model regression: explicitly enabled and required.\n' >> "$RUNNER_TEMP/release-notes.md"
+          else
+            printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
+          fi
+          printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\ncloud_cuda=%s\n' "$version" "$rc_tag" "$base" "$cloud_cuda" >> "$GITHUB_OUTPUT"
       - name: Reuse the immutable stable launcher from the formal baseline
         if: steps.plan.outputs.active == 'true'
         id: launcher
@@ -319,8 +340,12 @@ jobs:
 
   cpu-models:
     name: CPU release models
-    needs: [prepare, tools, stage]
+    needs: [prepare, tools, stage, cuda-models]
     runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+    concurrency:
+      group: ferrum-panda-hardware
+      cancel-in-progress: false
+      queue: max
     # Two complete model suites can each consume the task allowance below.
     # Keep time for artifact preparation and evidence upload after execution.
     timeout-minutes: 420
@@ -511,7 +536,69 @@ jobs:
           retention-days: 30
 
   cuda-models:
+    # Windows native staging and this WSL CUDA runner share Panda's physical RAM.
+    needs: [prepare, quality, tools, stage, stage-cuda-linux, stage-cuda, stage-cpu-windows]
+    runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+    concurrency:
+      group: ferrum-panda-hardware
+      cancel-in-progress: false
+      queue: max
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.tools.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-tools
+      - name: Verify prepared release tools
+        run: |
+          cd "$RUNNER_TEMP/release-tools"
+          tar -xzf tools.tar.gz
+          sha256sum --check binaries.sha256
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_runner_id }},${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-cuda
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan
+      - name: Execute required local CUDA models from the staged archive
+        run: |
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,memory.free,driver_version --format=csv
+          model_gate prepare --backend cuda --cuda-lane local --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
+            --output-dir "$RUNNER_TEMP/tasks"
+          release_delivery inspect \
+            --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
+            --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
+            --extract-dir "$RUNNER_TEMP/extracted-cuda" --output "$RUNNER_TEMP/installation-cuda.json"
+          cd "$RUNNER_TEMP/staged-cuda"
+          sha256sum --check model-regression-linux-x86_64.tar.gz.sha256
+          tar -xzf model-regression-linux-x86_64.tar.gz model_regression
+          runner_sha=$(awk '{print $1}' model-regression-linux-x86_64.binary.sha256)
+          release_delivery local --backend cuda \
+            --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
+            --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
+            --report-dir "$RUNNER_TEMP/model-cuda" --task-timeout-secs 1500 --request-timeout-secs 300
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-cuda-evidence
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/installation-cuda.json
+            ${{ runner.temp }}/model-cuda/
+          if-no-files-found: error
+          retention-days: 30
+
+  cuda-models-cloud:
     needs: [prepare, tools, stage, stage-cuda-linux]
+    if: needs.prepare.outputs.active == 'true' && needs.prepare.outputs.cloud_cuda == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 200
     env:
@@ -542,7 +629,7 @@ jobs:
           path: ${{ runner.temp }}/plan
       - name: Prepare controller and verified CUDA bytes before the lease clock
         run: |
-          model_gate prepare --backend cuda --plan "$RUNNER_TEMP/plan/release-plan.json" \
+          model_gate prepare --backend cuda --cuda-lane cloud --plan "$RUNNER_TEMP/plan/release-plan.json" \
             --version "$VERSION" --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
             --output-dir "$RUNNER_TEMP/tasks"
           release_delivery inspect \
@@ -576,14 +663,14 @@ jobs:
             jq -e '.status == "ahead" or .status == "identical"'
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs?filter=all&per_page=100" > "$reuse/jobs.json"
           jq -e --slurpfile run "$reuse/run.json" '
-            [.[].jobs[] | select(.name == "cuda-models")] | group_by(.run_attempt) |
+            [.[].jobs[] | select(.name == "cuda-models-cloud")] | group_by(.run_attempt) |
             if any(.[]; length != 1) then error("ambiguous CUDA job") else flatten end |
             last as $job | select($job != null) | $job |
             select(.run_id == $run[0].id and .head_sha == $run[0].head_sha and
               .run_attempt > 0 and .run_attempt <= $run[0].run_attempt and
               .status == "completed" and .conclusion == "success")' "$reuse/jobs.json" > "$reuse/job.json"
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts?per_page=100" | \
-            jq -e '[.[].artifacts[] | select(.name == "release-cuda-evidence")] | if length == 1 then .[0] else error("ambiguous CUDA artifact") end' > "$reuse/artifact.json"
+            jq -e '[.[].artifacts[] | select(.name == "release-cuda-cloud-evidence")] | if length == 1 then .[0] else error("ambiguous CUDA artifact") end' > "$reuse/artifact.json"
           jq -e --slurpfile job "$reuse/job.json" --slurpfile run "$reuse/run.json" '
             def time: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
             def successful($name): [$job[0].steps[] | select(.name == $name)] |
@@ -670,7 +757,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: release-cuda-evidence
+          name: release-cuda-cloud-evidence
           overwrite: true
           path: |
             ${{ runner.temp }}/model-cuda/
@@ -679,7 +766,18 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cpu-models]
+    needs: [prepare, quality, tools, stage, stage-metal, stage-cuda-linux, stage-cuda, stage-cpu-windows, tasks, metal-models, cuda-models, cuda-models-cloud, cpu-models]
+    if: >-
+      always() && !cancelled() &&
+      needs.prepare.outputs.active == 'true' &&
+      needs.prepare.result == 'success' && needs.quality.result == 'success' &&
+      needs.tools.result == 'success' && needs.stage.result == 'success' &&
+      needs.stage-metal.result == 'success' && needs.stage-cuda-linux.result == 'success' &&
+      needs.stage-cuda.result == 'success' && needs.stage-cpu-windows.result == 'success' &&
+      needs.tasks.result == 'success' && needs.metal-models.result == 'success' &&
+      needs.cuda-models.result == 'success' && needs.cpu-models.result == 'success' &&
+      ((needs.prepare.outputs.cloud_cuda == 'true' && needs.cuda-models-cloud.result == 'success') ||
+       (needs.prepare.outputs.cloud_cuda == 'false' && needs.cuda-models-cloud.result == 'skipped'))
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -763,7 +861,12 @@ jobs:
             --windows-staged "$RUNNER_TEMP/staged-windows"
             --repo "$GITHUB_REPOSITORY" --ci-run-id "$GITHUB_RUN_ID")
           for abi in "$RUNNER_TEMP/staged/"*.abi.json; do gate_args+=(--abi "$abi"); done
-          for install in "$RUNNER_TEMP/installation/"*.json; do gate_args+=(--installation "$install"); done
+          # The planning host's CUDA receipt is extract-only. Use the local GPU
+          # host's same-artifact runtime receipt as the authoritative install check.
+          for install in "$RUNNER_TEMP/installation/"*.json; do
+            if [ "$install" != "$RUNNER_TEMP/installation/cuda.json" ]; then gate_args+=(--installation "$install"); fi
+          done
+          gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json")
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
@@ -827,6 +930,10 @@ jobs:
             brew: /home/linuxbrew/.linuxbrew/bin/brew
             formula: ferrum-cuda
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-homebrew-{0}', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

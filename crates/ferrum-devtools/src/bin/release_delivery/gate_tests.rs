@@ -3,8 +3,8 @@ use ferrum_bench_core::release_regression::model_basic::{
     ARITHMETIC_PROMPT, MEMORY_PROMPT, RECALL_PROMPT,
 };
 use ferrum_bench_core::release_regression::{
-    model_tasks::ModelRunCapacity, Entrypoint, ExecutionTarget, Impact, ModelProfile, PlanCost,
-    SelectedProfile,
+    model_tasks::ModelRunCapacity, CloudCudaMode, Entrypoint, ExecutionTarget, Impact,
+    ModelProfile, PlanCost, SelectedProfile,
 };
 use serde_json::json;
 
@@ -38,6 +38,8 @@ fn task() -> ExpectedModelRun {
 }
 fn make_plan(task: &ExpectedModelRun) -> Plan {
     Plan {
+        release_cuda: None,
+        extended_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
@@ -73,6 +75,63 @@ fn make_plan(task: &ExpectedModelRun) -> Plan {
 }
 fn plan_document(plan: &Plan) -> Value {
     json!({"schema_version":2,"stage":"release","provenance":{"candidate":"a".repeat(40)},"plan":plan,"model_tasks":model_task_schedule(plan)})
+}
+
+#[test]
+fn cuda_policy_requires_committed_membership_and_complete_local_tasks() {
+    let mut expected = task();
+    expected.profile.model = format!("fixture/small@{}", "a".repeat(40));
+    let mut large = expected.profile.clone();
+    large.id = "cloud-large".into();
+    large.model = format!("fixture/large@{}", "b".repeat(40));
+    let policy = ReleaseCudaPolicy {
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec![expected.profile.id.clone()],
+        extended_cloud_profile_ids: vec![large.id.clone()],
+        reason: "Always validate local representatives; require cloud only when requested".into(),
+    };
+    let catalog = json!({"release_cuda":policy,"profiles":[expected.profile,large],
+        "quick_start_profile_ids":[expected.profile.id], "release_profile_ids":[large.id],
+        "required_targets":[expected.profile.target]});
+    let mut input = catalog.clone();
+    input["stage"] = json!("release");
+    input["impact"] = serde_json::to_value(make_plan(&expected).impact).unwrap();
+    let input: ferrum_bench_core::release_regression::PlanInput =
+        serde_json::from_value(input).unwrap();
+    let plan = ferrum_bench_core::release_regression::plan(&input).unwrap();
+    cuda_gate::verify_policy(&plan, &catalog).unwrap();
+
+    let mut absent = plan.clone();
+    absent.release_cuda = None;
+    assert!(cuda_gate::verify_policy(&absent, &catalog).is_err());
+    let mut changed = plan.clone();
+    changed
+        .release_cuda
+        .as_mut()
+        .unwrap()
+        .mandatory_local_profile_ids
+        .clear();
+    assert!(cuda_gate::verify_policy(&changed, &catalog).is_err());
+    let mut missing_cloud = plan.clone();
+    missing_cloud.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    assert!(cuda_gate::verify_policy(&missing_cloud, &catalog).is_err());
+    let mut unsafe_default = catalog.clone();
+    unsafe_default["release_cuda"]["cloud"] = json!("required");
+    assert!(cuda_gate::verify_policy(&plan, &unsafe_default).is_err());
+    let mut hidden = plan.clone();
+    assert!(!hidden.extended_not_run.is_empty());
+    hidden.extended_not_run.clear();
+    assert!(cuda_gate::verify_policy(&hidden, &catalog).is_err());
+    let mut weakened = plan.clone();
+    weakened.obligations.remove(0);
+    assert!(cuda_gate::verify_policy(&weakened, &catalog).is_err());
+
+    let mut document = plan_document(&plan);
+    document["plan"]["release_cuda"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cloud");
+    assert!(release_plan(&document).unwrap_err().contains("explicitly"));
 }
 fn distributions() -> Distributions {
     BTreeMap::from([(
@@ -380,6 +439,16 @@ async fn ci_fixture_with_windows(
     expect_jobs: bool,
     windows_attempt: Option<windows_assets::WindowsAttempts>,
 ) -> Result<(), String> {
+    ci_fixture_with_validation(run, jobs, status, expect_jobs, windows_attempt, None).await
+}
+async fn ci_fixture_with_validation(
+    run: Value,
+    jobs: Vec<Value>,
+    status: u16,
+    expect_jobs: bool,
+    windows_attempt: Option<windows_assets::WindowsAttempts>,
+    cuda_policy: Option<&ReleaseCudaPolicy>,
+) -> Result<(), String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -430,8 +499,8 @@ async fn ci_fixture_with_windows(
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
-    let result = match windows_attempt {
-        Some(attempt) => {
+    let result = match (windows_attempt, cuda_policy) {
+        (attempt, policy) if attempt.is_some() || policy.is_some() => {
             ci_at_with_windows(
                 &client,
                 &url,
@@ -439,17 +508,60 @@ async fn ci_fixture_with_windows(
                 17,
                 &"a".repeat(40),
                 None,
-                Some(attempt),
+                attempt,
+                policy,
             )
             .await
         }
-        None => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await,
+        _ => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await,
     };
     tokio::time::timeout(Duration::from_secs(3), worker)
         .await
         .expect("CI fixture did not finish expected requests")
         .unwrap();
     result
+}
+
+#[tokio::test]
+async fn cuda_jobs_are_bound_to_the_actual_candidate_and_latest_attempt() {
+    let mut local = ci_job();
+    local["id"] = json!(31);
+    local["name"] = json!("cuda-models");
+    let mut cloud = ci_job();
+    cloud["id"] = json!(32);
+    cloud["name"] = json!("cuda-models-cloud");
+    cloud["conclusion"] = json!("skipped");
+    let policy = ReleaseCudaPolicy {
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec!["small".into()],
+        extended_cloud_profile_ids: vec!["large".into()],
+        reason: "Required local model execution and optional cloud extension".into(),
+    };
+    let verify = |jobs| ci_fixture_with_validation(ci_run(), jobs, 200, true, None, Some(&policy));
+    verify(vec![ci_job(), local.clone(), cloud.clone()])
+        .await
+        .unwrap();
+    for field in ["head_sha", "run_id", "run_attempt"] {
+        let mut foreign = local.clone();
+        foreign[field] = match field {
+            "head_sha" => json!("c".repeat(40)),
+            "run_id" => json!(18),
+            _ => json!(3),
+        };
+        assert!(verify(vec![ci_job(), foreign, cloud.clone()])
+            .await
+            .is_err());
+    }
+    let mut old = local.clone();
+    old["id"] = json!(30);
+    old["run_attempt"] = json!(1);
+    local["conclusion"] = json!("failure");
+    assert!(verify(vec![ci_job(), old.clone(), local, cloud.clone()])
+        .await
+        .is_err());
+    assert!(verify(vec![ci_job(), cloud.clone()]).await.is_err());
+    cloud["conclusion"] = json!("success");
+    assert!(verify(vec![ci_job(), old, cloud]).await.is_err());
 }
 
 fn windows_ci_job() -> Value {

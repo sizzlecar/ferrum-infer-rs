@@ -10,10 +10,11 @@ use ferrum_bench_core::{
         distribution::distribution_check_descriptors,
         model_schedule::{model_check_descriptors, model_task_schedule, ModelTaskSchedule},
         model_tasks::{
-            verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_FUNCTIONAL_CAPACITY,
+            verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
+            DEFAULT_FUNCTIONAL_CAPACITY,
         },
-        Backend, Behavior, CheckDescriptor, EvidenceLayer, Gap, Obligation, ObligationScope, Plan,
-        ReleasePerformancePolicy, Stage,
+        Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, Obligation,
+        ObligationScope, Plan, ReleaseCudaPolicy, ReleasePerformancePolicy, Stage,
     },
 };
 use serde::Deserialize;
@@ -30,6 +31,9 @@ use tokio::process::Command;
 
 #[path = "ci_evidence.rs"]
 mod ci_evidence;
+
+#[path = "cuda_gate.rs"]
+mod cuda_gate;
 
 #[path = "windows_assets.rs"]
 pub(super) mod windows_assets;
@@ -111,7 +115,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != candidate {
         return Err("workspace HEAD does not match the plan candidate".into());
     }
-    if plan.deferred_performance.is_some() {
+    {
         let catalog = Command::new("git")
             .arg("-C")
             .arg(&workspace)
@@ -127,18 +131,19 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
             .kill_on_drop(true)
             .output()
             .await
-            .map_err(|_| "cannot read candidate release performance policy")?;
+            .map_err(|_| "cannot read candidate release validation policy")?;
         if !catalog.status.success()
             || text(&document["provenance"], "catalog_sha256")?
                 != format!("{:x}", Sha256::digest(&catalog.stdout))
         {
             return Err(
-                "deferred performance plan must use the candidate's committed catalog".into(),
+                "release validation plan must use the candidate's committed catalog".into(),
             );
         }
         let catalog: Value = serde_json::from_slice(&catalog.stdout)
             .map_err(|_| "invalid candidate release catalog")?;
         verify_performance_policy(&plan, &catalog)?;
+        cuda_gate::verify_policy(&plan, &catalog)?;
     }
     // The candidate's reachable base can be older than today's main releases.
     // Reject a historical downgrade before any public channel can be mutated.
@@ -209,7 +214,18 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     let contracts: ContractReport = read(&args.contracts)?;
     verify_contract_report(&contract_groups(), &contracts)
         .map_err(|issues| format!("CPU contract evidence: {}", issues.join("; ")))?;
-    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempts).await?;
+    let cuda_policy = plan
+        .release_cuda
+        .as_ref()
+        .ok_or("missing frozen CUDA policy")?;
+    verify_ci(
+        &args.repo,
+        args.ci_run_id,
+        &candidate,
+        windows.attempts,
+        cuda_policy,
+    )
+    .await?;
     let ci_evidence = ci_evidence::load(
         &args.repo,
         args.ci_run_id,
@@ -224,7 +240,14 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
     // A rerun that began while artifacts were inspected must not reuse old Quality.
-    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempts).await?;
+    verify_ci(
+        &args.repo,
+        args.ci_run_id,
+        &candidate,
+        windows.attempts,
+        cuda_policy,
+    )
+    .await?;
     let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
         return Err("release notes are empty".into());
@@ -297,7 +320,16 @@ fn release_plan(document: &Value) -> Result<(Plan, String, ModelTaskSchedule), S
     }
     let plan: Plan = serde_json::from_value(document["plan"].clone())
         .map_err(|e| format!("invalid typed release plan: {e}"))?;
+    if document["plan"]["release_cuda"].is_object()
+        && !matches!(
+            document["plan"]["release_cuda"]["cloud"].as_str(),
+            Some("disabled" | "required")
+        )
+    {
+        return Err("frozen CUDA policy must explicitly state whether cloud was enabled".into());
+    }
     plan.validate_performance_deferral()?;
+    plan.validate_cuda_policy()?;
     let candidate = text(&document["provenance"], "candidate")?;
     if !hex(&candidate, 40) || plan.stage != Stage::Release {
         return Err("release plan has invalid candidate or stage".into());
@@ -557,7 +589,11 @@ fn validate_tasks(
             || expected.disable_thinking != run.quick_start
             || expected.use_default_backend != run.quick_start
             || expected.runtime_capacity
-                != (!run.quick_start).then_some(DEFAULT_FUNCTIONAL_CAPACITY)
+                != (!run.quick_start).then_some(if run.cuda_lane == Some(CudaModelLane::Local) {
+                    DEFAULT_CUDA_FUNCTIONAL_CAPACITY
+                } else {
+                    DEFAULT_FUNCTIONAL_CAPACITY
+                })
             || expected.checks.iter().copied().collect::<BTreeSet<_>>()
                 != run.checks.iter().copied().collect::<BTreeSet<_>>()
             || expected.checks.len() != run.checks.len()
@@ -832,6 +868,7 @@ async fn verify_ci(
     run_id: u64,
     candidate: &str,
     windows_attempt: windows_assets::WindowsAttempts,
+    cuda_policy: &ReleaseCudaPolicy,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
@@ -847,6 +884,7 @@ async fn verify_ci(
         candidate,
         token.as_deref(),
         Some(windows_attempt),
+        Some(cuda_policy),
     )
     .await
 }
@@ -859,7 +897,7 @@ async fn ci_at(
     candidate: &str,
     token: Option<&str>,
 ) -> Result<(), String> {
-    ci_at_with_windows(client, base, repo, run_id, candidate, token, None).await
+    ci_at_with_windows(client, base, repo, run_id, candidate, token, None, None).await
 }
 async fn ci_at_with_windows(
     client: &reqwest::Client,
@@ -869,6 +907,7 @@ async fn ci_at_with_windows(
     candidate: &str,
     token: Option<&str>,
     windows_attempt: Option<windows_assets::WindowsAttempts>,
+    cuda_policy: Option<&ReleaseCudaPolicy>,
 ) -> Result<(), String> {
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
@@ -929,6 +968,8 @@ async fn ci_at_with_windows(
     let mut occurrences = BTreeMap::new();
     let mut windows_occurrences = BTreeMap::new();
     let mut windows_cpu_occurrences = BTreeMap::new();
+    let mut local_cuda_occurrences = BTreeMap::new();
+    let mut cloud_cuda_occurrences = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut total = None;
     loop {
@@ -951,8 +992,11 @@ async fn ci_at_with_windows(
             }
             let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89";
             let windows_cpu_job = job["name"] == "stage-cpu-windows / Stage Windows x86_64 CPU";
+            let local_cuda_job = job["name"] == "cuda-models";
+            let cloud_cuda_job = job["name"] == "cuda-models-cloud";
             if job["name"] != "Quality / CI required"
                 && !(windows_attempt.is_some() && (windows_job || windows_cpu_job))
+                && !(cuda_policy.is_some() && (local_cuda_job || cloud_cuda_job))
             {
                 continue;
             }
@@ -964,7 +1008,11 @@ async fn ci_at_with_windows(
             {
                 return Err("Quality job belongs to another run or candidate".into());
             }
-            let selected = if windows_cpu_job {
+            let selected = if local_cuda_job {
+                &mut local_cuda_occurrences
+            } else if cloud_cuda_job {
+                &mut cloud_cuda_occurrences
+            } else if windows_cpu_job {
                 &mut windows_cpu_occurrences
             } else if windows_job {
                 &mut windows_occurrences
@@ -982,6 +1030,14 @@ async fn ci_at_with_windows(
     }
     if total != Some(ids.len() as u64) {
         return Err("CI returned an incomplete job inventory".into());
+    }
+    if let Some(policy) = cuda_policy {
+        cuda_gate::verify_jobs(
+            policy,
+            &run["event"],
+            &local_cuda_occurrences,
+            &cloud_cuda_occurrences,
+        )?;
     }
     if let Some(expected) = windows_attempt {
         ci_evidence::verify_staging_job(

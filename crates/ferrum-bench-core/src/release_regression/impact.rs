@@ -565,12 +565,14 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/regression_plan/scope.rs"
             | "examples/regression_plan/native_artifacts.rs"
             | "examples/regression_plan/native_artifacts/topology.rs"
+            | "examples/regression_plan/native_artifacts/publication.rs"
             | "examples/regression_plan/readme.rs"
             | "examples/regression_plan/readme_tests.rs"
             | "examples/release_candidate.rs"
             | "examples/contract_checks.rs"
             | "examples/release_delivery.rs"
             | "tests/release_staging_workflows.rs"
+            | "tests/release_staging_workflows/installer.rs"
     ) || relative.starts_with("src/release_regression/")
         || relative.starts_with("src/release_candidate/")
         || relative.starts_with("examples/release_candidate/")
@@ -1020,8 +1022,10 @@ mod tests {
             ".github/workflows/prepare-release.yml",
             ".github/workflows/release-delivery.yml",
             ".github/workflows/release-cloud-reaper.yml",
+            ".github/workflows/release-windows.yml",
             ".github/actionlint.yaml",
             "crates/ferrum-bench-core/src/release_regression/selection.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/installer.rs",
         ]);
         assert!(validation.areas.contains(&ChangeArea::Validation));
         assert!(validation.areas.contains(&ChangeArea::Build));
@@ -1068,10 +1072,12 @@ mod tests {
             "crates/ferrum-bench-core/examples/regression_plan.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/topology.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/publication.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme_tests.rs",
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
             "crates/ferrum-bench-core/src/stats.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/installer.rs",
         ] {
             let impact = analyze_paths([path]);
             assert_eq!(impact.areas, [ChangeArea::Validation], "{path}");
@@ -1154,6 +1160,7 @@ mod tests {
             "crates/ferrum-bench-core/src/new_runtime_sink.rs",
             "crates/ferrum-bench-core/examples/new_runner.rs",
             "crates/ferrum-bench-core/tests/shared/new_fixture.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/unreviewed.rs",
         ] {
             let impact = analyze_paths([path]);
             assert_eq!(impact.unknown_paths, [path]);

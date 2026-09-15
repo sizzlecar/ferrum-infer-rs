@@ -33,6 +33,18 @@ was publicly released. `--stage pull_request` uses the PR base instead;
 Output files must be new. Git endpoints and the catalog digest identify planning
 inputs; neither proves correctness.
 
+CUDA release model sampling defaults to the committed local lane: pinned 4B
+Q4 GGUF, 0.8B dense-hybrid SafeTensors and 1B Llama SafeTensors representatives.
+Use `--run-cloud-cuda true` only for an explicitly requested extended cloud run;
+the delivery workflow exposes the same boolean and defaults it to false.
+`model_gate prepare --backend cuda --cuda-lane local|cloud` prepares only that
+enabled lane; omitting the lane prepares all enabled CUDA tasks. Disabled
+cloud-only model obligations remain visible in `plan.extended_not_run` and do
+not count as passed. Numerical/safety targets remain unchanged. The publisher
+recomputes the partition from the committed catalog and requires local success
+even when cloud execution is enabled. See the [delivery procedure](release-candidate-automation.md)
+for resource limits and the distinction between capacity preflight and release evidence.
+
 The catalog's optional `release_performance` policy defaults to
 `{"mode":"required"}`. A release may explicitly use
 `{"mode":"deferred","reason":"..."}` to schedule comparative measurements after

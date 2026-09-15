@@ -9,6 +9,142 @@ fn fixture() -> Plan {
     fixture_with_quick_start(true)
 }
 
+fn cuda_lane_fixture(cloud: CloudCudaMode, quick_cuda: bool) -> Plan {
+    use ferrum_bench_core::release_regression::ReleaseCudaPolicy;
+    let mut profiles: Vec<_> = fixture()
+        .selected
+        .into_iter()
+        .map(|selected| selected.profile)
+        .collect();
+    let local = profiles
+        .iter_mut()
+        .find(|profile| profile.target.backend == Backend::Cuda)
+        .unwrap();
+    local.model = format!("owner/local@{}", "a".repeat(40));
+    let local_id = local.id.clone();
+    let mut extended = local.clone();
+    extended.id = "extended".into();
+    extended.model = format!("owner/extended@{}", "b".repeat(40));
+    extended.target.precision = "q4".into();
+    profiles.push(extended);
+    let quick = profiles
+        .iter()
+        .filter(|profile| {
+            profile.target.backend == Backend::Metal || (quick_cuda && profile.id == local_id)
+        })
+        .map(|profile| profile.id.clone())
+        .collect();
+    plan(&PlanInput {
+        stage: Stage::Release,
+        release_cuda: Some(ReleaseCudaPolicy {
+            cloud,
+            mandatory_local_profile_ids: vec![local_id],
+            extended_cloud_profile_ids: vec!["extended".into()],
+            reason: "Separate optional larger model coverage from required local execution.".into(),
+        }),
+        release_performance: Default::default(),
+        release_profile_ids: vec![],
+        impact: analyze_paths(Vec::<String>::new()),
+        required_targets: profiles
+            .iter()
+            .map(|profile| profile.target.clone())
+            .collect(),
+        quick_start_profile_ids: quick,
+        profiles,
+        checks: model_check_descriptors(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn cuda_lane_preparation_keeps_complete_tasks_and_rejects_disabled_cloud() {
+    for cloud in [CloudCudaMode::Disabled, CloudCudaMode::Required] {
+        let plan = cuda_lane_fixture(cloud, false);
+        let local = prepare_lane(
+            &plan,
+            &assets(),
+            "1.2.3",
+            512,
+            Some(Backend::Cuda),
+            Some(CudaModelLane::Local),
+        )
+        .unwrap();
+        assert!(local.expectations.iter().all(|task| plan
+            .release_cuda
+            .as_ref()
+            .unwrap()
+            .lane(&task.profile.id)
+            == Some(CudaModelLane::Local)));
+        assert!(local
+            .expectations
+            .iter()
+            .all(|task| task.runtime_capacity == Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY)));
+        let extended = prepare_lane(
+            &plan,
+            &assets(),
+            "1.2.3",
+            512,
+            Some(Backend::Cuda),
+            Some(CudaModelLane::Cloud),
+        );
+        if cloud == CloudCudaMode::Disabled {
+            assert!(extended.is_err());
+        } else {
+            let extended = extended.unwrap();
+            assert!(extended
+                .expectations
+                .iter()
+                .all(|task| task.runtime_capacity == Some(DEFAULT_FUNCTIONAL_CAPACITY)));
+            let all = prepare_backend(&plan, &assets(), "1.2.3", 512, Some(Backend::Cuda)).unwrap();
+            let mut union = local.expectations;
+            union.extend(extended.expectations);
+            union.sort_by(|left, right| left.profile.id.cmp(&right.profile.id));
+            assert_eq!(all.expectations, union);
+        }
+        assert!(prepare_lane(
+            &plan,
+            &assets(),
+            "1.2.3",
+            512,
+            Some(Backend::Metal),
+            Some(CudaModelLane::Local)
+        )
+        .is_err());
+        assert!(prepare_lane(
+            &plan,
+            &assets(),
+            "1.2.3",
+            512,
+            None,
+            Some(CudaModelLane::Local)
+        )
+        .is_err());
+    }
+    let quick = cuda_lane_fixture(CloudCudaMode::Disabled, true);
+    let tasks = prepare_lane(
+        &quick,
+        &assets(),
+        "1.2.3",
+        512,
+        Some(Backend::Cuda),
+        Some(CudaModelLane::Local),
+    )
+    .unwrap();
+    assert!(tasks
+        .expectations
+        .iter()
+        .all(|task| task.runtime_capacity.is_none() && task.use_default_backend));
+    assert!(prepare_lane(
+        &fixture(),
+        &assets(),
+        "1.2.3",
+        512,
+        Some(Backend::Cuda),
+        Some(CudaModelLane::Local)
+    )
+    .is_err());
+}
+
 fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
     let profiles: Vec<_> = [Backend::Metal, Backend::Cuda, Backend::Cpu]
         .into_iter()
@@ -29,6 +165,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
         })
         .collect();
     plan(&PlanInput {
+        release_cuda: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,

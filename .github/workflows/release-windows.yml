@@ -61,6 +61,10 @@ jobs:
   build:
     name: Stage Windows x86_64 ${{ inputs.backend == 'cuda' && 'CUDA sm89' || 'CPU' }}
     runs-on: ${{ inputs.backend == 'cuda' && fromJSON('["self-hosted", "Windows", "X64", "ferrum-windows-native"]') || fromJSON('["windows-2022"]') }}
+    concurrency:
+      group: ${{ inputs.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-hosted-windows-stage-{0}', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
     timeout-minutes: 180
     outputs:
       asset_id: ${{ steps.windows_assets.outputs.artifact-id }}

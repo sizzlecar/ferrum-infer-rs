@@ -26,6 +26,8 @@ fn profile() -> ModelProfile {
 fn plan() -> Plan {
     let profile = profile();
     Plan {
+        release_cuda: None,
+        extended_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
