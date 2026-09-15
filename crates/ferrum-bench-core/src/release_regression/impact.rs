@@ -171,6 +171,8 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             | "packaging/windows/ferrum.iss"
             | "website/cloudflare-worker.js"
             | "website/wrangler.jsonc"
+            | "website/README.md"
+            | "assets/brand/ferrum-lockup.svg"
     ) {
         return Some((vec![Build, Validation],
             "source checkout and distribution entrypoints: retain build, installation, upgrade and publication contracts; inference executes in the separately built product"));
@@ -206,11 +208,18 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             || relative == "tests/fixtures/unix_bootstrap_program.rs"
             || matches!(
                 relative,
-                "tests/support/http_fixture.rs" | "tests/unix_bootstrap/candidate.rs"
+                "tests/support/http_fixture.rs"
+                    | "tests/unix_bootstrap/candidate.rs"
+                    | "tests/unix_bootstrap/reuse.rs"
+                    | "tests/windows_bootstrap/installed.rs"
             )
         {
             return Some((vec![Validation],
                 "independent Cargo integration target or reviewed Rust installation-test helper; production imports retain their own source impact"));
+        }
+        if relative == "README.md" {
+            return Some((vec![Validation],
+                "reviewed internal profiling-tool documentation; retain measurement validation without inferring production execution changes"));
         }
         if relative == "Cargo.toml" || (relative.starts_with("src/") && relative.ends_with(".rs")) {
             return Some((vec![Build, Validation],
@@ -555,6 +564,7 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/regression_plan.rs"
             | "examples/regression_plan/scope.rs"
             | "examples/regression_plan/native_artifacts.rs"
+            | "examples/regression_plan/native_artifacts/topology.rs"
             | "examples/regression_plan/readme.rs"
             | "examples/regression_plan/readme_tests.rs"
             | "examples/release_candidate.rs"
@@ -597,6 +607,8 @@ mod tests {
             "packaging/windows/ferrum.iss",
             "website/cloudflare-worker.js",
             "website/wrangler.jsonc",
+            "website/README.md",
+            "assets/brand/ferrum-lockup.svg",
             "crates/ferrum-cli/src/bin/ferrum-launcher.rs",
             "crates/ferrum-cli/src/bin/launcher/current.rs",
             "crates/ferrum-cli/src/bin/launcher/windows.rs",
@@ -617,6 +629,7 @@ mod tests {
         for unreviewed in [
             "scripts/inference.sh",
             "website/inference.js",
+            "assets/brand/inference.js",
             "packaging/windows/unknown.ps1",
             "crates/ferrum-cli/src/bin/launcher/unknown.rs",
             "crates/ferrum-cli/src/commands/run.rs",
@@ -673,6 +686,9 @@ mod tests {
             "crates/ferrum-devtools/tests/fixtures/unix_bootstrap_program.rs",
             "crates/ferrum-devtools/tests/support/http_fixture.rs",
             "crates/ferrum-devtools/tests/unix_bootstrap/candidate.rs",
+            "crates/ferrum-devtools/tests/unix_bootstrap/reuse.rs",
+            "crates/ferrum-devtools/tests/windows_bootstrap/installed.rs",
+            "crates/ferrum-devtools/README.md",
             "crates/ferrum-cli/src/source_resolver/cache/tests.rs",
         ] {
             let impact = analyze_paths([path]);
@@ -681,6 +697,8 @@ mod tests {
         }
         for path in [
             "crates/ferrum-devtools/tests/fixtures/unknown.rs",
+            "crates/ferrum-devtools/tests/unix_bootstrap/unknown.rs",
+            "crates/ferrum-devtools/tests/windows_bootstrap/unknown.rs",
             "crates/ferrum-devtools/tests/.rs",
             "crates/ferrum-devtools/tests/config.json",
             "crates/ferrum-cli/src/source_resolver/cache/new_helper.rs",
@@ -1049,6 +1067,7 @@ mod tests {
             "crates/ferrum-bench-core/examples/checkpoint_diff/tests.rs",
             "crates/ferrum-bench-core/examples/regression_plan.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/topology.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme_tests.rs",
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
@@ -1069,6 +1088,9 @@ mod tests {
             analyze_paths(["crates/ferrum-bench-core/examples/regression_plan/unreviewed.rs"]);
         assert_eq!(unreviewed.areas, ALL_AREAS);
         assert_eq!(unreviewed.unknown_paths.len(), 1);
+        let nested =
+            "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/unreviewed.rs";
+        assert_eq!(analyze_paths([nested]).unknown_paths, [nested]);
     }
 
     #[test]
