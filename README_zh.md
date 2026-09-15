@@ -24,16 +24,21 @@ Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运�
 <details>
 <summary><strong>快速试用</strong></summary>
 
-在 macOS 或 Linux 上安装 Ferrum 和 Orchestral：
+在 macOS Apple Silicon 或 Linux x86_64 上安装 Ferrum 和 Orchestral：
 
 ```sh
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 curl -fsSL https://orch.pandaailabs.com/install.sh | sh
 ```
 
-Windows 请使用 [Ferrum](#快速开始) 和
-[Orchestral](https://github.com/sizzlecar/orchestral/blob/main/README.zh-CN.md#安装)
-的 PowerShell 安装脚本。安装后打开新终端，一行启动模型：
+Windows x64 请使用 PowerShell：
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
+安装后打开新终端，一行启动模型：
 
 ```sh
 ferrum serve --model unsloth/Qwen3.5-9B-GGUF

@@ -25,16 +25,21 @@ running tests concurrently.
 <details>
 <summary><strong>Try it locally</strong></summary>
 
-Install Ferrum and Orchestral on macOS or Linux:
+Install Ferrum and Orchestral on macOS Apple Silicon or Linux x86_64:
 
 ```sh
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 curl -fsSL https://orch.pandaailabs.com/install.sh | sh
 ```
 
-On Windows, use the PowerShell installers for [Ferrum](#quick-start) and
-[Orchestral](https://github.com/sizzlecar/orchestral#install). Then open a new
-terminal and start the model:
+On Windows x64, use PowerShell:
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
+After installation, open a new terminal and start the model:
 
 ```sh
 ferrum serve --model unsloth/Qwen3.5-9B-GGUF

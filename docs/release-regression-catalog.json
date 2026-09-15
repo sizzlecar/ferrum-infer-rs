@@ -464,7 +464,7 @@
     {
       "path": "README.md",
       "before_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
-      "after_sha256": "a877894eed642c16250c94b826fb5af3d8f79e330f4fa28d54a7144f0d48812c",
+      "after_sha256": "4d57f05e8ce8c01ab81f4141eedef4fae2752d8156af211feddd89b92d5f3906",
       "areas": [
         "build",
         "backend_submission",
@@ -477,7 +477,7 @@
     {
       "path": "README_zh.md",
       "before_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
-      "after_sha256": "31104c4686ee2b54c9ab04d9ca8c50bd4ab234998cd4087aabf469d4bc5d7d68",
+      "after_sha256": "c0b0f8a85f5ecca54b980a79695872f410c450b0d3eae7f3a72a8c166061def4",
       "areas": [
         "build",
         "backend_submission",
