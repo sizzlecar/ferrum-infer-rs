@@ -3,7 +3,7 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const DEMO_ASSETS = "https://github.com/sizzlecar/orchestral/releases/download/v0.3.1";
+const DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
 
 const css = String.raw`
 :root {
@@ -409,7 +409,7 @@ function response(body, contentType, status = 200) {
     headers: {
       "content-type": `${contentType}; charset=utf-8`,
       "cache-control": contentType === "text/html" ? "public, max-age=60, s-maxage=60" : "public, max-age=300, s-maxage=3600",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://github.com https://release-assets.githubusercontent.com; media-src https://github.com https://release-assets.githubusercontent.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com; media-src https://ferrum-downloads.pandaailabs.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
       "referrer-policy": "strict-origin-when-cross-origin",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",
