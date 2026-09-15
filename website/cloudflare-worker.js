@@ -137,7 +137,9 @@ const pages = {
     demoTitle: "One model, three working agents",
     demoLead: "Ferrum serves Qwen3.5-9B in the upper left. Three native Orchestral terminals inspect code, make changes, and run tests concurrently.",
     demoCaption: "Three concurrent coding sessions, with all repairs independently tested. M1 Max · Qwen3.5-9B Q4_K_M. Authentic terminal replay · 8× speed.",
-    demoDetails: "Recording details and configuration",
+    demoDetails: "Recording details",
+    demoCommands: "Installation and startup commands",
+    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs#see-it-in-action",
     demoDownload: "Download the terminal demo",
     featureTitle: "The direct path from model to API",
     featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
@@ -205,7 +207,9 @@ const pages = {
     demoTitle: "一个模型，三个 Agent 同时工作",
     demoLead: "左上角是提供 Qwen3.5-9B 推理的 Ferrum；另外三个原生 Orchestral 终端同时读取代码、修改实现并运行测试。",
     demoCaption: "三个编码会话同时工作，全部修复通过独立测试。M1 Max · Qwen3.5-9B Q4_K_M。真实终端录制，8 倍速回放。",
-    demoDetails: "录制说明与实际配置",
+    demoDetails: "录制说明",
+    demoCommands: "安装与启动命令",
+    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#看它如何工作",
     demoDownload: "下载终端演示视频",
     featureTitle: "从模型直接到 API",
     featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
@@ -333,7 +337,7 @@ function render(page) {
           <source src="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4" type="video/mp4">
           <a href="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoDownload}</a>
         </video>
-        <figcaption id="demo-caption">${page.demoCaption} <a href="${DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></figcaption>
+        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></figcaption>
       </figure>
     </div></section>
     <section id="quick-start"><div class="wrap">
