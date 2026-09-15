@@ -290,6 +290,16 @@ timeouts are failures, not successful or skipped numerical checks.
 The [delivery workflow](../.github/workflows/release-delivery.yml)
 and [Quality workflow](../.github/workflows/ci.yml) define this scheduling.
 
+Metal device Quality preserves Cargo build outputs outside checkout in
+`RUNNER_TOOL_CACHE/ferrum-metal-cargo-target`. After acquiring the existing host
+lock, a job moves a previous ordinary `target` there only if the destination
+does not exist, before checkout can clean it. It then links `target` back to the
+cache, keeping existing `./target` commands unchanged. Conflicting directories,
+unexpected or broken links, and cache paths overlapping checkout fail closed
+without deletion or overwrite. An already-running job is not cancelled or
+modified; migration starts in a later job after the host lock is released.
+Toolchain and source changes can still require recompilation. CUDA is unchanged.
+
 The Metal model job pins the official artifact downloader containing the
 [upstream timeout-rejection fix](https://github.com/actions/toolkit/pull/2124).
 Its artifact IDs, extraction directories and independent archive/ABI checks
