@@ -1145,7 +1145,7 @@ fn native_json_auto_none_and_template_without_tools_preserve_existing_contracts(
                 hard_format && choice == json!("auto")
             );
             if choice == json!("none") {
-                assert!(!internal.prompt.contains("Use the native envelope"));
+                assert!(!chat.allows_tool_name("weather"));
             }
         }
     }
