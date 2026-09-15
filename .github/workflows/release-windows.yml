@@ -159,6 +159,38 @@ jobs:
           "FERRUM_MSVC_LIB=$compilerBin\lib.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$compilerBin\link.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "FERRUM_VS_ROOT=$vs" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install the pinned Inno Setup compiler
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:FERRUM_WINDOWS_INNO_ROOT) {
+            $compiler = Join-Path $env:FERRUM_WINDOWS_INNO_ROOT 'ISCC.exe'
+            if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Preinstalled ISCC is missing' }
+            "ISCC=$compiler" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            # The successful build below must still report the pinned version.
+            exit 0
+          }
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          curl.exe --fail --location --proto '=https' --retry 3 --output $installer 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') { throw 'Inno installer hash mismatch' }
+          $signature = Get-AuthenticodeSignature $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Pyrsys B.V.') { throw 'Inno publisher signature mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3'
+          $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
+          $process = Start-Process $installer -Wait -PassThru -ArgumentList @('/PORTABLE=1', '/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/TASKS=""', ('/DIR="{0}"' -f $root), ('/LOG="{0}"' -f $log))
+          if ($process.ExitCode -ne 0) { throw "Inno installation failed: $($process.ExitCode)" }
+          $compiler = Join-Path $root 'ISCC.exe'
+          if (-not (Test-Path $compiler -PathType Leaf)) { throw 'The pinned Inno installation did not produce ISCC.exe' }
+          # ISCC has no usable PE version resource. Verify its real compiler banner
+          # during the required successful compilation below, not via /? (exit 1).
+          "ISCC=$compiler" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Compile CPU and CUDA installer contracts before backend builds
+        env:
+          FERRUM_INNO_EVIDENCE_DIR: ${{ runner.temp }}/windows-installer-contracts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked -p ferrum-bench-core --test release_staging_workflows installer::windows_installer_wrapper_compiles_cpu_and_cuda -- --ignored --exact --nocapture
       - name: Install CUDA compilation and runtime components
         if: inputs.backend == 'cuda'
         run: |
@@ -351,31 +383,6 @@ jobs:
             & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/release/ferrum.exe'
             & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/release/ferrum.exe'
           }
-      - name: Install the pinned Inno Setup compiler
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          if ($env:FERRUM_WINDOWS_INNO_ROOT) {
-            $compiler = Join-Path $env:FERRUM_WINDOWS_INNO_ROOT 'ISCC.exe'
-            if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Preinstalled ISCC is missing' }
-            "ISCC=$compiler" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-            # The successful build below must still report the pinned version.
-            exit 0
-          }
-          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
-          curl.exe --fail --location --proto '=https' --retry 3 --output $installer 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
-          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') { throw 'Inno installer hash mismatch' }
-          $signature = Get-AuthenticodeSignature $installer
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Pyrsys B.V.') { throw 'Inno publisher signature mismatch' }
-          $root = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3'
-          $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
-          $process = Start-Process $installer -Wait -PassThru -ArgumentList @('/PORTABLE=1', '/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/NOICONS', '/TASKS=""', ('/DIR="{0}"' -f $root), ('/LOG="{0}"' -f $log))
-          if ($process.ExitCode -ne 0) { throw "Inno installation failed: $($process.ExitCode)" }
-          $compiler = Join-Path $root 'ISCC.exe'
-          if (-not (Test-Path $compiler -PathType Leaf)) { throw 'The pinned Inno installation did not produce ISCC.exe' }
-          # ISCC has no usable PE version resource. Verify its real compiler banner
-          # during the required successful compilation below, not via /? (exit 1).
-          "ISCC=$compiler" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Pack the exact release EXE and redistributable runtime bytes
         run: |
           $ErrorActionPreference = 'Stop'
@@ -487,7 +494,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $assets = Join-Path $env:RUNNER_TEMP 'windows-assets'
-          & $env:ISCC "/DBackend=$env:BACKEND" "/DPayloadDir=$env:WINDOWS_PAYLOAD" "/DLauncherPath=$env:WINDOWS_LAUNCHER_PATH" "/DAppVersion=$env:VERSION" "/O$assets" 'packaging/windows/ferrum.iss' | Tee-Object -FilePath (Join-Path $assets 'iscc-build.log')
+          # Installer backend IDs include the CUDA capability, like asset names.
+          $suffix = if ($env:BACKEND -eq 'cuda') { 'cuda-sm89' } else { 'cpu' }
+          & $env:ISCC "/DBackend=$suffix" "/DPayloadDir=$env:WINDOWS_PAYLOAD" "/DLauncherPath=$env:WINDOWS_LAUNCHER_PATH" "/DAppVersion=$env:VERSION" "/O$assets" 'packaging/windows/ferrum.iss' | Tee-Object -FilePath (Join-Path $assets 'iscc-build.log')
           if ($LASTEXITCODE -ne 0) { throw "ISCC compilation failed: $LASTEXITCODE" }
           $compilerLog = Get-Content (Join-Path $assets 'iscc-build.log') -Raw
           if ($compilerLog -cnotmatch '(?m)^Compiler engine version: Inno Setup (6\.7\.3)\r?$') { throw 'ISCC compiler banner/version mismatch' }
@@ -495,7 +504,6 @@ jobs:
           $provenancePath = Join-Path $assets 'windows-staging.json'
           $provenance = Get-Content $provenancePath -Raw | ConvertFrom-Json -AsHashtable
           $provenance.iscc_version = $compilerVersion
-          $suffix = if ($env:BACKEND -eq 'cuda') { 'cuda-sm89' } else { 'cpu' }
           $setup = Join-Path $assets "ferrum-$env:VERSION-windows-x86_64-$suffix-setup.exe"
           if (-not (Test-Path $setup -PathType Leaf)) { throw 'ISCC did not produce the versioned installer' }
           foreach ($entry in @(@('archive', "ferrum-windows-x86_64-$suffix.zip"), @('setup', (Split-Path $setup -Leaf)), @('launcher', 'ferrum-windows-launcher-v1.exe'))) {
@@ -529,6 +537,7 @@ jobs:
             ${{ runner.temp }}/windows-assets/launcher.dependencies.txt
             ${{ runner.temp }}/windows-assets/iscc-build.log
             ${{ runner.temp }}/inno-install.log
+            ${{ runner.temp }}/windows-installer-contracts
           if-no-files-found: warn
           retention-days: 14
       - name: Save Windows staging build caches

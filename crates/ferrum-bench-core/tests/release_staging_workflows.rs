@@ -6,6 +6,10 @@ use serde_yaml::{Mapping, Value};
 use std::{collections::BTreeMap, process::Command};
 use std::{fs, path::Path};
 
+#[cfg(windows)]
+#[path = "release_staging_workflows/installer.rs"]
+mod installer;
+
 fn key(name: &str) -> Value {
     Value::String(name.into())
 }
