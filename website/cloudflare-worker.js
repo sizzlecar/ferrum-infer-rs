@@ -3,6 +3,7 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
+const DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
 
 const css = String.raw`
 :root {
@@ -63,6 +64,9 @@ section { padding: 68px 0; scroll-margin-top: 68px; }
 .section-head { max-width: 760px; margin-bottom: 30px; }
 h2 { margin: 0 0 10px; font-size: clamp(2rem, 5vw, 3.25rem); line-height: 1.05; letter-spacing: -.045em; }
 .section-head p, .muted { color: var(--muted); }
+.demo-recording { margin: 0; }
+.demo-recording video { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--line); border-radius: 16px; background: #101319; }
+.demo-recording figcaption { margin-top: 16px; color: var(--muted); font-size: .9rem; }
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
 .card { padding: 25px; border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(145deg, rgba(24,29,34,.94), rgba(15,18,21,.94)); }
 .card h3 { margin: 0 0 8px; font-size: 1.15rem; }
@@ -130,6 +134,13 @@ const pages = {
     primary: "View on GitHub",
     secondary: "Start locally",
     proof: ["MIT licensed", "CPU + Metal + CUDA", "Run + OpenAI-compatible serve"],
+    demoTitle: "One model, three working agents",
+    demoLead: "Ferrum serves Qwen3.5-9B in the upper left. Three native Orchestral terminals inspect code, make changes, and run tests concurrently.",
+    demoCaption: "Three concurrent coding sessions, with all repairs independently tested. M1 Max · Qwen3.5-9B Q4_K_M. Authentic terminal replay · 8× speed.",
+    demoDetails: "Recording details",
+    demoCommands: "Try it locally",
+    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs#see-it-in-action",
+    demoDownload: "Download the terminal demo",
     featureTitle: "The direct path from model to API",
     featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
     cards: [
@@ -193,6 +204,13 @@ const pages = {
     primary: "查看 GitHub",
     secondary: "开始使用",
     proof: ["MIT 开源", "CPU + Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
+    demoTitle: "一个模型，三个 Agent 同时工作",
+    demoLead: "左上角是提供 Qwen3.5-9B 推理的 Ferrum；另外三个原生 Orchestral 终端同时读取代码、修改实现并运行测试。",
+    demoCaption: "三个编码会话同时工作，全部修复通过独立测试。M1 Max · Qwen3.5-9B Q4_K_M。真实终端录制，8 倍速回放。",
+    demoDetails: "录制说明",
+    demoCommands: "快速试用",
+    demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#看它如何工作",
+    demoDownload: "下载终端演示视频",
     featureTitle: "从模型直接到 API",
     featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
     cards: [
@@ -312,6 +330,16 @@ function render(page) {
       <div class="actions"><a class="button primary" href="${REPOSITORY}">${page.primary}</a><a class="button" href="#quick-start">${page.secondary}</a></div>
       <div class="proof">${proof}</div>
     </div></header>
+    <section id="demo"><div class="wrap">
+      <div class="section-head"><h2>${page.demoTitle}</h2><p>${page.demoLead}</p></div>
+      <figure class="demo-recording">
+        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_ASSETS}/ferrum-orch-three-agents.png">
+          <source src="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4" type="video/mp4">
+          <a href="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoDownload}</a>
+        </video>
+        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></figcaption>
+      </figure>
+    </div></section>
     <section id="quick-start"><div class="wrap">
       <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
       <p class="note">${page.installNote}</p>
@@ -385,7 +413,7 @@ function response(body, contentType, status = 200) {
     headers: {
       "content-type": `${contentType}; charset=utf-8`,
       "cache-control": contentType === "text/html" ? "public, max-age=60, s-maxage=60" : "public, max-age=300, s-maxage=3600",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com; media-src https://ferrum-downloads.pandaailabs.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
       "referrer-policy": "strict-origin-when-cross-origin",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",

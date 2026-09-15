@@ -463,27 +463,29 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "c81dec6c25681cc0c614a600ed50a80f127ab4429310f9445e3f637226b8be2b",
-      "after_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
+      "before_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
+      "after_sha256": "4d57f05e8ce8c01ab81f4141eedef4fae2752d8156af211feddd89b92d5f3906",
       "areas": [
         "build",
         "backend_submission",
         "template",
-        "termination"
+        "termination",
+        "tools"
       ],
-      "rationale": "Reviewed both immutable README revisions since v0.9.0: CPU fallback and Windows CPU availability, checksum-verified CDN/GitHub installation and same-version reuse, common Qwen3.5 4B Q4_K_M run/serve examples across Metal and CUDA, explicit memory limits and short non-thinking HTTP responses, and serving positioning. Retain installation/upgrade/publication contracts and declared backend, model, template and termination checks. The model-family inventory is unchanged. This review certifies neither successful execution nor measured performance."
+      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "c1f65b0a766c8103575cbcf1eb27d43014c031a166acce75a52406a7899c0c98",
-      "after_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
+      "before_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
+      "after_sha256": "c0b0f8a85f5ecca54b980a79695872f410c450b0d3eae7f3a72a8c166061def4",
       "areas": [
         "build",
         "backend_submission",
         "template",
-        "termination"
+        "termination",
+        "tools"
       ],
-      "rationale": "Reviewed both immutable README revisions since v0.9.0: CPU fallback and Windows CPU availability, checksum-verified CDN/GitHub installation and same-version reuse, common Qwen3.5 4B Q4_K_M run/serve examples across Metal and CUDA, explicit memory limits and short non-thinking HTTP responses, and serving positioning. Retain installation/upgrade/publication contracts and declared backend, model, template and termination checks. The model-family inventory is unchanged. This review certifies neither successful execution nor measured performance."
+      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
     }
   ],
   "release_profile_ids": [
