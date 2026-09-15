@@ -153,37 +153,18 @@ fn state_recall_rejects_changed_case_and_truncated_identifiers() {
 }
 
 #[test]
-fn legacy_state_requests_cannot_be_relabelled_as_the_explicit_copying_probe() {
-    // These are recorded requests from the previous probe, not an assertion
-    // about the wording of the new contract. Even correct answers cannot turn
-    // a different request/history into evidence for this probe.
-    let legacy_write = "The code to remember is cobalt-731. Reply with only OK.";
+fn legacy_state_recall_cannot_be_relabelled_as_the_explicit_copying_probe() {
+    // The acknowledgement and no-memory requests retain their original form.
+    // A correct answer to the old recall request still cannot be relabelled as
+    // evidence for the explicit copying contract.
     let legacy_recall = super::super::model_basic::RECALL_PROMPT;
-    let legacy_empty = "What code did I ask you to remember in this conversation? Reply with only that code, or NONE if I have not given you a code.";
-    for (index, prompt) in [(0, legacy_write), (2, legacy_recall), (5, legacy_empty)] {
-        let mut records = run_fixture();
-        records[index]["content"] = json!(prompt);
-        assert!(verify_run(&records, ModelReasoningProtocol::None, 16).is_err());
-    }
-    let mutations: [fn(&mut ServeStateEvidence, &str); 3] = [
-        |e: &mut ServeStateEvidence, prompt: &str| {
-            e.writes[0].messages[0]["content"] = json!(prompt)
-        },
-        |e: &mut ServeStateEvidence, prompt: &str| {
-            e.recall_rounds[0][0].messages[2]["content"] = json!(prompt)
-        },
-        |e: &mut ServeStateEvidence, prompt: &str| {
-            e.fresh[0].messages[0]["content"] = json!(prompt)
-        },
-    ];
-    for (mutate, prompt) in mutations
-        .into_iter()
-        .zip([legacy_write, legacy_recall, legacy_empty])
-    {
-        let mut evidence = serve_fixture();
-        mutate(&mut evidence, prompt);
-        assert!(verify_serve(&evidence, ModelReasoningProtocol::None, 16).is_err());
-    }
+    let mut records = run_fixture();
+    records[2]["content"] = json!(legacy_recall);
+    assert!(verify_run(&records, ModelReasoningProtocol::None, 16).is_err());
+
+    let mut evidence = serve_fixture();
+    evidence.recall_rounds[0][0].messages[2]["content"] = json!(legacy_recall);
+    assert!(verify_serve(&evidence, ModelReasoningProtocol::None, 16).is_err());
 }
 
 #[test]

@@ -319,7 +319,10 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
 }
 
 async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Result<()> {
-    let user = json!({"role": "user", "content": "Use the calc tool to evaluate 123+456. After receiving its result, reply with only the resulting number."});
+    // This named-tool protocol probe supplies the requested expression, not
+    // its result. The model must still generate the call and consume the
+    // independently calculated result; it is not an open-ended planning test.
+    let user = json!({"role": "user", "content": "Call calc with the expression field set to \"123 + 456\". After receiving its result, reply with only the resulting number."});
     let declarations = json!([
         {"type": "function", "function": {
             "name": "calc", "description": "Add two unsigned decimal integers. The expression must contain exactly one plus sign between the two operands; whitespace and balanced parentheses are allowed.",

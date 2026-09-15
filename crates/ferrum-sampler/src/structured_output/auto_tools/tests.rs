@@ -381,6 +381,85 @@ fn forced_native_json_masks_wrong_names_arguments_and_final_answers() {
 }
 
 #[test]
+fn native_json_addition_strings_remain_reachable_with_byte_and_merged_tokens() {
+    use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
+    // This is a generic grammar/token-boundary regression, not evidence about
+    // a particular model tokenizer. Reuse the byte fixture with optional packets
+    // spanning entry into the string value and its closing quote/object braces.
+    let packets = [
+        "{\"name\":\"calc\",\"parameters\":{\"expression\":\"123",
+        "+456\"}}",
+        "{\"name\":\"calc\",\"parameters\":{\"expression\":\"123 ",
+        "+ 456\"}}",
+    ];
+    for merged in [false, true] {
+        let tokenizer = Arc::new(PacketTokenizer::new(if merged { &packets } else { &[] }));
+        let factory = StructuredOutputFactory::new(tokenizer.clone()).unwrap();
+        let mut chat = request(ApiToolCallProtocol::NativeJson);
+        chat.response_format = None;
+        chat.tools[0].function.name = "calc".into();
+        // The declared schema does not encode an answer, operand or expression.
+        chat.tools[0].function.parameters = Some(json!({
+            "type":"object", "properties":{"expression":{"type":"string"}},
+            "required":["expression"], "additionalProperties":false
+        }));
+        for named in [false, true] {
+            chat.tool_choice = Some(if named {
+                ApiToolChoice::Function {
+                    tool_type: "function".into(),
+                    function: ApiToolChoiceFunction {
+                        name: "calc".into(),
+                    },
+                }
+            } else {
+                ApiToolChoice::Mode("required".into())
+            });
+            let processor = factory
+                .create_processor_with_chat_contract(
+                    &ResponseFormat::Text,
+                    &StructuredOutputStart::Immediate,
+                    512,
+                    &tokenizer.terminals(),
+                    &[],
+                    Some(&chat),
+                    ModelOutputProtocol::Text,
+                )
+                .unwrap()
+                .unwrap();
+            for expression in ["123+456", "123 + 456"] {
+                let payload = format!(
+                    "{{\"name\":\"calc\",\"parameters\":{{\"expression\":\"{expression}\"}}}}"
+                );
+                processor.reset().unwrap();
+                let mut generated = Vec::new();
+                // append checks the real grammar mask before every token.
+                append(&processor, &tokenizer, &mut generated, &payload);
+                assert!(processor.is_accepting(&generated).unwrap());
+                assert_eq!(
+                    processor
+                        .classified_result_with_terminals(&generated, &tokenizer.terminals())
+                        .unwrap(),
+                    Some((StructuredOutputBranch::ToolCall, payload))
+                );
+                let mut logits = vec![0.0; tokenizer.vocab_size()];
+                processor
+                    .mask_logits_with_terminals(
+                        &mut logits,
+                        &generated,
+                        &tokenizer.terminals(),
+                        &HashSet::new(),
+                    )
+                    .unwrap();
+                assert!(
+                    logits[EOS as usize].is_finite(),
+                    "complete call must allow EOS"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn forced_native_calls_mask_bare_arguments_and_unselected_names() {
     use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
     let tokenizer = Arc::new(PacketTokenizer::new(&[]));

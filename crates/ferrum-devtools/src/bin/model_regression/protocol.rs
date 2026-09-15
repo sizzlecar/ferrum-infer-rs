@@ -413,6 +413,11 @@ mod tests {
                 ("/function/name", json!("lookup_weather")),
                 ("/function/arguments", json!("invalid JSON")),
                 ("/function/arguments", json!("{\"expression\":\"123-456\"}")),
+                ("/function/arguments", json!("{\"expression\":\"+123456\"}")),
+                (
+                    "/function/arguments",
+                    json!("{\"expression\":\",123,456\"}"),
+                ),
                 ("/function/arguments", json!("{\"expression\":579}")),
                 (
                     "/function/arguments",
