@@ -143,6 +143,7 @@ fn staged_binary(
         sha256: sha256.into(),
     })
 }
+#[cfg(test)]
 fn prepare(
     plan: &Plan,
     assets: &[StagedBinary],
@@ -151,6 +152,7 @@ fn prepare(
 ) -> Result<PreparedTasks, String> {
     prepare_backend(plan, assets, version, max_tokens, None)
 }
+#[cfg(test)]
 fn prepare_backend(
     plan: &Plan,
     assets: &[StagedBinary],
