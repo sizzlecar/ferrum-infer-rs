@@ -5552,6 +5552,10 @@ async fn models_handler(
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
+            max_model_len: match entry.kind() {
+                ServedModelKind::Llm => state.llm.as_ref().and_then(|llm| llm.context_capacity()),
+                _ => None,
+            },
             modalities: entry
                 .kind()
                 .modalities()
@@ -6003,6 +6007,7 @@ mod tests {
 
     struct StubLlm {
         config: EngineConfig,
+        context_capacity: Option<usize>,
         text: String,
         stream_chunks: Option<Vec<String>>,
         stream_final_chunk_separate: bool,
@@ -6025,6 +6030,7 @@ mod tests {
             Self {
                 config,
                 text: text.to_string(),
+                context_capacity: None,
                 stream_chunks: None,
                 stream_final_chunk_separate: false,
                 stream_tail_without_token: false,
@@ -6597,6 +6603,10 @@ mod tests {
 
     #[async_trait]
     impl LlmInferenceEngine for StubLlm {
+        fn context_capacity(&self) -> Option<usize> {
+            self.context_capacity
+        }
+
         async fn infer(
             &self,
             request: InferenceRequest,
@@ -8559,6 +8569,7 @@ mod tests {
         assert!(data[0]["permission"].as_array().unwrap().is_empty());
         assert!(data[0]["root"].is_null());
         assert!(data[0]["parent"].is_null());
+        assert!(data[0].get("max_model_len").is_none());
     }
 
     #[tokio::test]
@@ -8628,6 +8639,36 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "stub-embed");
         assert_eq!(data[0]["modalities"], json!(["text", "image"]));
+        assert!(data[0].get("max_model_len").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_models_reports_engine_capacity_for_public_aliases_and_adapters() {
+        let capacity = 3072;
+        let engine = StubLlm {
+            context_capacity: Some(capacity),
+            ..StubLlm::new("ok")
+        };
+        let registry = ServedModelRegistry::try_new(
+            "stub-model",
+            ServedModelKind::Llm,
+            vec!["public-model".to_owned(), "second-alias".to_owned()],
+            vec![LoraAdapterModel::new(
+                "sql",
+                "public-model:sql",
+                "/tmp/adapter",
+            )],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(Arc::new(engine))
+            .with_served_model_registry(registry)
+            .build_router();
+        let body = response_json(get(router, "/v1/models").await).await;
+        let entries = body["data"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            assert_eq!(entry["max_model_len"], capacity);
+        }
     }
 
     #[tokio::test]

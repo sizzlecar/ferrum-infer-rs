@@ -15,12 +15,20 @@ support matrix and are hidden from the default CLI help.
 | `POST /v1/chat/completions` | Supported | Non-streaming and streaming chat responses. |
 | `POST /v1/responses` | Supported, stateless | Ordered text/reasoning/tool history, non-streaming and streaming output, usage, and caller-owned function/namespace-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
-| `GET /v1/models` | Supported | Lists models known to the server. |
+| `GET /v1/models` | Supported | Lists public model names and optional effective serving capacity. |
 | `POST /v1/embeddings` | Experimental / outside v0.8 release scope | Text and image embedding support depends on a specialized loaded model. |
 | `POST /v1/audio/transcriptions` | Experimental / outside v0.8 release scope | Multipart form input for specialized ASR engines. |
 | `POST /v1/audio/speech` | Experimental / outside v0.8 release scope | Speech output depends on a specialized TTS engine. |
 
 ## Modality Endpoint Fields
+
+For loaded language models, each model card includes `max_model_len` when the
+engine reports its effective per-request capacity. This is the same input-plus-output
+limit used by request admission, including runtime and executor capacity constraints.
+Public aliases and LoRA adapters report their base engine's limit. Unreported capacity
+is omitted, including on the specialized non-LLM routes; it is not inferred from the
+model name or nominal weights context window. This discovery field affects `serve`;
+`run` continues to use the same existing engine admission boundary.
 
 | Endpoint / field | Status | Behavior |
 |---|---|---|

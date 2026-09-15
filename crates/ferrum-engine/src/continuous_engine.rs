@@ -2984,6 +2984,14 @@ impl ContinuousBatchEngine {
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
+    fn context_capacity(&self) -> Option<usize> {
+        effective_request_context_capacity(
+            &self.inner.config,
+            &self.inner.runtime_config,
+            self.inner.model_executor.kv_capacity(),
+        )
+    }
+
     async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
         let request_id = request.id.clone();
         let infer_start = Instant::now();

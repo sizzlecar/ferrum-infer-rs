@@ -70,6 +70,13 @@ pub trait InferenceEngine: Send + Sync {
 /// `/v1/chat/completions` and `/v1/completions`.
 #[async_trait]
 pub trait LlmInferenceEngine: InferenceEngine {
+    /// Effective per-request capacity in tokens, including input and output.
+    /// Implementations must report the limit used by request admission, not
+    /// the model weights' nominal context window. None means unreported.
+    fn context_capacity(&self) -> Option<usize> {
+        None
+    }
+
     /// Execute single inference request.
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
 

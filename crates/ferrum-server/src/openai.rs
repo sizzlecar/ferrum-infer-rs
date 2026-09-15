@@ -598,6 +598,9 @@ pub struct ModelInfo {
     pub created: u64,
     pub owned_by: String,
     pub modalities: Vec<String>,
+    /// Effective input-plus-output capacity reported by the loaded LLM engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
     pub permission: Vec<ModelPermission>,
     pub root: Option<String>,
     pub parent: Option<String>,

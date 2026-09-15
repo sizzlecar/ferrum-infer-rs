@@ -7979,6 +7979,38 @@ fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
 }
 
 #[test]
+fn advertised_context_capacity_matches_the_request_admission_boundary() {
+    let mut config = EngineConfig::default();
+    config.runtime.max_model_len = Some(512);
+    let engine = test_continuous_engine_with_config(config);
+    let capacity = engine.context_capacity().expect("known engine capacity");
+    assert!(capacity <= 512);
+    let mut request = InferenceRequest::new("test", "test").with_sampling_params(SamplingParams {
+        max_tokens: 1,
+        ..SamplingParams::default()
+    });
+    validate_request_context_budget(
+        &request,
+        capacity - 1,
+        &engine.inner.config,
+        &engine.inner.runtime_config,
+        engine.inner.model_executor.kv_capacity(),
+    )
+    .expect("advertised capacity must be accepted");
+    request.sampling_params.max_tokens = 2;
+    assert!(matches!(
+        validate_request_context_budget(
+            &request,
+            capacity - 1,
+            &engine.inner.config,
+            &engine.inner.runtime_config,
+            engine.inner.model_executor.kv_capacity(),
+        ),
+        Err(FerrumError::ContextLengthExceeded { capacity: actual, .. }) if actual == capacity
+    ));
+}
+
+#[test]
 fn explicit_request_budget_accepts_exact_capacity_and_rejects_one_token_over() {
     let capacity = 512;
     let prompt_tokens = 59;
