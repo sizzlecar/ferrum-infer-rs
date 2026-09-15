@@ -42,6 +42,23 @@ jobs:
             console.log(JSON.stringify({present:result.present,outerWhitespace:result.outerWhitespace,httpStatus:result.httpStatus,classification:result.classification}));
           })().catch(() => { console.error('Credential audit failed; credential output suppressed.'); process.exitCode = 1; });
           AUDIT
+      - name: Align Orchestral publication with the authenticated existing credential
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: |
+          node <<'ALIGN'
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const audit = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/cargo-credential-audit.json','utf8'));
+          if (audit.classification !== 'authenticated') throw new Error('Existing Ferrum credential did not authenticate; no secret updated.');
+          const result = cp.spawnSync('gh', ['secret','set','CARGO_TOKEN','--repo','sizzlecar/orchestral'], {
+            input:process.env.CARGO_REGISTRY_TOKEN,
+            encoding:'utf8',
+          });
+          if (result.status !== 0) { console.error('Orchestral secret update failed; credential and raw output suppressed.'); process.exit(1); }
+          console.log('Orchestral CARGO_TOKEN now uses the authenticated existing Ferrum publication credential.');
+          ALIGN
       - uses: actions/upload-artifact@v4
         if: always()
         with:
