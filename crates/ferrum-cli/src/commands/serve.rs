@@ -583,17 +583,13 @@ async fn execute_with_compatibility(
             None => crate::source_resolver::load_model_chat_template(&source.local_path),
         },
     };
-    let product_source_identity = defined_model
-        .as_deref()
-        .map(|prepared| {
-            crate::source_resolver::defined_product_source_identity(
-                prepared,
-                &requested_model,
-                &model_id,
-                model_chat_template.as_ref(),
-            )
-        })
-        .transpose()?;
+    let product_source_identity = crate::source_resolver::product_source_identity(
+        defined_model.as_deref(),
+        model_sources.as_deref(),
+        &requested_model,
+        &model_id,
+        model_chat_template.as_ref(),
+    )?;
     let requested_public_model_name = matches!(
         product_engine_config.model.source.as_ref(),
         Some(ferrum_types::ModelSource::HuggingFace { .. })
