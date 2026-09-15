@@ -13,9 +13,24 @@ use std::time::Duration;
 use tokio::process::Command;
 
 async fn run(hub: &Hub, model: &str, cache: &Path) -> Output {
+    invoke(hub, model, cache, false).await
+}
+
+async fn invoke(hub: &Hub, model: &str, cache: &Path, serve: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferrum"));
-    command
-        .args([
+    if serve {
+        command.args([
+            "serve",
+            "--model",
+            model,
+            "--backend",
+            "cpu",
+            "--disable-thinking",
+            "--port",
+            "0",
+        ]);
+    } else {
+        command.args([
             "run",
             model,
             "--backend",
@@ -27,7 +42,9 @@ async fn run(hub: &Hub, model: &str, cache: &Path) -> Output {
             "fixture",
             "--max-tokens",
             "1",
-        ])
+        ]);
+    }
+    command
         .current_dir(cache)
         .env("HOME", cache)
         .env("HF_HOME", cache)
@@ -60,6 +77,33 @@ async fn run(hub: &Hub, model: &str, cache: &Path) -> Output {
         .await
         .expect("local download/CPU load timed out; child is killed on drop")
         .expect("launch actual ferrum binary")
+}
+
+#[tokio::test]
+async fn run_and_serve_recover_transient_weight_download_before_reaching_the_loader() {
+    let repo = "fixture/recover-weight";
+    for serve in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        let files: ModelFiles = [(repo.to_owned(), hub::safetensors_files())].into();
+        let hub = Hub::start(files.clone()).await;
+        hub.fail_get_once(repo, "model.safetensors");
+        let output = invoke(&hub, repo, cache.path(), serve).await;
+        assert_downloaded(&hub, cache.path(), &files, true);
+        assert_eq!(hub.get_count(repo, "model.safetensors"), 2);
+        if serve {
+            assert!(
+                !output.status.success(),
+                "fixture omits actual model weights"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("model.embed_tokens") || stderr.contains("token_embd"),
+                "serve must recover transfer and reach the loader: {stderr}"
+            );
+        } else {
+            assert_loader_failure_and_clean_stdout(output);
+        }
+    }
 }
 
 fn assert_downloaded(hub: &Hub, cache: &Path, files: &ModelFiles, cold: bool) {

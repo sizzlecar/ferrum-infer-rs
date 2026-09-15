@@ -259,6 +259,10 @@ impl HubFixture {
             cache_dir: self.cache.path().to_path_buf(),
             token: None,
             endpoint: self.endpoint.clone(),
+            retry_policy: super::DownloadRetryPolicy {
+                initial_backoff: Duration::ZERO,
+                ..Default::default()
+            },
         }
     }
 

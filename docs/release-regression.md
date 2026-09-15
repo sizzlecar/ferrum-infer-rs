@@ -361,6 +361,23 @@ reuses complete cached files. Interrupted selected metadata transfers must
 finish before the model is ready. Split GGUF sets currently require a standalone
 variant; selecting one part does not make the set loadable.
 
+Selected-file transfers automatically recover temporary connection/body failures
+and HTTP 408, 429 or 5xx responses. The default is at most three attempts with
+one- and two-second backoffs, sharing a 3600-second network/retry budget per
+file (including HEAD); retries do not renew that budget. Embedders can configure
+the typed `HfDownloader::with_retry_policy(DownloadRetryPolicy)` interface.
+The release task deadline still bounds the whole task and may expire earlier.
+This does not impose a hard wall-clock bound on stalled local disk operations.
+
+After a broken body, Ferrum flushes the incomplete file and resumes from its
+saved length against the same resolved snapshot. A server that ignores Range
+and returns HTTP 200 replaces the partial body; HTTP 206 must match the requested
+offset, total size and response interval before bytes are appended. Permanent
+HTTP errors, malformed ranges and disk errors fail without publishing a complete
+cache entry. Incomplete bytes remain available for a later invocation. Both
+`run` and `serve` use this shared transfer path; a recovered download alone does
+not establish that the model loads or generates a valid answer.
+
 The model runner also forwards `--gguf-file FILE` to both entrypoints and requires
 an immutable `--model` pin with this option. A prepared `ModelProfile` can declare
 the selected artifact and separate metadata expectations:

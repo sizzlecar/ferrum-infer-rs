@@ -397,6 +397,7 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             relative,
             "src/source.rs"
                 | "src/hf_download.rs"
+                | "src/hf_download/transfer.rs"
                 | "src/hf_download/selection.rs"
                 | "src/hf_download/metadata_inventory.rs"
                 | "src/source/cached_weights.rs"
@@ -416,7 +417,11 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((vec![Download],
             "shared source-cache selection and completeness, including explicit metadata overrides; no tensor loading, numerical conversion or device-state implementation"));
     }
-    if (component == "ferrum-models" && relative == "src/hf_download/download_tests.rs")
+    if (component == "ferrum-models"
+        && matches!(
+            relative,
+            "src/hf_download/download_tests.rs" | "src/hf_download/transfer_tests.rs"
+        ))
         || (component == "ferrum-cli" && relative == "tests/download_jsonl/hub.rs")
         || (component == "ferrum-cli" && relative == "tests/cache_recovery/model.rs")
         || (component == "ferrum-cli" && relative == "src/source_resolver/cache/tests.rs")
