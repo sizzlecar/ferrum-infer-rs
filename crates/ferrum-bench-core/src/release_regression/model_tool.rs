@@ -222,6 +222,9 @@ pub fn verify_tool_case(
     max_tokens: u32,
     reasoning_alias_replay: bool,
 ) -> Result<(), String> {
+    if !evidence.is_object() {
+        return Err("missing tool evidence".into());
+    }
     if evidence["reasoning_alias_replayed"].as_bool() != Some(reasoning_alias_replay) {
         return Err("tool evidence does not match the requested reasoning alias mode".into());
     }
