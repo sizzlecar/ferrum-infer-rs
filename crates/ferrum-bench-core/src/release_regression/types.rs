@@ -293,6 +293,9 @@ pub struct CheckDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct PlanInput {
     pub stage: Stage,
+    /// Explicit release-only CUDA model sampling; device numerical targets remain intact.
+    #[serde(default)]
+    pub release_cuda: Option<ReleaseCudaPolicy>,
     /// Release scheduling only; correctness layers cannot be deferred by this policy.
     #[serde(default)]
     pub release_performance: ReleasePerformancePolicy,
@@ -375,6 +378,11 @@ pub struct PlanCost {
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     pub stage: Stage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_cuda: Option<ReleaseCudaPolicy>,
+    /// Optional CUDA model coverage not requested for this release. Never a pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended_not_run: Vec<Obligation>,
     pub impact: Impact,
     pub obligations: Vec<Obligation>,
     /// Explicitly postponed measurements, never passing execution evidence.
@@ -403,7 +411,154 @@ pub struct DeferredPerformance {
     pub obligations: Vec<Obligation>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudCudaMode {
+    #[default]
+    Disabled,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CudaModelLane {
+    Local,
+    Cloud,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseCudaPolicy {
+    #[serde(default)]
+    pub cloud: CloudCudaMode,
+    /// Ordered representatives: earlier local profiles own shared matching behavior.
+    pub mandatory_local_profile_ids: Vec<String>,
+    pub extended_cloud_profile_ids: Vec<String>,
+    pub reason: String,
+}
+
+impl ReleaseCudaPolicy {
+    pub fn lane(&self, profile_id: &str) -> Option<CudaModelLane> {
+        if self
+            .mandatory_local_profile_ids
+            .iter()
+            .any(|id| id == profile_id)
+        {
+            Some(CudaModelLane::Local)
+        } else if self
+            .extended_cloud_profile_ids
+            .iter()
+            .any(|id| id == profile_id)
+        {
+            Some(CudaModelLane::Cloud)
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self, profiles: &[ModelProfile]) -> Result<(), String> {
+        if self.reason.trim().is_empty()
+            || self.reason.trim() != self.reason
+            || self.mandatory_local_profile_ids.is_empty()
+            || self.extended_cloud_profile_ids.is_empty()
+        {
+            return Err(
+                "CUDA release policy requires local/extended profiles and an explicit reason"
+                    .into(),
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for id in self
+            .mandatory_local_profile_ids
+            .iter()
+            .chain(&self.extended_cloud_profile_ids)
+        {
+            if id.trim().is_empty() || id.trim() != id || !seen.insert(id) {
+                return Err("CUDA lane profile IDs must be nonblank, unique and disjoint".into());
+            }
+            let profile = profiles
+                .iter()
+                .find(|profile| &profile.id == id)
+                .ok_or_else(|| format!("CUDA lane profile {id} is absent from the catalog"))?;
+            if profile.target.backend != Backend::Cuda {
+                return Err(format!("CUDA lane profile {id} declares another backend"));
+            }
+            if self.lane(id) == Some(CudaModelLane::Local) {
+                super::model_sources::validate_profile_sources(profile)?;
+                if super::model_sources::pinned_hf_source(&profile.model)?.is_none() {
+                    return Err(format!(
+                        "local CUDA profile {id} requires an immutable HF revision"
+                    ));
+                }
+            }
+        }
+        if profiles
+            .iter()
+            .any(|profile| profile.target.backend == Backend::Cuda && !seen.contains(&profile.id))
+        {
+            return Err("every CUDA model profile requires an explicit local or cloud lane".into());
+        }
+        Ok(())
+    }
+}
+
 impl Plan {
+    pub fn validate_cuda_policy(&self) -> Result<(), String> {
+        let Some(policy) = &self.release_cuda else {
+            return if self.extended_not_run.is_empty() {
+                Ok(())
+            } else {
+                Err("extended not-run coverage requires an explicit CUDA release policy".into())
+            };
+        };
+        let ids: Vec<_> = policy
+            .mandatory_local_profile_ids
+            .iter()
+            .chain(&policy.extended_cloud_profile_ids)
+            .collect();
+        if self.stage != Stage::Release
+            || policy.reason.trim().is_empty()
+            || policy.reason.trim() != policy.reason
+            || policy.mandatory_local_profile_ids.is_empty()
+            || policy.extended_cloud_profile_ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.trim() != id.as_str())
+            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+            || self
+                .extended_not_run
+                .iter()
+                .any(|o| o.layer != EvidenceLayer::ModelRuntime)
+            || (policy.cloud == CloudCudaMode::Required && !self.extended_not_run.is_empty())
+        {
+            return Err("invalid frozen CUDA release policy or extended not-run evidence".into());
+        }
+        for selected in &self.selected {
+            if selected.profile.target.backend == Backend::Cuda {
+                match policy.lane(&selected.profile.id) {
+                    Some(CudaModelLane::Local) => {}
+                    Some(CudaModelLane::Cloud) if policy.cloud == CloudCudaMode::Required => {}
+                    _ => return Err("selected CUDA profile is outside its enabled lane".into()),
+                }
+            }
+        }
+        for id in policy.mandatory_local_profile_ids.iter().chain(
+            policy
+                .extended_cloud_profile_ids
+                .iter()
+                .filter(|_| policy.cloud == CloudCudaMode::Required),
+        ) {
+            if !self.selected.iter().any(|selected| {
+                selected.profile.id == *id && selected.profile.target.backend == Backend::Cuda
+            }) {
+                return Err(format!(
+                    "required CUDA profile {id} has no selected CUDA execution"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_performance_deferral(&self) -> Result<(), String> {
         if let Some(deferred) = &self.deferred_performance {
             if self.stage != Stage::Release

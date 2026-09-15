@@ -3,9 +3,10 @@
 use clap::{Parser, Subcommand};
 use ferrum_bench_core::release_regression::model_schedule::model_task_schedule;
 use ferrum_bench_core::release_regression::model_tasks::{
-    verify_model_reports, ExpectedModelRun, DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
+    verify_model_reports, ExpectedModelRun, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
+    DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
 };
-use ferrum_bench_core::release_regression::{Backend, Gap, Plan};
+use ferrum_bench_core::release_regression::{Backend, CloudCudaMode, CudaModelLane, Gap, Plan};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -41,6 +42,9 @@ enum Action {
         /// still requires the complete plan prepared without this filter.
         #[arg(long, value_parser = parse_backend)]
         backend: Option<Backend>,
+        /// Restrict CUDA execution to its frozen local or explicitly enabled cloud lane.
+        #[arg(long, value_parser = parse_cuda_lane, requires = "backend")]
+        cuda_lane: Option<CudaModelLane>,
     },
     /// Missing, failed, duplicate and unfinished reports fail this model gate.
     Verify {
@@ -71,6 +75,13 @@ fn parse_backend(value: &str) -> Result<Backend, String> {
         "metal" => Ok(Backend::Metal),
         "cuda" => Ok(Backend::Cuda),
         _ => Err("backend must be cpu, metal or cuda".into()),
+    }
+}
+fn parse_cuda_lane(value: &str) -> Result<CudaModelLane, String> {
+    match value {
+        "local" => Ok(CudaModelLane::Local),
+        "cloud" => Ok(CudaModelLane::Cloud),
+        _ => Err("CUDA lane must be local or cloud".into()),
     }
 }
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -147,6 +158,30 @@ fn prepare_backend(
     max_tokens: u32,
     backend: Option<Backend>,
 ) -> Result<PreparedTasks, String> {
+    prepare_lane(plan, assets, version, max_tokens, backend, None)
+}
+
+fn prepare_lane(
+    plan: &Plan,
+    assets: &[StagedBinary],
+    version: &str,
+    max_tokens: u32,
+    backend: Option<Backend>,
+    cuda_lane: Option<CudaModelLane>,
+) -> Result<PreparedTasks, String> {
+    plan.validate_cuda_policy()?;
+    if let Some(lane) = cuda_lane {
+        if backend != Some(Backend::Cuda) {
+            return Err("--cuda-lane requires --backend cuda".into());
+        }
+        let policy = plan
+            .release_cuda
+            .as_ref()
+            .ok_or("CUDA lane requires a frozen release policy")?;
+        if lane == CudaModelLane::Cloud && policy.cloud != CloudCudaMode::Required {
+            return Err("cloud CUDA was not explicitly requested in the frozen plan".into());
+        }
+    }
     let version_value = semver::Version::parse(version).map_err(|e| e.to_string())?;
     if !version_value.pre.is_empty() || !version_value.build.is_empty() || max_tokens == 0 {
         return Err("task version must be formal and output budget positive".into());
@@ -166,11 +201,16 @@ fn prepare_backend(
         if backend.is_some_and(|selected| run.profile.target.backend != selected) {
             continue;
         }
+        if cuda_lane.is_some_and(|lane| run.cuda_lane != Some(lane)) {
+            continue;
+        }
         let asset = by_backend
             .get(&run.profile.target.backend)
             .ok_or_else(|| format!("no staged binary for profile {}", run.profile.id))?;
         let runtime_capacity = if run.quick_start {
             None
+        } else if run.cuda_lane == Some(CudaModelLane::Local) {
+            Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY)
         } else {
             Some(DEFAULT_FUNCTIONAL_CAPACITY)
         };
@@ -206,6 +246,7 @@ fn run(action: Action) -> Result<(), String> {
             output_dir,
             max_tokens,
             backend,
+            cuda_lane,
         } => {
             let document = read_json(&plan)?;
             if document["schema_version"] != 2 {
@@ -232,12 +273,7 @@ fn run(action: Action) -> Result<(), String> {
                     candidate,
                 )?);
             }
-            let tasks = match backend {
-                Some(backend) => {
-                    prepare_backend(&plan, &assets, &version, max_tokens, Some(backend))?
-                }
-                None => prepare(&plan, &assets, &version, max_tokens)?,
-            };
+            let tasks = prepare_lane(&plan, &assets, &version, max_tokens, backend, cuda_lane)?;
             // Reserve a fresh directory so a retry cannot reuse partial or stale tasks.
             fs::create_dir(&output_dir).map_err(|e| format!("create task directory: {e}"))?;
             write_new(&output_dir.join("tasks.json"), &tasks)?;

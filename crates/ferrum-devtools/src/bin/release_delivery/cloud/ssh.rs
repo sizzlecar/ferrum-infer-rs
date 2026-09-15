@@ -440,6 +440,9 @@ pub(super) fn runner_command(
             "--max-num-seqs".into(),
             capacity.max_num_seqs.to_string(),
         ]);
+        if let Some(budget) = capacity.runtime_memory_budget_bytes {
+            words.extend(["--runtime-memory-budget-bytes".into(), budget.to_string()]);
+        }
     }
     if task.disable_thinking {
         words.push("--disable-thinking".into());

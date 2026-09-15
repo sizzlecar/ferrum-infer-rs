@@ -3,6 +3,9 @@
 //! normal kernel scope; this is not a general workflow interpreter.
 use super::*;
 
+#[path = "publication.rs"]
+mod publication;
+
 fn require(value: &Value, expected: Value, context: &str) -> Result<(), String> {
     if value != &expected {
         return Err(format!("unreviewed artifact binding: {context}"));
@@ -171,6 +174,14 @@ pub(super) fn producer_jobs(
         "stage-cuda-linux",
         "${{ needs.stage-cuda-linux.outputs.cuda_asset_id }}",
     )?;
+    let mut publish = delivery["jobs"]["publish"].clone();
+    if publish.get("if").is_some() {
+        publication::verify(&publish)?;
+        publish
+            .as_object_mut()
+            .ok_or("publisher is not a job")?
+            .remove("if");
+    }
     for (producer, artifact) in [
         (
             "stage-cuda-linux",
@@ -182,7 +193,7 @@ pub(super) fn producer_jobs(
             "${{ needs.stage-cpu-windows.outputs.asset_id }}",
         ),
     ] {
-        consumes(&delivery["jobs"]["publish"], producer, artifact)?;
+        consumes(&publish, producer, artifact)?;
     }
 
     let mut linux = cuda["jobs"][LINUX].clone();

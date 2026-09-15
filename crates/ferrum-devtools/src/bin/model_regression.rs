@@ -72,6 +72,9 @@ struct Args {
     /// Functional concurrency ceiling, paired with --context-tokens.
     #[arg(long, requires = "context_tokens", value_parser = clap::value_parser!(u32).range(1..))]
     max_num_seqs: Option<u32>,
+    /// Public runtime memory budget for both entrypoints; requires explicit capacity.
+    #[arg(long, requires_all = ["context_tokens", "max_num_seqs"], value_parser = clap::value_parser!(u64).range(1..))]
+    runtime_memory_budget_bytes: Option<u64>,
     /// Per-generation test output budget; does not change context or concurrency.
     #[arg(long, default_value = "512", value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
@@ -96,6 +99,7 @@ impl Args {
             .map(|(context_tokens, max_num_seqs)| ModelRunCapacity {
                 context_tokens,
                 max_num_seqs,
+                runtime_memory_budget_bytes: self.runtime_memory_budget_bytes,
             })
     }
 
@@ -122,10 +126,17 @@ impl Args {
                 "--max-num-seqs".into(),
                 capacity.max_num_seqs.to_string(),
             ]);
+            if let Some(budget) = capacity.runtime_memory_budget_bytes {
+                args.extend(["--runtime-memory-budget-bytes".into(), budget.to_string()]);
+            }
         }
         args
     }
 }
+
+#[cfg(test)]
+#[path = "model_regression/capacity_tests.rs"]
+mod capacity_tests;
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     fs::write(path.as_ref(), serde_json::to_vec_pretty(value)?)
