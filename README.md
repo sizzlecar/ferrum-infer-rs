@@ -23,13 +23,48 @@ running tests concurrently.
 [Watch the English demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 seconds · 8× speed.
 
 <details>
-<summary><strong>Run this demo: installation and startup commands</strong></summary>
+<summary><strong>Try it locally</strong></summary>
+
+Install Ferrum and Orchestral on macOS or Linux:
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+On Windows, use the PowerShell installers for [Ferrum](#quick-start) and
+[Orchestral](https://github.com/sizzlecar/orchestral#install). Then open a new
+terminal and start the model:
+
+```sh
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF
+```
+
+Ferrum automatically selects an available backend, resolves the GGUF file, and
+downloads any missing weights and metadata. Later starts reuse the cache. With
+the default configuration, the API listens at `http://127.0.0.1:8000/v1`.
+
+Leave Ferrum running. In another terminal, open your project directory and run:
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
+```
+
+Once the model is ready, type a task and press Enter. No JSON configuration or API
+key is required. Memory requirements and speed depend on your hardware; these
+defaults are for trying the model, not reproducing the recording's concurrency
+and performance settings.
+
+</details>
+
+<details>
+<summary><strong>Advanced: reproduce the recording configuration</strong></summary>
 
 The recording uses an **M1 Max Mac with 32 GB unified memory**, Metal, and
 **Qwen3.5-9B Q4_K_M**. The commands below reproduce its serving settings:
 24,576 tokens per context, three active sequences, a 20 GiB runtime memory budget,
-and the model's default thinking behavior. Use **Ferrum 0.10.0** and
-**Orchestral 0.3.1**. No JSON configuration or API key is required.
+and the model's default thinking behavior. These optional settings are not
+required to try Ferrum. Use **Ferrum 0.10.0** and **Orchestral 0.3.1**.
 
 Install both programs once, then open four terminal panes:
 

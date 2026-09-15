@@ -22,11 +22,44 @@ Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运�
 [观看英文演示](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 秒 · 8 倍速。
 
 <details>
-<summary><strong>运行演示：安装与启动命令</strong></summary>
+<summary><strong>快速试用</strong></summary>
+
+在 macOS 或 Linux 上安装 Ferrum 和 Orchestral：
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+Windows 请使用 [Ferrum](#快速开始) 和
+[Orchestral](https://github.com/sizzlecar/orchestral/blob/main/README.zh-CN.md#安装)
+的 PowerShell 安装脚本。安装后打开新终端，一行启动模型：
+
+```sh
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF
+```
+
+Ferrum 会自动选择可用后端、解析 GGUF 文件并下载缺失的权重和元数据，后续启动复用缓存。
+默认配置下，API 地址为 `http://127.0.0.1:8000/v1`。
+
+保持 Ferrum 运行，在另一个终端进入你的项目目录后执行：
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
+```
+
+模型就绪后，输入任务并按 Enter 即可，无需 JSON 配置或 API key。
+内存需求和速度取决于硬件；这些默认设置用于快速试用，不等于录像的并发和性能配置。
+
+</details>
+
+<details>
+<summary><strong>高级：复现录像配置</strong></summary>
 
 视频使用 **M1 Max、32 GB 统一内存的 Mac**，通过 Metal 运行 **Qwen3.5-9B Q4_K_M**。
 以下命令采用相同的服务参数：每个上下文 24,576 token、三个活跃序列、20 GiB 运行时内存预算，
-并保留模型默认的思考行为。使用 **Ferrum 0.10.0** 和 **Orchestral 0.3.1**，无需 JSON 配置或 API key。
+并保留模型默认的思考行为。这些可选设置不是试用 Ferrum 的前提。
+使用 **Ferrum 0.10.0** 和 **Orchestral 0.3.1**。
 
 先安装两个程序，再打开四个终端格子：
 

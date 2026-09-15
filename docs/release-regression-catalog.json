@@ -464,7 +464,7 @@
     {
       "path": "README.md",
       "before_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
-      "after_sha256": "4f5adee5fa9fabed161d7de328a65c2f5646ecc968920116c3af92057ca8b3f8",
+      "after_sha256": "a877894eed642c16250c94b826fb5af3d8f79e330f4fa28d54a7144f0d48812c",
       "areas": [
         "build",
         "backend_submission",
@@ -472,12 +472,12 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the added CDN-linked English demo and collapsed installation/startup instructions: pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, model discovery, and three independent coding sessions. The recording and setup are scoped to M1 Max with 32 GB; no comparative performance or additional platform claim is introduced. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
+      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
     },
     {
       "path": "README_zh.md",
       "before_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
-      "after_sha256": "d3c8dd5e4137f5f6207d00d03550246a0c6d63facb069560293205d0abe15a3d",
+      "after_sha256": "31104c4686ee2b54c9ab04d9ca8c50bd4ab234998cd4087aabf469d4bc5d7d68",
       "areas": [
         "build",
         "backend_submission",
@@ -485,7 +485,7 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the added CDN-linked English demo and collapsed installation/startup instructions: pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, model discovery, and three independent coding sessions. The recording and setup are scoped to M1 Max with 32 GB; no comparative performance or additional platform claim is introduced. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
+      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
     }
   ],
   "release_profile_ids": [
