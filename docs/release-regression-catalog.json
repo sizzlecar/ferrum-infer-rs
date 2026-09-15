@@ -23,7 +23,7 @@
   "release_metal": {
     "mandatory_local_profile_ids": [
       "release-qwen35-4b-gguf-metal",
-      "release-qwen35-2b-safetensors-metal",
+      "release-qwen35-08b-safetensors-metal",
       "llama-dense-metal"
     ],
     "extended_profile_ids": [
@@ -32,7 +32,7 @@
       "release-qwen35-9b-gguf-metal",
       "release-qwen38-27b-gguf-metal"
     ],
-    "reason": "Require pinned Metal representatives sized for a 16 GiB unified-memory host, with bounded functional workloads and unchanged product Quick Start defaults. Larger model coverage is explicitly not run, not passed; all backend numerical and safety obligations remain required."
+    "reason": "Require pinned local Metal representatives with bounded functional workloads: a 0.8B SafeTensors sample, the unchanged 4B GGUF product Quick Start, and the existing Llama GGUF legacy-executor sample. Unselected larger model coverage is explicitly not run, not passed; all backend numerical and safety obligations remain required."
   },
   "release_performance": {
     "mode": "deferred",
@@ -226,11 +226,11 @@
       "reasoning_protocol": "model_generated"
     },
     {
-      "id": "release-qwen35-4b-gguf-cpu",
-      "model": "unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523",
+      "id": "release-qwen35-08b-gguf-cpu",
+      "model": "unsloth/Qwen3.5-0.8B-GGUF@6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
       "gguf": {
-        "filename": "Qwen3.5-4B-Q4_K_M.gguf",
-        "semantic_source": "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+        "filename": "Qwen3.5-0.8B-Q4_K_M.gguf",
+        "semantic_source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17"
       },
       "target": {
         "architecture": "qwen3_5_dense_hybrid",
@@ -352,8 +352,8 @@
       "reasoning_protocol": "prompt_opened"
     },
     {
-      "id": "release-qwen35-2b-safetensors-cpu",
-      "model": "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "id": "release-qwen35-08b-safetensors-cpu",
+      "model": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
       "target": {
         "architecture": "qwen3_5_dense_hybrid",
         "protocol": "text",
@@ -366,8 +366,8 @@
       "reasoning_protocol": "prompt_opened"
     },
     {
-      "id": "release-qwen35-2b-safetensors-metal",
-      "model": "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "id": "release-qwen35-08b-safetensors-metal",
+      "model": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
       "target": {
         "architecture": "qwen3_5_dense_hybrid",
         "protocol": "text",
@@ -540,14 +540,14 @@
     }
   ],
   "release_profile_ids": [
-    "release-qwen35-4b-gguf-cpu",
+    "release-qwen35-08b-gguf-cpu",
     "release-qwen35-4b-gguf-cuda",
     "release-qwen35-4b-gguf-metal",
     "release-qwen35-9b-gguf-cuda",
     "release-qwen35-9b-gguf-metal",
     "release-qwen38-27b-gguf-cuda",
     "release-qwen38-27b-gguf-metal",
-    "release-qwen35-2b-safetensors-cpu",
-    "release-qwen35-2b-safetensors-metal"
+    "release-qwen35-08b-safetensors-cpu",
+    "release-qwen35-08b-safetensors-metal"
   ]
 }

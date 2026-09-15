@@ -190,7 +190,7 @@ impl Plan {
         let mut entries = Vec::new();
         if run.has(Check::MetalRuntime) {
             entries.push(
-                r#"{"backend":"metal","runner":["self-hosted","macOS","ARM64","ferrum-metal-16gb"]}"#,
+                r#"{"backend":"metal","runner":["self-hosted","macOS","ARM64","ferrum-metal"]}"#,
             );
         }
         if run.has(Check::CudaRuntime) {
@@ -200,7 +200,7 @@ impl Plan {
         // A skipped job still needs a syntactically valid matrix at expansion.
         if entries.is_empty() {
             entries.push(
-                r#"{"backend":"metal","runner":["self-hosted","macOS","ARM64","ferrum-metal-16gb"]}"#,
+                r#"{"backend":"metal","runner":["self-hosted","macOS","ARM64","ferrum-metal"]}"#,
             );
         }
         println!("gpu_matrix={{\"include\":[{}]}}", entries.join(","));

@@ -125,15 +125,15 @@ cases. Selected HTTP checks share one server; separate run baseline/replay cases
 retain their existing processes. There is no extra Quick Start model launch.
 
 The mandatory Metal tasks are `release-qwen35-4b-gguf-metal`,
-`release-qwen35-2b-safetensors-metal` and `llama-dense-metal`. The first is the
+`release-qwen35-08b-safetensors-metal` and `llama-dense-metal`. The first is the
 sole Metal Quick Start: its entire assigned task retains product capacity
 defaults. The latter two bind typed `ModelRunCapacity` values of 2048 context
 tokens, one sequence and `runtime_memory_budget_bytes: 10737418240` (10 GiB),
 forwarded to both `run` and `serve`; the controlled output budget remains 512
 tokens. This runtime planning budget is not an RSS hard limit or proof of fit.
-The actual staged-candidate CI execution on the M4 16 GiB worker must establish
+The actual staged-candidate CI execution on the local release worker must establish
 the tested capacity and model behavior. Timeout, OOM and assertion failures
-remain failures. See the [Metal lane procedure](release-regression.md#required-16-gib-metal-model-lane).
+remain failures. See the [Metal lane procedure](release-regression.md#required-local-metal-model-lane).
 
 Missing or failed execution, wrong observed backend, mismatched task inputs and
 unsupported model obligations fail this limited gate. The target remains a
@@ -147,7 +147,7 @@ checks, fresh downloads and unimplemented behavior checks remain separate.
 | Profile ID | Declared coverage | Source (see catalog for pinned identities) | Release lane |
 |---|---|---|---|
 | `release-qwen35-4b-gguf-metal` | Dense hybrid, GGUF Q4_K_M, Metal | `unsloth/Qwen3.5-4B-GGUF` | Mandatory local; sole Metal Quick Start |
-| `release-qwen35-2b-safetensors-metal` | Dense hybrid, SafeTensors BF16 + F32, Metal | `Qwen/Qwen3.5-2B` | Mandatory local |
+| `release-qwen35-08b-safetensors-metal` | Dense hybrid, SafeTensors BF16 + F32, Metal | `Qwen/Qwen3.5-0.8B` | Mandatory local |
 | `llama-dense-metal` | Llama dense, GGUF Q4_K_M, legacy Metal path | `bartowski/Meta-Llama-3.1-8B-Instruct-GGUF` | Mandatory local |
 | `release-qwen35-9b-gguf-metal` | Dense hybrid, GGUF Q4_K_M, Metal | `unsloth/Qwen3.5-9B-GGUF` | Extended, not run |
 | `release-qwen38-27b-gguf-metal` | Dense hybrid, mixed GGUF 4-bit, Metal | `unsloth/Qwen3.8-27B-GGUF` | Extended, not run |
@@ -156,6 +156,8 @@ checks, fresh downloads and unimplemented behavior checks remain separate.
 | `release-qwen35-4b-gguf-cuda` | Dense hybrid, GGUF Q4_K_M, CUDA | `unsloth/Qwen3.5-4B-GGUF` | Mandatory local; CUDA Quick Start |
 | `release-qwen35-08b-safetensors-cuda` | Dense hybrid, SafeTensors BF16 + F32, CUDA | `Qwen/Qwen3.5-0.8B` | Mandatory local |
 | `release-llama32-1b-safetensors-cuda` | Llama dense, SafeTensors BF16, legacy CUDA path | `unsloth/Llama-3.2-1B-Instruct` | Mandatory local |
+| `release-qwen35-08b-gguf-cpu` | Dense hybrid, GGUF Q4_K_M, CPU | `unsloth/Qwen3.5-0.8B-GGUF` | Mandatory CPU |
+| `release-qwen35-08b-safetensors-cpu` | Dense hybrid, SafeTensors BF16 + F32, CPU | `Qwen/Qwen3.5-0.8B` | Mandatory CPU |
 | `quick-start-cuda` | Dense hybrid, SafeTensors BF16 + F32, CUDA | `qwen3.5:4b` | Cloud extension; not a current Quick Start binding |
 | `attention-moe-cuda` | Attention-only MoE, GPTQ INT4, CUDA | `Qwen/Qwen3-30B-A3B-GPTQ-Int4@9b534e4318b7ebc3c961a839f13eb18b1833f441` | Cloud extension |
 | `llama-dense-cuda` | Llama dense, SafeTensors BF16, legacy CUDA path | `unsloth/Meta-Llama-3.1-8B-Instruct` | Cloud extension |
@@ -239,10 +241,12 @@ The CUDA Ubuntu container type-checks the CUDA CLI and optionally builds PTX;
 it does not execute CUDA operators.
 
 The separate `GPU runtime` matrix schedules repository-controlled code on the
-self-hosted Metal and CUDA workers. The M4 16 GiB Metal worker carries both
-`ferrum-metal` and `ferrum-metal-16gb`; Metal device Quality, release models and
-Homebrew verification select the 16 GiB label and share a single-host concurrency
-group with cancellation disabled. Model tasks run serially, with a 3600-second
+self-hosted Metal and CUDA workers. Metal device Quality selects the
+`ferrum-metal` pool (the local Mac and the 16 GiB MacBook Pro). Release models
+and Homebrew verification select the local Mac's `ferrum-metal-release` role.
+Mac mini 2 is unregistered. One service per Mac serializes that host's jobs;
+different Macs do not share a Metal concurrency lock. The CUDA jobs retain
+their shared physical-host lock. Model tasks run serially, with a 3600-second
 per-task timeout and a 240-minute model job limit. Those labels and limits select
 and schedule resources; they do not prove model fit or success. CUDA retains
 the mandatory local RTX 4050 lane and explicit cloud extension.

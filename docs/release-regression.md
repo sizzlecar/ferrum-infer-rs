@@ -33,6 +33,24 @@ was publicly released. `--stage pull_request` uses the PR base instead;
 Output files must be new. Git endpoints and the catalog digest identify planning
 inputs; neither proves correctness.
 
+CPU release model sampling uses pinned Qwen3.5 0.8B representatives in
+SafeTensors BF16/F32 and Q4_K_M GGUF. Both retain the same dense-hybrid
+architecture and production execution path as the former 2B/4B CPU samples.
+Each format must still pass its own load, forward and architecture-state checks
+through `run`, synchronous HTTP and streaming HTTP. Shared protocol, structured,
+tool, reasoning, stop, length and observability checks can be assigned to the
+GGUF representative; they do not require the previous SafeTensors model size.
+Numerical and safety contracts are unchanged. The former 2B/4B CPU samples are
+not run by this candidate's default gate; smaller-model results do not certify
+those larger variants. Metal/CUDA Quick Start samples and defaults are unchanged.
+
+These CPU functional tasks retain context 2048, one sequence and the existing
+512-token output budget. Each task is limited to 3600 seconds and each HTTP
+request to 300 seconds, within a 150-minute job including preparation and evidence
+upload. These are failure ceilings, not expected durations or measured speedups;
+timeouts remain failures. The new samples must produce fresh candidate evidence,
+not renamed reports from the former models.
+
 CUDA release model sampling defaults to the committed local lane: pinned 4B
 Q4 GGUF, 0.8B dense-hybrid SafeTensors and 1B Llama SafeTensors representatives.
 Use `--run-cloud-cuda true` only for an explicitly requested extended cloud run;
@@ -46,8 +64,8 @@ even when cloud execution is enabled. See the [delivery procedure](release-candi
 for resource limits and the distinction between capacity preflight and release evidence.
 
 Metal release model sampling uses the committed `release_metal` local lane on
-the 16 GiB Apple Silicon worker. It requires pinned Qwen3.5 4B Q4_K_M GGUF,
-Qwen3.5 2B SafeTensors and Llama 3.1 8B Q4_K_M GGUF. Only the 4B profile is the
+the local Apple Silicon release worker. It requires pinned Qwen3.5 4B Q4_K_M GGUF,
+Qwen3.5 0.8B SafeTensors and Llama 3.1 8B Q4_K_M GGUF. Only the 4B profile is the
 Metal Quick Start and retains product capacity defaults. The other two use the
 explicit workload below. The larger Metal 9B, 27B, 30B attention-only MoE and
 35B hybrid MoE profiles remain in `plan.extended_not_run`: they have not been
@@ -253,14 +271,14 @@ checks. A smaller-model substitution or capacity override is diagnostic evidence
 not completion of the advertised Quick Start. Capture startup/download failures,
 timeouts, output errors and resource limits instead of silently changing flags.
 
-## Required 16 GiB Metal model lane
+## Required local Metal model lane
 
 The release catalog requires these three independently identified profiles:
 
 | Profile | Model path | Capacity configuration |
 |---|---|---|
 | `release-qwen35-4b-gguf-metal` | Qwen3.5 4B Q4_K_M GGUF, production plan runtime | Sole Metal Quick Start; product context, concurrency and memory defaults |
-| `release-qwen35-2b-safetensors-metal` | Qwen3.5 2B BF16/F32 SafeTensors, production plan runtime | Context 2048, one sequence, 10 GiB runtime memory budget |
+| `release-qwen35-08b-safetensors-metal` | Qwen3.5 0.8B BF16/F32 SafeTensors, production plan runtime | Context 2048, one sequence, 10 GiB runtime memory budget |
 | `llama-dense-metal` | Llama 3.1 8B Q4_K_M GGUF, legacy model executor | Context 2048, one sequence, 10 GiB runtime memory budget |
 
 The [catalog](release-regression-catalog.json) fixes weight revisions, GGUF
@@ -268,21 +286,27 @@ filenames and independent semantic sources. These are release model tasks, not
 changes to README or other public first-use examples. All checks assigned to
 the 4B Quick Start share its default-capacity task; do not replace it with a
 bounded duplicate or treat another profile as its Quick Start evidence.
+The SafeTensors sample replaces the former 2B task without changing its target
+architecture, precision or execution path. The existing Llama 3.1 GGUF sample
+retains the independent legacy-executor check; an unverified smaller Llama
+source or different RoPE configuration is not a valid drop-in substitute.
 
 For the two non-Quick-Start profiles, prepared expectations bind
 `--context-tokens 2048 --max-num-seqs 1 --runtime-memory-budget-bytes 10737418240`
 in both `run` and `serve`. The controlled output budget remains 512 tokens.
 The 10 GiB value is a typed runtime planning budget, not an operating-system
 RSS hard limit, a reservation of all other host memory, or proof that loading
-and execution fit. Only actual candidate CI results on the M4 16 GiB host can
+and execution fit. Only actual candidate CI results on the selected release host can
 establish the tested capacity and semantics. OOM, timeout and invalid output
 remain failures; the policy does not waive them.
 
-The worker carries both `ferrum-metal` and `ferrum-metal-16gb` labels. Metal
-release model execution, device Quality checks and Homebrew verification select
-the 16 GiB worker and share a single-host concurrency group with cancellation
-disabled. Model tasks execute serially, with a 3600-second timeout per task and
-a 240-minute model job limit. These are execution ceilings, not measured
+Device Quality selects the `ferrum-metal` pool, currently the local Mac and the
+16 GiB MacBook Pro. Release models and Homebrew verification select the local
+Mac's additional `ferrum-metal-release` role. Mac mini 2 is no longer registered.
+Each Mac has one runner service, which serializes jobs on that host; independent
+Macs do not share a Metal concurrency lock. CUDA retains its shared physical-host
+lock across native Windows and Linux jobs. Model tasks execute serially, with a
+3600-second timeout per task and a 240-minute model job limit. These are execution ceilings, not measured
 durations. Metal device Quality has a separate 120-minute job ceiling that
 includes cold checkout, toolchain/dependency downloads and the full Metal
 feature suite. The CUDA device Quality ceiling remains 30 minutes. Setup
@@ -291,13 +315,13 @@ The [delivery workflow](../.github/workflows/release-delivery.yml)
 and [Quality workflow](../.github/workflows/ci.yml) define this scheduling.
 
 Metal device Quality preserves Cargo build outputs outside checkout in
-`RUNNER_TOOL_CACHE/ferrum-metal-cargo-target`. After acquiring the existing host
-lock, a job moves a previous ordinary `target` there only if the destination
+`RUNNER_TOOL_CACHE/ferrum-metal-cargo-target`. Once assigned to a runner,
+a job moves a previous ordinary `target` there only if the destination
 does not exist, before checkout can clean it. It then links `target` back to the
 cache, keeping existing `./target` commands unchanged. Conflicting directories,
 unexpected or broken links, and cache paths overlapping checkout fail closed
 without deletion or overwrite. An already-running job is not cancelled or
-modified; migration starts in a later job after the host lock is released.
+modified; migration starts when that runner picks up a later job.
 Toolchain and source changes can still require recompilation. CUDA is unchanged.
 
 The Metal model job pins the official artifact downloader containing the

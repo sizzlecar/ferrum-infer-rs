@@ -434,7 +434,8 @@ jobs:
     # Include cold checkout/toolchain/dependency setup in its bounded budget.
     timeout-minutes: ${{ matrix.backend == 'metal' && 120 || 30 }}
     concurrency:
-      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || 'ferrum-mini-metal-hardware' }}
+      # Panda's Windows/WSL jobs share hardware; independent Metal workers do not.
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-ci-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
       queue: max
     permissions:
@@ -452,7 +453,8 @@ jobs:
         id: metal_cargo_cache
         working-directory: ${{ runner.workspace }}
         run: |
-          # The job already owns the single-Metal-host concurrency lock.
+          # Each runner executes one job at a time; this cache stays on that
+          # worker, outside checkout, without serializing other Metal machines.
           reject() { echo "Metal Cargo cache: $*" >&2; exit 1; }
           checkout_root="${GITHUB_WORKSPACE:?}"
           cache_parent="${RUNNER_TOOL_CACHE:?}"
