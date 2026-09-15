@@ -43,6 +43,11 @@ impl ModelChatTemplate {
             reasoning_default_enabled: false,
             reasoning_effort_support: ReasoningEffortSupport::Unknown,
         };
+        if model_template.tool_call_protocol == ApiToolCallProtocol::Json
+            && model_template_emits_native_json_tools(&model_template)
+        {
+            model_template.tool_call_protocol = ApiToolCallProtocol::NativeJson;
+        }
         let (reasoning_protocol, reasoning_default_enabled) =
             detect_model_reasoning_protocol(&model_template);
         model_template.reasoning_protocol = reasoning_protocol;
@@ -101,6 +106,85 @@ fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
     } else {
         ApiToolCallProtocol::Json
     }
+}
+
+/// Observe the model-owned assistant-history wire, not just whether it accepts
+/// tool definitions. Other native formats must keep their existing fallback.
+fn model_template_emits_native_json_tools(template: &ModelChatTemplate) -> bool {
+    if !model_template_supports_tools(template) {
+        return false;
+    }
+    let probe = || -> Option<()> {
+        const SENTINEL: &str = "ferrum_tool_protocol_content_probe";
+        const NAME: &str = "ferrum_tool_protocol_probe";
+        let arguments = serde_json::json!({"value":"sample"});
+        let tools = [ChatTool {
+            tool_type: "function".into(),
+            function: ChatFunction {
+                name: NAME.into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type":"object", "properties":{"value":{"type":"string"}},
+                    "required":["value"], "additionalProperties":false
+                })),
+                strict: None,
+            },
+        }];
+        let options = ChatTemplateOptions {
+            now_override: chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0)),
+            ..ChatTemplateOptions::default()
+        };
+        let render = |messages: &[PromptMessage]| {
+            render_model_template_once(
+                messages,
+                &[],
+                template,
+                &options,
+                Some(&tools),
+                None,
+                None,
+                None,
+                false,
+            )
+            .ok()
+        };
+        let mut messages = [
+            PromptMessage::new("user", "Use the supplied function."),
+            PromptMessage::new("assistant", SENTINEL),
+        ];
+        let baseline = render(&messages)?;
+        let (prefix, suffix) = baseline.split_once(SENTINEL)?;
+        if suffix.contains(SENTINEL) {
+            return None;
+        }
+        messages[1].content.clear();
+        messages[1].tool_calls = Some(vec![PromptToolCall {
+            index: None,
+            id: "a1b2c3d4e".into(),
+            tool_type: "function".into(),
+            function: PromptFunctionCall {
+                name: NAME.into(),
+                arguments: arguments.clone(),
+            },
+        }]);
+        let rendered = render(&messages)?;
+        let payload = rendered.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
+        let payload = if let Some(inner) = payload.strip_prefix("<tool_call>") {
+            inner.strip_suffix("</tool_call>")?.trim()
+        } else {
+            payload
+        };
+        let value: Value = serde_json::from_str(payload).ok()?;
+        let object = value.as_object()?;
+        let actual = match (object.get("arguments"), object.get("parameters")) {
+            (Some(arguments), None) | (None, Some(arguments)) => arguments,
+            _ => return None,
+        };
+        (object.len() == 2 && object.get("name")?.as_str()? == NAME && actual == &arguments)
+            .then_some(())
+    };
+    probe().is_some()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -46,13 +46,7 @@ impl Builder<'_> {
     }
 
     fn schema(&mut self, name: &str, schema: serde_json::Value) -> Result<String> {
-        let mut schema = compact_json_schema(schema)?;
-        // Both branches must permit ordinary JSON formatting. Restricting
-        // final JSON to compact separators can mask a model's intended answer
-        // while leaving a lower-scoring tool call available. Request budgets
-        // and the processor's liveness checks still bound generation; compiler
-        // options remain owned by Ferrum rather than request x-guidance.
-        JsonCompileOptions::default().apply_to(&mut schema);
+        let schema = prepare_json_schema(schema)?;
         self.schemas.push(GrammarWithLexer {
             name: Some(name.to_string()),
             json_schema: Some(schema),
@@ -126,7 +120,7 @@ pub(super) fn build(
     let tool_only = chat.requires_native_tool_call();
     if tool_only && protocol == ModelOutputProtocol::HarmonyGptOss {
         return Err(FerrumError::invalid_request(
-            "native XML tool framing cannot use the Harmony output protocol",
+            "native tool framing cannot use the Harmony output protocol",
         ));
     }
     let mut builder = Builder {
@@ -193,7 +187,7 @@ pub(super) fn build(
         let open = builder.marker("<tool_call>");
         let close = builder.marker("</tool_call>");
         match chat.tool_call_protocol {
-            ApiToolCallProtocol::Json => {
+            ApiToolCallProtocol::Json | ApiToolCallProtocol::NativeJson => {
                 // Keep each argument schema in its own root namespace so local
                 // $ref values are not accidentally rebound by a JSON wrapper.
                 let name_json = serde_json::to_string(name).expect("tool name serialization");

@@ -303,6 +303,84 @@ fn xml_envelope_keeps_raw_parameters_and_allows_multiple_complete_calls() {
 }
 
 #[test]
+fn forced_native_json_masks_wrong_names_arguments_and_final_answers() {
+    use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
+    let valid = r#"{"name":"weather","parameters":{"city":"Paris"}}"#;
+    let other = r#"{"name":"clock","arguments":{"hour":7}}"#;
+    let invalid = [
+        r#"{"city":"Paris"}"#,
+        r#"{"ok":true}"#,
+        r#"{"name":"undeclared","arguments":{"city":"Paris"}}"#,
+        r#"{"name":"weather","arguments":{"city":17}}"#,
+        r#"{"name":"weather","arguments":{"city":"Paris","extra":true}}"#,
+        r#"{"name":"clock","arguments":{"city":"Paris"}}"#,
+    ];
+    let mut packets = vec![valid, other];
+    packets.extend(invalid);
+    let tokenizer = Arc::new(PacketTokenizer::new(&packets));
+    let factory = StructuredOutputFactory::new(tokenizer.clone()).unwrap();
+    let mut chat = request(ApiToolCallProtocol::NativeJson);
+    let mut clock = chat.tools[0].clone();
+    clock.function.name = "clock".into();
+    clock.function.parameters = Some(json!({
+        "type":"object", "properties":{"hour":{"type":"integer"}},
+        "required":["hour"], "additionalProperties":false
+    }));
+    chat.tools.push(clock);
+    for named in [false, true] {
+        chat.tool_choice = Some(if named {
+            ApiToolChoice::Function {
+                tool_type: "function".into(),
+                function: ApiToolChoiceFunction {
+                    name: "weather".into(),
+                },
+            }
+        } else {
+            ApiToolChoice::Mode("required".into())
+        });
+        // A caller's final-response schema must not replace the native call.
+        let processor = configured_processor(
+            &factory,
+            &tokenizer,
+            &chat,
+            &StructuredOutputStart::Immediate,
+            ModelOutputProtocol::Text,
+        );
+        let mut logits = vec![0.0; tokenizer.vocab_size()];
+        processor
+            .mask_logits_with_terminals(&mut logits, &[], &tokenizer.terminals(), &HashSet::new())
+            .unwrap();
+        assert!(logits[tokenizer.id(valid) as usize].is_finite());
+        assert_eq!(logits[tokenizer.id(other) as usize].is_finite(), !named);
+        assert!(!logits[EOS as usize].is_finite());
+        for text in invalid {
+            assert!(
+                !logits[tokenizer.id(text) as usize].is_finite(),
+                "accepted {text}"
+            );
+        }
+        for text in [valid.to_string(), format!("<tool_call>{valid}</tool_call>")] {
+            processor.reset().unwrap();
+            let mut generated = Vec::new();
+            append(&processor, &tokenizer, &mut generated, &text);
+            assert!(processor.is_accepting(&generated).unwrap());
+            assert_eq!(
+                processor
+                    .classified_result_with_terminals(&generated, &tokenizer.terminals())
+                    .unwrap(),
+                Some((StructuredOutputBranch::ToolCall, text))
+            );
+        }
+        if !named {
+            processor.reset().unwrap();
+            let mut generated = Vec::new();
+            append(&processor, &tokenizer, &mut generated, other);
+            assert!(processor.is_accepting(&generated).unwrap());
+        }
+    }
+}
+
+#[test]
 fn forced_native_calls_mask_bare_arguments_and_unselected_names() {
     use ferrum_types::{ApiToolChoice, ApiToolChoiceFunction, StructuredOutputBranch};
     let tokenizer = Arc::new(PacketTokenizer::new(&[]));

@@ -566,6 +566,17 @@ fn tool_call_preamble_is_preserved_in_actual_continuation_history() {
 }
 
 #[test]
+fn absent_tool_evidence_is_not_a_reasoning_alias_mismatch() {
+    for alias in [false, true] {
+        let error = verify_tool_case(&Value::Null, 128, alias).unwrap_err();
+        assert!(error.contains("missing tool evidence"));
+        assert!(!error.contains("alias"));
+    }
+    let partial = json!({"reasoning_alias_replayed": false});
+    assert!(verify_tool_case(&partial, 128, false).is_err());
+}
+
+#[test]
 fn tool_case_replays_each_actual_call_and_only_moves_observed_reasoning_for_alias_mode() {
     verify_tool_case(&evidence(false), 128, false).unwrap();
     let mut punctuation = evidence(false);

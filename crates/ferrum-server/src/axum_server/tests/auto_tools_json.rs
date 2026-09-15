@@ -1011,13 +1011,223 @@ fn llama_json_template() -> ModelChatTemplate {
         )),
         "native-bare-json-contract",
     );
+    assert_eq!(
+        template.tool_call_protocol,
+        ferrum_types::ApiToolCallProtocol::NativeJson
+    );
     template.bos_token = Some("<|begin_of_text|>".into());
     template.eos_token = Some("<|eot_id|>".into());
     assert_eq!(
         template.tool_call_protocol,
-        ferrum_types::ApiToolCallProtocol::Json
+        ferrum_types::ApiToolCallProtocol::NativeJson
     );
     template
+}
+
+fn native_json_template() -> ModelChatTemplate {
+    ModelChatTemplate::new(
+        r#"{% if tools %}Use the native envelope {"name": function name, "parameters": argument object}. {{ tools | tojson }}{% endif %}{% for message in messages %}{% if message.tool_calls %}{% for call in message.tool_calls %}{{ {"name": call.function.name, "parameters": call.function.arguments} | tojson }}{% endfor %}{% else %}{{ message.content }}{% endif %}{% endfor %}"#,
+        "synthetic-native-json-contract",
+    )
+}
+
+#[test]
+fn native_json_detection_requires_actual_named_json_history() {
+    for source in [
+        include_str!("../../../tests/fixtures/chat_template/unsloth__Mistral-Small-3.2-24B-Instruct-2506/template.jinja"),
+        include_str!("../../../tests/fixtures/chat_template/unsloth__Magistral-Small-2509/template.jinja"),
+        include_str!("../../../tests/fixtures/chat_template/mistralai__Devstral-Small-2-24B-Instruct-2512/template.jinja"),
+        // Tools-aware does not establish the generated protocol.
+        "{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}[TOOL_CALLS]{{ c.function.name }}[ARGS]{{ c.function.arguments | tojson }}{% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}",
+        "{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}{% if m.tool_calls %}{{ m.tool_calls[0].function.arguments | tojson }}{% else %}{{ m.content }}{% endif %}{% endfor %}",
+        "{% if tools %}{{ raise_exception('unsupported tool history') }}{% endif %}",
+    ] {
+        let template = ModelChatTemplate::new(source, "arbitrary-tool-template");
+        assert_eq!(template.tool_call_protocol, ferrum_types::ApiToolCallProtocol::Json);
+        assert_eq!(template.template, source);
+    }
+    // Capability probing runs before callers bind BOS/EOS strings.
+    let template = native_json_template();
+    assert!(template.bos_token.is_none());
+    assert!(template.eos_token.is_none());
+    assert_eq!(
+        template.tool_call_protocol,
+        ferrum_types::ApiToolCallProtocol::NativeJson
+    );
+    llama_json_template();
+}
+
+#[test]
+fn native_json_conversion_preserves_template_and_forced_names_without_argument_prompt() {
+    let template = native_json_template();
+    let original = template.template.clone();
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"weather"}}),
+    ] {
+        let mut wire = Endpoint::Chat.request(weather_schema(), false);
+        wire["tool_choice"] = choice.clone();
+        wire["tools"].as_array_mut().unwrap().push(json!({
+            "type":"function", "function":{"name":"clock", "parameters":city_schema()}
+        }));
+        let request: ChatCompletionsRequest = serde_json::from_value(wire).unwrap();
+        validate_chat_request(&request).unwrap();
+        let internal =
+            convert_chat_request_with_template_model(&request, "unrelated-alias", Some(&template))
+                .unwrap();
+        assert_eq!(template.template, original);
+        assert!(internal
+            .prompt
+            .contains(r#"{"name": function name, "parameters": argument object}"#));
+        assert!(internal.prompt.contains("What is the weather in Paris?"));
+        assert!(internal.prompt.contains("weather"));
+        assert!(internal.prompt.contains("clock"));
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text
+        );
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::Immediate
+        );
+        assert!(internal.requires_structured_output());
+        let Some(ferrum_types::ApiRequest::Chat(chat)) = &internal.api_request else {
+            panic!("chat contract")
+        };
+        assert_eq!(
+            chat.tool_call_protocol,
+            ferrum_types::ApiToolCallProtocol::NativeJson
+        );
+        assert!(chat.requires_native_tool_call());
+        assert!(chat.allows_tool_name("weather"));
+        assert_eq!(chat.allows_tool_name("clock"), choice == json!("required"));
+        // The rendered messages have no generated argument-only instruction.
+        let expected = render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill(
+            &request.messages,
+            "unrelated-alias",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            request.tools.as_deref().unwrap(),
+            request.tool_choice.as_ref(),
+            &[],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(internal.prompt, expected.text);
+    }
+}
+
+#[test]
+fn native_json_auto_none_and_template_without_tools_preserve_existing_contracts() {
+    for choice in [json!("auto"), json!("none")] {
+        for hard_format in [false, true] {
+            let mut wire = Endpoint::Chat.request(weather_schema(), false);
+            wire["tool_choice"] = choice.clone();
+            if !hard_format {
+                wire.as_object_mut().unwrap().remove("response_format");
+            }
+            let request: ChatCompletionsRequest = serde_json::from_value(wire).unwrap();
+            let internal = convert_chat_request_with_template_model(
+                &request,
+                "unrelated-alias",
+                Some(&native_json_template()),
+            )
+            .unwrap();
+            let Some(ferrum_types::ApiRequest::Chat(chat)) = &internal.api_request else {
+                panic!("chat contract")
+            };
+            assert!(!chat.requires_native_tool_call());
+            assert_eq!(internal.requires_structured_output(), hard_format);
+            assert_eq!(
+                chat.automatic_tools_with_hard_response_format(),
+                hard_format && choice == json!("auto")
+            );
+            if choice == json!("none") {
+                assert!(!internal.prompt.contains("Use the native envelope"));
+            }
+        }
+    }
+    let template = ModelChatTemplate::new(
+        "{% for message in messages %}{{ message.content }}{% if message.tool_calls %}{{ message.tool_calls | tojson }}{% endif %}{% endfor %}",
+        "fallback-contract",
+    );
+    assert_eq!(
+        template.tool_call_protocol,
+        ferrum_types::ApiToolCallProtocol::Json
+    );
+    let mut wire = Endpoint::Chat.request(weather_schema(), false);
+    wire["tool_choice"] = json!({"type":"function","function":{"name":"weather"}});
+    let request: ChatCompletionsRequest = serde_json::from_value(wire).unwrap();
+    let internal =
+        convert_chat_request_with_template_model(&request, "unrelated-alias", Some(&template))
+            .unwrap();
+    let ferrum_types::ResponseFormat::JsonSchema(schema) =
+        &internal.sampling_params.response_format
+    else {
+        panic!("legacy argument schema")
+    };
+    let schema: Value = serde_json::from_str(schema).unwrap();
+    assert_eq!(schema["required"], json!(["city"]));
+    assert!(schema["properties"]["name"].is_null());
+}
+
+#[tokio::test]
+async fn forced_native_json_masks_bare_arguments_through_chat_and_responses() {
+    let envelope = r#"{"name":"weather","parameters":{"city":"Paris"}}"#;
+    let bare = r#"{"city":"Paris"}"#;
+    let unselected = envelope.replace("weather", "delete_file");
+    for endpoint in [Endpoint::Chat, Endpoint::Responses] {
+        for stream in [false, true] {
+            for named in [false, true] {
+                let tokenizer = branch_tokenizer(&[envelope, bare, &unselected]).await;
+                let steps = vec![
+                    LogitStep::candidates(vec![
+                        (tokenizer.token_id(bare).unwrap(), 400.0),
+                        (tokenizer.token_id(&unselected).unwrap(), 300.0),
+                        (tokenizer.token_id(EOS).unwrap(), 200.0),
+                        (tokenizer.token_id(envelope).unwrap(), 100.0),
+                    ]),
+                    LogitStep::only(tokenizer.token_id(EOS).unwrap()),
+                ];
+                let executor =
+                    Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+                // Keep the strict final response format: required/named tools
+                // must own the complete native envelope instead of this schema.
+                let mut wire = endpoint.request(weather_schema(), stream);
+                wire["tool_choice"] = if named {
+                    match endpoint {
+                        Endpoint::Chat => json!({"type":"function","function":{"name":"weather"}}),
+                        Endpoint::Responses => json!({"type":"function","name":"weather"}),
+                    }
+                } else {
+                    json!("required")
+                };
+                let (result, prefill) = run_branch_request(
+                    tokenizer,
+                    executor,
+                    native_json_template(),
+                    endpoint,
+                    stream,
+                    wire,
+                    envelope,
+                    false,
+                )
+                .await;
+                assert!(prefill.contains("Use the native envelope"));
+                let result = result.unwrap();
+                assert!(result.content.is_empty());
+                assert_eq!(result.calls.len(), 1);
+                assert_eq!(result.calls[0]["name"], "weather");
+                assert_eq!(
+                    serde_json::from_str::<Value>(result.calls[0]["arguments"].as_str().unwrap())
+                        .unwrap(),
+                    json!({"city":"Paris"})
+                );
+            }
+        }
+    }
 }
 
 fn named_call_schema(arguments_field: &str) -> Value {

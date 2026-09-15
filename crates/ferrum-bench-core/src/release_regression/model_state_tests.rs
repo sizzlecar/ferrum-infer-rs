@@ -127,6 +127,66 @@ fn serve_fixture_with_controls(acknowledged: &str, no_memory: &str) -> ServeStat
 }
 
 #[test]
+fn state_recall_and_reset_questions_do_not_supply_the_remembered_identifiers() {
+    for code in CODES {
+        assert!(remember(code).contains(code));
+        assert!(!RECALL.contains(code));
+        assert!(!EMPTY_RECALL.contains(code));
+    }
+    let mixed_case = "aB-7_x";
+    assert!(remember(mixed_case).contains(mixed_case));
+}
+
+#[test]
+fn state_recall_rejects_changed_case_and_truncated_identifiers() {
+    for changed in ["Cobalt-731", "Cob"] {
+        let mut records = run_fixture();
+        records[3]["content"] = json!(changed);
+        assert!(verify_run(&records, ModelReasoningProtocol::None, 16).is_err());
+
+        for round in 0..2 {
+            let mut evidence = serve_fixture();
+            evidence.recall_rounds[round][0].observation["message"]["content"] = json!(changed);
+            assert!(verify_serve(&evidence, ModelReasoningProtocol::None, 16).is_err());
+        }
+    }
+}
+
+#[test]
+fn legacy_state_requests_cannot_be_relabelled_as_the_explicit_copying_probe() {
+    // These are recorded requests from the previous probe, not an assertion
+    // about the wording of the new contract. Even correct answers cannot turn
+    // a different request/history into evidence for this probe.
+    let legacy_write = "The code to remember is cobalt-731. Reply with only OK.";
+    let legacy_recall = super::super::model_basic::RECALL_PROMPT;
+    let legacy_empty = "What code did I ask you to remember in this conversation? Reply with only that code, or NONE if I have not given you a code.";
+    for (index, prompt) in [(0, legacy_write), (2, legacy_recall), (5, legacy_empty)] {
+        let mut records = run_fixture();
+        records[index]["content"] = json!(prompt);
+        assert!(verify_run(&records, ModelReasoningProtocol::None, 16).is_err());
+    }
+    let mutations: [fn(&mut ServeStateEvidence, &str); 3] = [
+        |e: &mut ServeStateEvidence, prompt: &str| {
+            e.writes[0].messages[0]["content"] = json!(prompt)
+        },
+        |e: &mut ServeStateEvidence, prompt: &str| {
+            e.recall_rounds[0][0].messages[2]["content"] = json!(prompt)
+        },
+        |e: &mut ServeStateEvidence, prompt: &str| {
+            e.fresh[0].messages[0]["content"] = json!(prompt)
+        },
+    ];
+    for (mutate, prompt) in mutations
+        .into_iter()
+        .zip([legacy_write, legacy_recall, legacy_empty])
+    {
+        let mut evidence = serve_fixture();
+        mutate(&mut evidence, prompt);
+        assert!(verify_serve(&evidence, ModelReasoningProtocol::None, 16).is_err());
+    }
+}
+
+#[test]
 fn state_controls_ignore_ascii_case_but_remembered_codes_do_not() {
     for (acknowledged, no_memory) in [("ok", "None"), ("Ok.", "none"), ("**oK**", "`nOnE`.")] {
         verify_run(

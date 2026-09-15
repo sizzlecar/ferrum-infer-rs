@@ -72,6 +72,18 @@ fn model_report_rechecks_state_histories_reset_and_isolation() {
     let mut stale = ReportFixture::passed(&expected);
     stale.case_mut("run-state")["evidence"]["records"][6]["history_epoch"] = json!(0);
     assert!(verify_model_report(&expected, &stale.value).is_err());
+    for changed in ["Cobalt-731", "Cob"] {
+        let mut run = ReportFixture::passed(&expected);
+        run.case_mut("run-state")["evidence"]["records"][3]["content"] = json!(changed);
+        assert!(verify_model_report(&expected, &run.value).is_err());
+
+        for round in 0..2 {
+            let mut serve = ReportFixture::passed(&expected);
+            serve.case_mut("serve-state")["evidence"]["state"]["recall_rounds"][round][0]
+                ["observation"]["message"]["content"] = json!(changed);
+            assert!(verify_model_report(&expected, &serve.value).is_err());
+        }
+    }
 }
 
 /// Small runner-result fixtures exercise the shared semantic verifier through

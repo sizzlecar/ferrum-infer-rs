@@ -3527,7 +3527,17 @@ fn convert_chat_request_with_template_model_and_default(
     let output_contract = EffectiveChatOutputContract::resolve(request);
     let output_budget = ChatOutputBudget::resolve(request);
     let tool_call_protocol = model_template
-        .map(|template| template.tool_call_protocol)
+        .map(|template| {
+            // Harmony owns its channel/recipient envelope independently of the
+            // generic native JSON tool grammar.
+            if model_output_protocol == ModelOutputProtocol::HarmonyGptOss
+                && template.tool_call_protocol == ferrum_types::ApiToolCallProtocol::NativeJson
+            {
+                ferrum_types::ApiToolCallProtocol::Json
+            } else {
+                template.tool_call_protocol
+            }
+        })
         .unwrap_or_default();
     let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
     let native_tool_call_contract = api_chat.requires_native_tool_call();
