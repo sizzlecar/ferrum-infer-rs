@@ -283,7 +283,11 @@ release model execution, device Quality checks and Homebrew verification select
 the 16 GiB worker and share a single-host concurrency group with cancellation
 disabled. Model tasks execute serially, with a 3600-second timeout per task and
 a 240-minute model job limit. These are execution ceilings, not measured
-durations. The [delivery workflow](../.github/workflows/release-delivery.yml)
+durations. Metal device Quality has a separate 120-minute job ceiling that
+includes cold checkout, toolchain/dependency downloads and the full Metal
+feature suite. The CUDA device Quality ceiling remains 30 minutes. Setup
+timeouts are failures, not successful or skipped numerical checks.
+The [delivery workflow](../.github/workflows/release-delivery.yml)
 and [Quality workflow](../.github/workflows/ci.yml) define this scheduling.
 
 Qwen3.5 9B, Qwen3.8 27B, Qwen3 30B-A3B attention-only MoE and Qwen3.5 35B-A3B
