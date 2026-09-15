@@ -164,8 +164,12 @@ unfiltered task plan, and all selected model reports.
 Model jobs print profile counts and case start/completion events. A 30-second
 heartbeat indicates the controller is still waiting; it does not imply a passed
 check. Full diagnostics remain in evidence artifacts, and deadlines and process
-cleanup still apply. CPU requests have a 900-second allowance within the existing
-one-hour task deadline.
+cleanup still apply. CPU requests have a 900-second allowance within a three-hour
+model task deadline. The complete CPU suite runs multiple CLI and server cases
+serially; the task deadline includes cold model downloads and every selected
+case. The CPU job allows seven hours for the two model tasks, preparation and
+evidence upload. These are upper bounds, not expected durations; completed tasks
+return immediately and every selected check must still pass.
 
 Windows native object caching is separate from Rust dependency/build caching.
 Successful native builds save their cache before application compilation, and

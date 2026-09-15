@@ -321,7 +321,9 @@ jobs:
     name: CPU release models
     needs: [prepare, tools, stage]
     runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
-    timeout-minutes: 180
+    # Two complete model suites can each consume the task allowance below.
+    # Keep time for artifact preparation and evidence upload after execution.
+    timeout-minutes: 420
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -361,7 +363,7 @@ jobs:
           release_delivery local --backend cpu \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cpu/ferrum" \
             --runner "$RUNNER_TEMP/staged-cpu/model_regression" --runner-sha256 "$runner_sha" \
-            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 3600 \
+            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 10800 \
             --request-timeout-secs 900
       - name: Save CPU release evidence
         uses: actions/upload-artifact@v4
