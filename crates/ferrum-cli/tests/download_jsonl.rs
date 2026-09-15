@@ -6,6 +6,7 @@
 mod hub;
 
 use hub::{Hub, ModelFiles, REVISION};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
@@ -17,6 +18,16 @@ async fn run(hub: &Hub, model: &str, cache: &Path) -> Output {
 }
 
 async fn invoke(hub: &Hub, model: &str, cache: &Path, serve: bool) -> Output {
+    invoke_with_sources(hub, model, cache, serve, &[]).await
+}
+
+async fn invoke_with_sources(
+    hub: &Hub,
+    model: &str,
+    cache: &Path,
+    serve: bool,
+    source_args: &[String],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferrum"));
     if serve {
         command.args([
@@ -45,6 +56,7 @@ async fn invoke(hub: &Hub, model: &str, cache: &Path, serve: bool) -> Output {
         ]);
     }
     command
+        .args(source_args)
         .current_dir(cache)
         .env("HOME", cache)
         .env("HF_HOME", cache)
@@ -77,6 +89,256 @@ async fn invoke(hub: &Hub, model: &str, cache: &Path, serve: bool) -> Output {
         .await
         .expect("local download/CPU load timed out; child is killed on drop")
         .expect("launch actual ferrum binary")
+}
+
+#[tokio::test]
+async fn run_and_serve_download_explicit_metadata_pin_without_following_cached_main() {
+    let weights_repo = "fixture/pinned-weights";
+    let metadata_repo = "fixture/pinned-metadata";
+    let filename = "model-Q4_K_M.gguf";
+    let old_revision = "a".repeat(40);
+    for serve in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        let mut metadata_files = hub::sidecar_files();
+        let generation = br#"{"eos_token_id":2}"#;
+        metadata_files.insert("generation_config.json".into(), generation.to_vec());
+        // A source repository may contain weights. Metadata selection must not
+        // accidentally download them while fixing a cold semantic/tokenizer pin.
+        metadata_files.insert(
+            "model.safetensors".into(),
+            b"not selected metadata".to_vec(),
+        );
+        let hub = Hub::start(
+            [
+                (
+                    weights_repo.to_owned(),
+                    [(filename.to_owned(), hub::gguf_without_weights())].into(),
+                ),
+                (metadata_repo.to_owned(), metadata_files.clone()),
+            ]
+            .into(),
+        )
+        .await;
+        let repo_root = cache.path().join("hub/models--fixture--pinned-metadata");
+        let old_root = repo_root.join("snapshots").join(&old_revision);
+        fs::create_dir_all(&old_root).unwrap();
+        fs::create_dir(repo_root.join("refs")).unwrap();
+        fs::write(repo_root.join("refs/main"), &old_revision).unwrap();
+        for (name, bytes) in hub::sidecar_files() {
+            fs::write(old_root.join(name), bytes).unwrap();
+        }
+        // If the wrong warm snapshot is consumed, tokenizer parsing fails
+        // before the intentional missing-weights failure asserted below.
+        let stale_tokenizer = b"stale snapshot tokenizer must not be selected";
+        fs::write(old_root.join("tokenizer.json"), stale_tokenizer).unwrap();
+        let source_args = [
+            "--gguf-file".into(),
+            filename.into(),
+            "--semantic-source".into(),
+            format!("{metadata_repo}@{REVISION}"),
+            "--effective-config-json".into(),
+            cache.path().join("effective.json").display().to_string(),
+        ];
+        let model = format!("{weights_repo}@{REVISION}");
+        let output = invoke_with_sources(&hub, &model, cache.path(), serve, &source_args).await;
+        assert!(
+            !output.status.success(),
+            "fixture deliberately omits GGUF tensors"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("token_embd") || stderr.contains("model.embed_tokens"),
+            "metadata must resolve and reach the missing-embedding loader error: {stderr}"
+        );
+        let wanted_root = repo_root.join("snapshots").join(REVISION);
+        for (name, bytes) in hub::sidecar_files() {
+            assert_eq!(fs::read(wanted_root.join(&name)).unwrap(), bytes);
+            assert!(hub.requested("GET", metadata_repo, &name));
+        }
+        assert_eq!(
+            fs::read(wanted_root.join("generation_config.json")).unwrap(),
+            generation
+        );
+        assert!(!wanted_root.join("model.safetensors").exists());
+        assert!(!hub.requested("GET", metadata_repo, "model.safetensors"));
+        assert_eq!(
+            fs::read_to_string(repo_root.join("refs/main")).unwrap(),
+            old_revision
+        );
+        assert_eq!(
+            fs::read(old_root.join("tokenizer.json")).unwrap(),
+            stale_tokenizer
+        );
+        assert!(hub
+            .request_paths()
+            .iter()
+            .all(|path| !path.contains("/main") && !path.contains(&old_revision)));
+        assert_legacy_pinned_identity(
+            cache.path(),
+            &model,
+            weights_repo,
+            metadata_repo,
+            metadata_repo,
+        );
+        if !serve {
+            assert_loader_failure_and_clean_stdout(output);
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_and_serve_download_independent_tokenizer_pin_with_generation_metadata() {
+    let weights_repo = "fixture/separate-weights";
+    let semantic_repo = "fixture/separate-semantic";
+    let tokenizer_repo = "fixture/separate-tokenizer";
+    let filename = "model-Q4_K_M.gguf";
+    for serve in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        let mut tokenizer_files = hub::sidecar_files();
+        let semantic_files = [(
+            "config.json".into(),
+            tokenizer_files.remove("config.json").unwrap(),
+        )]
+        .into();
+        let generation = br#"{"eos_token_id":2}"#;
+        tokenizer_files.insert("generation_config.json".into(), generation.to_vec());
+        tokenizer_files.insert(
+            "model.safetensors".into(),
+            b"must not be downloaded".to_vec(),
+        );
+        let hub = Hub::start(
+            [
+                (
+                    weights_repo.to_owned(),
+                    [(filename.to_owned(), hub::gguf_without_weights())].into(),
+                ),
+                (semantic_repo.to_owned(), semantic_files),
+                (tokenizer_repo.to_owned(), tokenizer_files),
+            ]
+            .into(),
+        )
+        .await;
+        let model = format!("{weights_repo}@{REVISION}");
+        let source_args = [
+            "--gguf-file".into(),
+            filename.into(),
+            "--semantic-source".into(),
+            format!("{semantic_repo}@{REVISION}"),
+            "--tokenizer-source".into(),
+            format!("{tokenizer_repo}@{REVISION}"),
+            "--effective-config-json".into(),
+            cache.path().join("effective.json").display().to_string(),
+        ];
+        let output = invoke_with_sources(&hub, &model, cache.path(), serve, &source_args).await;
+        assert!(
+            !output.status.success(),
+            "fixture deliberately omits GGUF tensors"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("token_embd") || stderr.contains("model.embed_tokens"),
+            "both metadata roles must resolve before the missing-embedding error: {stderr}"
+        );
+        let tokenizer_root = cache
+            .path()
+            .join("hub/models--fixture--separate-tokenizer/snapshots")
+            .join(REVISION);
+        assert_eq!(
+            fs::read(tokenizer_root.join("generation_config.json")).unwrap(),
+            generation
+        );
+        for name in [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+        ] {
+            assert!(hub.requested("GET", tokenizer_repo, name), "{name}");
+        }
+        assert!(hub.requested("GET", semantic_repo, "config.json"));
+        assert!(!hub.requested("GET", semantic_repo, "tokenizer.json"));
+        assert!(!hub.requested("GET", tokenizer_repo, "model.safetensors"));
+        assert!(hub
+            .request_paths()
+            .iter()
+            .all(|path| !path.contains("/main")));
+        assert_legacy_pinned_identity(
+            cache.path(),
+            &model,
+            weights_repo,
+            semantic_repo,
+            tokenizer_repo,
+        );
+        if !serve {
+            assert_loader_failure_and_clean_stdout(output);
+        }
+    }
+}
+
+fn assert_legacy_pinned_identity(
+    cache: &Path,
+    requested_model: &str,
+    weights_repo: &str,
+    semantic_repo: &str,
+    tokenizer_repo: &str,
+) {
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(cache.join("effective.json"))
+            .expect("startup must retain actual source evidence before the dummy weight error"),
+    )
+    .unwrap();
+    assert_eq!(config["execution_resource_authority"], "legacy_engine");
+    let identity = &config["resolution_evidence"];
+    assert_eq!(identity["requested_model"], requested_model);
+    assert_eq!(identity["resolved_model"], weights_repo);
+    for (role, repo) in [
+        ("weights", weights_repo),
+        ("semantic", semantic_repo),
+        ("tokenizer", tokenizer_repo),
+    ] {
+        assert_eq!(identity["original_sources"][role]["kind"], "repository");
+        assert_eq!(identity["original_sources"][role]["location"], repo);
+        assert_eq!(
+            identity["original_sources"][role]["requested_revision"],
+            REVISION
+        );
+        let resolved = &identity["resolved_sources"][role];
+        assert_eq!(resolved["canonical_location"], repo);
+        assert_eq!(resolved["resolved_revision"], REVISION);
+        let files = resolved["files"]
+            .as_array()
+            .expect("observed file fingerprints");
+        assert!(!files.is_empty());
+        let root = cache
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(REVISION);
+        for file in files {
+            let bytes = fs::read(root.join(file["relative_path"].as_str().unwrap())).unwrap();
+            assert_eq!(file["size_bytes"], bytes.len());
+            assert_eq!(file["sha256"], format!("{:x}", Sha256::digest(&bytes)));
+        }
+    }
+    let root = cache
+        .join("hub")
+        .join(format!("models--{}", tokenizer_repo.replace('/', "--")))
+        .join("snapshots")
+        .join(REVISION);
+    let bytes = fs::read(root.join("tokenizer_config.json")).unwrap();
+    let tokenizer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(identity["template"]["role"], "tokenizer");
+    assert_eq!(identity["template"]["source_file"], "tokenizer_config.json");
+    assert_eq!(
+        identity["template"]["container_sha256"],
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(
+        identity["template"]["content_sha256"],
+        format!(
+            "{:x}",
+            Sha256::digest(tokenizer["chat_template"].as_str().unwrap().as_bytes())
+        )
+    );
 }
 
 #[tokio::test]

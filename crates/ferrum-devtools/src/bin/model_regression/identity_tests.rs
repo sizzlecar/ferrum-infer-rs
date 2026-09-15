@@ -76,6 +76,76 @@ fn selected_gguf_is_forwarded_to_both_entrypoints() {
 }
 
 #[test]
+fn expected_metadata_pins_reach_both_entrypoints_without_overriding_quick_start_capacity() {
+    let semantic = format!("author/semantic@{}", "b".repeat(40));
+    let tokenizer = format!("author/tokenizer@{}", "c".repeat(40));
+    for quick_start in [false, true] {
+        let mut selected = args("metal");
+        selected.model = format!("quantizer/model@{}", "a".repeat(40));
+        selected.gguf_file = Some("model.gguf".into());
+        selected.source_expectation =
+            Some(ferrum_bench_core::release_regression::GgufSourceProfile {
+                filename: "model.gguf".into(),
+                semantic_source: semantic.clone(),
+                tokenizer_source: Some(tokenizer.clone()),
+            });
+        selected.use_default_backend = quick_start;
+        selected.disable_thinking = quick_start;
+        if !quick_start {
+            selected.context_tokens = Some(2048);
+            selected.max_num_seqs = Some(1);
+        }
+        for entrypoint in ["run", "serve"] {
+            let command = selected.common_args(entrypoint);
+            assert!(command
+                .windows(2)
+                .any(|pair| pair == ["--semantic-source", semantic.as_str()]));
+            assert!(command
+                .windows(2)
+                .any(|pair| pair == ["--tokenizer-source", tokenizer.as_str()]));
+            assert_eq!(command.iter().any(|word| word == "--backend"), !quick_start);
+            assert_eq!(
+                command.iter().any(|word| word == "--kv-capacity"),
+                !quick_start
+            );
+            assert_eq!(
+                command.iter().any(|word| word == "--max-model-len"),
+                !quick_start
+            );
+            assert_eq!(
+                command.iter().any(|word| word == "--max-num-seqs"),
+                !quick_start
+            );
+            assert!(!command
+                .iter()
+                .any(|word| word == "--runtime-memory-budget-bytes"));
+            assert_eq!(
+                command.iter().any(|word| word == "--disable-thinking"),
+                quick_start
+            );
+        }
+        selected
+            .source_expectation
+            .as_mut()
+            .unwrap()
+            .tokenizer_source = None;
+        for entrypoint in ["run", "serve"] {
+            let command = selected.common_args(entrypoint);
+            assert!(command
+                .windows(2)
+                .any(|pair| pair == ["--semantic-source", semantic.as_str()]));
+            assert!(!command.iter().any(|word| word == "--tokenizer-source"));
+        }
+    }
+    for entrypoint in ["run", "serve"] {
+        let command = args("metal").common_args(entrypoint);
+        assert!(!command
+            .iter()
+            .any(|word| matches!(word.as_str(), "--semantic-source" | "--tokenizer-source")));
+    }
+}
+
+#[test]
 fn every_gguf_child_config_must_match_retained_task_metadata_expectations() {
     let mut selected = args("cuda");
     selected.model = format!("quantizer/model@{}", "a".repeat(40));

@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod cache;
 mod gguf_repository;
+mod product_source_selection;
+#[cfg(test)]
+mod source_identity_tests;
 use cache::{CacheRequirements, CachedModel};
 
 /// Small, release-supported starter models used by CLI guidance. These are
@@ -71,14 +74,14 @@ pub struct ProductSourceArgs {
     #[arg(long, value_name = "FILE")]
     pub gguf_file: Option<String>,
 
-    /// Directory containing the semantic `config.json` used to build the
-    /// typed model family. When set, it is also the tokenizer source unless
-    /// `--tokenizer-source` is supplied.
-    #[arg(long, value_name = "DIR")]
+    /// Semantic metadata directory or pinned HF_REPO@40-hex-commit. A repository
+    /// downloads only metadata, not weights. Also supplies the tokenizer unless
+    /// --tokenizer-source is set.
+    #[arg(long, value_name = "DIR|HF_REPO@COMMIT")]
     pub semantic_source: Option<PathBuf>,
 
-    /// Directory containing tokenizer files and the selected chat template.
-    #[arg(long, value_name = "DIR")]
+    /// Tokenizer/template directory or pinned HF_REPO@40-hex-commit.
+    #[arg(long, value_name = "DIR|HF_REPO@COMMIT")]
     pub tokenizer_source: Option<PathBuf>,
 }
 
@@ -1283,6 +1286,51 @@ pub fn define_registered_product_model(
     Ok(None)
 }
 
+/// Describe the source lease consumed by both product entrypoints, including
+/// registered legacy engines which have no vNext model definition.
+pub fn product_source_identity(
+    prepared: Option<&ferrum_models::vnext::DefinedProductionModel>,
+    sources: Option<&ProductionModelSourceBundle>,
+    requested_model: &str,
+    resolved_model: &str,
+    selected_template: Option<&ModelChatTemplate>,
+) -> Result<Option<ProductModelSourceIdentity>> {
+    if let Some(prepared) = prepared {
+        return defined_product_source_identity(
+            prepared,
+            requested_model,
+            resolved_model,
+            selected_template,
+        )
+        .map(Some);
+    }
+    let (Some(sources), Some(selected)) = (sources, selected_template) else {
+        // Direct legacy sources and template-less models do not have the
+        // complete role-specific identity. Do not fabricate a template binding.
+        return Ok(None);
+    };
+    let source_file = Path::new(&selected.source)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| FerrumError::model("selected chat template has no source filename"))?;
+    let retained = load_product_chat_template_source(sources, source_file).ok_or_else(|| {
+        FerrumError::model("selected chat template is absent from the product source lease")
+    })?;
+    if selected.source != retained.source || selected.template != retained.template {
+        return Err(FerrumError::model(
+            "selected runtime chat template differs from the retained product source",
+        ));
+    }
+    sources
+        .product_source_identity(
+            requested_model,
+            resolved_model,
+            source_file,
+            &selected.template,
+        )
+        .map(Some)
+}
+
 pub fn defined_product_source_identity(
     prepared: &ferrum_models::vnext::DefinedProductionModel,
     requested_model: &str,
@@ -1658,6 +1706,8 @@ pub async fn resolve_model_source_with_product_sources(
     autosize: Option<(AutoSizeProfile, f32)>,
     source_args: &ProductSourceArgs,
 ) -> Result<Resolved> {
+    let selected = product_source_selection::resolve(source_args, cache_dir, download).await?;
+    let source_args = &selected.arguments;
     if let Some(filename) = &source_args.gguf_file {
         let resolved = gguf_repository::selection::resolve(
             model,
@@ -1668,7 +1718,7 @@ pub async fn resolve_model_source_with_product_sources(
             source_args,
         )
         .await?;
-        return apply_explicit_product_sources(resolved, source_args);
+        return apply_explicit_product_sources(resolved, &selected);
     }
     let mut resolved = resolve_model_source_internal(
         model,
@@ -1686,13 +1736,14 @@ pub async fn resolve_model_source_with_product_sources(
     )
     .await?;
     resolved.requested_model = model.to_owned();
-    apply_explicit_product_sources(resolved, source_args)
+    apply_explicit_product_sources(resolved, &selected)
 }
 
 fn apply_explicit_product_sources(
     mut resolved: Resolved,
-    source_args: &ProductSourceArgs,
+    selected: &product_source_selection::SelectedSources,
 ) -> Result<Resolved> {
+    let source_args = &selected.arguments;
     if source_args.semantic_source.is_none() && source_args.tokenizer_source.is_none() {
         return Ok(resolved);
     }
@@ -1731,10 +1782,9 @@ fn apply_explicit_product_sources(
         location: path.display().to_string(),
         requested_revision: None,
     };
-    let semantic_original = match source_args
-        .semantic_source
-        .as_deref()
-        .map(explicit_original)
+    let semantic_original = match selected
+        .semantic_original
+        .clone()
         .or_else(|| existing.map(|sources| sources.original_sources().semantic.clone()))
     {
         Some(original) => original,
@@ -1743,10 +1793,9 @@ fn apply_explicit_product_sources(
         }
         None => explicit_original(semantic_root),
     };
-    let tokenizer_original = source_args
-        .tokenizer_source
-        .as_deref()
-        .map(explicit_original)
+    let tokenizer_original = selected
+        .tokenizer_original
+        .clone()
         .or_else(|| {
             source_args
                 .semantic_source
@@ -1771,6 +1820,7 @@ fn apply_explicit_product_sources(
             weights: weight_original,
         },
     )?));
+    resolved.source.from_cache &= !selected.downloaded;
     Ok(resolved)
 }
 
