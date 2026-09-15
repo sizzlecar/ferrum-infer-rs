@@ -430,9 +430,12 @@ jobs:
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Metal also runs the full feature suite on a fresh self-hosted worker.
+    # Include cold checkout/toolchain/dependency setup in its bounded budget.
+    timeout-minutes: ${{ matrix.backend == 'metal' && 120 || 30 }}
     concurrency:
-      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-quality-{0}', github.run_id) }}
+      # Panda's Windows/WSL jobs share hardware; independent Metal workers do not.
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-ci-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
       queue: max
     permissions:
@@ -445,10 +448,54 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
+      - name: Preserve the Metal Cargo target before checkout
+        if: matrix.backend == 'metal'
+        id: metal_cargo_cache
+        working-directory: ${{ runner.workspace }}
+        run: |
+          # Each runner executes one job at a time; this cache stays on that
+          # worker, outside checkout, without serializing other Metal machines.
+          reject() { echo "Metal Cargo cache: $*" >&2; exit 1; }
+          checkout_root="${GITHUB_WORKSPACE:?}"
+          cache_parent="${RUNNER_TOOL_CACHE:?}"
+          [[ "$checkout_root" = /* && "$cache_parent" = /* ]] || reject 'paths must be absolute'
+          [[ ! -L "$checkout_root" && ! -L "$cache_parent" ]] || reject 'root paths must not be symlinks'
+          mkdir -p -- "$checkout_root" "$cache_parent"
+          checkout_root=$(cd -- "$checkout_root" && pwd -P)
+          cache_parent=$(cd -- "$cache_parent" && pwd -P)
+          [[ "$checkout_root" != / && "$cache_parent" != / ]] || reject 'filesystem roots are not cache roots'
+          metal_cache="$cache_parent/ferrum-metal-cargo-target"
+          case "$metal_cache/" in "$checkout_root/"*) reject 'cache must be outside checkout';; esac
+          case "$checkout_root/" in "$metal_cache/"*) reject 'checkout must be outside cache';; esac
+          case "$metal_cache" in *$'\n'*|*$'\r'*) reject 'cache path must fit one output line';; esac
+          [[ ! -L "$metal_cache" ]] || reject 'cache must not be a symlink'
+          [[ ! -e "$metal_cache" || -d "$metal_cache" ]] || reject 'cache must be a directory'
+          target_dir="$checkout_root/target"
+          if [[ -L "$target_dir" ]]; then
+            [[ -d "$target_dir" ]] || reject 'target link is broken or not a directory'
+            [[ "$(cd -- "$target_dir" && pwd -P)" = "$metal_cache" ]] || reject 'target links to another directory'
+          elif [[ -e "$target_dir" ]]; then
+            [[ -d "$target_dir" ]] || reject 'target must be a directory'
+            [[ ! -e "$metal_cache" ]] || reject 'both target and cache exist; preserve both for inspection'
+            mv -n -- "$target_dir" "$metal_cache"
+            [[ ! -e "$target_dir" && ! -L "$target_dir" ]] || reject 'migration did not complete; preserve both paths'
+          fi
+          mkdir -p -- "$metal_cache"
+          printf 'path=%s\n' "$metal_cache" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
+
+      - name: Link the preserved Metal Cargo target
+        if: matrix.backend == 'metal'
+        env:
+          METAL_CARGO_TARGET: ${{ steps.metal_cargo_cache.outputs.path }}
+        run: |
+          [[ -n "$METAL_CARGO_TARGET" && -d "$METAL_CARGO_TARGET" && ! -L "$METAL_CARGO_TARGET" ]] || { echo 'Metal Cargo cache is unavailable' >&2; exit 1; }
+          [[ ! -e target && ! -L target ]] || { echo 'Unexpected target after checkout; refusing to replace it' >&2; exit 1; }
+          ln -s -- "$METAL_CARGO_TARGET" target
 
       - uses: dtolnay/rust-toolchain@1.91.0
 

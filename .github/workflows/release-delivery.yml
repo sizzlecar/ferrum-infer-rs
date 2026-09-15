@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-delivery-controller-rust-1.91
-      - name: Freeze required local and optional cloud validation before building
+      - name: Freeze required local Metal/CUDA and optional cloud validation before building
         id: plan
         env:
           EVENT: ${{ github.event_name }}
@@ -98,6 +98,7 @@ jobs:
           jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == [] and .performance_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
           cloud_cuda=$(jq -er '.plan.release_cuda.cloud | if . == "required" then "true" elif . == "disabled" then "false" else error("missing frozen CUDA policy") end' "$RUNNER_TEMP/release-plan.json")
           test "$cloud_cuda" = "$RUN_CLOUD_CUDA"
+          jq -e '.plan.release_metal | (.mandatory_local_profile_ids | length > 0) and (.extended_profile_ids | length > 0) and (.reason | length > 0)' "$RUNNER_TEMP/release-plan.json"
           # Freeze source selectors and latency policy before staging or rental.
           # Every newly selected performance target needs an explicit source;
           # a missing mapping cannot silently reuse a different model.
@@ -123,12 +124,18 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
+          printf '\n## CPU validation scope\n\nRequired functional representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
+          jq -r '.model_tasks.runs[] | select(.profile.target.backend == "cpu") | "- " + .profile.id + ": " + .profile.model' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+          printf '\nCPU protocol, per-format load/forward/state, numerical and safety checks remain required. Larger CPU model variants are not validated by these small-model results.\n' >> "$RUNNER_TEMP/release-notes.md"
           printf '\n## CUDA validation scope\n\nRequired: local small-model and device correctness regression.\n' >> "$RUNNER_TEMP/release-notes.md"
           if [ "$cloud_cuda" = true ]; then
             printf 'Extended cloud model regression: explicitly enabled and required.\n' >> "$RUNNER_TEMP/release-notes.md"
           else
             printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           fi
+          printf '\n## Metal validation scope\n\nRequired: serial representative-model regression on the local Apple Silicon release runner, plus real-device correctness checks.\n' >> "$RUNNER_TEMP/release-notes.md"
+          jq -r '"Required profiles: " + (.plan.release_metal.mandatory_local_profile_ids | join(", ")) + ".", "Not run: " + (.plan.release_metal.extended_profile_ids | join(", ")) + ".", .plan.release_metal.reason' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+          printf 'Local dense-model results do not certify the untested MoE, larger-model or mixed-precision profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\ncloud_cuda=%s\n' "$version" "$rc_tag" "$base" "$cloud_cuda" >> "$GITHUB_OUTPUT"
       - name: Reuse the immutable stable launcher from the formal baseline
         if: steps.plan.outputs.active == 'true'
@@ -346,9 +353,9 @@ jobs:
       group: ferrum-panda-hardware
       cancel-in-progress: false
       queue: max
-    # Two complete model suites can each consume the task allowance below.
-    # Keep time for artifact preparation and evidence upload after execution.
-    timeout-minutes: 420
+    # Use the small-model functional samples without expanding their deadline.
+    # Include artifact preparation and evidence upload outside the task budgets.
+    timeout-minutes: 150
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -388,8 +395,8 @@ jobs:
           release_delivery local --backend cpu \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cpu/ferrum" \
             --runner "$RUNNER_TEMP/staged-cpu/model_regression" --runner-sha256 "$runner_sha" \
-            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 10800 \
-            --request-timeout-secs 900
+            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 3600 \
+            --request-timeout-secs 300
       - name: Save CPU release evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -405,18 +412,21 @@ jobs:
   metal-models:
     name: Metal release models
     needs: [prepare, stage-metal]
-    runs-on: [self-hosted, macOS, ARM64, ferrum-metal-large]
-    timeout-minutes: 120
+    # One runner service on the release host serializes its own hardware jobs.
+    runs-on: [self-hosted, macOS, ARM64, ferrum-metal-release]
+    timeout-minutes: 240
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       BASELINE_TAG: ${{ needs.prepare.outputs.baseline_tag }}
     steps:
-      - uses: actions/download-artifact@v4
+      # Includes the upstream timeout-rejection fix (actions/toolkit#2124).
+      # Keep the immutable artifact IDs and subsequent archive/ABI verification.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.stage-metal.outputs.metal_asset_id }},${{ needs.stage-metal.outputs.metal_runner_id }},${{ needs.stage-metal.outputs.metal_controller_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-metal
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-plan
           path: ${{ runner.temp }}/plan
@@ -922,7 +932,7 @@ jobs:
       matrix:
         include:
           - backend: metal
-            runner: [self-hosted, macOS, ARM64, ferrum-metal]
+            runner: [self-hosted, macOS, ARM64, ferrum-metal-release]
             brew: /opt/homebrew/bin/brew
             formula: ferrum
           - backend: cuda
@@ -931,7 +941,7 @@ jobs:
             formula: ferrum-cuda
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-homebrew-{0}', github.run_id) }}
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-brew-{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: false
       queue: max
     timeout-minutes: 30
@@ -979,17 +989,19 @@ jobs:
           - runner: macos-14
             platform: macos
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build the controller before invoking the public installer
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Build only acceptance helpers before invoking the public installer
+        timeout-minutes: 30
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
       - name: Verify deployed script and execute the README download pipeline
         run: |
           target/debug/release_delivery entry \
@@ -1004,28 +1016,47 @@ jobs:
           target/debug/release_delivery entry \
             --url https://ferrum.pandaailabs.com/install.sh --expected-script scripts/install.sh \
             --output "$RUNNER_TEMP/public-entry-after.json"
+      # This bounded CPU sample tests the public installation, not default GPU
+      # selection, Quick Start capacity, or another full release model matrix.
+      - name: Run the publicly installed CPU binary through real run and HTTP serve
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/public-bootstrap-runtime"
+          mkdir "$receipt"
+          target/debug/model_regression \
+            --ferrum-bin "$HOME/.local/bin/ferrum" --backend cpu \
+            --model "$PUBLIC_SMOKE_MODEL" --checks basic --profile-id public-install-cpu-basic \
+            --source-label "$PUBLIC_SMOKE_MODEL" --precision-label safetensors-bf16-f32 \
+            --context-tokens 2048 --max-num-seqs 1 --max-tokens 512 \
+            --run-timeout-secs 600 --startup-timeout-secs 600 --request-timeout-secs 300 \
+            --report-dir "$receipt/model" 2>&1 | tee "$receipt/model-runner.log"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-bootstrap-${{ matrix.platform }}
-          path: ${{ runner.temp }}/public-*.json
+          path: |
+            ${{ runner.temp }}/public-*.json
+            ${{ runner.temp }}/public-bootstrap-runtime/
           if-no-files-found: error
           retention-days: 30
 
   install-bootstrap-windows:
     needs: [prepare, publish]
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build the CPU controller before invoking the public installer
-        run: cargo build --locked -p ferrum-devtools --bin release_delivery
+      - name: Build only CPU acceptance helpers before invoking the public installer
+        timeout-minutes: 30
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
       - name: Execute the README pipeline in Windows PowerShell 5.1
         shell: powershell
         run: |
@@ -1039,11 +1070,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'The publicly installed Windows program failed startup checks' }
           & $controller entry --url https://ferrum.pandaailabs.com/install.ps1 --expected-script scripts/install.ps1 --output "$env:RUNNER_TEMP/public-entry-after.json"
           if ($LASTEXITCODE -ne 0) { throw 'The public PowerShell script changed during installation' }
+      # The hosted Windows image selects CPU through the unchanged README
+      # installer. Keep native stderr logging out of PowerShell 5.1 error records.
+      - name: Run the publicly installed Windows launcher through real run and HTTP serve
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($PSVersionTable.PSVersion -lt [version]'7.2') { throw 'Runtime log capture requires PowerShell 7.2 or later' }
+          $receipt = Join-Path $env:RUNNER_TEMP 'public-bootstrap-runtime'
+          $null = New-Item -ItemType Directory -Path $receipt -ErrorAction Stop
+          # Reuse the exact installed entrypoint verified in the previous PS 5.1
+          # process; a new step need not inherit its process-local PATH update.
+          $installed = Get-Content -Raw -LiteralPath "$env:RUNNER_TEMP/public-bootstrap-auto.json" | ConvertFrom-Json
+          $binary = $installed.requested_binary
+          & target/debug/model_regression.exe `
+            --ferrum-bin $binary --backend cpu `
+            --model $env:PUBLIC_SMOKE_MODEL --checks basic --profile-id public-install-cpu-basic `
+            --source-label $env:PUBLIC_SMOKE_MODEL --precision-label safetensors-bf16-f32 `
+            --context-tokens 2048 --max-num-seqs 1 --max-tokens 512 `
+            --run-timeout-secs 600 --startup-timeout-secs 600 --request-timeout-secs 300 `
+            --report-dir "$receipt/model" 2>&1 | Tee-Object -FilePath "$receipt/model-runner.log"
+          $runtimeExit = $LASTEXITCODE
+          $runtimeExit | Set-Content -LiteralPath "$receipt/model-runner.exit-code.txt"
+          if ($runtimeExit -ne 0) { throw "The installed Windows program failed real model regression (exit $runtimeExit)" }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: public-bootstrap-windows
-          path: ${{ runner.temp }}/public-*.json
+          path: |
+            ${{ runner.temp }}/public-*.json
+            ${{ runner.temp }}/public-bootstrap-runtime/
           if-no-files-found: error
           retention-days: 30
 

@@ -11,10 +11,10 @@ use ferrum_bench_core::{
         model_schedule::{model_check_descriptors, model_task_schedule, ModelTaskSchedule},
         model_tasks::{
             verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
-            DEFAULT_FUNCTIONAL_CAPACITY,
+            DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_METAL_FUNCTIONAL_CAPACITY,
         },
-        Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, Obligation,
-        ObligationScope, Plan, ReleaseCudaPolicy, ReleasePerformancePolicy, Stage,
+        Backend, Behavior, CheckDescriptor, CudaModelLane, EvidenceLayer, Gap, MetalModelLane,
+        Obligation, ObligationScope, Plan, ReleaseCudaPolicy, ReleasePerformancePolicy, Stage,
     },
 };
 use serde::Deserialize;
@@ -329,7 +329,7 @@ fn release_plan(document: &Value) -> Result<(Plan, String, ModelTaskSchedule), S
         return Err("frozen CUDA policy must explicitly state whether cloud was enabled".into());
     }
     plan.validate_performance_deferral()?;
-    plan.validate_cuda_policy()?;
+    plan.validate_release_policies()?;
     let candidate = text(&document["provenance"], "candidate")?;
     if !hex(&candidate, 40) || plan.stage != Stage::Release {
         return Err("release plan has invalid candidate or stage".into());
@@ -591,6 +591,8 @@ fn validate_tasks(
             || expected.runtime_capacity
                 != (!run.quick_start).then_some(if run.cuda_lane == Some(CudaModelLane::Local) {
                     DEFAULT_CUDA_FUNCTIONAL_CAPACITY
+                } else if run.metal_lane == Some(MetalModelLane::Local) {
+                    DEFAULT_METAL_FUNCTIONAL_CAPACITY
                 } else {
                     DEFAULT_FUNCTIONAL_CAPACITY
                 })

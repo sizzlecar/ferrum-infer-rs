@@ -1136,17 +1136,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             None => crate::source_resolver::load_model_chat_template(&source.local_path),
         },
     };
-    let product_source_identity = defined_model
-        .as_deref()
-        .map(|prepared| {
-            crate::source_resolver::defined_product_source_identity(
-                prepared,
-                &requested_model,
-                &model_id,
-                model_chat_template.as_ref(),
-            )
-        })
-        .transpose()?;
+    let product_source_identity = crate::source_resolver::product_source_identity(
+        defined_model.as_deref(),
+        model_sources.as_deref(),
+        &requested_model,
+        &model_id,
+        model_chat_template.as_ref(),
+    )?;
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 

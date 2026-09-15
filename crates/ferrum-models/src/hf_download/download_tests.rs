@@ -259,6 +259,10 @@ impl HubFixture {
             cache_dir: self.cache.path().to_path_buf(),
             token: None,
             endpoint: self.endpoint.clone(),
+            retry_policy: super::DownloadRetryPolicy {
+                initial_backoff: Duration::ZERO,
+                ..Default::default()
+            },
         }
     }
 
@@ -472,6 +476,12 @@ async fn selected_gguf_repairs_failed_metadata_without_refetching_weights() {
             .unwrap()
             .is_some()
     );
+    let failed_attempts = super::DownloadRetryPolicy::default().max_attempts.get() as usize;
+    assert_eq!(
+        hub.file_requests("GET", "chat_template.jinja"),
+        failed_attempts,
+        "the persistent metadata failure must exhaust its bounded attempts"
+    );
     hub.fail_get("chat_template.jinja", false);
     let downloaded = hub
         .downloader()
@@ -492,7 +502,11 @@ async fn selected_gguf_repairs_failed_metadata_without_refetching_weights() {
     assert_eq!(hub.file_requests("GET", filename), 1);
     assert_eq!(hub.file_requests("GET", "config.json"), 1);
     assert_eq!(hub.file_requests("GET", "weights/model-Q8_0.gguf"), 0);
-    assert_eq!(hub.file_requests("GET", "chat_template.jinja"), 2);
+    assert_eq!(
+        hub.file_requests("GET", "chat_template.jinja"),
+        failed_attempts + 1,
+        "recovery must fetch the missing metadata once, after the failed attempts"
+    );
     assert_eq!(std::fs::read_to_string(hub.main_ref()).unwrap(), REVISION);
     hub.assert_pinned_reads();
 }
@@ -700,6 +714,12 @@ async fn indexed_transfer_failure_preserves_ref_and_retry_completes() {
             std::fs::read_to_string(hub.main_ref()).ok().as_deref(),
             previous_ref
         );
+        let failed_attempts = downloader.retry_policy.max_attempts.get() as usize;
+        assert_eq!(
+            hub.file_requests("GET", failed_file),
+            failed_attempts,
+            "the persistent transfer failure must exhaust its bounded attempts"
+        );
         if failed_file == INDEX {
             for path in [SHARD_A, SHARD_B]
                 .into_iter()
@@ -724,8 +744,8 @@ async fn indexed_transfer_failure_preserves_ref_and_retry_completes() {
         assert_eq!(std::fs::read_to_string(hub.main_ref()).unwrap(), REVISION);
         assert_eq!(
             hub.file_requests("GET", failed_file),
-            2,
-            "failed file must be fetched again"
+            failed_attempts + 1,
+            "recovery must fetch the failed file once, after the failed attempts"
         );
     }
 }

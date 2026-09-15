@@ -42,6 +42,7 @@ fn cuda_lane_fixture(cloud: CloudCudaMode, quick_cuda: bool) -> Plan {
             extended_cloud_profile_ids: vec!["extended".into()],
             reason: "Separate optional larger model coverage from required local execution.".into(),
         }),
+        release_metal: None,
         release_performance: Default::default(),
         release_profile_ids: vec![],
         impact: analyze_paths(Vec::<String>::new()),
@@ -166,6 +167,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
         .collect();
     plan(&PlanInput {
         release_cuda: None,
+        release_metal: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage: Stage::Release,
@@ -180,6 +182,103 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
         checks: model_check_descriptors(),
     })
     .unwrap()
+}
+
+fn metal_lane_fixture() -> Plan {
+    use ferrum_bench_core::release_regression::ReleaseMetalPolicy;
+    let mut profiles: Vec<_> = fixture()
+        .selected
+        .into_iter()
+        .map(|selected| selected.profile)
+        .collect();
+    let quick = profiles
+        .iter_mut()
+        .find(|profile| profile.target.backend == Backend::Metal)
+        .unwrap();
+    quick.model = format!("owner/quick@{}", "c".repeat(40));
+    let quick_id = quick.id.clone();
+    let mut functional = quick.clone();
+    functional.id = "functional-metal".into();
+    functional.model = format!("owner/functional@{}", "d".repeat(40));
+    functional.target.precision = "bf16".into();
+    let mut extended = quick.clone();
+    extended.id = "extended-metal".into();
+    extended.model = format!("owner/extended@{}", "e".repeat(40));
+    extended.target.architecture = "mixture".into();
+    profiles.extend([functional, extended]);
+    plan(&PlanInput {
+        stage: Stage::Release,
+        release_cuda: None,
+        release_metal: Some(ReleaseMetalPolicy {
+            mandatory_local_profile_ids: vec![quick_id.clone(), "functional-metal".into()],
+            extended_profile_ids: vec!["extended-metal".into()],
+            reason: "Resource-bounded Metal execution with explicit not-run coverage.".into(),
+        }),
+        release_performance: Default::default(),
+        release_profile_ids: vec![],
+        impact: analyze_paths(Vec::<String>::new()),
+        required_targets: profiles
+            .iter()
+            .map(|profile| profile.target.clone())
+            .collect(),
+        quick_start_profile_ids: vec![quick_id],
+        profiles,
+        checks: model_check_descriptors(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn bounded_metal_preparation_keeps_defaults_and_binds_only_mandatory_functional_capacity() {
+    let plan = metal_lane_fixture();
+    let tasks = prepare_backend(&plan, &assets(), "1.2.3", 512, Some(Backend::Metal)).unwrap();
+    let policy = plan.release_metal.as_ref().unwrap();
+    for id in &policy.mandatory_local_profile_ids {
+        let task = tasks
+            .expectations
+            .iter()
+            .find(|task| &task.profile.id == id)
+            .unwrap();
+        if task.use_default_backend {
+            assert!(task.disable_thinking && task.runtime_capacity.is_none());
+        } else {
+            assert_eq!(
+                task.runtime_capacity,
+                Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY)
+            );
+        }
+    }
+    assert!(tasks
+        .expectations
+        .iter()
+        .all(|task| policy.lane(&task.profile.id) == Some(MetalModelLane::Local)));
+    let all = prepare(&plan, &assets(), "1.2.3", 512).unwrap();
+    assert_eq!(
+        all.expectations
+            .into_iter()
+            .filter(|task| task.profile.target.backend == Backend::Metal)
+            .collect::<Vec<_>>(),
+        tasks.expectations
+    );
+    let mut forged = plan.clone();
+    forged
+        .selected
+        .retain(|selected| selected.profile.id != "functional-metal");
+    assert!(prepare_backend(&forged, &assets(), "1.2.3", 512, Some(Backend::Metal)).is_err());
+    let mut forged = plan;
+    forged
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .mandatory_local_profile_ids
+        .retain(|id| id != "functional-metal");
+    forged
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .extended_profile_ids
+        .push("functional-metal".into());
+    assert!(prepare_backend(&forged, &assets(), "1.2.3", 512, Some(Backend::Metal)).is_err());
 }
 fn assets() -> Vec<StagedBinary> {
     [Backend::Metal, Backend::Cuda, Backend::Cpu]

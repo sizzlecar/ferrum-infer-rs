@@ -4,9 +4,11 @@ use clap::{Parser, Subcommand};
 use ferrum_bench_core::release_regression::model_schedule::model_task_schedule;
 use ferrum_bench_core::release_regression::model_tasks::{
     verify_model_reports, ExpectedModelRun, DEFAULT_CUDA_FUNCTIONAL_CAPACITY,
-    DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
+    DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_METAL_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
 };
-use ferrum_bench_core::release_regression::{Backend, CloudCudaMode, CudaModelLane, Gap, Plan};
+use ferrum_bench_core::release_regression::{
+    Backend, CloudCudaMode, CudaModelLane, Gap, MetalModelLane, Plan,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -171,7 +173,7 @@ fn prepare_lane(
     backend: Option<Backend>,
     cuda_lane: Option<CudaModelLane>,
 ) -> Result<PreparedTasks, String> {
-    plan.validate_cuda_policy()?;
+    plan.validate_release_policies()?;
     if let Some(lane) = cuda_lane {
         if backend != Some(Backend::Cuda) {
             return Err("--cuda-lane requires --backend cuda".into());
@@ -213,6 +215,8 @@ fn prepare_lane(
             None
         } else if run.cuda_lane == Some(CudaModelLane::Local) {
             Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY)
+        } else if run.metal_lane == Some(MetalModelLane::Local) {
+            Some(DEFAULT_METAL_FUNCTIONAL_CAPACITY)
         } else {
             Some(DEFAULT_FUNCTIONAL_CAPACITY)
         };

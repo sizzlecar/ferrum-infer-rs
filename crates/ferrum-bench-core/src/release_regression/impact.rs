@@ -371,8 +371,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "explicit production-engine protocol fixture modules reachable only through axum_server's cfg(test) tests module"));
     }
     if component == "ferrum-cli" && relative == "src/source_resolver.rs" {
-        return Some((vec![Download, Template, Scheduler, Kv],
-            "source/metadata/template selection and runtime presets include paged KV routing; retain loading, protocol and resource obligations without inferring changed operators"));
+        return Some((vec![Download, Template, Scheduler, Kv, Observability],
+            "source/metadata/template selection, actual source evidence and runtime presets include paged KV routing; retain loading, protocol and resource obligations without inferring changed operators"));
+    }
+    if component == "ferrum-cli" && relative == "src/source_resolver/product_source_selection.rs" {
+        return Some((vec![Download, Template, Termination],
+            "explicit pinned semantic/tokenizer repository selection and sidecar completeness, including chat templates and generation stop-token metadata; no tensor decoding or device operators"));
     }
     if component == "ferrum-server" && relative == "src/axum_server.rs" {
         return Some((vec![Template, Termination, Structured, Tools, Scheduler],
@@ -397,6 +401,7 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             relative,
             "src/source.rs"
                 | "src/hf_download.rs"
+                | "src/hf_download/transfer.rs"
                 | "src/hf_download/selection.rs"
                 | "src/hf_download/metadata_inventory.rs"
                 | "src/source/cached_weights.rs"
@@ -416,10 +421,19 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((vec![Download],
             "shared source-cache selection and completeness, including explicit metadata overrides; no tensor loading, numerical conversion or device-state implementation"));
     }
-    if (component == "ferrum-models" && relative == "src/hf_download/download_tests.rs")
+    if (component == "ferrum-models"
+        && matches!(
+            relative,
+            "src/hf_download/download_tests.rs" | "src/hf_download/transfer_tests.rs"
+        ))
         || (component == "ferrum-cli" && relative == "tests/download_jsonl/hub.rs")
         || (component == "ferrum-cli" && relative == "tests/cache_recovery/model.rs")
-        || (component == "ferrum-cli" && relative == "src/source_resolver/cache/tests.rs")
+        || (component == "ferrum-cli"
+            && matches!(
+                relative,
+                "src/source_resolver/cache/tests.rs"
+                    | "src/source_resolver/source_identity_tests.rs"
+            ))
     {
         return Some((
             vec![Validation],
@@ -1253,9 +1267,23 @@ mod tests {
                 ChangeArea::Template,
                 ChangeArea::Scheduler,
                 ChangeArea::Kv,
+                ChangeArea::Observability,
             ]
         );
         assert!(!resolver.areas.contains(&ChangeArea::Kernel));
+        assert_eq!(
+            analyze_paths(["crates/ferrum-cli/src/source_resolver/product_source_selection.rs"])
+                .areas,
+            [
+                ChangeArea::Download,
+                ChangeArea::Template,
+                ChangeArea::Termination
+            ]
+        );
+        assert_eq!(
+            analyze_paths(["crates/ferrum-cli/src/source_resolver/source_identity_tests.rs"]).areas,
+            [ChangeArea::Validation]
+        );
         let adapter = analyze_paths(["crates/ferrum-server/src/axum_server.rs"]);
         assert_eq!(
             adapter.areas,

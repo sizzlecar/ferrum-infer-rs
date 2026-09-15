@@ -11,6 +11,8 @@ pub struct ModelRunRequirements {
     pub profile: ModelProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_lane: Option<CudaModelLane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metal_lane: Option<MetalModelLane>,
     pub checks: Vec<ModelCheck>,
     pub quick_start: bool,
     pub obligations: Vec<usize>,
@@ -198,6 +200,10 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
                         || (policy.cloud == CloudCudaMode::Required
                             && policy.lane(&owner.profile.id) == Some(CudaModelLane::Cloud))
                 })
+                && plan.release_metal.as_ref().is_none_or(|policy| {
+                    owner.profile.target.backend != Backend::Metal
+                        || policy.lane(&owner.profile.id) == Some(MetalModelLane::Local)
+                })
                 && match obligation.behavior {
                     Behavior::ReasoningBoundaries => {
                         owner.profile.reasoning_protocol.supports_reasoning()
@@ -229,6 +235,10 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
             .or_insert_with(|| ModelRunRequirements {
                 cuda_lane: plan
                     .release_cuda
+                    .as_ref()
+                    .and_then(|policy| policy.lane(&owner.profile.id)),
+                metal_lane: plan
+                    .release_metal
                     .as_ref()
                     .and_then(|policy| policy.lane(&owner.profile.id)),
                 profile: owner.profile.clone(),

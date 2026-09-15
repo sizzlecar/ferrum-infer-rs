@@ -26,6 +26,7 @@ struct HubState {
     files: ModelFiles,
     requests: Mutex<Vec<(Method, String)>>,
     failing_gets: Mutex<BTreeSet<(String, String)>>,
+    failing_once: Mutex<BTreeSet<(String, String)>>,
 }
 
 pub struct Hub {
@@ -42,6 +43,7 @@ impl Hub {
             files,
             requests: Mutex::new(Vec::new()),
             failing_gets: Mutex::new(BTreeSet::new()),
+            failing_once: Mutex::new(BTreeSet::new()),
         });
         let router = Router::new().fallback(handle).with_state(state.clone());
         let server = tokio::spawn(async move {
@@ -70,6 +72,29 @@ impl Hub {
 
     pub fn clear_requests(&self) {
         self.state.requests.lock().unwrap().clear();
+    }
+
+    pub fn fail_get_once(&self, repo: &str, filename: &str) {
+        self.state
+            .failing_once
+            .lock()
+            .unwrap()
+            .insert((repo.to_owned(), filename.to_owned()));
+    }
+
+    pub fn get_count(&self, repo: &str, filename: &str) -> usize {
+        self.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path)| {
+                method == Method::GET
+                    && ["main", REVISION]
+                        .iter()
+                        .any(|revision| path == &format!("/{repo}/resolve/{revision}/{filename}"))
+            })
+            .count()
     }
 
     pub fn fail_get(&self, repo: &str, filename: &str) {
@@ -138,11 +163,16 @@ async fn handle(State(state): State<Arc<HubState>>, method: Method, uri: Uri) ->
             if let Some(name) = path.strip_prefix(&format!("/{repo}/resolve/{revision}/")) {
                 if let Some(bytes) = files.get(name) {
                     if method == Method::GET
-                        && state
+                        && (state
                             .failing_gets
                             .lock()
                             .unwrap()
                             .contains(&(repo.clone(), name.to_owned()))
+                            || state
+                                .failing_once
+                                .lock()
+                                .unwrap()
+                                .remove(&(repo.clone(), name.to_owned())))
                     {
                         return Response::builder()
                             .status(503)

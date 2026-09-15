@@ -16,13 +16,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 
 mod gguf;
 mod metadata_inventory;
 mod selection;
+mod transfer;
 pub use gguf::validate_gguf_filename;
+pub use transfer::DownloadRetryPolicy;
 
 pub use metadata_inventory::{
     inspect_cached_metadata_inventory, inspect_cached_metadata_selection,
@@ -130,6 +131,7 @@ pub struct HfDownloader {
     cache_dir: PathBuf,
     token: Option<String>,
     endpoint: String,
+    retry_policy: DownloadRetryPolicy,
 }
 
 impl HfDownloader {
@@ -142,9 +144,9 @@ impl HfDownloader {
         // Check for proxy environment variables
         if let Some(proxy_url) = hf_downloader_runtime_env().proxy_url.as_deref() {
             if !proxy_url.is_empty() {
-                eprintln!("🌐 Using proxy: {}", proxy_url);
+                eprintln!("🌐 Using configured proxy");
                 let proxy = reqwest::Proxy::all(proxy_url)
-                    .map_err(|e| FerrumError::config(format!("Invalid proxy URL: {}", e)))?;
+                    .map_err(|_| FerrumError::config("Invalid proxy URL"))?;
                 builder = builder.proxy(proxy);
             }
         }
@@ -158,7 +160,16 @@ impl HfDownloader {
             cache_dir,
             token,
             endpoint: hf_endpoint().to_owned(),
+            retry_policy: DownloadRetryPolicy::default(),
         })
+    }
+
+    /// Configure bounded retries for each file, including its HEAD request.
+    /// The elapsed budget is shared by all attempts, not renewed on retry.
+    pub fn with_retry_policy(mut self, policy: DownloadRetryPolicy) -> Result<Self> {
+        policy.validate()?;
+        self.retry_policy = policy;
+        Ok(self)
     }
 
     /// Download one exact GGUF weight file from a HuggingFace repo. Returns
@@ -629,23 +640,12 @@ impl HfDownloader {
             filename.to_string()
         };
 
-        // First, do a HEAD request to get file info
-        let mut head_req = self.client.head(&url);
-        if let Some(token) = &self.token {
-            head_req = head_req.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let head_resp = head_req.send().await.map_err(|e| {
-            FerrumError::model(format!("Failed to get file info for {}: {}", filename, e))
-        })?;
-
-        if !head_resp.status().is_success() {
-            return Err(FerrumError::model(format!(
-                "Failed to access {} ({})",
-                filename,
-                head_resp.status()
-            )));
-        }
+        // Resolve metadata once; all transfer retries keep this URL, etag and
+        // size closure and share the same per-file elapsed-time budget.
+        let mut retry = transfer::DownloadRetry::new(self.retry_policy)?;
+        let head_resp = retry
+            .head(&self.client, &url, self.token.as_deref(), filename)
+            .await?;
 
         // Get content length - prefer HEAD response, fallback to API size
         let head_size = head_resp.content_length().unwrap_or(0);
@@ -677,16 +677,6 @@ impl HfDownloader {
             }
         }
 
-        // Check for incomplete download
-        let resume_from = if incomplete_path.exists() {
-            fs::metadata(&incomplete_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
         // Create progress bar - use spinner mode if size unknown
         let pb = if total_size > 0 {
             let pb = if let Some(mp) = mp {
@@ -716,91 +706,25 @@ impl HfDownloader {
         };
         pb.set_message(display_name.clone());
 
-        // If resuming, set initial position
-        if resume_from > 0 && (total_size == 0 || resume_from < total_size) {
-            pb.set_position(resume_from);
-            pb.set_message(format!("{} (续传)", display_name));
+        let transferred = transfer::FileTransfer {
+            client: &self.client,
+            url: &url,
+            token: self.token.as_deref(),
+            filename,
+            incomplete_path: &incomplete_path,
+            total_size: (total_size > 0).then_some(total_size),
+            progress: &pb,
         }
-
-        // Build download request with optional Range header
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let (mut file, start_pos) = if resume_from > 0 && resume_from < total_size {
-            // Resume download
-            request = request.header("Range", format!("bytes={}-", resume_from));
-            let file = OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&incomplete_path)
-                .await?;
-            (file, resume_from)
-        } else {
-            // Fresh download
-            let file = File::create(&incomplete_path).await?;
-            (file, 0u64)
+        .download(&mut retry)
+        .await;
+        let final_size = match transferred {
+            Ok(size) => size,
+            Err(error) => {
+                pb.finish_with_message(format!("{} ⚠ 不完整", display_name));
+                return Err(error);
+            }
         };
-
-        // Send request
-        let response = request
-            .send()
-            .await
-            .map_err(|e| FerrumError::model(format!("Failed to download {}: {}", filename, e)))?;
-
-        let status = response.status();
-        if !status.is_success() && status.as_u16() != 206 {
-            // 206 = Partial Content (for range requests)
-            return Err(FerrumError::model(format!(
-                "Failed to download {} ({})",
-                filename, status
-            )));
-        }
-
-        // Update total size from GET response if we didn't have it
-        let content_length = response.content_length().unwrap_or(0);
-        let actual_total = if start_pos > 0 {
-            // For range requests, add start position to content-length
-            start_pos + content_length
-        } else if content_length > 0 {
-            content_length
-        } else {
-            total_size
-        };
-
-        // Update progress bar with correct total
-        if actual_total > 0 && actual_total != total_size {
-            pb.set_length(actual_total);
-        }
-
-        // Stream download
-        let mut stream = response.bytes_stream();
-        let mut downloaded = start_pos;
-
-        use futures_util::StreamExt;
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                FerrumError::model(format!("Download error for {}: {}", filename, e))
-            })?;
-
-            file.write_all(&chunk).await?;
-            downloaded += chunk.len() as u64;
-            pb.set_position(downloaded);
-        }
-
-        file.flush().await?;
-        drop(file);
-
-        // Verify size
-        let final_size = fs::metadata(&incomplete_path).await?.len();
-        if total_size > 0 && final_size != total_size {
-            pb.finish_with_message(format!("{} ⚠ 不完整", display_name));
-            return Err(FerrumError::model(format!(
-                "Incomplete download for {}: got {} bytes, expected {}",
-                filename, final_size, total_size
-            )));
-        }
+        retry.ensure_time(filename)?;
 
         // Rename to final path
         fs::rename(&incomplete_path, &blob_path).await?;
@@ -871,6 +795,9 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod download_tests;
+
+#[cfg(test)]
+mod transfer_tests;
 
 #[cfg(test)]
 mod tests {

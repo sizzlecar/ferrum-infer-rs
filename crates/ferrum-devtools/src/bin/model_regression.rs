@@ -108,6 +108,16 @@ impl Args {
         if let Some(filename) = &self.gguf_file {
             args.extend(["--gguf-file".into(), filename.clone()]);
         }
+        if let Some(source) = &self.source_expectation {
+            // Freeze metadata independently of the weight repository. Quick
+            // Start still exercises default backend/capacity and its declared
+            // thinking flag, but these reproducible tasks do not certify automatic metadata
+            // selection by a bare user command.
+            args.extend(["--semantic-source".into(), source.semantic_source.clone()]);
+            if let Some(tokenizer) = &source.tokenizer_source {
+                args.extend(["--tokenizer-source".into(), tokenizer.clone()]);
+            }
+        }
         if !self.use_default_backend {
             args.extend(["--backend".into(), self.backend.clone()]);
         }

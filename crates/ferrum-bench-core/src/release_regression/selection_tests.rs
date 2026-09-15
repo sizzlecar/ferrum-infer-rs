@@ -31,6 +31,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
         release_cuda: None,
+        release_metal: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage,
@@ -230,6 +231,167 @@ fn frozen_cuda_policy_cannot_omit_required_profiles_or_change_their_backend() {
             .target
             .backend = Backend::Cpu;
         assert!(wrong_backend.validate_cuda_policy().is_err());
+    }
+}
+
+fn metal_lane_input() -> PlanInput {
+    let local_target = text_target("bf16", Backend::Metal);
+    let extended_target = target(
+        "mixture",
+        ModelOutputProtocol::Text,
+        "mixed-4bit",
+        Backend::Metal,
+    );
+    let mut local = profile("metal-local", local_target.clone());
+    local.model = format!("owner/local@{}", "c".repeat(40));
+    let mut extended = profile("metal-extended", extended_target.clone());
+    extended.model = format!("owner/extended@{}", "d".repeat(40));
+    let mut request = input(
+        Stage::Release,
+        vec![local_target, extended_target],
+        vec![local, extended],
+    );
+    request.release_metal = Some(ReleaseMetalPolicy {
+        mandatory_local_profile_ids: vec!["metal-local".into()],
+        extended_profile_ids: vec!["metal-extended".into()],
+        reason: "Run bounded local model representatives; larger model coverage is not run.".into(),
+    });
+    request.quick_start_profile_ids = vec!["metal-local".into()];
+    request.impact.areas = vec![
+        ChangeArea::Kernel,
+        ChangeArea::Template,
+        ChangeArea::Scheduler,
+    ];
+    request.release_performance = ReleasePerformancePolicy::Deferred {
+        reason: "Measurements remain separate.".into(),
+    };
+    request.checks = super::super::model_schedule::model_check_descriptors();
+    request
+}
+
+#[test]
+fn bounded_metal_keeps_numerics_and_records_only_unrepresented_model_runtime_as_not_run() {
+    let request = metal_lane_input();
+    let bounded = plan(&request).unwrap();
+    bounded.validate_release_policies().unwrap();
+    assert_eq!(selected_ids(&bounded), ["metal-local"]);
+    assert!(!bounded.extended_not_run.is_empty());
+    assert!(bounded
+        .extended_not_run
+        .iter()
+        .all(|o| o.layer == EvidenceLayer::ModelRuntime));
+    assert!(bounded.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "metal-extended")));
+    assert!(bounded.obligations.iter().any(|o| o.layer == EvidenceLayer::BackendNumerics && matches!(&o.scope, ObligationScope::Target { target } if target.architecture == "mixture")));
+    let mut unrestricted = request.clone();
+    unrestricted.release_metal = None;
+    let unrestricted = plan(&unrestricted).unwrap();
+    let non_model = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(non_model(&bounded), non_model(&unrestricted));
+    assert_eq!(
+        bounded.deferred_performance,
+        unrestricted.deferred_performance
+    );
+    let schedule = super::super::model_schedule::model_task_schedule(&bounded);
+    assert!(schedule.unsupported_obligations.is_empty());
+    assert!(schedule
+        .runs
+        .iter()
+        .all(|run| run.metal_lane == Some(MetalModelLane::Local) && run.cuda_lane.is_none()));
+    let mut same_target = request;
+    same_target.profiles[1].target = same_target.profiles[0].target.clone();
+    same_target.required_targets = vec![same_target.profiles[0].target.clone()];
+    let same_target = plan(&same_target).unwrap();
+    assert!(same_target.extended_not_run.iter().all(|o| matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "metal-extended")));
+}
+
+#[test]
+fn bounded_metal_rejects_missing_overlapping_unpinned_wrong_backend_and_optional_quick_start() {
+    let request = metal_lane_input();
+    let mut changed = request.clone();
+    changed
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .extended_profile_ids
+        .push("metal-local".into());
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed
+        .profiles
+        .push(profile("unclassified", text_target("bf16", Backend::Metal)));
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.profiles[0].model = "owner/unpinned".into();
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.profiles[0].target.backend = Backend::Cuda;
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.quick_start_profile_ids = vec!["metal-extended".into()];
+    assert!(plan(&changed).is_err());
+    let complete = plan(&request).unwrap();
+    let mut missing = complete.clone();
+    missing.selected.clear();
+    assert!(missing.validate_release_policies().is_err());
+    let mut forged = complete.clone();
+    forged.extended_not_run[0].layer = EvidenceLayer::BackendNumerics;
+    assert!(forged.validate_release_policies().is_err());
+    let mut forged = complete;
+    forged.release_metal = None;
+    assert!(forged.validate_release_policies().is_err());
+}
+
+#[test]
+fn metal_not_run_is_independent_of_both_cuda_cloud_modes_and_never_applies_to_prs() {
+    for cloud in [CloudCudaMode::Disabled, CloudCudaMode::Required] {
+        let mut request = cuda_lane_input();
+        request.release_cuda.as_mut().unwrap().cloud = cloud;
+        let cuda_only = plan(&request).unwrap();
+        let metal = metal_lane_input();
+        request.profiles.extend(metal.profiles);
+        request.required_targets.extend(metal.required_targets);
+        request
+            .quick_start_profile_ids
+            .extend(metal.quick_start_profile_ids);
+        request.release_metal = metal.release_metal;
+        let combined = plan(&request).unwrap();
+        combined.validate_release_policies().unwrap();
+        let cuda_runs = |plan: &Plan| {
+            super::super::model_schedule::model_task_schedule(plan)
+                .runs
+                .into_iter()
+                .filter(|run| run.profile.target.backend == Backend::Cuda)
+                .map(|run| (run.profile, run.cuda_lane, run.checks, run.quick_start))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cuda_runs(&cuda_only), cuda_runs(&combined));
+        assert!(combined.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Profile { target, .. } if target.backend == Backend::Metal)));
+        if cloud == CloudCudaMode::Required {
+            assert!(!combined.extended_not_run.iter().any(|o| matches!(&o.scope, ObligationScope::Target { target } | ObligationScope::Profile { target, .. } if target.backend == Backend::Cuda)));
+            let mut forged = combined.clone();
+            let obligation = forged
+                .extended_not_run
+                .iter_mut()
+                .find(|o| matches!(&o.scope, ObligationScope::Profile { .. }))
+                .unwrap();
+            if let ObligationScope::Profile { target, .. } = &mut obligation.scope {
+                target.backend = Backend::Cuda;
+            }
+            assert!(forged.validate_release_policies().is_err());
+        }
+        request.stage = Stage::PullRequest;
+        let pr = plan(&request).unwrap();
+        assert!(
+            pr.release_metal.is_none()
+                && pr.release_cuda.is_none()
+                && pr.extended_not_run.is_empty()
+        );
     }
 }
 
@@ -2680,4 +2842,203 @@ fn explicit_release_models_cannot_be_replaced_by_a_cheaper_same_family_sample() 
     request.stage = Stage::Release;
     request.release_profile_ids.push("large".into());
     assert!(plan(&request).is_err());
+}
+
+#[test]
+fn catalog_cpu_sample_replacement_preserves_scoped_checks_and_precision_boundaries() {
+    use super::super::model_schedule::{model_check_descriptors, model_task_schedule};
+    use super::super::model_sources::validate_profile_sources;
+    use super::super::model_tasks::ModelCheck;
+
+    let mut catalog: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../docs/release-regression-catalog.json"
+    ))
+    .unwrap();
+    catalog.as_object_mut().unwrap().remove("readme_reviews");
+    catalog["stage"] = serde_json::json!("release");
+    catalog["impact"] = serde_json::to_value(Impact {
+        areas: ChangeArea::ALL.to_vec(),
+        paths: Vec::new(),
+        unknown_paths: Vec::new(),
+        product_contract_changed: true,
+    })
+    .unwrap();
+    let mut current: PlanInput = serde_json::from_value(catalog).unwrap();
+    current.checks = model_check_descriptors();
+    let cpu_sample = |profile: &&ModelProfile| {
+        profile.target.backend == Backend::Cpu
+            && profile.target.architecture == "qwen3_5_dense_hybrid"
+    };
+    let safetensors = current
+        .profiles
+        .iter()
+        .filter(cpu_sample)
+        .find(|profile| profile.target.precision == "safetensors-bf16-f32")
+        .unwrap();
+    let gguf = current
+        .profiles
+        .iter()
+        .filter(cpu_sample)
+        .find(|profile| profile.target.precision == "gguf-q4_k_m")
+        .unwrap();
+    for profile in [safetensors, gguf] {
+        validate_profile_sources(profile).unwrap();
+        assert_eq!(profile.target.protocol, ModelOutputProtocol::Text);
+        assert_eq!(profile.target.execution_path, "production-plan-runtime");
+        assert_eq!(
+            profile.reasoning_protocol,
+            ferrum_types::ModelReasoningProtocol::PromptOpened
+        );
+        assert!(!current.quick_start_profile_ids.contains(&profile.id));
+    }
+    // Both formats must use the same independently pinned semantic model, not
+    // the previous larger model's configuration beside new GGUF weights.
+    assert_eq!(
+        gguf.gguf.as_ref().unwrap().semantic_source,
+        safetensors.model
+    );
+
+    let mut previous = current.clone();
+    for profile in previous.profiles.iter_mut().filter(|profile| {
+        profile.target.backend == Backend::Cpu
+            && profile.target.architecture == "qwen3_5_dense_hybrid"
+    }) {
+        let current_id = profile.id.clone();
+        let current_model = profile.model.clone();
+        if profile.gguf.is_some() {
+            profile.id = "release-qwen35-4b-gguf-cpu".into();
+            profile.model =
+                "unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523".into();
+            let source = profile.gguf.as_mut().unwrap();
+            source.filename = "Qwen3.5-4B-Q4_K_M.gguf".into();
+            source.semantic_source =
+                "Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a".into();
+        } else {
+            profile.id = "release-qwen35-2b-safetensors-cpu".into();
+            profile.model = "Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc".into();
+        }
+        assert_ne!(
+            profile.model, current_model,
+            "exercise a real source replacement"
+        );
+        for id in &mut previous.release_profile_ids {
+            if *id == current_id {
+                *id = profile.id.clone();
+            }
+        }
+    }
+    let before = plan(&previous).unwrap();
+    let after = plan(&current).unwrap();
+    // Only the explicit CPU representative commitment changes identity. Do not
+    // erase precision, behavior or entrypoints, or reduce backend/safety duties.
+    let coverage = |plan: &Plan| {
+        let mut obligations: Vec<_> = plan
+            .obligations
+            .iter()
+            .map(|obligation| {
+                let mut scope = obligation.scope.clone();
+                if let ObligationScope::Profile { profile_id, target } = &mut scope {
+                    if target.backend == Backend::Cpu {
+                        *profile_id = target.precision.clone();
+                    }
+                }
+                serde_json::to_string(&(
+                    obligation.behavior,
+                    obligation.layer,
+                    scope,
+                    &obligation.entrypoints,
+                ))
+                .unwrap()
+            })
+            .collect();
+        obligations.sort();
+        obligations
+    };
+    assert_eq!(coverage(&before), coverage(&after));
+    assert_eq!(before.extended_not_run, after.extended_not_run);
+    assert_eq!(before.deferred_performance, after.deferred_performance);
+
+    let schedule = model_task_schedule(&after);
+    assert!(schedule.unsupported_obligations.is_empty());
+    for profile in [safetensors, gguf] {
+        let run = schedule
+            .runs
+            .iter()
+            .find(|run| run.profile == *profile)
+            .unwrap();
+        assert!(!run.quick_start);
+        for (behavior, check) in [
+            (Behavior::ModelLoad, ModelCheck::Basic),
+            (Behavior::ModelForward, ModelCheck::Basic),
+            (Behavior::ArchitectureState, ModelCheck::State),
+        ] {
+            assert!(run.checks.contains(&check));
+            assert!(run.obligations.iter().any(|index| {
+                let obligation = &after.obligations[*index];
+                obligation.behavior == behavior
+                    && obligation.entrypoints == ENTRYPOINTS
+                    && matches!(&obligation.scope, ObligationScope::Target { target }
+                        if target == &profile.target)
+            }));
+        }
+    }
+    // Protocol checks may move from SafeTensors to GGUF. Verify each obligation
+    // and its scheduled check instead of fixing a model ID or matrix size.
+    for (behavior, check) in [
+        (Behavior::TemplateHistory, ModelCheck::Basic),
+        (Behavior::ProtocolFraming, ModelCheck::Basic),
+        (Behavior::NaturalEnd, ModelCheck::Basic),
+        (Behavior::UserStop, ModelCheck::Stop),
+        (Behavior::StructuredValidity, ModelCheck::Structured),
+        (Behavior::ToolSelection, ModelCheck::Tools),
+        (Behavior::ToolHandoff, ModelCheck::Tools),
+        (Behavior::ToolContinuation, ModelCheck::Tools),
+        (Behavior::ReasoningBoundaries, ModelCheck::Reasoning),
+        (Behavior::LengthLimit, ModelCheck::Length),
+        (Behavior::Observability, ModelCheck::Observability),
+    ] {
+        let (index, obligation) = after
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| {
+                obligation.behavior == behavior
+                    && obligation.layer == EvidenceLayer::ModelRuntime
+                    && matches!(
+                        &obligation.scope,
+                        ObligationScope::Protocol {
+                            backend: Backend::Cpu,
+                            ..
+                        } | ObligationScope::Reasoning {
+                            backend: Backend::Cpu,
+                            ..
+                        } | ObligationScope::Backend {
+                            backend: Backend::Cpu
+                        }
+                    )
+            })
+            .unwrap();
+        let owner = schedule
+            .runs
+            .iter()
+            .find(|run| run.obligations.contains(&index))
+            .unwrap();
+        assert_eq!(owner.profile.target.backend, Backend::Cpu);
+        assert!(owner.checks.contains(&check));
+        let entrypoints = if matches!(
+            behavior,
+            Behavior::StructuredValidity
+                | Behavior::ToolSelection
+                | Behavior::ToolHandoff
+                | Behavior::ToolContinuation
+        ) {
+            &ENTRYPOINTS[1..]
+        } else {
+            ENTRYPOINTS
+        };
+        assert_eq!(
+            obligation.entrypoints, entrypoints,
+            "the replacement must retain every affected product entrypoint"
+        );
+    }
 }
