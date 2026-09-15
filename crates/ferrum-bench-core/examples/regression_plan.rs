@@ -18,7 +18,7 @@ use ferrum_bench_core::release_regression::performance::{
     performance_check_descriptors, performance_task_schedule,
 };
 use ferrum_bench_core::release_regression::submission::submission_check_descriptors;
-use ferrum_bench_core::release_regression::{plan, Impact, PlanInput};
+use ferrum_bench_core::release_regression::{plan, CloudCudaMode, Impact, PlanInput, Stage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "regression_plan --catalog PATH --base REV [--candidate REV] \
-    [--stage pull_request|release|nightly] [--repo PATH] [--output PATH] [--summary PATH]\n\
+    [--stage pull_request|release|nightly] [--run-cloud-cuda true|false] [--repo PATH] [--output PATH] [--summary PATH]\n\
     Uses git diff --no-renames to include both sides of renames.\n\
     Release base must resolve to the latest reachable formal vMAJOR.MINOR.PATCH tag. Output is a plan, not passing evidence.\n\
     Missing coverage is recorded in gaps; it never authorizes promotion.";
@@ -40,6 +40,7 @@ struct Args {
     base: String,
     candidate: String,
     stage: String,
+    run_cloud_cuda: bool,
     repo: PathBuf,
     output: Option<PathBuf>,
     summary: Option<PathBuf>,
@@ -59,6 +60,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
                 | "--base"
                 | "--candidate"
                 | "--stage"
+                | "--run-cloud-cuda"
                 | "--repo"
                 | "--output"
                 | "--summary"
@@ -84,11 +86,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     if !matches!(stage.as_str(), "pull_request" | "release" | "nightly") {
         return Err(format!("invalid --stage {stage:?}"));
     }
+    let run_cloud_cuda = match values.remove("--run-cloud-cuda").as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err("--run-cloud-cuda must be true or false".into()),
+    };
+    if run_cloud_cuda && stage != "release" {
+        return Err("--run-cloud-cuda requires --stage release".into());
+    }
     Ok(Some(Args {
         catalog: catalog.into(),
         base,
         candidate,
         stage,
+        run_cloud_cuda,
         repo: values
             .remove("--repo")
             .map(PathBuf::from)
@@ -180,6 +191,7 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
                 | "required_targets"
                 | "checks"
                 | "release_performance"
+                | "release_cuda"
         ) {
             return Err(format!("unknown catalog field {key:?}"));
         }
@@ -214,6 +226,22 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
     Ok(input)
 }
 
+fn select_cloud_mode(input: &mut PlanInput, required: bool) -> Result<(), String> {
+    if required && (input.stage != Stage::Release || input.release_cuda.is_none()) {
+        return Err(
+            "cloud CUDA opt-in requires a release catalog with an explicit lane policy".into(),
+        );
+    }
+    if let Some(policy) = &mut input.release_cuda {
+        policy.cloud = if required {
+            CloudCudaMode::Required
+        } else {
+            CloudCudaMode::Disabled
+        };
+    }
+    Ok(())
+}
+
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -229,10 +257,10 @@ fn render_summary(document: &Value) -> String {
     let count = |key: &str| plan[key].as_array().map_or(0, Vec::len);
     format!(
         "## Regression plan\n\nPlanning only; no model or GPU execution is certified.\n\n\
-         Stage: `{}`. Required behaviors: {}. Deferred performance measurements (not passed): {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
+         Stage: `{}`. Required behaviors: {}. Extended CUDA model behaviors not run (not passed): {}. Deferred performance measurements (not passed): {}. Selected profiles: {}. Unresolved gaps: {}.\n\n\
          Missing estimates remain unknown. Review scope, selections and gaps before allocating hardware.\n\n\
          <details><summary>Complete plan and provenance</summary>\n\n```json\n{}\n```\n\n</details>\n",
-        document["stage"].as_str().unwrap_or("unknown"), count("obligations"), plan["deferred_performance"]["obligations"].as_array().map_or(0, Vec::len), count("selected"), count("gaps"),
+        document["stage"].as_str().unwrap_or("unknown"), count("obligations"), count("extended_not_run"), plan["deferred_performance"]["obligations"].as_array().map_or(0, Vec::len), count("selected"), count("gaps"),
         serde_json::to_string_pretty(document).expect("JSON value serializes")
     )
 }
@@ -266,13 +294,15 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         json!({"applied": false, "reason": "artifact host projection only applies to formal release plans"})
     };
-    let input = plan_input(catalog, &args.stage, analysis.impact)?;
+    let mut input = plan_input(catalog, &args.stage, analysis.impact)?;
+    select_cloud_mode(&mut input, args.run_cloud_cuda)?;
     let plan = plan(&input)?;
     let document = json!({
         "schema_version": 2,
         "stage": args.stage,
         "provenance": {"base": base, "candidate": candidate, "changed_paths": paths,
             "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes)),
+            "run_cloud_cuda": args.run_cloud_cuda,
             "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement,
             "dependency_refinement": analysis.dependency_refinement,
             "content_refinement": analysis.content_refinement,
@@ -324,6 +354,40 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Option<Args>, String> {
         parse_args(args.iter().map(|value| (*value).into()))
+    }
+
+    #[test]
+    fn cloud_cuda_requires_explicit_boolean_release_opt_in() {
+        let base = ["--catalog", "catalog.json", "--base", "v1"];
+        assert!(!parse(&base).unwrap().unwrap().run_cloud_cuda);
+        for value in ["false", "true"] {
+            let args: Vec<_> = base
+                .into_iter()
+                .chain(["--run-cloud-cuda", value])
+                .collect();
+            assert_eq!(
+                parse(&args).unwrap().unwrap().run_cloud_cuda,
+                value == "true"
+            );
+        }
+        let mut args: Vec<_> = base
+            .into_iter()
+            .chain(["--run-cloud-cuda", "true", "--stage", "pull_request"])
+            .collect();
+        assert!(parse(&args).is_err());
+        args = base
+            .into_iter()
+            .chain(["--run-cloud-cuda", "yes"])
+            .collect();
+        assert!(parse(&args).is_err());
+        let mut input = plan_input(
+            json!({"profiles":[],"quick_start_profile_ids":[],"required_targets":[]}),
+            "release",
+            analyze_paths(Vec::<String>::new()),
+        )
+        .unwrap();
+        assert!(select_cloud_mode(&mut input, true).is_err());
+        select_cloud_mode(&mut input, false).unwrap();
     }
 
     #[test]
@@ -684,6 +748,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         run(Args {
             catalog,
             base: "refs/tags/v1.2.3".into(),
+            run_cloud_cuda: false,
             candidate: candidate.clone(),
             stage: "release".into(),
             repo: repo.0.clone(),
@@ -863,6 +928,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         let output = repo.0.join("plan.json");
         run(Args {
             catalog: catalog.clone(),
+            run_cloud_cuda: false,
             base: base.clone(),
             candidate,
             stage: "pull_request".into(),
@@ -890,6 +956,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         run(Args {
             catalog,
             base,
+            run_cloud_cuda: false,
             candidate: later,
             stage: "pull_request".into(),
             repo: repo.0.clone(),

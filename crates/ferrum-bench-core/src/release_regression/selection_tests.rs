@@ -30,6 +30,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
+        release_cuda: None,
         release_profile_ids: Vec::new(),
         release_performance: Default::default(),
         stage,
@@ -77,6 +78,159 @@ fn obligation_owners(plan: &Plan, obligation: usize) -> Vec<&str> {
         .filter(|selected| selected.obligations.contains(&obligation))
         .map(|selected| selected.profile.id.as_str())
         .collect()
+}
+
+fn cuda_lane_input() -> PlanInput {
+    let local_target = text_target("bf16", Backend::Cuda);
+    let cloud_target = target(
+        "mixture",
+        ModelOutputProtocol::HarmonyGptOss,
+        "mxfp4",
+        Backend::Cuda,
+    );
+    let mut local = profile("local", local_target.clone());
+    local.model = format!("owner/small@{}", "a".repeat(40));
+    let mut cloud = profile("cloud", cloud_target.clone());
+    cloud.model = format!("owner/large@{}", "b".repeat(40));
+    let mut request = input(
+        Stage::Release,
+        vec![local_target, cloud_target],
+        vec![local, cloud],
+    );
+    request.release_cuda = Some(ReleaseCudaPolicy {
+        cloud: CloudCudaMode::Disabled,
+        mandatory_local_profile_ids: vec!["local".into()],
+        extended_cloud_profile_ids: vec!["cloud".into()],
+        reason: "Cloud model behavior is optional, never replaced by numerical contracts.".into(),
+    });
+    request.release_profile_ids = vec!["cloud".into()];
+    request.quick_start_profile_ids = vec!["local".into()];
+    request.impact.areas = vec![
+        ChangeArea::Kernel,
+        ChangeArea::Template,
+        ChangeArea::Scheduler,
+    ];
+    request.release_performance = ReleasePerformancePolicy::Deferred {
+        reason: "Comparative performance is separate.".into(),
+    };
+    request.checks = super::super::model_schedule::model_check_descriptors();
+    request
+}
+
+#[test]
+fn optional_cuda_models_do_not_remove_numerical_safety_or_claim_extended_passes() {
+    let mut request = cuda_lane_input();
+    let disabled = plan(&request).unwrap();
+    disabled.validate_cuda_policy().unwrap();
+    assert_eq!(selected_ids(&disabled), ["local"]);
+    assert!(!disabled.extended_not_run.is_empty());
+    assert!(disabled
+        .extended_not_run
+        .iter()
+        .all(|o| o.layer == EvidenceLayer::ModelRuntime));
+    assert!(disabled.extended_not_run.iter().any(
+        |o| matches!(&o.scope, ObligationScope::Profile { profile_id, .. } if profile_id == "cloud")
+    ));
+    assert!(disabled.obligations.iter().any(|o| o.layer == EvidenceLayer::BackendNumerics && matches!(&o.scope, ObligationScope::Target { target } if target.precision == "mxfp4")));
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    let enabled = plan(&request).unwrap();
+    enabled.validate_cuda_policy().unwrap();
+    assert!(enabled.extended_not_run.is_empty());
+    assert_eq!(selected_ids(&enabled), ["cloud", "local"]);
+    let non_model = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(non_model(&disabled), non_model(&enabled));
+    assert_eq!(disabled.deferred_performance, enabled.deferred_performance);
+    let schedule = super::super::model_schedule::model_task_schedule(&enabled);
+    assert!(schedule.unsupported_obligations.is_empty());
+    for run in schedule.runs {
+        assert_eq!(
+            run.cuda_lane,
+            request.release_cuda.as_ref().unwrap().lane(&run.profile.id)
+        );
+    }
+}
+
+#[test]
+fn cuda_policy_rejects_unclassified_overlapping_unpinned_and_optional_quick_starts() {
+    let request = cuda_lane_input();
+    let mut changed = request.clone();
+    changed
+        .release_cuda
+        .as_mut()
+        .unwrap()
+        .extended_cloud_profile_ids
+        .push("local".into());
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed
+        .profiles
+        .push(profile("unknown", text_target("q4", Backend::Cuda)));
+    assert!(plan(&changed).is_err());
+    let mut changed = request.clone();
+    changed.profiles[0].model = "owner/unpinned".into();
+    assert!(plan(&changed).is_err());
+    let mut changed = request;
+    changed.quick_start_profile_ids = vec!["cloud".into()];
+    assert!(plan(&changed).is_err());
+}
+
+#[test]
+fn enabled_cloud_never_steals_shared_local_protocol_checks() {
+    let mut request = cuda_lane_input();
+    request.profiles[1].target = request.profiles[0].target.clone();
+    request.required_targets = vec![request.profiles[0].target.clone()];
+    request.profiles[1].estimate = Some(estimate(1, None, None));
+    let disabled = plan(&request).unwrap();
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    let enabled = plan(&request).unwrap();
+    let local_checks = |plan: &Plan| {
+        super::super::model_schedule::model_task_schedule(plan)
+            .runs
+            .into_iter()
+            .find(|run| run.profile.id == "local")
+            .unwrap()
+            .checks
+    };
+    assert_eq!(local_checks(&disabled), local_checks(&enabled));
+    let cloud = enabled
+        .selected
+        .iter()
+        .find(|selected| selected.profile.id == "cloud")
+        .unwrap();
+    assert!(cloud.obligations.iter().all(|index| matches!(&enabled.obligations[*index].scope, ObligationScope::Profile { profile_id, .. } if profile_id == "cloud")));
+    let mut forged = disabled;
+    forged.extended_not_run[0].layer = EvidenceLayer::BackendNumerics;
+    assert!(forged.validate_cuda_policy().is_err());
+}
+
+#[test]
+fn frozen_cuda_policy_cannot_omit_required_profiles_or_change_their_backend() {
+    let mut request = cuda_lane_input();
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    let complete = plan(&request).unwrap();
+    for id in ["local", "cloud"] {
+        let mut omitted = complete.clone();
+        omitted
+            .selected
+            .retain(|selected| selected.profile.id != id);
+        assert!(omitted.validate_cuda_policy().is_err());
+        let mut wrong_backend = complete.clone();
+        wrong_backend
+            .selected
+            .iter_mut()
+            .find(|selected| selected.profile.id == id)
+            .unwrap()
+            .profile
+            .target
+            .backend = Backend::Cpu;
+        assert!(wrong_backend.validate_cuda_policy().is_err());
+    }
 }
 
 #[test]

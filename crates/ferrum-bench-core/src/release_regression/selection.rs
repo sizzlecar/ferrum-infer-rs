@@ -484,6 +484,18 @@ fn estimate_cmp(left: &ModelProfile, right: &ModelProfile) -> Ordering {
     price_order.then_with(|| left.id.cmp(&right.id))
 }
 
+fn profile_covers(profile: &ModelProfile, obligation: &Obligation) -> bool {
+    requires_model(obligation)
+        && super::model_schedule::scope_matches(&obligation.scope, profile)
+        && match obligation.behavior {
+            Behavior::ReasoningBoundaries => profile.reasoning_protocol.supports_reasoning(),
+            Behavior::ReasoningAbsence => {
+                profile.reasoning_protocol == ferrum_types::ModelReasoningProtocol::None
+            }
+            _ => true,
+        }
+}
+
 fn complete_model_binding(
     checks: &[CheckDescriptor],
     obligation: &Obligation,
@@ -562,8 +574,16 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     {
         return Err("deferred release performance requires a nonblank, unpadded reason".into());
     }
+    if let Some(policy) = &input.release_cuda {
+        policy.validate(&input.profiles)?;
+    }
+    let cuda_policy = (input.stage == Stage::Release)
+        .then_some(input.release_cuda.as_ref())
+        .flatten();
     let mut result = Plan {
         stage: input.stage,
+        release_cuda: cuda_policy.cloned(),
+        extended_not_run: Vec::new(),
         impact: input.impact.clone(),
         obligations: Vec::new(),
         deferred_performance: None,
@@ -708,6 +728,34 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                 }),
             }
         }
+        if let Some(policy) = cuda_policy {
+            for id in policy
+                .mandatory_local_profile_ids
+                .iter()
+                .chain(&policy.extended_cloud_profile_ids)
+            {
+                if input.release_profile_ids.contains(id) {
+                    continue;
+                }
+                let profile = input
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .expect("CUDA policy validated its profile inventory");
+                add(&mut result, Behavior::ModelForward, EvidenceLayer::ModelRuntime,
+                    ObligationScope::Profile { profile_id: id.clone(), target: profile.target.clone() },
+                    "explicit CUDA release lane representative; extended coverage is not a local pass");
+            }
+            if input
+                .quick_start_profile_ids
+                .iter()
+                .any(|id| policy.lane(id) == Some(CudaModelLane::Cloud))
+            {
+                return Err(
+                    "a release Quick Start cannot be assigned to optional cloud coverage".into(),
+                );
+            }
+        }
         for id in &input.quick_start_profile_ids {
             match input.profiles.iter().find(|profile| {
                 &profile.id == id && profile.available && valid_target(&profile.target)
@@ -828,28 +876,58 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         }
     }
 
+    if let Some(policy) = cuda_policy.filter(|policy| policy.cloud == CloudCudaMode::Disabled) {
+        let (extended, required): (Vec<_>, Vec<_>) =
+            result.obligations.drain(..).partition(|obligation| {
+                obligation.layer == EvidenceLayer::ModelRuntime
+                    && input.profiles.iter().any(|profile| {
+                        policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
+                            && profile_covers(profile, obligation)
+                    })
+                    && !input.profiles.iter().any(|profile| {
+                        policy.lane(&profile.id) != Some(CudaModelLane::Cloud)
+                            && profile_covers(profile, obligation)
+                    })
+            });
+        result.extended_not_run = extended;
+        result.obligations = required;
+    }
     let mut profiles: Vec<_> = input
         .profiles
         .iter()
         .filter(|profile| profile.available && valid_target(&profile.target))
+        .filter(|profile| {
+            !cuda_policy.is_some_and(|policy| {
+                policy.cloud == CloudCudaMode::Disabled
+                    && policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
+            })
+        })
         .collect();
     profiles.sort_by(|left, right| left.id.cmp(&right.id));
     let covers = |profile: &ModelProfile, obligation: &Obligation| {
-        requires_model(obligation)
-            && scope_matches(&obligation.scope, &profile.target, Some(&profile.id))
-            && match &obligation.scope {
-                ObligationScope::Reasoning {
-                    reasoning_protocol, ..
-                } => *reasoning_protocol == profile.reasoning_protocol,
-                _ => true,
-            }
-            && match obligation.behavior {
-                Behavior::ReasoningBoundaries => profile.reasoning_protocol.supports_reasoning(),
-                Behavior::ReasoningAbsence => {
-                    profile.reasoning_protocol == ferrum_types::ModelReasoningProtocol::None
-                }
-                _ => true,
-            }
+        profile_covers(profile, obligation)
+            && !cuda_policy.is_some_and(|policy| {
+                policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
+                    && profiles.iter().any(|local| {
+                        policy.lane(&local.id) == Some(CudaModelLane::Local)
+                            && profile_covers(local, obligation)
+                    })
+            })
+    };
+    let compare_profiles = |left: &ModelProfile, right: &ModelProfile| {
+        let rank = |profile: &ModelProfile| {
+            cuda_policy
+                .and_then(|policy| {
+                    policy
+                        .mandatory_local_profile_ids
+                        .iter()
+                        .position(|id| id == &profile.id)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| estimate_cmp(left, right))
     };
     // Reserve every required QuickStart first, then reuse it for all matching scopes.
     let mut selected = BTreeSet::<usize>::new();
@@ -889,7 +967,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
             if best.is_none_or(|(previous, score)| {
                 coverage > score
                     || (coverage == score
-                        && estimate_cmp(profile, profiles[previous]) == Ordering::Less)
+                        && compare_profiles(profile, profiles[previous]) == Ordering::Less)
             }) {
                 best = Some((index, coverage));
             }
@@ -925,7 +1003,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                 covers(profile, obligation)
                     && complete_model_binding(&input.checks, obligation, &profile.target)
             })
-            .min_by(|(_, left), (_, right)| estimate_cmp(left, right))
+            .min_by(|(_, left), (_, right)| compare_profiles(left, right))
             .map(|(index, _)| index);
         if let Some(index) = representative {
             selected.insert(index);
@@ -947,7 +1025,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                     complete_model_binding(&input.checks, obligation, &profiles[*right].target);
                 right_bound
                     .cmp(&left_bound)
-                    .then_with(|| estimate_cmp(profiles[*left], profiles[*right]))
+                    .then_with(|| compare_profiles(profiles[*left], profiles[*right]))
             });
         if let Some(index) = representative {
             assignments.entry(index).or_default().push(obligation_index);

@@ -88,16 +88,28 @@ impl ModelCheck {
 pub struct ModelRunCapacity {
     pub context_tokens: u32,
     pub max_num_seqs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_memory_budget_bytes: Option<u64>,
 }
 
 /// Functional correctness workload policy; Quick Start retains product defaults.
 pub const DEFAULT_FUNCTIONAL_CAPACITY: ModelRunCapacity = ModelRunCapacity {
     context_tokens: 2048,
     max_num_seqs: 1,
+    runtime_memory_budget_bytes: None,
+};
+
+pub const DEFAULT_CUDA_FUNCTIONAL_CAPACITY: ModelRunCapacity = ModelRunCapacity {
+    context_tokens: 2048,
+    max_num_seqs: 1,
+    runtime_memory_budget_bytes: Some(4 * 1024 * 1024 * 1024),
 };
 
 impl ModelRunCapacity {
     pub fn validate(self, max_tokens: u32) -> Result<(), String> {
+        if self.runtime_memory_budget_bytes == Some(0) {
+            return Err("functional runtime memory budget must be positive".into());
+        }
         if self.max_num_seqs == 0 || max_tokens == 0 || max_tokens >= self.context_tokens {
             return Err("functional capacity must have positive concurrency and room for prompt plus output".into());
         }
@@ -331,6 +343,14 @@ pub fn verify_model_options(
             format!("options.{field} differs from the expected runtime capacity"),
         );
     }
+    require(
+        &mut errors,
+        options["runtime_memory_budget_bytes"]
+            == serde_json::json!(expected
+                .runtime_capacity
+                .and_then(|capacity| capacity.runtime_memory_budget_bytes)),
+        "options.runtime_memory_budget_bytes differs from the expected runtime capacity",
+    );
     match serde_json::from_value::<Vec<ModelCheck>>(options["checks"].clone()) {
         Ok(checks) => {
             let actual: BTreeSet<_> = checks.iter().copied().collect();

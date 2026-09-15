@@ -240,6 +240,7 @@ impl ReportFixture {
                     "max_tokens": expected.max_tokens, "reasoning_alias_replay": expected.reasoning_alias_replay,
                     "context_tokens": expected.runtime_capacity.map(|c| c.context_tokens),
                     "max_num_seqs": expected.runtime_capacity.map(|c| c.max_num_seqs),
+                    "runtime_memory_budget_bytes": expected.runtime_capacity.and_then(|c| c.runtime_memory_budget_bytes),
                     "stop_prompt": expected.stop_prompt,
                     "ferrum_bin": "/staging/ferrum", "source_label": null, "precision_label": null,
                     "report_dir": "/reports/model", "startup_timeout_secs": 600,
@@ -1209,6 +1210,7 @@ fn only_buffered_harmony_can_record_unavailable_run_raw_prefix_evidence() {
 fn explicit_functional_capacity_is_bound_before_execution_and_observed_at_startup() {
     let mut expected = task("functional", Backend::Metal, vec![ModelCheck::Stop]);
     let capacity = ModelRunCapacity {
+        runtime_memory_budget_bytes: None,
         context_tokens: 2048,
         max_num_seqs: 1,
     };
@@ -1240,9 +1242,37 @@ fn explicit_functional_capacity_is_bound_before_execution_and_observed_at_startu
         assert!(verify_model_options(&expected, &fixture.value["options"]).is_err());
     }
     assert!(ModelRunCapacity {
+        runtime_memory_budget_bytes: None,
         context_tokens: 2048,
         max_num_seqs: 0
     }
     .validate(512)
     .is_err());
+}
+
+#[test]
+fn functional_memory_budget_is_positive_and_bound_to_the_runner_options() {
+    let mut expected = task("bounded", Backend::Cuda, vec![ModelCheck::Basic]);
+    expected.runtime_capacity = Some(DEFAULT_CUDA_FUNCTIONAL_CAPACITY);
+    let fixture = ReportFixture::passed(&expected);
+    verify_model_options(&expected, &fixture.value["options"]).unwrap();
+    for budget in [Value::Null, json!(0), json!(8 * 1024_u64 * 1024 * 1024)] {
+        let mut options = fixture.value["options"].clone();
+        options["runtime_memory_budget_bytes"] = budget;
+        assert!(verify_model_options(&expected, &options).is_err());
+    }
+    let invalid = ModelRunCapacity {
+        runtime_memory_budget_bytes: Some(0),
+        ..DEFAULT_CUDA_FUNCTIONAL_CAPACITY
+    };
+    assert!(invalid.validate(512).is_err());
+    let legacy: ModelRunCapacity =
+        serde_json::from_value(json!({"context_tokens":2048,"max_num_seqs":1})).unwrap();
+    assert_eq!(legacy.runtime_memory_budget_bytes, None);
+    assert_eq!(
+        serde_json::to_value(legacy)
+            .unwrap()
+            .get("runtime_memory_budget_bytes"),
+        None
+    );
 }

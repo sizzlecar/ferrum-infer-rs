@@ -1,4 +1,4 @@
-//! Execute prepared CPU/Metal tasks with the existing real-model runner.
+//! Execute prepared CPU/Metal/CUDA tasks with the existing real-model runner.
 use clap::{Args, ValueEnum};
 use ferrum_bench_core::release_regression::{
     model_tasks::{verify_model_options, verify_model_report, ExpectedModelRun},
@@ -23,18 +23,21 @@ use tokio::process::Command;
 pub enum LocalBackend {
     Cpu,
     Metal,
+    Cuda,
 }
 impl LocalBackend {
     fn backend(self) -> Backend {
         match self {
             Self::Cpu => Backend::Cpu,
             Self::Metal => Backend::Metal,
+            Self::Cuda => Backend::Cuda,
         }
     }
     fn name(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
             Self::Metal => "metal",
+            Self::Cuda => "cuda",
         }
     }
 }
@@ -130,6 +133,7 @@ fn select(
             "stop_prompt":task.stop_prompt,"checks":task.checks,"max_tokens":task.max_tokens,
             "context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),
             "max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),
+            "runtime_memory_budget_bytes":task.runtime_capacity.as_ref().and_then(|capacity|capacity.runtime_memory_budget_bytes),
             "disable_thinking":task.disable_thinking,"use_default_backend":task.use_default_backend,"reasoning_alias_replay":task.reasoning_alias_replay}))
             .map_err(|issues|issues.join("; "))?;
         selected.push(task);
@@ -181,6 +185,12 @@ fn runner_arguments(
             "--max-num-seqs".into(),
             capacity.max_num_seqs.to_string().into(),
         ]);
+        if let Some(budget) = capacity.runtime_memory_budget_bytes {
+            words.extend([
+                "--runtime-memory-budget-bytes".into(),
+                budget.to_string().into(),
+            ]);
+        }
     }
     if task.disable_thinking {
         words.push("--disable-thinking".into());

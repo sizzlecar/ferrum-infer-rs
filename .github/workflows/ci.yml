@@ -431,6 +431,10 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    concurrency:
+      group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-quality-{0}', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read
@@ -581,6 +585,10 @@ jobs:
     # Fork pull requests stay on disposable hosted runners.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "Windows", "X64", "ferrum-windows-native"]') || fromJSON('["windows-2022"]') }}
     timeout-minutes: 120
+    concurrency:
+      group: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'ferrum-panda-hardware' || format('ferrum-hosted-windows-{0}', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
     env:
       CARGO_BUILD_JOBS: 4
     defaults:

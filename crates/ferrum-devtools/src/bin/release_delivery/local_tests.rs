@@ -6,6 +6,9 @@ use ferrum_bench_core::release_regression::{
 };
 use ferrum_types::ModelOutputProtocol;
 
+#[path = "local/cuda_tests.rs"]
+mod cuda;
+
 fn task(backend: Backend, id: &str) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
@@ -47,13 +50,13 @@ fn args(directory: &Path) -> LocalArgs {
     }
 }
 #[test]
-fn local_backend_cli_rejects_cuda() {
+fn local_backend_cli_accepts_only_explicit_supported_backends() {
     #[derive(Parser)]
     struct Cli {
         #[command(flatten)]
         args: LocalArgs,
     }
-    for backend in ["cpu", "metal", "cuda"] {
+    for backend in ["cpu", "metal", "cuda", "auto", "rocm"] {
         let result = Cli::try_parse_from([
             "local",
             "--tasks",
@@ -71,7 +74,7 @@ fn local_backend_cli_rejects_cuda() {
             "--task-timeout-secs",
             "20",
         ]);
-        if backend == "cuda" {
+        if matches!(backend, "auto" | "rocm") {
             assert_eq!(
                 result.err().unwrap().kind(),
                 clap::error::ErrorKind::InvalidValue
@@ -165,6 +168,7 @@ fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     explicit.runtime_capacity = Some(ModelRunCapacity {
         context_tokens: 2048,
         max_num_seqs: 1,
+        runtime_memory_budget_bytes: None,
     });
     let words = runner_arguments(&input, &explicit, Path::new("task"), Path::new("report"));
     for (flag, value) in [("--context-tokens", "2048"), ("--max-num-seqs", "1")] {
@@ -186,6 +190,7 @@ fn local_capacity_preflight_rejects_an_exhausted_context_or_empty_sequence_pool(
     expected.runtime_capacity = Some(ModelRunCapacity {
         context_tokens: 2048,
         max_num_seqs: 1,
+        runtime_memory_budget_bytes: None,
     });
     let document = |task| PreparedTasks {
         schema_version: 1,
@@ -203,6 +208,7 @@ fn local_capacity_preflight_rejects_an_exhausted_context_or_empty_sequence_pool(
         expected.runtime_capacity = Some(ModelRunCapacity {
             context_tokens,
             max_num_seqs,
+            runtime_memory_budget_bytes: None,
         });
         assert!(select(document(expected.clone()), LocalBackend::Metal).is_err());
     }

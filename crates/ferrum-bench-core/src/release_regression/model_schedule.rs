@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct ModelRunRequirements {
     pub profile: ModelProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_lane: Option<CudaModelLane>,
     pub checks: Vec<ModelCheck>,
     pub quick_start: bool,
     pub obligations: Vec<usize>,
@@ -190,6 +192,12 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
             obligation.layer == EvidenceLayer::ModelRuntime
                 && owners.next().is_none()
                 && owner.profile.available
+                && plan.release_cuda.as_ref().is_none_or(|policy| {
+                    owner.profile.target.backend != Backend::Cuda
+                        || policy.lane(&owner.profile.id) == Some(CudaModelLane::Local)
+                        || (policy.cloud == CloudCudaMode::Required
+                            && policy.lane(&owner.profile.id) == Some(CudaModelLane::Cloud))
+                })
                 && match obligation.behavior {
                     Behavior::ReasoningBoundaries => {
                         owner.profile.reasoning_protocol.supports_reasoning()
@@ -219,6 +227,10 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
         let run = runs
             .entry(owner.profile.id.clone())
             .or_insert_with(|| ModelRunRequirements {
+                cuda_lane: plan
+                    .release_cuda
+                    .as_ref()
+                    .and_then(|policy| policy.lane(&owner.profile.id)),
                 profile: owner.profile.clone(),
                 checks: Vec::new(),
                 quick_start: false,

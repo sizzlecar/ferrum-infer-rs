@@ -210,7 +210,7 @@ Configure these repository Actions secrets before starting:
 
 - `RELEASE_GITHUB_TOKEN`: repository/workflow and tap write access; must trigger PR CI.
 - `CARGO_TOKEN`: crates.io publishing credential.
-- `VAST_API_KEY`: Vast account credential for GPU rental and cleanup.
+- `VAST_API_KEY`: needed only for opted-in cloud GPU rental and cleanup.
 
 Use **Re-run failed jobs** to keep successful platform builds and model results.
 A failed Windows CUDA staging job does not invalidate Windows CPU or Metal
@@ -243,17 +243,40 @@ evidence artifacts;
 missing or failed evidence blocks publication. Do not restart the whole workflow
 solely to retry an upload.
 
-During development, use the existing CPU, Metal and CUDA hosts for affected
-compilation, unit tests and model checks. Freeze the release source, version,
-binaries and model tasks before renting a GPU for release acceptance. Publish
-the accepted binaries without rebuilding them. Development results remain useful
-regression evidence, but do not certify a different release binary. A manual
-delivery run can use `reuse_cuda_run_id` to reverify a previous delivery run's
-CUDA results against the current binary, runner and tasks; a verified match
-skips the lease. Investigate any mismatch before restarting delivery instead of
-repeatedly renting machines while implementation is still changing.
+Release delivery always runs the local CUDA lane on the existing RTX 4050
+(`ferrum-cuda`, `cuda-sm89`). Windows native staging, device CI and WSL model
+execution share a queued physical-host concurrency group so they do not compete
+for Panda's RAM/GPU. CPU model regression follows the local CUDA job.
 
-Current rental limits: one 48 GB sm89 GPU, 300 GiB disk, $0.75/hour maximum,
+The default local representatives are pinned Qwen3.5-4B Q4_K_M GGUF,
+Qwen3.5-0.8B SafeTensors and Llama-3.2-1B-Instruct SafeTensors. Non-Quick-Start
+functional tasks (the 0.8B and 1B profiles) use context 2048, one sequence, up to
+512 output tokens and an explicit 4 GiB runtime memory budget. The 4B Q4 profile
+is the CUDA Quick Start: its combined basic/state/protocol task retains product
+capacity defaults rather than repeating a second, capacity-overridden model task.
+This is a test configuration, not measured performance or a promise that every
+selected semantic check has already passed on 6 GiB hardware.
+
+`workflow_dispatch.run_cloud_cuda` defaults to **false**; pushes also disable
+cloud execution. No rental occurs and no cloud secret is needed on this path.
+The plan discloses extended large-model coverage as `extended_not_run`, never
+as passed. Local model failures block publication and never trigger a rental.
+Device numerical and safety obligations remain required across the full declared
+target inventory; small dense models do not certify large-model, MoE or other
+precision end-to-end behavior or capacity.
+
+To request extended large-model acceptance, manually enable `run_cloud_cuda`.
+Both local and cloud lanes must then succeed; cloud failures, cancellation or
+cleanup errors block publication. Only with that opt-in may `reuse_cuda_run_id`
+reverify a previous cloud lane's binary, runner and task identities to avoid a
+new lease. Reuse never substitutes for the mandatory local lane.
+
+During development, use existing hosts for affected checks. Freeze the release
+source, version, binaries and model tasks before release acceptance; publish the
+accepted binaries without rebuilding them. Development or old-candidate capacity
+preflights do not certify a different release binary.
+
+Opt-in rental limits: one 48 GB sm89 GPU, 300 GiB disk, $0.75/hour maximum,
 $0.004 per transfer GB, three hours per lease, 15 minutes to bootstrap and one
 hour per model task. Storage and transfer still contribute to the bill.
 [Expired-lease cleanup](../.github/workflows/release-cloud-reaper.yml) is scheduled,

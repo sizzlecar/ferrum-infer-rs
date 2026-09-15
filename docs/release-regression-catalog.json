@@ -1,9 +1,58 @@
 {
+  "release_cuda": {
+    "cloud": "disabled",
+    "mandatory_local_profile_ids": [
+      "release-qwen35-4b-gguf-cuda",
+      "release-qwen35-08b-safetensors-cuda",
+      "release-llama32-1b-safetensors-cuda"
+    ],
+    "extended_cloud_profile_ids": [
+      "quick-start-cuda",
+      "attention-moe-cuda",
+      "llama-dense-cuda",
+      "hybrid-dense-ct-int4-cuda",
+      "hybrid-dense-block-fp8-cuda",
+      "hybrid-moe-block-fp8-cuda",
+      "harmony-mxfp4-cuda",
+      "gemma-ct-w4a16-cuda",
+      "release-qwen35-9b-gguf-cuda",
+      "release-qwen38-27b-gguf-cuda"
+    ],
+    "reason": "Require pinned local CUDA representatives and all device numerical/safety contracts. Larger CUDA model profiles require explicit cloud opt-in; disabled extension coverage is not run, not passed, and does not certify those models' end-to-end behavior or capacity."
+  },
   "release_performance": {
     "mode": "deferred",
     "reason": "Prioritize correct installation and first use for this release; complete comparative performance measurements after release. Numerical correctness, model behavior, capacity safety and installation remain required."
   },
   "profiles": [
+    {
+      "id": "release-qwen35-08b-safetensors-cuda",
+      "model": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "safetensors-bf16-f32",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
+    },
+    {
+      "id": "release-llama32-1b-safetensors-cuda",
+      "model": "unsloth/Llama-3.2-1B-Instruct@5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+      "target": {
+        "architecture": "llama_dense",
+        "protocol": "text",
+        "precision": "safetensors-bf16",
+        "backend": "cuda",
+        "execution_path": "legacy-model-executor"
+      },
+      "available": true,
+      "estimate": null,
+      "reasoning_protocol": "none"
+    },
     {
       "id": "quick-start-metal",
       "model": "qwen3.5:4b-q4_k_m",
@@ -329,7 +378,7 @@
   ],
   "quick_start_profile_ids": [
     "quick-start-metal",
-    "quick-start-cuda"
+    "release-qwen35-4b-gguf-cuda"
   ],
   "required_targets": [
     {

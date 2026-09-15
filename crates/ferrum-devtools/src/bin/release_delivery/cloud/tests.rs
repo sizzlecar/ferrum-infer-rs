@@ -147,6 +147,7 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
     task.runtime_capacity = Some(ModelRunCapacity {
         context_tokens: 2048,
         max_num_seqs: 1,
+        runtime_memory_budget_bytes: Some(4_294_967_296),
     });
     task.profile.gguf = Some(ferrum_bench_core::release_regression::GgufSourceProfile {
         filename: "weights/model.gguf".into(),
@@ -157,7 +158,11 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
     assert!(words
         .windows(2)
         .any(|pair| pair == ["--gguf-file", "weights/model.gguf"]));
-    for (flag, value) in [("--context-tokens", "2048"), ("--max-num-seqs", "1")] {
+    for (flag, value) in [
+        ("--context-tokens", "2048"),
+        ("--max-num-seqs", "1"),
+        ("--runtime-memory-budget-bytes", "4294967296"),
+    ] {
         assert!(words
             .windows(2)
             .any(|pair| pair[0] == flag && pair[1] == value));
@@ -169,6 +174,7 @@ fn cloud_capacity_preflight_rejects_an_exhausted_context_before_rental() {
     expected.runtime_capacity = Some(ModelRunCapacity {
         context_tokens: 2048,
         max_num_seqs: 1,
+        runtime_memory_budget_bytes: None,
     });
     let document = |task| PreparedTasks {
         schema_version: 1,
@@ -184,6 +190,7 @@ fn cloud_capacity_preflight_rejects_an_exhausted_context_before_rental() {
         expected.runtime_capacity = Some(ModelRunCapacity {
             context_tokens,
             max_num_seqs,
+            runtime_memory_budget_bytes: None,
         });
         assert!(cuda_tasks(document(expected.clone())).is_err());
     }
