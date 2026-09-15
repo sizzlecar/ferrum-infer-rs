@@ -290,6 +290,12 @@ timeouts are failures, not successful or skipped numerical checks.
 The [delivery workflow](../.github/workflows/release-delivery.yml)
 and [Quality workflow](../.github/workflows/ci.yml) define this scheduling.
 
+The Metal model job pins the official artifact downloader containing the
+[upstream timeout-rejection fix](https://github.com/actions/toolkit/pull/2124).
+Its artifact IDs, extraction directories and independent archive/ABI checks
+remain unchanged. A dependency upgrade is not evidence of a successful transfer:
+the job must still verify every staged input before starting model execution.
+
 Qwen3.5 9B, Qwen3.8 27B, Qwen3 30B-A3B attention-only MoE and Qwen3.5 35B-A3B
 hybrid MoE remain explicitly unexecuted extended Metal coverage. A successful
 three-profile lane does not establish their end-to-end correctness or capacity,
