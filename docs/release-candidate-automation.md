@@ -185,6 +185,15 @@ backend's actual successful staging attempt independently, including retries.
 Packaging helpers use debug builds without debug information; distributed Ferrum
 executables retain the release profile.
 
+Before backend compilation, Windows staging runs the actual installer wrapper
+with Inno Setup for both `cpu` and `cuda` inputs. Installer identifiers and
+filenames use `cpu` and `cuda-sm89`, respectively. This Rust integration test
+compiles small packaging fixtures and verifies the generated installers and
+receipts; it never installs or executes the fixture payloads. The test is ignored
+in ordinary workspace runs because it requires Windows, PowerShell 7 and the
+pinned compiler, but staging explicitly executes it with `ISCC` and a fresh
+`FERRUM_INNO_EVIDENCE_DIR`. Its logs are included in Windows staging evidence.
+
 The native runner label is `ferrum-windows-native`. Configure its service with
 `FERRUM_WINDOWS_VS_ROOT`, `FERRUM_WINDOWS_CUDA_ROOT`,
 `FERRUM_WINDOWS_INNO_ROOT`, and `FERRUM_WINDOWS_OBJECT_CACHE`, plus persistent
