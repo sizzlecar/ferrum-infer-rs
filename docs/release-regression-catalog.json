@@ -29,6 +29,13 @@
         "behaviors": ["architecture_state", "tool_selection", "tool_handoff", "tool_continuation"],
         "reason": "The pinned 1B model/template changes opaque identifier capitalization and refuses a valid calculator continuation in both Ferrum and independent Transformers inference. Its combined semantic probes are not release blockers; basic inference, structured output, termination, backend numerical and protocol contracts remain required. This is uncovered model behavior, not a passing result.",
         "evidence": "docs/validation/llama32-1b-release-limitations.md"
+      },
+      {
+        "profile_id": "release-qwen35-08b-safetensors-cuda",
+        "model_source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+        "behaviors": ["architecture_state"],
+        "reason": "The pinned 0.8B model/template does not follow the exact identifier-only recall instruction in both Ferrum Metal and independent Transformers CPU inference. Its combined model-state semantic probe is not certified; basic run/serve, protocol, device numerical/state-boundary, capacity and installation checks remain required. This model limitation is declared for the same pinned source on both local GPU backends, not a claim that CUDA execution passed.",
+        "evidence": "docs/validation/qwen35-08b-release-limitations.md"
       }
     ],
     "reason": "Require pinned local CUDA representatives and all device numerical/safety contracts. Larger CUDA model profiles require explicit cloud opt-in; disabled extension coverage is not run, not passed, and does not certify those models' end-to-end behavior or capacity."
@@ -44,6 +51,15 @@
       "hybrid-moe-metal",
       "release-qwen35-9b-gguf-metal",
       "release-qwen38-27b-gguf-metal"
+    ],
+    "model_limitations": [
+      {
+        "profile_id": "release-qwen35-08b-safetensors-metal",
+        "model_source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+        "behaviors": ["architecture_state"],
+        "reason": "The pinned 0.8B model/template does not follow the exact identifier-only recall instruction in both Ferrum Metal and independent Transformers CPU inference. Its combined model-state semantic probe is not certified; basic run/serve, protocol, device numerical/state-boundary, capacity and installation checks remain required. Existing failed reports remain failures; unexecuted semantics are not passing evidence.",
+        "evidence": "docs/validation/qwen35-08b-release-limitations.md"
+      }
     ],
     "reason": "Require pinned local Metal representatives with bounded functional workloads: a 0.8B SafeTensors sample, the unchanged 4B GGUF product Quick Start, and the existing Llama GGUF legacy-executor sample. Unselected larger model coverage is explicitly not run, not passed; all backend numerical and safety obligations remain required."
   },

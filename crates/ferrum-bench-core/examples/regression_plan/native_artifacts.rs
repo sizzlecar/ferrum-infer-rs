@@ -778,6 +778,138 @@ mod tests {
     }
 
     #[test]
+    fn current_release_models_precede_windows_staging_without_windows_prerequisites() {
+        let before = fixture(true, b"old");
+        let after = fixture(true, b"new");
+        let delivery = yaml(after.get(DELIVERY).unwrap()).unwrap();
+        // Check the actual current workflow separately from historical recipe
+        // compatibility: reverting Windows to prepare-only must not pass CI.
+        topology::model_first_windows_dependencies(&delivery).unwrap();
+        assert!(prove(&before, &after).is_ok());
+
+        let mut legacy_before = before.clone();
+        let mut legacy_after = after.clone();
+        for snapshot in [&mut legacy_before, &mut legacy_after] {
+            change_file(snapshot, DELIVERY, |workflow| {
+                workflow["jobs"]["stage-cuda"]["needs"] = json!("prepare");
+            });
+        }
+        assert!(prove(&legacy_before, &legacy_after).is_ok());
+        assert!(topology::model_first_windows_dependencies(
+            &yaml(legacy_after.get(DELIVERY).unwrap()).unwrap()
+        )
+        .is_err());
+        // A migration still retains full native-source reach even when each
+        // endpoint is a separately reviewed, valid topology.
+        assert!(prove(&legacy_before, &after).is_err());
+    }
+
+    #[test]
+    fn model_first_staging_rejects_missing_optional_and_cyclic_prerequisites() {
+        type Mutation = (&'static str, fn(&mut Value));
+        let changes: &[Mutation] = &[
+            ("missing prepare", |v| {
+                v["jobs"]["stage-cuda"]["needs"] =
+                    json!(["metal-models", "cuda-models", "cpu-models"]);
+            }),
+            ("missing CPU gate", |v| {
+                v["jobs"]["stage-cuda"]["needs"] =
+                    json!(["prepare", "metal-models", "cuda-models"]);
+            }),
+            ("unknown prerequisite", |v| {
+                v["jobs"]["cuda-models"]["needs"] = json!(["prepare", "missing-stage"]);
+            }),
+            ("nonliteral prerequisite", |v| {
+                v["jobs"]["cuda-models"]["needs"] = json!("${{ inputs.model_prerequisites }}");
+            }),
+            ("cycle through tools", |v| {
+                v["jobs"]["tools"]["needs"] = json!(["prepare", "cpu-models"]);
+            }),
+            ("direct Windows CUDA prerequisite", |v| {
+                v["jobs"]["cuda-models"]["needs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("stage-cuda"));
+            }),
+            ("transitive Windows CPU prerequisite", |v| {
+                v["jobs"]["quality"]["needs"] = json!(["prepare", "stage-cpu-windows"]);
+            }),
+            ("failure-tolerant quality", |v| {
+                v["jobs"]["quality"]["continue-on-error"] = json!(true);
+            }),
+            ("failure-tolerant model job", |v| {
+                v["jobs"]["metal-models"]["continue-on-error"] = json!(true);
+            }),
+            ("optional model job", |v| {
+                v["jobs"]["cpu-models"]["if"] = json!("always()");
+            }),
+            ("optional model execution", |v| {
+                let execute = v["jobs"]["metal-models"]["steps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| {
+                        step["name"] == "Execute selected Metal models from the staged archive"
+                    })
+                    .unwrap();
+                execute["if"] = json!("false");
+            }),
+            ("failure-tolerant model execution", |v| {
+                let execute = v["jobs"]["cpu-models"]["steps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| step["name"] == "Check CPU load and basic run/serve compatibility")
+                    .unwrap();
+                execute["continue-on-error"] = json!(true);
+            }),
+        ];
+        for &(name, change) in changes {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            // Change both snapshots: rejection must come from the actual
+            // dependency/mandatory-execution proof, not merely a YAML diff.
+            change_file(&mut before, DELIVERY, change);
+            change_file(&mut after, DELIVERY, change);
+            let delivery = yaml(after.get(DELIVERY).unwrap()).unwrap();
+            assert!(
+                topology::model_first_windows_dependencies(&delivery).is_err(),
+                "{name}"
+            );
+            assert!(prove(&before, &after).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn model_first_windows_support_does_not_relax_other_callers_or_failure_checks() {
+        for producer in ["stage-cuda-linux", "stage-cpu-windows"] {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            for snapshot in [&mut before, &mut after] {
+                change_file(snapshot, DELIVERY, |workflow| {
+                    workflow["jobs"][producer]["needs"] =
+                        json!(["prepare", "metal-models", "cuda-models", "cpu-models"]);
+                });
+            }
+            assert!(prove(&before, &after).is_err(), "{producer}");
+        }
+        for field in ["if", "continue-on-error"] {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            for snapshot in [&mut before, &mut after] {
+                change_file(snapshot, DELIVERY, |workflow| {
+                    workflow["jobs"]["stage-cuda"][field] = if field == "if" {
+                        json!("always()")
+                    } else {
+                        json!(true)
+                    };
+                });
+            }
+            assert!(prove(&before, &after).is_err(), "{field}");
+        }
+    }
+
+    #[test]
     fn unresolved_or_optional_producers_never_authorize_reuse() {
         type Mutation = (&'static str, fn(&mut Value));
         let changes: &[Mutation] = &[

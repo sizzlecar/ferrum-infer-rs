@@ -93,6 +93,7 @@ fn metal_schedule_rejects_an_extended_owner_instead_of_silently_executing_it() {
     let requirement = obligation(Behavior::ModelForward, &owner);
     let mut plan = make_plan(vec![requirement], vec![selected(owner, vec![0])]);
     plan.release_metal = Some(ReleaseMetalPolicy {
+        model_limitations: Vec::new(),
         mandatory_local_profile_ids: vec!["local-metal".into()],
         extended_profile_ids: vec!["extended-metal".into()],
         reason: "Only the local representative is enabled.".into(),

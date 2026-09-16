@@ -962,7 +962,9 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     result.obligations = required;
     let limited = |profile: &ModelProfile, obligation: &Obligation| {
         obligation.layer == EvidenceLayer::ModelRuntime
-            && cuda_policy.is_some_and(|policy| policy.limits(&profile.id, obligation.behavior))
+            && (cuda_policy.is_some_and(|policy| policy.limits(&profile.id, obligation.behavior))
+                || metal_policy
+                    .is_some_and(|policy| policy.limits(&profile.id, obligation.behavior)))
     };
     // Partition before assigning obligation indices. Only available, valid
     // representatives can justify a declared semantic limitation.
