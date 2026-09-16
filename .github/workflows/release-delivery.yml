@@ -133,6 +133,11 @@ jobs:
           else
             printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           fi
+          if jq -e '(.plan.model_limitations_not_run // [] | length) > 0' "$RUNNER_TEMP/release-plan.json" >/dev/null; then
+            printf '\n## Known model capability limits\n\nThe following model-dependent coverage is explicitly not certified, not passed. Product protocol, device/numerical and installation checks remain required.\n' >> "$RUNNER_TEMP/release-notes.md"
+            jq -r '.plan.release_cuda.model_limitations[] | "- " + .model_source + ": " + .reason + " Evidence: " + .evidence' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+            jq -r '.plan.model_limitations_not_run[] | "- Uncovered behavior: " + .behavior + "; scope: " + (.scope | tojson)' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+          fi
           printf '\n## Metal validation scope\n\nRequired: serial representative-model regression on the local Apple Silicon release runner, plus real-device correctness checks.\n' >> "$RUNNER_TEMP/release-notes.md"
           jq -r '"Required profiles: " + (.plan.release_metal.mandatory_local_profile_ids | join(", ")) + ".", "Not run: " + (.plan.release_metal.extended_profile_ids | join(", ")) + ".", .plan.release_metal.reason' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
           printf 'Local dense-model results do not certify the untested MoE, larger-model or mixed-precision profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
