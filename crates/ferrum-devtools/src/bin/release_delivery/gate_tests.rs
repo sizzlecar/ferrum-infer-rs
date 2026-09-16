@@ -41,6 +41,7 @@ fn make_plan(task: &ExpectedModelRun) -> Plan {
         release_cuda: None,
         release_metal: None,
         extended_not_run: vec![],
+        model_limitations_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
@@ -86,6 +87,7 @@ fn release_policy_requires_committed_membership_and_complete_local_tasks() {
     large.id = "cloud-large".into();
     large.model = format!("fixture/large@{}", "b".repeat(40));
     let policy = ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
         cloud: CloudCudaMode::Disabled,
         mandatory_local_profile_ids: vec![expected.profile.id.clone()],
         extended_cloud_profile_ids: vec![large.id.clone()],
@@ -622,6 +624,7 @@ async fn cuda_jobs_are_bound_to_the_actual_candidate_and_latest_attempt() {
     cloud["name"] = json!("cuda-models-cloud");
     cloud["conclusion"] = json!("skipped");
     let policy = ReleaseCudaPolicy {
+        model_limitations: Vec::new(),
         cloud: CloudCudaMode::Disabled,
         mandatory_local_profile_ids: vec!["small".into()],
         extended_cloud_profile_ids: vec!["large".into()],

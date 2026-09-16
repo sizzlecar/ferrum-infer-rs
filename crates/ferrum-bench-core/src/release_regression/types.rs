@@ -388,6 +388,10 @@ pub struct Plan {
     /// Explicit model coverage outside enabled release lanes. Never a pass.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_not_run: Vec<Obligation>,
+    /// Model-dependent semantics excluded by documented capability limitations.
+    /// These are uncovered obligations, not successful execution evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_limitations_not_run: Vec<Obligation>,
     pub impact: Impact,
     pub obligations: Vec<Obligation>,
     /// Explicitly postponed measurements, never passing execution evidence.
@@ -439,10 +443,82 @@ pub struct ReleaseCudaPolicy {
     /// Ordered representatives: earlier local profiles own shared matching behavior.
     pub mandatory_local_profile_ids: Vec<String>,
     pub extended_cloud_profile_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_limitations: Vec<ModelCapabilityLimitation>,
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCapabilityLimitation {
+    pub profile_id: String,
+    /// Exact pinned source reviewed by the independent reference experiment.
+    pub model_source: String,
+    pub behaviors: Vec<Behavior>,
+    pub reason: String,
+    pub evidence: String,
+}
+
+impl ModelCapabilityLimitation {
+    fn validate(&self) -> Result<(), String> {
+        let allowed = |behavior: &Behavior| {
+            matches!(
+                behavior,
+                Behavior::ArchitectureState
+                    | Behavior::ToolSelection
+                    | Behavior::ToolHandoff
+                    | Behavior::ToolContinuation
+            )
+        };
+        if [
+            &self.profile_id,
+            &self.model_source,
+            &self.reason,
+            &self.evidence,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty() || value.trim() != value.as_str())
+            || self.behaviors.is_empty()
+            || self.behaviors.iter().any(|behavior| !allowed(behavior))
+            || self
+                .behaviors
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.behaviors.len()
+        {
+            return Err("model limitation requires unique semantic behaviors, a reason and reference evidence".into());
+        }
+        if super::model_sources::pinned_hf_source(&self.model_source)?.is_none() {
+            return Err("model limitation requires an immutable model source".into());
+        }
+        let tools = [
+            Behavior::ToolSelection,
+            Behavior::ToolHandoff,
+            Behavior::ToolContinuation,
+        ];
+        if tools
+            .iter()
+            .any(|behavior| self.behaviors.contains(behavior))
+            && !tools
+                .iter()
+                .all(|behavior| self.behaviors.contains(behavior))
+        {
+            return Err(
+                "the combined tool probe requires declaring all three tool behaviors".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ReleaseCudaPolicy {
+    pub fn limits(&self, profile_id: &str, behavior: Behavior) -> bool {
+        self.model_limitations.iter().any(|limitation| {
+            limitation.profile_id == profile_id && limitation.behaviors.contains(&behavior)
+        })
+    }
+
     pub fn lane(&self, profile_id: &str) -> Option<CudaModelLane> {
         if self
             .mandatory_local_profile_ids
@@ -462,6 +538,18 @@ impl ReleaseCudaPolicy {
     }
 
     pub fn validate(&self, profiles: &[ModelProfile]) -> Result<(), String> {
+        let mut limited_profiles = std::collections::BTreeSet::new();
+        for limitation in &self.model_limitations {
+            limitation.validate()?;
+            if self.lane(&limitation.profile_id) != Some(CudaModelLane::Local)
+                || !limited_profiles.insert(&limitation.profile_id)
+                || !profiles.iter().any(|profile| {
+                    profile.id == limitation.profile_id && profile.model == limitation.model_source
+                })
+            {
+                return Err("model limitations must name unique mandatory local profiles".into());
+            }
+        }
         if self.reason.trim().is_empty()
             || self.reason.trim() != self.reason
             || self.mandatory_local_profile_ids.is_empty()
@@ -602,6 +690,20 @@ impl Plan {
 
     pub fn validate_release_policies(&self) -> Result<(), String> {
         self.validate_cuda_lane_policy()?;
+        for obligation in &self.model_limitations_not_run {
+            let permitted = obligation.layer == EvidenceLayer::ModelRuntime
+                && self.release_cuda.as_ref().is_some_and(|policy| {
+                    self.selected.iter().any(|selected| {
+                        policy.limits(&selected.profile.id, obligation.behavior)
+                            && super::selection::profile_covers(&selected.profile, obligation)
+                    })
+                });
+            if !permitted {
+                return Err(
+                    "model limitation cannot exempt undeclared or non-model obligations".into(),
+                );
+            }
+        }
         if let Some(policy) = &self.release_metal {
             policy.validate_inventory()?;
             if self.stage != Stage::Release {
@@ -657,6 +759,19 @@ impl Plan {
         let Some(policy) = &self.release_cuda else {
             return Ok(());
         };
+        let mut limited_profiles = std::collections::BTreeSet::new();
+        for limitation in &policy.model_limitations {
+            limitation.validate()?;
+            if policy.lane(&limitation.profile_id) != Some(CudaModelLane::Local)
+                || !limited_profiles.insert(&limitation.profile_id)
+                || !self.selected.iter().any(|selected| {
+                    selected.profile.id == limitation.profile_id
+                        && selected.profile.model == limitation.model_source
+                })
+            {
+                return Err("invalid frozen model capability limitation".into());
+            }
+        }
         let ids: Vec<_> = policy
             .mandatory_local_profile_ids
             .iter()

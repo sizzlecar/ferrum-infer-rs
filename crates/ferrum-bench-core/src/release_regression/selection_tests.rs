@@ -102,6 +102,7 @@ fn cuda_lane_input() -> PlanInput {
         cloud: CloudCudaMode::Disabled,
         mandatory_local_profile_ids: vec!["local".into()],
         extended_cloud_profile_ids: vec!["cloud".into()],
+        model_limitations: Vec::new(),
         reason: "Cloud model behavior is optional, never replaced by numerical contracts.".into(),
     });
     request.release_profile_ids = vec!["cloud".into()];
@@ -232,6 +233,260 @@ fn frozen_cuda_policy_cannot_omit_required_profiles_or_change_their_backend() {
             .backend = Backend::Cpu;
         assert!(wrong_backend.validate_cuda_policy().is_err());
     }
+}
+
+fn limited_cuda_input() -> PlanInput {
+    let mut request = cuda_lane_input();
+    request.profiles[1].target = request.profiles[0].target.clone();
+    request.required_targets = vec![request.profiles[0].target.clone()];
+    request.impact.areas.extend([
+        ChangeArea::Architecture,
+        ChangeArea::Tools,
+        ChangeArea::Structured,
+    ]);
+    request.release_cuda.as_mut().unwrap().model_limitations = vec![ModelCapabilityLimitation {
+        profile_id: "local".into(),
+        model_source: request.profiles[0].model.clone(),
+        behaviors: vec![
+            Behavior::ArchitectureState,
+            Behavior::ToolSelection,
+            Behavior::ToolHandoff,
+            Behavior::ToolContinuation,
+        ],
+        reason: "Reference execution reproduces the model-dependent semantic failure.".into(),
+        evidence: "docs/validation/model-capability-fixture.md".into(),
+    }];
+    request
+}
+
+#[test]
+fn model_limitations_disclose_only_unrepresented_semantics_and_keep_hard_checks() {
+    let request = limited_cuda_input();
+    let limited = plan(&request).unwrap();
+    limited.validate_release_policies().unwrap();
+    let mut unrestricted = request.clone();
+    unrestricted
+        .release_cuda
+        .as_mut()
+        .unwrap()
+        .model_limitations
+        .clear();
+    let unrestricted = plan(&unrestricted).unwrap();
+    assert!(!limited.model_limitations_not_run.is_empty());
+    let policy = request.release_cuda.as_ref().unwrap();
+    for obligation in &limited.model_limitations_not_run {
+        assert_eq!(obligation.layer, EvidenceLayer::ModelRuntime);
+        assert!(policy.limits("local", obligation.behavior));
+        assert!(
+            obligation.checkers.is_empty(),
+            "not-run is never executed evidence"
+        );
+    }
+    let non_model = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(non_model(&limited), non_model(&unrestricted));
+    for behavior in [
+        Behavior::ArchitectureState,
+        Behavior::ToolSelection,
+        Behavior::ToolHandoff,
+        Behavior::ToolContinuation,
+    ] {
+        assert!(limited
+            .obligations
+            .iter()
+            .any(|o| o.layer == EvidenceLayer::Contract && o.behavior == behavior));
+        assert!(limited
+            .model_limitations_not_run
+            .iter()
+            .any(|o| o.behavior == behavior));
+    }
+    assert!(limited
+        .obligations
+        .iter()
+        .any(|o| o.layer == EvidenceLayer::BackendNumerics));
+    assert!(limited
+        .obligations
+        .iter()
+        .any(|o| o.layer == EvidenceLayer::ModelRuntime
+            && o.behavior == Behavior::StructuredValidity));
+    let schedule = super::super::model_schedule::model_task_schedule(&limited);
+    assert!(schedule.unsupported_obligations.is_empty());
+    let local = schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "local")
+        .unwrap();
+    assert!(local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::Basic));
+    assert!(local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::Structured));
+    assert!(!local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::State));
+    assert!(!local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::Tools));
+    for (index, obligation) in limited
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.layer == EvidenceLayer::ModelRuntime)
+    {
+        assert_eq!(
+            obligation_owners(&limited, index),
+            ["local"],
+            "{obligation:?}"
+        );
+    }
+}
+
+#[test]
+fn enabled_cloud_replaces_limited_local_semantics_but_not_its_basic_execution() {
+    let mut request = limited_cuda_input();
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    let planned = plan(&request).unwrap();
+    planned.validate_release_policies().unwrap();
+    assert!(planned.model_limitations_not_run.is_empty());
+    assert!(planned.extended_not_run.is_empty());
+    for (index, obligation) in planned.obligations.iter().enumerate().filter(|(_, o)| {
+        o.layer == EvidenceLayer::ModelRuntime
+            && request
+                .release_cuda
+                .as_ref()
+                .unwrap()
+                .limits("local", o.behavior)
+    }) {
+        assert_eq!(
+            obligation_owners(&planned, index),
+            ["cloud"],
+            "{obligation:?}"
+        );
+    }
+    let schedule = super::super::model_schedule::model_task_schedule(&planned);
+    assert!(schedule.unsupported_obligations.is_empty());
+    let checks = |id| {
+        &schedule
+            .runs
+            .iter()
+            .find(|run| run.profile.id == id)
+            .unwrap()
+            .checks
+    };
+    assert!(checks("local").contains(&super::super::model_tasks::ModelCheck::Basic));
+    assert!(checks("cloud").contains(&super::super::model_tasks::ModelCheck::State));
+    assert!(checks("cloud").contains(&super::super::model_tasks::ModelCheck::Tools));
+}
+
+#[test]
+fn model_limitations_do_not_hide_an_enabled_representatives_missing_checker() {
+    let mut request = limited_cuda_input();
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::ToolContinuation);
+    let planned = plan(&request).unwrap();
+    assert!(planned.model_limitations_not_run.is_empty());
+    let index = planned
+        .obligations
+        .iter()
+        .position(|o| {
+            o.layer == EvidenceLayer::ModelRuntime && o.behavior == Behavior::ToolContinuation
+        })
+        .unwrap();
+    assert_eq!(obligation_owners(&planned, index), ["cloud"]);
+    assert!(planned
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+}
+
+#[test]
+fn model_limitations_do_not_make_unavailable_or_different_execution_paths_representative() {
+    let mut request = limited_cuda_input();
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    request.profiles[1].available = false;
+    let unavailable = plan(&request).unwrap();
+    assert!(!unavailable.model_limitations_not_run.is_empty());
+    assert!(unavailable.gaps.iter().any(
+        |gap| matches!(gap, Gap::MissingReleaseProfile { profile_id } if profile_id == "cloud")
+    ));
+    assert!(unavailable.validate_release_policies().is_err());
+    request.profiles[1].available = true;
+    request.profiles[1].target.execution_path = "other-executor".into();
+    let different = plan(&request).unwrap();
+    assert!(!different.model_limitations_not_run.is_empty());
+    assert!(different
+        .model_limitations_not_run
+        .iter()
+        .all(
+            |o| profile_covers(&request.profiles[0], o) && !profile_covers(&request.profiles[1], o)
+        ));
+    request.stage = Stage::PullRequest;
+    let pr = plan(&request).unwrap();
+    assert!(
+        pr.model_limitations_not_run.is_empty(),
+        "release declarations must not suppress PR checks"
+    );
+    assert!(pr.release_cuda.is_none());
+}
+
+#[test]
+fn model_limitations_reject_invalid_declarations_and_preserve_legacy_absence() {
+    let request = limited_cuda_input();
+    let invalid: &[fn(&mut ModelCapabilityLimitation)] = &[
+        |limit| limit.behaviors = vec![Behavior::ModelForward],
+        |limit| limit.behaviors = vec![Behavior::StructuredValidity],
+        |limit| limit.behaviors.push(Behavior::ArchitectureState),
+        |limit| limit.evidence.clear(),
+        |limit| limit.reason.clear(),
+        |limit| limit.behaviors = vec![Behavior::ToolSelection],
+        |limit| limit.model_source = format!("owner/small@{}", "c".repeat(40)),
+        |limit| limit.model_source = "owner/small".into(),
+    ];
+    for mutate in invalid {
+        let mut changed = request.clone();
+        mutate(&mut changed.release_cuda.as_mut().unwrap().model_limitations[0]);
+        assert!(plan(&changed).is_err());
+    }
+    let mut duplicate = request.clone();
+    let limitations = &mut duplicate.release_cuda.as_mut().unwrap().model_limitations;
+    limitations.push(limitations[0].clone());
+    assert!(plan(&duplicate).is_err());
+
+    let mut restored = request;
+    restored
+        .release_cuda
+        .as_mut()
+        .unwrap()
+        .model_limitations
+        .clear();
+    let mut legacy = serde_json::to_value(&restored).unwrap();
+    legacy["release_cuda"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model_limitations");
+    let legacy: PlanInput = serde_json::from_value(legacy).unwrap();
+    let restored = plan(&restored).unwrap();
+    assert_eq!(restored, plan(&legacy).unwrap());
+    assert!(restored.model_limitations_not_run.is_empty());
+    let schedule = super::super::model_schedule::model_task_schedule(&restored);
+    let local = schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "local")
+        .unwrap();
+    assert!(local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::State));
+    assert!(local
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::Tools));
 }
 
 fn metal_lane_input() -> PlanInput {

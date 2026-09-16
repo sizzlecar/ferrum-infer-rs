@@ -37,6 +37,7 @@ fn cuda_lane_fixture(cloud: CloudCudaMode, quick_cuda: bool) -> Plan {
     plan(&PlanInput {
         stage: Stage::Release,
         release_cuda: Some(ReleaseCudaPolicy {
+            model_limitations: Vec::new(),
             cloud,
             mandatory_local_profile_ids: vec![local_id],
             extended_cloud_profile_ids: vec!["extended".into()],

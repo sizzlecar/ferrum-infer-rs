@@ -18,6 +18,15 @@
       "release-qwen35-9b-gguf-cuda",
       "release-qwen38-27b-gguf-cuda"
     ],
+    "model_limitations": [
+      {
+        "profile_id": "release-llama32-1b-safetensors-cuda",
+        "model_source": "unsloth/Llama-3.2-1B-Instruct@5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+        "behaviors": ["architecture_state", "tool_selection", "tool_handoff", "tool_continuation"],
+        "reason": "The pinned 1B model/template changes opaque identifier capitalization and refuses a valid calculator continuation in both Ferrum and independent Transformers inference. Its combined semantic probes are not release blockers; basic inference, structured output, termination, backend numerical and protocol contracts remain required. This is uncovered model behavior, not a passing result.",
+        "evidence": "docs/validation/llama32-1b-release-limitations.md"
+      }
+    ],
     "reason": "Require pinned local CUDA representatives and all device numerical/safety contracts. Larger CUDA model profiles require explicit cloud opt-in; disabled extension coverage is not run, not passed, and does not certify those models' end-to-end behavior or capacity."
   },
   "release_metal": {

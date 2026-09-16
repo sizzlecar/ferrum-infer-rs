@@ -29,6 +29,7 @@ fn plan() -> Plan {
         release_cuda: None,
         release_metal: None,
         extended_not_run: vec![],
+        model_limitations_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {

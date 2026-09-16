@@ -67,6 +67,9 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
     if plan.extended_not_run != recomputed.extended_not_run {
         return Err("extended not-run disclosure differs from committed coverage".into());
     }
+    if plan.model_limitations_not_run != recomputed.model_limitations_not_run {
+        return Err("model limitation disclosure differs from committed coverage".into());
+    }
     let without_assignments =
         |obligations: &[ferrum_bench_core::release_regression::Obligation]| {
             obligations
@@ -169,6 +172,7 @@ mod tests {
 
     fn policy(cloud: CloudCudaMode) -> ReleaseCudaPolicy {
         ReleaseCudaPolicy {
+            model_limitations: Vec::new(),
             cloud,
             mandatory_local_profile_ids: vec!["local-model".into()],
             extended_cloud_profile_ids: vec!["large-model".into()],
@@ -199,6 +203,19 @@ mod tests {
             input.release_cuda.as_mut().unwrap().cloud = cloud;
             let plan = ferrum_bench_core::release_regression::plan(&input).unwrap();
             verify_policy(&plan, &catalog).unwrap();
+            if !plan.model_limitations_not_run.is_empty() {
+                let mut hidden = plan.clone();
+                hidden.model_limitations_not_run.clear();
+                assert!(verify_policy(&hidden, &catalog).is_err());
+                let mut forged = plan.clone();
+                forged.model_limitations_not_run[0].layer =
+                    ferrum_bench_core::release_regression::EvidenceLayer::BackendNumerics;
+                assert!(verify_policy(&forged, &catalog).is_err());
+            }
+            let mut unreviewed = plan.clone();
+            unreviewed.release_cuda.as_mut().unwrap().model_limitations[0].reason =
+                "An uncommitted exception".into();
+            assert!(verify_policy(&unreviewed, &catalog).is_err());
             let pinned_metal = plan
                 .selected
                 .iter()

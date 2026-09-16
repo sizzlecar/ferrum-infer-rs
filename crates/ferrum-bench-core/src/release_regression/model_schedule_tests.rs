@@ -49,6 +49,7 @@ fn make_plan(obligations: Vec<Obligation>, selected: Vec<SelectedProfile>) -> Pl
         release_cuda: None,
         release_metal: None,
         extended_not_run: Vec::new(),
+        model_limitations_not_run: Vec::new(),
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
@@ -382,6 +383,7 @@ fn reasoning_schedule_rejects_unknown_or_wrong_capability_owners() {
             release_cuda: None,
             release_metal: None,
             extended_not_run: Vec::new(),
+            model_limitations_not_run: Vec::new(),
             deferred_performance: None,
             stage: Stage::PullRequest,
             impact: Impact {
