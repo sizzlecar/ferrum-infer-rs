@@ -176,6 +176,45 @@ fn list_shows_ready_and_incomplete_models() {
 }
 
 #[test]
+fn list_redirected_output_is_plain_text_even_with_force_color() {
+    let workspace = TempDirGuard::new("list-plain-text");
+    let hf_home = workspace.path().join("hf-cache");
+    create_cached_model(&hf_home, "Acme/ReadyModel", true, 1024);
+    create_cached_model(&hf_home, "Acme/IncompleteModel", false, 512);
+
+    // Test each command in a separate process rather than mutating global
+    // environment or color switches in a parallel Rust test process.
+    for no_color in [None, Some("1")] {
+        let mut cmd = base_cmd(workspace.path());
+        cmd.arg("list")
+            .env("HF_HOME", &hf_home)
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
+            .env("CLICOLOR_FORCE", "1")
+            .env("TERM", "xterm-256color");
+        if let Some(value) = no_color {
+            cmd.env("NO_COLOR", value);
+        }
+        let output = run(&mut cmd);
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "stdout contains ANSI: {stdout:?}"
+        );
+        assert!(
+            !stderr.contains('\u{1b}'),
+            "stderr contains ANSI: {stderr:?}"
+        );
+        assert!(stdout.contains("Acme/ReadyModel"));
+        assert!(stdout.contains("Acme/IncompleteModel"));
+        assert!(stdout.contains("ready"));
+        assert!(stdout.contains("incomplete"));
+    }
+}
+
+#[test]
 fn serve_accepts_positional_model_argument() {
     let workspace = TempDirGuard::new("serve-positional-model");
 

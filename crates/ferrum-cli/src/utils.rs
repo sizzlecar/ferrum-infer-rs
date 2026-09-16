@@ -48,7 +48,11 @@ pub fn setup_logging(
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_ansi(console::colors_enabled_stderr()),
+        )
         .init();
 
     Ok(())

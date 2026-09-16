@@ -62,15 +62,15 @@ pub async fn execute(_cmd: ListCommand, config: CliConfig) -> Result<()> {
     // Print models
     for model in models {
         let status = if model.is_complete {
-            "ready".green().to_string()
+            "ready".green()
         } else {
-            "incomplete".yellow().to_string()
+            "incomplete".yellow()
         };
 
         let name_display = if model.is_complete {
-            model.name.normal().to_string()
+            model.name.normal()
         } else {
-            model.name.dimmed().to_string()
+            model.name.dimmed()
         };
 
         println!(
