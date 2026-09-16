@@ -36,17 +36,22 @@ inputs; neither proves correctness.
 CPU release model sampling uses pinned Qwen3.5 0.8B representatives in
 SafeTensors BF16/F32 and Q4_K_M GGUF. Both retain the same dense-hybrid
 architecture and production execution path as the former 2B/4B CPU samples.
-Each format must still pass its own load, forward and architecture-state checks
-through `run`, synchronous HTTP and streaming HTTP. Shared protocol, structured,
-tool, reasoning, stop, length and observability checks can be assigned to the
-GGUF representative; they do not require the previous SafeTensors model size.
-Numerical and safety contracts are unchanged. The former 2B/4B CPU samples are
+CPU is a compatibility backend: each format must pass loading and basic forward
+execution through `run` and `serve`. The committed `release_cpu` policy uses
+`{"mode":"compatibility","reason":"..."}`; omitted policy defaults to `full`
+for backward compatibility. Extended CPU model-state, tool, structured, reasoning
+and termination probes are disclosed in `cpu_compatibility_not_run`, not passed.
+Primary model-semantic regression runs on Metal and local CUDA. Explicit Quick
+Start commitments, protocol contracts, numerical and safety checks are unchanged.
+The policy applies only to release planning; PR/nightly coverage is unchanged.
+The former 2B/4B CPU samples are
 not run by this candidate's default gate; smaller-model results do not certify
 those larger variants. Metal/CUDA Quick Start samples and defaults are unchanged.
 
 These CPU functional tasks retain context 2048, one sequence and the existing
-512-token output budget. Each task is limited to 3600 seconds and each HTTP
-request to 300 seconds, within a 150-minute job including preparation and evidence
+512-token output ceiling; basic probes use their own smaller output limits.
+Each task is limited to 600 seconds and each HTTP
+request to 120 seconds, within a 30-minute job including preparation and evidence
 upload. These are failure ceilings, not expected durations or measured speedups;
 timeouts remain failures. The new samples must produce fresh candidate evidence,
 not renamed reports from the former models.

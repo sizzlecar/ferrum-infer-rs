@@ -38,6 +38,8 @@ fn task() -> ExpectedModelRun {
 }
 fn make_plan(task: &ExpectedModelRun) -> Plan {
     Plan {
+        release_cpu: Default::default(),
+        cpu_compatibility_not_run: vec![],
         release_cuda: None,
         release_metal: None,
         extended_not_run: vec![],

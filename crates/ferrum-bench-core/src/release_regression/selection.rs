@@ -570,6 +570,7 @@ fn record_cost(plan: &mut Plan) -> Result<(), String> {
 /// Plan coverage from declared capabilities and complete change impact. Gaps are
 /// retained for review; a successful return means a plan was made, not a release passed.
 pub fn plan(input: &PlanInput) -> Result<Plan, String> {
+    input.release_cpu.validate()?;
     if matches!(&input.release_performance, ReleasePerformancePolicy::Deferred { reason } if !nonblank(reason))
     {
         return Err("deferred release performance requires a nonblank, unpadded reason".into());
@@ -586,12 +587,19 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     let metal_policy = (input.stage == Stage::Release)
         .then_some(input.release_metal.as_ref())
         .flatten();
+    let cpu_policy = if input.stage == Stage::Release {
+        input.release_cpu.clone()
+    } else {
+        ReleaseCpuPolicy::Full
+    };
     let mut result = Plan {
         stage: input.stage,
+        release_cpu: cpu_policy.clone(),
         release_cuda: cuda_policy.cloned(),
         release_metal: metal_policy.cloned(),
         extended_not_run: Vec::new(),
         model_limitations_not_run: Vec::new(),
+        cpu_compatibility_not_run: Vec::new(),
         impact: input.impact.clone(),
         obligations: Vec::new(),
         deferred_performance: None,
@@ -940,6 +948,18 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         .filter(|profile| !disabled_profile(profile))
         .collect();
     profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    // CPU compatibility does not replace shared GPU model evidence. Basic and
+    // all non-model obligations retain their ordinary required checker binding.
+    let (cpu_not_run, required): (Vec<_>, Vec<_>) =
+        result.obligations.drain(..).partition(|obligation| {
+            profiles.iter().any(|profile| {
+                cpu_policy.defers(profile, obligation) && profile_covers(profile, obligation)
+            }) && !profiles.iter().any(|profile| {
+                profile.target.backend != Backend::Cpu && profile_covers(profile, obligation)
+            })
+        });
+    result.cpu_compatibility_not_run = cpu_not_run;
+    result.obligations = required;
     let limited = |profile: &ModelProfile, obligation: &Obligation| {
         obligation.layer == EvidenceLayer::ModelRuntime
             && cuda_policy.is_some_and(|policy| policy.limits(&profile.id, obligation.behavior))
@@ -954,7 +974,9 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                 .iter()
                 .any(|profile| profile_covers(profile, obligation) && limited(profile, obligation))
                 && !profiles.iter().any(|profile| {
-                    profile_covers(profile, obligation) && !limited(profile, obligation)
+                    profile_covers(profile, obligation)
+                        && !limited(profile, obligation)
+                        && !cpu_policy.defers(profile, obligation)
                 })
         });
     result.model_limitations_not_run = limited_not_run;
@@ -962,6 +984,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     let covers = |profile: &ModelProfile, obligation: &Obligation| {
         profile_covers(profile, obligation)
             && !limited(profile, obligation)
+            && !cpu_policy.defers(profile, obligation)
             && !cuda_policy.is_some_and(|policy| {
                 policy.lane(&profile.id) == Some(CudaModelLane::Cloud)
                     && profiles.iter().any(|local| {

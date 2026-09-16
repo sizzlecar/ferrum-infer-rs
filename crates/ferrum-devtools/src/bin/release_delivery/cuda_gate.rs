@@ -1,13 +1,23 @@
 //! Bind local Metal/CUDA and optional cloud execution to committed coverage.
 use ferrum_bench_core::release_regression::{
     model_schedule::model_task_schedule, Backend, CloudCudaMode, CudaModelLane, MetalModelLane,
-    ModelProfile, Plan, PlanInput, ReleaseCudaPolicy, ReleaseMetalPolicy,
+    ModelProfile, Plan, PlanInput, ReleaseCpuPolicy, ReleaseCudaPolicy, ReleaseMetalPolicy,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> {
     plan.validate_release_policies()?;
+    let committed_cpu: ReleaseCpuPolicy = serde_json::from_value(
+        catalog
+            .get("release_cpu")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"mode":"full"})),
+    )
+    .map_err(|_| "candidate catalog has an invalid CPU compatibility policy")?;
+    if plan.release_cpu != committed_cpu {
+        return Err("frozen CPU compatibility policy differs from the committed catalog".into());
+    }
     let policy = plan
         .release_cuda
         .as_ref()
@@ -69,6 +79,9 @@ pub(super) fn verify_policy(plan: &Plan, catalog: &Value) -> Result<(), String> 
     }
     if plan.model_limitations_not_run != recomputed.model_limitations_not_run {
         return Err("model limitation disclosure differs from committed coverage".into());
+    }
+    if plan.cpu_compatibility_not_run != recomputed.cpu_compatibility_not_run {
+        return Err("CPU compatibility disclosure differs from committed coverage".into());
     }
     let without_assignments =
         |obligations: &[ferrum_bench_core::release_regression::Obligation]| {
@@ -196,6 +209,7 @@ mod tests {
         input["impact"] =
             serde_json::to_value(ferrum_bench_core::release_regression::analyze_paths([
                 "crates/ferrum-kernels/src/backend/cuda/mod.rs",
+                "crates/ferrum-engine/src/lib.rs",
             ]))
             .unwrap();
         let mut input: PlanInput = serde_json::from_value(input).unwrap();
@@ -203,6 +217,23 @@ mod tests {
             input.release_cuda.as_mut().unwrap().cloud = cloud;
             let plan = ferrum_bench_core::release_regression::plan(&input).unwrap();
             verify_policy(&plan, &catalog).unwrap();
+            assert!(!plan.cpu_compatibility_not_run.is_empty());
+            let mut hidden_cpu = plan.clone();
+            hidden_cpu.cpu_compatibility_not_run.clear();
+            assert!(verify_policy(&hidden_cpu, &catalog).is_err());
+            let mut forged_cpu = plan.clone();
+            forged_cpu.cpu_compatibility_not_run[0].layer =
+                ferrum_bench_core::release_regression::EvidenceLayer::BackendNumerics;
+            assert!(verify_policy(&forged_cpu, &catalog).is_err());
+            let mut changed_cpu = plan.clone();
+            changed_cpu.release_cpu = ReleaseCpuPolicy::Full;
+            assert!(verify_policy(&changed_cpu, &catalog).is_err());
+            assert!(model_task_schedule(&plan)
+                .runs
+                .iter()
+                .filter(|run| run.profile.target.backend == Backend::Cpu)
+                .all(|run| run.checks
+                    == [ferrum_bench_core::release_regression::model_tasks::ModelCheck::Basic]));
             if !plan.model_limitations_not_run.is_empty() {
                 let mut hidden = plan.clone();
                 hidden.model_limitations_not_run.clear();

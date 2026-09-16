@@ -293,6 +293,9 @@ pub struct CheckDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct PlanInput {
     pub stage: Stage,
+    /// CPU compatibility samples preserve basic execution, not full model semantics.
+    #[serde(default)]
+    pub release_cpu: ReleaseCpuPolicy,
     /// Explicit release-only CUDA model sampling; device numerical targets remain intact.
     #[serde(default)]
     pub release_cuda: Option<ReleaseCudaPolicy>,
@@ -381,6 +384,8 @@ pub struct PlanCost {
 #[serde(deny_unknown_fields)]
 pub struct Plan {
     pub stage: Stage,
+    #[serde(default, skip_serializing_if = "ReleaseCpuPolicy::is_full")]
+    pub release_cpu: ReleaseCpuPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cuda: Option<ReleaseCudaPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +397,9 @@ pub struct Plan {
     /// These are uncovered obligations, not successful execution evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_limitations_not_run: Vec<Obligation>,
+    /// CPU model coverage outside compatibility basic execution. Never a pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_compatibility_not_run: Vec<Obligation>,
     pub impact: Impact,
     pub obligations: Vec<Obligation>,
     /// Explicitly postponed measurements, never passing execution evidence.
@@ -401,6 +409,40 @@ pub struct Plan {
     pub omitted: Vec<OmittedProfile>,
     pub gaps: Vec<Gap>,
     pub cost: PlanCost,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReleaseCpuPolicy {
+    #[default]
+    Full,
+    Compatibility {
+        reason: String,
+    },
+}
+
+impl ReleaseCpuPolicy {
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::Compatibility { reason } = self {
+            if reason.trim().is_empty() || reason.trim() != reason {
+                return Err(
+                    "CPU compatibility coverage requires a nonblank, unpadded reason".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn defers(&self, profile: &ModelProfile, obligation: &Obligation) -> bool {
+        !self.is_full()
+            && profile.target.backend == Backend::Cpu
+            && obligation.layer == EvidenceLayer::ModelRuntime
+            && !super::model_schedule::is_basic_behavior(obligation.behavior)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +731,7 @@ impl Plan {
     }
 
     pub fn validate_release_policies(&self) -> Result<(), String> {
+        self.validate_cpu_policy()?;
         self.validate_cuda_lane_policy()?;
         for obligation in &self.model_limitations_not_run {
             let permitted = obligation.layer == EvidenceLayer::ModelRuntime
@@ -750,6 +793,53 @@ impl Plan {
             };
             if obligation.layer != EvidenceLayer::ModelRuntime || !enabled_extension {
                 return Err("extended not-run coverage requires an explicit disabled model lane for its backend".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cpu_policy(&self) -> Result<(), String> {
+        self.release_cpu.validate()?;
+        if self.release_cpu.is_full() {
+            return if self.cpu_compatibility_not_run.is_empty() {
+                Ok(())
+            } else {
+                Err("full CPU coverage cannot contain compatibility not-run obligations".into())
+            };
+        }
+        if self.stage != Stage::Release
+            || !self
+                .selected
+                .iter()
+                .any(|selected| selected.profile.target.backend == Backend::Cpu)
+        {
+            return Err("CPU compatibility requires a release plan with CPU execution".into());
+        }
+        for obligation in &self.cpu_compatibility_not_run {
+            let permitted = obligation.checkers.is_empty()
+                && self.selected.iter().any(|selected| {
+                    self.release_cpu.defers(&selected.profile, obligation)
+                        && super::selection::profile_covers(&selected.profile, obligation)
+                })
+                && !self.selected.iter().any(|selected| {
+                    selected.profile.target.backend != Backend::Cpu
+                        && super::selection::profile_covers(&selected.profile, obligation)
+                });
+            if !permitted {
+                return Err(
+                    "CPU not-run coverage must be unrepresented CPU-only model behavior".into(),
+                );
+            }
+        }
+        for selected in &self.selected {
+            for index in &selected.obligations {
+                let obligation = self
+                    .obligations
+                    .get(*index)
+                    .ok_or_else(|| "invalid selected obligation index".to_owned())?;
+                if self.release_cpu.defers(&selected.profile, obligation) {
+                    return Err("CPU compatibility cannot own non-basic model obligations".into());
+                }
             }
         }
         Ok(())

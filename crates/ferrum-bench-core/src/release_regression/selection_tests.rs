@@ -30,6 +30,7 @@ fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
 
 fn input(stage: Stage, targets: Vec<ExecutionTarget>, profiles: Vec<ModelProfile>) -> PlanInput {
     PlanInput {
+        release_cpu: Default::default(),
         release_cuda: None,
         release_metal: None,
         release_profile_ids: Vec::new(),
@@ -522,6 +523,213 @@ fn metal_lane_input() -> PlanInput {
     };
     request.checks = super::super::model_schedule::model_check_descriptors();
     request
+}
+
+fn cpu_compatibility_input() -> PlanInput {
+    let profiles = vec![
+        profile("cpu-safetensors", text_target("bf16", Backend::Cpu)),
+        profile("cpu-gguf", text_target("q4", Backend::Cpu)),
+        profile("gpu", text_target("bf16", Backend::Metal)),
+    ];
+    let mut request = input(
+        Stage::Release,
+        profiles
+            .iter()
+            .map(|profile| profile.target.clone())
+            .collect(),
+        profiles,
+    );
+    request.release_cpu = ReleaseCpuPolicy::Compatibility {
+        reason: "CPU is a compatibility backend; broader model semantics are not run.".into(),
+    };
+    request.release_performance = ReleasePerformancePolicy::Deferred {
+        reason: "Comparative measurements remain independent of compatibility execution.".into(),
+    };
+    request.release_profile_ids = vec!["cpu-safetensors".into(), "cpu-gguf".into()];
+    request.quick_start_profile_ids = vec!["gpu".into()];
+    request.impact.areas = vec![
+        ChangeArea::Architecture,
+        ChangeArea::Template,
+        ChangeArea::Tools,
+        ChangeArea::Structured,
+        ChangeArea::Termination,
+    ];
+    request.checks = super::super::model_schedule::model_check_descriptors();
+    request
+}
+
+#[test]
+fn cpu_compatibility_keeps_both_basic_formats_and_gpu_semantics_with_explicit_not_run() {
+    use super::super::model_tasks::ModelCheck;
+    let request = cpu_compatibility_input();
+    let compatibility = plan(&request).unwrap();
+    compatibility.validate_release_policies().unwrap();
+    let mut full = request.clone();
+    full.release_cpu = ReleaseCpuPolicy::Full;
+    let full = plan(&full).unwrap();
+    let hard = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hard(&compatibility), hard(&full));
+    assert!(!compatibility.cpu_compatibility_not_run.is_empty());
+    assert!(compatibility.cpu_compatibility_not_run.iter().all(|o| {
+        o.layer == EvidenceLayer::ModelRuntime
+            && !matches!(
+                o.behavior,
+                Behavior::ModelLoad
+                    | Behavior::ModelForward
+                    | Behavior::QuickStart
+                    | Behavior::NaturalEnd
+                    | Behavior::TemplateHistory
+                    | Behavior::ProtocolFraming
+                    | Behavior::ReasoningAbsence
+            )
+            && o.checkers.is_empty()
+    }));
+    let schedule = super::super::model_schedule::model_task_schedule(&compatibility);
+    assert!(schedule.unsupported_obligations.is_empty());
+    for id in ["cpu-safetensors", "cpu-gguf"] {
+        let run = schedule
+            .runs
+            .iter()
+            .find(|run| run.profile.id == id)
+            .unwrap();
+        assert_eq!(run.checks, [ModelCheck::Basic]);
+        for behavior in [Behavior::ModelLoad, Behavior::ModelForward] {
+            assert!(run
+                .obligations
+                .iter()
+                .any(|index| compatibility.obligations[*index].behavior == behavior));
+        }
+    }
+    let gpu = schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "gpu")
+        .unwrap();
+    for check in [
+        ModelCheck::State,
+        ModelCheck::Tools,
+        ModelCheck::Structured,
+        ModelCheck::Stop,
+        ModelCheck::Length,
+    ] {
+        assert!(gpu.checks.contains(&check));
+    }
+    let mut no_bindings = request;
+    no_bindings.checks.clear();
+    assert_eq!(
+        compatibility.cpu_compatibility_not_run,
+        plan(&no_bindings).unwrap().cpu_compatibility_not_run
+    );
+}
+
+#[test]
+fn cpu_compatibility_never_defers_required_basic_or_quick_start_missing_checkers() {
+    let mut request = cpu_compatibility_input();
+    request
+        .quick_start_profile_ids
+        .push("cpu-safetensors".into());
+    request.checks.retain(|check| {
+        !matches!(
+            check.behavior,
+            Behavior::ModelLoad | Behavior::ModelForward | Behavior::QuickStart
+        )
+    });
+    let planned = plan(&request).unwrap();
+    for behavior in [
+        Behavior::ModelLoad,
+        Behavior::ModelForward,
+        Behavior::QuickStart,
+    ] {
+        let (index, obligation) = planned
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, o)| {
+                o.behavior == behavior
+                    && o.layer == EvidenceLayer::ModelRuntime
+                    && profile_covers(&request.profiles[0], o)
+            })
+            .unwrap();
+        assert!(obligation.checkers.is_empty());
+        assert!(planned
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+        assert!(!planned
+            .cpu_compatibility_not_run
+            .iter()
+            .any(|o| o.behavior == behavior));
+    }
+    let schedule = super::super::model_schedule::model_task_schedule(&planned);
+    assert!(
+        schedule
+            .runs
+            .iter()
+            .find(|run| run.profile.id == "cpu-safetensors")
+            .unwrap()
+            .quick_start
+    );
+}
+
+#[test]
+fn cpu_compatibility_freeze_rejects_wrong_layer_scope_behavior_or_policy() {
+    let request = cpu_compatibility_input();
+    let planned = plan(&request).unwrap();
+    let invalid: &[fn(&mut Obligation)] = &[
+        |o| o.layer = EvidenceLayer::Contract,
+        |o| o.layer = EvidenceLayer::BackendNumerics,
+        |o| o.behavior = Behavior::ModelLoad,
+        |o| o.behavior = Behavior::ModelForward,
+        |o| o.behavior = Behavior::QuickStart,
+        |o| o.behavior = Behavior::NaturalEnd,
+        |o| o.behavior = Behavior::TemplateHistory,
+        |o| o.behavior = Behavior::ProtocolFraming,
+        |o| o.behavior = Behavior::ReasoningAbsence,
+        |o| o.scope = ObligationScope::Global,
+        |o| {
+            o.scope = ObligationScope::Backend {
+                backend: Backend::Metal,
+            }
+        },
+        |o| o.checkers.push("claimed-execution".into()),
+    ];
+    for mutate in invalid {
+        let mut forged = planned.clone();
+        mutate(&mut forged.cpu_compatibility_not_run[0]);
+        assert!(forged.validate_release_policies().is_err());
+    }
+    let mut shared_gpu = planned.clone();
+    shared_gpu.cpu_compatibility_not_run[0].scope = ObligationScope::Architecture {
+        architecture: request.profiles[2].target.architecture.clone(),
+        protocol: request.profiles[2].target.protocol,
+        execution_path: request.profiles[2].target.execution_path.clone(),
+    };
+    assert!(shared_gpu.validate_release_policies().is_err());
+    let mut full = planned.clone();
+    full.release_cpu = ReleaseCpuPolicy::Full;
+    assert!(full.validate_release_policies().is_err());
+    let mut wrong_stage = planned;
+    wrong_stage.stage = Stage::PullRequest;
+    assert!(wrong_stage.validate_release_policies().is_err());
+    let mut invalid_reason = request.clone();
+    invalid_reason.release_cpu = ReleaseCpuPolicy::Compatibility { reason: " ".into() };
+    assert!(plan(&invalid_reason).is_err());
+    let mut pr = request.clone();
+    pr.stage = Stage::PullRequest;
+    let pr = plan(&pr).unwrap();
+    assert_eq!(pr.release_cpu, ReleaseCpuPolicy::Full);
+    assert!(pr.cpu_compatibility_not_run.is_empty());
+    let mut legacy = serde_json::to_value(&request).unwrap();
+    legacy.as_object_mut().unwrap().remove("release_cpu");
+    let legacy: PlanInput = serde_json::from_value(legacy).unwrap();
+    let mut full = request;
+    full.release_cpu = ReleaseCpuPolicy::Full;
+    assert_eq!(plan(&legacy).unwrap(), plan(&full).unwrap());
 }
 
 #[test]
@@ -3119,6 +3327,9 @@ fn catalog_cpu_sample_replacement_preserves_scoped_checks_and_precision_boundari
     })
     .unwrap();
     let mut current: PlanInput = serde_json::from_value(catalog).unwrap();
+    // This regression compares source replacement under the original full CPU
+    // scope. Compatibility sampling is tested separately and does not erase it.
+    current.release_cpu = ReleaseCpuPolicy::Full;
     current.checks = model_check_descriptors();
     let cpu_sample = |profile: &&ModelProfile| {
         profile.target.backend == Backend::Cpu

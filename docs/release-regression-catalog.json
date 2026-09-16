@@ -1,4 +1,8 @@
 {
+  "release_cpu": {
+    "mode": "compatibility",
+    "reason": "CPU is a compatibility backend. Release acceptance requires pinned small-model load and basic run/serve execution for each CPU format, plus protocol, numerical, safety and installer contracts. Extended CPU model semantics are not release-blocking and are explicitly not certified; primary model regression runs on Metal and local CUDA."
+  },
   "release_cuda": {
     "cloud": "disabled",
     "mandatory_local_profile_ids": [
