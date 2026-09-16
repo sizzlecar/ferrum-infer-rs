@@ -723,9 +723,11 @@ fn metal_model_limitations_yield_to_an_enabled_compatible_representative() {
     unavailable.profiles.last_mut().unwrap().available = false;
     let unavailable = plan(&unavailable).unwrap();
     assert!(!unavailable.model_limitations_not_run.is_empty());
-    assert!(unavailable.gaps.iter().any(
-        |gap| matches!(gap, Gap::MissingReleaseProfile { profile_id } if profile_id == "metal-other")
-    ));
+    assert!(unavailable.gaps.iter().any(|gap| {
+        matches!(gap, Gap::MissingRepresentative { obligation }
+            if matches!(&unavailable.obligations[*obligation].scope,
+                ObligationScope::Profile { profile_id, .. } if profile_id == "metal-other"))
+    }));
     assert!(unavailable.validate_release_policies().is_err());
     request
         .checks
