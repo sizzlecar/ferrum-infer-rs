@@ -284,31 +284,49 @@ pub(super) async fn structured(server: &Server<'_>) -> Result<Value> {
         "name": "ArithmeticAnswer", "strict": true,
         "schema": {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"], "additionalProperties": false}
     }});
-    let mut outputs = Vec::new();
-    for (name, stream) in [("structured-sync", false), ("structured-stream", true)] {
-        let result = chat(server, name, body.clone(), stream).await?;
-        ensure!(
-            result.finish == "stop",
-            "strict JSON exhausted output budget"
-        );
-        let value: Value =
-            serde_json::from_str(result.content()).context("invalid strict JSON content")?;
-        ensure!(
-            value.as_object().is_some_and(|object| object.len() == 1)
-                && value["answer"].as_i64() == Some(42),
-            "strict JSON failed schema or arithmetic semantics: {value}"
-        );
-        outputs.push(value);
+    let mut evidence = json!({"request": body, "observations": {}, "answers": []});
+    let checked = async {
+        for (name, stream) in [("structured-sync", false), ("structured-stream", true)] {
+            let result = chat(server, name, body.clone(), stream).await?;
+            evidence["observations"][name] = observation(&result);
+            let value = structured_answer(result.content(), &result.finish)?;
+            evidence["answers"].as_array_mut().unwrap().push(value);
+        }
+        Ok::<_, anyhow::Error>(())
     }
-    Ok(json!({"answers": outputs}))
+    .await;
+    checked.map_err(|error| super::case_failure(evidence.clone(), error))?;
+    Ok(evidence)
+}
+
+fn structured_answer(content: &str, finish: &str) -> Result<Value> {
+    ensure!(finish == "stop", "strict JSON did not terminate normally");
+    let value: Value = serde_json::from_str(content).context("invalid strict JSON content")?;
+    ensure!(
+        value.as_object().is_some_and(|object| object.len() == 1)
+            && value["answer"].as_i64() == Some(42),
+        "strict JSON failed schema or arithmetic semantics: {value}"
+    );
+    Ok(value)
 }
 
 pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
-    let user = json!({"role": "user", "content": "Use the calc tool to evaluate 123+456. After receiving its result, reply with only the resulting number."});
+    let mut evidence = json!({"reasoning_alias_replayed": server.args.reasoning_alias_replay});
+    tools_with_evidence(server, &mut evidence)
+        .await
+        .map_err(|error| super::case_failure(evidence.clone(), error))?;
+    Ok(evidence)
+}
+
+async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Result<()> {
+    // This named-tool protocol probe supplies the requested expression, not
+    // its result. The model must still generate the call and consume the
+    // independently calculated result; it is not an open-ended planning test.
+    let user = json!({"role": "user", "content": "Call calc with the expression field set to \"123 + 456\". After receiving its result, reply with only the resulting number."});
     let declarations = json!([
         {"type": "function", "function": {
-            "name": "calc", "description": "Evaluate an arithmetic expression.",
-            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"], "additionalProperties": false}
+            "name": "calc", "description": "Add two unsigned decimal integers. The expression must contain exactly one plus sign between the two operands; whitespace and balanced parentheses are allowed.",
+            "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "A single addition expression, not a list of numbers."}}, "required": ["expression"], "additionalProperties": false}
         }},
         {"type": "function", "function": {
             "name": "lookup_weather", "description": "Look up current weather in a city.",
@@ -318,12 +336,15 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
     let mut body = request(server, vec![user.clone()]);
     body["tools"] = declarations.clone();
     body["tool_choice"] = json!({"type": "function", "function": {"name": "calc"}});
+    evidence["request"] = body.clone();
     // Reuse the loaded server; each HTTP mode must actually select and hand off
     // the named tool from the same declarations, including a distractor.
     let sync_called = chat(server, "tools-call-sync", body.clone(), false).await?;
+    evidence["sync_call"] = observation(&sync_called);
     let sync_call = protocol::calc_call(&sync_called, server.args.max_tokens)
         .context("sync named tool handoff")?;
     let stream_called = chat(server, "tools-call-stream", body, true).await?;
+    evidence["stream_call"] = observation(&stream_called);
     let stream_call = protocol::calc_call(&stream_called, server.args.max_tokens)
         .context("SSE named tool handoff")?;
     // Only execute this typed local fixture. Model text is never shell code.
@@ -338,7 +359,10 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
         body
     };
     let sync_body = continuation(&sync_called, &sync_call);
+    evidence["sync_continuation_request"] = sync_body.clone();
     let canonical = chat(server, "tools-final-sync", sync_body.clone(), false).await?;
+    evidence["sync_continuation"] = json!({"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage,
+        "tool_call_id": sync_call.call["id"], "replayed_assistant": sync_body["messages"][1], "tool_result_message": sync_body["messages"][2]});
     finished_answer(&canonical, &sync_call.result.to_string())
         .context("canonical tool-result replay")?;
     let mut final_body = continuation(&stream_called, &stream_call);
@@ -352,31 +376,42 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
         ensure!(reasoning.as_str().is_some_and(|text| !text.trim().is_empty()), "alias replay requires nonempty actual tool-call reasoning; keep model thinking enabled");
         assistant.insert("reasoning_content".into(), reasoning);
     }
+    evidence["stream_continuation_request"] = final_body.clone();
     let streamed = chat(server, "tools-final-stream", final_body.clone(), true).await?;
+    evidence["stream_continuation"] = json!({"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage,
+        "tool_call_id": stream_call.call["id"], "replayed_assistant": final_body["messages"][1], "tool_result_message": final_body["messages"][2]});
     finished_answer(&streamed, &stream_call.result.to_string())
         .context("streamed tool-result replay")?;
-    let evidence = json!({
-        "sync_call": {"message": sync_called.message, "finish_reason": sync_called.finish, "usage": sync_called.usage},
-        "stream_call": {"message": stream_called.message, "finish_reason": stream_called.finish, "usage": stream_called.usage},
-        "sync_continuation": {"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage,
-            "tool_call_id": sync_call.call["id"], "replayed_assistant": sync_body["messages"][1], "tool_result_message": sync_body["messages"][2]},
-        "stream_continuation": {"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage,
-            "tool_call_id": stream_call.call["id"], "replayed_assistant": final_body["messages"][1], "tool_result_message": final_body["messages"][2]},
-        "tool_result": sync_call.result,
-        "reasoning_alias_replayed": server.args.reasoning_alias_replay
-    });
+    evidence["tool_result"] = json!(sync_call.result);
     verify_tool_case(
-        &evidence,
+        evidence,
         server.args.max_tokens,
         server.args.reasoning_alias_replay,
     )
     .map_err(anyhow::Error::msg)?;
-    Ok(evidence)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_answer_requires_correct_value_shape_and_natural_finish() {
+        assert_eq!(
+            structured_answer(r#"{"answer":42}"#, "stop").unwrap(),
+            json!({"answer": 42})
+        );
+        for content in [
+            r#"{"answer":17}"#,
+            r#"{"answer":"42"}"#,
+            r#"{"answer":42,"extra":0}"#,
+            r#"{"answer":42"#,
+        ] {
+            assert!(structured_answer(content, "stop").is_err(), "{content}");
+        }
+        assert!(structured_answer(r#"{"answer":42}"#, "length").is_err());
+    }
 
     fn assistant(request_id: &str, raw: &str) -> Value {
         json!({

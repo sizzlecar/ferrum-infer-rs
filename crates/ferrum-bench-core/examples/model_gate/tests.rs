@@ -35,8 +35,10 @@ fn cuda_lane_fixture(cloud: CloudCudaMode, quick_cuda: bool) -> Plan {
         .map(|profile| profile.id.clone())
         .collect();
     plan(&PlanInput {
+        release_cpu: Default::default(),
         stage: Stage::Release,
         release_cuda: Some(ReleaseCudaPolicy {
+            model_limitations: Vec::new(),
             cloud,
             mandatory_local_profile_ids: vec![local_id],
             extended_cloud_profile_ids: vec!["extended".into()],
@@ -166,6 +168,7 @@ fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
         })
         .collect();
     plan(&PlanInput {
+        release_cpu: Default::default(),
         release_cuda: None,
         release_metal: None,
         release_profile_ids: Vec::new(),
@@ -207,6 +210,7 @@ fn metal_lane_fixture() -> Plan {
     extended.target.architecture = "mixture".into();
     profiles.extend([functional, extended]);
     plan(&PlanInput {
+        release_cpu: Default::default(),
         stage: Stage::Release,
         release_cuda: None,
         release_metal: Some(ReleaseMetalPolicy {

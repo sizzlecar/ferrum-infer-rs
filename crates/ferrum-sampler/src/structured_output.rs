@@ -273,7 +273,7 @@ impl StructuredOutputFactory {
                 })?
             }
         };
-        let schema = compact_json_schema(schema)?;
+        let schema = prepare_json_schema(schema)?;
         let grammar_key = serde_json::to_string(&schema).map_err(|error| {
             FerrumError::invalid_request(format!("serialize structured-output schema: {error}"))
         })?;
@@ -452,7 +452,7 @@ impl StructuredOutputFactory {
     }
 }
 
-fn compact_json_schema(schema: serde_json::Value) -> Result<serde_json::Value> {
+fn prepare_json_schema(schema: serde_json::Value) -> Result<serde_json::Value> {
     let mut schema = match schema {
         schema @ serde_json::Value::Object(_) => schema,
         schema @ serde_json::Value::Bool(_) => json!({"allOf": [schema]}),
@@ -464,13 +464,12 @@ fn compact_json_schema(schema: serde_json::Value) -> Result<serde_json::Value> {
     };
 
     // x-guidance is an llguidance compiler extension, not a JSON Schema
-    // constraint. Keep compiler policy owned by Ferrum so a request cannot
-    // re-enable an unbounded whitespace loop or change JSON separators.
-    JsonCompileOptions {
-        whitespace_flexible: false,
-        ..JsonCompileOptions::default()
-    }
-    .apply_to(&mut schema);
+    // constraint. Keep compiler policy owned by Ferrum, including strict JSON
+    // separators and escapes. Legal JSON whitespace must remain available:
+    // compact-only masking can remove a BPE token containing both whitespace
+    // and the intended value. Generation still has its token budget and
+    // liveness guard, just as composed tool/final output does.
+    JsonCompileOptions::default().apply_to(&mut schema);
     Ok(schema)
 }
 
@@ -1398,8 +1397,12 @@ mod tests {
         const EOS: u32 = 257;
 
         fn new() -> Self {
+            Self::with_merged("{}")
+        }
+
+        fn with_merged(text: &str) -> Self {
             let mut inner = ByteTokenizer::new();
-            inner.token_text[EOS as usize] = "{}".to_string();
+            inner.token_text[EOS as usize] = text.to_string();
             inner.token_text.push("<eos>".to_string());
             inner.special.eos_token = Some(TokenId::new(Self::EOS));
             Self { inner }
@@ -1415,7 +1418,7 @@ mod tests {
             let mut decoded = String::new();
             for token in tokens {
                 match token.get() {
-                    Self::OBJECT => decoded.push_str("{}"),
+                    Self::OBJECT => decoded.push_str(&self.inner.token_text[Self::OBJECT as usize]),
                     Self::EOS if skip_special => {}
                     Self::EOS => decoded.push_str("<eos>"),
                     _ => decoded.push_str(&self.inner.decode(&[*token], skip_special)?),
@@ -1437,7 +1440,7 @@ mod tests {
         }
 
         fn token_id(&self, text: &str) -> Option<TokenId> {
-            (text == "{}")
+            (text == self.inner.token_text[Self::OBJECT as usize])
                 .then(|| TokenId::new(Self::OBJECT))
                 .or_else(|| self.inner.token_id(text))
         }
@@ -1449,7 +1452,7 @@ mod tests {
         fn info(&self) -> TokenizerInfo {
             TokenizerInfo {
                 vocab_size: self.vocab_size(),
-                max_token_length: Some(2),
+                max_token_length: Some(self.inner.token_text[Self::OBJECT as usize].len()),
                 model_name: Some("merged-object-test".to_string()),
                 ..self.inner.info()
             }
@@ -1498,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn json_object_uses_compact_separators_without_unbounded_whitespace() {
+    fn json_object_accepts_ordinary_json_whitespace() {
         let processor = factory()
             .create_processor(
                 &ResponseFormat::JsonObject,
@@ -1513,9 +1516,76 @@ mod tests {
         let mut logits = vec![0.0; EOS as usize + 1];
         processor.mask_logits(&mut logits, &generated).unwrap();
 
-        assert!(!logits[b' ' as usize].is_finite());
+        assert!(logits[b' ' as usize].is_finite());
         assert!(logits[b'}' as usize].is_finite());
         assert!(logits[b'"' as usize].is_finite());
+        let mut generated = generated;
+        assert_and_append(&processor, &mut generated, "\n  \"answer\" : 42\n}");
+        assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    #[test]
+    fn strict_schema_preserves_a_merged_whitespace_and_integer_token() {
+        let tokenizer = Arc::new(MergedObjectTokenizer::with_merged(" 42"));
+        let processor = StructuredOutputFactory::new(tokenizer)
+            .unwrap()
+            .create_processor(
+                &ResponseFormat::JsonSchema(r#"{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}"#.into()),
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated =
+            r#"{"answer":"#.bytes().map(|byte| TokenId::new(byte as u32)).collect::<Vec<_>>();
+        let mut logits = vec![0.0; MergedObjectTokenizer::EOS as usize + 1];
+        logits[MergedObjectTokenizer::OBJECT as usize] = 9.0;
+        processor.mask_logits(&mut logits, &generated).unwrap();
+        assert_eq!(logits[MergedObjectTokenizer::OBJECT as usize], 9.0);
+        // The schema constrains the type, not the answer to the user's problem.
+        assert!(logits[b'1' as usize].is_finite());
+        assert!(!logits[b'"' as usize].is_finite());
+        assert!(!logits[MergedObjectTokenizer::EOS as usize].is_finite());
+        generated.extend([
+            TokenId::new(MergedObjectTokenizer::OBJECT),
+            TokenId::new(b'}' as u32),
+        ]);
+        assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    #[test]
+    fn legal_whitespace_keeps_the_existing_liveness_guard() {
+        let budget = 64;
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::Immediate,
+                budget,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated = vec![TokenId::new(b'{' as u32)];
+        generated.extend(std::iter::repeat_n(
+            TokenId::new(b' ' as u32),
+            StructuredOutputLivenessPolicy::for_request(budget, None).max_identical_token_run,
+        ));
+        let mut logits = vec![0.0; EOS as usize + 1];
+        let outcome = processor
+            .mask_logits_with_terminals(
+                &mut logits,
+                &generated,
+                &HashSet::from([EOS]),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(outcome.liveness_intervention);
+        assert!(!logits[b' ' as usize].is_finite());
+        assert!(logits[b'}' as usize].is_finite());
+        assert!(!logits[EOS as usize].is_finite());
     }
 
     #[test]
@@ -1723,16 +1793,17 @@ mod tests {
     }
 
     #[test]
-    fn request_cannot_override_compact_json_compiler_policy() {
+    fn request_cannot_override_strict_json_compiler_policy() {
         let schema = r#"{
             "type":"object",
             "properties":{"answer":{"const":42}},
             "required":["answer"],
             "additionalProperties":false,
             "x-guidance":{
-                "item_separator":", ",
-                "key_separator":": ",
-                "whitespace_flexible":true
+                "item_separator":";",
+                "key_separator":"=",
+                "whitespace_flexible":false,
+                "lenient":true
             }
         }"#;
         let processor = factory()
@@ -1746,18 +1817,24 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut generated = Vec::new();
-        assert_and_append(&processor, &mut generated, r#"{"answer":"#);
+        assert_and_append(&processor, &mut generated, r#"{"answer""#);
+        let mut logits = vec![0.0; EOS as usize + 1];
+        processor.mask_logits(&mut logits, &generated).unwrap();
+        assert!(!logits[b'=' as usize].is_finite());
+        assert!(logits[b':' as usize].is_finite());
+        assert_and_append(&processor, &mut generated, ":");
         let mut logits = vec![0.0; EOS as usize + 1];
         processor.mask_logits(&mut logits, &generated).unwrap();
 
-        assert!(!logits[b' ' as usize].is_finite());
+        assert!(logits[b' ' as usize].is_finite());
         assert!(logits[b'4' as usize].is_finite());
+        assert!(!logits[b'1' as usize].is_finite());
         assert_and_append(&processor, &mut generated, "42}");
         assert!(processor.is_accepting(&generated).unwrap());
     }
 
     #[test]
-    fn boolean_json_schema_keeps_its_semantics_under_compact_policy() {
+    fn boolean_json_schema_keeps_its_semantics_under_compiler_policy() {
         let processor = factory()
             .create_processor(
                 &ResponseFormat::JsonSchema("true".to_string()),

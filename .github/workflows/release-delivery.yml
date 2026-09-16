@@ -124,14 +124,20 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
-          printf '\n## CPU validation scope\n\nRequired functional representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
+          printf '\n## CPU compatibility scope\n\nRequired load and basic run/serve representatives:\n' >> "$RUNNER_TEMP/release-notes.md"
           jq -r '.model_tasks.runs[] | select(.profile.target.backend == "cpu") | "- " + .profile.id + ": " + .profile.model' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
-          printf '\nCPU protocol, per-format load/forward/state, numerical and safety checks remain required. Larger CPU model variants are not validated by these small-model results.\n' >> "$RUNNER_TEMP/release-notes.md"
+          printf '\nCPU is a compatibility backend, not the primary model-regression target. Per-format load/basic inference, protocol, numerical, safety and installation checks remain required. Extended CPU model semantics are not run and are not certified.\n' >> "$RUNNER_TEMP/release-notes.md"
+          jq -r '.plan.cpu_compatibility_not_run[]? | "- CPU behavior not run: " + .behavior + "; scope: " + (.scope | tojson)' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
           printf '\n## CUDA validation scope\n\nRequired: local small-model and device correctness regression.\n' >> "$RUNNER_TEMP/release-notes.md"
           if [ "$cloud_cuda" = true ]; then
             printf 'Extended cloud model regression: explicitly enabled and required.\n' >> "$RUNNER_TEMP/release-notes.md"
           else
             printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
+          fi
+          if jq -e '(.plan.model_limitations_not_run // [] | length) > 0' "$RUNNER_TEMP/release-plan.json" >/dev/null; then
+            printf '\n## Known model capability limits\n\nThe following model-dependent coverage is explicitly not certified, not passed. Product protocol, device/numerical and installation checks remain required.\n' >> "$RUNNER_TEMP/release-notes.md"
+            jq -r '.plan.release_cuda.model_limitations[] | "- " + .model_source + ": " + .reason + " Evidence: " + .evidence' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+            jq -r '.plan.model_limitations_not_run[] | "- Uncovered behavior: " + .behavior + "; scope: " + (.scope | tojson)' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
           fi
           printf '\n## Metal validation scope\n\nRequired: serial representative-model regression on the local Apple Silicon release runner, plus real-device correctness checks.\n' >> "$RUNNER_TEMP/release-notes.md"
           jq -r '"Required profiles: " + (.plan.release_metal.mandatory_local_profile_ids | join(", ")) + ".", "Not run: " + (.plan.release_metal.extended_profile_ids | join(", ")) + ".", .plan.release_metal.reason' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
@@ -353,9 +359,9 @@ jobs:
       group: ferrum-panda-hardware
       cancel-in-progress: false
       queue: max
-    # Use the small-model functional samples without expanding their deadline.
-    # Include artifact preparation and evidence upload outside the task budgets.
-    timeout-minutes: 150
+    # Compatibility only: pinned small-model loading and basic run/serve for
+    # each CPU format. Full CPU semantic coverage is disclosed as not run.
+    timeout-minutes: 30
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -379,7 +385,7 @@ jobs:
         with:
           name: release-plan
           path: ${{ runner.temp }}/plan
-      - name: Execute selected CPU models from the staged archive
+      - name: Check CPU load and basic run/serve compatibility
         run: |
           model_gate prepare --backend cpu --plan "$RUNNER_TEMP/plan/release-plan.json" \
             --version "$VERSION" --abi "$RUNNER_TEMP/staged-cpu/ferrum-linux-x86_64.tar.gz.abi.json" \
@@ -395,8 +401,8 @@ jobs:
           release_delivery local --backend cpu \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-cpu/ferrum" \
             --runner "$RUNNER_TEMP/staged-cpu/model_regression" --runner-sha256 "$runner_sha" \
-            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 3600 \
-            --request-timeout-secs 300
+            --report-dir "$RUNNER_TEMP/model-cpu" --task-timeout-secs 600 \
+            --request-timeout-secs 120
       - name: Save CPU release evidence
         uses: actions/upload-artifact@v4
         if: always()

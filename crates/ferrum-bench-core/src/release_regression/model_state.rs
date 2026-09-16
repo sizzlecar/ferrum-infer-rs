@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 pub const CODES: [&str; 2] = ["cobalt-731", "amber-284"];
-pub const RECALL: &str = super::model_basic::RECALL_PROMPT;
+// State continuity concerns exact remembered data, not sentence capitalization.
+// Spell out the copying contract in recall without supplying the answer. Keep
+// the original acknowledgement and no-memory controls; their oracles and the
+// strict rejection of changed or truncated identifiers remain unchanged.
+pub const RECALL: &str = "Copy the complete opaque, case-sensitive identifier I gave you in this conversation exactly, preserving capitalization and punctuation. Reply with only that identifier.";
 pub const EMPTY_RECALL: &str = "What code did I ask you to remember in this conversation? Reply with only that code, or NONE if I have not given you a code.";
 
 pub fn remember(code: &str) -> String {

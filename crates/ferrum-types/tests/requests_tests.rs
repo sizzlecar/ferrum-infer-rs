@@ -232,6 +232,149 @@ fn api_response_after_stop(request: &InferenceRequest, text: &str) -> Option<Api
     api_response_from_generated_text(request, text, FinishReason::Stop)
 }
 
+#[test]
+fn native_json_protocol_is_explicit_and_missing_protocol_keeps_legacy_json() {
+    assert_eq!(
+        serde_json::to_value(ApiToolCallProtocol::NativeJson).unwrap(),
+        json!("native_json")
+    );
+    let request = chat_request_with_tool_protocol(None, ApiToolCallProtocol::NativeJson);
+    let Some(ApiRequest::Chat(chat)) = request.api_request else {
+        panic!("chat request")
+    };
+    let mut value = serde_json::to_value(&chat).unwrap();
+    let roundtrip: ApiChatRequest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        roundtrip.tool_call_protocol,
+        ApiToolCallProtocol::NativeJson
+    );
+    value.as_object_mut().unwrap().remove("tool_call_protocol");
+    let legacy: ApiChatRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.tool_call_protocol, ApiToolCallProtocol::Json);
+    assert_eq!(
+        serde_json::from_value::<ApiToolCallProtocol>(json!("json")).unwrap(),
+        ApiToolCallProtocol::Json
+    );
+}
+
+#[test]
+fn forced_native_json_projects_only_complete_named_calls() {
+    for choice in [
+        ApiToolChoice::Mode("required".into()),
+        ApiToolChoice::Function {
+            tool_type: "function".into(),
+            function: ApiToolChoiceFunction {
+                name: "weather".into(),
+            },
+        },
+    ] {
+        let request =
+            chat_request_with_tool_protocol(Some(choice.clone()), ApiToolCallProtocol::NativeJson);
+        let Some(ApiRequest::Chat(chat)) = &request.api_request else {
+            panic!("chat request")
+        };
+        assert!(chat.requires_native_tool_call());
+        assert_eq!(
+            chat.generated_control_token_texts(),
+            &["<tool_call>", "</tool_call>"]
+        );
+        assert!(chat.generated_response_envelope().is_some());
+        for text in [
+            r#"{"name":"weather","parameters":{"city":"Paris","unit":"c"}}"#,
+            r#"{"arguments":{"city":"Paris","unit":"c"},"name":"weather"}"#,
+            r#"<tool_call>{"name":"weather","arguments":{"city":"Paris","unit":"c"}}</tool_call>"#,
+        ] {
+            let projected = api_response_after_stop(&request, text).expect("complete native call");
+            assert_eq!(
+                api_response_from_classified_generated_text(
+                    &request,
+                    text,
+                    FinishReason::Stop,
+                    StructuredOutputBranch::ToolCall
+                )
+                .unwrap(),
+                Some(projected)
+            );
+            assert!(api_response_from_classified_generated_text(
+                &request,
+                text,
+                FinishReason::Stop,
+                StructuredOutputBranch::Final
+            )
+            .is_err());
+        }
+        for text in [
+            r#"{"city":"Paris","unit":"c"}"#,
+            r#"{"name":"undeclared","parameters":{"city":"Paris","unit":"c"}}"#,
+            r#"{"name":"weather","parameters":[],"arguments":{}}"#,
+            r#"{"name":"weather","parameters":{"city":"Paris","unit":"c"}} trailing"#,
+            r#"<tool_call>{"name":"weather","parameters":{"city":"Paris","unit":"c"}}"#,
+        ] {
+            assert!(
+                api_response_after_stop(&request, text).is_none(),
+                "accepted {text}"
+            );
+            assert!(
+                api_response_from_classified_generated_text(
+                    &request,
+                    text,
+                    FinishReason::Stop,
+                    StructuredOutputBranch::ToolCall
+                )
+                .is_err(),
+                "classified {text}"
+            );
+        }
+        let legacy = chat_request_with_tool_protocol(Some(choice), ApiToolCallProtocol::Json);
+        assert!(
+            api_response_after_stop(&legacy, r#"{"city":"Paris","unit":"c"}"#).is_some(),
+            "legacy forced-argument fallback remains supported"
+        );
+    }
+}
+
+#[test]
+fn native_json_auto_and_none_do_not_add_a_forced_contract() {
+    for choice in [
+        None,
+        Some(ApiToolChoice::Mode("auto".into())),
+        Some(ApiToolChoice::Mode("none".into())),
+    ] {
+        let request = chat_request_with_tool_protocol(choice, ApiToolCallProtocol::NativeJson);
+        let Some(ApiRequest::Chat(chat)) = &request.api_request else {
+            panic!("chat request")
+        };
+        assert!(!chat.requires_native_tool_call());
+        assert!(chat.generated_control_token_texts().is_empty());
+        assert!(chat.generated_response_envelope().is_none());
+    }
+    let request = hard_auto_tool_request(ApiToolCallProtocol::NativeJson);
+    let text = r#"{"name":"weather","parameters":{"city":"Paris","unit":"c"}}"#;
+    assert!(
+        api_response_after_stop(&request, text).is_none(),
+        "auto hard JSON requires branch classification"
+    );
+    let Some(ApiResponse::Chat(final_response)) = api_response_from_classified_generated_text(
+        &request,
+        text,
+        FinishReason::Stop,
+        StructuredOutputBranch::Final,
+    )
+    .unwrap() else {
+        panic!("final response")
+    };
+    assert_eq!(final_response.message.content, text);
+    assert!(final_response.message.tool_calls.is_empty());
+    assert!(api_response_from_classified_generated_text(
+        &request,
+        text,
+        FinishReason::Stop,
+        StructuredOutputBranch::ToolCall
+    )
+    .unwrap()
+    .is_some());
+}
+
 fn parse_single_xml_parameter(
     parameter_schema: serde_json::Value,
     value: &str,

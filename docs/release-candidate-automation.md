@@ -164,12 +164,15 @@ unfiltered task plan, and all selected model reports.
 Model jobs print profile counts and case start/completion events. A 30-second
 heartbeat indicates the controller is still waiting; it does not imply a passed
 check. Full diagnostics remain in evidence artifacts, and deadlines and process
-cleanup still apply. CPU requests have a 900-second allowance within a three-hour
-model task deadline. The complete CPU suite runs multiple CLI and server cases
-serially; the task deadline includes cold model downloads and every selected
-case. The CPU job allows seven hours for the two model tasks, preparation and
-evidence upload. These are upper bounds, not expected durations; completed tasks
-return immediately and every selected check must still pass.
+cleanup still apply. CPU is compatibility-only: pinned 0.8B SafeTensors and GGUF
+each load and execute basic CLI/server requests, without the full model-semantic
+matrix. Requests allow 120 seconds, each task 600 seconds including downloads,
+and the job 30 minutes including preparation and evidence upload. These are
+failure ceilings, not expected durations; every selected check must still pass.
+The frozen plan and public notes disclose omitted CPU model semantics in
+`cpu_compatibility_not_run`, never as passed. CPU compilation, protocol, numerical,
+safety and installation contracts remain required. After publication, all three
+public installer jobs also execute real basic `run`/`serve` before delivery is complete.
 
 Windows native object caching is separate from Rust dependency/build caching.
 Successful native builds save their cache before application compilation, and
@@ -246,7 +249,7 @@ solely to retry an upload.
 Release delivery always runs the local CUDA lane on the existing RTX 4050
 (`ferrum-cuda`, `cuda-sm89`). Windows native staging, device CI and WSL model
 execution share a queued physical-host concurrency group so they do not compete
-for Panda's RAM/GPU. CPU model regression follows the local CUDA job.
+for Panda's RAM/GPU. The small CPU compatibility smoke follows the local CUDA job.
 
 The default local representatives are pinned Qwen3.5-4B Q4_K_M GGUF,
 Qwen3.5-0.8B SafeTensors and Llama-3.2-1B-Instruct SafeTensors. Non-Quick-Start

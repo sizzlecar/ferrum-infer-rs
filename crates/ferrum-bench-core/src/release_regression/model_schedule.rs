@@ -34,6 +34,10 @@ const ALL_ENTRYPOINTS: &[Entrypoint] = &[
 ];
 const HTTP_ENTRYPOINTS: &[Entrypoint] = &[Entrypoint::ServeSync, Entrypoint::ServeStream];
 
+pub(super) fn is_basic_behavior(behavior: Behavior) -> bool {
+    capability(behavior).is_some_and(|(check, _, _)| check == ModelCheck::Basic)
+}
+
 fn capability(behavior: Behavior) -> Option<(ModelCheck, &'static str, &'static [Entrypoint])> {
     use Behavior::*;
     let (check, id) = match behavior {

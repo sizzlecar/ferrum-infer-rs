@@ -26,9 +26,12 @@ fn profile() -> ModelProfile {
 fn plan() -> Plan {
     let profile = profile();
     Plan {
+        release_cpu: Default::default(),
+        cpu_compatibility_not_run: vec![],
         release_cuda: None,
         release_metal: None,
         extended_not_run: vec![],
+        model_limitations_not_run: vec![],
         deferred_performance: None,
         stage: Stage::Release,
         impact: Impact {
