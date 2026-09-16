@@ -18,7 +18,7 @@ fn continuation(call: &Value, alias: bool) -> Value {
         let thought = object.remove("reasoning").unwrap();
         object.insert("reasoning_content".into(), thought);
     }
-    json!({"message": {"role": "assistant", "content": "**579**", "reasoning": null},
+    json!({"message": {"role": "assistant", "content": "{\"answer\":579}", "reasoning": null},
         "finish_reason": "stop", "usage": {
             "prompt_tokens": 40, "completion_tokens": 3, "total_tokens": 43},
         "tool_call_id": id, "replayed_assistant": assistant,
@@ -26,13 +26,37 @@ fn continuation(call: &Value, alias: bool) -> Value {
             "content": "{\"result\":579}"}})
 }
 
+fn named_continuation_request(first: &Value, completed: &Value) -> Value {
+    let mut replay = first.clone();
+    replay["messages"] = json!([
+        first["messages"][0],
+        completed["replayed_assistant"],
+        completed["tool_result_message"]
+    ]);
+    replay["tool_choice"] = json!("none");
+    replay["response_format"] = tool_continuation_response_format();
+    replay
+}
+
 fn evidence(alias: bool) -> Value {
     let sync = called("(123 + 456)", "sync-calculation");
     let stream = called("(456) + (123)", "stream-calculation");
-    json!({"sync_continuation": continuation(&sync, false),
+    let mut first = auto_tools_json_controls();
+    first.as_object_mut().unwrap().remove("response_format");
+    first["tool_choice"] = json!({"type": "function", "function": {"name": "calc"}});
+    first["messages"] = json!([{"role": "user", "content": "Call calc with expression 123 + 456, then return the resulting integer in the JSON answer field."}]);
+    first["max_tokens"] = json!(128);
+    let mut evidence = json!({"sync_continuation": continuation(&sync, false),
         "stream_continuation": continuation(&stream, alias),
         "sync_call": sync, "stream_call": stream, "tool_result": 579,
-        "reasoning_alias_replayed": alias})
+        "reasoning_alias_replayed": alias, "request": first});
+    for mode in ["sync", "stream"] {
+        evidence[format!("{mode}_continuation_request")] = named_continuation_request(
+            &evidence["request"],
+            &evidence[format!("{mode}_continuation")],
+        );
+    }
+    evidence
 }
 
 fn native_response(observation: &Value, id: &str) -> Value {
@@ -559,6 +583,10 @@ fn tool_call_preamble_is_preserved_in_actual_continuation_history() {
         verify_calc_call(&call, 128).unwrap();
         document[format!("{mode}_continuation")] = continuation(&call, false);
         document[format!("{mode}_call")] = call;
+        document[format!("{mode}_continuation_request")] = named_continuation_request(
+            &document["request"],
+            &document[format!("{mode}_continuation")],
+        );
     }
     verify_tool_case(&document, 128, false).unwrap();
     document["stream_continuation"]["replayed_assistant"]["content"] = Value::Null;
@@ -579,10 +607,10 @@ fn absent_tool_evidence_is_not_a_reasoning_alias_mismatch() {
 #[test]
 fn tool_case_replays_each_actual_call_and_only_moves_observed_reasoning_for_alias_mode() {
     verify_tool_case(&evidence(false), 128, false).unwrap();
-    let mut punctuation = evidence(false);
-    punctuation["sync_continuation"]["message"]["content"] = json!("579.");
-    punctuation["stream_continuation"]["message"]["content"] = json!("`579`");
-    verify_tool_case(&punctuation, 128, false).unwrap();
+    let mut whitespace = evidence(false);
+    whitespace["sync_continuation"]["message"]["content"] = json!("\n{ \"answer\" : 579 }\t");
+    whitespace["stream_continuation"]["message"]["content"] = json!("{\n\"answer\":579\n}");
+    verify_tool_case(&whitespace, 128, false).unwrap();
     verify_tool_case(&evidence(true), 128, true).unwrap();
     assert!(verify_tool_case(&evidence(false), 128, true).is_err());
     assert!(verify_tool_case(&evidence(true), 128, false).is_err());
@@ -606,6 +634,9 @@ fn tool_case_rejects_wrong_computation_history_identity_and_missing_entrypoint()
         "stream_call",
         "sync_continuation",
         "stream_continuation",
+        "request",
+        "sync_continuation_request",
+        "stream_continuation_request",
         "tool_result",
         "reasoning_alias_replayed",
     ] {
@@ -634,6 +665,12 @@ fn tool_case_rejects_wrong_computation_history_identity_and_missing_entrypoint()
             ("/message/content", json!(".579")),
             ("/message/content", json!("580")),
             ("/message/content", json!("579 and another answer")),
+            ("/message/content", json!("{\"answer\":580}")),
+            ("/message/content", json!("{\"answer\":579,\"extra\":0}")),
+            ("/message/content", json!("{\"answer\":579,\"answer\":579}")),
+            ("/message/content", json!("[579]")),
+            ("/message/content", json!("{\"answer\":579")),
+            ("/message/content", json!("{\"answer\":\"579\"}")),
             ("/finish_reason", json!("length")),
             ("/usage/completion_tokens", json!(0)),
             ("/usage/total_tokens", json!(44)),
@@ -655,4 +692,79 @@ fn tool_case_rejects_wrong_computation_history_identity_and_missing_entrypoint()
     let mut wrong_result = good;
     wrong_result["tool_result"] = json!(580);
     assert!(verify_tool_case(&wrong_result, 128, false).is_err());
+}
+
+#[test]
+fn named_tool_continuation_binds_schema_selection_budget_and_actual_request_history() {
+    let good = evidence(false);
+    for mode in ["sync", "stream"] {
+        for (pointer, value) in [
+            ("/tool_choice", json!("auto")),
+            ("/tool_choice", Value::Null),
+            ("/response_format", json!({"type": "json_object"})),
+            ("/response_format/json_schema/strict", json!(false)),
+            (
+                "/response_format/json_schema/schema/properties/answer/type",
+                json!("string"),
+            ),
+            ("/max_tokens", json!(127)),
+            ("/tools", json!([])),
+            ("/messages/0/content", json!("Invented user instruction")),
+            (
+                "/messages/1/tool_calls/0/function/arguments",
+                json!("{\"expression\":\"456+123\"}"),
+            ),
+            ("/messages/2/tool_call_id", json!("different-call")),
+            ("/messages/2/content", json!("{\"result\":580}")),
+        ] {
+            let mut wrong = good.clone();
+            *wrong[format!("{mode}_continuation_request")]
+                .pointer_mut(pointer)
+                .unwrap() = value;
+            assert!(
+                verify_tool_case(&wrong, 128, false).is_err(),
+                "{mode}{pointer}"
+            );
+        }
+    }
+    let mut reordered = good.clone();
+    // JSON object member order and whitespace are not protocol differences.
+    reordered["sync_continuation_request"]["response_format"] = serde_json::from_str(
+        r#"{
+        "json_schema": {"schema": {"additionalProperties": false, "required": ["answer"],
+            "properties": {"answer": {"type": "integer"}}, "type": "object"},
+            "strict": true, "name": "ArithmeticAnswer"}, "type": "json_schema"
+    }"#,
+    )
+    .unwrap();
+    verify_tool_case(&reordered, 128, false).unwrap();
+    let mut missing_result = good;
+    missing_result
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_result");
+    let error = verify_tool_case(&missing_result, 128, false).unwrap_err();
+    assert!(error.contains("missing"));
+    assert!(!error.contains("differs"));
+}
+
+#[test]
+fn tool_continuation_json_checks_independent_results_without_schema_constants() {
+    let format = tool_continuation_response_format();
+    assert_eq!(format, auto_tools_json_controls()["response_format"]);
+    assert_eq!(
+        format["json_schema"]["schema"]["properties"]["answer"],
+        json!({"type": "integer"})
+    );
+    for expression in ["0+0", "2+5", "123+456", "18446744073709551615+0"] {
+        let result = IntegerAddition::parse(expression)
+            .unwrap()
+            .result()
+            .unwrap();
+        let mut completed = continuation(&called("123+456", "actual-call"), false);
+        completed["message"]["content"] = json!(format!(" {{ \"answer\" : {result} }} \n"));
+        verify_tool_continuation_answer(&completed, result, 128).unwrap();
+        completed["message"]["content"] = json!(format!("{{\"answer\":{}}}", result ^ 1));
+        assert!(verify_tool_continuation_answer(&completed, result, 128).is_err());
+    }
 }

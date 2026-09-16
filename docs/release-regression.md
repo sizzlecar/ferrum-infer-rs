@@ -362,7 +362,13 @@ to `basic`; explicitly select the checks relevant to the release:
   actual assistant-history replay through both HTTP modes.
 - `stop`: termination behavior through both entrypoints, including stream text.
 - `structured`: server JSON/schema behavior and valid structured responses.
-- `tools`: server tool calls and a tool-result continuation.
+- `tools`: synchronous and streaming named tool calls with independently parsed
+  calculator arguments, followed by replay of each actual call and computed
+  result. Continuations request a strict JSON object containing an integer
+  `answer`; the schema does not supply the answer. Check the computed value,
+  history and call identities, natural termination and token usage, rather than
+  unconstrained prose formatting. Automatic tool selection remains a separate
+  opt-in probe.
 - `state`: `run` recalls a code, clears history, verifies its absence, and repeats
   with a different code in the same process. One server interleaves two independent
   conversations, continues each actual assistant history through both HTTP modes,
