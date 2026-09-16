@@ -24,6 +24,7 @@ fn input(impact: Impact) -> PlanInput {
         execution_path: "production-plan-runtime".into(),
     };
     PlanInput {
+        release_cpu: Default::default(),
         release_cuda: None,
         release_metal: None,
         release_profile_ids: Vec::new(),

@@ -30,6 +30,12 @@ binary and the actual installation and first-use paths.
   below determine which release profiles are enabled. An unavailable or missing
   enabled profile is a gap.
   PR and nightly sampling do not automatically repeat these release commitments.
+- `release_cpu` defaults to `full` when absent. The committed `compatibility`
+  mode requires per-format small-model loading and basic `run`/`serve`, plus any
+  explicit Quick Start commitment. Other CPU model-runtime obligations remain
+  visible in `cpu_compatibility_not_run`, not certified. Protocol contracts,
+  numerical/safety checks and installation remain required; PR/nightly planning
+  is unchanged. The publisher binds the policy and disclosure to this catalog.
 - `release_cuda` separates mandatory pinned local representatives from optional
   extended cloud profiles. Every CUDA profile belongs to exactly one lane.
   The committed `cloud: "disabled"` default can be changed to `required` only by
@@ -52,8 +58,9 @@ binary and the actual installation and first-use paths.
   all other missing bindings remain gaps. Neither declaration nor model
   availability means a check ran or passed.
 
-The current default commitments include pinned Qwen3.5 4B GGUF on CPU/CUDA/Metal
-and Qwen3.5 2B SafeTensors on CPU/Metal. Local Metal additionally requires pinned
+The current CPU compatibility commitments are pinned Qwen3.5 0.8B GGUF and
+SafeTensors. CUDA/Metal require pinned Qwen3.5 4B GGUF and 0.8B SafeTensors.
+Local Metal additionally requires pinned
 Llama 3.1 8B Q4_K_M GGUF. Its 9B, 27B, 30B attention-only MoE and 35B hybrid MoE
 profiles remain unexecuted extended coverage, not release passes. Local CUDA
 continues to require Qwen3.5 0.8B and Llama3.2 1B SafeTensors on the RTX 4050.

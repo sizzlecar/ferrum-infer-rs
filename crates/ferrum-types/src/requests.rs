@@ -200,8 +200,9 @@ pub struct ApiChatRequest {
     pub tools: Vec<ApiTool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ApiToolChoice>,
-    /// Wire protocol emitted by the model's chat template for automatic tool calls.
-    /// Forced/named calls may still use a hard argument grammar and the JSON fallback.
+    /// Wire protocol emitted by the model's chat template for tool calls.
+    /// Native protocols retain their complete envelope for forced/named calls;
+    /// `Json` preserves the legacy bare-argument fallback.
     #[serde(default)]
     pub tool_call_protocol: ApiToolCallProtocol,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -298,6 +299,8 @@ pub struct ApiToolChoiceFunction {
 pub enum ApiToolCallProtocol {
     #[default]
     Json,
+    /// A tools-aware template emits a named JSON call, not bare arguments.
+    NativeJson,
     FunctionParameterXml,
 }
 
@@ -309,7 +312,7 @@ impl ApiToolCallProtocol {
     /// masked.
     pub const fn generated_control_token_texts(self) -> &'static [&'static str] {
         match self {
-            Self::Json => &[],
+            Self::Json | Self::NativeJson => &[],
             Self::FunctionParameterXml => &["<tool_call>", "</tool_call>"],
         }
     }
@@ -317,7 +320,7 @@ impl ApiToolCallProtocol {
     /// Lexical envelope that may satisfy a pending response boundary.
     pub fn generated_response_envelope(self) -> Option<ResponseCompletionEnvelope> {
         match self {
-            Self::Json => None,
+            Self::Json | Self::NativeJson => None,
             Self::FunctionParameterXml => Some(ResponseCompletionEnvelope {
                 open_token_text: "<tool_call>".to_string(),
                 close_token_text: "</tool_call>".to_string(),
@@ -328,15 +331,17 @@ impl ApiToolCallProtocol {
 }
 
 impl ApiChatRequest {
-    /// A forced native XML call must retain its declared envelope and tool name.
+    /// A forced native call must retain its declared envelope and tool name.
     /// A bare argument-object grammar would mask the model's native wire format.
     pub fn requires_native_tool_call(&self) -> bool {
-        self.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml
-            && match self.tool_choice.as_ref() {
-                Some(ApiToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("required"),
-                Some(ApiToolChoice::Function { tool_type, .. }) => tool_type == "function",
-                None => false,
-            }
+        matches!(
+            self.tool_call_protocol,
+            ApiToolCallProtocol::NativeJson | ApiToolCallProtocol::FunctionParameterXml
+        ) && match self.tool_choice.as_ref() {
+            Some(ApiToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("required"),
+            Some(ApiToolChoice::Function { tool_type, .. }) => tool_type == "function",
+            None => false,
+        }
     }
 
     pub fn allows_tool_name(&self, name: &str) -> bool {
@@ -367,7 +372,7 @@ impl ApiChatRequest {
         if self.tools.is_empty() || api_tool_choice_is_none(self) {
             return &[];
         }
-        if self.automatic_tools_with_hard_response_format() {
+        if self.automatic_tools_with_hard_response_format() || self.requires_native_tool_call() {
             return &["<tool_call>", "</tool_call>"];
         }
         self.tool_call_protocol.generated_control_token_texts()
@@ -378,7 +383,7 @@ impl ApiChatRequest {
         if self.tools.is_empty() || api_tool_choice_is_none(self) {
             return None;
         }
-        if self.automatic_tools_with_hard_response_format() {
+        if self.automatic_tools_with_hard_response_format() || self.requires_native_tool_call() {
             return Some(ResponseCompletionEnvelope {
                 open_token_text: "<tool_call>".to_string(),
                 close_token_text: "</tool_call>".to_string(),
@@ -550,7 +555,10 @@ fn parse_classified_named_json_call(
     text: &str,
     chat_request: &ApiChatRequest,
 ) -> Option<Vec<ApiToolCall>> {
-    if chat_request.tool_call_protocol != ApiToolCallProtocol::Json {
+    if !matches!(
+        chat_request.tool_call_protocol,
+        ApiToolCallProtocol::Json | ApiToolCallProtocol::NativeJson
+    ) {
         return None;
     }
     // Consume the whole JSON value, without searching surrounding prose,
@@ -655,6 +663,15 @@ fn parse_tool_calls_from_generated_text(
         || chat_request.requires_native_tool_call()
     {
         return parse_explicit_tool_call_envelopes(text, chat_request)
+            .or_else(|| {
+                // Only a forced native JSON contract makes a complete named
+                // object unambiguously a call. Automatic hard final JSON still
+                // requires the sampler's branch classification.
+                chat_request
+                    .requires_native_tool_call()
+                    .then(|| parse_classified_named_json_call(text, chat_request))
+                    .flatten()
+            })
             .map(|calls| (String::new(), calls));
     }
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {

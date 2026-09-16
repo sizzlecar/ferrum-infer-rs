@@ -1,6 +1,6 @@
 //! Semantic checks for the runner's local integer-addition tool fixture.
 //! Model arguments are parsed as a narrow grammar, never evaluated as code.
-use super::model_tasks::{boundary_observation, probe_answer_matches};
+use super::model_tasks::boundary_observation;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -161,17 +161,7 @@ fn verify_continuation(
     max_tokens: u32,
     alias: bool,
 ) -> Result<(), String> {
-    verify_usage(continuation, max_tokens)?;
-    let (content, _, _) = boundary_observation(continuation)?;
-    if continuation["finish_reason"] != "stop"
-        || !continuation["message"]["function_call"].is_null()
-        || !probe_answer_matches(content, &validated.result.to_string())
-    {
-        return Err(
-            "tool continuation must naturally finish with the computed answer and no new tool call"
-                .into(),
-        );
-    }
+    verify_tool_continuation_answer(continuation, validated.result, max_tokens)?;
     if continuation["tool_call_id"] != validated.call["id"] {
         return Err("tool continuation did not replay its actual call identity".into());
     }
@@ -217,11 +207,52 @@ fn verify_continuation(
     Ok(())
 }
 
+fn verify_named_continuation_request(
+    first: &Value,
+    replay: &Value,
+    continuation: &Value,
+    max_tokens: u32,
+) -> Result<(), String> {
+    if !first.is_object() || !replay.is_object() {
+        return Err("missing actual named-tool request or continuation request".into());
+    }
+    let original = first["messages"]
+        .as_array()
+        .filter(|messages| {
+            messages.len() == 1
+                && messages[0]["role"] == "user"
+                && messages[0]["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
+        .ok_or("named-tool request must retain its original user message")?;
+    if first["tool_choice"] != serde_json::json!({"type": "function", "function": {"name": "calc"}})
+        || first["max_tokens"].as_u64() != Some(u64::from(max_tokens))
+    {
+        return Err("named-tool request has wrong selection or token budget".into());
+    }
+    let mut expected = first.clone();
+    expected["messages"] = serde_json::json!([
+        original[0],
+        continuation["replayed_assistant"],
+        continuation["tool_result_message"]
+    ]);
+    expected["tool_choice"] = serde_json::json!("none");
+    expected["response_format"] = tool_continuation_response_format();
+    if *replay != expected {
+        return Err("named-tool continuation changed its original controls/history or omitted the strict final schema and tool_choice none".into());
+    }
+    Ok(())
+}
+
 pub fn verify_tool_case(
     evidence: &Value,
     max_tokens: u32,
     reasoning_alias_replay: bool,
 ) -> Result<(), String> {
+    if !evidence.is_object() {
+        return Err("missing tool evidence".into());
+    }
     if evidence["reasoning_alias_replayed"].as_bool() != Some(reasoning_alias_replay) {
         return Err("tool evidence does not match the requested reasoning alias mode".into());
     }
@@ -229,7 +260,10 @@ pub fn verify_tool_case(
         let called = &evidence[format!("{mode}_call")];
         let validated =
             verify_calc_call(called, max_tokens).map_err(|e| format!("{mode}_call: {e}"))?;
-        if evidence["tool_result"].as_u64() != Some(validated.result) {
+        let result = evidence["tool_result"]
+            .as_u64()
+            .ok_or("missing or invalid recorded tool result")?;
+        if result != validated.result {
             return Err("recorded tool result differs from the parsed calculation".into());
         }
         verify_continuation(
@@ -240,11 +274,28 @@ pub fn verify_tool_case(
             reasoning_alias_replay && mode == "stream",
         )
         .map_err(|e| format!("{mode}_continuation: {e}"))?;
+        verify_named_continuation_request(
+            &evidence["request"],
+            &evidence[format!("{mode}_continuation_request")],
+            &evidence[format!("{mode}_continuation")],
+            max_tokens,
+        )
+        .map_err(|e| format!("{mode}_continuation_request: {e}"))?;
     }
     Ok(())
 }
 
 pub const AUTO_TOOLS_JSON_PROMPT: &str = "Use the calc tool to evaluate 123+456. After receiving its result, return only a JSON object with that integer result in the answer field.";
+
+/// Shape-only final-answer contract shared by named and automatic tool probes.
+/// The expected result is computed independently, never embedded as a schema constant.
+pub fn tool_continuation_response_format() -> Value {
+    serde_json::json!({"type": "json_schema", "json_schema": {
+        "name": "ArithmeticAnswer", "strict": true,
+        "schema": {"type": "object", "properties": {"answer": {"type": "integer"}},
+            "required": ["answer"], "additionalProperties": false}
+    }})
+}
 
 /// Public wire controls for the optional real-model automatic-tool probe.
 pub fn auto_tools_json_controls() -> Value {
@@ -255,11 +306,7 @@ pub fn auto_tools_json_controls() -> Value {
                 "required": ["expression"], "additionalProperties": false}
         }}],
         "tool_choice": "auto",
-        "response_format": {"type": "json_schema", "json_schema": {
-            "name": "ArithmeticAnswer", "strict": true,
-            "schema": {"type": "object", "properties": {"answer": {"type": "integer"}},
-                "required": ["answer"], "additionalProperties": false}
-        }}
+        "response_format": tool_continuation_response_format()
     })
 }
 
@@ -376,10 +423,16 @@ fn verify_chat_auto_json(evidence: &Value, max_tokens: u32, stream: bool) -> Res
             "{mode}: tool result differs from the parsed calculation"
         ));
     }
-    verify_auto_json_final(&evidence["continuation"], calculated.result, max_tokens)
+    verify_tool_continuation_answer(&evidence["continuation"], calculated.result, max_tokens)
 }
 
-fn verify_auto_json_final(completed: &Value, result: u64, max_tokens: u32) -> Result<(), String> {
+/// Verify a naturally completed JSON answer against the independent calculation.
+/// This accepts JSON whitespace, but not extra/duplicate fields or answer substrings.
+pub fn verify_tool_continuation_answer(
+    completed: &Value,
+    result: u64,
+    max_tokens: u32,
+) -> Result<(), String> {
     if completed["finish_reason"] == "tool_calls" {
         return Err("final: returned another tool call after the supplied result; the two-round final-answer task did not complete".into());
     }
@@ -601,7 +654,7 @@ fn verify_responses_auto_json(
     let completed = &evidence["continuation"];
     verify_responses_observation(&evidence["continuation_response"], completed)
         .map_err(|error| format!("final: {error}"))?;
-    verify_auto_json_final(completed, calculation.result, max_tokens)?;
+    verify_tool_continuation_answer(completed, calculation.result, max_tokens)?;
     Ok(())
 }
 

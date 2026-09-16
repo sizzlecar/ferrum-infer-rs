@@ -21,6 +21,11 @@ on:
         description: 'Also compile CUDA kernels to PTX (~40min)'
         type: boolean
         default: false
+      cuda_model_probe:
+        description: 'Optional real CUDA model diagnosis; not a formal release gate'
+        type: choice
+        default: none
+        options: [none, llama32-1b]
 
 defaults:
   run:
@@ -79,6 +84,7 @@ jobs:
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
+          CUDA_MODEL_PROBE: ${{ inputs.cuda_model_probe || 'none' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           RELEASE_CANDIDATE: ${{ inputs.candidate_sha }}
           GH_TOKEN: ${{ github.token }}
@@ -89,6 +95,9 @@ jobs:
           if [ -n "$RELEASE_CANDIDATE" ]; then
             "$RUNNER_TEMP/policy" release-plan >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = workflow_dispatch ]; then
+            case "$CUDA_MODEL_PROBE" in none|llama32-1b) ;; *) echo 'Invalid CUDA model probe' >&2; exit 1;; esac
+            # Explicit dispatch always selects fresh GPU checks, even for a
+            # docs-only ref; do not let scope/reuse omit the requested CUDA job.
             "$RUNNER_TEMP/policy" full-plan >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = pull_request ]; then
             test -n "$BASE_SHA"
@@ -417,8 +426,8 @@ jobs:
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --locked -p ferrum-kernels --features cuda
 
-  # Small real-device numerical checks; no model download. Keep the hosted
-  # workspace jobs above: this lane proves only the operations invoked below.
+  # Normally small real-device checks without models. An explicit dispatch can
+  # additionally diagnose one pinned CUDA model; neither replaces release gates.
   gpu:
     name: GPU runtime (${{ matrix.backend }})
     needs: prepare
@@ -432,7 +441,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Metal also runs the full feature suite on a fresh self-hosted worker.
     # Include cold checkout/toolchain/dependency setup in its bounded budget.
-    timeout-minutes: ${{ matrix.backend == 'metal' && 120 || 30 }}
+    # Only the opt-in CUDA probe includes a fresh release build and model run.
+    timeout-minutes: ${{ matrix.backend == 'metal' && 120 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b') && 90 || 30 }}
     concurrency:
       # Panda's Windows/WSL jobs share hardware; independent Metal workers do not.
       group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-ci-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -623,6 +633,58 @@ jobs:
           name: backend-numerics-${{ matrix.backend }}
           if-no-files-found: error
           path: ${{ runner.temp }}/backend-numerics/
+          retention-days: 14
+
+      - name: Build this candidate for the optional CUDA model diagnosis
+        if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
+        timeout-minutes: 60
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          set -o pipefail
+          probe="$RUNNER_TEMP/cuda-model-probe"
+          mkdir -p "$probe"
+          candidate=$(git rev-parse HEAD)
+          test "$candidate" = "$GITHUB_SHA"
+          test -f "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
+          jq --arg candidate "$candidate" \
+            '. + {candidate_sha:$candidate,scope:"diagnostic_only_not_release_gate"}' \
+            "$RUNNER_TEMP/backend-numerics/ci-origin.json" > "$probe/source.json"
+          # Cargo rebuilds changed product and harness sources from this same
+          # checkout; no prior release binary or rewritten ABI is accepted.
+          cargo build --release --locked -p ferrum-cli -p ferrum-devtools \
+            --bin ferrum --bin model_regression \
+            --target-dir "$GITHUB_WORKSPACE/target" \
+            --features ferrum-cli/cuda,ferrum-cli/vllm-moe-marlin,ferrum-cli/vllm-paged-attn-v2 \
+            2>&1 | tee "$probe/build.log"
+          sha256sum target/release/ferrum target/release/model_regression > "$probe/binaries.sha256"
+
+      - name: Diagnose the pinned Llama 1B CUDA contracts
+        if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          probe="$RUNNER_TEMP/cuda-model-probe"
+          sha256sum --check --strict "$probe/binaries.sha256"
+          # Rust checks the actual CUDA backend and pinned source identity and
+          # records every case. Without a prepared task this is diagnostic
+          # evidence only, never a substitute for the full formal model gate.
+          target/release/model_regression \
+            --ferrum-bin "$GITHUB_WORKSPACE/target/release/ferrum" \
+            --model unsloth/Llama-3.2-1B-Instruct@5a8abab4a5d6f164389b1079fb721cfab8d7126c \
+            --backend cuda --profile-id release-llama32-1b-safetensors-cuda \
+            --checks basic,stop,structured,tools,length,state \
+            --context-tokens 2048 --max-num-seqs 1 --runtime-memory-budget-bytes 4294967296 \
+            --max-tokens 512 --run-timeout-secs 1500 --request-timeout-secs 300 \
+            --report-dir "$probe/report" 2>&1 | tee "$probe/runner.log"
+
+      - name: Save optional CUDA model diagnosis and raw logs
+        if: always() && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-model-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cuda-model-probe/
+          if-no-files-found: error
           retention-days: 14
 
   windows:

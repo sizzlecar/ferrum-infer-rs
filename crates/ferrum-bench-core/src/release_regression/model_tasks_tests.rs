@@ -72,6 +72,18 @@ fn model_report_rechecks_state_histories_reset_and_isolation() {
     let mut stale = ReportFixture::passed(&expected);
     stale.case_mut("run-state")["evidence"]["records"][6]["history_epoch"] = json!(0);
     assert!(verify_model_report(&expected, &stale.value).is_err());
+    for changed in ["Cobalt-731", "Cob"] {
+        let mut run = ReportFixture::passed(&expected);
+        run.case_mut("run-state")["evidence"]["records"][3]["content"] = json!(changed);
+        assert!(verify_model_report(&expected, &run.value).is_err());
+
+        for round in 0..2 {
+            let mut serve = ReportFixture::passed(&expected);
+            serve.case_mut("serve-state")["evidence"]["state"]["recall_rounds"][round][0]
+                ["observation"]["message"]["content"] = json!(changed);
+            assert!(verify_model_report(&expected, &serve.value).is_err());
+        }
+    }
 }
 
 /// Small runner-result fixtures exercise the shared semantic verifier through
@@ -174,7 +186,17 @@ impl ReportFixture {
                             "output": output, "sync": output, "stream": output})
                     }
                     "serve-tools" => {
-                        let mut evidence = json!({"reasoning_alias_replayed": expected.reasoning_alias_replay, "tool_result": 579});
+                        let mut request = super::super::model_tool::auto_tools_json_controls();
+                        request.as_object_mut().unwrap().remove("response_format");
+                        request["model"] = json!(expected.profile.model);
+                        request["messages"] = json!([{"role": "user", "content": "Call calc with expression 123 + 456, then return the resulting integer in the JSON answer field."}]);
+                        request["tool_choice"] =
+                            json!({"type": "function", "function": {"name": "calc"}});
+                        request["max_tokens"] = json!(expected.max_tokens);
+                        request["temperature"] = json!(0);
+                        request["seed"] = json!(7);
+                        let mut evidence = json!({"reasoning_alias_replayed": expected.reasoning_alias_replay,
+                            "tool_result": 579, "request": request});
                         for (mode, id) in [("sync", "sync-call"), ("stream", "stream-call")] {
                             let message = json!({"role": "assistant", "content": null,
                                 "reasoning": expected.reasoning_alias_replay.then_some("Use calc to add the two numbers."),
@@ -193,11 +215,22 @@ impl ReportFixture {
                                 "finish_reason": "tool_calls", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
                             });
                             evidence[format!("{mode}_continuation")] = json!({
-                                "message": {"role": "assistant", "content": "579", "reasoning": null},
+                                "message": {"role": "assistant", "content": "{\"answer\":579}", "reasoning": null},
                                 "finish_reason": "stop", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
                                 "tool_call_id": id, "replayed_assistant": replayed_assistant,
                                 "tool_result_message": {"role": "tool", "tool_call_id": id, "content": "{\"result\":579}"}
                             });
+                            let completed = &evidence[format!("{mode}_continuation")];
+                            let mut replay = evidence["request"].clone();
+                            replay["messages"] = json!([
+                                evidence["request"]["messages"][0],
+                                completed["replayed_assistant"],
+                                completed["tool_result_message"]
+                            ]);
+                            replay["tool_choice"] = json!("none");
+                            replay["response_format"] =
+                                super::super::model_tool::tool_continuation_response_format();
+                            evidence[format!("{mode}_continuation_request")] = replay;
                         }
                         evidence
                     }
@@ -851,6 +884,18 @@ fn tools_require_both_named_calls_and_their_actual_continuations() {
         fixture.case_mut("serve-tools")["evidence"][name]["finish_reason"] = json!("length");
         rejected(&expected, &fixture, name);
     }
+    for name in [
+        "request",
+        "sync_continuation_request",
+        "stream_continuation_request",
+    ] {
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut("serve-tools")["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        rejected(&expected, &fixture, "continuation_request");
+    }
     for mode in ["sync", "stream"] {
         for (field, wrong) in [("id", json!("")), ("type", json!("unknown"))] {
             let mut fixture = ReportFixture::passed(&expected);
@@ -886,10 +931,12 @@ fn tool_report_cannot_substitute_expression_result_or_actual_replay_messages() {
         evidence[format!("{mode}_call")]["message"]["tool_calls"][0]["function"]["arguments"] =
             wrong_arguments.clone();
         evidence[format!("{mode}_continuation")]["replayed_assistant"]["tool_calls"][0]
+            ["function"]["arguments"] = wrong_arguments.clone();
+        evidence[format!("{mode}_continuation_request")]["messages"][1]["tool_calls"][0]
             ["function"]["arguments"] = wrong_arguments;
         assert!(verify_model_report(&expected, &invalid.value).is_err());
         for (pointer, wrong) in [
-            ("/message/content", json!("580")),
+            ("/message/content", json!("{\"answer\":580}")),
             ("/tool_call_id", json!("another-call")),
             ("/replayed_assistant/tool_calls/0/id", json!("another-call")),
             ("/tool_result_message/tool_call_id", json!("another-call")),
