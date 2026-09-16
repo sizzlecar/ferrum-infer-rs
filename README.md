@@ -13,6 +13,131 @@ A Rust-native LLM serving engine. One binary, no Python runtime.
 
 [中文说明](README_zh.md)
 
+## See it in action
+
+One local model. Three Orchestral terminals inspecting code, fixing bugs, and
+running tests concurrently.
+
+[![Watch the Ferrum + Orchestral demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.png)](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
+
+[Watch the English demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 seconds · 8× speed.
+
+<details>
+<summary><strong>Try it locally</strong></summary>
+
+Install Ferrum and Orchestral on macOS Apple Silicon or Linux x86_64:
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+```
+
+On Windows x64, use PowerShell:
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+irm https://orch.pandaailabs.com/install.ps1 | iex
+```
+
+After installation, open a new terminal and start the model:
+
+```sh
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF
+```
+
+Ferrum automatically selects an available backend, resolves the GGUF file, and
+downloads any missing weights and metadata. Later starts reuse the cache. With
+the default configuration, the API listens at `http://127.0.0.1:8000/v1`.
+
+Leave Ferrum running. In another terminal, open your project directory and run:
+
+```sh
+orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
+```
+
+Once the model is ready, type a task and press Enter. No JSON configuration or API
+key is required. Memory requirements and speed depend on your hardware; these
+defaults are for trying the model, not reproducing the recording's concurrency
+and performance settings.
+
+</details>
+
+<details>
+<summary><strong>Advanced: reproduce the recording configuration</strong></summary>
+
+The recording uses an **M1 Max Mac with 32 GB unified memory**, Metal, and
+**Qwen3.5-9B Q4_K_M**. The commands below reproduce its serving settings:
+24,576 tokens per context, three active sequences, a 20 GiB runtime memory budget,
+and the model's default thinking behavior. These optional settings are not
+required to try Ferrum. Use **Ferrum 0.10.0** and **Orchestral 0.3.1**.
+
+Install both programs once, then open four terminal panes:
+
+```sh
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0 --backend metal
+curl -fsSL https://orch.pandaailabs.com/install.sh | sh -s -- --version 0.3.1
+export PATH="$HOME/.local/bin:$PATH"
+ferrum --version
+orchestral --version
+```
+
+**Terminal 1 — upper left: start Ferrum.** The first start downloads the selected
+GGUF and its model/tokenizer metadata from Hugging Face; subsequent starts reuse
+the cache. The repository revision and filename select the weights used in the video.
+
+```sh
+ferrum serve \
+  --model unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5 \
+  --gguf-file Qwen3.5-9B-Q4_K_M.gguf \
+  --served-model-name Qwen3.5-9B \
+  --backend metal \
+  --numerical-profile qwen3_5.f32-master \
+  --host 127.0.0.1 --port 8001 \
+  --max-model-len 24576 \
+  --max-num-seqs 3 \
+  --max-num-batched-tokens 3072 \
+  --scheduler-prefill-step-chunk 1024 \
+  --scheduler-active-decode-prefill-chunk 256 \
+  --enable-prefix-cache \
+  --runtime-memory-budget-bytes 21474836480 \
+  --prefix-rendezvous-max-wait-ms 180000
+```
+
+Leave Ferrum running. In another terminal, check that it is ready before starting
+the agents. This discovers the served model without generating a response:
+
+```sh
+orchestral --base-url http://127.0.0.1:8001/v1 --no-auth doctor --check-connection
+```
+
+**Terminal 2 — upper right:** replace the path with your first project directory.
+
+```sh
+cd /path/to/project-a
+orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
+```
+
+**Terminal 3 — lower left:** open your second project.
+
+```sh
+cd /path/to/project-b
+orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
+```
+
+**Terminal 4 — lower right:** open your third project.
+
+```sh
+cd /path/to/project-c
+orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
+```
+
+Type a task in each Orchestral terminal and press Enter. Each session uses the
+same Ferrum server. The video uses three separate Rust projects with Cargo
+installed, and asks each agent to fix failing tests, preserve the public API,
+run `cargo test`, and explain the fix in English.
+
+</details>
+
 ## Vision
 
 Make high-performance LLM serving simple to deploy and operate.
