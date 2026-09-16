@@ -25,7 +25,10 @@ use std::time::Duration;
 use ferrum_bench_core::release_regression::model_basic::{
     verify_basic_run, verify_basic_serve, ARITHMETIC_PROMPT, MEMORY_PROMPT, RECALL_PROMPT,
 };
-use ferrum_bench_core::release_regression::model_tool::{verify_tool_case, ValidatedCalcCall};
+use ferrum_bench_core::release_regression::model_tool::{
+    tool_continuation_response_format, verify_tool_case, verify_tool_continuation_answer,
+    ValidatedCalcCall,
+};
 
 fn observation(chat: &Chat) -> Value {
     json!({"message": chat.message, "finish_reason": chat.finish, "usage": chat.usage})
@@ -322,7 +325,7 @@ async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Resul
     // This named-tool protocol probe supplies the requested expression, not
     // its result. The model must still generate the call and consume the
     // independently calculated result; it is not an open-ended planning test.
-    let user = json!({"role": "user", "content": "Call calc with the expression field set to \"123 + 456\". After receiving its result, reply with only the resulting number."});
+    let user = json!({"role": "user", "content": "Call calc with the expression field set to \"123 + 456\". After receiving its result, return a JSON object with that integer result in the answer field."});
     let declarations = json!([
         {"type": "function", "function": {
             "name": "calc", "description": "Add two unsigned decimal integers. The expression must contain exactly one plus sign between the two operands; whitespace and balanced parentheses are allowed.",
@@ -343,6 +346,9 @@ async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Resul
     evidence["sync_call"] = observation(&sync_called);
     let sync_call = protocol::calc_call(&sync_called, server.args.max_tokens)
         .context("sync named tool handoff")?;
+    // Preserve the independently computed result even if a later call or
+    // continuation fails. Missing evidence must not masquerade as wrong math.
+    evidence["tool_result"] = json!(sync_call.result);
     let stream_called = chat(server, "tools-call-stream", body, true).await?;
     evidence["stream_call"] = observation(&stream_called);
     let stream_call = protocol::calc_call(&stream_called, server.args.max_tokens)
@@ -356,6 +362,9 @@ async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Resul
         );
         body["tools"] = declarations.clone();
         body["tool_choice"] = json!("none");
+        // Test the returned value and protocol, not the model's prose style.
+        // The schema constrains only its type; it never supplies the answer.
+        body["response_format"] = tool_continuation_response_format();
         body
     };
     let sync_body = continuation(&sync_called, &sync_call);
@@ -363,8 +372,13 @@ async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Resul
     let canonical = chat(server, "tools-final-sync", sync_body.clone(), false).await?;
     evidence["sync_continuation"] = json!({"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage,
         "tool_call_id": sync_call.call["id"], "replayed_assistant": sync_body["messages"][1], "tool_result_message": sync_body["messages"][2]});
-    finished_answer(&canonical, &sync_call.result.to_string())
-        .context("canonical tool-result replay")?;
+    verify_tool_continuation_answer(
+        &observation(&canonical),
+        sync_call.result,
+        server.args.max_tokens,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("canonical tool-result replay")?;
     let mut final_body = continuation(&stream_called, &stream_call);
     if server.args.reasoning_alias_replay {
         let assistant = final_body["messages"][1]
@@ -380,9 +394,13 @@ async fn tools_with_evidence(server: &Server<'_>, evidence: &mut Value) -> Resul
     let streamed = chat(server, "tools-final-stream", final_body.clone(), true).await?;
     evidence["stream_continuation"] = json!({"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage,
         "tool_call_id": stream_call.call["id"], "replayed_assistant": final_body["messages"][1], "tool_result_message": final_body["messages"][2]});
-    finished_answer(&streamed, &stream_call.result.to_string())
-        .context("streamed tool-result replay")?;
-    evidence["tool_result"] = json!(sync_call.result);
+    verify_tool_continuation_answer(
+        &observation(&streamed),
+        stream_call.result,
+        server.args.max_tokens,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("streamed tool-result replay")?;
     verify_tool_case(
         evidence,
         server.args.max_tokens,
