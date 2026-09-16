@@ -689,3 +689,29 @@ Check the advertised Homebrew formulas and crates.io installation command as wel
 as direct downloads: installed `--version`, `--help` and `doctor` must work with
 their stated dependencies. Preserve the mandatory model-runtime evidence for
 each backend, and disclose any installation or runtime check still incomplete.
+
+### Recover public installation verification without republishing
+
+When a formal version is already public, use the existing delivery workflow's
+`verify_published_version` input to rerun only its public installation checks:
+
+```sh
+gh workflow run release-delivery.yml --ref main \
+  -f verify_published_version=0.10.0 -f run_cloud_cuda=false
+```
+
+This mode requires a published, non-prerelease version, checks out its exact tag,
+and verifies the CLI package version before scheduling installation. It does not
+stage product packages, rerun GPU/model regression, publish crates, or change
+release assets or tags. Installation helpers and the Cargo installation still
+compile as needed. Cloud execution and cloud evidence reuse are rejected in this
+mode. A newer public default installer or tap can make verification of an older
+version fail; this mode does not silently accept a different installed version.
+
+Both normal delivery and verification-only delivery explicitly handle skipped
+ancestors in their installation job conditions. An optional cloud job being
+skipped must not suppress public installation checks after successful publication.
+Completion requires preparation and every Cargo, Homebrew, Unix bootstrap and
+Windows bootstrap job to succeed; skipped, failed or cancelled installation is
+not success. Report publication and installation acceptance separately, preserving
+the original failed run rather than rebuilding or republishing an existing version.

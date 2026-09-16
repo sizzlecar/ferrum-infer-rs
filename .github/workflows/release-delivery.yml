@@ -6,6 +6,11 @@ on:
     paths: [Cargo.toml]
   workflow_dispatch:
     inputs:
+      verify_published_version:
+        description: "Only verify public installations of an existing formal version (for example 0.10.0); no staging, publication or GPU regression"
+        required: false
+        default: ''
+        type: string
       run_cloud_cuda:
         description: "Opt in to rented CUDA hardware for extended large-model regression (local CUDA remains required)"
         required: false
@@ -45,14 +50,17 @@ jobs:
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
       baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
       cloud_cuda: ${{ steps.plan.outputs.cloud_cuda }}
+      verify_only: ${{ steps.plan.outputs.verify_only }}
+      source_ref: ${{ steps.plan.outputs.source_ref }}
       windows_launcher_url: ${{ steps.launcher.outputs.url }}
       windows_launcher_sha256: ${{ steps.launcher.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.verify_published_version != '' && format('refs/tags/v{0}', inputs.verify_published_version) || github.sha }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          token: ${{ inputs.verify_published_version != '' && github.token || secrets.RELEASE_GITHUB_TOKEN }}
+          persist-credentials: ${{ inputs.verify_published_version == '' }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,8 +71,27 @@ jobs:
           EVENT: ${{ github.event_name }}
           RUN_CLOUD_CUDA: ${{ github.event_name == 'workflow_dispatch' && inputs.run_cloud_cuda }}
           REUSE_CUDA_RUN_ID: ${{ inputs.reuse_cuda_run_id }}
-          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          VERIFY_PUBLISHED_VERSION: ${{ inputs.verify_published_version }}
+          GH_TOKEN: ${{ inputs.verify_published_version != '' && github.token || secrets.RELEASE_GITHUB_TOKEN }}
         run: |
+          if [ -n "$VERIFY_PUBLISHED_VERSION" ]; then
+            test "$EVENT" = workflow_dispatch
+            [[ "$VERIFY_PUBLISHED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            test "$RUN_CLOUD_CUDA" != true
+            test -z "$REUSE_CUDA_RUN_ID"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERIFY_PUBLISHED_VERSION" > "$RUNNER_TEMP/public-release.json"
+            jq -e --arg tag "v$VERIFY_PUBLISHED_VERSION" \
+              '.tag_name == $tag and .draft == false and .prerelease == false and (.published_at | type == "string" and length > 0)' \
+              "$RUNNER_TEMP/public-release.json"
+            source_ref=$(git rev-parse HEAD)
+            test "$source_ref" = "$(git rev-parse "refs/tags/v$VERIFY_PUBLISHED_VERSION^{commit}")"
+            version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
+            test "$version" = "$VERIFY_PUBLISHED_VERSION"
+            printf 'active=false\nverify_only=true\nversion=%s\nsource_ref=%s\ncloud_cuda=false\n' "$version" "$source_ref" >> "$GITHUB_OUTPUT"
+            printf 'Verifying public installations of Ferrum %s at %s; no staging, publication, or GPU regression.\n' "$version" "$source_ref" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'verify_only=false\nsource_ref=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if [ "$RUN_CLOUD_CUDA" != true ] && [ -n "$REUSE_CUDA_RUN_ID" ]; then
             echo '::error::reuse_cuda_run_id requires explicit run_cloud_cuda=true'
             exit 1
@@ -168,7 +195,7 @@ jobs:
             printf 'url=%s\nsha256=%s\n' "$expected" "$sha" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.plan.outputs.verify_only != 'true'
         with:
           name: release-plan
           overwrite: true
@@ -177,6 +204,13 @@ jobs:
             ${{ runner.temp }}/release-plan.md
             ${{ runner.temp }}/release-notes.md
             ${{ runner.temp }}/release-performance.json
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.verify_only == 'true'
+        with:
+          name: public-release-verification-source
+          path: ${{ runner.temp }}/public-release.json
+          if-no-files-found: error
           retention-days: 30
 
   tools:
@@ -908,11 +942,17 @@ jobs:
 
   install-cargo:
     needs: [prepare, publish]
+    # Explicit status handling is required when an optional ancestor is skipped.
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.active == 'true' && needs.prepare.outputs.verify_only == 'false' && needs.publish.result == 'success') ||
+       (needs.prepare.outputs.active == 'false' && needs.prepare.outputs.verify_only == 'true' && needs.publish.result == 'skipped'))
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
@@ -937,6 +977,10 @@ jobs:
 
   install-homebrew:
     needs: [prepare, publish]
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.active == 'true' && needs.prepare.outputs.verify_only == 'false' && needs.publish.result == 'success') ||
+       (needs.prepare.outputs.active == 'false' && needs.prepare.outputs.verify_only == 'true' && needs.publish.result == 'skipped'))
     strategy:
       fail-fast: false
       matrix:
@@ -958,6 +1002,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - name: Install or upgrade from the public tap and execute it
@@ -990,6 +1035,10 @@ jobs:
 
   install-bootstrap-unix:
     needs: [prepare, publish]
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.active == 'true' && needs.prepare.outputs.verify_only == 'false' && needs.publish.result == 'success') ||
+       (needs.prepare.outputs.active == 'false' && needs.prepare.outputs.verify_only == 'true' && needs.publish.result == 'skipped'))
     strategy:
       fail-fast: false
       matrix:
@@ -1006,6 +1055,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
@@ -1053,6 +1103,10 @@ jobs:
 
   install-bootstrap-windows:
     needs: [prepare, publish]
+    if: >-
+      always() && !cancelled() && needs.prepare.result == 'success' &&
+      ((needs.prepare.outputs.active == 'true' && needs.prepare.outputs.verify_only == 'false' && needs.publish.result == 'success') ||
+       (needs.prepare.outputs.active == 'false' && needs.prepare.outputs.verify_only == 'true' && needs.publish.result == 'skipped'))
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -1061,6 +1115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
@@ -1117,21 +1172,33 @@ jobs:
 
   complete:
     needs: [prepare, publish, install-cargo, install-homebrew, install-bootstrap-unix, install-bootstrap-windows]
-    if: always() && needs.prepare.outputs.active == 'true'
+    if: always() && !cancelled() && (needs.prepare.outputs.active == 'true' || needs.prepare.outputs.verify_only == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require publication and actual public installations
         env:
+          VERIFY_ONLY: ${{ needs.prepare.outputs.verify_only }}
+          ACTIVE: ${{ needs.prepare.outputs.active }}
+          PREPARE: ${{ needs.prepare.result }}
+          VERSION: ${{ needs.prepare.outputs.version }}
           PUBLISH: ${{ needs.publish.result }}
           CARGO_INSTALL: ${{ needs.install-cargo.result }}
           BREW_INSTALL: ${{ needs.install-homebrew.result }}
           UNIX_BOOTSTRAP: ${{ needs.install-bootstrap-unix.result }}
           WINDOWS_BOOTSTRAP: ${{ needs.install-bootstrap-windows.result }}
         run: |
-          test "$PUBLISH" = success
+          test "$PREPARE" = success
+          if [ "$VERIFY_ONLY" = true ]; then
+            test "$ACTIVE" = false
+            test "$PUBLISH" = skipped
+          else
+            test "$VERIFY_ONLY" = false
+            test "$ACTIVE" = true
+            test "$PUBLISH" = success
+          fi
           test "$CARGO_INSTALL" = success
           test "$BREW_INSTALL" = success
           test "$UNIX_BOOTSTRAP" = success
           test "$WINDOWS_BOOTSTRAP" = success
-          echo 'Formal release delivered; Cargo, Homebrew and the public Windows/Linux/macOS installer entrypoints passed installation/startup checks.' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Ferrum %s: Cargo, Homebrew and public Windows/Linux/macOS installer entrypoints passed their required installation/startup checks (verification-only=%s).\n' "$VERSION" "$VERIFY_ONLY" >> "$GITHUB_STEP_SUMMARY"
