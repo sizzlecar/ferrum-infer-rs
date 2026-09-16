@@ -715,3 +715,9 @@ Completion requires preparation and every Cargo, Homebrew, Unix bootstrap and
 Windows bootstrap job to succeed; skipped, failed or cancelled installation is
 not success. Report publication and installation acceptance separately, preserving
 the original failed run rather than rebuilding or republishing an existing version.
+
+The hosted Windows verifier disables Git's automatic CRLF conversion before
+checkout so that installer identity is compared with committed bytes. It does not
+normalize the downloaded response or relax checksum comparison. Homebrew disables
+implicit auto-update for the installation step while retaining one explicit update
+before installation, preventing duplicate update attempts in the same job.

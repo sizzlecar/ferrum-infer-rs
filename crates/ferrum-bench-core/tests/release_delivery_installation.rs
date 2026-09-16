@@ -439,3 +439,119 @@ fn complete_requires_the_correct_publication_mode_and_every_public_installation(
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn windows_public_script_checkout_preserves_committed_bytes_after_crlf_conversion() {
+    use std::{fs, process::Command};
+
+    let workflow = workflow();
+    let job = &workflow["jobs"]["install-bootstrap-windows"];
+    let steps = job["steps"].as_sequence().unwrap();
+    let canonical = steps
+        .iter()
+        .position(|step| step["id"].as_str() == Some("canonical-source-bytes"))
+        .expect("Windows entrypoint comparison needs canonical checkout bytes");
+    let checkout = steps
+        .iter()
+        .position(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("actions/checkout@"))
+        })
+        .unwrap();
+    assert!(
+        canonical < checkout,
+        "Git configuration must precede checkout"
+    );
+    let step = &steps[canonical];
+    let shell = step["shell"]
+        .as_str()
+        .or_else(|| job["defaults"]["run"]["shell"].as_str())
+        .or_else(|| workflow["defaults"]["run"]["shell"].as_str());
+    assert_eq!(shell, Some("bash"));
+
+    let temporary = tempfile::tempdir().unwrap();
+    // No HOME or user Git configuration is changed. Even --global in the real
+    // workflow step is redirected into this disposable fixture directory.
+    let command = |program: &str| {
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("GIT_CONFIG_GLOBAL", temporary.path().join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("XDG_CONFIG_HOME", temporary.path().join("xdg"))
+            .current_dir(temporary.path());
+        command
+    };
+    let git = |args: &[&str]| {
+        let output = command("git").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["config", "--global", "core.autocrlf", "true"]);
+    git(&["init", "--quiet", "source"]);
+    fs::create_dir(temporary.path().join("source/scripts")).unwrap();
+    let original = b"$ErrorActionPreference = 'Stop'\nWrite-Output 'fixture'\n";
+    fs::write(
+        temporary.path().join("source/scripts/install.ps1"),
+        original,
+    )
+    .unwrap();
+    git(&["-C", "source", "add", "scripts/install.ps1"]);
+    git(&[
+        "-C",
+        "source",
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "LF source",
+    ]);
+    let blob = git(&["-C", "source", "show", "HEAD:scripts/install.ps1"]);
+    assert_eq!(blob, original);
+    git(&["clone", "--quiet", "--no-hardlinks", "source", "converted"]);
+    let converted = fs::read(temporary.path().join("converted/scripts/install.ps1")).unwrap();
+    assert_eq!(
+        converted,
+        String::from_utf8(blob.clone())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes(),
+        "autocrlf fixture must reproduce the Windows byte mismatch"
+    );
+    assert_ne!(converted, blob);
+
+    let output = command("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            step["run"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(&["clone", "--quiet", "--no-hardlinks", "source", "canonical"]);
+    assert_eq!(
+        fs::read(temporary.path().join("canonical/scripts/install.ps1")).unwrap(),
+        blob,
+        "the actual workflow step must make fresh checkout equal the original blob"
+    );
+}

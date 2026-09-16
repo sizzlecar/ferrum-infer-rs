@@ -1010,6 +1010,9 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           BREW: ${{ matrix.brew }}
           FORMULA: ${{ matrix.formula }}
+          # Run the explicit update below once; tap's implicit update can still
+          # hold the update lock when the next command starts on a shared host.
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           cargo build --locked -p ferrum-devtools --bin release_delivery
           "$BREW" tap sizzlecar/ferrum
@@ -1113,6 +1116,11 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       PUBLIC_SMOKE_MODEL: Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17
     steps:
+      # Compare the deployed script with committed bytes, not Git for Windows'
+      # automatic CRLF worktree conversion. This runner is an ephemeral VM.
+      - name: Preserve canonical source bytes before checkout
+        id: canonical-source-bytes
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.source_ref }}
