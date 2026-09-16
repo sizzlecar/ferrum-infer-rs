@@ -102,6 +102,7 @@ fn release_policy_requires_committed_membership_and_complete_local_tasks() {
     extended_metal.id = "metal-extended".into();
     extended_metal.model = format!("fixture/extended-metal@{}", "c".repeat(40));
     let metal_policy = ReleaseMetalPolicy {
+        model_limitations: Vec::new(),
         mandatory_local_profile_ids: vec![metal.id.clone()],
         extended_profile_ids: vec![extended_metal.id.clone()],
         reason: "Required small-host models; larger Metal profiles are explicitly not run".into(),
@@ -334,6 +335,7 @@ fn local_metal_capacity_and_backend_are_bound_without_overriding_quick_start() {
         expected.runtime_capacity = (!quick_start).then_some(DEFAULT_METAL_FUNCTIONAL_CAPACITY);
         let mut plan = make_plan(&expected);
         plan.release_metal = Some(ReleaseMetalPolicy {
+            model_limitations: Vec::new(),
             mandatory_local_profile_ids: vec![expected.profile.id.clone()],
             extended_profile_ids: vec!["large-metal".into()],
             reason: "Small-host functional workloads; larger models are not run".into(),

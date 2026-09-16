@@ -134,9 +134,9 @@ jobs:
           else
             printf 'Extended cloud model regression: not run (disabled by default); local representative results do not certify the untested large-model profiles.\n' >> "$RUNNER_TEMP/release-notes.md"
           fi
-          if jq -e '(.plan.model_limitations_not_run // [] | length) > 0' "$RUNNER_TEMP/release-plan.json" >/dev/null; then
+          if jq -e '([.plan.release_cuda.model_limitations[]?, .plan.release_metal.model_limitations[]?] | length) > 0' "$RUNNER_TEMP/release-plan.json" >/dev/null; then
             printf '\n## Known model capability limits\n\nThe following model-dependent coverage is explicitly not certified, not passed. Product protocol, device/numerical and installation checks remain required.\n' >> "$RUNNER_TEMP/release-notes.md"
-            jq -r '.plan.release_cuda.model_limitations[] | "- " + .model_source + ": " + .reason + " Evidence: " + .evidence' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
+            jq -r '.plan | [(.release_cuda.model_limitations[]? | . + {backend: "cuda"}), (.release_metal.model_limitations[]? | . + {backend: "metal"})][] | "- " + .backend + "/" + .profile_id + " (" + .model_source + "): " + .reason + " Evidence: " + .evidence' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
             jq -r '.plan.model_limitations_not_run[] | "- Uncovered behavior: " + .behavior + "; scope: " + (.scope | tojson)' "$RUNNER_TEMP/release-plan.json" >> "$RUNNER_TEMP/release-notes.md"
           fi
           printf '\n## Metal validation scope\n\nRequired: serial representative-model regression on the local Apple Silicon release runner, plus real-device correctness checks.\n' >> "$RUNNER_TEMP/release-notes.md"
@@ -255,7 +255,10 @@ jobs:
       publish_release: false
 
   stage-cuda:
-    needs: prepare
+    # Qualify the existing model probes before the expensive native Windows
+    # package. CPU compatibility runs first on the same Panda hardware as well;
+    # these are the ordinary required jobs, not an extra preflight model matrix.
+    needs: [prepare, metal-models, cuda-models, cpu-models]
     if: needs.prepare.outputs.active == 'true'
     uses: ./.github/workflows/release-windows.yml
     with:
@@ -552,8 +555,9 @@ jobs:
           retention-days: 30
 
   cuda-models:
-    # Windows native staging and this WSL CUDA runner share Panda's physical RAM.
-    needs: [prepare, quality, tools, stage, stage-cuda-linux, stage-cuda, stage-cpu-windows]
+    # Consume Linux artifacts directly; Windows staging runs after these model
+    # checks. The shared hardware lock still excludes other Panda GPU/CPU jobs.
+    needs: [prepare, quality, tools, stage, stage-cuda-linux]
     runs-on: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
     concurrency:
       group: ferrum-panda-hardware

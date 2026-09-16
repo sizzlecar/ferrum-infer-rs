@@ -79,6 +79,27 @@ stand in for MoE model behavior. There is no extended-Metal enable flag; the
 CUDA local default and explicit cloud opt-in are independent and unchanged.
 Numerical, safety and installation requirements are not deferred by this policy.
 
+Both local GPU policies may declare `model_limitations` for independently
+confirmed limitations of an exact pinned model/template. Each declaration binds
+a mandatory profile, source revision, supported semantic behaviors, reason and
+reference evidence. An omitted list is empty. The same rules apply to Metal and
+CUDA: unavailable or disabled profiles cannot replace required coverage, while
+an enabled compatible unrestricted representative still owns that obligation.
+Unrepresented semantics are disclosed as `model_limitations_not_run`, not passed;
+basic execution, protocol, numerical, capacity and installation gates remain
+required. Release notes list every declaration by backend and profile, including
+when another representative covers the behavior. Existing failed reports retain
+their original status. Qualify all affected small-model probes directly before
+starting another full packaging run; do not use repeated full releases to diagnose
+model instruction-following limits or relax the output oracle after a failure.
+
+Formal delivery also orders the existing Metal/CUDA model jobs and bounded CPU
+compatibility job before Windows CUDA staging. CUDA model checks consume the
+Linux CUDA package and do not need a Windows build. This adds no model runs and
+preserves the shared Panda hardware lock, quality checks and final publication
+gate. It stops an unqualified model request from first consuming an expensive
+Windows build, at the cost of less overlap on an entirely successful release.
+
 The catalog's optional `release_performance` policy defaults to
 `{"mode":"required"}`. A release may explicitly use
 `{"mode":"deferred","reason":"..."}` to schedule comparative measurements after

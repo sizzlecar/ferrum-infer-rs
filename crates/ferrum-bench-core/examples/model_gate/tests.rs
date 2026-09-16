@@ -214,6 +214,7 @@ fn metal_lane_fixture() -> Plan {
         stage: Stage::Release,
         release_cuda: None,
         release_metal: Some(ReleaseMetalPolicy {
+            model_limitations: Vec::new(),
             mandatory_local_profile_ids: vec![quick_id.clone(), "functional-metal".into()],
             extended_profile_ids: vec!["extended-metal".into()],
             reason: "Resource-bounded Metal execution with explicit not-run coverage.".into(),
