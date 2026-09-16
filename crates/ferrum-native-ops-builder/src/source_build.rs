@@ -6005,25 +6005,22 @@ mod tests {
 
     #[test]
     fn successful_host_probe_may_close_stdin_before_parent_finishes_writing() {
-        let root = tempfile::tempdir().unwrap();
-        let compiler = root.path().join("successful-probe");
-        fs::write(
-            &compiler,
-            "#!/bin/sh\nexec 0<&-\nprintf 'probe complete\\n'\nexit 0\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&compiler).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&compiler, permissions).unwrap();
         let environment = BTreeMap::from([
             ("LANG".to_string(), "C".to_string()),
             ("LC_ALL".to_string(), "C".to_string()),
             ("TZ".to_string(), "UTC".to_string()),
         ]);
 
-        let output =
-            host_compiler_raw_output(&compiler, &[], &vec![b'x'; 1024 * 1024], &environment)
-                .unwrap();
+        // Exercise the pipe boundary without executing a newly written file:
+        // concurrent process spawning can transiently keep its writable file
+        // description alive across fork and cause Linux ETXTBSY before exec.
+        let output = host_compiler_raw_output(
+            Path::new("/bin/sh"),
+            &["-c", "exec 0<&-; printf 'probe complete\\n'; exit 0"],
+            &vec![b'x'; 1024 * 1024],
+            &environment,
+        )
+        .unwrap();
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"probe complete\n");
