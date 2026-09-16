@@ -1010,11 +1010,17 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           BREW: ${{ matrix.brew }}
           FORMULA: ${{ matrix.formula }}
+          BACKEND: ${{ matrix.backend }}
           # Run the explicit update below once; tap's implicit update can still
           # hold the update lock when the next command starts on a shared host.
           HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
-          cargo build --locked -p ferrum-devtools --bin release_delivery
+          helper_target=target
+          if [ "$BACKEND" = metal ]; then
+            # Reuse the Metal test cache without recreating checkout/target.
+            helper_target="${RUNNER_TOOL_CACHE:?}/ferrum-metal-cargo-target"
+          fi
+          cargo build --locked -p ferrum-devtools --bin release_delivery --target-dir "$helper_target"
           "$BREW" tap sizzlecar/ferrum
           "$BREW" update
           "$BREW" trust --formula sizzlecar/ferrum/ferrum
@@ -1025,7 +1031,7 @@ jobs:
             "$BREW" install "sizzlecar/ferrum/$FORMULA"
           fi
           binary="$("$BREW" --prefix "$FORMULA")/bin/ferrum"
-          target/debug/release_delivery installed --channel homebrew --version "$VERSION" \
+          "$helper_target/debug/release_delivery" installed --channel homebrew --version "$VERSION" \
             --binary "$binary" --output "$RUNNER_TEMP/public-homebrew.json"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -1131,7 +1137,9 @@ jobs:
         timeout-minutes: 30
         run: cargo build --locked -p ferrum-devtools --bin release_delivery --bin model_regression
       - name: Execute the README pipeline in Windows PowerShell 5.1
-        shell: powershell
+        # Actions' default dot-sourced wrapper leaks InvocationName='.' into
+        # IEX, which deliberately loads installer functions without running them.
+        shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {0}
         run: |
           $ErrorActionPreference = 'Stop'
           $controller = Join-Path $env:GITHUB_WORKSPACE 'target/debug/release_delivery.exe'

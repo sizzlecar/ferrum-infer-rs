@@ -42,22 +42,55 @@ fn invoke_powershell_in(
     body: &str,
     environment: &[(&str, &str)],
 ) -> std::process::Output {
+    invoke_powershell_in_context(
+        system_directory,
+        body,
+        environment,
+        PowerShellContext::Command,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PowerShellContext {
+    Command,
+    File,
+}
+
+fn invoke_powershell_in_context(
+    system_directory: &str,
+    body: &str,
+    environment: &[(&str, &str)],
+    context: PowerShellContext,
+) -> std::process::Output {
     let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
         .join(system_directory)
         .join("WindowsPowerShell/v1.0/powershell.exe");
-    Command::new(program)
+    let body = format!(
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); {body}"
+    );
+    let temporary = tempfile::tempdir().unwrap();
+    let mut command = Command::new(program);
+    command
         // Load the repository's unsigned script only in this test process,
         // independently of the invoking shell's execution policy.
         .args([
+            "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-        ])
-        .arg(format!(
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); {body}"
-        ))
+        ]);
+    match context {
+        PowerShellContext::Command => {
+            command.arg("-Command").arg(body);
+        }
+        PowerShellContext::File => {
+            let script = temporary.path().join("pipeline context.ps1");
+            fs::write(&script, body).unwrap();
+            command.arg("-File").arg(script);
+        }
+    }
+    command
         .envs(environment.iter().copied())
         // Let Windows PowerShell build its own module paths. A PowerShell 7
         // parent passes incompatible modules through intermediate Rust processes.
@@ -68,6 +101,18 @@ fn invoke_powershell_in(
 
 #[test]
 fn downloaded_bootstrap_pipeline_selects_cpu_without_driver_tools() {
+    check_downloaded_bootstrap_pipeline_selects_cpu(PowerShellContext::Command);
+}
+
+#[test]
+fn downloaded_bootstrap_pipeline_enters_installer_in_native_file_context() {
+    // The Actions default dot-sources its step file, making IEX inherit an
+    // InvocationName of '.' and suppressing the installer's entrypoint. The
+    // public acceptance step uses native -File, as exercised here without setup.
+    check_downloaded_bootstrap_pipeline_selects_cpu(PowerShellContext::File);
+}
+
+fn check_downloaded_bootstrap_pipeline_selects_cpu(context: PowerShellContext) {
     // Serve unmodified candidate bytes and execute the README's IRM/IEX pipeline.
     // Replace driver-file lookup and release metadata at the network boundary.
     // Missing CPU assets stop before setup execution; this is a startup/selection
@@ -103,7 +148,7 @@ fn downloaded_bootstrap_pipeline_selects_cpu_without_driver_tools() {
         {
             continue;
         }
-        let output = invoke_powershell_in(directory, &body, &[]);
+        let output = invoke_powershell_in_context(directory, &body, &[], context);
         require_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let observed: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
