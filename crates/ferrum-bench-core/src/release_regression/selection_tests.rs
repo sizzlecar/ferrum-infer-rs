@@ -510,6 +510,7 @@ fn metal_lane_input() -> PlanInput {
     request.release_metal = Some(ReleaseMetalPolicy {
         mandatory_local_profile_ids: vec!["metal-local".into()],
         extended_profile_ids: vec!["metal-extended".into()],
+        model_limitations: Vec::new(),
         reason: "Run bounded local model representatives; larger model coverage is not run.".into(),
     });
     request.quick_start_profile_ids = vec!["metal-local".into()];
@@ -523,6 +524,277 @@ fn metal_lane_input() -> PlanInput {
     };
     request.checks = super::super::model_schedule::model_check_descriptors();
     request
+}
+
+fn limited_metal_input() -> PlanInput {
+    let mut request = metal_lane_input();
+    request.impact.areas.extend([
+        ChangeArea::Architecture,
+        ChangeArea::Tools,
+        ChangeArea::Structured,
+        ChangeArea::Build,
+    ]);
+    request.release_metal.as_mut().unwrap().model_limitations = vec![ModelCapabilityLimitation {
+        profile_id: request.profiles[0].id.clone(),
+        model_source: request.profiles[0].model.clone(),
+        behaviors: vec![Behavior::ArchitectureState],
+        reason: "Independent reference evidence identifies this semantic limitation.".into(),
+        evidence: "docs/validation/model-capability-fixture.md".into(),
+    }];
+    request
+}
+
+#[test]
+fn metal_model_limitations_keep_basic_hard_checks_and_unlimited_semantics() {
+    use super::super::model_tasks::ModelCheck;
+    let mut request = limited_metal_input();
+    assert!(request.release_cuda.is_none());
+    let limited = plan(&request).unwrap();
+    limited.validate_release_policies().unwrap();
+    let mut unrestricted = request.clone();
+    unrestricted
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .model_limitations
+        .clear();
+    let full = plan(&unrestricted).unwrap();
+    let hard = |plan: &Plan| {
+        plan.obligations
+            .iter()
+            .filter(|o| o.layer != EvidenceLayer::ModelRuntime)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hard(&limited), hard(&full));
+    for layer in [
+        EvidenceLayer::Contract,
+        EvidenceLayer::BackendNumerics,
+        EvidenceLayer::Installation,
+    ] {
+        assert!(limited.obligations.iter().any(|o| o.layer == layer));
+    }
+    assert!(!limited.model_limitations_not_run.is_empty());
+    assert!(limited.model_limitations_not_run.iter().all(|o| {
+        o.layer == EvidenceLayer::ModelRuntime
+            && o.behavior == Behavior::ArchitectureState
+            && o.checkers.is_empty()
+            && profile_covers(&request.profiles[0], o)
+    }));
+    let schedule = super::super::model_schedule::model_task_schedule(&limited);
+    assert!(schedule.unsupported_obligations.is_empty());
+    let local = schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "metal-local")
+        .unwrap();
+    for check in [ModelCheck::Basic, ModelCheck::Tools, ModelCheck::Structured] {
+        assert!(local.checks.contains(&check));
+    }
+    assert!(!local.checks.contains(&ModelCheck::State));
+    for behavior in [
+        Behavior::ModelLoad,
+        Behavior::ModelForward,
+        Behavior::QuickStart,
+    ] {
+        let obligation = local
+            .obligations
+            .iter()
+            .map(|index| &limited.obligations[*index])
+            .find(|o| o.behavior == behavior)
+            .unwrap();
+        for entrypoint in [
+            Entrypoint::Run,
+            Entrypoint::ServeSync,
+            Entrypoint::ServeStream,
+        ] {
+            assert!(obligation.entrypoints.contains(&entrypoint));
+        }
+    }
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::ModelForward);
+    let missing = plan(&request).unwrap();
+    assert_eq!(
+        missing.model_limitations_not_run,
+        limited.model_limitations_not_run
+    );
+    assert!(missing
+        .gaps
+        .iter()
+        .any(|gap| matches!(gap, Gap::UnassignedCheck { obligation }
+        if missing.obligations[*obligation].behavior == Behavior::ModelForward)));
+    request.stage = Stage::PullRequest;
+    let pr = plan(&request).unwrap();
+    assert!(pr.release_metal.is_none());
+    assert!(pr.model_limitations_not_run.is_empty());
+    let mut legacy = serde_json::to_value(&unrestricted).unwrap();
+    legacy["release_metal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model_limitations");
+    assert_eq!(
+        full,
+        plan(&serde_json::from_value(legacy).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn metal_model_limitations_reject_invalid_and_forged_declarations() {
+    let request = limited_metal_input();
+    let invalid: &[fn(&mut ModelCapabilityLimitation)] = &[
+        |limit| limit.behaviors = vec![Behavior::ModelForward],
+        |limit| limit.behaviors = vec![Behavior::StructuredValidity],
+        |limit| limit.behaviors.push(Behavior::ArchitectureState),
+        |limit| limit.behaviors = vec![Behavior::ToolSelection],
+        |limit| limit.model_source = format!("owner/local@{}", "e".repeat(40)),
+        |limit| limit.model_source = "owner/local".into(),
+        |limit| limit.profile_id = "metal-extended".into(),
+        |limit| limit.reason.clear(),
+        |limit| limit.evidence.clear(),
+    ];
+    for mutate in invalid {
+        let mut changed = request.clone();
+        mutate(&mut changed.release_metal.as_mut().unwrap().model_limitations[0]);
+        assert!(plan(&changed).is_err());
+    }
+    let mut duplicate = request.clone();
+    let limits = &mut duplicate.release_metal.as_mut().unwrap().model_limitations;
+    limits.push(limits[0].clone());
+    assert!(plan(&duplicate).is_err());
+    let valid = plan(&request).unwrap();
+    for layer in [
+        EvidenceLayer::Contract,
+        EvidenceLayer::BackendNumerics,
+        EvidenceLayer::Installation,
+    ] {
+        let mut forged = valid.clone();
+        forged.model_limitations_not_run[0].layer = layer;
+        assert!(forged.validate_release_policies().is_err());
+    }
+    let mut claimed = valid.clone();
+    claimed.model_limitations_not_run[0]
+        .checkers
+        .push("claimed-execution".into());
+    assert!(claimed.validate_release_policies().is_err());
+    for wrong_backend in [false, true] {
+        let mut forged = valid.clone();
+        let profile = &mut forged
+            .selected
+            .iter_mut()
+            .find(|selected| selected.profile.id == "metal-local")
+            .unwrap()
+            .profile;
+        if wrong_backend {
+            profile.target.backend = Backend::Cuda;
+        } else {
+            profile.model = format!("owner/local@{}", "e".repeat(40));
+        }
+        assert!(forged.validate_release_policies().is_err());
+    }
+}
+
+#[test]
+fn metal_model_limitations_yield_to_an_enabled_compatible_representative() {
+    use super::super::model_tasks::ModelCheck;
+    let mut request = limited_metal_input();
+    let mut other = request.profiles[0].clone();
+    other.id = "metal-other".into();
+    other.model = format!("owner/other@{}", "e".repeat(40));
+    request
+        .release_metal
+        .as_mut()
+        .unwrap()
+        .mandatory_local_profile_ids
+        .push(other.id.clone());
+    request.profiles.push(other);
+    let complete = plan(&request).unwrap();
+    complete.validate_release_policies().unwrap();
+    assert!(complete.model_limitations_not_run.is_empty());
+    let schedule = super::super::model_schedule::model_task_schedule(&complete);
+    assert!(schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "metal-other")
+        .unwrap()
+        .checks
+        .contains(&ModelCheck::State));
+    let mut unavailable = request.clone();
+    unavailable.profiles.last_mut().unwrap().available = false;
+    let unavailable = plan(&unavailable).unwrap();
+    assert!(!unavailable.model_limitations_not_run.is_empty());
+    assert!(unavailable.gaps.iter().any(|gap| {
+        matches!(gap, Gap::MissingRepresentative { obligation }
+            if matches!(&unavailable.obligations[*obligation].scope,
+                ObligationScope::Profile { profile_id, .. } if profile_id == "metal-other"))
+    }));
+    assert!(unavailable.validate_release_policies().is_err());
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::ArchitectureState);
+    let missing = plan(&request).unwrap();
+    assert!(missing.model_limitations_not_run.is_empty());
+    assert!(missing
+        .gaps
+        .iter()
+        .any(|gap| matches!(gap, Gap::UnassignedCheck { obligation }
+        if missing.obligations[*obligation].behavior == Behavior::ArchitectureState)));
+    for changed_path in [false, true] {
+        let mut incompatible = request.clone();
+        let other = incompatible.profiles.last_mut().unwrap();
+        if changed_path {
+            other.target.execution_path = "other-executor".into();
+        } else {
+            other.target.precision = "gguf-q4_k_m".into();
+        }
+        assert!(!plan(&incompatible)
+            .unwrap()
+            .model_limitations_not_run
+            .is_empty());
+    }
+}
+
+#[test]
+fn same_source_metal_and_cuda_limitations_remain_backend_scoped() {
+    let mut request = limited_cuda_input();
+    request.release_cuda.as_mut().unwrap().model_limitations[0].behaviors =
+        vec![Behavior::ArchitectureState];
+    let mut metal = limited_metal_input();
+    metal.profiles[0].model = request.profiles[0].model.clone();
+    metal.release_metal.as_mut().unwrap().model_limitations[0].model_source =
+        metal.profiles[0].model.clone();
+    request.release_metal = metal.release_metal;
+    request.profiles.extend(metal.profiles);
+    request.required_targets.extend(metal.required_targets);
+    request
+        .quick_start_profile_ids
+        .extend(metal.quick_start_profile_ids);
+    let limited = plan(&request).unwrap();
+    limited.validate_release_policies().unwrap();
+    for backend in [Backend::Metal, Backend::Cuda] {
+        assert!(limited
+            .model_limitations_not_run
+            .iter()
+            .any(|o| matches!(&o.scope,
+            ObligationScope::Target { target } if target.backend == backend)));
+    }
+    request.release_cuda.as_mut().unwrap().cloud = CloudCudaMode::Required;
+    let cloud = plan(&request).unwrap();
+    cloud.validate_release_policies().unwrap();
+    assert!(!cloud.model_limitations_not_run.is_empty());
+    assert!(cloud
+        .model_limitations_not_run
+        .iter()
+        .all(|o| matches!(&o.scope,
+        ObligationScope::Target { target } if target.backend == Backend::Metal)));
+    let schedule = super::super::model_schedule::model_task_schedule(&cloud);
+    assert!(schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.id == "cloud")
+        .unwrap()
+        .checks
+        .contains(&super::super::model_tasks::ModelCheck::State));
 }
 
 fn cpu_compatibility_input() -> PlanInput {

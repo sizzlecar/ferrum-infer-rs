@@ -21,7 +21,12 @@ fn condition(job: &mut Value, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn caller(job: &Value, workflow: &str, selector: (&str, &str)) -> Result<(), String> {
+fn caller(
+    job: &Value,
+    workflow: &str,
+    selector: (&str, &str),
+    dependencies: Value,
+) -> Result<(), String> {
     require(&job["uses"], json!(format!("./{workflow}")), "local callee")?;
     require(
         &job["with"][selector.0],
@@ -43,9 +48,99 @@ fn caller(job: &Value, workflow: &str, selector: (&str, &str)) -> Result<(), Str
         json!("needs.prepare.outputs.active == 'true'"),
         "active release",
     )?;
-    require(&job["needs"], json!("prepare"), "release preparation")?;
+    require(&job["needs"], dependencies, "release preparation and gates")?;
     if job.get("steps").is_some() || job.get("continue-on-error").is_some_and(|v| v != false) {
         return Err("invalid or failure-tolerant reusable caller".into());
+    }
+    Ok(())
+}
+
+fn prerequisites<'a>(job: &'a Value, name: &str) -> Result<Vec<&'a str>, String> {
+    match job.get("needs") {
+        None => Ok(Vec::new()),
+        Some(Value::String(dependency)) => Ok(vec![dependency]),
+        Some(Value::Array(dependencies)) => dependencies
+            .iter()
+            .map(|dependency| {
+                dependency
+                    .as_str()
+                    .ok_or_else(|| format!("nonliteral dependency for {name}"))
+            })
+            .collect(),
+        _ => Err(format!("unresolved dependencies for {name}")),
+    }
+}
+
+fn model_dependencies(
+    jobs: &Value,
+    name: &str,
+    visiting: &mut BTreeSet<String>,
+    checked: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if matches!(name, "stage-cuda" | "stage-cpu-windows") {
+        return Err("model gate depends on Windows staging".into());
+    }
+    if checked.contains(name) {
+        return Ok(());
+    }
+    if !visiting.insert(name.to_string()) {
+        return Err(format!("cycle in model prerequisites at {name}"));
+    }
+    let job = jobs
+        .get(name)
+        .filter(|job| job.is_object())
+        .ok_or_else(|| format!("unresolved model prerequisite {name}"))?;
+    if job
+        .get("continue-on-error")
+        .is_some_and(|value| value != false)
+    {
+        return Err(format!("failure-tolerant model prerequisite {name}"));
+    }
+    for dependency in prerequisites(job, name)? {
+        model_dependencies(jobs, dependency, visiting, checked)?;
+    }
+    visiting.remove(name);
+    checked.insert(name.to_string());
+    Ok(())
+}
+
+fn windows_cuda_dependencies(delivery: &Value) -> Result<Value, String> {
+    // Retain the previously reviewed topology as well as the model-first graph.
+    // Comparing immutable workflow snapshots still rejects a graph migration.
+    if delivery["jobs"]["stage-cuda"]["needs"] == "prepare" {
+        return Ok(json!("prepare"));
+    }
+    model_first_windows_dependencies(delivery)?;
+    Ok(delivery["jobs"]["stage-cuda"]["needs"].clone())
+}
+
+pub(super) fn model_first_windows_dependencies(delivery: &Value) -> Result<(), String> {
+    let jobs = &delivery["jobs"];
+    let expected = json!(["prepare", "metal-models", "cuda-models", "cpu-models"]);
+    require(
+        &jobs["stage-cuda"]["needs"],
+        expected,
+        "model-first Windows staging dependencies",
+    )?;
+    let mut checked = BTreeSet::new();
+    for (name, execution) in [
+        (
+            "metal-models",
+            "Execute selected Metal models from the staged archive",
+        ),
+        (
+            "cuda-models",
+            "Execute required local CUDA models from the staged archive",
+        ),
+        (
+            "cpu-models",
+            "Check CPU load and basic run/serve compatibility",
+        ),
+    ] {
+        // Artifact upload steps may run always(), but the model execution and
+        // job itself must remain mandatory and propagate failures to staging.
+        step(&jobs[name], execution)?;
+        model_dependencies(jobs, name, &mut BTreeSet::new(), &mut checked)?;
     }
     Ok(())
 }
@@ -122,16 +217,19 @@ pub(super) fn producer_jobs(
         &delivery["jobs"]["stage-cuda-linux"],
         WORKFLOW,
         ("platform", "linux"),
+        json!("prepare"),
     )?;
     caller(
         &delivery["jobs"]["stage-cuda"],
         WINDOWS_WORKFLOW,
         ("backend", "cuda"),
+        windows_cuda_dependencies(delivery)?,
     )?;
     caller(
         &delivery["jobs"]["stage-cpu-windows"],
         WINDOWS_WORKFLOW,
         ("backend", "cpu"),
+        json!("prepare"),
     )?;
     require(
         &cuda["on"]["workflow_call"]["outputs"]["cuda_asset_id"]["value"],

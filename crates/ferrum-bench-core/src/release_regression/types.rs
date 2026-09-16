@@ -554,6 +554,30 @@ impl ModelCapabilityLimitation {
     }
 }
 
+fn validate_model_limitations<'a>(
+    limitations: &[ModelCapabilityLimitation],
+    mandatory_local_profile_ids: &[String],
+    backend: Backend,
+    profiles: impl Iterator<Item = &'a ModelProfile>,
+) -> Result<(), String> {
+    let profiles: Vec<_> = profiles.collect();
+    let mut limited_profiles = std::collections::BTreeSet::new();
+    for limitation in limitations {
+        limitation.validate()?;
+        if !mandatory_local_profile_ids.contains(&limitation.profile_id)
+            || !limited_profiles.insert(&limitation.profile_id)
+            || !profiles.iter().any(|profile| {
+                profile.id == limitation.profile_id
+                    && profile.model == limitation.model_source
+                    && profile.target.backend == backend
+            })
+        {
+            return Err("model limitations must name unique mandatory local profiles with matching backend and immutable source".into());
+        }
+    }
+    Ok(())
+}
+
 impl ReleaseCudaPolicy {
     pub fn limits(&self, profile_id: &str, behavior: Behavior) -> bool {
         self.model_limitations.iter().any(|limitation| {
@@ -580,18 +604,12 @@ impl ReleaseCudaPolicy {
     }
 
     pub fn validate(&self, profiles: &[ModelProfile]) -> Result<(), String> {
-        let mut limited_profiles = std::collections::BTreeSet::new();
-        for limitation in &self.model_limitations {
-            limitation.validate()?;
-            if self.lane(&limitation.profile_id) != Some(CudaModelLane::Local)
-                || !limited_profiles.insert(&limitation.profile_id)
-                || !profiles.iter().any(|profile| {
-                    profile.id == limitation.profile_id && profile.model == limitation.model_source
-                })
-            {
-                return Err("model limitations must name unique mandatory local profiles".into());
-            }
-        }
+        validate_model_limitations(
+            &self.model_limitations,
+            &self.mandatory_local_profile_ids,
+            Backend::Cuda,
+            profiles.iter(),
+        )?;
         if self.reason.trim().is_empty()
             || self.reason.trim() != self.reason
             || self.mandatory_local_profile_ids.is_empty()
@@ -651,10 +669,18 @@ pub enum MetalModelLane {
 pub struct ReleaseMetalPolicy {
     pub mandatory_local_profile_ids: Vec<String>,
     pub extended_profile_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_limitations: Vec<ModelCapabilityLimitation>,
     pub reason: String,
 }
 
 impl ReleaseMetalPolicy {
+    pub fn limits(&self, profile_id: &str, behavior: Behavior) -> bool {
+        self.model_limitations.iter().any(|limitation| {
+            limitation.profile_id == profile_id && limitation.behaviors.contains(&behavior)
+        })
+    }
+
     pub fn lane(&self, profile_id: &str) -> Option<MetalModelLane> {
         if self
             .mandatory_local_profile_ids
@@ -691,6 +717,12 @@ impl ReleaseMetalPolicy {
 
     pub fn validate(&self, profiles: &[ModelProfile]) -> Result<(), String> {
         self.validate_inventory()?;
+        validate_model_limitations(
+            &self.model_limitations,
+            &self.mandatory_local_profile_ids,
+            Backend::Metal,
+            profiles.iter(),
+        )?;
         for id in self
             .mandatory_local_profile_ids
             .iter()
@@ -735,11 +767,13 @@ impl Plan {
         self.validate_cuda_lane_policy()?;
         for obligation in &self.model_limitations_not_run {
             let permitted = obligation.layer == EvidenceLayer::ModelRuntime
-                && self.release_cuda.as_ref().is_some_and(|policy| {
-                    self.selected.iter().any(|selected| {
+                && obligation.checkers.is_empty()
+                && self.selected.iter().any(|selected| {
+                    (self.release_cuda.as_ref().is_some_and(|policy| {
                         policy.limits(&selected.profile.id, obligation.behavior)
-                            && super::selection::profile_covers(&selected.profile, obligation)
-                    })
+                    }) || self.release_metal.as_ref().is_some_and(|policy| {
+                        policy.limits(&selected.profile.id, obligation.behavior)
+                    })) && super::selection::profile_covers(&selected.profile, obligation)
                 });
             if !permitted {
                 return Err(
@@ -752,6 +786,12 @@ impl Plan {
             if self.stage != Stage::Release {
                 return Err("Metal model sampling requires a release plan".into());
             }
+            validate_model_limitations(
+                &policy.model_limitations,
+                &policy.mandatory_local_profile_ids,
+                Backend::Metal,
+                self.selected.iter().map(|selected| &selected.profile),
+            )?;
             for selected in &self.selected {
                 if selected.profile.target.backend == Backend::Metal
                     && policy.lane(&selected.profile.id) != Some(MetalModelLane::Local)
@@ -849,19 +889,12 @@ impl Plan {
         let Some(policy) = &self.release_cuda else {
             return Ok(());
         };
-        let mut limited_profiles = std::collections::BTreeSet::new();
-        for limitation in &policy.model_limitations {
-            limitation.validate()?;
-            if policy.lane(&limitation.profile_id) != Some(CudaModelLane::Local)
-                || !limited_profiles.insert(&limitation.profile_id)
-                || !self.selected.iter().any(|selected| {
-                    selected.profile.id == limitation.profile_id
-                        && selected.profile.model == limitation.model_source
-                })
-            {
-                return Err("invalid frozen model capability limitation".into());
-            }
-        }
+        validate_model_limitations(
+            &policy.model_limitations,
+            &policy.mandatory_local_profile_ids,
+            Backend::Cuda,
+            self.selected.iter().map(|selected| &selected.profile),
+        )?;
         let ids: Vec<_> = policy
             .mandatory_local_profile_ids
             .iter()

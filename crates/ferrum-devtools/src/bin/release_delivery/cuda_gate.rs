@@ -297,6 +297,93 @@ mod tests {
     }
 
     #[test]
+    fn metal_model_limitations_bind_committed_policy_and_explicit_disclosure() {
+        use ferrum_bench_core::release_regression::{
+            model_schedule::model_check_descriptors, model_tasks::ModelCheck, Behavior,
+            EvidenceLayer, ObligationScope,
+        };
+        let mut catalog: Value = serde_json::from_str(include_str!(
+            "../../../../../docs/release-regression-catalog.json"
+        ))
+        .unwrap();
+        let id = catalog["release_metal"]["mandatory_local_profile_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let profile: ModelProfile = serde_json::from_value(
+            catalog["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["id"] == id)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        // Synthetic policy fixture only: this does not add a catalog exception
+        // for the sampled model or claim independent reference evidence for it.
+        catalog["release_metal"]["model_limitations"] = json!([{
+            "profile_id": id, "model_source": profile.model,
+            "behaviors": ["architecture_state"],
+            "reason": "Synthetic reference limitation for policy-binding verification.",
+            "evidence": "docs/validation/model-capability-fixture.md"
+        }]);
+        let mut input = catalog.clone();
+        input.as_object_mut().unwrap().remove("readme_reviews");
+        input["stage"] = json!("release");
+        input["impact"] =
+            serde_json::to_value(ferrum_bench_core::release_regression::analyze_paths([
+                "crates/ferrum-engine/src/lib.rs",
+            ]))
+            .unwrap();
+        input["checks"] = serde_json::to_value(model_check_descriptors()).unwrap();
+        let input: PlanInput = serde_json::from_value(input).unwrap();
+        let planned = ferrum_bench_core::release_regression::plan(&input).unwrap();
+        verify_policy(&planned, &catalog).unwrap();
+        let index = planned.model_limitations_not_run.iter().position(|o| {
+            o.behavior == Behavior::ArchitectureState
+                && matches!(&o.scope, ObligationScope::Target { target } if target == &profile.target)
+        }).unwrap();
+        let schedule = model_task_schedule(&planned);
+        let run = schedule
+            .runs
+            .iter()
+            .find(|run| run.profile.id == id)
+            .unwrap();
+        assert!(run.checks.contains(&ModelCheck::Basic));
+        assert!(!run.checks.contains(&ModelCheck::State));
+        let mut hidden = planned.clone();
+        hidden.model_limitations_not_run.remove(index);
+        assert!(verify_policy(&hidden, &catalog).is_err());
+        let mut unreviewed = planned.clone();
+        unreviewed.release_metal.as_mut().unwrap().model_limitations[0].reason =
+            "An uncommitted exception".into();
+        assert!(verify_policy(&unreviewed, &catalog).is_err());
+        for layer in [
+            EvidenceLayer::Contract,
+            EvidenceLayer::BackendNumerics,
+            EvidenceLayer::Installation,
+        ] {
+            let mut forged = planned.clone();
+            forged.model_limitations_not_run[index].layer = layer;
+            assert!(verify_policy(&forged, &catalog).is_err());
+        }
+        let mut claimed = planned.clone();
+        claimed.model_limitations_not_run[index]
+            .checkers
+            .push("claimed-execution".into());
+        assert!(verify_policy(&claimed, &catalog).is_err());
+        let mut wrong_source = planned;
+        wrong_source
+            .release_metal
+            .as_mut()
+            .unwrap()
+            .model_limitations[0]
+            .model_source = format!("fixture/changed@{}", "f".repeat(40));
+        assert!(verify_policy(&wrong_source, &catalog).is_err());
+    }
+
+    #[test]
     fn cloud_skip_is_only_accepted_when_disabled_and_local_succeeded() {
         let manual = json!("workflow_dispatch");
         for mode in [CloudCudaMode::Disabled, CloudCudaMode::Required] {
