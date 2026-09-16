@@ -83,6 +83,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    ferrum_cli::terminal::initialize();
     let cli = Cli::parse();
 
     // Setup logging

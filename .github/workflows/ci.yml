@@ -771,6 +771,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked -p ferrum-cli --test windows_launcher
+          cargo test --locked -p ferrum-cli --lib terminal::tests::
+          cargo test --locked -p ferrum-cli --test cli_e2e list_
           cargo test --locked -p ferrum-devtools --test windows_bootstrap
       - name: Test portable and Windows release asset contracts
         run: |
