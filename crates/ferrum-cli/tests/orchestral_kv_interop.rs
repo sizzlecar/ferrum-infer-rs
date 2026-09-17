@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 mod journal;
 #[path = "orchestral_kv_interop/process.rs"]
 mod process;
+#[path = "orchestral_kv_interop/request_capture.rs"]
+mod request_capture;
 #[path = "orchestral_kv_interop/tests.rs"]
 mod tests;
 
@@ -149,6 +151,9 @@ impl Configuration {
                 "--max-num-seqs",
                 "1",
             ]);
+        command
+            .arg("--request-dump-dir")
+            .arg(directory.join("model-requests"));
         if self.disable_thinking {
             command.arg("--disable-thinking");
         }
@@ -201,7 +206,7 @@ impl Configuration {
     fn orchestral_command(&self, endpoint: &str, directory: &Path, prompt: &str) -> Command {
         let mut command = Command::new(&self.orchestral_bin);
         command
-            .current_dir(directory.join("sandbox"))
+            .current_dir(self.report_dir.join("sandbox"))
             .env("ORCHESTRAL_HOME", directory.join("orchestral-home"))
             .args([
                 "--base-url",
@@ -223,7 +228,7 @@ impl Configuration {
             ])
             .arg(directory.join("orchestral.yaml"))
             .arg("--cwd")
-            .arg(directory.join("sandbox"))
+            .arg(self.report_dir.join("sandbox"))
             .arg(prompt);
         // The local endpoint is the only provider. Do not inherit alternate homes,
         // API tokens, credential files or tracing exporters into the test agent.
@@ -267,6 +272,13 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn prepare_sandbox(config: &Configuration, facts: &Facts) -> Result<PathBuf> {
+    let sandbox = config.report_dir.join("sandbox");
+    fs::create_dir(&sandbox)?;
+    write_json(sandbox.join(DATA_FILE), &facts.answer())?;
+    Ok(sandbox)
+}
+
 fn health_evidence(health: &Value, dtype: &str) -> Result<()> {
     ensure!(health["status"] == "healthy", "server reports unhealthy");
     let format = match dtype {
@@ -302,21 +314,31 @@ async fn get_health(client: &reqwest::Client, base: &str) -> Result<Value> {
 async fn run_format(config: &Configuration, dtype: &str, facts: &Facts) -> Result<Value> {
     let directory = config.report_dir.join(dtype);
     fs::create_dir(&directory)?;
-    fs::create_dir(directory.join("sandbox"))?;
+    // The workspace root is model-visible. Both formats must see the same
+    // absolute path and fresh facts, not precision-specific prompt text.
+    let sandbox = prepare_sandbox(config, facts)?;
+    let result = run_format_in_sandbox(config, dtype, facts, &directory).await;
+    // Preserve even unexpected files from a failed run, then let the next
+    // format recreate an empty workspace at exactly the same original path.
+    fs::rename(&sandbox, directory.join("sandbox-after"))?;
+    result
+}
+
+async fn run_format_in_sandbox(
+    config: &Configuration,
+    dtype: &str,
+    facts: &Facts,
+    directory: &Path,
+) -> Result<Value> {
     fs::create_dir(directory.join("orchestral-home"))?;
-    write_json(directory.join("sandbox").join(DATA_FILE), &facts.answer())?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     drop(listener);
     let base = format!("http://127.0.0.1:{port}");
     let endpoint = format!("{base}/v1");
-    fs::write(
-        directory.join("orchestral.yaml"),
-        serde_yaml::to_string(&config.orchestral_config(&endpoint, &directory))?,
-    )?;
     let mut server = process::OwnedChild::spawn(
-        config.ferrum_command(dtype, port, &directory),
-        &directory,
+        config.ferrum_command(dtype, port, directory),
+        directory,
         "ferrum",
     )?;
     let client = reqwest::Client::builder()
@@ -340,18 +362,22 @@ async fn run_format(config: &Configuration, dtype: &str, facts: &Facts) -> Resul
     };
     write_json(directory.join("health-before.json"), &before)?;
     health_evidence(&before, dtype)?;
+    fs::write(
+        directory.join("orchestral.yaml"),
+        serde_yaml::to_string(&config.orchestral_config(&endpoint, directory))?,
+    )?;
     let result: Result<Vec<Value>> = async {
     let prompt = format!("Use the file_read tool to read {DATA_FILE} in this workspace. Report its tracking_code and parcel_count fields with their exact values. Do not modify files or run commands.");
     let mut turns = Vec::new();
-    let first = run_turn(config, &endpoint, &directory, 1, &prompt, &facts.answer()).await?;
+    let first = run_turn(config, &endpoint, directory, 1, &prompt, &facts.answer()).await?;
     let snapshot = journal::Snapshot::read(&directory.join("journals"))?;
     snapshot.validate_file_read(DATA_FILE, &facts.answer())?;
     turns.push(first);
     // A second process must reconstruct the same session; the source no longer
     // exists, so another read cannot substitute for conversation continuity.
-    fs::remove_file(directory.join("sandbox").join(DATA_FILE))?;
+    fs::remove_file(config.report_dir.join("sandbox").join(DATA_FILE))?;
     let tools_before = snapshot.tool_exchange_count();
-    turns.push(run_turn(config, &endpoint, &directory, 2,
+    turns.push(run_turn(config, &endpoint, directory, 2,
         "Without using any tools or reading any files, repeat the tracking_code and parcel_count from the previous turn. Use the values already in our conversation.", &facts.answer()).await?);
     let snapshot = journal::Snapshot::read(&directory.join("journals"))?;
     ensure!(
@@ -377,7 +403,7 @@ async fn run_format(config: &Configuration, dtype: &str, facts: &Facts) -> Resul
             run_turn(
                 config,
                 &endpoint,
-                &directory,
+                directory,
                 3,
                 &prompt,
                 &json!({"record": selected, "dispatch_code": facts.retrieval_code}),
@@ -487,10 +513,17 @@ async fn real_orchestral_file_read_and_session_recall_with_both_kv_formats() -> 
         reports.push(report);
     }
     let unchanged = identity == process::identities(&config.ferrum_bin, &config.orchestral_bin)?;
-    let passed = unchanged && reports.iter().all(|r| r["status"] == "passed");
+    let comparison = request_capture::compare_first_requests(&config.report_dir)
+        .unwrap_or_else(|error| json!({"equal": false, "error": format!("{error:#}")}));
+    write_json(
+        config.report_dir.join("paired-model-input.json"),
+        &comparison,
+    )?;
+    let passed =
+        unchanged && comparison["equal"] == true && reports.iter().all(|r| r["status"] == "passed");
     write_json(
         config.report_dir.join("report.json"),
-        &json!({"passed": passed, "binaries_unchanged": unchanged,
+        &json!({"passed": passed, "binaries_unchanged": unchanged, "first_model_input": comparison,
         "cases": reports, "scope": "local agent tool/session interoperability; no performance or all-model qualification"}),
     )?;
     ensure!(
