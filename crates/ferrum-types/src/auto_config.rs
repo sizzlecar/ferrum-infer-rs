@@ -468,6 +468,31 @@ impl ResolvedFerrumConfig {
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
+        let memory_estimate = serde_json::json!({
+            "source": "legacy_f16_geometry_estimate",
+            "applies_to_selected_state_layout": false,
+            "is_resident_usage": false,
+            "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
+            "vram_bytes": self.hardware_capabilities.vram_bytes,
+            "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
+            "kv_bytes_per_token": kv_bytes_per_token,
+            "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
+            "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
+            "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
+            "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
+            "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
+                (Some(slots), Some(bytes_per_sequence)) => {
+                    (slots as u64).checked_mul(bytes_per_sequence)
+                }
+                _ => None,
+            },
+            "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
+                (Some(tokens), Some(bytes_per_token)) => {
+                    (tokens as u64).checked_mul(bytes_per_token)
+                }
+                _ => None,
+            },
+        });
         serde_json::json!({
             "schema_version": 1,
             "backend": self.hardware_capabilities.backend,
@@ -501,31 +526,7 @@ impl ResolvedFerrumConfig {
             "kv_capacity_tokens": kv_capacity_tokens,
             "max_model_length": max_model_len,
             "max_batched_tokens": max_batched_tokens,
-            "memory_estimate": {
-                "source": "legacy_f16_geometry_estimate",
-                "applies_to_selected_state_layout": false,
-                "is_resident_usage": false,
-                "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
-                "vram_bytes": self.hardware_capabilities.vram_bytes,
-                "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
-                "kv_bytes_per_token": kv_bytes_per_token,
-                "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
-                "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
-                "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
-                "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
-                "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
-                    (Some(slots), Some(bytes_per_sequence)) => {
-                        (slots as u64).checked_mul(bytes_per_sequence)
-                    }
-                    _ => None,
-                },
-                "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
-                    (Some(tokens), Some(bytes_per_token)) => {
-                        (tokens as u64).checked_mul(bytes_per_token)
-                    }
-                    _ => None,
-                },
-            },
+            "memory_estimate": memory_estimate,
         })
     }
 
