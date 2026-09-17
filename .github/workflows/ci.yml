@@ -32,7 +32,9 @@ defaults:
     shell: bash
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # An explicitly requested model probe keeps its frozen candidate while PR
+  # checkpoints continue. The per-job Panda hardware lock still serializes it.
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe != '' && inputs.cuda_model_probe != 'none' && format('{0}-{1}-model-probe-{2}', github.workflow, github.ref, github.run_id) || format('{0}-{1}', github.workflow, github.ref) }}
   cancel-in-progress: true
 
 env:
