@@ -1004,6 +1004,7 @@ async fn execute_with_compatibility(
         Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
         _ => ServedModelKind::Llm,
     };
+    validate_served_model_kv_dtype(served_model_kind, product_engine_config.kv_cache.dtype)?;
     if vnext_checkpoint.teacher_token_file.is_some() {
         return Err(FerrumError::unsupported(
             "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
@@ -1751,6 +1752,19 @@ fn resolve_effective_kv_dtype<'a>(
     config_file_value: Option<&'a str>,
 ) -> Option<&'a str> {
     cli_arg.or(env_value).or(config_file_value)
+}
+
+fn validate_served_model_kv_dtype(
+    kind: ServedModelKind,
+    dtype: ferrum_types::KvCacheDtype,
+) -> Result<()> {
+    if kind != ServedModelKind::Llm && dtype != ferrum_types::KvCacheDtype::Fp16 {
+        return Err(FerrumError::unsupported(format!(
+            "KV storage overrides require a causal language executor; {kind:?} serving does not support KV dtype {}",
+            dtype.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn push_cli_runtime_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<&str>) {
@@ -3686,6 +3700,35 @@ mod tests {
             Some("fp16")
         );
         assert_eq!(resolve_effective_kv_dtype(None, None, None), None);
+    }
+
+    #[test]
+    fn non_language_serving_rejects_kv_overrides_from_every_source() {
+        use ferrum_types::KvCacheDtype;
+        for kind in [
+            ServedModelKind::Embedding,
+            ServedModelKind::Transcription,
+            ServedModelKind::Speech,
+        ] {
+            validate_served_model_kv_dtype(kind, KvCacheDtype::Fp16).unwrap();
+            for sources in [
+                (Some("int8"), Some("fp16"), Some("fp16")),
+                (None, Some("int8"), Some("fp16")),
+                (None, None, Some("int8")),
+            ] {
+                let mut engine = ferrum_types::EngineConfig::default();
+                super::super::run::apply_kv_dtype_override(
+                    &mut engine,
+                    resolve_effective_kv_dtype(sources.0, sources.1, sources.2),
+                )
+                .unwrap();
+                let error =
+                    validate_served_model_kv_dtype(kind, engine.kv_cache.dtype).unwrap_err();
+                assert!(error.to_string().contains("does not support KV dtype int8"));
+            }
+        }
+        // The language executor validates its actual family/backend later.
+        validate_served_model_kv_dtype(ServedModelKind::Llm, KvCacheDtype::Int8).unwrap();
     }
 
     #[test]
