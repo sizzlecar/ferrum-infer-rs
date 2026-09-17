@@ -370,10 +370,9 @@ mod block_fp8_exact_materializer_tests {
     }
 }
 
-/// Build the exact composition root used for both planning and dispatch.
-pub fn cuda_vnext_operation_registry(
-    runtime: &CudaDeviceRuntime,
-) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
+fn cuda_operation_contracts(
+    attention_policy: AttentionExecutionPolicy,
+) -> Result<Vec<Box<dyn OperationContract>>, CudaDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(token_embedding_f32_master_contract().map_err(contract_error)?),
@@ -395,11 +394,23 @@ pub fn cuda_vnext_operation_registry(
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
-        Box::new(causal_paged_attention_int8_kv_contract().map_err(contract_error)?),
-        Box::new(causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?),
         Box::new(hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
+    // A catalog requires a real provider for every operation contract. Native
+    // F16 compositions must not advertise the portable-only INT8 operations.
+    let contracts = if attention_policy == AttentionExecutionPolicy::Portable {
+        let mut contracts = contracts;
+        contracts.push(Box::new(
+            causal_paged_attention_int8_kv_contract().map_err(contract_error)?,
+        ));
+        contracts.push(Box::new(
+            causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?,
+        ));
+        contracts
+    } else {
+        contracts
+    };
     #[cfg(feature = "vllm-moe-marlin")]
     let contracts = {
         let mut contracts = contracts;
@@ -414,6 +425,14 @@ pub fn cuda_vnext_operation_registry(
         ));
         contracts
     };
+    Ok(contracts)
+}
+
+/// Build the exact composition root used for both planning and dispatch.
+pub fn cuda_vnext_operation_registry(
+    runtime: &CudaDeviceRuntime,
+) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
+    let contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaTokenEmbeddingProvider::new_f32(runtime)?),

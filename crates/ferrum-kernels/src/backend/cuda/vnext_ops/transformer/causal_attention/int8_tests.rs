@@ -91,6 +91,27 @@ fn launch(shape: CausalAttentionShape, position: usize, tokens: usize) -> Causal
 
 #[test]
 fn int8_kv_geometry_counts_independent_scales_and_rejects_native() {
+    let contract_ids = |policy| {
+        crate::backend::cuda::vnext_ops::cuda_operation_contracts(policy)
+            .unwrap()
+            .iter()
+            .map(|contract| contract.descriptor().id.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let native = contract_ids(AttentionExecutionPolicy::NativeAdaptive);
+    let portable = contract_ids(AttentionExecutionPolicy::Portable);
+    assert!(native.is_subset(&portable));
+    assert_eq!(
+        portable
+            .difference(&native)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID.to_owned(),
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID
+                .to_owned(),
+        ])
+    );
     let shape = shape(128);
     assert_eq!(shape.kv_layout().unwrap(), CausalKvLayout::TokenMajorPages);
     assert_eq!(shape.state_bytes_per_token().unwrap(), 512);
