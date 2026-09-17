@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Corrected packed Metal attention row offsets for head dimensions whose row size is not 16-byte aligned, covering both FP16 and INT8 KV.
 - Reported context-capacity failures as structured HTTP 400 errors before streaming begins, so clients can distinguish them from transient server failures.
 - Honored Chat Completions `reasoning_effort` and Responses `reasoning.effort`, preserving model defaults when omitted and respecting declared model capabilities.
 - Allowed automatic tool calls alongside strict final JSON schemas in Chat Completions and Responses, including streaming, while giving schema-valid final answers precedence over ambiguous tool-call JSON.
@@ -16,11 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Typed `MemoryRequirements` reports now serialize complete-model token-scaled and fixed sequence state under `typed_sequence_state`, omitting the legacy per-layer `kv_cache_memory_per_token` field. New readers retain legacy-wire support; older consumers must be updated to interpret typed reports.
 - Enabled independent staging of eligible Q4/Q5 FFN projections in mixed-format Metal prefill, with storage-layout checks and reusable scratch capacity.
 
 ### Added
 
-- Added opt-in `--kv-dtype int8` / `runtime.kv_dtype` for supported vNext Metal and portable CUDA causal attention, with per-token/head scales, typed capacity accounting, and paired KV checkpoint state. FP16 remains the default; unsupported combinations fail explicitly. See [KV precision](docs/kv-cache-precision.md) and the [measured validation scope](docs/vnext-8bit-kv-validation.zh.md).
+- Added opt-in `--kv-dtype int8` / `runtime.kv_dtype` to `run` and `serve` for supported vNext standard causal attention on Metal and portable CUDA, with per-token/head scales and typed capacity accounting. FP16 remains the default; unsupported combinations fail explicitly. KV payload and scales are checkpointed together; whole-model restore requires support for every model state.
+- Added optional `/v1/models` reasoning metadata that distinguishes a supported thinking switch and its effective default from explicitly declared effort levels.
 - Exposed resolved KV precision and complete-model logical state requirements in health and effective configuration, separating them from legacy estimates and actual allocator residency.
 - Added native profile summaries that distinguish shared GPU work from per-request observations and avoid duplicate accounting.
 - Added one-command installation on Apple Silicon macOS, Linux x86_64, and Windows x64, with PATH setup and upgrades that keep existing processes running while new launches use the updated version.

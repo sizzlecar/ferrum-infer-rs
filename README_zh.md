@@ -213,6 +213,10 @@ Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提�
 `reasoning_effort` 或 Responses 的 `reasoning.effort` 覆盖服务端默认值。
 模型支持范围及兼容行为见 [API 说明](docs/openai-api-compatibility.md#chat-fields)。
 
+`GET /v1/models` 还提供可选的 `reasoning` 元数据：`thinking.default_enabled`
+表示受支持思考开关的服务端实际默认值，`supported_efforts` 列出模型明确声明的强度档位。
+支持思考开关不代表支持 low/medium/high；省略档位字段表示支持情况未知。
+
 `ferrum doctor <MODEL>` 会解析模型来源并打印下一条 `run`、`serve` 命令，
 不会下载模型或启动推理引擎。
 
@@ -229,6 +233,21 @@ reusable_execution_preparation = "auto" # auto、startup、on_demand
 `on_demand` 会报错。设置 `reusable_execution = false` 可关闭设备程序准备。
 这些选项不改变请求准入、排队或模型数值策略。
 
+### KV 缓存精度
+
+开发版本的 `run` 和 `serve` 均可使用 `--kv-dtype int8`，默认仍为 FP16。
+此选项需要支持标准 causal attention 的 vNext 模型，以及 Metal 或 portable CUDA
+执行路径；不支持的组合会明确报错。
+
+```sh
+ferrum run unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+```
+
+此选项减少注意力 KV 的存储占用，包含量化所需的 scale；模型权重和固定大小的循环状态
+保持原有大小。通过 `/health` 的 `kv_storage` 可确认实际生效格式。
+整个模型的 checkpoint 恢复需要所有模型状态均支持恢复；重新发送对话历史会重新计算输入。
+
 ## 功能
 
 - 一个 Rust 二进制同时提供 `ferrum run` 和 `ferrum serve`。
@@ -236,6 +255,7 @@ reusable_execution_preparation = "auto" # auto、startup、on_demand
   tools 和 structured output。
 - 同一 runtime 覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
 - 支持 continuous batching、paged KV cache、prefix cache 和 typed admission。
+- 支持在兼容的 vNext Metal、portable CUDA 路径选择 8-bit KV，默认保持 FP16。
 - Metal 与 CUDA 均支持 GGUF；CUDA 还支持 GPTQ/safetensors。
 - Ferrum 只覆盖语言模型推理。支持的模型包括 Qwen3.5 4B、Qwen3.5 35B-A3B、
   Qwen3 30B-A3B 和 Llama 3.1 8B dense。

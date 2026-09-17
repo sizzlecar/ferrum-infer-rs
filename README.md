@@ -228,6 +228,11 @@ behavior; an HTTP request can override the server default with
 `reasoning.effort`. See [reasoning control behavior](docs/openai-api-compatibility.md#chat-fields)
 for model support and compatibility details.
 
+`GET /v1/models` also exposes optional `reasoning` metadata. A supported thinking
+switch reports its effective default in `thinking.default_enabled`; explicitly
+declared effort levels appear in `supported_efforts`. A thinking switch alone
+does not imply low/medium/high levels. Omitted effort metadata means unknown support.
+
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
 
@@ -247,6 +252,23 @@ server becomes ready. Other backends retain their existing behavior; explicitly
 requesting unsupported `on_demand` reports an error. Set `reusable_execution = false`
 to disable device-program preparation. These options do not change request
 admission, queuing, or the model's numerical profile.
+
+### KV cache precision
+
+Development builds accept `--kv-dtype int8` in both `run` and `serve`. FP16 remains
+the default. INT8 requires supported vNext standard causal attention on Metal or
+portable CUDA; unsupported combinations report an error.
+
+```sh
+ferrum run unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+```
+
+This reduces attention KV storage, including its quantization scales. Model
+weights and fixed recurrent state retain their existing sizes. Inspect
+`/health` → `kv_storage` to confirm the selected format. Whole-model checkpoint
+restore requires support for every model state; resending conversation history
+recomputes the input.
 
 ## Features
 
