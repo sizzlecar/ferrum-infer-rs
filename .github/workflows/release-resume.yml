@@ -12,6 +12,11 @@ on:
         required: false
         default: ''
         type: string
+      preupload_timeout_minutes:
+        description: "Deadline for the optional single-asset upload, in whole minutes (1-60)"
+        required: false
+        default: 10
+        type: number
 
 permissions:
   contents: read
@@ -172,6 +177,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
           SOURCE_RUN: ${{ inputs.source_run_id }}
           PREUPLOAD_ASSET: ${{ inputs.preupload_asset }}
+          PREUPLOAD_TIMEOUT_MINUTES: ${{ inputs.preupload_timeout_minutes }}
         run: |
           version=$(cargo metadata --manifest-path candidate/Cargo.toml --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
@@ -188,6 +194,7 @@ jobs:
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
           if [ -n "$PREUPLOAD_ASSET" ]; then
             [[ "$PREUPLOAD_ASSET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            [[ "$PREUPLOAD_TIMEOUT_MINUTES" =~ ^([1-9]|[1-5][0-9]|60)$ ]]
             "$GITHUB_WORKSPACE/tools/target/debug/release_delivery" gate "${gate_args[@]}" \
               --output "$RUNNER_TEMP/accepted-preupload.json"
             jq -e --arg name "$PREUPLOAD_ASSET" '[.assets[] | select(.name == $name)] |
@@ -239,9 +246,9 @@ jobs:
               .published_at == null and .target_commitish == $accepted[0].candidate_sha and .body == $accepted[0].notes' \
               "$RUNNER_TEMP/preupload-draft-fresh.json"
             gh --version
-            printf 'Preupload one accepted asset: name=%s size=%s sha256=%s source_run=%s release_id=%s\n' \
-              "$PREUPLOAD_ASSET" "$asset_size" "$asset_sha" "$SOURCE_RUN" "$release_id"
-            if timeout --signal=TERM --kill-after=15s 600s gh api --hostname github.com --method POST \
+            printf 'Preupload one accepted asset: name=%s size=%s sha256=%s source_run=%s release_id=%s timeout_minutes=%s\n' \
+              "$PREUPLOAD_ASSET" "$asset_size" "$asset_sha" "$SOURCE_RUN" "$release_id" "$PREUPLOAD_TIMEOUT_MINUTES"
+            if timeout --signal=TERM --kill-after=15s "${PREUPLOAD_TIMEOUT_MINUTES}m" gh api --hostname github.com --method POST \
               "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
               --input "$asset_path" --raw-field "name=$PREUPLOAD_ASSET" \
               --header 'Content-Type: application/octet-stream' --header 'X-GitHub-Api-Version: 2022-11-28' \
