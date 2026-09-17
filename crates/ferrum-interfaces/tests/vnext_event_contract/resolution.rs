@@ -290,6 +290,7 @@ pub(crate) fn resolved_model_plan_with_mode(
         .unwrap();
     let numerical_execution = NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Auto,
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &family,
         &catalog,

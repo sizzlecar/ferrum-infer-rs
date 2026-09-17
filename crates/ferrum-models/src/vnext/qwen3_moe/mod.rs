@@ -35,6 +35,7 @@ use weights::Qwen3MoeWeightManifest;
 pub const FAMILY_ID: &str = "family.qwen3.routed_moe";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3MoeForCausalLM";
 pub const NUMERICAL_PROFILE_ID: &str = "qwen3_moe.f16";
+pub const INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_moe.f16.int8-kv";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +350,66 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn int8_kv_profile_prepares_every_standard_causal_layer_with_scales() {
+        use ferrum_interfaces::vnext::{
+            ElementType, KvStorageFormat, NumericalExecutionPolicy,
+            CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+        };
+        let config = production_config();
+        let registration = TypedFamilyRegistration::new(Qwen3MoeFamilyProvider::new().unwrap());
+        let definition = registration
+            .define(&serde_json::to_value(&config).unwrap())
+            .unwrap();
+        let profile = definition
+            .numerical_profiles()
+            .candidates(
+                &NumericalExecutionPolicy::Auto,
+                KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
+            )
+            .unwrap()[0];
+        let prepared = registration.prepare(&definition, &profile.id).unwrap();
+        profile.validate_program(prepared.program()).unwrap();
+        let states = prepared.program().states();
+        for node in prepared
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .filter(|node| {
+                node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID
+            })
+        {
+            assert_eq!(node.inputs.len(), 10);
+            assert_eq!(
+                states
+                    .iter()
+                    .find(|s| s.value_id == node.inputs[8])
+                    .unwrap()
+                    .tensor
+                    .element_type,
+                ElementType::I8
+            );
+            assert_eq!(
+                states
+                    .iter()
+                    .find(|s| s.value_id == node.inputs[9])
+                    .unwrap()
+                    .tensor
+                    .element_type,
+                ElementType::F32
+            );
+        }
+        assert_eq!(profile.kv_storage.len() as u64, config.semantic.layer_count);
+        assert!(definition
+            .numerical_profiles()
+            .candidates(
+                &NumericalExecutionPolicy::Require(profile.id.clone()),
+                KvStorageFormat::F16
+            )
+            .is_err());
     }
 
     #[test]

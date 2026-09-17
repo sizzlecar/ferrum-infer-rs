@@ -12,18 +12,20 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
     ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, GatedDeltaDecayParameterization,
-    GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
-    ModelProgram, ModelSemanticMetadata, NodeId, NumericalExecutionProfile, OperationId,
-    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
-    PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode, ProgramNodeWorkSpec,
-    ProgramTensorSpec, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
-    QuantizationPacking, QuantizationSpec, QuantizedProviderAttributionDenominator,
-    ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId, StateInitialization,
-    StateLifetime, StateSpec, TypedFamilyRegistration, VNextError, WeightComponentRole,
-    WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
-    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
-    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
-    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    GatedDeltaValueHeadMapping, KvStorageFormat, ModelFamilyId, ModelFamilyProvider,
+    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NodeId,
+    NumericalExecutionProfile, OperationId, PhysicalWeightComponentBinding, PhysicalWeightLayout,
+    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramCheckpointInputs, ProgramNode,
+    ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec,
+    QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
+    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F32_F16_OPERATION_ID,
@@ -63,7 +65,10 @@ pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
 mod numerical;
-pub use numerical::{F16_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID};
+pub use numerical::{
+    F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
+    F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID,
+};
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
 const PACKED_LINEAR_ATTN_QKVZBA_ROLE: &str = "linear_attn_qkvzba";
@@ -300,10 +305,29 @@ impl Qwen35OperationProfile {
         argmax: OperationSelection::new(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, 1, 0),
     };
 
+    const F16_INT8_KV: Self = Self {
+        causal_attention: OperationSelection::new(
+            CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F16
+    };
+    const F32_MASTER_INT8_KV: Self = Self {
+        causal_attention: OperationSelection::new(
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER
+    };
+
     fn for_profile(profile: &NumericalExecutionProfile) -> Result<Self, VNextError> {
         match profile.id.as_str() {
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
+            F16_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F16_INT8_KV),
+            F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_INT8_KV),
             _ => Err(invalid_config(
                 "numerical_profile",
                 "unknown Qwen3.5 numerical profile",
@@ -934,8 +958,16 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                             role,
                         )?)?);
                     }
-                    let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
-                    attention_inputs.push(kv_value.clone());
+                    let int8_kv = profile.kv_storage_format()?
+                        == Some(KvStorageFormat::Int8PerTokenHeadF32ScaleV1);
+                    let role = if int8_kv { "kv_quant" } else { "kv" };
+                    attention_inputs
+                        .push(value_id(format!("value.state.layer.{layer_index}.{role}"))?);
+                    if int8_kv {
+                        attention_inputs.push(value_id(format!(
+                            "value.state.layer.{layer_index}.kv_scale"
+                        ))?);
+                    }
                     (
                         operations.causal_attention.id,
                         operations.causal_attention.version,
@@ -8059,6 +8091,74 @@ mod tests {
     }
 
     #[test]
+    fn int8_kv_profiles_preserve_recurrent_state_and_close_the_attention_program() {
+        use ferrum_interfaces::vnext::NumericalExecutionPolicy;
+        let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
+        for config in [
+            test_config(),
+            test_dense_gguf_config(),
+            test_moe_gptq_config(),
+        ] {
+            let definition = registration
+                .define(&serde_json::to_value(config).unwrap())
+                .unwrap();
+            let profiles = definition.numerical_profiles();
+            let f16 = profiles
+                .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
+                .unwrap()[0];
+            let int8 = profiles
+                .candidates(
+                    &NumericalExecutionPolicy::Auto,
+                    KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
+                )
+                .unwrap()[0];
+            assert_eq!(f16.boundaries, int8.boundaries);
+            let recurrent = |p: &NumericalExecutionProfile| {
+                p.states
+                    .iter()
+                    .filter(|s| s.capacity_demand == StateCapacityDemand::FixedPerScope)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(recurrent(f16), recurrent(int8));
+            assert_ne!(f16.fingerprint().unwrap(), int8.fingerprint().unwrap());
+            let prepared = registration.prepare(&definition, &int8.id).unwrap();
+            int8.validate_program(prepared.program()).unwrap();
+            for declaration in &int8.kv_storage {
+                let payload = prepared
+                    .program()
+                    .states()
+                    .iter()
+                    .find(|s| &s.id == declaration.payload_state())
+                    .unwrap();
+                let scale = prepared
+                    .program()
+                    .states()
+                    .iter()
+                    .find(|s| Some(&s.id) == declaration.scale_state())
+                    .unwrap();
+                let node = prepared
+                    .program()
+                    .blocks()
+                    .iter()
+                    .flat_map(|b| &b.nodes)
+                    .find(|n| n.inputs.contains(&payload.value_id))
+                    .unwrap();
+                assert_eq!(node.inputs[8], payload.value_id);
+                assert_eq!(node.inputs[9], scale.value_id);
+                assert_eq!(payload.tensor.element_type, ElementType::I8);
+                assert_eq!(scale.tensor.element_type, ElementType::F32);
+                assert_eq!(payload.checkpoint, scale.checkpoint);
+                assert!(
+                    node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID
+                        || node.operation_id.as_str()
+                            == CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID
+                );
+            }
+        }
+    }
+
+    #[test]
     fn same_native_quantized_source_prepares_explicit_f16_and_f32_master_graphs() {
         use ferrum_interfaces::vnext::{NumericalExecutionPolicy, NumericalProfileId};
         let registration = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap());
@@ -8119,7 +8219,10 @@ mod tests {
         let catalog = definition.numerical_profiles();
         assert_eq!(
             catalog
-                .candidates(&NumericalExecutionPolicy::Auto)
+                .candidates(
+                    &NumericalExecutionPolicy::Auto,
+                    ferrum_types::KvStorageFormat::F16
+                )
                 .unwrap()
                 .iter()
                 .map(|p| &p.id)
@@ -8128,7 +8231,10 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .candidates(&NumericalExecutionPolicy::Require(f16_id.clone()))
+                .candidates(
+                    &NumericalExecutionPolicy::Require(f16_id.clone()),
+                    ferrum_types::KvStorageFormat::F16
+                )
                 .unwrap()[0]
                 .id,
             f16_id
@@ -8165,7 +8271,10 @@ mod tests {
             assert_eq!(gguf.numerical_profiles(), safetensors.numerical_profiles());
             for candidate in gguf
                 .numerical_profiles()
-                .candidates(&NumericalExecutionPolicy::Auto)
+                .candidates(
+                    &NumericalExecutionPolicy::Auto,
+                    ferrum_types::KvStorageFormat::F16,
+                )
                 .unwrap()
             {
                 let first = registration.prepare(&gguf, &candidate.id).unwrap();
@@ -8975,7 +9084,9 @@ mod tests {
         );
         let defined = define_from_sources(sources).unwrap();
         let policy = ferrum_interfaces::vnext::NumericalExecutionPolicy::Auto;
-        let startup = defined.model_capabilities(&policy).unwrap();
+        let startup = defined
+            .model_capabilities(&policy, KvStorageFormat::F16)
+            .unwrap();
         let prepared = defined
             .prepare(&F32_MASTER_NUMERICAL_PROFILE_ID.parse().unwrap())
             .unwrap();

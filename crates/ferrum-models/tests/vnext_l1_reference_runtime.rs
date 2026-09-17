@@ -128,6 +128,7 @@ impl ModelFamilyProvider for TinyDenseFamily {
             self.family_id(),
             ContractVersion::new(1, 0),
             vec![NumericalExecutionProfile {
+                kv_storage: Vec::new(),
                 id: profile_id.clone(),
                 family_id: self.family_id().clone(),
                 version: ContractVersion::new(1, 0),

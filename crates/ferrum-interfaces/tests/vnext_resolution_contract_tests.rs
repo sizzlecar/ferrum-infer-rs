@@ -436,6 +436,7 @@ fn numerical_resolution(fixture: &PlanFixture) -> NumericalProfileResolution {
         .unwrap();
     NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Auto,
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,
@@ -579,6 +580,7 @@ fn numerical_resolution_rejects_wrong_request_candidate_prefix_and_static_plan()
     let explicit = NumericalExecutionPolicy::Require(fixture.family.numerical_profile().id.clone());
     assert!(NumericalProfileResolution::from_static_plan(
         explicit.clone(),
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,
@@ -589,6 +591,7 @@ fn numerical_resolution_rejects_wrong_request_candidate_prefix_and_static_plan()
     .is_ok());
     assert!(NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Require(NumericalProfileId::new("fixture.unknown").unwrap()),
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,
@@ -599,6 +602,7 @@ fn numerical_resolution_rejects_wrong_request_candidate_prefix_and_static_plan()
     .is_err());
     assert!(NumericalProfileResolution::from_static_plan(
         explicit.clone(),
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,
@@ -613,6 +617,7 @@ fn numerical_resolution_rejects_wrong_request_candidate_prefix_and_static_plan()
     .is_err());
     assert!(NumericalProfileResolution::from_static_plan(
         explicit,
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,
@@ -635,6 +640,7 @@ fn numerical_policy_is_bound_to_external_context_even_for_self_consistent_wire()
         .unwrap();
     explicit_inputs.numerical_execution = NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Require(fixture.family.numerical_profile().id.clone()),
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &fixture.family,
         &fixture.catalog,

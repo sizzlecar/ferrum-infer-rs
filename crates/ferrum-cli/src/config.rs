@@ -964,12 +964,14 @@ mod tests {
         assert!(crate::source_resolver::define_registered_product_model(
             None,
             &ferrum_types::NumericalExecutionPolicy::Auto,
+            ferrum_types::KvCacheDtype::Fp16,
         )
         .unwrap()
         .is_none());
         assert!(crate::source_resolver::define_registered_product_model(
             None,
             &"qwen3_5.f16".parse().unwrap(),
+            ferrum_types::KvCacheDtype::Fp16,
         )
         .is_err());
     }

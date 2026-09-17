@@ -173,10 +173,9 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub session_cache_max_tokens: Option<usize>,
 
-    /// KV cache element dtype (Dim 5 polymorphism point). Accepts
-    /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
-    /// require model wire-up; today only the kernel + type layer ships.
-    /// Override via `FERRUM_KV_DTYPE` env var.
+    /// KV cache storage: `fp16` (default) or `int8` on supported model/backend
+    /// combinations. INT8 uses separate per-token/head K/V scales; unsupported
+    /// combinations fail during planning. Also configurable as runtime.kv_dtype.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
 
@@ -568,10 +567,41 @@ async fn execute_with_compatibility(
     let mut product_engine_config = product_input.engine_config;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
+    let config_runtime_entries = config.runtime.runtime_config_entries();
+    let configured_runtime_preset = runtime_preset
+        .as_deref()
+        .map(|preset| (preset, RuntimeConfigSource::Cli))
+        .or_else(|| {
+            config
+                .runtime
+                .preset
+                .as_deref()
+                .map(|preset| (preset, RuntimeConfigSource::ConfigFile))
+        });
+    let selected_runtime_preset_name =
+        configured_runtime_preset.map(|(preset, _source)| preset.to_string());
+    let preset_runtime_entries = match configured_runtime_preset {
+        Some((preset, source)) => runtime_preset_entries(preset, source)?,
+        None => Vec::new(),
+    };
+    let mut non_env_runtime_entries = preset_runtime_entries;
+    non_env_runtime_entries.extend(config_runtime_entries);
+    let mut non_env_runtime_entries =
+        RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
+    let mut materialized_runtime_keys =
+        crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
+    let kv_runtime_snapshot = RuntimeConfigSnapshot::capture_current();
+    let effective_kv_dtype = resolve_effective_kv_dtype(
+        kv_dtype.as_deref(),
+        runtime_snapshot_value(&kv_runtime_snapshot, "FERRUM_KV_DTYPE"),
+        config.runtime.kv_dtype.as_deref(),
+    );
+    super::run::apply_kv_dtype_override(&mut product_engine_config, effective_kv_dtype)?;
     let model_sources = product_input.model_sources;
     let defined_model = crate::source_resolver::define_registered_product_model(
         model_sources.as_ref(),
         &product_engine_config.numerical_execution,
+        product_engine_config.kv_cache.dtype,
     )?;
     let vnext_plan_owns_context_capacity = defined_model.is_some();
     let model_chat_template = match defined_model.as_deref() {
@@ -605,30 +635,6 @@ async fn execute_with_compatibility(
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
     println!("{} {}", "Path:".dimmed(), source.local_path.display());
 
-    let config_runtime_entries = config.runtime.runtime_config_entries();
-    let configured_runtime_preset = runtime_preset
-        .as_deref()
-        .map(|preset| (preset, RuntimeConfigSource::Cli))
-        .or_else(|| {
-            config
-                .runtime
-                .preset
-                .as_deref()
-                .map(|preset| (preset, RuntimeConfigSource::ConfigFile))
-        });
-    let selected_runtime_preset_name =
-        configured_runtime_preset.map(|(preset, _source)| preset.to_string());
-    let preset_runtime_entries = match configured_runtime_preset {
-        Some((preset, source)) => runtime_preset_entries(preset, source)?,
-        None => Vec::new(),
-    };
-    let mut non_env_runtime_entries = preset_runtime_entries;
-    non_env_runtime_entries.extend(config_runtime_entries);
-    let mut non_env_runtime_entries =
-        RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    let mut materialized_runtime_keys =
-        crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
-
     let startup_lora_adapters = if lora_specs.is_empty() {
         Vec::new()
     } else {
@@ -650,14 +656,6 @@ async fn execute_with_compatibility(
 
     let host = host.unwrap_or_else(|| config.server.host.clone());
     let port = port.unwrap_or(config.server.port);
-    let kv_runtime_snapshot = RuntimeConfigSnapshot::capture_current();
-    let env_kv_dtype = runtime_snapshot_value(&kv_runtime_snapshot, "FERRUM_KV_DTYPE");
-    let effective_kv_dtype = resolve_effective_kv_dtype(
-        kv_dtype.as_deref(),
-        env_kv_dtype,
-        config.runtime.kv_dtype.as_deref(),
-    );
-
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     // Speculative decoding draft model: resolve the draft path and pass it
@@ -940,7 +938,13 @@ async fn execute_with_compatibility(
     materialized_runtime_keys.dedup();
     let typed_model_capabilities = defined_model
         .as_ref()
-        .map(|defined| defined.model_capabilities(&product_engine_config.numerical_execution))
+        .map(|defined| {
+            defined.model_capabilities(
+                &product_engine_config.numerical_execution,
+                ferrum_types::KvStorageFormat::try_from(product_engine_config.kv_cache.dtype)
+                    .map_err(ferrum_types::FerrumError::config)?,
+            )
+        })
         .transpose()?;
     let startup_auto_config = startup_auto_config(
         &device,
@@ -1140,6 +1144,10 @@ async fn execute_with_compatibility(
                     }
                     (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
                 });
+            write_resolved_execution_config(
+                effective_config_json.as_deref(),
+                engine.cache_metrics_snapshot().as_ref(),
+            )?;
             if product_memory_enabled {
                 cache_allocated_status = Some(engine.status().await);
             }
@@ -1861,6 +1869,38 @@ pub(crate) fn write_startup_config_artifacts(
     Ok(())
 }
 
+/// Replace requested-only startup evidence with the selected plan after the
+/// executor has compiled and initialized successfully. Both run and serve use
+/// this path; legacy executors without numerical evidence leave it unchanged.
+pub(crate) fn write_resolved_execution_config(
+    path: Option<&std::path::Path>,
+    executor_snapshot: Option<&serde_json::Value>,
+) -> Result<()> {
+    let (Some(path), Some(snapshot)) = (path, executor_snapshot) else {
+        return Ok(());
+    };
+    let Some(numerical) = snapshot.get("numerical_execution") else {
+        return Ok(());
+    };
+    let bytes =
+        std::fs::read(path).map_err(|error| ferrum_types::FerrumError::io(error.to_string()))?;
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| ferrum_types::FerrumError::serialization(error.to_string()))?;
+    let object = document.as_object_mut().ok_or_else(|| {
+        ferrum_types::FerrumError::serialization("effective startup config must be an object")
+    })?;
+    object.insert("numerical_execution".into(), numerical.clone());
+    for field in ["kv_storage", "attention_execution_policy"] {
+        if let Some(value) = snapshot.get(field) {
+            object.insert(field.into(), value.clone());
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| ferrum_types::FerrumError::serialization(error.to_string()))?;
+    std::fs::write(path, [bytes.as_slice(), b"\n"].concat())
+        .map_err(|error| ferrum_types::FerrumError::io(error.to_string()))
+}
+
 struct ProfileSinkCliFields {
     commit_sha: Option<String>,
     env_hash: Option<String>,
@@ -1997,7 +2037,9 @@ pub(crate) fn hardware_capabilities_for_device(
         ferrum_types::Device::Metal => HardwareCapabilities {
             backend: "metal".to_string(),
             supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
-            supported_kv_dtypes: vec!["fp16".to_string()],
+            // This is a startup hardware filter. The compiled vNext plan still
+            // proves model/operation support for the requested storage ABI.
+            supported_kv_dtypes: vec!["fp16".to_string(), "int8".to_string()],
             compiled_features: features,
             ..HardwareCapabilities::unknown()
         },
@@ -3644,5 +3686,41 @@ mod tests {
             Some("fp16")
         );
         assert_eq!(resolve_effective_kv_dtype(None, None, None), None);
+    }
+
+    #[test]
+    fn resolved_execution_config_preserves_sources_and_records_actual_kv_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effective.json");
+        let original = serde_json::json!({
+            "resolution_evidence": {"source": "fixture"},
+            "numerical_execution": {"requested": "auto"},
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        // Legacy/non-numerical snapshots must not claim the requested dtype
+        // was selected merely because it appears in the input configuration.
+        write_resolved_execution_config(Some(&path), Some(&serde_json::json!({}))).unwrap();
+        let unchanged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(unchanged, original);
+
+        let selected = serde_json::json!({
+            "numerical_execution": {"selected_profile": "fixture.int8"},
+            "kv_storage": {"source": "resolved_model_plan", "selected": "int8_per_token_head_f32_scale_v1"},
+            "attention_execution_policy": "portable",
+        });
+        write_resolved_execution_config(Some(&path), Some(&selected)).unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            actual["resolution_evidence"],
+            original["resolution_evidence"]
+        );
+        assert_eq!(actual["kv_storage"], selected["kv_storage"]);
+        assert_eq!(
+            actual["numerical_execution"],
+            selected["numerical_execution"]
+        );
+        assert_eq!(actual["attention_execution_policy"], "portable");
     }
 }

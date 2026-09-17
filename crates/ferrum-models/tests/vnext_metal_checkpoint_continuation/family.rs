@@ -228,6 +228,7 @@ impl ModelFamilyProvider for Family {
             &self.id,
             ContractVersion::new(1, 0),
             vec![NumericalExecutionProfile {
+                kv_storage: Vec::new(),
                 id: id(PROFILE),
                 family_id: self.id.clone(),
                 version: ContractVersion::new(1, 0),

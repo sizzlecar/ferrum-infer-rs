@@ -10,9 +10,10 @@ use super::{DefinedProductionModel, PreparedProductionModel};
 pub(super) trait PrepareFamilyFixture: ModelFamilyRegistration {
     fn prepare_fixture(&self, raw: &serde_json::Value) -> Result<PreparedModelFamily, VNextError> {
         let definition = self.define(raw)?;
-        let candidates = definition
-            .numerical_profiles()
-            .candidates(&NumericalExecutionPolicy::Auto)?;
+        let candidates = definition.numerical_profiles().candidates(
+            &NumericalExecutionPolicy::Auto,
+            ferrum_types::KvStorageFormat::F16,
+        )?;
         self.prepare(&definition, &candidates[0].id)
     }
 }
@@ -24,7 +25,10 @@ pub(super) fn prepare_product_fixture(
     let candidates = defined
         .definition()
         .numerical_profiles()
-        .candidates(&NumericalExecutionPolicy::Auto)
+        .candidates(
+            &NumericalExecutionPolicy::Auto,
+            ferrum_types::KvStorageFormat::F16,
+        )
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     defined.prepare(&candidates[0].id)
 }

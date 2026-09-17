@@ -914,10 +914,9 @@ pub struct RunCommand {
     #[arg(long, conflicts_with = "unified_graph_lm_head_eager")]
     pub disable_unified_graph_lm_head_eager: bool,
 
-    /// KV cache element dtype (Dim 5 polymorphism point). Accepts
-    /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
-    /// require model wire-up; today only the kernel + type layer ships.
-    /// Override via `FERRUM_KV_DTYPE` env var.
+    /// KV cache storage: `fp16` (default) or `int8` on supported model/backend
+    /// combinations. INT8 uses separate per-token/head K/V scales; unsupported
+    /// combinations fail during planning. Also configurable as runtime.kv_dtype.
     #[arg(long, value_name = "DTYPE")]
     pub kv_dtype: Option<String>,
 
@@ -1099,10 +1098,21 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = product_input.engine_config;
     engine_config.numerical_execution =
         config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
+    // Family candidates and startup sizing must see the same KV request as
+    // the eventual executor; resolving it after model definition loses this
+    // constraint when the numerical policy is Auto.
+    apply_kv_dtype_override(
+        &mut engine_config,
+        crate::runtime_env::runtime_snapshot_value(
+            &early_effective_runtime_config,
+            "FERRUM_KV_DTYPE",
+        ),
+    )?;
     let model_sources = product_input.model_sources;
     let defined_model = crate::source_resolver::define_registered_product_model(
         model_sources.as_ref(),
         &engine_config.numerical_execution,
+        engine_config.kv_cache.dtype,
     )?;
     let model_definition_for_config = if defined_model.is_none() {
         load_run_model_definition(&source, model_sources.as_deref()).await?
@@ -1196,7 +1206,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
     let typed_model_capabilities = defined_model
         .as_ref()
-        .map(|defined| defined.model_capabilities(&engine_config.numerical_execution))
+        .map(|defined| {
+            defined.model_capabilities(
+                &engine_config.numerical_execution,
+                ferrum_types::KvStorageFormat::try_from(engine_config.kv_cache.dtype)
+                    .map_err(ferrum_types::FerrumError::config)?,
+            )
+        })
         .transpose()?;
     let startup_auto_config = run_startup_auto_config(
         &device,
@@ -1259,6 +1275,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         }
         (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
     };
+    crate::commands::serve::write_resolved_execution_config(
+        cmd.effective_config_json.as_deref(),
+        engine.cache_metrics_snapshot().as_ref(),
+    )?;
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -2813,9 +2833,8 @@ fn run_startup_auto_config(
 }
 
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine
-/// config, validating early. Default is FP16 (the production-validated path on
-/// every backend); selecting INT8 / FP8 is rejected with a helpful message
-/// until model integration ships.
+/// config, validating syntax early. The registered numerical profiles and
+/// actual backend providers validate the requested FP16/INT8 combination.
 pub fn apply_kv_dtype_override(
     engine_config: &mut ferrum_types::EngineConfig,
     raw: Option<&str>,
@@ -2837,10 +2856,9 @@ pub fn apply_kv_dtype_override(
             Ok(())
         }
         KvCacheDtype::Int8 => {
-            // Dim 5 PR C: end-to-end INT8 KV path on CUDA via
-            // LlamaFamilyModel<CudaBackend, KvInt8>. Registry rejects
-            // (CPU/Metal, Int8) and (CUDA Qwen3-MoE, Int8) with helpful
-            // messages.
+            // This is a request, not proof that a backend supports the format.
+            // vNext must bind it into its numerical profile before compilation;
+            // the explicit legacy registry retains its own capability checks.
             engine_config.kv_cache.dtype = KvCacheDtype::Int8;
             Ok(())
         }

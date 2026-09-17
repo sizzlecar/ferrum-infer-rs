@@ -6,10 +6,10 @@
 //! does need GPU types, so it stays in `ferrum-kernels::backend`.
 //!
 //! Each model's KV cache has its own precision independent of the
-//! model's compute precision. vLLM 0.6+ ships INT8 / FP8 KV caches that
-//! halve KV memory at small (<1%) accuracy hit. ferrum's type system
-//! exposes this axis via the `K: KvDtypeKind` parameter on
-//! `KvCache<B, K>` (default `K = KvFp16`).
+//! model's compute precision. The legacy cache exposes this axis via
+//! `K: KvDtypeKind` on `KvCache<B, K>` (default `K = KvFp16`). vNext declares
+//! storage, scales and layout in its numerical/operation contracts instead.
+//! A marker alone does not prove backend integration, memory savings or quality.
 
 /// Marker trait + metadata for a KV cache element type.
 pub trait KvDtypeKind: Send + Sync + 'static {

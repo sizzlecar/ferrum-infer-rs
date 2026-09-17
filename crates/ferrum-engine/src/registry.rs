@@ -1220,7 +1220,10 @@ fn create_registered_vnext_executor(
                     ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
                         *ordinal,
                         device_id,
-                        config.engine_config.runtime.attention_execution_policy,
+                        crate::product_composition::cuda_attention_policy_for_kv(
+                            config.engine_config.runtime.attention_execution_policy,
+                            config.engine_config.kv_cache.dtype,
+                        )?,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     canonical_runtime_policy_fingerprint, CapabilityCatalog, ContractVersion, ExecutionPlan,
-    ModelFamilyDefinition, NumericalExecutionPolicy, NumericalProfileId, PreparedModelFamily,
-    ResolvedRuntimePolicy, VNextError,
+    KvStorageFormat, ModelFamilyDefinition, NumericalExecutionPolicy, NumericalProfileId,
+    PreparedModelFamily, ResolvedRuntimePolicy, VNextError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +37,8 @@ pub struct NumericalProfileResolution {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NumericalProfileResolutionWire {
     requested: NumericalExecutionPolicy,
+    requested_kv_storage: KvStorageFormat,
+    selected_kv_storage: Option<KvStorageFormat>,
     selected_profile: NumericalProfileId,
     selected_version: ContractVersion,
     profile_fingerprint: String,
@@ -63,6 +65,7 @@ impl NumericalProfileResolution {
     #[allow(clippy::too_many_arguments)]
     pub fn from_static_plan(
         requested: NumericalExecutionPolicy,
+        requested_kv_storage: KvStorageFormat,
         definition: &ModelFamilyDefinition,
         family: &PreparedModelFamily,
         capabilities: &CapabilityCatalog,
@@ -78,7 +81,7 @@ impl NumericalProfileResolution {
         {
             return Err(invalid("selected family differs from its typed definition"));
         }
-        let candidates = profiles.candidates(&requested)?;
+        let candidates = profiles.candidates(&requested, requested_kv_storage)?;
         let selected_position = candidates
             .iter()
             .position(|profile| profile.id == selected.id)
@@ -111,6 +114,8 @@ impl NumericalProfileResolution {
         Ok(Self {
             parts: NumericalProfileResolutionWire {
                 requested,
+                requested_kv_storage,
+                selected_kv_storage: selected.kv_storage_format()?,
                 selected_profile: selected.id.clone(),
                 selected_version: selected.version,
                 profile_fingerprint: selected.fingerprint()?,
@@ -127,6 +132,14 @@ impl NumericalProfileResolution {
 
     pub fn requested(&self) -> &NumericalExecutionPolicy {
         &self.parts.requested
+    }
+
+    pub fn requested_kv_storage(&self) -> KvStorageFormat {
+        self.parts.requested_kv_storage
+    }
+
+    pub fn selected_kv_storage(&self) -> Option<KvStorageFormat> {
+        self.parts.selected_kv_storage
     }
 
     pub fn selected_profile(&self) -> &NumericalProfileId {
@@ -151,6 +164,7 @@ impl NumericalProfileResolution {
     ) -> Result<(), VNextError> {
         let rebuilt = Self::from_static_plan(
             self.parts.requested.clone(),
+            self.parts.requested_kv_storage,
             definition,
             family,
             capabilities,

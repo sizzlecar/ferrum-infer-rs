@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
-    ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId, ProgramBlock,
-    ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
-    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
-    VNextError, WeightReference, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    KvStorageFormat, ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId,
+    ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,
+    ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateCheckpointCapability, StateId,
+    StateInitialization, StateLifetime, StateSpec, VNextError, WeightReference,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SWIGLU_MOE_OPERATION_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
@@ -19,16 +20,50 @@ use super::weights::{
     POST_ATTENTION_NORM_ROLE, Q_NORM_ROLE, Q_PROJ_ROLE, ROUTED_DOWN_ROLE, ROUTED_GATE_UP_ROLE,
     ROUTER_ROLE, V_PROJ_ROLE,
 };
-use crate::vnext::numerical::{kv_state, F16LanguageProfile};
+use crate::vnext::numerical::{int8_kv_states, kv_state, F16LanguageProfile};
 
 pub(super) fn numerical_profiles(
     family: &ModelFamilyId,
     semantic: &Qwen3MoeSemanticConfig,
 ) -> Result<FamilyNumericalProfiles, VNextError> {
-    let mut profile = F16LanguageProfile::new(family, super::NUMERICAL_PROFILE_ID)?;
+    let f16 = profile(family, semantic, KvStorageFormat::F16)?;
+    let int8 = profile(
+        family,
+        semantic,
+        KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
+    )?;
+    let automatic = vec![f16.id.clone(), int8.id.clone()];
+    FamilyNumericalProfiles::new(
+        family,
+        ContractVersion::new(1, 1),
+        vec![f16, int8],
+        automatic,
+    )
+}
+
+fn profile(
+    family: &ModelFamilyId,
+    semantic: &Qwen3MoeSemanticConfig,
+    storage: KvStorageFormat,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let int8 = storage == KvStorageFormat::Int8PerTokenHeadF32ScaleV1;
+    let (id, attention, version) = if int8 {
+        (
+            super::INT8_KV_NUMERICAL_PROFILE_ID,
+            CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+            1,
+        )
+    } else {
+        (
+            super::NUMERICAL_PROFILE_ID,
+            CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            2,
+        )
+    };
+    let mut profile = F16LanguageProfile::new(family, id)?;
     for (operation, major, multiply, accumulate) in [
         (TOKEN_EMBEDDING_OPERATION_ID, 1, false, false),
-        (CAUSAL_PAGED_ATTENTION_OPERATION_ID, 2, true, true),
+        (attention, version, true, true),
         (RMS_NORM_OPERATION_ID, 1, true, true),
         (ROUTED_SWIGLU_MOE_OPERATION_ID, 1, true, true),
         (RESIDUAL_ADD_OPERATION_ID, 1, false, true),
@@ -38,18 +73,30 @@ pub(super) fn numerical_profiles(
         profile.operation(operation, major, multiply, accumulate)?;
     }
     for layer in 0..semantic.layer_count {
-        profile.layer(
-            layer,
-            &["attention", "post_attention_norm", "moe", "output"],
-            kv_state(
+        let roles = &["attention", "post_attention_norm", "moe", "output"];
+        if int8 {
+            let (states, declaration) = int8_kv_states(
                 layer,
                 semantic.kv_head_count,
                 semantic.head_dim,
                 semantic.maximum_sequence_tokens,
-            )?,
-        )?;
+                StateCheckpointCapability::Unsupported,
+            )?;
+            profile.layer_with_kv(layer, roles, states, declaration)?;
+        } else {
+            profile.layer(
+                layer,
+                roles,
+                kv_state(
+                    layer,
+                    semantic.kv_head_count,
+                    semantic.head_dim,
+                    semantic.maximum_sequence_tokens,
+                )?,
+            )?;
+        }
     }
-    profile.finish()
+    Ok(profile.into_profile())
 }
 
 pub(super) fn build_semantic_program(
@@ -82,6 +129,18 @@ pub(super) fn build_semantic_program(
             .saturating_add(4),
     );
     let states = profile.states.clone();
+    let int8_kv = profile.kv_storage_format()? == Some(KvStorageFormat::Int8PerTokenHeadF32ScaleV1);
+    let (attention, attention_version) = if int8_kv {
+        (
+            CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+            ContractVersion::new(1, 0),
+        )
+    } else {
+        (
+            CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            ContractVersion::new(2, 0),
+        )
+    };
 
     let input_tokens = value_id("value.input.token_ids")?;
     let mut hidden = value_id("value.hidden.embedding")?;
@@ -105,23 +164,30 @@ pub(super) fn build_semantic_program(
         let layer_index = u32::try_from(layer_index)
             .map_err(|_| invalid_config("semantic.layer_count", "layer index exceeds u32"))?;
         let attention_output = value_id(format!("value.layer.{layer_index}.attention"))?;
-        let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
+        let role = if int8_kv { "kv_quant" } else { "kv" };
+        let kv_value = value_id(format!("value.state.layer.{layer_index}.{role}"))?;
+        let mut inputs = vec![
+            hidden.clone(),
+            layer_weight_value_id(layer_index, INPUT_NORM_ROLE)?,
+            layer_weight_value_id(layer_index, Q_PROJ_ROLE)?,
+            layer_weight_value_id(layer_index, K_PROJ_ROLE)?,
+            layer_weight_value_id(layer_index, V_PROJ_ROLE)?,
+            layer_weight_value_id(layer_index, O_PROJ_ROLE)?,
+            layer_weight_value_id(layer_index, Q_NORM_ROLE)?,
+            layer_weight_value_id(layer_index, K_NORM_ROLE)?,
+            kv_value,
+        ];
+        if int8_kv {
+            inputs.push(value_id(format!(
+                "value.state.layer.{layer_index}.kv_scale"
+            ))?);
+        }
         nodes.push(ProgramNode {
             id: node_id(format!("node.layer.{layer_index}.attention"))?,
-            operation_id: operation_id(CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
-            required_version: ContractVersion::new(2, 0),
+            operation_id: operation_id(attention)?,
+            required_version: attention_version,
             work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
-            inputs: vec![
-                hidden.clone(),
-                layer_weight_value_id(layer_index, INPUT_NORM_ROLE)?,
-                layer_weight_value_id(layer_index, Q_PROJ_ROLE)?,
-                layer_weight_value_id(layer_index, K_PROJ_ROLE)?,
-                layer_weight_value_id(layer_index, V_PROJ_ROLE)?,
-                layer_weight_value_id(layer_index, O_PROJ_ROLE)?,
-                layer_weight_value_id(layer_index, Q_NORM_ROLE)?,
-                layer_weight_value_id(layer_index, K_NORM_ROLE)?,
-                kv_value,
-            ],
+            inputs,
             outputs: vec![attention_output.clone()],
             attributes: BTreeMap::from([
                 attribute("query_heads", semantic.attention_head_count)?,

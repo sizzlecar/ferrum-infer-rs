@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use ferrum_types::{NumericalExecutionPolicy, NumericalProfileId};
+pub use ferrum_types::{KvStorageFormat, NumericalExecutionPolicy, NumericalProfileId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -10,6 +10,9 @@ use super::{
     ContractVersion, ElementType, ModelFamilyId, ModelProgram, OperationId, ProgramValueId,
     ResolvedTensorSpec, StateSpec, VNextError,
 };
+
+mod kv_storage;
+pub use kv_storage::KvStateStorage;
 
 /// The referenced operation version defines its internal ordering and rounding
 /// points. Arithmetic types are explicit here; copying/indexing operations have
@@ -42,6 +45,9 @@ pub struct NumericalExecutionProfile {
     /// State shapes, initialization and capacity are shared with the final
     /// program, permitting startup sizing without constructing a dummy program.
     pub states: Vec<StateSpec>,
+    /// Typed association of every causal KV payload and its optional scales.
+    /// Empty means the family declares no applicable KV state.
+    pub kv_storage: Vec<KvStateStorage>,
     pub operations: Vec<NumericalOperationContract>,
 }
 
@@ -104,11 +110,14 @@ impl NumericalExecutionProfile {
             state.tensor.validate("numerical_profile.state")?;
             state.capacity_demand.validate(state.tensor.byte_len()?)?;
         }
+        self.kv_storage_format()?;
         Ok(())
     }
 
     pub(crate) fn normalize(&mut self) {
         self.states.sort_by(|left, right| left.id.cmp(&right.id));
+        self.kv_storage
+            .sort_by(|left, right| left.payload_state().cmp(right.payload_state()));
         self.operations
             .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
     }
@@ -116,6 +125,10 @@ impl NumericalExecutionProfile {
     pub fn activation_type(&self) -> Result<ElementType, VNextError> {
         self.validate()?;
         Ok(self.boundaries[&self.primary_activation])
+    }
+
+    pub fn kv_storage_format(&self) -> Result<Option<KvStorageFormat>, VNextError> {
+        kv_storage::validate_kv_storage(&self.family_id, &self.kv_storage, &self.states)
     }
 
     pub fn fingerprint(&self) -> Result<String, VNextError> {
@@ -278,6 +291,7 @@ impl FamilyNumericalProfiles {
     pub fn candidates(
         &self,
         policy: &NumericalExecutionPolicy,
+        kv_storage: KvStorageFormat,
     ) -> Result<Vec<&NumericalExecutionProfile>, VNextError> {
         let ids = match policy {
             NumericalExecutionPolicy::Auto => self.auto_preference.iter().collect::<Vec<_>>(),
@@ -289,6 +303,29 @@ impl FamilyNumericalProfiles {
                 "no numerical profile is qualified for Auto",
             ));
         }
-        ids.into_iter().map(|id| self.resolve(id)).collect()
+        let mut candidates = Vec::new();
+        for id in ids {
+            let profile = self.resolve(id)?;
+            // F16 is the existing default, including programs with no causal
+            // KV state. An explicit INT8 request must actually change KV storage.
+            let matches = profile
+                .kv_storage_format()?
+                .map_or(kv_storage == KvStorageFormat::F16, |actual| {
+                    actual == kv_storage
+                });
+            if matches {
+                candidates.push(profile);
+            } else if matches!(policy, NumericalExecutionPolicy::Require(_)) {
+                return Err(invalid(&profile.family_id, format!(
+                    "numerical profile {} conflicts with requested KV storage {kv_storage}; select a compatible profile and kv_dtype", profile.id
+                )));
+            }
+        }
+        if candidates.is_empty() {
+            return Err(invalid(&self.profiles[0].family_id, format!(
+                "no qualified numerical profile supports KV storage {kv_storage}; it may be unsupported or not applicable to this family; use fp16"
+            )));
+        }
+        Ok(candidates)
     }
 }

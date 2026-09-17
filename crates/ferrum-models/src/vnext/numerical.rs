@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
-    ContractVersion, ElementType, FamilyNumericalProfiles, ModelFamilyId,
+    ContractVersion, ElementType, FamilyNumericalProfiles, KvStateStorage, ModelFamilyId,
     NumericalExecutionProfile, NumericalOperationContract, NumericalProfileId, OperationId,
     ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, StateCapacityDemand,
     StateCheckpointCapability, StateId, StateInitialization, StateLifetime, StateSpec, VNextError,
@@ -34,6 +34,38 @@ pub(super) fn kv_state(
         initialization: StateInitialization::None,
         checkpoint: StateCheckpointCapability::Unsupported,
     })
+}
+
+pub(super) fn int8_kv_states(
+    layer: u64,
+    heads: u64,
+    head_dim: u64,
+    maximum_tokens: u64,
+    checkpoint: StateCheckpointCapability,
+) -> Result<(Vec<StateSpec>, KvStateStorage), VNextError> {
+    let mut payload = kv_state(layer, heads, head_dim, maximum_tokens)?;
+    payload.id = StateId::new(format!("state.layer.{layer}.kv_quant"))?;
+    payload.value_id = ProgramValueId::new(format!("value.state.layer.{layer}.kv_quant"))?;
+    payload.tensor.element_type = ElementType::I8;
+    payload.capacity_demand = StateCapacityDemand::TokenScaled {
+        bytes_per_token: payload.tensor.byte_len()?,
+        maximum_tokens,
+    };
+    payload.checkpoint = checkpoint;
+    let mut scales = payload.clone();
+    scales.id = StateId::new(format!("state.layer.{layer}.kv_scale"))?;
+    scales.value_id = ProgramValueId::new(format!("value.state.layer.{layer}.kv_scale"))?;
+    scales.tensor.dimensions = vec![2, heads];
+    scales.tensor.element_type = ElementType::F32;
+    scales.capacity_demand = StateCapacityDemand::TokenScaled {
+        bytes_per_token: scales.tensor.byte_len()?,
+        maximum_tokens,
+    };
+    let declaration = KvStateStorage::Int8PerTokenHeadF32ScaleV1 {
+        payload_state: payload.id.clone(),
+        scale_state: scales.id.clone(),
+    };
+    Ok((vec![payload, scales], declaration))
 }
 
 /// A family with one existing F16 boundary ABI still explicitly declares all
@@ -74,6 +106,7 @@ impl F16LanguageProfile {
                 ]),
                 primary_activation,
                 states: Vec::new(),
+                kv_storage: Vec::new(),
                 operations: Vec::new(),
             },
         })
@@ -92,10 +125,24 @@ impl F16LanguageProfile {
         roles: &[&str],
         state: StateSpec,
     ) -> Result<(), VNextError> {
+        let declaration = KvStateStorage::F16 {
+            state: state.id.clone(),
+        };
+        self.layer_with_kv(index, roles, vec![state], declaration)
+    }
+
+    pub(super) fn layer_with_kv(
+        &mut self,
+        index: u64,
+        roles: &[&str],
+        states: Vec<StateSpec>,
+        declaration: KvStateStorage,
+    ) -> Result<(), VNextError> {
         for role in roles {
             self.boundary(format!("value.layer.{index}.{role}"))?;
         }
-        self.profile.states.push(state);
+        self.profile.states.extend(states);
+        self.profile.kv_storage.push(declaration);
         Ok(())
     }
 
@@ -124,5 +171,9 @@ impl F16LanguageProfile {
             vec![self.profile],
             vec![preferred],
         )
+    }
+
+    pub(super) fn into_profile(self) -> NumericalExecutionProfile {
+        self.profile
     }
 }

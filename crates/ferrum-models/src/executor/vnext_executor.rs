@@ -9694,6 +9694,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "numerical_execution".to_owned(),
             serde_json::json!(self.resolved_plan.parts().numerical_execution),
         );
+        let numerical = &self.resolved_plan.parts().numerical_execution;
+        fields.insert(
+            "kv_storage".to_owned(),
+            serde_json::json!({
+                "source": "resolved_model_plan",
+                "requested": numerical.requested_kv_storage(),
+                "selected": numerical.selected_kv_storage(),
+                "numerical_profile": numerical.selected_profile(),
+            }),
+        );
         snapshot
     }
 }

@@ -5648,6 +5648,8 @@ async fn health_handler(
         "config": runtime_config,
         "auto_config": auto_config,
         "admission": admission,
+        "numerical_execution": engine_cache.as_ref().and_then(|snapshot| snapshot.get("numerical_execution")),
+        "kv_storage": engine_cache.as_ref().and_then(|snapshot| snapshot.get("kv_storage")),
         "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
         "execution_attribution": execution_attribution,
         "lora": engine_lora.unwrap_or_else(|| serde_json::json!({

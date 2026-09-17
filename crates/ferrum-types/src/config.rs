@@ -656,11 +656,10 @@ pub enum KvCacheDtype {
     /// BF16 K/V — same memory cost as FP16, slightly different precision.
     /// Marker only; no backend impl ships yet.
     Bf16,
-    /// INT8 K/V with per-token per-kv-head FP16 scale (vLLM-style).
-    /// Halves KV memory at small (<1%) accuracy hit. CUDA kernels
-    /// land via `BackendKvDtype<KvInt8>` (PR #131); model wire-up
-    /// (`KvCacheQuant<B, KvInt8>` through the model decode loop) is
-    /// the only remaining step.
+    /// INT8 K/V. The selected execution plan declares the scale and layout ABI;
+    /// vNext uses per-token/head F32 scales, while legacy CUDA uses F16 scales.
+    /// This is an explicit lossy storage request, subject to model/backend
+    /// support. Memory savings include scale, alignment and workspace overhead.
     Int8,
     /// FP8 (E4M3) K/V. Marker only; CUDA kernels pending.
     Fp8,

@@ -631,8 +631,10 @@ mod cuda {
                     binding.key
                 ))
             })?;
-            let capabilities =
-                prepared.model_capabilities(&ferrum_types::NumericalExecutionPolicy::Auto)?;
+            let capabilities = prepared.model_capabilities(
+                &ferrum_types::NumericalExecutionPolicy::Auto,
+                ferrum_types::KvStorageFormat::F16,
+            )?;
             let quantization = capabilities
                 .quantization
                 .unwrap_or_else(|| "none".to_owned());
