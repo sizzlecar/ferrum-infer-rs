@@ -13,13 +13,15 @@ use ferrum_interfaces::vnext::{
     last_token_masked_argmax_f32_contract, logit_softcap_contract, residual_add_contract,
     residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
-    DeviceBatchingForm, DeviceId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, EngineProviderDescriptor, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    OperationRuntimeRegistry, PreparedModelFamily, ProfilePhase, ProviderId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    ContractVersion, DeviceBatchingForm, DeviceId, DeviceReusableExecutionTopologyFingerprint,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EncodedDeviceOperation, EngineProviderDescriptor,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, OperationRuntimeRegistry, PreparedModelFamily, ProfilePhase,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderId,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
@@ -716,8 +718,19 @@ impl CudaTokenEmbeddingProvider {
             ),
         };
         let contract = contract.map_err(contract_error)?;
+        // Lookup reads immutable weights and the exact immediate token IDs;
+        // it has no sequence state or partition-dependent accumulation. Its
+        // completed output can accompany either KV state's retained prefix.
         let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+            native_io::descriptor(runtime, &contract, provider, capability, estimator)?
+                .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+                    ProviderCheckpointContract::new(
+                        CheckpointInputDependency::ExactTokenPrefix,
+                        CheckpointBoundaryConstraint::any_positive(),
+                        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+                    )
+                    .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+                ));
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP.to_owned()))
