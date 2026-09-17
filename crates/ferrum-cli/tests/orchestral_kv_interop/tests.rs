@@ -174,6 +174,118 @@ fn request_bundle(root: &Path, id: &str, generated_history: bool) -> PathBuf {
     directory
 }
 
+fn startup_bundle(root: &Path, id: &str) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir_all(&directory).unwrap();
+    let schema = ferrum_types::OBSERVABILITY_PROFILE_SCHEMA_VERSION;
+    let request = json!({
+        "schema_version":schema, "request_id":id, "entrypoint":"serve",
+        "backend":"actual", "actual_model_smoke":true, "sanitized":true,
+        "replay_command":"fixture serve command"
+    });
+    for path in [directory.join("request.json"), root.join("request.json")] {
+        write_json(path, &request).unwrap();
+    }
+    fs::write(root.join("replay_command.txt"), "fixture serve command\n").unwrap();
+    write_json(
+        directory.join("prompt_token_ids.json"),
+        &json!({
+            "schema_version":schema, "request_id":id, "token_ids":null,
+            "token_count":null,
+            "unavailable_reason":"startup or non-run request has no rendered prompt token dump in WP9 L0"
+        }),
+    )
+    .unwrap();
+    write_json(
+        directory.join("sampling_params.json"),
+        &json!({
+            "schema_version":schema, "request_id":id, "sampling_params":null,
+            "unavailable_reason":"sampling params unavailable for this replay bundle kind in WP9 L0"
+        }),
+    )
+    .unwrap();
+    write_json(
+        directory.join("output_token_ids.json"),
+        &json!({
+            "schema_version":schema, "request_id":id, "token_ids":[],
+            "token_count":0, "finish_reason":null
+        }),
+    )
+    .unwrap();
+    directory
+}
+
+#[test]
+fn initial_model_request_comparison_accepts_startup_bundles_and_root_aliases() {
+    let temporary = tempfile::tempdir().unwrap();
+    for dtype in ["fp16", "int8"] {
+        let root = temporary.path().join(dtype).join("model-requests");
+        // Neither directory has a role-bearing name. Only its product evidence
+        // may distinguish startup from a real inference request.
+        startup_bundle(&root, "observation");
+        request_bundle(&root, "inference", false);
+    }
+    let comparison = request_capture::compare_first_requests(temporary.path()).unwrap();
+    assert_eq!(comparison["equal"], true);
+    assert_eq!(comparison["fp16"]["prompt_token_count"], 3);
+}
+
+#[test]
+fn initial_model_request_comparison_rejects_malformed_startup_and_http_evidence() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut startup = PathBuf::new();
+    for dtype in ["fp16", "int8"] {
+        let root = temporary.path().join(dtype).join("model-requests");
+        startup = startup_bundle(&root, "observation");
+        request_bundle(&root, "inference", false);
+    }
+    let path = startup.join("request.json");
+    let original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    // An HTTP record cannot evade strict validation by carrying otherwise
+    // valid startup metadata, including an explicitly null HTTP field.
+    for (field, value) in [("method", json!("GET")), ("http", Value::Null)] {
+        let mut malformed = original.clone();
+        malformed[field] = value;
+        write_json(&path, &malformed).unwrap();
+        let error = request_capture::compare_first_requests(temporary.path()).unwrap_err();
+        assert!(error.to_string().contains("HTTP request-dump"), "{error:#}");
+    }
+    write_json(&path, &original).unwrap();
+    let tokens_path = startup.join("prompt_token_ids.json");
+    let mut tokens: Value = serde_json::from_slice(&fs::read(&tokens_path).unwrap()).unwrap();
+    tokens["token_ids"] = json!([11]);
+    tokens["token_count"] = json!(1);
+    write_json(tokens_path, &tokens).unwrap();
+    let error = request_capture::compare_first_requests(temporary.path()).unwrap_err();
+    assert!(error.to_string().contains("startup evidence"), "{error:#}");
+}
+
+#[test]
+fn initial_model_request_comparison_validates_root_aliases() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut root = PathBuf::new();
+    for dtype in ["fp16", "int8"] {
+        root = temporary.path().join(dtype).join("model-requests");
+        startup_bundle(&root, "observation");
+        request_bundle(&root, "inference", false);
+    }
+    let command_path = root.join("replay_command.txt");
+    fs::write(&command_path, "different command\n").unwrap();
+    let error = request_capture::compare_first_requests(temporary.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("replay command alias"),
+        "{error:#}"
+    );
+    fs::remove_file(command_path).unwrap();
+    let error = request_capture::compare_first_requests(temporary.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("incomplete request-dump root aliases"),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn initial_model_request_comparison_uses_actual_tokens_and_effective_sampling() {
     let temporary = tempfile::tempdir().unwrap();

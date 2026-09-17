@@ -7,23 +7,84 @@ fn read_json(path: &Path) -> Result<Value> {
         .with_context(|| format!("read request evidence {}", path.display()))
 }
 
+fn is_startup_bundle(bundle: &Path, request: &Value) -> Result<bool> {
+    // The current product's legacy startup bundle has no operation/phase
+    // discriminator. Recognize its complete non-inference evidence, never an
+    // ID prefix or merely a missing HTTP method. Any HTTP-shaped record still
+    // goes through the request checks below, including malformed requests.
+    if ["method", "endpoint", "http"]
+        .iter()
+        .any(|key| request.get(key).is_some())
+    {
+        return Ok(false);
+    }
+    ensure!(
+        request["backend"] == "actual" && request["actual_model_smoke"] == true,
+        "unrecognized non-HTTP request-dump record"
+    );
+    let tokens = read_json(&bundle.join("prompt_token_ids.json"))?;
+    let sampling = read_json(&bundle.join("sampling_params.json"))?;
+    let output = read_json(&bundle.join("output_token_ids.json"))?;
+    for evidence in [&tokens, &sampling, &output] {
+        ensure!(
+            evidence["schema_version"] == ferrum_types::OBSERVABILITY_PROFILE_SCHEMA_VERSION
+                && evidence["request_id"] == request["request_id"],
+            "mismatched startup bundle evidence"
+        );
+    }
+    ensure!(
+        tokens.get("token_ids") == Some(&Value::Null)
+            && tokens.get("token_count") == Some(&Value::Null)
+            && tokens["unavailable_reason"]
+                == "startup or non-run request has no rendered prompt token dump in WP9 L0"
+            && sampling.get("sampling_params") == Some(&Value::Null)
+            && sampling["unavailable_reason"]
+                == "sampling params unavailable for this replay bundle kind in WP9 L0"
+            && output["token_ids"].as_array().is_some_and(Vec::is_empty)
+            && output["token_count"] == 0
+            && output.get("finish_reason") == Some(&Value::Null),
+        "non-HTTP bundle does not declare the product startup evidence"
+    );
+    Ok(true)
+}
+
 fn first_request_bundle(directory: &Path) -> Result<(PathBuf, Value)> {
     let mut candidates = Vec::new();
+    let mut records = Vec::new();
+    let mut root_aliases = 0;
     // Only inspect this case's newly created product dump directory. UUID
     // filenames and filesystem iteration order do not establish request order.
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        ensure!(entry.file_type()?.is_dir(), "unexpected request-dump entry");
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            ensure!(
+                matches!(
+                    entry.file_name().to_str(),
+                    Some("request.json" | "replay_command.txt")
+                ),
+                "unexpected request-dump root file"
+            );
+            root_aliases += 1;
+            continue;
+        }
+        ensure!(file_type.is_dir(), "unexpected request-dump entry");
         let bundle = entry.path();
         let request = read_json(&bundle.join("request.json"))?;
         ensure!(
             request["schema_version"] == ferrum_types::OBSERVABILITY_PROFILE_SCHEMA_VERSION
                 && request["entrypoint"] == "serve"
-                && request["method"] == "POST"
-                && request["endpoint"] == "/v1/chat/completions"
                 && request["request_id"].as_str()
                     == bundle.file_name().and_then(|name| name.to_str()),
             "unrecognized request-dump schema or identity"
+        );
+        records.push(request.clone());
+        if is_startup_bundle(&bundle, &request)? {
+            continue;
+        }
+        ensure!(
+            request["method"] == "POST" && request["endpoint"] == "/v1/chat/completions",
+            "unrecognized HTTP request-dump method or endpoint"
         );
         let body = read_json(&bundle.join("replay_body.json"))?;
         ensure!(request["http"]["body"] == body, "inconsistent replay body");
@@ -40,6 +101,23 @@ fn first_request_bundle(directory: &Path) -> Result<(PathBuf, Value)> {
         {
             candidates.push((bundle, body));
         }
+    }
+    if root_aliases != 0 {
+        // write_replay_bundle publishes this pair as aliases to one complete
+        // bundle. They are not additional requests, but must agree with it.
+        ensure!(root_aliases == 2, "incomplete request-dump root aliases");
+        let alias = read_json(&directory.join("request.json"))?;
+        ensure!(
+            records.contains(&alias),
+            "root request alias has no matching bundle"
+        );
+        let command = alias["replay_command"]
+            .as_str()
+            .context("root request alias has no replay command")?;
+        ensure!(
+            fs::read_to_string(directory.join("replay_command.txt"))? == format!("{command}\n"),
+            "root replay command alias differs from its bundle"
+        );
     }
     ensure!(
         candidates.len() == 1,
