@@ -93,6 +93,12 @@ fn names(backend: Backend) -> Vec<String> {
                 "int8_prepare_marks_nonfinite_input_in_device_status",
                 "int8_tiled_prefill_and_direct_decode_match_reference_across_payload_page_and_tail",
                 "int8_tiled_dispatch_accounts_for_bounded_dequantization_memory",
+                "int8_general_attention_accepts_a_partial_simd_head",
+                "int8_optimized_attention_reads_across_an_independent_scale_page",
+            ]),
+            ("causal_attention::conformance_tests::int8::packed", &[
+                "packed_partial_head_f16_preserves_contiguous_rows_and_independent_histories",
+                "packed_partial_head_int8_preserves_contiguous_rows_and_independent_histories",
             ]),
             ("causal_attention::shape_tests", &[
                 "int8_state_geometry_counts_independent_pages_and_omits_unused_split_decode_scratch",

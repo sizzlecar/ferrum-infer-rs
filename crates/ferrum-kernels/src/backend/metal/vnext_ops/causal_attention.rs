@@ -1068,9 +1068,13 @@ impl ScratchLayout {
     }
 
     fn token_offset(self, base: u64, token_start: u64, width: u64) -> Result<u64, String> {
+        // Segment reservations retain alignment padding, but projection and
+        // attention kernels write contiguous rows within each segment. Packed
+        // participants must use that same physical row stride.
         base.checked_add(
-            aligned_bytes(width, ElementType::F16.size_bytes())?
-                .checked_mul(token_start)
+            width
+                .checked_mul(ElementType::F16.size_bytes())
+                .and_then(|row_bytes| row_bytes.checked_mul(token_start))
                 .ok_or_else(|| {
                     "Metal causal-attention token scratch offset overflows".to_owned()
                 })?,

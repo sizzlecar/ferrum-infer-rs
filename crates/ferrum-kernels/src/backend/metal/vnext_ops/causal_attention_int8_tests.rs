@@ -4,6 +4,9 @@
 use super::*;
 use std::mem::size_of;
 
+#[path = "causal_attention_packed_tests.rs"]
+mod packed;
+
 struct State {
     payload: Vec<Buffer>,
     scales: Vec<Buffer>,
@@ -119,7 +122,7 @@ impl Inputs {
             query_heads: self.heads as u32,
             key_value_heads: self.kv_heads as u32,
             head_dim: self.dim as u32,
-            rope_dim: (self.dim / 2) as u32,
+            rope_dim: (self.dim / 4 * 2) as u32,
             query_projection_stride: (self.heads * self.dim * if self.gate { 2 } else { 1 }) as u32,
             query_head_stride: (self.dim * if self.gate { 2 } else { 1 }) as u32,
             kv_projection_stride: (self.kv_heads * self.dim) as u32,
@@ -509,4 +512,60 @@ fn int8_tiled_dispatch_accounts_for_bounded_dequantization_memory() {
         int8_attention_dispatch_plan(&params, 32 * 1024).kind,
         AttentionDispatchKind::TiledPrefill
     );
+}
+
+#[test]
+fn int8_general_attention_accepts_a_partial_simd_head() {
+    let device = Device::system_default().expect("INT8 partial-head conformance requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
+    let inputs = Inputs::new(9, 2, 1, 34, true);
+    let state = State::new(&device, inputs.tokens, inputs.kv_heads, inputs.dim);
+    let output = inputs.execute(&device, &queue, &pipelines, &state, 0, true);
+    assert_eq!(output.error, 0);
+    assert_eq!(output.dispatch, Some(AttentionDispatchKind::General));
+    for (actual, expected) in output
+        .attention
+        .iter()
+        .zip(attention_reference(&inputs, &output, &state, 0))
+    {
+        assert!((actual.to_f32() - expected).abs() <= 0.001);
+    }
+}
+
+#[test]
+fn int8_optimized_attention_reads_across_an_independent_scale_page() {
+    let device = Device::system_default().expect("INT8 scale-page conformance requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
+    let (heads, kv_heads, dim) = (2, 1, 128);
+    let prefix_tokens = VNEXT_KV_PAGE_BYTES as usize / (2 * kv_heads * size_of::<f32>()) - 1;
+    let state = State::new(&device, prefix_tokens + 10, kv_heads, dim);
+    let prefix = Inputs::new(prefix_tokens, heads, kv_heads, dim, false);
+    // Initialize the existing history without quadratic prefix attention work.
+    assert_eq!(
+        prefix
+            .execute(&device, &queue, &pipelines, &state, 0, false)
+            .error,
+        0
+    );
+    for (start, tokens, expected_dispatch) in [
+        (prefix_tokens, 9, AttentionDispatchKind::TiledPrefill),
+        (prefix_tokens + 9, 1, AttentionDispatchKind::DirectDecode),
+    ] {
+        let inputs = Inputs::new(tokens, heads, kv_heads, dim, false);
+        let output = inputs.execute(&device, &queue, &pipelines, &state, start, true);
+        assert_eq!(output.error, 0);
+        assert_eq!(output.dispatch, Some(expected_dispatch));
+        for (actual, expected) in output
+            .attention
+            .iter()
+            .zip(attention_reference(&inputs, &output, &state, start))
+        {
+            assert!(
+                (actual.to_f32() - expected).abs() <= 0.001,
+                "{expected_dispatch:?} read across a scale page: {actual} versus {expected}"
+            );
+        }
+    }
 }
