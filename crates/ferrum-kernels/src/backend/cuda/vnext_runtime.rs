@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use cudarc::cublas::{result::CublasError, CudaBlas};
-use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError, HostSlice,
+    PinnedHostSlice,
+};
 #[cfg(feature = "vllm-marlin")]
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 #[cfg(feature = "vllm-marlin")]
@@ -275,6 +278,52 @@ pub(crate) struct CudaCommandExecutable {
     enqueue: Mutex<EnqueueAction>,
 }
 
+/// A snapshot of provider numerical status, retained by the submission rather
+/// than a cached graph. Typed program-binding slots are non-aliasing throughout
+/// the wave and can be sampled after replay. Eager scratch must be sampled
+/// immediately after its command before another operation can reuse it.
+struct CudaCompletionReadback {
+    source: CudaBufferRegion,
+    offsets: Vec<u64>,
+    failure_mask: u32,
+    deferred: bool,
+    host: Mutex<PinnedHostSlice<u32>>,
+}
+
+impl CudaCompletionReadback {
+    fn enqueue(&self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
+        let mut host = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The guard records the pinned allocation's own completion event so an
+        // exceptional enqueue path cannot free host memory still used by DMA.
+        let (values, _guard) = unsafe { host.stream_synced_mut_slice(stream) };
+        for (value, offset) in values.iter_mut().zip(&self.offsets) {
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(
+                    std::slice::from_mut(value),
+                    self.source.device_ptr + offset,
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|error| CudaDeviceRuntimeError::driver("numerical status snapshot", error))?;
+        }
+        Ok(())
+    }
+
+    fn failed(&self) -> Result<bool, CudaDeviceRuntimeError> {
+        let host = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let values = host.as_slice().map_err(|error| {
+            CudaDeviceRuntimeError::driver("numerical status completion", error)
+        })?;
+        Ok(values.iter().any(|value| value & self.failure_mask != 0))
+    }
+}
+
 pub(crate) struct CudaProgramBindingWrite {
     destination_offset_bytes: u64,
     payload: Box<[u8]>,
@@ -476,6 +525,7 @@ fn coalesce_program_binding_transfers(
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
+    completion_checks: Vec<Arc<CudaCompletionReadback>>,
     runtime_instance: u64,
     operation: &'static str,
     batching_form: DeviceBatchingForm,
@@ -534,6 +584,64 @@ impl fmt::Debug for CudaDeviceCommand {
 }
 
 impl CudaDeviceCommand {
+    pub(crate) fn with_numerical_status(
+        mut self,
+        source: CudaBufferRegion,
+        offsets: Vec<u64>,
+        failure_mask: u32,
+        deferred: bool,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if source.runtime_instance != self.runtime_instance
+            || offsets.is_empty()
+            || failure_mask == 0
+            || offsets.iter().any(|offset| {
+                offset % 4 != 0
+                    || offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > source.length_bytes)
+            })
+            || (deferred
+                && self.program_binding_patch.as_ref().is_none_or(|patch| {
+                    patch.destination.device_ptr != source.device_ptr
+                        || patch.destination.length_bytes != source.length_bytes
+                }))
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "numerical status differs from its owned CUDA binding",
+            ));
+        }
+        let mut host = unsafe {
+            source
+                ._allocation
+                ._base
+                .context()
+                .alloc_pinned::<u32>(offsets.len())
+        }
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver("numerical status host allocation", error)
+        })?;
+        host.as_mut_slice()
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("numerical status initialization", error)
+            })?
+            .fill(0);
+        self.completion_checks
+            .push(Arc::new(CudaCompletionReadback {
+                source,
+                offsets,
+                failure_mask,
+                deferred,
+                host: Mutex::new(host),
+            }));
+        if !deferred {
+            // The submission-specific host destination must not enter a cached
+            // CUDA graph. Typed, non-aliasing binding checks keep replay enabled.
+            self.replay_key = None;
+            self.reusable_address_scope = None;
+        }
+        Ok(self)
+    }
+
     /// Backend-local operation providers use this constructor after translating
     /// every logical invocation view into owned physical regions.
     pub(crate) fn operation(
@@ -759,6 +867,7 @@ impl CudaDeviceCommand {
             replay_gap_reason,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks: Vec::new(),
         })
     }
 
@@ -801,6 +910,7 @@ impl CudaDeviceCommand {
             replay_gap_reason,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks: Vec::new(),
         })
     }
 
@@ -832,6 +942,7 @@ impl CudaDeviceCommand {
             replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks: Vec::new(),
         }
     }
 
@@ -896,6 +1007,7 @@ impl CudaDeviceCommand {
                 fence_dependencies,
             }),
             reusable_execution: None,
+            completion_checks: Vec::new(),
         })
     }
 
@@ -983,6 +1095,7 @@ impl CudaDeviceCommand {
             replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: Some(invocation),
+            completion_checks: Vec::new(),
         }
     }
 
@@ -1029,6 +1142,15 @@ impl CudaDeviceCommand {
             ));
         }
 
+        let completion_checks = commands
+            .iter_mut()
+            .flat_map(|command| std::mem::take(&mut command.completion_checks))
+            .collect::<Vec<_>>();
+        if completion_checks.iter().any(|check| !check.deferred) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "program-binding prelude has eager numerical checks",
+            ));
+        }
         let mut patches = commands
             .iter_mut()
             .map(|command| {
@@ -1263,6 +1385,7 @@ impl CudaDeviceCommand {
             replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks,
         }])
     }
 
@@ -1283,6 +1406,7 @@ impl CudaDeviceCommand {
                     || command.transfer_command_count == 0
                     || command.replay_key.is_some()
                     || command.reusable_address_scope.is_some()
+                    || !command.completion_checks.is_empty()
             })
         {
             return Err(CudaDeviceRuntimeError::contract(
@@ -1323,6 +1447,7 @@ impl CudaDeviceCommand {
             replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks: Vec::new(),
         }])
     }
 
@@ -1340,7 +1465,15 @@ impl CudaDeviceCommand {
             .enqueue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        enqueue(stream, blas, &executable.regions, &executable.host_storage)
+        enqueue(stream, blas, &executable.regions, &executable.host_storage)?;
+        for check in self
+            .completion_checks
+            .iter()
+            .filter(|check| !check.deferred)
+        {
+            check.enqueue(stream)?;
+        }
+        Ok(())
     }
 
     pub(crate) const fn replay_key(&self) -> Option<CudaCommandReplayKey> {
@@ -1819,6 +1952,24 @@ impl fmt::Debug for CudaDeviceFence {
 }
 
 impl CudaDeviceFence {
+    fn numerical_terminal(&self) -> DeviceTerminal<CudaDeviceRuntimeError> {
+        for check in self
+            ._commands
+            .iter()
+            .flat_map(|command| &command.completion_checks)
+        {
+            match check.failed() {
+                Ok(false) => {}
+                Ok(true) => {
+                    return DeviceTerminal::FailedButQuiescent(CudaDeviceRuntimeError::contract(
+                        "CUDA INT8 KV write encountered non-finite values",
+                    ))
+                }
+                Err(error) => return DeviceTerminal::FailedButQuiescent(error),
+            }
+        }
+        DeviceTerminal::Succeeded
+    }
     fn mark_terminal(&self) {
         if !self.terminal_accounted.swap(true, Ordering::AcqRel) {
             self.stream_state.finish_one();
@@ -3966,6 +4117,21 @@ impl DeviceRuntime for CudaDeviceRuntime {
             }
             index += 1;
         }
+        // Snapshot non-aliasing typed binding statuses after all eager or
+        // replayed computation and before the fence. The prelude commands own
+        // both their source regions and pinned host destinations until terminal.
+        let numerical_snapshot = commands
+            .iter()
+            .flat_map(|command| &command.completion_checks)
+            .filter(|check| check.deferred)
+            .try_for_each(|check| check.enqueue(&stream.stream));
+        if let Err(error) = numerical_snapshot {
+            stream.state.fail();
+            self.quarantine(stream, commands);
+            panic!(
+                "CUDA submission became indeterminate while snapshotting numerical status: {error}"
+            );
+        }
         drop(enqueue_stage);
         if S::ENABLED {
             timing_sink.record_reusable_execution(replay_observation);
@@ -4066,7 +4232,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         match unsafe { cudarc::driver::result::event::query(fence.event.cu_event()) } {
             Ok(()) => {
                 fence.mark_terminal();
-                FenceQuery::Terminal(fence.terminal_receipt(DeviceTerminal::Succeeded))
+                FenceQuery::Terminal(fence.terminal_receipt(fence.numerical_terminal()))
             }
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 FenceQuery::Pending
@@ -4085,7 +4251,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         match fence.event.synchronize() {
             Ok(()) => {
                 fence.mark_terminal();
-                Ok(fence.terminal_receipt(DeviceTerminal::Succeeded))
+                Ok(fence.terminal_receipt(fence.numerical_terminal()))
             }
             Err(error) => {
                 fence.stream_state.fail();
@@ -4209,6 +4375,84 @@ mod tests {
     #[cfg(feature = "vllm-marlin")]
     use cudarc::driver::DevicePtrMut;
     use ferrum_interfaces::vnext::DeviceCommandPhase;
+
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn numerical_status_snapshot_survives_eager_scratch_reuse_and_keeps_stream_usable() {
+        let runtime = CudaDeviceRuntime::new(
+            crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+                0,
+                DeviceId::new("device.test.numerical-status").unwrap(),
+                AttentionExecutionPolicy::Portable,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let base = stream.stream.alloc_zeros::<u8>(4).unwrap();
+        let pointer = base.device_ptr(&stream.stream).0;
+        let region = CudaBufferRegion {
+            _allocation: Arc::new(CudaAllocation {
+                _base: base,
+                aligned_ptr: pointer,
+                requested_bytes: 4,
+            }),
+            _core_retention: None,
+            reusable_address_scope: None,
+            runtime_instance: runtime.runtime_instance,
+            device_ptr: pointer,
+            length_bytes: 4,
+            element_type: ElementType::U8,
+        };
+        for should_fail in [true, false] {
+            let command = CudaDeviceCommand::operation(
+                "test.numerical_status",
+                vec![region.clone()],
+                move |stream, regions| {
+                    unsafe {
+                        cudarc::driver::result::memset_d8_async(
+                            regions[0].device_ptr,
+                            if should_fail { 0xff } else { 0 },
+                            4,
+                            stream.cu_stream(),
+                        )
+                    }
+                    .map_err(|error| CudaDeviceRuntimeError::driver("test status write", error))
+                },
+            )
+            .unwrap()
+            .with_numerical_status(region.clone(), vec![0], 1 << 31, false)
+            .unwrap();
+            stream.state.begin_submission().unwrap();
+            command.enqueue(&stream.stream, &stream.blas).unwrap();
+            // A following operation overwrites the entire scratch word. Its
+            // value must not erase the earlier operation's failure snapshot.
+            unsafe {
+                cudarc::driver::result::memset_d8_async(pointer, 0, 4, stream.stream.cu_stream())
+            }
+            .unwrap();
+            let event = stream.stream.record_event(None).unwrap();
+            stream.state.submission_recorded().unwrap();
+            let fence = CudaDeviceFence {
+                event,
+                timing: CudaFenceTiming::NotRequested,
+                command_timing: CudaFenceCommandTiming::NotRequested,
+                attribution: None,
+                stream_state: stream.state.clone(),
+                terminal_accounted: AtomicBool::new(false),
+                _stream: stream.stream.clone(),
+                _blas: stream.blas.clone(),
+                _commands: vec![command],
+            };
+            fence.event.synchronize().unwrap();
+            assert_eq!(fence.numerical_terminal().is_succeeded(), !should_fail);
+            assert!(matches!(
+                runtime.query_fence(&fence),
+                FenceQuery::Terminal(_)
+            ));
+            assert!(!stream.state.failed.load(Ordering::Acquire));
+        }
+    }
 
     fn program_binding_write(offset: u64, payload: Vec<u8>) -> CudaProgramBindingWrite {
         CudaProgramBindingWrite::new(offset, payload.into_boxed_slice()).unwrap()
@@ -4543,6 +4787,7 @@ mod tests {
             replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
+            completion_checks: Vec::new(),
         }
     }
 

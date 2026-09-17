@@ -61,9 +61,12 @@ mod native_io;
 mod selection;
 mod transformer;
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_f32_master_contract,
-    gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_f32_contract,
-    token_embedding_f32_master_contract, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
+    causal_paged_attention_int8_kv_contract, gated_delta_recurrent_attention_f32_master_contract,
+    last_token_dense_linear_f32_contract, token_embedding_f32_master_contract,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
@@ -210,6 +213,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
         HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
@@ -388,6 +393,8 @@ pub fn cuda_vnext_operation_registry(
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_int8_kv_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?),
         Box::new(hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
@@ -446,6 +453,27 @@ pub fn cuda_vnext_operation_registry(
             runtime,
         )?),
     ];
+    // A native-adaptive runtime has no INT8 native ABI. Composition selects a
+    // portable runtime for an automatic INT8 request; explicit native requests
+    // therefore cannot find an INT8 provider in this registry.
+    let providers = if runtime.attention_execution_policy() == AttentionExecutionPolicy::Portable {
+        let mut providers = providers;
+        providers.push(Box::new(
+            transformer::CudaCausalPagedAttentionProvider::new_int8_kv(
+                runtime,
+                AttentionExecutionPolicy::Portable,
+            )?,
+        ));
+        providers.push(Box::new(
+            transformer::CudaCausalPagedAttentionProvider::new_f32_master_int8_kv(
+                runtime,
+                AttentionExecutionPolicy::Portable,
+            )?,
+        ));
+        providers
+    } else {
+        providers
+    };
     #[cfg(feature = "vllm-marlin")]
     let providers = {
         let mut providers = providers;
