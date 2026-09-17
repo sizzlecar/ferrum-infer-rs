@@ -1,5 +1,30 @@
 use super::*;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+fn existing_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "unexpected journal symlink"
+            );
+            ensure!(
+                metadata.is_dir(),
+                "journal layout component is not a directory"
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn session_directory(directory: &Path) -> PathBuf {
+    directory
+        .join("sessions")
+        .join(format!("{:x}", Sha256::digest(SESSION.as_bytes())))
+}
 
 #[derive(Default)]
 pub(super) struct Snapshot {
@@ -10,44 +35,60 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub(super) fn read(directory: &Path) -> Result<Self> {
         let mut snapshot = Self::default();
-        if !directory.exists() {
+        if !existing_directory(directory)? {
             return Ok(snapshot);
         }
         let mut sessions = 0;
-        // Deliberately non-recursive: this is the explicit, newly created test
-        // journal directory. Never discover or open a user's existing journals.
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            ensure!(
-                !entry.file_type()?.is_symlink(),
-                "unexpected journal symlink"
-            );
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.ends_with(".json") {
-                continue;
-            }
-            if name.starts_with("session-") {
-                sessions += 1;
-                snapshot.session = serde_json::from_slice(&fs::read(entry.path())?)?;
-            } else if name.starts_with("run-") {
-                let value: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
-                let records = value["run"]["records"]
-                    .as_array()
-                    .or_else(|| value["records"].as_array())
-                    .context("run journal missing records")?
-                    .clone();
-                let run_id = records
-                    .first()
-                    .and_then(|r| r["event"]["run_id"].as_str())
-                    .context("run journal missing event.run_id")?
-                    .to_owned();
+        let mut directories = vec![directory.to_path_buf()];
+        // Support both the legacy flat layout and the current CLI's exact
+        // session shard. Never recurse or discover unrelated session journals.
+        let shard = session_directory(directory);
+        if existing_directory(&directory.join("sessions"))? && existing_directory(&shard)? {
+            directories.push(shard);
+        }
+        let mut populated_layouts = 0;
+        for directory in directories {
+            let before = (sessions, snapshot.runs.len());
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
                 ensure!(
-                    snapshot.runs.insert(run_id, records).is_none(),
-                    "duplicate run journal identity"
+                    !entry.file_type()?.is_symlink(),
+                    "unexpected journal symlink"
                 );
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                if name.starts_with("session-") {
+                    sessions += 1;
+                    snapshot.session = serde_json::from_slice(&fs::read(entry.path())?)?;
+                } else if name.starts_with("run-") {
+                    let value: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+                    let records = value["run"]["records"]
+                        .as_array()
+                        .or_else(|| value["records"].as_array())
+                        .context("run journal missing records")?
+                        .clone();
+                    let run_id = records
+                        .first()
+                        .and_then(|r| r["event"]["run_id"].as_str())
+                        .context("run journal missing event.run_id")?
+                        .to_owned();
+                    ensure!(
+                        snapshot.runs.insert(run_id, records).is_none(),
+                        "duplicate run journal identity"
+                    );
+                }
+            }
+            if before != (sessions, snapshot.runs.len()) {
+                populated_layouts += 1;
             }
         }
+        ensure!(
+            populated_layouts <= 1,
+            "journals span multiple storage layouts"
+        );
         ensure!(sessions <= 1, "expected a single isolated session");
         for (index, record) in snapshot.session.iter().enumerate() {
             ensure!(

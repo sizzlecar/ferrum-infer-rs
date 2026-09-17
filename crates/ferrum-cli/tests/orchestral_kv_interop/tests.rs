@@ -60,6 +60,111 @@ fn delivery(text: &str) -> Value {
     }}}})
 }
 
+fn write_journal_fixture(directory: &Path) {
+    fs::create_dir_all(directory).unwrap();
+    fs::write(
+        directory.join("session-fixture.json"),
+        serde_json::to_vec(&vec![json!({
+            "session_id": SESSION, "session_seq": 1,
+            "payload": {"type": "run_input_committed"}
+        })])
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("run-fixture.json"),
+        serde_json::to_vec(&json!({"run": {"records": [delivery("actual delivery")]}})).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn isolated_journal_reader_accepts_flat_and_exact_session_shard_layouts() {
+    for sharded in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = if sharded {
+            journal::session_directory(root.path())
+        } else {
+            root.path().to_path_buf()
+        };
+        write_journal_fixture(&directory);
+        // An unrelated shard is never opened, even if its files are invalid.
+        let unrelated = root.path().join("sessions/unrelated");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("session-private.json"), "not JSON").unwrap();
+        let snapshot = journal::Snapshot::read(root.path()).unwrap();
+        assert_eq!(snapshot.session.len(), 1);
+        assert_eq!(
+            snapshot.new_delivery(&BTreeSet::new()).unwrap(),
+            "actual delivery"
+        );
+    }
+}
+
+#[test]
+fn isolated_journal_reader_rejects_mixed_layouts_and_wrong_session_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let shard = journal::session_directory(root.path());
+    write_journal_fixture(&shard);
+    fs::write(
+        shard.join("session-fixture.json"),
+        serde_json::to_vec(&vec![json!({
+            "session_id": "another-session", "session_seq": 1,
+            "payload": {"type": "run_input_committed"}
+        })])
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(journal::Snapshot::read(root.path()).is_err());
+    write_journal_fixture(&shard);
+    write_journal_fixture(root.path());
+    fs::remove_file(shard.join("run-fixture.json")).unwrap();
+    fs::remove_file(root.path().join("session-fixture.json")).unwrap();
+    assert!(journal::Snapshot::read(root.path())
+        .err()
+        .expect("a run and its session must share a storage layout")
+        .to_string()
+        .contains("multiple storage layouts"));
+}
+
+#[cfg(unix)]
+#[test]
+fn isolated_journal_reader_rejects_symlinked_layout_components_and_files() {
+    use std::os::unix::fs::symlink;
+    for component in ["root", "sessions", "shard", "file"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("journals");
+        let outside = temporary.path().join("outside");
+        write_journal_fixture(&outside);
+        match component {
+            "root" => symlink(&outside, &root).unwrap(),
+            "sessions" => {
+                fs::create_dir(&root).unwrap();
+                symlink(&outside, root.join("sessions")).unwrap();
+            }
+            "shard" => {
+                fs::create_dir_all(root.join("sessions")).unwrap();
+                symlink(&outside, journal::session_directory(&root)).unwrap();
+            }
+            "file" => {
+                let shard = journal::session_directory(&root);
+                fs::create_dir_all(&shard).unwrap();
+                symlink(
+                    outside.join("session-fixture.json"),
+                    shard.join("session-link.json"),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(journal::Snapshot::read(&root)
+            .err()
+            .expect("symlink must be rejected")
+            .to_string()
+            .contains("symlink"));
+    }
+}
+
 #[test]
 fn final_delivery_rejects_partial_failure_and_duplicate_terminals() {
     let mut snapshot = journal::Snapshot::default();
