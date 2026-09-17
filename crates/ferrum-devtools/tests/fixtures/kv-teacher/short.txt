@@ -1,0 +1,1 @@
+Explain how read committed and serializable isolation differ, with an example of a transaction anomaly and its prevention. Use one paragraph.

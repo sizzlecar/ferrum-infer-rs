@@ -444,7 +444,7 @@ jobs:
     # Metal also runs the full feature suite on a fresh self-hosted worker.
     # Include cold checkout/toolchain/dependency setup in its bounded budget.
     # Only the opt-in CUDA probe includes a fresh release build and model run.
-    timeout-minutes: ${{ (matrix.backend == 'metal' || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'qwen35-08b-kv-paired')) && 120 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b') && 90 || 30 }}
+    timeout-minutes: ${{ matrix.backend == 'metal' && 120 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'qwen35-08b-kv-paired') && 360 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b') && 90 || 30 }}
     concurrency:
       # Panda's Windows/WSL jobs share hardware; independent Metal workers do not.
       group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-ci-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -658,12 +658,13 @@ jobs:
             "$RUNNER_TEMP/backend-numerics/ci-origin.json" > "$probe/source.json"
           # Cargo rebuilds changed product and harness sources from this same
           # checkout; no prior release binary or rewritten ABI is accepted.
-          cargo build --release --locked -p ferrum-cli -p ferrum-devtools \
-            --bin ferrum --bin model_regression \
+          cargo build --release --locked -p ferrum-cli -p ferrum-devtools -p ferrum-bench-core \
+            --bin ferrum --bin model_regression --bin kv_teacher_regression --example checkpoint_diff \
             --target-dir "$GITHUB_WORKSPACE/target" \
             --features ferrum-cli/cuda,ferrum-cli/vllm-moe-marlin,ferrum-cli/vllm-paged-attn-v2 \
             2>&1 | tee "$probe/build.log"
-          sha256sum target/release/ferrum target/release/model_regression > "$probe/binaries.sha256"
+          sha256sum target/release/ferrum target/release/model_regression \
+            target/release/kv_teacher_regression target/release/examples/checkpoint_diff > "$probe/binaries.sha256"
 
       - name: Diagnose the pinned Llama 1B CUDA contracts
         if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
@@ -706,6 +707,40 @@ jobs:
               --runtime-memory-budget-bytes 4294967296 --max-tokens 512 \
               --run-timeout-secs 1500 --startup-timeout-secs 600 --request-timeout-secs 300 \
               --report-dir "$probe/report-$kv_dtype" 2>&1 | tee "$probe/runner-$kv_dtype.log"; then
+              :
+            else
+              probe_status=1
+            fi
+          done
+          exit "$probe_status"
+
+      - name: Diagnose paired CUDA KV quality on fixed short and long histories
+        if: ${{ !cancelled() && steps.cuda_model_probe_build.outcome == 'success' && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'qwen35-08b-kv-paired' }}
+        # Two samples, each with seed/capture/capture/diff bounded at 20 minutes.
+        timeout-minutes: 170
+        run: |
+          set -o pipefail
+          probe="$RUNNER_TEMP/cuda-model-probe"
+          # The Rust tool sets explicit portable attention for both precisions,
+          # verifies complete F16 seed token IDs and actual selected KV/backend,
+          # and scores full-vocabulary logits on that identical fixed history.
+          # Budgets were declared before candidate measurement. Each sample
+          # must pass independently; these finite samples are diagnostic only.
+          probe_status=0
+          for sample in short long; do
+            sha256sum --check --strict "$probe/binaries.sha256"
+            if target/release/kv_teacher_regression \
+              --ferrum-bin "$GITHUB_WORKSPACE/target/release/ferrum" \
+              --checkpoint-diff-bin "$GITHUB_WORKSPACE/target/release/examples/checkpoint_diff" \
+              --model Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17 \
+              --backend cuda \
+              --prompt-file "$GITHUB_WORKSPACE/crates/ferrum-devtools/tests/fixtures/kv-teacher/$sample.txt" \
+              --report-dir "$probe/teacher-$sample" \
+              --context-tokens 8192 --max-tokens 64 \
+              --runtime-memory-budget-bytes 4294967296 --disable-thinking --timeout-secs 1200 \
+              --mean-delta-nll-limit 0.03 --max-delta-nll-limit 0.30 \
+              --mean-kl-limit 0.02 --max-kl-limit 0.15 \
+              2>&1 | tee "$probe/teacher-$sample.log"; then
               :
             else
               probe_status=1
