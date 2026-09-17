@@ -1,7 +1,7 @@
 //! Compare actual vNext wave artifacts across numerical profiles/backends.
 //! This measures arrays; it does not establish matching model/input identities,
 //! accept a numerical tolerance, or authorize a release.
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use ferrum_bench_core::release_regression::numerics::nmse;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,11 +16,16 @@ use std::{
 
 #[derive(Parser)]
 #[command(about = "Measure verified checkpoint arrays; diagnostic only, no release approval")]
+#[command(group(ArgGroup::new("source").required(true).args(["reference", "reference_dir"])))]
 struct Args {
-    #[arg(long)]
-    reference: PathBuf,
-    #[arg(long)]
-    candidate: PathBuf,
+    #[arg(long, requires = "candidate")]
+    reference: Option<PathBuf>,
+    #[arg(long, requires = "reference")]
+    candidate: Option<PathBuf>,
+    #[arg(long, requires = "candidate_dir")]
+    reference_dir: Option<PathBuf>,
+    #[arg(long, requires = "reference_dir")]
+    candidate_dir: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
 }
@@ -28,6 +33,8 @@ struct Args {
 #[derive(Deserialize, Serialize)]
 struct Wave {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture_index: Option<u64>,
     wave_kind: String,
     participant_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,21 +300,41 @@ fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
         json!({"schema_version":1,"scope":"checkpoint_array_diagnostic","release_approved":false,
         "input_and_weight_identity_verified":false,
         "token_history_evidence":"matching_recorded_token_spans",
+        "wave_kind":left.wave_kind,"capture_index":left.capture_index,
+        "candidate_capture_index":right.capture_index,
+        "reference_schema_version":left.schema_version,"candidate_schema_version":right.schema_version,
+        "participant_count":left.participant_count,"teacher_forced_decision":teacher_decision,
         "reference_wave_sha256":format!("{:x}",Sha256::digest(&left_bytes)),
         "candidate_wave_sha256":format!("{:x}",Sha256::digest(&right_bytes)),"comparisons":rows}),
     )
 }
 
 fn run(args: Args) -> Result<(), String> {
+    let scope = if args.reference_dir.is_some() {
+        "checkpoint_directory_diagnostic"
+    } else {
+        "checkpoint_array_diagnostic"
+    };
     let mut file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&args.output)
         .map_err(|e| error("reserve diagnostic report", e))?;
-    let result = compare(&args.reference, &args.candidate);
+    let result = match (
+        args.reference,
+        args.candidate,
+        args.reference_dir,
+        args.candidate_dir,
+    ) {
+        (Some(reference), Some(candidate), None, None) => compare(&reference, &candidate),
+        (None, None, Some(reference), Some(candidate)) => {
+            directory::compare_directories(&reference, &candidate)
+        }
+        _ => Err("provide one pair of wave files or checkpoint directories".into()),
+    };
     let report = result.as_ref().cloned().unwrap_or_else(|error| {
         json!({"schema_version":1,
-        "scope":"checkpoint_array_diagnostic","release_approved":false,"error":error})
+        "scope":scope,"release_approved":false,"error":error})
     });
     file.write_all(&serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
         .map_err(|e| error("write diagnostic", e))?;
@@ -327,3 +354,6 @@ fn main() -> ExitCode {
 #[cfg(test)]
 #[path = "checkpoint_diff/tests.rs"]
 mod tests;
+
+#[path = "checkpoint_diff/directory.rs"]
+mod directory;

@@ -13,6 +13,7 @@ fn fixture(directory: &Path, dtype: &str, values: &[f32]) -> Wave {
     fs::write(directory.join("values.bin"), &bytes).unwrap();
     Wave {
         schema_version: 3,
+        capture_index: None,
         wave_kind: "prefill".into(),
         participant_count: 1,
         teacher_forced_decision: None,
@@ -274,8 +275,10 @@ fn failure_is_recorded_without_overwriting_existing_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("report.json");
     let args = || Args {
-        reference: directory.path().join("missing.json"),
-        candidate: directory.path().join("also-missing.json"),
+        reference: Some(directory.path().join("missing.json")),
+        candidate: Some(directory.path().join("also-missing.json")),
+        reference_dir: None,
+        candidate_dir: None,
         output: output.clone(),
     };
     assert!(run(args()).is_err());
@@ -284,4 +287,178 @@ fn failure_is_recorded_without_overwriting_existing_evidence() {
     assert!(report["error"].as_str().unwrap().contains("reference wave"));
     assert!(run(args()).unwrap_err().contains("reserve"));
     assert_eq!(fs::read(&output).unwrap(), bytes);
+}
+
+fn directory_wave(directory: &Path, decode: bool, index: u64, values: &[f32]) -> PathBuf {
+    let mut wave = logits_fixture(directory, values, Some(1));
+    wave.wave_kind = if decode { "decode" } else { "prefill" }.into();
+    wave.capture_index = Some(index);
+    wave.teacher_forced_decision.as_mut().unwrap().token_index = if decode { index + 1 } else { 0 };
+    let stem = if decode {
+        format!("decode-wave-{index:04}")
+    } else {
+        format!("wave-{index:04}")
+    };
+    let raw_name = format!("{stem}-logits.bin");
+    fs::rename(directory.join("values.bin"), directory.join(&raw_name)).unwrap();
+    wave.product_outputs[0].raw_file = raw_name;
+    let path = directory.join(format!("{stem}.json"));
+    fs::write(&path, serde_json::to_vec(&wave).unwrap()).unwrap();
+    path
+}
+
+fn directory_plan(directory: &Path, token_count: u64) {
+    let plan = json!({"schema_version":4,"teacher_forcing":{
+        "mode":"canonical-history","encoding":"u32-le","token_count":token_count,
+        "token_ids_sha256":format!("{:x}",Sha256::digest(b"shared-target-tokens"))}});
+    fs::write(
+        directory.join("plan.json"),
+        serde_json::to_vec(&plan).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn directory_comparison_includes_each_wave_and_averages_each_target_once() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    for directory in [left.path(), right.path()] {
+        directory_plan(directory, 2);
+        directory_wave(directory, false, 0, &[0.0, 1.0]);
+    }
+    directory_wave(left.path(), true, 0, &[1.0, 2.0]);
+    directory_wave(right.path(), true, 0, &[2.0, 1.0]);
+    let report = directory::compare_directories(left.path(), right.path()).unwrap();
+    assert_eq!(report["wave_count"], 2);
+    assert_eq!(report["waves"][0]["manifest"], "wave-0000.json");
+    assert_eq!(report["waves"][1]["manifest"], "decode-wave-0000.json");
+    assert_eq!(report["aggregate"]["distribution_count"], 2);
+    assert_eq!(report["aggregate"]["teacher_forced_target_count"], 2);
+    assert_close(&report["aggregate"]["mean_delta_nll_nats"], 0.5, 1e-15);
+    let decode = &report["waves"][1]["report"]["comparisons"][0]["distribution"];
+    assert_close(
+        &report["aggregate"]["mean_kl_reference_to_candidate_nats"],
+        decode["kl_reference_to_candidate_nats"].as_f64().unwrap() / 2.0,
+        0.0,
+    );
+    assert_eq!(report["release_approved"], false);
+}
+
+#[test]
+fn directory_comparison_refuses_missing_corrupt_or_truncated_waves() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("no wave"));
+    for directory in [left.path(), right.path()] {
+        directory_plan(directory, 2);
+        directory_wave(directory, false, 0, &[0.0, 1.0]);
+    }
+    directory_wave(left.path(), true, 0, &[1.0, 2.0]);
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("inventories differ"));
+    directory_wave(right.path(), true, 0, &[1.0, 2.0]);
+    fs::write(right.path().join("decode-wave-0000-logits.bin"), [0; 8]).unwrap();
+    let failure = directory::compare_directories(left.path(), right.path()).unwrap_err();
+    assert!(failure.contains("decode-wave-0000.json") && failure.contains("SHA-256"));
+    directory_wave(right.path(), true, 0, &[1.0, 2.0]);
+    for directory in [left.path(), right.path()] {
+        directory_plan(directory, 3);
+    }
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("incomplete"));
+    for directory in [left.path(), right.path()] {
+        fs::rename(
+            directory.join("decode-wave-0000.json"),
+            directory.join("decode-wave-0001.json"),
+        )
+        .unwrap();
+    }
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("missing capture index"));
+}
+
+#[test]
+fn directory_comparison_binds_each_decision_to_its_plan_history_and_capture_index() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    for directory in [left.path(), right.path()] {
+        directory_plan(directory, 1);
+        directory_wave(directory, false, 0, &[0.0, 1.0]);
+    }
+    let right_path = right.path().join("wave-0000.json");
+    let mut wave: Wave = serde_json::from_slice(&fs::read(&right_path).unwrap()).unwrap();
+    wave.capture_index = Some(1);
+    fs::write(&right_path, serde_json::to_vec(&wave).unwrap()).unwrap();
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("capture index"));
+    wave.capture_index = Some(0);
+    wave.product_outputs[0].token_span["fingerprint"] =
+        format!("{:x}", Sha256::digest(b"different-history")).into();
+    fs::write(&right_path, serde_json::to_vec(&wave).unwrap()).unwrap();
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("spans or shapes"));
+    for directory in [left.path(), right.path()] {
+        let path = directory_wave(directory, false, 0, &[0.0, 1.0]);
+        let mut wave: Wave = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        wave.teacher_forced_decision.as_mut().unwrap().token_index = 1;
+        fs::write(path, serde_json::to_vec(&wave).unwrap()).unwrap();
+    }
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("teacher decision"));
+    for directory in [left.path(), right.path()] {
+        directory_wave(directory, false, 0, &[0.0, 1.0]);
+        fs::remove_file(directory.join("plan.json")).unwrap();
+    }
+    assert!(directory::compare_directories(left.path(), right.path())
+        .unwrap_err()
+        .contains("requires its complete plan"));
+}
+
+#[test]
+fn command_line_accepts_exactly_one_complete_file_or_directory_pair() {
+    for switches in [
+        ["--reference", "--candidate"],
+        ["--reference-dir", "--candidate-dir"],
+    ] {
+        assert!(Args::try_parse_from([
+            "checkpoint_diff",
+            switches[0],
+            "left",
+            switches[1],
+            "right",
+            "--output",
+            "out.json"
+        ])
+        .is_ok());
+        assert!(Args::try_parse_from([
+            "checkpoint_diff",
+            switches[0],
+            "left",
+            "--output",
+            "out.json"
+        ])
+        .is_err());
+    }
+    assert!(Args::try_parse_from([
+        "checkpoint_diff",
+        "--reference",
+        "left",
+        "--candidate",
+        "right",
+        "--reference-dir",
+        "left-dir",
+        "--candidate-dir",
+        "right-dir",
+        "--output",
+        "out.json"
+    ])
+    .is_err());
 }
