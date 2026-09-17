@@ -30,8 +30,16 @@ struct Wave {
     schema_version: u32,
     wave_kind: String,
     participant_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    teacher_forced_decision: Option<TeacherForcedDecision>,
     records: Vec<Record>,
     product_outputs: Vec<Record>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TeacherForcedDecision {
+    token_index: u64,
+    token_id: u32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -73,10 +81,28 @@ fn index(wave: &Wave) -> Result<BTreeMap<(u32, String), &Record>, String> {
     if !matches!(wave.schema_version, 3 | 4) || wave.participant_count == 0 {
         return Err("unsupported or empty checkpoint wave".into());
     }
+    if (wave.schema_version == 4) != wave.teacher_forced_decision.is_some() {
+        return Err("checkpoint schema and teacher-forced decision disagree".into());
+    }
+    if wave.teacher_forced_decision.is_some()
+        && (wave.participant_count != 1
+            || wave.product_outputs.len() != 1
+            || wave.product_outputs[0].output_mode.as_deref() != Some("full-logits"))
+    {
+        return Err("teacher-forced checkpoint requires one participant and full logits".into());
+    }
     let mut records = BTreeMap::new();
     for record in wave.records.iter().chain(&wave.product_outputs) {
         if record.participant_index >= wave.participant_count {
             return Err("checkpoint participant is outside the wave".into());
+        }
+        if !record.token_span["fingerprint"]
+            .as_str()
+            .is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err("checkpoint token span has no SHA-256 history fingerprint".into());
         }
         let id = match (&record.value, &record.output_mode) {
             (Some(value), None) if !value.value_id.is_empty() => {
@@ -152,6 +178,61 @@ fn top(values: &[f32]) -> Vec<Value> {
         .collect()
 }
 
+fn compensated_sum(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (mut sum, mut correction) = (0.0, 0.0);
+    for value in values {
+        let adjusted = value - correction;
+        let next = sum + adjusted;
+        correction = (next - sum) - adjusted;
+        sum = next;
+    }
+    sum
+}
+
+fn log_probabilities(logits: &[f32]) -> Vec<f64> {
+    // Subtract before taking the partition's logarithm, so a large common
+    // logit offset cannot cancel small log probabilities. Inputs are already
+    // checked for finite values by the raw-artifact reader.
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let log_partition =
+        compensated_sum(logits.iter().map(|&x| (f64::from(x) - maximum).exp())).ln();
+    logits
+        .iter()
+        .map(|&x| (f64::from(x) - maximum) - log_partition)
+        .collect()
+}
+
+fn distribution_metrics(
+    reference: &[f32],
+    candidate: &[f32],
+    decision: Option<TeacherForcedDecision>,
+) -> Result<Value, String> {
+    let p = log_probabilities(reference);
+    let q = log_probabilities(candidate);
+    // Full-vocabulary KL(reference || candidate), in nats. Clamp only the
+    // negative floating-point roundoff of this mathematically nonnegative sum.
+    let kl = compensated_sum(p.iter().zip(&q).map(|(&p, &q)| p.exp() * (p - q))).max(0.0);
+    let teacher = decision
+        .map(|decision| {
+            let token = usize::try_from(decision.token_id)
+                .ok()
+                .filter(|&index| index < p.len())
+                .ok_or_else(|| {
+                    "teacher-forced token is outside checkpoint vocabulary".to_owned()
+                })?;
+            let reference_nll = -p[token];
+            let candidate_nll = -q[token];
+            Ok::<_, String>(json!({"decision":decision,
+                "reference_nll_nats":reference_nll,"candidate_nll_nats":candidate_nll,
+                "delta_nll_nats":candidate_nll-reference_nll}))
+        })
+        .transpose()?;
+    Ok(
+        json!({"vocabulary_size":p.len(),"kl_reference_to_candidate_nats":kl,
+        "teacher_forced":teacher}),
+    )
+}
+
 fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
     let left_bytes = fs::read(reference).map_err(|e| error("reference wave", e))?;
     let right_bytes = fs::read(candidate).map_err(|e| error("candidate wave", e))?;
@@ -163,6 +244,13 @@ fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
     }
     let lhs = index(&left)?;
     let rhs = index(&right)?;
+    let teacher_decision = match (left.teacher_forced_decision, right.teacher_forced_decision) {
+        (Some(a), Some(b)) if a != b => {
+            return Err("checkpoint teacher-forced decisions differ".into());
+        }
+        (Some(a), Some(_)) => Some(a),
+        _ => None, // Schema 3 remains comparable, but cannot prove a common target.
+    };
     if !lhs.keys().eq(rhs.keys()) {
         return Err("checkpoint value inventories differ".into());
     }
@@ -187,9 +275,15 @@ fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
             .zip(&y)
             .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
             .fold(0.0, f64::max);
+        let distribution = a
+            .output_mode
+            .as_ref()
+            .map(|_| distribution_metrics(&x, &y, teacher_decision))
+            .transpose()?;
         rows.push(
             json!({"participant":key.0,"value":key.1,"reference_layout":a.output_layout,
             "candidate_layout":b.output_layout,"nmse":error,"max_abs":max_abs,
+            "token_span_fingerprint":a.token_span["fingerprint"],"distribution":distribution,
             "equal_f32_bits":x.iter().zip(&y).filter(|(x,y)|x.to_bits()==y.to_bits()).count(),
             "reference_top_logits":a.output_mode.as_ref().map(|_|top(&x)),
             "candidate_top_logits":b.output_mode.as_ref().map(|_|top(&y))}),
@@ -198,6 +292,7 @@ fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
     Ok(
         json!({"schema_version":1,"scope":"checkpoint_array_diagnostic","release_approved":false,
         "input_and_weight_identity_verified":false,
+        "token_history_evidence":"matching_recorded_token_spans",
         "reference_wave_sha256":format!("{:x}",Sha256::digest(&left_bytes)),
         "candidate_wave_sha256":format!("{:x}",Sha256::digest(&right_bytes)),"comparisons":rows}),
     )
