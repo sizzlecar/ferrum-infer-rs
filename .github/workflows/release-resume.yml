@@ -7,6 +7,11 @@ on:
         description: "Completed Deliver formal release run whose candidate and frozen evidence will be reused"
         required: true
         type: string
+      preupload_asset:
+        description: "Optional diagnostic: upload exactly one accepted missing draft asset using gh api before normal publication"
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -162,8 +167,11 @@ jobs:
       - name: Recheck the original candidate and resume its publication
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          GH_DEBUG: ''
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
           SOURCE_RUN: ${{ inputs.source_run_id }}
+          PREUPLOAD_ASSET: ${{ inputs.preupload_asset }}
         run: |
           version=$(cargo metadata --manifest-path candidate/Cargo.toml --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
@@ -178,10 +186,91 @@ jobs:
             --installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
+          if [ -n "$PREUPLOAD_ASSET" ]; then
+            [[ "$PREUPLOAD_ASSET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            "$GITHUB_WORKSPACE/tools/target/debug/release_delivery" gate "${gate_args[@]}" \
+              --output "$RUNNER_TEMP/accepted-preupload.json"
+            jq -e --arg name "$PREUPLOAD_ASSET" '[.assets[] | select(.name == $name)] |
+              if length == 1 then .[0] else error("preupload asset must match exactly one accepted file") end' \
+              "$RUNNER_TEMP/accepted-preupload.json" > "$RUNNER_TEMP/preupload-asset.json"
+            asset_path=$(jq -er .path "$RUNNER_TEMP/preupload-asset.json")
+            asset_sha=$(jq -er .sha256 "$RUNNER_TEMP/preupload-asset.json")
+            [[ "$asset_sha" =~ ^[0-9a-f]{64}$ ]]
+            asset_path=$(realpath -e -- "$asset_path")
+            unix_stage=$(realpath -e -- "$RUNNER_TEMP/staged")
+            windows_stage=$(realpath -e -- "$RUNNER_TEMP/staged-windows")
+            [[ "${asset_path##*/}" == "$PREUPLOAD_ASSET" ]]
+            [[ "$asset_path" == "$unix_stage/"* || "$asset_path" == "$windows_stage/"* ]]
+            printf '%s  %s\n' "$asset_sha" "$asset_path" | sha256sum --check --status
+            asset_size=$(stat --format='%s' -- "$asset_path")
+            tag="v$version"
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/preupload-releases.json"
+            jq -e --arg tag "$tag" --slurpfile accepted "$RUNNER_TEMP/accepted-preupload.json" '
+              add | if (map(.id) | unique | length) != length then error("release list repeats an ID") else . end |
+              [.[] | select(.tag_name == $tag)] |
+              if length != 1 then error("preupload requires a unique existing release") else .[0] end |
+              select(.draft == true and .prerelease == false and .published_at == null and
+                .target_commitish == $accepted[0].candidate_sha and .body == $accepted[0].notes and
+                (.id | type == "number" and . > 0 and . == floor))' \
+              "$RUNNER_TEMP/preupload-releases.json" > "$RUNNER_TEMP/preupload-draft.json"
+            release_id=$(jq -er .id "$RUNNER_TEMP/preupload-draft.json")
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$RUNNER_TEMP/preupload-tag.json"
+            jq -e --slurpfile accepted "$RUNNER_TEMP/accepted-preupload.json" '
+              .object.type == "commit" and .object.sha == $accepted[0].candidate_sha' \
+              "$RUNNER_TEMP/preupload-tag.json"
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/preupload-inventory.json"
+            jq -e --arg name "$PREUPLOAD_ASSET" --slurpfile accepted "$RUNNER_TEMP/accepted-preupload.json" '
+              add as $assets |
+              ($assets | map(.id) | unique | length) == ($assets | length) and
+              ($assets | map(.name) | unique | length) == ($assets | length) and
+              all($assets[]; .name != $name) and
+              all($assets[]; . as $remote |
+                [$accepted[0].assets[] | select(.name == $remote.name)] as $matches |
+                ($matches | length) == 1 and $remote.state == "uploaded" and
+                ($remote.id | type == "number" and . > 0 and . == floor) and
+                ($remote.size | type == "number" and . >= 0 and . == floor) and
+                $remote.digest == ("sha256:" + $matches[0].sha256))' \
+              "$RUNNER_TEMP/preupload-inventory.json"
+            # Refresh the original draft after inventory reads. This diagnostic
+            # never creates a release, replaces an asset, or removes a starter.
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/preupload-draft-fresh.json"
+            jq -e --arg tag "$tag" --argjson id "$release_id" --slurpfile accepted "$RUNNER_TEMP/accepted-preupload.json" '
+              .id == $id and .tag_name == $tag and .draft == true and .prerelease == false and
+              .published_at == null and .target_commitish == $accepted[0].candidate_sha and .body == $accepted[0].notes' \
+              "$RUNNER_TEMP/preupload-draft-fresh.json"
+            gh --version
+            printf 'Preupload one accepted asset: name=%s size=%s sha256=%s source_run=%s release_id=%s\n' \
+              "$PREUPLOAD_ASSET" "$asset_size" "$asset_sha" "$SOURCE_RUN" "$release_id"
+            if timeout --signal=TERM --kill-after=15s 600s gh api --hostname github.com --method POST \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+              --input "$asset_path" --raw-field "name=$PREUPLOAD_ASSET" \
+              --header 'Content-Type: application/octet-stream' --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --jq '{id,name,size,state,digest}' > "$RUNNER_TEMP/preupload-response.json" 2>/dev/null; then
+              jq -e --arg name "$PREUPLOAD_ASSET" --arg sha "$asset_sha" --argjson size "$asset_size" '
+                .name == $name and .state == "uploaded" and .size == $size and .digest == ("sha256:" + $sha) and
+                (.id | type == "number" and . > 0 and . == floor)' "$RUNNER_TEMP/preupload-response.json"
+              uploaded_id=$(jq -er .id "$RUNNER_TEMP/preupload-response.json")
+              gh api "repos/$GITHUB_REPOSITORY/releases/assets/$uploaded_id" \
+                --jq '{id,name,size,state,digest}' > "$RUNNER_TEMP/preupload-readback.json"
+              jq -e --slurpfile expected "$RUNNER_TEMP/preupload-response.json" \
+                '. == $expected[0]' "$RUNNER_TEMP/preupload-readback.json"
+            else
+              status=$?
+              printf 'Preupload failed with exit status %s; inspect remote state before another attempt.\n' "$status" >&2
+              exit "$status"
+            fi
+          fi
           "$GITHUB_WORKSPACE/tools/target/debug/release_delivery" publish "${gate_args[@]}" \
             --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
           printf 'Candidate publication resumed from run %s. Public installations remain pending; run Deliver formal release with verify_published_version=%s.\n' \
             "$SOURCE_RUN" "$version" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.preupload_asset != ''
+        with:
+          name: preupload-diagnostic
+          path: ${{ runner.temp }}/preupload-*.json
+          if-no-files-found: warn
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
