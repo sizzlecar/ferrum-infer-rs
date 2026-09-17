@@ -25,7 +25,7 @@ on:
         description: 'Optional real CUDA model diagnosis; not a formal release gate'
         type: choice
         default: none
-        options: [none, llama32-1b]
+        options: [none, llama32-1b, qwen35-08b-kv-paired]
 
 defaults:
   run:
@@ -95,7 +95,7 @@ jobs:
           if [ -n "$RELEASE_CANDIDATE" ]; then
             "$RUNNER_TEMP/policy" release-plan >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = workflow_dispatch ]; then
-            case "$CUDA_MODEL_PROBE" in none|llama32-1b) ;; *) echo 'Invalid CUDA model probe' >&2; exit 1;; esac
+            case "$CUDA_MODEL_PROBE" in none|llama32-1b|qwen35-08b-kv-paired) ;; *) echo 'Invalid CUDA model probe' >&2; exit 1;; esac
             # Explicit dispatch always selects fresh GPU checks, even for a
             # docs-only ref; do not let scope/reuse omit the requested CUDA job.
             "$RUNNER_TEMP/policy" full-plan >> "$GITHUB_OUTPUT"
@@ -442,7 +442,7 @@ jobs:
     # Metal also runs the full feature suite on a fresh self-hosted worker.
     # Include cold checkout/toolchain/dependency setup in its bounded budget.
     # Only the opt-in CUDA probe includes a fresh release build and model run.
-    timeout-minutes: ${{ matrix.backend == 'metal' && 120 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b') && 90 || 30 }}
+    timeout-minutes: ${{ (matrix.backend == 'metal' || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'qwen35-08b-kv-paired')) && 120 || (github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b') && 90 || 30 }}
     concurrency:
       # Panda's Windows/WSL jobs share hardware; independent Metal workers do not.
       group: ${{ matrix.backend == 'cuda' && 'ferrum-panda-hardware' || format('ferrum-metal-ci-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -639,7 +639,7 @@ jobs:
           retention-days: 14
 
       - name: Build this candidate for the optional CUDA model diagnosis
-        if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
+        if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && (inputs.cuda_model_probe == 'llama32-1b' || inputs.cuda_model_probe == 'qwen35-08b-kv-paired')
         timeout-minutes: 60
         env:
           CARGO_BUILD_JOBS: 2
@@ -681,8 +681,37 @@ jobs:
             --max-tokens 512 --run-timeout-secs 1500 --request-timeout-secs 300 \
             --report-dir "$probe/report" 2>&1 | tee "$probe/runner.log"
 
+      - name: Diagnose paired F16 and INT8 Qwen 0.8B CUDA run and serve
+        if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'qwen35-08b-kv-paired'
+        timeout-minutes: 50
+        run: |
+          set -o pipefail
+          probe="$RUNNER_TEMP/cuda-model-probe"
+          # Each Rust run checks the actual model source, CUDA device and typed
+          # KV selection in run and serve. These are functional smoke results,
+          # not full-model checkpoint, quality or performance qualification.
+          # Keep both reports even when one precision fails, then fail the step.
+          probe_status=0
+          for kv_dtype in fp16 int8; do
+            sha256sum --check --strict "$probe/binaries.sha256"
+            if target/release/model_regression \
+              --ferrum-bin "$GITHUB_WORKSPACE/target/release/ferrum" \
+              --model Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17 \
+              --backend cuda --kv-dtype "$kv_dtype" \
+              --profile-id "diagnostic-qwen35-08b-cuda-kv-$kv_dtype" \
+              --checks basic --context-tokens 2048 --max-num-seqs 1 \
+              --runtime-memory-budget-bytes 4294967296 --max-tokens 512 \
+              --run-timeout-secs 1500 --startup-timeout-secs 600 --request-timeout-secs 300 \
+              --report-dir "$probe/report-$kv_dtype" 2>&1 | tee "$probe/runner-$kv_dtype.log"; then
+              :
+            else
+              probe_status=1
+            fi
+          done
+          exit "$probe_status"
+
       - name: Save optional CUDA model diagnosis and raw logs
-        if: always() && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && inputs.cuda_model_probe == 'llama32-1b'
+        if: always() && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && (inputs.cuda_model_probe == 'llama32-1b' || inputs.cuda_model_probe == 'qwen35-08b-kv-paired')
         uses: actions/upload-artifact@v4
         with:
           name: cuda-model-probe-${{ github.run_id }}-${{ github.run_attempt }}
