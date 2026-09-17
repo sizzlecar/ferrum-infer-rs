@@ -312,7 +312,7 @@ CUDA 12.4 与 NCCL 运行库时选择 CUDA，否则选择 CPU。也可以明确�
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0
 ```
 
 使用脚本安装后，重新执行原安装命令即可升级。同版本、同后端已安装且校验通过时，
@@ -378,7 +378,7 @@ native-operator set，因此受支持的安装路径是预编译 CUDA tarball �
 - 产品入口：`ferrum-cli`、`ferrum-server`、`ferrum-tokenizer`
 - 验证：`ferrum-bench-core`、`ferrum-testkit`
 
-开发接口说明：[数值执行策略](docs/numerical-execution.zh.md)。其中新增的 CLI 选项尚未包含在 v0.8.9 发布资产中。
+开发接口说明：[数值执行策略](docs/numerical-execution.zh.md)。
 
 ## License
 

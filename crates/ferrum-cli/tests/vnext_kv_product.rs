@@ -4,7 +4,7 @@
 //! cargo test -p ferrum-cli --test vnext_kv_product -- --ignored --test-threads=1
 //! Both executables, models, hardware label and an external report directory are
 //! selected by that configuration. No model name selects product behavior.
-//! See docs/vnext-8bit-kv-validation.zh.md for calibration and evidence limits.
+//! Reports retain the configured calibration, workload and evidence limits.
 
 use anyhow::{ensure, Context, Result};
 use ferrum_bench_core::release_regression::model_tasks::ModelCheck;

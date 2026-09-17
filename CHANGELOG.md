@@ -10,24 +10,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Corrected packed Metal attention row offsets for head dimensions whose row size is not 16-byte aligned, covering both FP16 and INT8 KV.
-- Reported context-capacity failures as structured HTTP 400 errors before streaming begins, so clients can distinguish them from transient server failures.
-- Honored Chat Completions `reasoning_effort` and Responses `reasoning.effort`, preserving model defaults when omitted and respecting declared model capabilities.
-- Allowed automatic tool calls alongside strict final JSON schemas in Chat Completions and Responses, including streaming, while giving schema-valid final answers precedence over ambiguous tool-call JSON.
-- Recovered incomplete model downloads in `run` and `serve` by fetching missing weights, tokenizer, and chat-template files while reusing completed cache entries; `list` now identifies incomplete snapshots.
+- Applied KV precision before automatic attention-policy selection in `run` and `serve`, and rejected explicit KV settings that unsupported or fixed-storage loaders would otherwise ignore.
+- Preserved full-input capacity requirements while reclaiming dynamic pools, preventing repeated growth and reclamation from blocking an otherwise admissible request.
+- Rejected requests whose combined plan-derived memory requirements cannot fit the runtime budget, while retaining retryable admission for temporary resource contention.
+- Initialized terminal colors safely on Windows.
+- Restored public installation verification when optional release jobs are skipped.
 
 ### Changed
 
 - Typed `MemoryRequirements` reports now serialize complete-model token-scaled and fixed sequence state under `typed_sequence_state`, omitting the legacy per-layer `kv_cache_memory_per_token` field. New readers retain legacy-wire support; older consumers must be updated to interpret typed reports.
-- Enabled independent staging of eligible Q4/Q5 FFN projections in mixed-format Metal prefill, with storage-layout checks and reusable scratch capacity.
+- Added a Metal INT8 GQA prefill path that shares KV tiles across query heads and uses vectorized KV reads, retaining separate payload and scale storage.
 
 ### Added
 
 - Added opt-in `--kv-dtype int8` / `runtime.kv_dtype` to `run` and `serve` for supported vNext standard causal attention on Metal and portable CUDA, with per-token/head scales and typed capacity accounting. FP16 remains the default; unsupported combinations fail explicitly. KV payload and scales are checkpointed together; whole-model restore requires support for every model state.
 - Added optional `/v1/models` reasoning metadata that distinguishes a supported thinking switch and its effective default from explicitly declared effort levels.
 - Exposed resolved KV precision and complete-model logical state requirements in health and effective configuration, separating them from legacy estimates and actual allocator residency.
+
+## [0.10.0] - 2026-09-16
+
+### Fixed
+
+- Reported context-capacity failures as structured HTTP 400 errors before streaming begins, so clients can distinguish them from transient server failures.
+
+### Changed
+
+- Enabled independent staging of eligible Q4/Q5 FFN projections in mixed-format Metal prefill, with storage-layout checks and reusable scratch capacity.
+
+### Added
+
 - Added native profile summaries that distinguish shared GPU work from per-request observations and avoid duplicate accounting.
+
+See the [published release notes](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.10.0) for the remaining changes and validation scope.
+
+## [0.9.0] - 2026-09-10
+
+### Added
+
+- Added explicit numerical execution profiles resolved before vNext initialization, with the selected profile retained in runtime evidence.
+- Added vNext CPU inference and native CUDA GGUF operations, including F32-master attention paths.
+- Added exact GGUF file selection across `pull`, `run`, and `serve`.
+
+### Changed
+
+- Prepared reusable CUDA execution on demand as request shapes arrive, with bounded preparation capacity.
+
+### Fixed
+
+- Resolved cached GGUF repositories consistently in `list`, `run`, and `serve`.
+- Preserved native framing for forced tool calls and scoped tool JSON guidance to final responses.
+- Repaired Windows PowerShell startup and displayed installer download progress.
+
+See the [published release notes](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.9.0) for the full change list.
+
+## [0.8.9] - 2026-09-09
+
+### Fixed
+
+- Honored Chat Completions `reasoning_effort` and Responses `reasoning.effort`, preserving model defaults when omitted and respecting declared model capabilities.
+- Allowed automatic tool calls alongside strict final JSON schemas in Chat Completions and Responses, including streaming, while giving schema-valid final answers precedence over ambiguous tool-call JSON.
+- Recovered incomplete model downloads in `run` and `serve` by fetching missing weights, tokenizer, and chat-template files while reusing completed cache entries; `list` now identifies incomplete snapshots.
+
+### Added
+
 - Added one-command installation on Apple Silicon macOS, Linux x86_64, and Windows x64, with PATH setup and upgrades that keep existing processes running while new launches use the updated version.
 - Added a native Windows EXE installer and portable CUDA package for a single NVIDIA sm89 GPU, bundling CUDA and VC runtimes and using the installed NVIDIA driver.
+
+See the [published release notes](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.8.9) for the full change list.
 
 ## [0.8.8] - 2026-09-07
 

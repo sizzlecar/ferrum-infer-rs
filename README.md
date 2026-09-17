@@ -277,7 +277,7 @@ recomputes the input.
   tools, and structured output.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
-- Optional [8-bit KV storage](docs/kv-cache-precision.md) for supported vNext Metal and portable CUDA attention paths; FP16 remains the default.
+- Optional [8-bit KV storage](#kv-cache-precision) for supported vNext Metal and portable CUDA attention paths; FP16 remains the default.
 - GGUF on Metal and CUDA; CUDA also supports GPTQ/safetensors.
 - Ferrum covers language-model inference only. Supported models include Qwen3.5 4B,
   Qwen3.5 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense.
@@ -342,7 +342,7 @@ and otherwise selects CPU. You can require a backend or install a specific versi
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0
 ```
 
 To upgrade an installation made with the script, rerun the original install
@@ -414,7 +414,6 @@ the prebuilt CUDA tarball or Homebrew formula for the supported install path.
 - Validation: `ferrum-bench-core`, `ferrum-testkit`
 
 Development notes: [numerical execution profiles (中文)](docs/numerical-execution.zh.md).
-The new CLI option is not available in v0.8.9 release assets.
 
 ## License
 
