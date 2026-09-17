@@ -55,6 +55,8 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             &[
                 "ordered_transfer_batch_is_async_and_readback_is_exact",
                 "encode_failure_is_definitely_not_submitted_and_restores_stream",
+                "completed_device_status_is_checked_after_fence_and_fails_quiescently",
+                "completed_device_status_reused_slot_is_cleared_by_each_submission",
             ],
         ),
         Backend::Cuda => (
@@ -66,19 +68,28 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             ],
         ),
     };
+    let mut submission_tests: Vec<_> = names
+        .iter()
+        .map(|name| ContractTest {
+            package: "ferrum-kernels".into(),
+            target: "ferrum_kernels".into(),
+            kind: "lib".into(),
+            name: format!("{module}::{name}"),
+        })
+        .collect();
+    if backend == Backend::Cuda {
+        submission_tests.push(ContractTest {
+            package: "ferrum-kernels".into(),
+            target: "ferrum_kernels".into(),
+            kind: "lib".into(),
+            name: "backend::cuda::vnext_runtime::tests::numerical_status_snapshot_survives_eager_scratch_reuse_and_keeps_stream_usable".into(),
+        });
+    }
     let mut groups = vec![ContractGroup {
         id: checker_id(backend),
         behavior: Behavior::SubmissionCompletion,
         entrypoints: Vec::new(),
-        tests: names
-            .iter()
-            .map(|name| ContractTest {
-                package: "ferrum-kernels".into(),
-                target: "ferrum_kernels".into(),
-                kind: "lib".into(),
-                name: format!("{module}::{name}"),
-            })
-            .collect(),
+        tests: submission_tests,
     }];
     if backend == Backend::Cuda {
         groups.push(ContractGroup {
