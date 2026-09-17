@@ -182,14 +182,13 @@ impl Inputs {
             ),
             MTLSize::new(SIMD_THREADS, 1, 1),
         );
-        if attention {
+        let dispatch = attention.then(|| pipelines.dispatch_plan(&params));
+        if let Some(plan) = dispatch {
             set_raw(encoder, 0, &prepared);
             set_raw(encoder, 1, &q);
             set_raw(encoder, 2, &output);
             encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&arguments), 0);
             set_raw_params(encoder, 4, &params);
-            let plan = pipelines.dispatch_plan(&params);
-            assert_eq!(plan.kind, AttentionDispatchKind::General);
             encode_attention_dispatch(pipelines, encoder, plan);
         }
         encoder.end_encoding();
@@ -206,6 +205,7 @@ impl Inputs {
                 Vec::new()
             },
             error,
+            dispatch: dispatch.map(|plan| plan.kind),
         }
     }
 }
@@ -214,6 +214,7 @@ struct Output {
     query: Vec<f16>,
     attention: Vec<f16>,
     error: u32,
+    dispatch: Option<AttentionDispatchKind>,
 }
 
 fn quantize(values: &[f16]) -> (Vec<i8>, f32) {
@@ -433,4 +434,77 @@ fn int8_prepare_marks_nonfinite_input_in_device_status() {
         let output = inputs.execute(&device, &queue, &pipelines, &state, 0, false);
         assert_ne!(output.error, 0);
     }
+}
+
+#[test]
+fn int8_tiled_prefill_and_direct_decode_match_reference_across_payload_page_and_tail() {
+    let device =
+        Device::system_default().expect("INT8 optimized attention conformance requires Metal");
+    let queue = device.new_command_queue();
+    let pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
+    for dim in [128, 256] {
+        let heads = 4;
+        let kv_heads = 2;
+        let page_tokens = VNEXT_KV_PAGE_BYTES as usize / (2 * kv_heads * dim);
+        let prefix_tokens = page_tokens - 1;
+        let state = State::new(&device, prefix_tokens + 10, kv_heads, dim);
+        let prefix = Inputs::new(prefix_tokens, heads, kv_heads, dim, true);
+        let prefix_output = prefix.execute(&device, &queue, &pipelines, &state, 0, true);
+        assert_eq!(prefix_output.error, 0);
+        assert_eq!(
+            prefix_output.dispatch,
+            Some(AttentionDispatchKind::TiledPrefill)
+        );
+        let tail = Inputs::new(9, heads, kv_heads, dim, true);
+        let output = tail.execute(&device, &queue, &pipelines, &state, prefix_tokens, true);
+        assert_eq!(output.error, 0);
+        assert_eq!(output.dispatch, Some(AttentionDispatchKind::TiledPrefill));
+        for (actual, expected) in
+            output
+                .attention
+                .iter()
+                .zip(attention_reference(&tail, &output, &state, prefix_tokens))
+        {
+            assert!(
+                (actual.to_f32() - expected).abs() <= 0.001,
+                "INT8 tiled prefill differs from scalar reference: {actual} versus {expected}"
+            );
+        }
+        let decode = Inputs::new(1, heads, kv_heads, dim, true);
+        let output = decode.execute(&device, &queue, &pipelines, &state, prefix_tokens + 9, true);
+        assert_eq!(output.error, 0);
+        assert_eq!(output.dispatch, Some(AttentionDispatchKind::DirectDecode));
+        for (actual, expected) in output.attention.iter().zip(attention_reference(
+            &decode,
+            &output,
+            &state,
+            prefix_tokens + 9,
+        )) {
+            assert!(
+                (actual.to_f32() - expected).abs() <= 0.001,
+                "INT8 direct decode differs from scalar reference"
+            );
+        }
+    }
+}
+
+#[test]
+fn int8_tiled_dispatch_accounts_for_bounded_dequantization_memory() {
+    let mut params = dispatch_test_params(8, 256);
+    params.page_elements = VNEXT_KV_PAGE_BYTES as u32;
+    let plan = int8_attention_dispatch_plan(&params, 32 * 1024);
+    assert_eq!(plan.kind, AttentionDispatchKind::TiledPrefill);
+    assert!(plan.threadgroup_memory_bytes.iter().sum::<u64>() <= 32 * 1024);
+    assert_eq!(
+        int8_attention_dispatch_plan(&params, 16 * 1024).kind,
+        AttentionDispatchKind::General
+    );
+    // Gather-based INT8 tiles can cross page boundaries that prevent F16 direct loads.
+    params.key_value_heads = 3;
+    params.query_heads = 6;
+    assert!(!page_holds_whole_token_rows(&params));
+    assert_eq!(
+        int8_attention_dispatch_plan(&params, 32 * 1024).kind,
+        AttentionDispatchKind::TiledPrefill
+    );
 }

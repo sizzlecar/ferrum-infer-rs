@@ -279,14 +279,26 @@ impl MetalCausalAttentionPipelines {
         let attention_function = library
             .get_function("vnext_causal_attention_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
+        let direct_function = library
+            .get_function("vnext_causal_attention_decode_direct_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let tiled_function = library
+            .get_function("vnext_causal_attention_prefill_tiled_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
         let prepare_encoder = prepare_function.new_argument_encoder(PREPARE_PAGE_TABLE_INDEX);
         let attention_encoder = attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let direct_encoder = direct_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let tiled_encoder = tiled_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
         let binding_encoded_length = prepare_encoder.encoded_length();
         let binding_alignment = prepare_encoder.alignment();
         if binding_encoded_length == 0
             || binding_alignment == 0
             || attention_encoder.encoded_length() != binding_encoded_length
             || attention_encoder.alignment() != binding_alignment
+            || direct_encoder.encoded_length() != binding_encoded_length
+            || direct_encoder.alignment() != binding_alignment
+            || tiled_encoder.encoded_length() != binding_encoded_length
+            || tiled_encoder.alignment() != binding_alignment
         {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal INT8 causal kernels disagree on their two page tables",
@@ -298,25 +310,38 @@ impl MetalCausalAttentionPipelines {
         let attention = device
             .new_compute_pipeline_state_with_function(&attention_function)
             .map_err(MetalDeviceRuntimeError::contract)?;
+        let direct_decode_attention = device
+            .new_compute_pipeline_state_with_function(&direct_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let tiled_prefill_attention = device
+            .new_compute_pipeline_state_with_function(&tiled_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
         if prepare.thread_execution_width() != SIMD_THREADS
             || attention.thread_execution_width() != SIMD_THREADS
+            || direct_decode_attention.thread_execution_width() != SIMD_THREADS
+            || tiled_prefill_attention.thread_execution_width() != SIMD_THREADS
+            || u64::from(tiled_prefill_attention.max_total_threads_per_threadgroup())
+                < SIMD_THREADS * TILED_PREFILL_SIMDGROUPS
         {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal INT8 causal kernels require 32-lane SIMD execution",
             ));
         }
-        let maximum_attention_simdgroups =
-            (attention.max_total_threads_per_threadgroup() as u64 / SIMD_THREADS)
-                .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS) as u32;
+        let maximum_attention_simdgroups = (attention
+            .max_total_threads_per_threadgroup()
+            .min(direct_decode_attention.max_total_threads_per_threadgroup())
+            as u64
+            / SIMD_THREADS)
+            .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS)
+            as u32;
         Ok(Self {
             kv_type: ElementType::I8,
             prepare,
-            // INT8 dispatch is deliberately restricted to the general reader until
-            // an independently validated quantized optimized kernel is available.
-            direct_decode_attention: attention.clone(),
+            direct_decode_attention,
+            // These F16-specific routes are never selected for INT8 storage.
             grouped_decode_partial_attention: attention.clone(),
             grouped_decode_reduce_attention: attention.clone(),
-            tiled_prefill_attention: attention.clone(),
+            tiled_prefill_attention,
             gqa_tiled_prefill_attention: attention.clone(),
             attention,
             binding_encoder: Mutex::new(prepare_encoder),
@@ -349,7 +374,7 @@ impl MetalCausalAttentionPipelines {
 
     fn dispatch_plan(&self, params: &CausalAttentionParams) -> AttentionDispatchPlan {
         if self.kv_type == ElementType::I8 {
-            general_attention_dispatch_plan(params)
+            int8_attention_dispatch_plan(params, self.maximum_threadgroup_memory_length)
         } else {
             attention_dispatch_plan_with_memory_limit(
                 params,
@@ -610,7 +635,7 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
             ProviderWorkspaceSizeFormula::affine(
                 0,
                 shape
-                    .split_decode_partial_bytes_per_sequence()
+                    .split_decode_bytes_for_storage(self.attention.kv_type)
                     .map_err(invalid_plan)?,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
@@ -881,6 +906,14 @@ impl CausalAttentionShape {
         aligned_bytes(elements, std::mem::size_of::<f32>() as u64)
     }
 
+    fn split_decode_bytes_for_storage(self, kv_type: ElementType) -> Result<u64, String> {
+        if kv_type == ElementType::I8 {
+            Ok(0)
+        } else {
+            self.split_decode_partial_bytes_per_sequence()
+        }
+    }
+
     fn params(
         self,
         tokens: u64,
@@ -969,10 +1002,20 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
+    #[cfg(test)]
     fn new(
         shape: CausalAttentionShape,
         total_tokens: u64,
         participant_count: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_storage(shape, total_tokens, participant_count, ElementType::F16)
+    }
+
+    fn new_with_storage(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        participant_count: usize,
+        kv_type: ElementType,
     ) -> Result<Self, String> {
         if total_tokens == 0 || participant_count == 0 {
             return Err("Metal causal-attention scratch cannot size empty work".to_owned());
@@ -981,7 +1024,7 @@ impl ScratchLayout {
             .map_err(|_| "Metal causal-attention participant count exceeds u64".to_owned())?;
         let mut offset = 0_u64;
         let split_decode = offset;
-        let split_decode_bytes_per_sequence = shape.split_decode_partial_bytes_per_sequence()?;
+        let split_decode_bytes_per_sequence = shape.split_decode_bytes_for_storage(kv_type)?;
         offset = offset
             .checked_add(
                 split_decode_bytes_per_sequence
@@ -1174,7 +1217,12 @@ fn encode_attention(
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, invocation.participants().len())?;
+    let layout = ScratchLayout::new_with_storage(
+        shape,
+        total_tokens,
+        invocation.participants().len(),
+        kv_type,
+    )?;
     let binding_layout = BindingLayout::new(
         attention.binding_slot_bytes()?,
         invocation.participants().len(),
@@ -2099,6 +2147,31 @@ fn attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchP
     attention_dispatch_plan_with_memory_limit(params, u64::MAX)
 }
 
+fn int8_attention_dispatch_plan(
+    params: &CausalAttentionParams,
+    maximum_threadgroup_memory_length: u64,
+) -> AttentionDispatchPlan {
+    if uses_direct_decode(params) {
+        return direct_decode_attention_dispatch_plan(params);
+    }
+    // INT8 tiles gather through both page tables, so they do not require the
+    // F16 direct-matrix-load page divisibility restriction.
+    if params.tokens >= TILED_PREFILL_QUERY_TILE
+        && matches!(params.head_dim, 128 | 256)
+        && query_heads_per_kv_head(params).is_some()
+    {
+        let mut plan = tiled_prefill_attention_dispatch_plan(params);
+        // One shared staging tile is overwritten between QK and PV phases.
+        let staging =
+            TILED_PREFILL_KEY_TILE * u64::from(params.head_dim) * ElementType::F16.size_bytes();
+        plan.threadgroup_memory_bytes[0] += staging;
+        if plan.threadgroup_memory_bytes.iter().sum::<u64>() <= maximum_threadgroup_memory_length {
+            return plan;
+        }
+    }
+    general_attention_dispatch_plan(params)
+}
+
 fn attention_dispatch_plan_with_memory_limit(
     params: &CausalAttentionParams,
     maximum_threadgroup_memory_length: u64,
@@ -2704,6 +2777,38 @@ mod shape_tests {
                 assert!(layout.split_decode_offset(participant_count).is_err());
             }
         }
+    }
+
+    #[test]
+    fn int8_state_geometry_counts_independent_pages_and_omits_unused_split_decode_scratch() {
+        let mut shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
+        let tokens = 32_768;
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(tokens, ElementType::I8)
+                .unwrap(),
+            64 << 20
+        );
+        assert_eq!(shape.physical_scale_bytes(tokens).unwrap(), 1 << 20);
+        // Both typed pools still need their own first page for a short sequence.
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(1, ElementType::I8)
+                .unwrap(),
+            VNEXT_KV_PAGE_BYTES
+        );
+        assert_eq!(shape.physical_scale_bytes(1).unwrap(), VNEXT_KV_PAGE_BYTES);
+        let scratch = ScratchLayout::new_with_storage(shape, 3, 2, ElementType::I8).unwrap();
+        assert_eq!(
+            scratch.required_bytes,
+            3 * shape.scratch_bytes_per_token().unwrap()
+        );
+        assert_eq!(scratch.split_decode_bytes_per_sequence, 0);
+        shape.maximum_context_tokens *= 2;
+        assert!(shape.validate_page_count(ElementType::F16).is_err());
+        shape.validate_page_count(ElementType::I8).unwrap();
+        shape.maximum_context_tokens += 1;
+        assert!(shape.validate_page_count(ElementType::I8).is_err());
     }
 
     #[test]

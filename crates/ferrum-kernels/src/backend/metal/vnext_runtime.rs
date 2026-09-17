@@ -1786,11 +1786,14 @@ impl MetalDeviceFence {
             .commands
             .iter()
             .try_for_each(MetalDeviceCommand::check_completed_status);
-        self.mark_terminal();
         match result {
-            Ok(()) => self.terminal_receipt(DeviceTerminal::Succeeded),
+            Ok(()) => {
+                self.mark_terminal();
+                self.terminal_receipt(DeviceTerminal::Succeeded)
+            }
             Err(error) => {
                 self.stream_state.fail();
+                self.mark_terminal();
                 self.terminal_receipt(DeviceTerminal::FailedButQuiescent(error))
             }
         }
