@@ -1,8 +1,6 @@
 use super::*;
 use std::ops::Range;
 
-type Runtime = MetalDeviceRuntime;
-
 pub struct Fixture {
     _composition: CompositionParts,
     compilation: ProgramPlanCompilation,
@@ -12,21 +10,37 @@ pub struct Fixture {
     reaper: Arc<CompletionReaper<Runtime>>,
     states: Vec<StateSpec>,
     checkpoint_timing_mode: DeviceTimingMode,
+    reusable_bucket: Option<ReusableExecutionBucketId>,
 }
 
 impl Fixture {
     pub fn new(kind: AttentionKind) -> Self {
+        Self::with_execution_options(kind, false, None)
+    }
+
+    pub fn with_execution_options(
+        kind: AttentionKind,
+        reusable: bool,
+        nonfinite_token: Option<u32>,
+    ) -> Self {
         let definition = Family::new(kind);
         let states = definition.states();
         let profile_id = definition.profile_id();
         let family = TypedFamilyRegistration::new(definition)
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
-        let composition =
-            MetalVNextComposition::create(id(format!("device.metal.checkpoint.{kind:?}"))).unwrap();
+        let composition = composition(kind);
         let (runtime, registry, materializers, materializer_id, catalog) = composition.into_parts();
+        let bucket = reusable.then(|| {
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("fixture.checkpoint.decode").unwrap(),
+                ReusableExecutionCapacity::new(1, 1, 16).unwrap(),
+            )
+            .unwrap()
+        });
+        let reusable_bucket = bucket.as_ref().map(|bucket| bucket.bucket_id().clone());
         let policy = ResolvedRuntimePolicy::new(
-            "runtime-policy.metal.checkpoint-continuation",
+            "runtime-policy.fixture.checkpoint-continuation",
             ContractVersion::new(1, 0),
             SchedulingDiscipline::FirstReady,
             RuntimeMemoryPolicy {
@@ -48,9 +62,13 @@ impl Fixture {
                 allow_defer: true,
                 cancellation_check_interval_steps: 1,
             },
-            ferrum_types::AttentionExecutionPolicy::NativeAdaptive,
-            ExecutionDeterminismRequirement::BitwiseSameRuntime,
-            None,
+            runtime.attention_execution_policy(),
+            if reusable {
+                ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
+            } else {
+                ExecutionDeterminismRequirement::BitwiseSameRuntime
+            },
+            bucket.map(|bucket| ReusableExecutionPolicy::new(1, vec![bucket]).unwrap()),
         )
         .unwrap();
         let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
@@ -87,7 +105,7 @@ impl Fixture {
         let provisioned = plan
             .provision_static(
                 Arc::clone(&runtime),
-                id("request.metal.checkpoint.provision"),
+                id("request.fixture.checkpoint.provision"),
             )
             .unwrap();
         let permit = match provisioned.into_provisioning() {
@@ -96,8 +114,8 @@ impl Fixture {
         };
         let identity = ResourceTransactionIdentity::for_admission(
             permit.binding(),
-            id("run.metal.checkpoint.provision"),
-            id("transaction.metal.checkpoint.provision"),
+            id("run.fixture.checkpoint.provision"),
+            id("transaction.fixture.checkpoint.provision"),
         );
         let driver = RuntimeResourceDriver::new(Arc::clone(&runtime)).unwrap();
         let reserved = ResourceTransaction::begin(driver, identity, permit)
@@ -126,7 +144,10 @@ impl Fixture {
         }
         // Ordinary pool initialization only. Foreground admission and optional
         // checkpoint retention must request their own subsequent maintenance.
-        let source = family::Weights::new(family.weight_schema());
+        let mut source = family::Weights::new(family.weight_schema());
+        if let Some(token) = nonfinite_token {
+            source.set_nonfinite_embedding(token);
+        }
         let initialized = committed
             .initialize_static(
                 &family,
@@ -140,6 +161,10 @@ impl Fixture {
             Err(error) => panic!("plan runtime handoff failed: {}", error.error()),
         };
         let lane = resources.create_execution_lane().unwrap();
+        if reusable {
+            lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(8).unwrap())
+                .unwrap();
+        }
         // The registry, runtime, materializers and catalog retain their real
         // composition owners; no provider descriptor is substituted in tests.
         let composition = CompositionParts {
@@ -157,6 +182,7 @@ impl Fixture {
             reaper: CompletionReaper::new(),
             states,
             checkpoint_timing_mode: DeviceTimingMode::Off,
+            reusable_bucket,
         }
     }
 
@@ -219,8 +245,8 @@ impl Fixture {
             match binding
                 .try_admit_request(
                     request.clone(),
-                    id(format!("run.metal.checkpoint.{name}")),
-                    id(format!("request.metal.checkpoint.{name}")),
+                    id(format!("run.fixture.checkpoint.{name}")),
+                    id(format!("request.fixture.checkpoint.{name}")),
                 )
                 .unwrap()
             {
@@ -315,14 +341,52 @@ impl Fixture {
         tokens: Arc<[u32]>,
         range: Range<usize>,
     ) -> Observation {
+        self.execute_checked(session, tokens, range, false, false)
+            .unwrap()
+    }
+
+    pub fn execute_replayed(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+    ) -> Observation {
+        self.execute_checked(session, tokens, range, true, false)
+            .unwrap()
+    }
+
+    pub fn execute_numerical_failure(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+    ) {
+        assert!(self
+            .execute_checked(session, tokens, range, replay, true)
+            .is_none());
+    }
+
+    fn execute_checked(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+        expect_failure: bool,
+    ) -> Option<Observation> {
+        let catalog = replay.then(|| self.lane.reusable_execution_catalog().unwrap());
         let span = token_span(Arc::clone(&tokens), range.clone());
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(session)]).unwrap();
-        let request = StepResourceAdmissionRequest::new(
+        let mut request = StepResourceAdmissionRequest::new(
             batch.bind_work_shape(vec![span]).unwrap(),
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
         .unwrap();
+        if let Some(bucket) = &self.reusable_bucket {
+            request = request.with_reusable_execution_bucket(bucket.clone());
+        }
         let step = loop {
             match batch.try_begin_step(request.clone(), &self.lane).unwrap() {
                 StepResourceAdmissionDecision::Admitted(step) => break step,
@@ -463,18 +527,80 @@ impl Fixture {
                 .insert(component.resource_id().clone(), state.id.to_string())
                 .is_none());
         }
-        let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
-            self.providers.providers(),
-            executable,
-            &identity,
-            std::iter::once(&active),
-            DeviceTimingMode::Off,
-            &[input],
-            wave,
-            &self.lane,
-            &self.reaper,
-        )
-        .unwrap();
+        let handle = if let Some(catalog) = catalog {
+            let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+                self.providers.providers(),
+                executable,
+                &wave,
+                &self.lane,
+            )
+            .unwrap()
+            .expect("typed slots must authorize a reusable topology");
+            let program = catalog
+                .programs()
+                .iter()
+                .find(|program| program.program_id() == &program_id)
+                .expect("real backend must publish the warmed topology, without eager fallback");
+            assert!(
+                program.is_determinism_ready(),
+                "incomplete replay program: {program:?}"
+            );
+            assert_eq!(
+                program.per_wave_binding_node_indices(),
+                &[0, 1],
+                "both embedding and dual-state attention must update their typed slots"
+            );
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+                self.providers.providers(),
+                executable,
+                &identity,
+                std::iter::once(&active),
+                DeviceTimingMode::Off,
+                &[input],
+                program,
+                SubmissionExecutionPolicy::determinism_replayed(1),
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        } else {
+            OperationDispatch::encode_and_submit_wave_with_inputs(
+                self.providers.providers(),
+                executable,
+                &identity,
+                std::iter::once(&active),
+                DeviceTimingMode::Off,
+                &[input],
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        };
+        if expect_failure {
+            let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+                panic!("numerical failure must reach a quiescent terminal");
+            };
+            let OperationCompletionDisposition::FailedButQuiescent(failures) =
+                receipt.disposition()
+            else {
+                panic!("non-finite input must report a device numerical failure: {receipt:?}");
+            };
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].failure().domain(), FailureDomain::Device);
+            assert!(
+                failures[0].failure().message().contains("non-finite"),
+                "unexpected device failure: {failures:?}"
+            );
+            drop((receipt, handle, identity, active));
+            let failure = step
+                .try_retire_normal()
+                .expect_err("failed participant must not commit a successful completed frontier");
+            failure.into_step().try_abort().unwrap();
+            self.assert_failed_sequence_has_no_checkpoint(session);
+            return None;
+        }
         let readbacks = CompletionReadbackCollectionRequest::new(
             requests
                 .into_iter()
@@ -503,14 +629,32 @@ impl Fixture {
         drop(identity);
         drop(active);
         step.try_retire_normal().unwrap();
-        Observation {
+        Some(Observation {
             values,
             state_types: self
                 .states
                 .iter()
                 .map(|s| (s.id.to_string(), s.tensor.element_type))
                 .collect(),
-        }
+        })
+    }
+
+    fn assert_failed_sequence_has_no_checkpoint(&self, session: &Arc<SequenceSession<Runtime>>) {
+        let binding = self.resources.trusted_runtime_binding().unwrap();
+        let result = self.reaper.try_capture_sequence_checkpoint(
+            self.compilation.executable().execution_plan(),
+            &binding,
+            Arc::clone(session),
+            Arc::clone(&self.lane),
+        );
+        assert!(
+            matches!(result, Err(_) | Ok(NativeCheckpointStart::Skipped(_))),
+            "a failed full-plan wave must never authorize checkpoint allocation or publication"
+        );
+        assert_eq!(
+            CapacitySnapshot::observe(&self.resources).checkpoint_claims,
+            0
+        );
     }
 
     pub fn capture(&self, source: &Arc<SequenceSession<Runtime>>) -> SequenceCheckpoint<Runtime> {

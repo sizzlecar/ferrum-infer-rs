@@ -502,6 +502,8 @@ fn int8_tiled_dispatch_accounts_for_bounded_dequantization_memory() {
     // Gather-based INT8 tiles can cross page boundaries that prevent F16 direct loads.
     params.key_value_heads = 3;
     params.query_heads = 6;
+    params.query_projection_stride = params.query_heads * params.query_head_stride;
+    params.kv_projection_stride = params.key_value_heads * params.head_dim;
     assert!(!page_holds_whole_token_rows(&params));
     assert_eq!(
         int8_attention_dispatch_plan(&params, 32 * 1024).kind,

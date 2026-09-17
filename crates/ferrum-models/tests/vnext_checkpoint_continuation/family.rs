@@ -440,6 +440,16 @@ impl Weight {
 
 pub struct Weights(pub BTreeMap<WeightId, Vec<u8>>);
 impl Weights {
+    pub fn set_nonfinite_embedding(&mut self, token: u32) {
+        assert!(u64::from(token) < VOCAB);
+        let bytes = self
+            .0
+            .get_mut(&id::<WeightId>("component.embedding"))
+            .unwrap();
+        let offset = token as usize * HIDDEN as usize * 2;
+        bytes[offset..offset + 2].copy_from_slice(&f16::NAN.to_le_bytes());
+    }
+
     pub fn new(schema: &WeightSchema) -> Self {
         let values = schema
             .components

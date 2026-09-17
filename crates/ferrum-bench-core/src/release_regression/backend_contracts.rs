@@ -85,6 +85,29 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
             name: "backend::cuda::vnext_runtime::tests::numerical_status_snapshot_survives_eager_scratch_reuse_and_keeps_stream_usable".into(),
         });
     }
+    if backend != Backend::Cpu {
+        let target = format!("vnext_{}_checkpoint_continuation", backend_name(backend));
+        let mut names = vec![
+            "causal_int8_kv_q4k_provider_resumes_payload_and_scales_across_a_page_boundary",
+            "causal_int8_kv_captures_completed_input_and_restores_an_appended_suffix",
+            "causal_int8_kv_eager_failure_does_not_poison_the_execution_lane",
+        ];
+        match backend {
+            Backend::Metal => {
+                names.push("causal_int8_kv_checkpoint_rejects_a_same_token_f16_target")
+            }
+            Backend::Cuda => {
+                names.push("causal_int8_kv_typed_slots_replay_and_recover_after_nonfinite_input")
+            }
+            Backend::Cpu => unreachable!(),
+        }
+        submission_tests.extend(names.into_iter().map(|name| ContractTest {
+            package: "ferrum-models".into(),
+            target: target.clone(),
+            kind: "test".into(),
+            name: name.into(),
+        }));
+    }
     let mut groups = vec![ContractGroup {
         id: checker_id(backend),
         behavior: Behavior::SubmissionCompletion,
