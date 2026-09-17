@@ -601,9 +601,29 @@ pub struct ModelInfo {
     /// Effective input-plus-output capacity reported by the loaded LLM engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
+    /// Optional model-declared controls; omission means support is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ModelReasoningCapabilities>,
     pub permission: Vec<ModelPermission>,
     pub root: Option<String>,
     pub parent: Option<String>,
+}
+
+/// Optional extension for clients to discover actual reasoning controls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelReasoningCapabilities {
+    /// Only populated from a declaration, including an explicitly empty set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_efforts: Option<Vec<ferrum_types::ReasoningEffort>>,
+    /// Present only when template probing establishes an enable/disable control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ModelThinkingCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelThinkingCapability {
+    /// Effective service default, including an explicit server override.
+    pub default_enabled: bool,
 }
 
 /// Model permission

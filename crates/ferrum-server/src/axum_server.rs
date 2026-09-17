@@ -5553,6 +5553,26 @@ async fn models_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
     let now = chrono::Utc::now().timestamp() as u64;
+    let reasoning = state.prompt_template.as_ref().and_then(|template| {
+        let supported_efforts = template
+            .reasoning_effort_support
+            .declared_efforts()
+            .map(|efforts| efforts.iter().copied().collect());
+        let thinking =
+            template
+                .supports_thinking_control()
+                .then(|| crate::openai::ModelThinkingCapability {
+                    default_enabled: state
+                        .default_enable_thinking
+                        .unwrap_or(template.reasoning_default_enabled),
+                });
+        (supported_efforts.is_some() || thinking.is_some()).then_some(
+            crate::openai::ModelReasoningCapabilities {
+                supported_efforts,
+                thinking,
+            },
+        )
+    });
     let data = state
         .served_model_registry
         .entries()
@@ -5565,6 +5585,16 @@ async fn models_handler(
             max_model_len: match entry.kind() {
                 ServedModelKind::Llm => state.llm.as_ref().and_then(|llm| llm.context_capacity()),
                 _ => None,
+            },
+            reasoning: if entry.kind() == ServedModelKind::Llm
+                && state
+                    .llm
+                    .as_ref()
+                    .is_some_and(|llm| &llm.config().model.model_id == entry.engine_model_id())
+            {
+                reasoning.clone()
+            } else {
+                None
             },
             modalities: entry
                 .kind()
@@ -5875,6 +5905,7 @@ mod tests {
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
+    mod model_reasoning_metadata;
     mod native_tool_stream;
     mod reasoning_controls;
     mod tool_argument_strictness;
