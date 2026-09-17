@@ -67,7 +67,7 @@ impl FromStr for ModelCheck {
 }
 
 impl ModelCheck {
-    fn cases(self) -> &'static [&'static str] {
+    pub fn cases(self) -> &'static [&'static str] {
         match self {
             Self::Basic => &["run-basic", "serve-basic"],
             Self::Stop => &["run-stop", "serve-stop"],

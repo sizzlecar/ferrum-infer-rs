@@ -7,6 +7,7 @@
 //! See docs/vnext-8bit-kv-validation.zh.md for calibration and evidence limits.
 
 use anyhow::{ensure, Context, Result};
+use ferrum_bench_core::release_regression::model_tasks::ModelCheck;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -45,9 +46,15 @@ struct Model {
     model: PathBuf,
     source_label: String,
     precision_label: String,
+    #[serde(default = "default_checks")]
+    checks: Vec<ModelCheck>,
     #[serde(default)]
     expect_prefix_restore: bool,
     long_context: Option<LongContext>,
+}
+
+fn default_checks() -> Vec<ModelCheck> {
+    vec![ModelCheck::Basic, ModelCheck::State]
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -118,6 +125,12 @@ impl Configuration {
         let mut ids = BTreeSet::new();
         for model in &self.models {
             ensure!(
+                !model.checks.is_empty()
+                    && model.checks.iter().copied().collect::<BTreeSet<_>>().len()
+                        == model.checks.len(),
+                "model checks must be nonempty and unique"
+            );
+            ensure!(
                 !model.id.is_empty()
                     && model
                         .id
@@ -155,7 +168,12 @@ impl Configuration {
             "--report-dir".into(),
             report_dir.to_string_lossy().into_owned(),
             "--checks".into(),
-            "basic,state".into(),
+            model
+                .checks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             "--context-tokens".into(),
             self.context_tokens.to_string(),
             "--max-num-seqs".into(),
@@ -249,17 +267,22 @@ fn validate_report(report: &Value, model: &Model, dtype: &str) -> Result<Value> 
         report["options"]["kv_dtype"] == dtype,
         "runner did not record the requested KV format"
     );
+    ensure!(
+        report["options"]["checks"] == json!(model.checks),
+        "runner checks differ from the model's calibrated selection"
+    );
     for name in [
         "binary-version",
-        "run-basic",
-        "run-state",
         "serve-startup",
-        "serve-basic",
-        "serve-state",
         "serve-kv-final",
         "binary-unchanged",
     ] {
         case(report, name)?;
+    }
+    for check in &model.checks {
+        for name in check.cases() {
+            case(report, name)?;
+        }
     }
     if model.long_context.is_some() {
         case(report, "run-long-context")?;

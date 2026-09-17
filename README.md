@@ -255,6 +255,7 @@ admission, queuing, or the model's numerical profile.
   tools, and structured output.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
+- Optional [8-bit KV storage](docs/kv-cache-precision.md) for supported vNext Metal and portable CUDA attention paths; FP16 remains the default.
 - GGUF on Metal and CUDA; CUDA also supports GPTQ/safetensors.
 - Ferrum covers language-model inference only. Supported models include Qwen3.5 4B,
   Qwen3.5 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense.
