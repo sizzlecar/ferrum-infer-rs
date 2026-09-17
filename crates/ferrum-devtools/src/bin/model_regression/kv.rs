@@ -52,6 +52,28 @@ pub(super) fn validate_storage(dtype: Option<KvDtype>, observed: &Value) -> Resu
     Ok(())
 }
 
+/// Public product evidence cannot inspect every internal floating-point value.
+/// It must nevertheless reject any failed request or reported executor failure,
+/// including the INT8 encoder's nonfinite-input error propagated by its fence.
+pub(super) fn validate_completed_health(health: &Value) -> Result<()> {
+    ensure!(
+        health["scheduler"]["failed_requests"].as_u64() == Some(0),
+        "server reported failed requests: {}",
+        health["scheduler"]
+    );
+    let prefix = &health["cache"]["prefix_cache"];
+    ensure!(
+        prefix["source"] == "vnext-native-sequence-checkpoint-cache",
+        "KV acceptance requires native vNext executor evidence"
+    );
+    ensure!(
+        prefix.get("last_failure").is_some_and(Value::is_null),
+        "executor reported a failure or omitted its failure status: {}",
+        prefix["last_failure"]
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -48,6 +48,12 @@ struct Args {
     /// Prepared release tasks do not yet declare this independent selection.
     #[arg(long, value_enum, conflicts_with = "expected_task")]
     kv_dtype: Option<kv::KvDtype>,
+    /// Add a deterministic fact-retrieval probe with this many numbered records.
+    #[arg(long, requires_all = ["context_tokens", "long_context_min_prompt_tokens"], conflicts_with = "expected_task", value_parser = clap::value_parser!(u32).range(1..))]
+    long_context_records: Option<u32>,
+    /// Reject a long probe whose actual tokenizer usage falls below this bound.
+    #[arg(long, requires = "long_context_records", value_parser = clap::value_parser!(u32).range(1..))]
+    long_context_min_prompt_tokens: Option<u32>,
     /// Link this execution to a prepared model task. Its configuration is checked before loading.
     #[arg(long)]
     expected_task: Option<PathBuf>,
@@ -290,6 +296,12 @@ async fn main() -> Result<()> {
         capacity
             .validate(args.max_tokens)
             .map_err(anyhow::Error::msg)?;
+        if let Some(minimum) = args.long_context_min_prompt_tokens {
+            ensure!(
+                minimum < capacity.context_tokens.saturating_sub(args.max_tokens),
+                "long-context minimum plus output budget must fit the selected context"
+            );
+        }
     }
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
     if let Some(filename) = &args.gguf_file {
@@ -410,6 +422,14 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
+    if args.long_context_records.is_some() {
+        record(
+            &mut report,
+            "run-long-context",
+            cases::run_long_context(&args),
+        )
+        .await?;
+    }
     let started = Instant::now();
     match process::Server::start(&args).await {
         Ok(server) => {
@@ -461,6 +481,22 @@ async fn main() -> Result<()> {
                         .await?
                     }
                 }
+            }
+            if args.long_context_records.is_some() {
+                record(
+                    &mut report,
+                    "serve-long-context",
+                    cases::serve_long_context(&server),
+                )
+                .await?;
+            }
+            if args.kv_dtype.is_some() {
+                record(&mut report, "serve-kv-final", async {
+                    let health = server.health_snapshot("serve.final-health").await?;
+                    kv::validate_completed_health(&health)?;
+                    Ok(health)
+                })
+                .await?;
             }
         }
         Err(error) => {
