@@ -110,6 +110,7 @@ impl ModelExecutor for StubModelExecutor {
             supported_dtypes: vec![DataType::FP32, DataType::FP16],
             supported_devices: vec![Device::CPU],
             memory_requirements: MemoryRequirements {
+                typed_sequence_state: None,
                 parameter_memory: 4 * 1024 * 1024, // 4MB
                 activation_memory_per_token: 1024,
                 kv_cache_memory_per_token: 512,

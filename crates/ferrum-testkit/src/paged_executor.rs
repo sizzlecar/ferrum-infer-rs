@@ -332,6 +332,7 @@ impl ModelExecutor for PagedAttentionExecutor {
             supported_dtypes: vec![DataType::FP32],
             supported_devices: vec![Device::CPU],
             memory_requirements: MemoryRequirements {
+                typed_sequence_state: None,
                 parameter_memory: 0,
                 activation_memory_per_token: 0,
                 kv_cache_memory_per_token: (self.config.num_kv_heads

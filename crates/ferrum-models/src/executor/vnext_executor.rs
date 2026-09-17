@@ -31,7 +31,7 @@ use ferrum_interfaces::model_executor::{
     PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreDeferral,
     PlanRuntimePrefixRestoreInput, PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput,
     PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary,
-    PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
+    PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -65,6 +65,7 @@ pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
 mod request;
 mod reusable_catalog;
+mod state_memory;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -4423,6 +4424,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     static_provider_attribution: Option<StaticProviderAttributionWitness>,
     checkpoint_capture: Option<VNextCheckpointCapture>,
     static_bytes: u64,
+    sequence_state_memory: TypedSequenceStateMemory,
     device_reusable_execution_enabled: bool,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
@@ -4753,6 +4755,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let catalog = composition.catalog.clone();
         let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let family = prepared.family();
+        let sequence_state_memory = state_memory::logical_sequence_state_memory(
+            &family.numerical_profile().states,
+            &family.numerical_profile().kv_storage,
+        )?;
         let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
         let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
@@ -4974,6 +4980,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             static_provider_attribution,
             checkpoint_capture,
             static_bytes,
+            sequence_state_memory,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
             reusable_execution_supported,
             reusable_execution_startup_plan,
@@ -9702,6 +9709,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "requested": numerical.requested_kv_storage(),
                 "selected": numerical.selected_kv_storage(),
                 "numerical_profile": numerical.selected_profile(),
+                "logical_sequence_state": self.sequence_state_memory,
+                "logical_bytes_scope": "complete_model_excluding_alignment_workspace_and_checkpoint_copies",
+                "resident_usage_source": "dynamic_pools",
             }),
         );
         snapshot
@@ -10356,10 +10366,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             memory_requirements: MemoryRequirements {
                 parameter_memory: self.static_bytes,
                 activation_memory_per_token: self.info.hidden_size * self.info.dtype.size_bytes(),
-                kv_cache_memory_per_token: self.info.num_kv_heads
-                    * self.attention_head_dimension
-                    * 2
-                    * self.info.dtype.size_bytes(),
+                kv_cache_memory_per_token: 0,
+                typed_sequence_state: Some(self.sequence_state_memory),
                 overhead_memory: self.policy.memory().reserve_bytes,
             },
         }

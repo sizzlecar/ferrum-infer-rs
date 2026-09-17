@@ -3550,33 +3550,161 @@ pub enum AttentionType {
     SlidingWindow,
 }
 
-/// Memory requirements for model execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Logical state bytes across the complete model, before physical page
+/// alignment, pool residency, checkpoint copies or operation workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TypedSequenceStateMemory {
+    /// K/V payload and quantization scale bytes for one token in one sequence.
+    pub kv_bytes_per_token: u64,
+    /// Other sequence states whose size scales with token count.
+    pub other_token_scaled_bytes_per_token: u64,
+    /// Fixed sequence state, including recurrent accumulators and windows.
+    pub fixed_bytes_per_sequence: u64,
+}
+
+/// Memory requirements for model execution. This describes logical model
+/// requirements, not measured device allocation or an admission guarantee.
+#[derive(Debug, Clone, Deserialize)]
 pub struct MemoryRequirements {
     /// Model parameter memory in bytes
     pub parameter_memory: u64,
     /// Minimum activation memory per token
     pub activation_memory_per_token: usize,
-    /// KV cache memory per token per layer
+    /// Legacy KV cache bytes per token per layer. Ignored and omitted from
+    /// serialization when typed_sequence_state supplies complete-model bytes.
+    #[serde(default)]
     pub kv_cache_memory_per_token: usize,
+    /// Exact logical sequence state from a typed model plan. Old wire values
+    /// without this field retain the legacy per-layer interpretation.
+    #[serde(default)]
+    pub typed_sequence_state: Option<TypedSequenceStateMemory>,
     /// Additional overhead memory
     pub overhead_memory: u64,
 }
 
+impl Serialize for MemoryRequirements {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut value = serializer.serialize_struct("MemoryRequirements", 4)?;
+        value.serialize_field("parameter_memory", &self.parameter_memory)?;
+        value.serialize_field(
+            "activation_memory_per_token",
+            &self.activation_memory_per_token,
+        )?;
+        match &self.typed_sequence_state {
+            Some(state) => value.serialize_field("typed_sequence_state", state)?,
+            None => value
+                .serialize_field("kv_cache_memory_per_token", &self.kv_cache_memory_per_token)?,
+        }
+        value.serialize_field("overhead_memory", &self.overhead_memory)?;
+        value.end()
+    }
+}
+
 impl MemoryRequirements {
-    /// Calculate total memory for given configuration
+    /// Calculate a logical memory estimate, returning None on arithmetic
+    /// overflow. Typed sequence state is already summed across all layers.
+    pub fn checked_calculate_total_memory(
+        &self,
+        batch_size: usize,
+        sequence_length: usize,
+        num_layers: usize,
+    ) -> Option<u64> {
+        let batch = u64::try_from(batch_size).ok()?;
+        let tokens = u64::try_from(sequence_length).ok()?;
+        let token_count = batch.checked_mul(tokens)?;
+        let activation_mem = u64::try_from(self.activation_memory_per_token)
+            .ok()?
+            .checked_mul(token_count)?;
+        let state_mem = match self.typed_sequence_state {
+            Some(state) => state
+                .kv_bytes_per_token
+                .checked_add(state.other_token_scaled_bytes_per_token)?
+                .checked_mul(token_count)?
+                .checked_add(state.fixed_bytes_per_sequence.checked_mul(batch)?)?,
+            None => u64::try_from(self.kv_cache_memory_per_token)
+                .ok()?
+                .checked_mul(token_count)?
+                .checked_mul(u64::try_from(num_layers).ok()?)?,
+        };
+        self.parameter_memory
+            .checked_add(activation_mem)?
+            .checked_add(state_mem)?
+            .checked_add(self.overhead_memory)
+    }
+
+    /// Calculate a logical memory estimate. Overflow saturates to u64::MAX;
+    /// callers needing an explicit overflow result can use the checked method.
     pub fn calculate_total_memory(
         &self,
         batch_size: usize,
         sequence_length: usize,
         num_layers: usize,
     ) -> u64 {
-        let activation_mem =
-            (self.activation_memory_per_token * batch_size * sequence_length) as u64;
-        let kv_cache_mem =
-            (self.kv_cache_memory_per_token * batch_size * sequence_length * num_layers) as u64;
+        self.checked_calculate_total_memory(batch_size, sequence_length, num_layers)
+            .unwrap_or(u64::MAX)
+    }
+}
 
-        self.parameter_memory + activation_mem + kv_cache_mem + self.overhead_memory
+#[cfg(test)]
+mod memory_requirements_tests {
+    use super::{MemoryRequirements, TypedSequenceStateMemory};
+
+    #[test]
+    fn typed_sequence_memory_counts_scales_and_fixed_state_once_per_sequence() {
+        let memory = MemoryRequirements {
+            parameter_memory: 100,
+            activation_memory_per_token: 4,
+            kv_cache_memory_per_token: 999,
+            typed_sequence_state: Some(TypedSequenceStateMemory {
+                kv_bytes_per_token: 528,
+                other_token_scaled_bytes_per_token: 8,
+                fixed_bytes_per_sequence: 64,
+            }),
+            overhead_memory: 20,
+        };
+        let expected = 100 + 4 * 2 * 3 + (528 + 8) * 2 * 3 + 64 * 2 + 20;
+        for layers in [1, 3, 32] {
+            assert_eq!(
+                memory.checked_calculate_total_memory(2, 3, layers),
+                Some(expected)
+            );
+        }
+        let wire = serde_json::to_value(&memory).unwrap();
+        assert!(wire.get("kv_cache_memory_per_token").is_none());
+        assert_eq!(wire["typed_sequence_state"]["kv_bytes_per_token"], 528);
+        let decoded: MemoryRequirements = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.calculate_total_memory(2, 3, 32), expected);
+    }
+
+    #[test]
+    fn legacy_memory_wire_keeps_per_layer_calculation_and_rejects_overflow() {
+        let wire = serde_json::json!({
+            "parameter_memory": 100,
+            "activation_memory_per_token": 4,
+            "kv_cache_memory_per_token": 16,
+            "overhead_memory": 20,
+        });
+        let mut memory: MemoryRequirements = serde_json::from_value(wire.clone()).unwrap();
+        assert!(memory.typed_sequence_state.is_none());
+        assert_eq!(
+            memory.calculate_total_memory(2, 3, 5),
+            100 + 4 * 2 * 3 + 16 * 2 * 3 * 5 + 20
+        );
+        assert_eq!(serde_json::to_value(&memory).unwrap(), wire);
+        memory.parameter_memory = u64::MAX;
+        assert_eq!(memory.checked_calculate_total_memory(1, 1, 1), None);
+        assert_eq!(memory.calculate_total_memory(1, 1, 1), u64::MAX);
+        memory.parameter_memory = 0;
+        memory.typed_sequence_state = Some(TypedSequenceStateMemory {
+            kv_bytes_per_token: u64::MAX,
+            other_token_scaled_bytes_per_token: 1,
+            fixed_bytes_per_sequence: 0,
+        });
+        assert_eq!(memory.checked_calculate_total_memory(1, 1, 1), None);
     }
 }
 

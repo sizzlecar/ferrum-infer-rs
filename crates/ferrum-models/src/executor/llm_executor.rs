@@ -1153,6 +1153,7 @@ impl ModelExecutor for LlmExecutor {
             supported_dtypes: vec![DataType::FP32],
             supported_devices: vec![self.info.device.clone()],
             memory_requirements: MemoryRequirements {
+                typed_sequence_state: None,
                 parameter_memory: (self.info.num_parameters * 4) as u64,
                 activation_memory_per_token: cfg.hidden_size * 4,
                 kv_cache_memory_per_token: cfg.hidden_size * 2,

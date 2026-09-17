@@ -436,6 +436,7 @@ impl ResolvedFerrumConfig {
             "selected_max_sequences": selected_max_sequences,
             "selected_max_model_len": selected_max_model_len,
             "selected_kv_capacity": selected_kv_capacity,
+            "selected_kv_capacity_source": "configured_token_limit",
             "selected_max_batched_tokens": selected_max_batched_tokens,
             "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
             "selected_admission_limit": selected_admission_limit,
@@ -492,12 +493,19 @@ impl ResolvedFerrumConfig {
             },
             "legacy_recurrent_state_max_slots_estimate": recurrent_state_max_slots,
             "legacy_recurrent_state_limit_applies": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "kv_capacity_source": "legacy_block_preflight_estimate",
+            "kv_capacity_applies_to_selected_state_layout": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "kv_capacity_is_resident_usage": false,
             "kv_block_count": kv_blocks,
             "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
             "kv_capacity_tokens": kv_capacity_tokens,
             "max_model_length": max_model_len,
             "max_batched_tokens": max_batched_tokens,
             "memory_estimate": {
+                "source": "legacy_f16_geometry_estimate",
+                "applies_to_selected_state_layout": false,
+                "is_resident_usage": false,
+                "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
                 "vram_bytes": self.hardware_capabilities.vram_bytes,
                 "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
                 "kv_bytes_per_token": kv_bytes_per_token,
@@ -3339,6 +3347,67 @@ mod tests {
             document["admission"]["legacy_recurrent_state_limit_applies"],
             serde_json::json!(false)
         );
+    }
+
+    #[test]
+    fn plan_runtime_preflight_labels_legacy_estimates_without_breaking_capacity_consumers() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let model = synthetic_tight_recurrent_state_model();
+        for authority in [
+            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionResourceAuthority::LegacyEngine,
+        ] {
+            let document = FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_DTYPE", "int8"),
+                ("FERRUM_KV_CAPACITY", "512"),
+            ]))
+            .with_model_capabilities(model.clone())
+            .with_hardware_capabilities(hardware.clone())
+            .with_execution_resource_authority(authority)
+            .resolve()
+            .unwrap()
+            .effective_config_document();
+            assert_eq!(document["selected_kv_capacity"], 512);
+            assert_eq!(
+                document["selected_kv_capacity_source"],
+                "configured_token_limit"
+            );
+            let admission = &document["admission"];
+            for field in [
+                "kv_block_count",
+                "kv_block_size_tokens",
+                "kv_capacity_tokens",
+            ] {
+                assert!(
+                    admission[field].as_u64().is_some(),
+                    "missing compatibility field {field}"
+                );
+            }
+            assert_eq!(
+                admission["kv_capacity_source"],
+                "legacy_block_preflight_estimate"
+            );
+            assert_eq!(admission["kv_capacity_is_resident_usage"], false);
+            assert_eq!(
+                admission["kv_capacity_applies_to_selected_state_layout"],
+                authority == ExecutionResourceAuthority::LegacyEngine
+            );
+            let estimate = &admission["memory_estimate"];
+            assert_eq!(
+                estimate["kv_bytes_per_token"],
+                kv_cache_bytes_per_token_for_model(&model).unwrap()
+            );
+            assert_eq!(estimate["source"], "legacy_f16_geometry_estimate");
+            assert_eq!(estimate["applies_to_selected_state_layout"], false);
+            assert_eq!(estimate["is_resident_usage"], false);
+            if authority == ExecutionResourceAuthority::PlanRuntime {
+                assert_eq!(
+                    estimate["selected_state_evidence_source"],
+                    "executor.kv_storage.logical_sequence_state"
+                );
+            }
+        }
     }
 
     #[test]
