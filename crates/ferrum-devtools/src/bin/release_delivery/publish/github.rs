@@ -6,6 +6,9 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "github/upload.rs"]
+mod upload;
+
 struct GitHub {
     client: Client,
     base: String,
@@ -134,6 +137,15 @@ async fn ensure_tag(api: &GitHub, repo: &str, accepted: &AcceptedRelease) -> Res
                 .ok_or("created Git tag is not readable")?
         }
     };
+    verify_tag_reference(api, repo, accepted, reference).await
+}
+
+async fn verify_tag_reference(
+    api: &GitHub,
+    repo: &str,
+    accepted: &AcceptedRelease,
+    reference: Value,
+) -> Result<(), String> {
     let mut object = reference["object"].clone();
     // Annotated tags can refer to another tag; detect cycles and bound bad input.
     let mut seen = std::collections::BTreeSet::new();
@@ -280,29 +292,15 @@ async fn reconcile_release(
         if !draft {
             return Err("formal release is missing accepted assets; refusing to mutate a partially published release".into());
         }
-        let bytes = verified_asset_bytes(asset)?;
-        let response = api
-            .client
-            .post(format!("{}/repos/{repo}/releases/{id}/assets", api.uploads))
-            .query(&[("name", asset.name.as_str())])
-            .bearer_auth(&api.token)
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("Content-Type", "application/octet-stream")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|error| asset_upload_error(&asset.name, error))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "asset upload returned HTTP {}; reconcile before retrying",
-                response.status()
-            ));
-        }
-        let remote: Value = response
-            .json()
-            .await
-            .map_err(|_| "asset upload response was invalid; reconcile before retrying")?;
-        check_remote_asset(api, repo, asset, &remote).await?;
+        upload::upload_missing_asset(
+            api,
+            repo,
+            accepted,
+            id,
+            asset,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
     }
     let final_assets = list_assets(api, repo, id).await?;
     if final_assets.len() != accepted.assets.len() {

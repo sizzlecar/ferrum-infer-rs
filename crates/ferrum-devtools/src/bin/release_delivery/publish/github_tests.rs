@@ -2,7 +2,7 @@ use super::super::test_http::{Response, Server};
 use super::*;
 use std::sync::{Arc, Mutex};
 
-fn accepted(directory: &std::path::Path) -> AcceptedRelease {
+pub(super) fn accepted(directory: &std::path::Path) -> AcceptedRelease {
     let assets = ["one.tar.gz", "two.tar.gz"]
         .into_iter()
         .map(|name| {
@@ -23,7 +23,7 @@ fn accepted(directory: &std::path::Path) -> AcceptedRelease {
         assets,
     }
 }
-fn api(server: &Server) -> GitHub {
+pub(super) fn api(server: &Server) -> GitHub {
     GitHub {
         client: Client::builder().no_proxy().build().unwrap(),
         base: server.url.clone(),
@@ -31,11 +31,11 @@ fn api(server: &Server) -> GitHub {
         token: "loopback-fixture-token".into(),
     }
 }
-fn remote(name: &str) -> Value {
+pub(super) fn remote(name: &str) -> Value {
     json!({"id": if name == "one.tar.gz" { 10 } else { 11 }, "name":name,"size":name.len(),"digest":format!("sha256:{}",sha256(name.as_bytes())),"state":"uploaded"})
 }
-fn release(draft: bool) -> Value {
-    json!({"id": 7,"tag_name":"v2.3.4","body":"Verified candidate release","draft":draft,"prerelease":false,"published_at": if draft { Value::Null } else { json!("2026-01-01T00:00:00Z") }})
+pub(super) fn release(draft: bool) -> Value {
+    json!({"id": 7,"target_commitish":"a".repeat(40),"tag_name":"v2.3.4","body":"Verified candidate release","draft":draft,"prerelease":false,"published_at": if draft { Value::Null } else { json!("2026-01-01T00:00:00Z") }})
 }
 
 #[tokio::test]
@@ -71,6 +71,7 @@ async fn resume_partial_draft(hidden_from_tag_lookup: bool) {
                     Response::json(200, release(!state.formal))
                 }
             }
+            ("GET", "/repos/test/repo/releases/7") => Response::json(200, release(!state.formal)),
             ("GET", "/repos/test/repo/releases?per_page=100&page=1") => Response::json(
                 200,
                 Value::Array(

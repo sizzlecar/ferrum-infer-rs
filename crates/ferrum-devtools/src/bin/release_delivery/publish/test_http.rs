@@ -18,18 +18,43 @@ pub(super) struct Request {
 pub(super) struct Response {
     pub status: u16,
     pub body: Vec<u8>,
+    disconnect: bool,
+    declared_length: Option<usize>,
 }
 impl Response {
     pub fn json(status: u16, body: serde_json::Value) -> Self {
         Self {
             status,
             body: serde_json::to_vec(&body).unwrap(),
+            disconnect: false,
+            declared_length: None,
         }
     }
     pub fn text(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
             body: body.into(),
+            disconnect: false,
+            declared_length: None,
+        }
+    }
+    /// Consume the complete request, then lose the response on the wire.
+    pub fn disconnect() -> Self {
+        Self {
+            status: 0,
+            body: Vec::new(),
+            disconnect: true,
+            declared_length: None,
+        }
+    }
+    /// Advertise more response bytes than the server sends before closing.
+    pub fn truncated(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        let body = body.into();
+        Self {
+            status,
+            declared_length: Some(body.len() + 1),
+            body,
+            disconnect: false,
         }
     }
 }
@@ -56,7 +81,10 @@ impl Server {
                             .set_read_timeout(Some(Duration::from_secs(3)))
                             .unwrap();
                         let response = handler(read_request(&mut stream));
-                        write!(stream, "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n", response.status, response.body.len()).unwrap();
+                        if response.disconnect {
+                            continue;
+                        }
+                        write!(stream, "HTTP/1.1 {} Fixture\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n", response.status, response.declared_length.unwrap_or(response.body.len())).unwrap();
                         stream.write_all(&response.body).unwrap();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
