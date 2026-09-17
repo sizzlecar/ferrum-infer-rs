@@ -24,6 +24,9 @@ mod checkpoint_maintenance_tests;
 #[path = "capacity_pressure_tests.rs"]
 mod capacity_pressure_tests;
 
+#[path = "plan_fit_tests.rs"]
+mod plan_fit_tests;
+
 #[path = "checkpoint/tests.rs"]
 mod checkpoint_backing_tests;
 

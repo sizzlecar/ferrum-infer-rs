@@ -2,14 +2,14 @@ use super::{
     defer_device_cleanup, invalid_resource, sequence_slot_is_poisoned, AdmissionDecision,
     AdmissionDeferred, AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionPressureAction,
     AdmissionRejected, AllocationLifetime, Arc, AtomicU64, BTreeMap, BTreeSet,
-    BackingPrepareDecision, BatchStepId, CapacityClaimDecision, DeferredDeviceCleanupDisposition,
-    DeferredDeviceCleanupTask, DeviceBufferRetention, DeviceRuntime, Digest,
-    DynamicBackingClaimScope, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
-    DynamicResourceShape, ExecutionFrameId, InitialSequenceAdmissionDecision,
-    LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalCapacityLease,
-    LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering, ParticipantNodeKey,
-    PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedBackingClaim,
+    BackingPrepareDecision, BatchStepId, CapacityClaimDecision, CapacityVector,
+    DeferredDeviceCleanupDisposition, DeferredDeviceCleanupTask, DeviceBufferRetention,
+    DeviceRuntime, Digest, DynamicBackingClaimScope, DynamicBackingDeferred,
+    DynamicDeferredMaintenanceOutcome, DynamicResourceShape, ExecutionFrameId,
+    InitialSequenceAdmissionDecision, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
+    LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
+    LogicalCapacityLease, LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering,
+    ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedBackingClaim,
     RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest,
     RequestStateHazardRegistration, ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId,
     SequenceRecoveryRegistry, SequenceResourceAdmissionRequest, Serialize, Sha256,
@@ -217,6 +217,13 @@ where
             fit_policy,
             pressure_action,
         )?;
+        if let Some(rejected) =
+            self.reject_impossible_plan_fit(demand.immediate_claim(), demand.fit_requirement())?
+        {
+            return Ok(RequestResourceAdmissionDecision::PermanentRejected(
+                rejected,
+            ));
+        }
         let prepared = match self.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
@@ -333,6 +340,20 @@ where
             ));
         }
         requested_slices.append(&mut sequence_slices);
+
+        let immediate = CapacityVector::checked_sum(
+            request_demand.immediate_claim(),
+            sequence_demand.immediate_claim(),
+        )?;
+        let fit = CapacityVector::checked_sum(
+            request_demand.fit_requirement(),
+            sequence_demand.fit_requirement(),
+        )?;
+        if let Some(rejected) = self.reject_impossible_plan_fit(&immediate, &fit)? {
+            return Ok(InitialSequenceResourceAdmissionDecision::PermanentRejected(
+                rejected,
+            ));
+        }
 
         loop {
             match self
@@ -605,6 +626,18 @@ where
             fit_policy,
             pressure_action,
         )?;
+        // The retained request root is part of this child's unavoidable cost.
+        // It is counted once, while unrelated requests and sibling sequences
+        // remain temporary pressure and never enter this permanent bound.
+        let immediate =
+            CapacityVector::checked_sum(self.logical_lease.claims(), demand.immediate_claim())?;
+        let fit =
+            CapacityVector::checked_sum(self.logical_lease.claims(), demand.fit_requirement())?;
+        if let Some(rejected) = self.plan.reject_impossible_plan_fit(&immediate, &fit)? {
+            return Ok(SequenceResourceAdmissionDecision::PermanentRejected(
+                rejected,
+            ));
+        }
         match self
             .plan
             .logical_admission()

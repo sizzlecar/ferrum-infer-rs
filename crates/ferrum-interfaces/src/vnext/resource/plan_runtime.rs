@@ -2,8 +2,8 @@ use super::{
     core_resource_failure, deferred_device_cleanup_status, invalid_resource,
     maintain_deferred_device_cleanups, new_deferred_device_cleanup_domain,
     retire_deferred_device_cleanup_domain, watch, AdmissionDeferred, AdmissionDemand,
-    AdmissionFitPolicy, AdmissionPressureAction, AllocationLifetime, Arc, AtomicU8,
-    BackingPrepareDecision, CapacityAvailabilityEpoch, CapacityEntry, CapacityEpochs,
+    AdmissionFitPolicy, AdmissionPressureAction, AdmissionRejected, AllocationLifetime, Arc,
+    AtomicU8, BackingPrepareDecision, CapacityAvailabilityEpoch, CapacityEntry, CapacityEpochs,
     CapacityUnits, CapacityVector, CapacityWaitCondition, CapacityWaitRecheck,
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
     DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
@@ -1072,6 +1072,59 @@ where
 
     pub fn evidence(&self) -> TrustedPlanRuntimeEvidence {
         self.resources.evidence()
+    }
+
+    /// Rejects only a plan-derived lower bound that cannot fit even after every
+    /// other owner releases. Current occupancy and process-wide contention are
+    /// deliberately absent: they can disappear and must remain recoverable.
+    pub(super) fn reject_impossible_plan_fit(
+        &self,
+        immediate: &CapacityVector,
+        fit: &CapacityVector,
+    ) -> Result<Option<AdmissionRejected>, VNextError> {
+        let pools = &self.resources.dynamic_pools;
+        let snapshot = self.logical_admission().snapshot()?;
+        for entry in fit.entries() {
+            let domain = snapshot
+                .domains()
+                .iter()
+                .find(|domain| domain.domain() == entry.domain())
+                .ok_or_else(|| {
+                    invalid_resource("plan fit references an unknown capacity domain")
+                })?;
+            // Preserve the existing, more specific per-domain rejection.
+            if entry.units().get() > domain.maximum_total().get() {
+                return Ok(None);
+            }
+        }
+        let binding = match &self.resources.static_resources {
+            PlanRuntimeStatic::NoStatic { binding } => binding,
+            PlanRuntimeStatic::Static(source) => &source.admission,
+        };
+        let minimum_required =
+            pools
+                .domains
+                .iter()
+                .try_fold(binding.plan_static_bytes(), |total, domain| {
+                    let requested = fit
+                        .units_for(domain.domain_id)
+                        .map_or(0, CapacityUnits::get);
+                    let minimum = domain.pool.provisioning().minimum_resident_bytes();
+                    total
+                        .checked_add(minimum.max(requested))
+                        .ok_or_else(|| invalid_resource("joint plan fit lower bound overflows u64"))
+                })?;
+        Ok(
+            (minimum_required > binding.usable_capacity_bytes()).then(|| {
+                AdmissionRejected::for_plan_budget(
+                    immediate.clone(),
+                    fit.clone(),
+                    snapshot,
+                    minimum_required,
+                    binding.usable_capacity_bytes(),
+                )
+            }),
+        )
     }
 
     pub(super) fn scoped_demand(
