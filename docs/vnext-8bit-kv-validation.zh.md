@@ -53,7 +53,7 @@
 
 ## 3. 已实际执行的检查
 
-以下为本机运行结果，代码里程碑包括 `c414a179`、`8fddf851`、`bf484f93`、`821fb996`。提交号用于复核来源，不是通过条件。
+以下为本机运行结果，核心代码里程碑包括 `821fb996`、`974ae0e3`，公共恢复夹具修正为 `f21f534d`。提交号用于复核来源，不是通过条件。
 
 | 检查 | 结果 | 证明范围 |
 | --- | --- | --- |
@@ -62,9 +62,28 @@
 | Metal `causal_attention::conformance_tests::int8` | 6 通过，0 ignored | 实际量化写入、独立页边界、GQA/MQA、general/direct/tiled 读取及 Rust reference 对照 |
 | Metal `completed_device_status` | 2 通过，0 ignored | 数值失败在 fence 后可见，复用 slot/stream 不改写旧 fence 的终态 |
 | Metal `vnext_metal_checkpoint_continuation` 中 `causal_int8_kv` | 3 通过，0 ignored | public provider 的 Q4_K projection、跨页双状态恢复、追加 suffix、跨 dtype 拒绝 |
+| 使用 CI artifact JSONL 的 Metal `backend-contract.metal.vnext-submission` | 8 项实际执行通过 | 包含 models integration harness，覆盖失败后不能 capture 与同 lane 恢复；没有以注册或缺失 executable 代替执行 |
 | `cargo check --locked --workspace --all-targets --features metal` | 通过（`RUSTFLAGS=-D warnings`） | 当前 workspace 的 Metal 编译；不等同于整个 workspace runtime 测试 |
+| 默认 workspace fmt / check / test / clippy | 全部通过；顶层 tests 4,290 passed、67 ignored、0 failed，另有 1 项子进程自测 | ignored 涉及真实模型、GPU、发行资产等，不包含其运行资格；Clippy 按仓库要求使用 `-A warnings` |
+| typed 内存与 preflight 标记 focused tests | 5 通过 | scales、固定 recurrent、溢出边界与旧字段的范围说明 |
+| `checkpoint_diff` example | 13 通过 | 完整 capture 目录、raw hash、同历史 KL/NLL，测量工具本身不批准发布 |
 
-首次 Metal 编译在 `-D warnings` 下因废弃 helper 未使用失败；已删除无用路径并重跑上述设备测试通过。全部 workspace 检查、真实模型验证、CUDA runtime 与发行验证仍需分别完成，不能由本表替代。
+首次 Metal 编译在 `-D warnings` 下因废弃 helper 未使用失败；已删除无用路径。后续 JSON 宏递归编译失败已拆分对象解决。Metal 公共失败测试曾错误假设一个 fence 只对应一个 failure、失败 step 一定不能正常 retire；修正为核验所有失败归因以及失败状态不能发布可 capture frontier，实际设备验证通过，未修改产品失败语义。
+
+CUDA 既有 RTX 4050 CI 已实际通过 4 个 INT8 kernel correctness 测试和 1 个 eager numerical status 测试。公共恢复夹具先暴露 CI 未构建 executable，补齐 artifact 后又发现 stateless embedding 缺少 checkpoint 声明；已提交最小声明修复，新的公共恢复和真实模型配对 CI 尚待结果。不能将这 5 项通过等同 CUDA 全模型恢复或发布资格。
+
+最终 teacher-forced 质量测量如下，两组均在第 2.1 节事前门槛内；每组 64 个 canonical targets，Qwen3.5-2B、Metal、同一候选二进制/权重/模板/采样。长输入实际 4,281 prompt tokens。全词表 logits/raw hashes、同历史 span 与完整 capture 数量由 Rust `checkpoint_diff --reference-dir ... --candidate-dir ...` 验证。
+
+| 样本 | 平均 ΔNLL | 最大 ΔNLL | 平均 KL | 最大 KL |
+| --- | ---: | ---: | ---: | ---: |
+| 数据库隔离级别短输入 | 0.0036891033 | 0.0591330618 | 0.0002476295 | 0.0015220417 |
+| 记录检索解释长输入 | 0.0000182353 | 0.0238580971 | 0.0001064513 | 0.0007249649 |
+
+数值单位均为 nats。这些结果不代表全部模型或领域；产品任务、容量与延迟仍需独立完成。两次 capture 都关闭 reusable execution、chunk 512、max sequences 1、greedy、thinking off；短输入 context/kv-capacity 4,096，长输入 8,192。输出长度为固定诊断 token 数，不要求自然结束，不把其 JSONL 耗时用作产品性能。
+
+实际内存解释：`kv_storage.logical_sequence_state` 来自完整 resolved model plan，区分 KV payload/scales、其他按 token 的状态和固定 recurrent；2B F16 的 KV 为 12,288 bytes/token，INT8 为 6,240，固定 recurrent 两者均为 19,537,920 bytes/sequence。它仍是逻辑需求，不是驻留峰值。历史 `auto_config.admission.memory_estimate` 为兼容消费者保留数值，但明确标记 `legacy_f16_geometry_estimate`、不适用于当前 selected state layout；实际 pool 驻留另看 `cache.prefix_cache.dynamic_pools.pools`。
+
+本机 Qwen3.5 的完整模型 checkpoint health 仍报告既有 provider/state-layout 不支持项；本轮产品质量配对不会把相同文本前缀算作恢复成功。当前真实恢复证据来自公共 causal provider 夹具，纯 causal GGUF 全模型仍需验证。
 
 完整日志与模型输出放仓库外。完成发布资格时补充具体命令、设备/驱动信息、配置、原始结果位置及实际限制。
 
