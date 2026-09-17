@@ -98,7 +98,10 @@ impl Args {
             .context("resolve checkpoint_diff binary")?;
         self.prompt_file = fs::canonicalize(&self.prompt_file).context("resolve prompt file")?;
         if Path::new(&self.model).exists() {
-            self.model = fs::canonicalize(&self.model)?
+            self.model =
+                ferrum_bench_core::release_regression::model_sources::normalize_local_model_path(
+                    Path::new(&self.model),
+                )?
                 .to_string_lossy()
                 .into_owned();
             ensure!(

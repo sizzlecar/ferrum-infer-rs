@@ -331,7 +331,11 @@ fn fp16_and_int8_run_and_serve_preserve_product_behavior() -> Result<()> {
     config.runner_bin =
         fs::canonicalize(&config.runner_bin).context("resolve shared Rust model runner")?;
     for model in &mut config.models {
-        model.model = fs::canonicalize(&model.model).context("resolve local model")?;
+        model.model =
+            ferrum_bench_core::release_regression::model_sources::normalize_local_model_path(
+                &model.model,
+            )
+            .context("resolve local model")?;
         for (label, source) in [
             ("semantic source", &mut model.semantic_source),
             ("tokenizer source", &mut model.tokenizer_source),
@@ -484,4 +488,34 @@ fn paired_local_gguf_configuration_preserves_independent_metadata_sources() {
     assert!(!words
         .iter()
         .any(|word| matches!(word.as_str(), "--semantic-source" | "--tokenizer-source")));
+}
+
+#[test]
+#[cfg(unix)]
+fn paired_local_gguf_symlink_keeps_its_filename_in_runner_commands() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    fs::write(root.join("content-address"), b"fixture").unwrap();
+    let selected = root.join("selected.gguf");
+    std::os::unix::fs::symlink("content-address", &selected).unwrap();
+    let mut config: Configuration = serde_json::from_value(json!({
+        "ferrum_bin": "/fixture/ferrum", "runner_bin": "/fixture/model_regression",
+        "backend": "metal", "hardware_label": "fixture device", "report_dir": "/fixture/report",
+        "context_tokens": 4096, "max_num_seqs": 1, "max_tokens": 128,
+        "models": [{"id": "gguf", "model": selected, "source_label": "fixture source", "precision_label": "Q4_K"}]
+    })).unwrap();
+    config.models[0].model =
+        ferrum_bench_core::release_regression::model_sources::normalize_local_model_path(
+            &config.models[0].model,
+        )
+        .unwrap();
+    for dtype in ["fp16", "int8"] {
+        let words = config.runner_args(&config.models[0], dtype, Path::new("/fixture/report"));
+        let model = words
+            .windows(2)
+            .find(|words| words[0] == "--model")
+            .unwrap();
+        assert_eq!(model[1], selected.to_str().unwrap());
+        assert_eq!(fs::read(&model[1]).unwrap(), b"fixture");
+    }
 }

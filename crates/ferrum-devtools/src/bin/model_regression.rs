@@ -177,6 +177,10 @@ impl Args {
 #[path = "model_regression/capacity_tests.rs"]
 mod capacity_tests;
 
+#[cfg(all(test, unix))]
+#[path = "model_regression/source_tests.rs"]
+mod source_tests;
+
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     fs::write(path.as_ref(), serde_json::to_vec_pretty(value)?)
         .with_context(|| format!("write {}", path.as_ref().display()))
@@ -342,7 +346,10 @@ async fn main() -> Result<()> {
     );
     args.ferrum_bin = fs::canonicalize(&args.ferrum_bin).context("resolve staged binary")?;
     if Path::new(&args.model).exists() {
-        args.model = fs::canonicalize(&args.model)?
+        args.model =
+            ferrum_bench_core::release_regression::model_sources::normalize_local_model_path(
+                Path::new(&args.model),
+            )?
             .to_str()
             .context("model path is not UTF-8")?
             .to_owned();
@@ -362,7 +369,7 @@ async fn main() -> Result<()> {
     if let Some(expected) = &expected {
         if Path::new(&expected.profile.model).exists() {
             ensure!(args.model == expected.profile.model,
-                "bound local model tasks must declare the canonical absolute model path; prepare the task with {}", args.model);
+                "bound local model tasks must declare the resolved absolute model path with its selected filename; prepare the task with {}", args.model);
         }
         verify_model_options(expected, &serde_json::to_value(&args)?)
             .map_err(|issues| anyhow::anyhow!("model task configuration: {}", issues.join("; ")))?;

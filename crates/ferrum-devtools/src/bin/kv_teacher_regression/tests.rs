@@ -32,6 +32,29 @@ fn args() -> Args {
     .unwrap()
 }
 
+#[test]
+#[cfg(unix)]
+fn local_gguf_symlink_survives_teacher_normalization_and_command_generation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let blob = root.join("content-address");
+    fs::write(&blob, b"fixture").unwrap();
+    let selected = root.join("selected.gguf");
+    std::os::unix::fs::symlink("content-address", &selected).unwrap();
+    let mut args = args();
+    args.ferrum_bin = blob.clone();
+    args.checkpoint_diff_bin = blob.clone();
+    args.prompt_file = blob;
+    args.model = selected.to_str().unwrap().to_owned();
+    args.report_dir = root.join("report");
+    args.normalize().unwrap();
+    for dtype in ["fp16", "int8"] {
+        let words = args.run_args("fixture", dtype, "prompt", None);
+        assert_eq!(words[1], selected.to_str().unwrap());
+        assert_eq!(fs::read(&words[1]).unwrap(), b"fixture");
+    }
+}
+
 fn records() -> Vec<Value> {
     let mut records = vec![
         json!({"event":"ready","requested_model":"/fixture/model","backend":"Metal"}),
