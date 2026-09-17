@@ -12,6 +12,9 @@ mod checkpoint;
 #[path = "causal_attention_timing_tests.rs"]
 mod timing;
 
+#[path = "causal_attention_int8_tests.rs"]
+mod int8;
+
 const TOKENS: usize = 2;
 const QUERY_HEADS: usize = 2;
 const KV_HEADS: usize = 1;
