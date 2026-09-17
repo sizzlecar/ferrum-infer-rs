@@ -1,7 +1,13 @@
 use super::*;
 use std::ops::Range;
 
-type Runtime = MetalDeviceRuntime;
+pub type Composition = (
+    Arc<Runtime>,
+    OperationRuntimeRegistry<Runtime>,
+    WeightMaterializerRegistry,
+    WeightMaterializerSelection,
+    CapabilityCatalog,
+);
 
 pub struct Fixture {
     _composition: CompositionParts,
@@ -12,23 +18,36 @@ pub struct Fixture {
     reaper: Arc<CompletionReaper<Runtime>>,
     states: Vec<StateSpec>,
     checkpoint_timing_mode: DeviceTimingMode,
+    reusable_bucket: Option<ReusableExecutionBucketId>,
 }
 
 impl Fixture {
     pub fn new(kind: AttentionKind) -> Self {
+        Self::with_execution_options(kind, false, None)
+    }
+
+    pub fn with_execution_options(
+        kind: AttentionKind,
+        reusable: bool,
+        nonfinite_token: Option<u32>,
+    ) -> Self {
         let definition = Family::new(kind);
         let states = definition.states();
+        let profile_id = definition.profile_id();
         let family = TypedFamilyRegistration::new(definition)
-            .prepare_with_profile(
-                &serde_json::to_value(kind).unwrap(),
-                &id("fixture.attention.f32-master"),
-            )
+            .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
-        let composition =
-            MetalVNextComposition::create(id(format!("device.metal.checkpoint.{kind:?}"))).unwrap();
-        let (runtime, registry, materializers, materializer_id, catalog) = composition.into_parts();
+        let (runtime, registry, materializers, materializer, catalog) = composition(kind, &family);
+        let bucket = reusable.then(|| {
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("fixture.checkpoint.decode").unwrap(),
+                ReusableExecutionCapacity::new(1, 1, 16).unwrap(),
+            )
+            .unwrap()
+        });
+        let reusable_bucket = bucket.as_ref().map(|bucket| bucket.bucket_id().clone());
         let policy = ResolvedRuntimePolicy::new(
-            "runtime-policy.metal.checkpoint-continuation",
+            "runtime-policy.fixture.checkpoint-continuation",
             ContractVersion::new(1, 0),
             SchedulingDiscipline::FirstReady,
             RuntimeMemoryPolicy {
@@ -50,9 +69,13 @@ impl Fixture {
                 allow_defer: true,
                 cancellation_check_interval_steps: 1,
             },
-            ferrum_types::AttentionExecutionPolicy::NativeAdaptive,
-            ExecutionDeterminismRequirement::BitwiseSameRuntime,
-            None,
+            runtime.attention_execution_policy(),
+            if reusable {
+                ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
+            } else {
+                ExecutionDeterminismRequirement::BitwiseSameRuntime
+            },
+            bucket.map(|bucket| ReusableExecutionPolicy::new(1, vec![bucket]).unwrap()),
         )
         .unwrap();
         let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
@@ -64,7 +87,7 @@ impl Fixture {
             },
         )]))
         .unwrap();
-        options.require_weight_materializer(materializer_id);
+        options.require_weight_materializer_selection(materializer);
         options.retain_completion_value(id("value.output"));
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             &family,
@@ -89,7 +112,7 @@ impl Fixture {
         let provisioned = plan
             .provision_static(
                 Arc::clone(&runtime),
-                id("request.metal.checkpoint.provision"),
+                id("request.fixture.checkpoint.provision"),
             )
             .unwrap();
         let permit = match provisioned.into_provisioning() {
@@ -98,8 +121,8 @@ impl Fixture {
         };
         let identity = ResourceTransactionIdentity::for_admission(
             permit.binding(),
-            id("run.metal.checkpoint.provision"),
-            id("transaction.metal.checkpoint.provision"),
+            id("run.fixture.checkpoint.provision"),
+            id("transaction.fixture.checkpoint.provision"),
         );
         let driver = RuntimeResourceDriver::new(Arc::clone(&runtime)).unwrap();
         let reserved = ResourceTransaction::begin(driver, identity, permit)
@@ -128,7 +151,10 @@ impl Fixture {
         }
         // Ordinary pool initialization only. Foreground admission and optional
         // checkpoint retention must request their own subsequent maintenance.
-        let source = family::Weights::new(family.weight_schema());
+        let mut source = family::Weights::new(family.weight_schema());
+        if let Some(token) = nonfinite_token {
+            source.set_nonfinite_embedding(token);
+        }
         let initialized = committed
             .initialize_static(
                 &family,
@@ -142,6 +168,10 @@ impl Fixture {
             Err(error) => panic!("plan runtime handoff failed: {}", error.error()),
         };
         let lane = resources.create_execution_lane().unwrap();
+        if reusable {
+            lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(8).unwrap())
+                .unwrap();
+        }
         // The registry, runtime, materializers and catalog retain their real
         // composition owners; no provider descriptor is substituted in tests.
         let composition = CompositionParts {
@@ -159,6 +189,7 @@ impl Fixture {
             reaper: CompletionReaper::new(),
             states,
             checkpoint_timing_mode: DeviceTimingMode::Off,
+            reusable_bucket,
         }
     }
 
@@ -221,8 +252,8 @@ impl Fixture {
             match binding
                 .try_admit_request(
                     request.clone(),
-                    id(format!("run.metal.checkpoint.{name}")),
-                    id(format!("request.metal.checkpoint.{name}")),
+                    id(format!("run.fixture.checkpoint.{name}")),
+                    id(format!("request.fixture.checkpoint.{name}")),
                 )
                 .unwrap()
             {
@@ -317,14 +348,53 @@ impl Fixture {
         tokens: Arc<[u32]>,
         range: Range<usize>,
     ) -> Observation {
+        self.execute_checked(session, tokens, range, false, false)
+            .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn execute_replayed(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+    ) -> Observation {
+        self.execute_checked(session, tokens, range, true, false)
+            .unwrap()
+    }
+
+    pub fn execute_numerical_failure(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+    ) {
+        assert!(self
+            .execute_checked(session, tokens, range, replay, true)
+            .is_none());
+    }
+
+    fn execute_checked(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+        expect_failure: bool,
+    ) -> Option<Observation> {
+        let catalog = replay.then(|| self.lane.reusable_execution_catalog().unwrap());
         let span = token_span(Arc::clone(&tokens), range.clone());
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(session)]).unwrap();
-        let request = StepResourceAdmissionRequest::new(
+        let mut request = StepResourceAdmissionRequest::new(
             batch.bind_work_shape(vec![span]).unwrap(),
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
         .unwrap();
+        if let Some(bucket) = &self.reusable_bucket {
+            request = request.with_reusable_execution_bucket(bucket.clone());
+        }
         let step = loop {
             match batch.try_begin_step(request.clone(), &self.lane).unwrap() {
                 StepResourceAdmissionDecision::Admitted(step) => break step,
@@ -465,18 +535,112 @@ impl Fixture {
                 .insert(component.resource_id().clone(), state.id.to_string())
                 .is_none());
         }
-        let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
-            self.providers.providers(),
-            executable,
-            &identity,
-            std::iter::once(&active),
-            DeviceTimingMode::Off,
-            &[input],
-            wave,
-            &self.lane,
-            &self.reaper,
-        )
-        .unwrap();
+        let handle = if let Some(catalog) = catalog {
+            let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+                self.providers.providers(),
+                executable,
+                &wave,
+                &self.lane,
+            )
+            .unwrap()
+            .expect("typed slots must authorize a reusable topology");
+            let program = catalog
+                .programs()
+                .iter()
+                .find(|program| program.program_id() == &program_id)
+                .expect("real backend must publish the warmed topology, without eager fallback");
+            assert!(
+                program.is_determinism_ready(),
+                "incomplete replay program: {program:?}"
+            );
+            assert!(
+                attention.binding_resource().is_some(),
+                "dual-state attention must declare a typed binding for replay"
+            );
+            // CUDA embedding uses direct kernel arguments; Metal embedding
+            // declares its own binding workspace. Require the exact selected
+            // providers' binding nodes, rather than imposing either topology.
+            let declared_binding_nodes = plan
+                .payload()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.binding_resource().is_some())
+                .map(|(index, _)| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                program.per_wave_binding_node_indices(),
+                declared_binding_nodes.as_slice(),
+                "every provider-declared typed binding must update before replay"
+            );
+            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+                self.providers.providers(),
+                executable,
+                &identity,
+                std::iter::once(&active),
+                DeviceTimingMode::Off,
+                &[input],
+                program,
+                SubmissionExecutionPolicy::determinism_replayed(1),
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        } else {
+            OperationDispatch::encode_and_submit_wave_with_inputs(
+                self.providers.providers(),
+                executable,
+                &identity,
+                std::iter::once(&active),
+                DeviceTimingMode::Off,
+                &[input],
+                wave,
+                &self.lane,
+                &self.reaper,
+            )
+            .unwrap()
+        };
+        if expect_failure {
+            let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+                panic!("numerical failure must reach a quiescent terminal");
+            };
+            let OperationCompletionDisposition::FailedButQuiescent(failures) =
+                receipt.disposition()
+            else {
+                panic!("non-finite input must report a device numerical failure: {receipt:?}");
+            };
+            // A backend may submit embedding and attention under one fence.
+            // The completion layer then attributes that device error to every
+            // participant in the batch rather than only the attention node.
+            assert!(
+                !failures.is_empty(),
+                "missing numerical failure attribution"
+            );
+            for failure in failures {
+                assert_eq!(failure.failure().domain(), FailureDomain::Device);
+                assert!(
+                    failure.failure().message().contains("non-finite"),
+                    "unexpected device failure: {failures:?}"
+                );
+            }
+            drop((receipt, handle, identity, active));
+            // Retiring a fresh frame can succeed without a completed FullPlan
+            // proof: that retires ownership and leaves the frontier Unproven.
+            // The safety boundary is capture authorization, not the retirement
+            // receipt's label. Exercise it before closing the failed request.
+            match step.try_retire_normal() {
+                Ok(_) => {
+                    self.assert_failed_sequence_has_no_checkpoint(session);
+                    session.try_abort_if_quiescent().unwrap();
+                }
+                Err(failure) => {
+                    failure.into_step().try_abort().unwrap();
+                    self.assert_failed_sequence_has_no_checkpoint(session);
+                }
+            }
+            return None;
+        }
         let readbacks = CompletionReadbackCollectionRequest::new(
             requests
                 .into_iter()
@@ -505,7 +669,32 @@ impl Fixture {
         drop(identity);
         drop(active);
         step.try_retire_normal().unwrap();
-        Observation { values }
+        Some(Observation {
+            values,
+            state_types: self
+                .states
+                .iter()
+                .map(|s| (s.id.to_string(), s.tensor.element_type))
+                .collect(),
+        })
+    }
+
+    fn assert_failed_sequence_has_no_checkpoint(&self, session: &Arc<SequenceSession<Runtime>>) {
+        let binding = self.resources.trusted_runtime_binding().unwrap();
+        let result = self.reaper.try_capture_sequence_checkpoint(
+            self.compilation.executable().execution_plan(),
+            &binding,
+            Arc::clone(session),
+            Arc::clone(&self.lane),
+        );
+        assert!(
+            matches!(result, Err(_) | Ok(NativeCheckpointStart::Skipped(_))),
+            "a failed full-plan wave must never authorize checkpoint allocation or publication"
+        );
+        assert_eq!(
+            CapacitySnapshot::observe(&self.resources).checkpoint_claims,
+            0
+        );
     }
 
     pub fn capture(&self, source: &Arc<SequenceSession<Runtime>>) -> SequenceCheckpoint<Runtime> {
@@ -770,6 +959,7 @@ fn finish(start: NativeCheckpointStart<Runtime>) -> NativeCheckpointResult<Runti
 
 pub struct Observation {
     values: BTreeMap<String, Vec<u8>>,
+    state_types: BTreeMap<String, ElementType>,
 }
 impl Observation {
     pub fn assert_state_nonzero(&self) {
@@ -777,25 +967,29 @@ impl Observation {
             if name == "output" {
                 continue;
             }
-            let values = if name.ends_with("delta") {
-                bytes
+            let values = match self.state_types[name] {
+                ElementType::F32 => bytes
                     .chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect::<Vec<_>>()
-            } else {
-                bytes
+                    .collect::<Vec<_>>(),
+                ElementType::F16 => bytes
                     .chunks_exact(2)
                     .map(|bytes| {
                         f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                ElementType::I8 => bytes
+                    .iter()
+                    .map(|byte| i8::from_le_bytes([*byte]) as f32)
+                    .collect::<Vec<_>>(),
+                other => panic!("fixture does not define state observations for {other:?}"),
             };
             assert!(
                 !values.is_empty() && values.iter().all(|value| value.is_finite()),
                 "{name}: state must be finite and nonempty"
             );
             assert!(
-                values.iter().any(|value| value.abs() > 1.0e-6),
+                values.iter().any(|value| *value != 0.0),
                 "{name}: prefix did not produce nonzero state"
             );
         }

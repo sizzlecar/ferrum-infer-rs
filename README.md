@@ -228,6 +228,11 @@ behavior; an HTTP request can override the server default with
 `reasoning.effort`. See [reasoning control behavior](docs/openai-api-compatibility.md#chat-fields)
 for model support and compatibility details.
 
+`GET /v1/models` also exposes optional `reasoning` metadata. A supported thinking
+switch reports its effective default in `thinking.default_enabled`; explicitly
+declared effort levels appear in `supported_efforts`. A thinking switch alone
+does not imply low/medium/high levels. Omitted effort metadata means unknown support.
+
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
 
@@ -248,6 +253,23 @@ requesting unsupported `on_demand` reports an error. Set `reusable_execution = f
 to disable device-program preparation. These options do not change request
 admission, queuing, or the model's numerical profile.
 
+### KV cache precision
+
+Ferrum v0.11.0 accepts `--kv-dtype int8` in both `run` and `serve`. FP16 remains
+the default. INT8 requires supported vNext standard causal attention on Metal or
+portable CUDA; unsupported combinations report an error.
+
+```sh
+ferrum run unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
+```
+
+This reduces attention KV storage, including its quantization scales. Model
+weights and fixed recurrent state retain their existing sizes. Inspect
+`/health` → `kv_storage` to confirm the selected format. Whole-model checkpoint
+restore requires support for every model state; resending conversation history
+recomputes the input.
+
 ## Features
 
 - `ferrum run` and `ferrum serve` in one Rust binary.
@@ -255,6 +277,7 @@ admission, queuing, or the model's numerical profile.
   tools, and structured output.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
+- Optional [8-bit KV storage](#kv-cache-precision) for supported vNext Metal and portable CUDA attention paths; FP16 remains the default.
 - GGUF on Metal and CUDA; CUDA also supports GPTQ/safetensors.
 - Ferrum covers language-model inference only. Supported models include Qwen3.5 4B,
   Qwen3.5 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense.
@@ -319,7 +342,7 @@ and otherwise selects CPU. You can require a backend or install a specific versi
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.11.0
 ```
 
 To upgrade an installation made with the script, rerun the original install
@@ -391,7 +414,6 @@ the prebuilt CUDA tarball or Homebrew formula for the supported install path.
 - Validation: `ferrum-bench-core`, `ferrum-testkit`
 
 Development notes: [numerical execution profiles (中文)](docs/numerical-execution.zh.md).
-The new CLI option is not available in v0.8.9 release assets.
 
 ## License
 

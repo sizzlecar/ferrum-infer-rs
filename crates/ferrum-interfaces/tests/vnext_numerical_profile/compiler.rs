@@ -213,7 +213,10 @@ fn same_gguf_compiles_both_profiles_and_registration_order_preserves_selection_a
     let mut compiled_profiles = Vec::new();
     for profile in definition
         .numerical_profiles()
-        .candidates(&NumericalExecutionPolicy::Auto)
+        .candidates(
+            &NumericalExecutionPolicy::Auto,
+            ferrum_types::KvStorageFormat::F16,
+        )
         .unwrap()
     {
         let family = registration.prepare(&definition, &profile.id).unwrap();
@@ -290,6 +293,7 @@ fn missing_tail_rejects_whole_candidate_and_explicit_request_cannot_fall_back() 
     let resolve = |policy, rejected| {
         NumericalProfileResolution::from_static_plan(
             policy,
+            ferrum_types::KvStorageFormat::F16,
             &definition,
             &fallback,
             &catalog,

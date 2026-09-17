@@ -5,6 +5,50 @@ use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
+/// Versioned storage of causal K/V state, independent of activation arithmetic.
+/// INT8 uses a separate F32 scale for each K/V token and head. Its encoder first
+/// rounds to the existing F16 KV boundary, then uses max-abs / 127 and ties-even
+/// rounding to [-127, 127]. A zero vector has scale 1; non-finite input fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvStorageFormat {
+    #[default]
+    F16,
+    Int8PerTokenHeadF32ScaleV1,
+}
+
+impl KvStorageFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Int8PerTokenHeadF32ScaleV1 => "int8-per-token-head-f32-scale-v1",
+        }
+    }
+}
+
+impl std::fmt::Display for KvStorageFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<crate::KvCacheDtype> for KvStorageFormat {
+    type Error = String;
+
+    fn try_from(dtype: crate::KvCacheDtype) -> Result<Self, Self::Error> {
+        match dtype {
+            crate::KvCacheDtype::Fp16 => Ok(Self::F16),
+            crate::KvCacheDtype::Int8 => Ok(Self::Int8PerTokenHeadF32ScaleV1),
+            crate::KvCacheDtype::Bf16 => Err(
+                "vNext BF16 KV storage is unsupported; use fp16 or a supported int8 plan".into(),
+            ),
+            crate::KvCacheDtype::Fp8 => {
+                Err("vNext FP8 KV storage is unsupported; use fp16 or a supported int8 plan".into())
+            }
+        }
+    }
+}
+
 /// Stable profile identity, interpreted within a model family's declared
 /// catalog. The profile's numerical ABI has a separate contract version.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -82,6 +126,28 @@ impl FromStr for NumericalExecutionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_storage_configuration_preserves_default_and_rejects_unimplemented_formats() {
+        assert_eq!(KvStorageFormat::default(), KvStorageFormat::F16);
+        assert_eq!(
+            KvStorageFormat::try_from(crate::KvCacheDtype::Int8).unwrap(),
+            KvStorageFormat::Int8PerTokenHeadF32ScaleV1
+        );
+        for dtype in [crate::KvCacheDtype::Bf16, crate::KvCacheDtype::Fp8] {
+            assert!(KvStorageFormat::try_from(dtype).is_err());
+        }
+        for storage in [
+            KvStorageFormat::F16,
+            KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
+        ] {
+            assert_eq!(
+                serde_json::from_value::<KvStorageFormat>(serde_json::to_value(storage).unwrap())
+                    .unwrap(),
+                storage
+            );
+        }
+    }
 
     #[test]
     fn explicit_policy_preserves_identity_through_config_and_cli_parsing() {

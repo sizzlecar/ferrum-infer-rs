@@ -957,6 +957,19 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 ///     same cascade. Only `KvFp16` is wired today.
 pub struct LlmExecutorFactory;
 
+/// Loaders without a typed KV selection must not discard a non-default
+/// storage request. Registered vNext and legacy typed decoders validate their
+/// own supported formats before reaching these fixed-storage paths.
+fn validate_fixed_storage_kv_dtype(dtype: ferrum_types::KvCacheDtype, loader: &str) -> Result<()> {
+    if dtype != ferrum_types::KvCacheDtype::Fp16 {
+        return Err(FerrumError::unsupported(format!(
+            "{loader} does not support KV dtype {}; use --kv-dtype fp16 for its existing storage behavior",
+            dtype.as_str()
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_llama_layer_split_plan(
     config: &ComponentConfig,
     num_layers: usize,
@@ -1220,7 +1233,10 @@ fn create_registered_vnext_executor(
                     ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
                         *ordinal,
                         device_id,
-                        config.engine_config.runtime.attention_execution_policy,
+                        crate::product_composition::cuda_attention_policy_for_kv(
+                            config.engine_config.runtime.attention_execution_policy,
+                            config.engine_config.kv_cache.dtype,
+                        )?,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -1455,6 +1471,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         if let WeightFormat::Gguf { ref path } = weight_fmt {
             // Legacy or direct-path GGUF packages still use the monolithic
             // loader. Registered typed packages have already returned above.
+            validate_fixed_storage_kv_dtype(
+                config.engine_config.kv_cache.dtype,
+                "legacy GGUF loader",
+            )?;
             let (llm, model_info) = ferrum_models::gguf_engine_loader::load_gguf_decoder_with_info(
                 path,
                 &config.device,
@@ -1483,6 +1503,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // arms still fail closed on CUDA unless that compatibility feature is
         // intentionally selected.
         let legacy_candle_device = || -> Result<CandleDevice> {
+            validate_fixed_storage_kv_dtype(
+                config.engine_config.kv_cache.dtype,
+                "legacy Candle executor",
+            )?;
             match &config.device {
                 Device::CPU => Ok(CandleDevice::Cpu),
                 #[cfg(feature = "candle-cuda-compat")]
@@ -1916,6 +1940,69 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn fixed_storage_loaders_preserve_default_and_reject_other_kv_dtypes() {
+        use ferrum_types::KvCacheDtype;
+        for loader in ["legacy GGUF loader", "legacy Candle executor"] {
+            validate_fixed_storage_kv_dtype(KvCacheDtype::Fp16, loader).unwrap();
+            for dtype in [KvCacheDtype::Int8, KvCacheDtype::Bf16, KvCacheDtype::Fp8] {
+                let error = validate_fixed_storage_kv_dtype(dtype, loader).unwrap_err();
+                assert!(error.to_string().contains(loader));
+                assert!(error.to_string().contains(dtype.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_storage_factory_rejects_int8_before_loading_legacy_weights() {
+        let directory = unique_test_dir("fixed-storage-kv-rejection");
+        let gguf = directory.join("unloaded.gguf");
+        // Deliberately invalid weights prove the storage check runs before
+        // either loader opens tensors or creates a backend device.
+        std::fs::write(&gguf, b"not model weights").unwrap();
+        let candle = directory.join("candle");
+        std::fs::create_dir(&candle).unwrap();
+        std::fs::write(
+            candle.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "architectures": ["BertModel"],
+                "model_type": "bert",
+                "hidden_size": 4,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "intermediate_size": 4,
+                "vocab_size": 8,
+                "max_position_embeddings": 8,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for (path, loader) in [
+            (&gguf, "legacy GGUF loader"),
+            (&candle, "legacy Candle executor"),
+        ] {
+            let mut engine = EngineConfig::default();
+            engine.kv_cache.dtype = ferrum_types::KvCacheDtype::Int8;
+            engine.backend.device = Device::CPU;
+            engine.backend.backend_options.insert(
+                "model_path".to_owned(),
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            );
+            let component = ComponentConfig::from_engine_config(&engine);
+            let error = match tokio_test::block_on(LlmExecutorFactory.create(&component)) {
+                Ok(_) => panic!("a fixed-storage loader accepted INT8 KV"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{loader} does not support KV dtype int8")),
+                "unexpected early error: {error}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn write_qwen35_fixture_config(dir: &Path) {

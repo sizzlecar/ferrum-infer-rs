@@ -149,6 +149,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let defined_model = crate::source_resolver::define_registered_product_model(
         model_sources.as_ref(),
         &engine_config.numerical_execution,
+        engine_config.kv_cache.dtype,
     )?;
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());

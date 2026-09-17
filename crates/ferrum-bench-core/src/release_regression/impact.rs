@@ -204,6 +204,15 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     let rest = path.strip_prefix("crates/")?;
     let (component, relative) = rest.split_once('/')?;
     if component == "ferrum-devtools" {
+        if matches!(
+            relative,
+            "tests/fixtures/kv-teacher/short.txt" | "tests/fixtures/kv-teacher/long.txt"
+        ) {
+            return Some((
+                vec![Validation],
+                "reviewed fixed prompt inputs passed to the standalone KV teacher regression runner",
+            ));
+        }
         if cargo_integration_target(relative)
             || relative == "tests/fixtures/unix_bootstrap_program.rs"
             || matches!(
@@ -573,6 +582,7 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/stats.rs"
             | "examples/model_gate.rs"
             | "examples/checkpoint_diff.rs"
+            | "examples/checkpoint_diff/directory.rs"
             | "examples/checkpoint_diff/tests.rs"
             | "examples/model_gate/tests.rs"
             | "examples/regression_plan.rs"
@@ -727,6 +737,38 @@ mod tests {
         ]);
         assert!(mixed.areas.contains(&ChangeArea::Validation));
         assert!(mixed.areas.contains(&ChangeArea::Kernel));
+    }
+
+    #[test]
+    fn teacher_prompts_and_directory_comparison_keep_unreviewed_inputs_conservative() {
+        let reviewed = [
+            "crates/ferrum-devtools/tests/fixtures/kv-teacher/short.txt",
+            "crates/ferrum-devtools/tests/fixtures/kv-teacher/long.txt",
+            "crates/ferrum-bench-core/examples/checkpoint_diff/directory.rs",
+        ];
+        let impact = analyze_paths(reviewed);
+        assert_eq!(impact.areas, [ChangeArea::Validation]);
+        assert!(impact.unknown_paths.is_empty());
+
+        for unreviewed in [
+            "crates/ferrum-devtools/tests/fixtures/kv-teacher/other.txt",
+            "crates/ferrum-devtools/tests/fixtures/kv-teacher/short.json",
+            "crates/ferrum-devtools/tests/fixtures/another/short.txt",
+            "crates/ferrum-devtools/src/short.txt",
+            "crates/ferrum-bench-core/examples/checkpoint_diff/other.rs",
+        ] {
+            let impact = analyze_paths(reviewed.into_iter().chain([unreviewed]));
+            assert_eq!(impact.areas, ALL_AREAS, "{unreviewed}");
+            assert_eq!(impact.unknown_paths, [unreviewed]);
+        }
+        let impact = analyze_paths(
+            reviewed
+                .into_iter()
+                .chain(["crates/ferrum-kernels/src/backend/cuda/transformer/causal_attention.rs"]),
+        );
+        assert!(impact.areas.contains(&ChangeArea::Kernel));
+        assert!(impact.areas.contains(&ChangeArea::Validation));
+        assert!(impact.unknown_paths.is_empty());
     }
 
     #[test]

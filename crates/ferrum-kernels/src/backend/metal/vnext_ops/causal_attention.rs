@@ -5,25 +5,31 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
-    BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
-    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
-    OperationBufferStorageKind, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProviderCheckpointCapability, ProviderCheckpointContract,
-    ProviderCheckpointStateLayout, ProviderCheckpointStatePort, ProviderStorageBindingRequirement,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    causal_paged_attention_contract, causal_paged_attention_f32_master_contract,
+    causal_paged_attention_f32_master_int8_kv_contract, causal_paged_attention_int8_kv_contract,
+    AttributeId, BatchedOperationInvocation, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
+    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
-    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     ArgumentEncoder, ArgumentEncoderRef, CompileOptions, ComputeCommandEncoderRef,
     ComputePipelineState, Device, Function, MTLArgumentBuffersTier, MTLResourceUsage, MTLSize,
+    NSRange,
 };
 use sha2::{Digest, Sha256};
 
@@ -49,6 +55,7 @@ use super::{
 };
 
 const SHADER_SOURCE: &str = include_str!("causal_attention.metal");
+const INT8_SHADER_SOURCE: &str = include_str!("causal_attention_int8.metal");
 const PROVIDER_ID: &str = "provider.metal.causal_paged_attention.f16.native";
 const ESTIMATOR_ID: &str = "resource-estimator.metal.causal_paged_attention.f16.native";
 const F32_MASTER_PROVIDER_ID: &str = "provider.metal.causal_paged_attention.f32-master.native";
@@ -76,11 +83,13 @@ const GQA_TILED_PREFILL_KEY_TILE: u64 = 64;
 const TILED_PREFILL_SIMDGROUPS: u64 = 4;
 const GQA_TILED_PREFILL_QUERY_HEADS: u32 = 2;
 const GQA_TILED_PREFILL_SIMDGROUPS: u64 = 8;
+const INT8_GQA_PREFILL_DIM_SLAB: u64 = 64;
 // One SIMD lane reduces each partial, so the reduction supports at most 32.
 const GROUPED_DECODE_MAX_PARTITIONS: u64 = SIMD_THREADS;
 const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = 256;
 
 pub(super) struct MetalCausalAttentionPipelines {
+    kv_type: ElementType,
     prepare: ComputePipelineState,
     attention: ComputePipelineState,
     direct_decode_attention: ComputePipelineState,
@@ -93,6 +102,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     binding_alignment: u64,
     maximum_attention_simdgroups: u32,
     maximum_threadgroup_memory_length: u64,
+    supports_gqa_tiled_prefill: bool,
 }
 
 impl MetalCausalAttentionPipelines {
@@ -233,6 +243,7 @@ impl MetalCausalAttentionPipelines {
             as u32;
         let maximum_threadgroup_memory_length = device.max_threadgroup_memory_length() as u64;
         Ok(Self {
+            kv_type: ElementType::F16,
             prepare,
             attention,
             direct_decode_attention,
@@ -245,6 +256,131 @@ impl MetalCausalAttentionPipelines {
             binding_alignment,
             maximum_attention_simdgroups,
             maximum_threadgroup_memory_length,
+            supports_gqa_tiled_prefill: true,
+        })
+    }
+
+    pub(super) fn new_int8(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal INT8 causal attention requires argument-buffer tier 2",
+            ));
+        }
+        // Precise division, rounding and non-finite detection are part of the
+        // INT8 write ABI. Keep prepare in its own strictly compiled library.
+        let prepare_options = CompileOptions::new();
+        prepare_options.set_fast_math_enabled(false);
+        let prepare_library = device
+            .new_library_with_source(INT8_SHADER_SOURCE, &prepare_options)
+            .map_err(|error| {
+                MetalDeviceRuntimeError::contract(format!(
+                    "compile Metal vNext INT8 causal-prepare library: {error}"
+                ))
+            })?;
+        let prepare_function = prepare_library
+            .get_function("vnext_causal_prepare_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        // Readers use the same default arithmetic policy as the F16 attention
+        // library. They never write the quantized payload, scales or status.
+        // This constructor's source is included in the provider/runtime
+        // implementation fingerprints, so changing its policy invalidates
+        // numerical execution identity without changing the storage contract.
+        let reader_library = device
+            .new_library_with_source(INT8_SHADER_SOURCE, &CompileOptions::new())
+            .map_err(|error| {
+                MetalDeviceRuntimeError::contract(format!(
+                    "compile Metal vNext INT8 causal-attention reader library: {error}"
+                ))
+            })?;
+        let attention_function = reader_library
+            .get_function("vnext_causal_attention_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let direct_function = reader_library
+            .get_function("vnext_causal_attention_decode_direct_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let tiled_function = reader_library
+            .get_function("vnext_causal_attention_prefill_tiled_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let gqa_tiled_function = reader_library
+            .get_function("vnext_causal_attention_prefill_gqa_tiled_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let prepare_encoder = prepare_function.new_argument_encoder(PREPARE_PAGE_TABLE_INDEX);
+        let attention_encoder = attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let direct_encoder = direct_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let tiled_encoder = tiled_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let gqa_tiled_encoder = gqa_tiled_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let binding_encoded_length = prepare_encoder.encoded_length();
+        let binding_alignment = prepare_encoder.alignment();
+        if binding_encoded_length == 0
+            || binding_alignment == 0
+            || attention_encoder.encoded_length() != binding_encoded_length
+            || attention_encoder.alignment() != binding_alignment
+            || direct_encoder.encoded_length() != binding_encoded_length
+            || direct_encoder.alignment() != binding_alignment
+            || tiled_encoder.encoded_length() != binding_encoded_length
+            || tiled_encoder.alignment() != binding_alignment
+            || gqa_tiled_encoder.encoded_length() != binding_encoded_length
+            || gqa_tiled_encoder.alignment() != binding_alignment
+        {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal INT8 causal kernels disagree on their two page tables",
+            ));
+        }
+        let prepare = device
+            .new_compute_pipeline_state_with_function(&prepare_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let attention = device
+            .new_compute_pipeline_state_with_function(&attention_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let direct_decode_attention = device
+            .new_compute_pipeline_state_with_function(&direct_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let tiled_prefill_attention = device
+            .new_compute_pipeline_state_with_function(&tiled_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let gqa_tiled_prefill_attention = device
+            .new_compute_pipeline_state_with_function(&gqa_tiled_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        if prepare.thread_execution_width() != SIMD_THREADS
+            || attention.thread_execution_width() != SIMD_THREADS
+            || direct_decode_attention.thread_execution_width() != SIMD_THREADS
+            || tiled_prefill_attention.thread_execution_width() != SIMD_THREADS
+            || u64::from(tiled_prefill_attention.max_total_threads_per_threadgroup())
+                < SIMD_THREADS * TILED_PREFILL_SIMDGROUPS
+        {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal INT8 causal kernels require 32-lane SIMD execution",
+            ));
+        }
+        let maximum_attention_simdgroups = (attention
+            .max_total_threads_per_threadgroup()
+            .min(direct_decode_attention.max_total_threads_per_threadgroup())
+            as u64
+            / SIMD_THREADS)
+            .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS)
+            as u32;
+        // A device with a lower per-pipeline thread limit retains the existing
+        // tiled/general readers; the optional GQA route must not reject it.
+        let supports_gqa_tiled_prefill = gqa_tiled_prefill_attention.thread_execution_width()
+            == SIMD_THREADS
+            && u64::from(gqa_tiled_prefill_attention.max_total_threads_per_threadgroup())
+                >= SIMD_THREADS * GQA_TILED_PREFILL_SIMDGROUPS;
+        Ok(Self {
+            kv_type: ElementType::I8,
+            prepare,
+            direct_decode_attention,
+            // Grouped decode remains F16-specific.
+            grouped_decode_partial_attention: attention.clone(),
+            grouped_decode_reduce_attention: attention.clone(),
+            tiled_prefill_attention,
+            gqa_tiled_prefill_attention,
+            attention,
+            binding_encoder: Mutex::new(prepare_encoder),
+            binding_encoded_length,
+            binding_alignment,
+            maximum_attention_simdgroups,
+            maximum_threadgroup_memory_length: device.max_threadgroup_memory_length() as u64,
+            supports_gqa_tiled_prefill,
         })
     }
 
@@ -254,7 +390,33 @@ impl MetalCausalAttentionPipelines {
     }
 
     fn binding_slot_bytes(&self) -> Result<u64, String> {
-        align_up(self.binding_encoded_length, self.binding_alignment)
+        let bytes = if self.kv_type == ElementType::I8 {
+            self.error_flag_offset()?
+                .checked_add(4)
+                .ok_or_else(|| "Metal INT8 binding size overflows".to_owned())?
+        } else {
+            self.binding_encoded_length
+        };
+        align_up(bytes, self.binding_alignment)
+    }
+
+    fn error_flag_offset(&self) -> Result<u64, String> {
+        align_up(self.binding_encoded_length, 4)
+    }
+
+    fn dispatch_plan(&self, params: &CausalAttentionParams) -> AttentionDispatchPlan {
+        if self.kv_type == ElementType::I8 {
+            int8_attention_dispatch_plan(
+                params,
+                self.maximum_threadgroup_memory_length,
+                self.supports_gqa_tiled_prefill,
+            )
+        } else {
+            attention_dispatch_plan_with_memory_limit(
+                params,
+                self.maximum_threadgroup_memory_length,
+            )
+        }
     }
 
     /// Reflection is immutable, but setting the destination is not. Only CPU
@@ -331,30 +493,41 @@ impl MetalCausalPagedAttentionProvider {
         let mut provider =
             Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)?;
         // prepare writes [position_start, position_start + tokens) in the
-        // token-major [2, kv_heads, head_dim] F16 state. Attention reads only
-        // the causal prefix. Scratch and the page table are rebuilt per wave.
+        // token-major KV payload (and, for INT8, its independent scales).
+        // Attention reads only the causal prefix. Scratch/page tables are rebuilt per wave.
         // A final one-token decode commits the same KV writes; no write is
         // deferred until another input token becomes available.
+        let checkpoint_storage = DynamicStorageProfile::new(
+            DynamicStorageAllocator::FixedBlockArena {
+                block_bytes: VNEXT_KV_PAGE_BYTES,
+            },
+            DynamicStorageView::PagedRegions {
+                block_bytes: VNEXT_KV_PAGE_BYTES,
+            },
+        )
+        .map_err(contract_error)?;
         let checkpoint = ProviderCheckpointContract::new(
             CheckpointInputDependency::ExactTokenPrefix,
             CheckpointBoundaryConstraint::any_positive(),
             CheckpointPartitionNumerics::CapturedExecutionContinuation,
         )
         .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
-        .with_state_ports(vec![ProviderCheckpointStatePort::new(
-            ResolvedValueRole::Input,
-            8,
-            DynamicStorageProfile::new(
-                DynamicStorageAllocator::FixedBlockArena {
-                    block_bytes: VNEXT_KV_PAGE_BYTES,
-                },
-                DynamicStorageView::PagedRegions {
-                    block_bytes: VNEXT_KV_PAGE_BYTES,
-                },
-            )
-            .map_err(contract_error)?,
-            ProviderCheckpointStateLayout::TokenMajorPrefix,
-        )])
+        .with_state_ports(
+            (8..if provider.attention.kv_type == ElementType::I8 {
+                10
+            } else {
+                9
+            })
+                .map(|ordinal| {
+                    ProviderCheckpointStatePort::new(
+                        ResolvedValueRole::Input,
+                        ordinal,
+                        checkpoint_storage,
+                        ProviderCheckpointStateLayout::TokenMajorPrefix,
+                    )
+                })
+                .collect(),
+        )
         .map_err(contract_error)?;
         provider.descriptor = provider.descriptor.with_checkpoint_capability(
             ProviderCheckpointCapability::CompletedBoundary(checkpoint),
@@ -370,8 +543,8 @@ impl MetalCausalPagedAttentionProvider {
         hidden_type: ElementType,
     ) -> Result<Self, MetalDeviceRuntimeError> {
         let (contract, operation_id, provider_id, capability_id, estimator_id, failure_stage) =
-            match hidden_type {
-                ElementType::F16 => (
+            match (hidden_type, attention.kv_type) {
+                (ElementType::F16, ElementType::F16) => (
                     causal_paged_attention_contract().map_err(contract_error)?,
                     CAUSAL_PAGED_ATTENTION_OPERATION_ID,
                     PROVIDER_ID,
@@ -379,13 +552,29 @@ impl MetalCausalPagedAttentionProvider {
                     ESTIMATOR_ID,
                     "metal.causal_paged_attention.encode",
                 ),
-                ElementType::F32 => (
+                (ElementType::F32, ElementType::F16) => (
                     causal_paged_attention_f32_master_contract().map_err(contract_error)?,
                     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
                     F32_MASTER_PROVIDER_ID,
                     CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
                     F32_MASTER_ESTIMATOR_ID,
                     "metal.causal_paged_attention.f32_master.encode",
+                ),
+                (ElementType::F16, ElementType::I8) => (
+                    causal_paged_attention_int8_kv_contract().map_err(contract_error)?,
+                    CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+                    "provider.metal.causal_paged_attention.f16.int8-kv.native",
+                    CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+                    "resource-estimator.metal.causal_paged_attention.f16.int8-kv.native",
+                    "metal.causal_paged_attention.int8_kv.encode",
+                ),
+                (ElementType::F32, ElementType::I8) => (
+                    causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?,
+                    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+                    "provider.metal.causal_paged_attention.f32-master.int8-kv.native",
+                    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+                    "resource-estimator.metal.causal_paged_attention.f32-master.int8-kv.native",
+                    "metal.causal_paged_attention.f32_master.int8_kv.encode",
                 ),
                 _ => {
                     return Err(MetalDeviceRuntimeError::contract(
@@ -399,12 +588,13 @@ impl MetalCausalPagedAttentionProvider {
             provider_id,
             capability_id,
             estimator_id,
-            storage_bindings().map_err(contract_error)?,
+            storage_bindings(attention.kv_type).map_err(contract_error)?,
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
             super::linear::ALL_LINEAR_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("causal_attention.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
+                INT8_SHADER_SOURCE.as_bytes(),
                 super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
@@ -424,7 +614,9 @@ impl MetalCausalPagedAttentionProvider {
     }
 }
 
-fn storage_bindings() -> Result<Vec<ProviderStorageBindingRequirement>, VNextError> {
+fn storage_bindings(
+    kv_type: ElementType,
+) -> Result<Vec<ProviderStorageBindingRequirement>, VNextError> {
     let paged = DynamicStorageRequirement::new(vec![DynamicStorageProfile::new(
         DynamicStorageAllocator::FixedBlockArena {
             block_bytes: VNEXT_KV_PAGE_BYTES,
@@ -433,12 +625,12 @@ fn storage_bindings() -> Result<Vec<ProviderStorageBindingRequirement>, VNextErr
             block_bytes: VNEXT_KV_PAGE_BYTES,
         },
     )?])?;
-    Ok((0..9)
+    Ok((0..if kv_type == ElementType::I8 { 10 } else { 9 })
         .map(|ordinal| {
             ProviderStorageBindingRequirement::new(
                 ResolvedValueRole::Input,
                 ordinal,
-                if ordinal == 8 {
+                if ordinal >= 8 {
                     paged.clone()
                 } else {
                     DynamicStorageRequirement::contiguous()
@@ -472,11 +664,14 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
         }
         let shape =
             CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        shape
+            .validate_page_count(self.attention.kv_type)
+            .map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 0,
                 shape
-                    .split_decode_partial_bytes_per_sequence()
+                    .split_decode_bytes_for_storage(self.attention.kv_type)
                     .map_err(invalid_plan)?,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
@@ -644,45 +839,55 @@ impl CausalAttentionShape {
         {
             return Err("Metal causal-attention attributes are inconsistent".to_owned());
         }
-        if shape.maximum_pages()? > MAXIMUM_KV_PAGES {
-            return Err(format!(
-                "Metal causal attention requires {} pages, exceeding provider limit {}",
-                shape.maximum_pages()?,
-                MAXIMUM_KV_PAGES
-            ));
-        }
         shape.params(1, 0, 1, 1)?;
         Ok(shape)
     }
 
-    fn state_bytes_per_token(self) -> Result<u64, String> {
+    fn validate_page_count(self, kv_type: ElementType) -> Result<(), String> {
+        let payload_pages = self
+            .physical_state_bytes_with_type(self.maximum_context_tokens, kv_type)?
+            / VNEXT_KV_PAGE_BYTES;
+        let scale_pages = if kv_type == ElementType::I8 {
+            self.physical_scale_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES
+        } else {
+            0
+        };
+        if payload_pages > MAXIMUM_KV_PAGES || scale_pages > MAXIMUM_KV_PAGES {
+            return Err(format!(
+                "Metal causal attention requires {payload_pages} payload / {scale_pages} scale pages, exceeding provider limit {}",
+                MAXIMUM_KV_PAGES
+            ));
+        }
+        Ok(())
+    }
+
+    fn state_bytes_per_token(self, kv_type: ElementType) -> Result<u64, String> {
         self.kv_features
             .checked_mul(2)
-            .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .and_then(|elements| elements.checked_mul(kv_type.size_bytes()))
             .ok_or_else(|| "Metal causal-attention KV bytes per token overflow".to_owned())
     }
 
-    fn physical_state_bytes(self, tokens: u64) -> Result<u64, String> {
+    fn physical_state_bytes_with_type(
+        self,
+        tokens: u64,
+        kv_type: ElementType,
+    ) -> Result<u64, String> {
         let logical = self
-            .state_bytes_per_token()?
+            .state_bytes_per_token(kv_type)?
             .checked_mul(tokens)
             .ok_or_else(|| "Metal causal-attention KV state size overflows".to_owned())?;
         align_up(logical, VNEXT_KV_PAGE_BYTES)
     }
 
-    fn physical_state_bytes_for_source_frontier(
-        self,
-        source_end_tokens: u64,
-        full_input_tokens: u64,
-    ) -> Result<u64, String> {
-        if source_end_tokens == 0 || source_end_tokens > full_input_tokens {
-            return Err("Metal causal-attention source frontier exceeds its full input".to_owned());
-        }
-        self.physical_state_bytes(source_end_tokens)
-    }
-
-    fn maximum_pages(self) -> Result<u64, String> {
-        Ok(self.physical_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES)
+    fn physical_scale_bytes(self, tokens: u64) -> Result<u64, String> {
+        let logical = self
+            .key_value_heads
+            .checked_mul(2)
+            .and_then(|elements| elements.checked_mul(ElementType::F32.size_bytes()))
+            .and_then(|bytes| bytes.checked_mul(tokens))
+            .ok_or_else(|| "Metal INT8 causal-attention scales size overflows".to_owned())?;
+        align_up(logical, VNEXT_KV_PAGE_BYTES)
     }
 
     fn scratch_bytes_per_token(self) -> Result<u64, String> {
@@ -713,6 +918,14 @@ impl CausalAttentionShape {
             .and_then(|value| value.checked_mul(elements_per_partial))
             .ok_or_else(|| "Metal grouped-decode partial workspace overflows".to_owned())?;
         aligned_bytes(elements, std::mem::size_of::<f32>() as u64)
+    }
+
+    fn split_decode_bytes_for_storage(self, kv_type: ElementType) -> Result<u64, String> {
+        if kv_type == ElementType::I8 {
+            Ok(0)
+        } else {
+            self.split_decode_partial_bytes_per_sequence()
+        }
     }
 
     fn params(
@@ -803,10 +1016,20 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
+    #[cfg(test)]
     fn new(
         shape: CausalAttentionShape,
         total_tokens: u64,
         participant_count: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_storage(shape, total_tokens, participant_count, ElementType::F16)
+    }
+
+    fn new_with_storage(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        participant_count: usize,
+        kv_type: ElementType,
     ) -> Result<Self, String> {
         if total_tokens == 0 || participant_count == 0 {
             return Err("Metal causal-attention scratch cannot size empty work".to_owned());
@@ -815,7 +1038,7 @@ impl ScratchLayout {
             .map_err(|_| "Metal causal-attention participant count exceeds u64".to_owned())?;
         let mut offset = 0_u64;
         let split_decode = offset;
-        let split_decode_bytes_per_sequence = shape.split_decode_partial_bytes_per_sequence()?;
+        let split_decode_bytes_per_sequence = shape.split_decode_bytes_for_storage(kv_type)?;
         offset = offset
             .checked_add(
                 split_decode_bytes_per_sequence
@@ -881,9 +1104,13 @@ impl ScratchLayout {
     }
 
     fn token_offset(self, base: u64, token_start: u64, width: u64) -> Result<u64, String> {
+        // Segment reservations retain alignment padding, but projection and
+        // attention kernels write contiguous rows within each segment. Packed
+        // participants must use that same physical row stride.
         base.checked_add(
-            aligned_bytes(width, ElementType::F16.size_bytes())?
-                .checked_mul(token_start)
+            width
+                .checked_mul(ElementType::F16.size_bytes())
+                .and_then(|row_bytes| row_bytes.checked_mul(token_start))
                 .ok_or_else(|| {
                     "Metal causal-attention token scratch offset overflows".to_owned()
                 })?,
@@ -942,6 +1169,7 @@ struct ParticipantLaunch {
     output: usize,
     first_page_region: usize,
     page_count: usize,
+    scale_page_count: usize,
     binding_offset: u64,
     split_decode: u64,
     normalized: u64,
@@ -980,6 +1208,8 @@ struct PackedLaunch {
 struct PageBinding {
     first_page_region: usize,
     page_count: usize,
+    scale_page_count: usize,
+    kv_type: ElementType,
     binding_offset: u64,
 }
 
@@ -994,16 +1224,23 @@ fn encode_attention(
     ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let shape = CausalAttentionShape::from_attributes(first.attributes())?;
-    validate_signature(first, shape, hidden_type)?;
+    let kv_type = attention.kv_type;
+    shape.validate_page_count(kv_type)?;
+    validate_signature(first, shape, hidden_type, kv_type)?;
     for participant in &invocation.participants()[1..] {
         if CausalAttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("Metal causal-attention participant attributes disagree".to_owned());
         }
-        validate_signature(participant, shape, hidden_type)?;
+        validate_signature(participant, shape, hidden_type, kv_type)?;
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, invocation.participants().len())?;
+    let layout = ScratchLayout::new_with_storage(
+        shape,
+        total_tokens,
+        invocation.participants().len(),
+        kv_type,
+    )?;
     let binding_layout = BindingLayout::new(
         attention.binding_slot_bytes()?,
         invocation.participants().len(),
@@ -1115,10 +1352,8 @@ fn encode_attention(
         let pages = paged_state_regions(
             participant,
             state,
-            shape.physical_state_bytes_for_source_frontier(
-                source.end,
-                token_range.full_input_tokens(),
-            )?,
+            shape.physical_state_bytes_with_type(source.end, kv_type)?,
+            kv_type,
         )?;
         if pages.len() > MAXIMUM_KV_PAGES as usize {
             return Err("Metal causal-attention page table exceeds its provider limit".to_owned());
@@ -1128,12 +1363,33 @@ fn encode_attention(
         let first_page_region = regions.len();
         regions.extend(pages);
         let page_count = regions.len() - first_page_region;
+        let scale_page_count = if kv_type == ElementType::I8 {
+            let scales = paged_state_regions(
+                participant,
+                binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+                shape.physical_scale_bytes(source.end)?,
+                ElementType::F32,
+            )?;
+            if scales.len() > MAXIMUM_KV_PAGES as usize {
+                return Err(
+                    "Metal causal-attention scale page table exceeds its provider limit".to_owned(),
+                );
+            }
+            let count = scales.len();
+            binding_regions.extend(scales.iter().cloned());
+            regions.extend(scales);
+            count
+        } else {
+            0
+        };
         let page_count_u64 = u64::try_from(page_count)
             .map_err(|_| "Metal causal-attention page count exceeds u64".to_owned())?;
         let binding_offset = binding_layout.offset(participant_index)?;
         page_bindings.push(PageBinding {
             first_page_region: binding_first_page,
             page_count,
+            scale_page_count,
+            kv_type,
             binding_offset,
         });
 
@@ -1154,6 +1410,7 @@ fn encode_attention(
             output,
             first_page_region,
             page_count,
+            scale_page_count,
             binding_offset,
             split_decode: layout.split_decode_offset(participant_index)?,
             normalized,
@@ -1170,16 +1427,23 @@ fn encode_attention(
                 })?,
                 "Metal causal-attention residual elements",
             )?,
-            params: shape.params(
-                tokens,
-                source.start,
-                page_count_u64,
-                attention.attention_simdgroups_for_context(
-                    source.start.checked_add(tokens).ok_or_else(|| {
-                        "Metal causal-attention context extent overflowed".to_owned()
-                    })?,
-                ),
-            )?,
+            params: {
+                let mut params = shape.params(
+                    tokens,
+                    source.start,
+                    page_count_u64,
+                    attention.attention_simdgroups_for_context(
+                        source.start.checked_add(tokens).ok_or_else(|| {
+                            "Metal causal-attention context extent overflowed".to_owned()
+                        })?,
+                    ),
+                )?;
+                params.page_elements = checked_u32(
+                    VNEXT_KV_PAGE_BYTES / kv_type.size_bytes(),
+                    "Metal causal KV page elements",
+                )?;
+                params
+            },
             query_projection: linear_launch(
                 query_weight,
                 shared.scratch,
@@ -1346,18 +1610,54 @@ fn encode_attention(
     let grouped_decode_reductions = launches
         .iter()
         .filter(|launch| {
-            attention_dispatch_plan(&launch.params).kind == AttentionDispatchKind::GroupedDecode
+            attention.dispatch_plan(&launch.params).kind == AttentionDispatchKind::GroupedDecode
         })
         .count() as u64;
     let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
         .saturating_add(grouped_decode_reductions);
-    let operation_label = if hidden_type == ElementType::F32 {
+    let operation_label = if kv_type == ElementType::I8 {
+        if hidden_type == ElementType::F32 {
+            "vnext_causal_paged_attention_f32_master_int8_kv"
+        } else {
+            "vnext_causal_paged_attention_int8_kv"
+        }
+    } else if hidden_type == ElementType::F32 {
         "vnext_causal_paged_attention_f32_master"
     } else {
         "vnext_causal_paged_attention"
     };
-    let compute_command =
+    let completion_offsets = if kv_type == ElementType::I8 {
+        let flag_offset = attention.error_flag_offset()?;
+        launches
+            .iter()
+            .map(|launch| {
+                launch
+                    .binding_offset
+                    .checked_add(flag_offset)
+                    .ok_or_else(|| "Metal INT8 completion flag offset overflows".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let reset_offsets = completion_offsets.clone();
+    let mut compute_command =
         MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
+            // Binding slots are non-overlapping for the complete submission and
+            // retained through its fence. Reset on the device on every invocation,
+            // including a reused execution topology, before any quantization writes.
+            if !reset_offsets.is_empty() {
+                let workspace = &regions[shared.binding];
+                encoder.with_blit_commands(reset_offsets.len() as u64, |blit| {
+                    for offset in &reset_offsets {
+                        blit.fill_buffer(
+                            workspace.buffer(),
+                            NSRange::new(workspace.offset_bytes() + offset, 4),
+                            0,
+                        );
+                    }
+                });
+            }
             encoder.record_compute_dispatches(dispatch_count);
             if let Some(packed) = packed.as_ref() {
                 enqueue_packed_attention(
@@ -1400,6 +1700,15 @@ fn encode_attention(
             token_count,
         )
         .map_err(|error| error.to_string())?;
+    for offset in completion_offsets {
+        compute_command = compute_command
+            .with_completed_u32_zero_check(
+                shared.binding,
+                offset,
+                "Metal INT8 KV quantization encountered non-finite values",
+            )
+            .map_err(|error| error.to_string())?;
+    }
 
     Ok(invocation.attach_binding_command(
         EncodedDeviceOperation::compute(compute_command),
@@ -1531,8 +1840,7 @@ fn encode_page_bindings(
             })?;
         if pages.is_empty()
             || pages.iter().any(|page| {
-                page.length_bytes() != VNEXT_KV_PAGE_BYTES
-                    || page.element_type() != ElementType::F16
+                page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != binding.kv_type
             })
         {
             return Err(MetalDeviceRuntimeError::contract(
@@ -1557,6 +1865,33 @@ fn encode_page_bindings(
             .map(MetalBufferRegion::offset_bytes)
             .collect::<Vec<_>>();
         encoder.set_buffers(0, &buffers, &offsets);
+        if binding.scale_page_count != 0 {
+            let scale_end = page_end
+                .checked_add(binding.scale_page_count)
+                .ok_or_else(|| {
+                    MetalDeviceRuntimeError::contract("Metal INT8 scale page range overflows")
+                })?;
+            let scales = regions.get(page_end..scale_end).ok_or_else(|| {
+                MetalDeviceRuntimeError::contract("Metal INT8 scale pages are missing")
+            })?;
+            if scales.iter().any(|page| {
+                page.length_bytes() != VNEXT_KV_PAGE_BYTES
+                    || page.element_type() != ElementType::F32
+            }) {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal INT8 scale pages changed after encoding",
+                ));
+            }
+            let buffers = scales
+                .iter()
+                .map(MetalBufferRegion::buffer)
+                .collect::<Vec<_>>();
+            let offsets = scales
+                .iter()
+                .map(MetalBufferRegion::offset_bytes)
+                .collect::<Vec<_>>();
+            encoder.set_buffers(MAXIMUM_KV_PAGES, &buffers, &offsets);
+        }
     }
     Ok(())
 }
@@ -1738,6 +2073,17 @@ fn dispatch_prepare(
         launch.binding_offset,
     );
     set_params(encoder, 7, &launch.params);
+    if pipelines.kv_type == ElementType::I8 {
+        set_region_offset(
+            encoder,
+            8,
+            &regions[shared.binding],
+            launch.binding_offset
+                + pipelines
+                    .error_flag_offset()
+                    .expect("validated INT8 flag layout"),
+        );
+    }
     use_pages(encoder, regions, launch);
     encoder.set_threadgroup_memory_length(0, 0);
     encoder.set_threadgroup_memory_length(1, 0);
@@ -1759,10 +2105,7 @@ fn dispatch_attention(
     launch: &ParticipantLaunch,
 ) {
     let scratch = &regions[shared.scratch];
-    let plan = attention_dispatch_plan_with_memory_limit(
-        &launch.params,
-        pipelines.maximum_threadgroup_memory_length,
-    );
+    let plan = pipelines.dispatch_plan(&launch.params);
     set_region_offset(encoder, 0, scratch, launch.query);
     set_region_offset(encoder, 1, scratch, launch.query_raw);
     set_region_offset(
@@ -1818,8 +2161,74 @@ struct AttentionDispatchPlan {
     threadgroup_memory_bytes: [u64; 2],
 }
 
+#[cfg(test)]
 fn attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
     attention_dispatch_plan_with_memory_limit(params, u64::MAX)
+}
+
+fn int8_attention_dispatch_plan(
+    params: &CausalAttentionParams,
+    maximum_threadgroup_memory_length: u64,
+    supports_gqa_tiled_prefill: bool,
+) -> AttentionDispatchPlan {
+    if uses_direct_decode(params) {
+        return direct_decode_attention_dispatch_plan(params);
+    }
+    if supports_gqa_tiled_prefill
+        && params.tokens >= TILED_PREFILL_QUERY_TILE
+        && params.head_dim == 256
+        && query_heads_per_kv_head(params).is_some_and(|heads| {
+            heads >= GQA_TILED_PREFILL_QUERY_HEADS
+                && heads.is_multiple_of(GQA_TILED_PREFILL_QUERY_HEADS)
+        })
+    {
+        let plan = int8_gqa_tiled_prefill_attention_dispatch_plan(params);
+        if plan.threadgroup_memory_bytes.iter().sum::<u64>() <= maximum_threadgroup_memory_length {
+            return plan;
+        }
+    }
+    // INT8 tiles gather through both page tables, so they do not require the
+    // F16 direct-matrix-load page divisibility restriction.
+    if params.tokens >= TILED_PREFILL_QUERY_TILE
+        && matches!(params.head_dim, 128 | 256)
+        && query_heads_per_kv_head(params).is_some()
+    {
+        let mut plan = tiled_prefill_attention_dispatch_plan(params);
+        // One shared staging tile is overwritten between QK and PV phases.
+        let staging =
+            TILED_PREFILL_KEY_TILE * u64::from(params.head_dim) * ElementType::F16.size_bytes();
+        plan.threadgroup_memory_bytes[0] += staging;
+        if plan.threadgroup_memory_bytes.iter().sum::<u64>() <= maximum_threadgroup_memory_length {
+            return plan;
+        }
+    }
+    general_attention_dispatch_plan(params)
+}
+
+fn int8_gqa_tiled_prefill_attention_dispatch_plan(
+    params: &CausalAttentionParams,
+) -> AttentionDispatchPlan {
+    let rows = u64::from(TILED_PREFILL_QUERY_TILE * GQA_TILED_PREFILL_QUERY_HEADS);
+    // Q and F32 output remain resident. K/V share one 32 x 64 half slab,
+    // gathered independently through the payload and scale page tables.
+    // For D=256 the two allocations sum to 31 KiB, including every region.
+    let half_elements = rows * u64::from(params.head_dim)
+        + rows * TILED_PREFILL_KEY_TILE
+        + TILED_PREFILL_KEY_TILE * INT8_GQA_PREFILL_DIM_SLAB;
+    let float_elements = rows * (u64::from(params.head_dim) + TILED_PREFILL_KEY_TILE);
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::GqaTiledPrefill,
+        threadgroups: [
+            u64::from(params.tokens).div_ceil(u64::from(TILED_PREFILL_QUERY_TILE)),
+            u64::from(params.query_heads / GQA_TILED_PREFILL_QUERY_HEADS),
+            1,
+        ],
+        threads_per_threadgroup: [SIMD_THREADS, GQA_TILED_PREFILL_SIMDGROUPS, 1],
+        threadgroup_memory_bytes: [
+            half_elements * ElementType::F16.size_bytes(),
+            float_elements * ElementType::F32.size_bytes(),
+        ],
+    }
 }
 
 fn attention_dispatch_plan_with_memory_limit(
@@ -2092,6 +2501,7 @@ fn use_pages(
     let page_end = launch
         .first_page_region
         .checked_add(launch.page_count)
+        .and_then(|end| end.checked_add(launch.scale_page_count))
         .expect("validated Metal causal-attention page range overflowed during dispatch");
     let pages = regions
         .get(launch.first_page_region..page_end)
@@ -2135,6 +2545,7 @@ fn paged_state_regions(
     participant: &OperationInvocation<'_, MetalDeviceBuffer>,
     state: &ResolvedValueBinding,
     expected_physical_bytes: u64,
+    element_type: ElementType,
 ) -> Result<Vec<MetalBufferRegion>, String> {
     let [component] = state.storage().components() else {
         return Err(
@@ -2147,8 +2558,8 @@ fn paged_state_regions(
         .find(|view| view.resource_id() == component.resource_id())
         .ok_or_else(|| "Metal causal-attention state has no resource view".to_owned())?;
     if component.offset_bytes() != 0
-        || component.element_type() != ElementType::F16
-        || view.descriptor().element_type != ElementType::F16
+        || component.element_type() != element_type
+        || view.descriptor().element_type != element_type
         || view.storage_kind() != OperationBufferStorageKind::DynamicPaged
         || view.descriptor().size_bytes != expected_physical_bytes
         || expected_physical_bytes == 0
@@ -2183,8 +2594,7 @@ fn paged_state_regions(
             let page = buffer
                 .retained_region(start..end, retention.clone())
                 .map_err(|error| error.to_string())?;
-            if page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != ElementType::F16
-            {
+            if page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != element_type {
                 return Err(
                     "Metal causal-attention physical page differs from its contract".to_owned(),
                 );
@@ -2206,6 +2616,7 @@ fn validate_signature(
     participant: &OperationInvocation<'_, MetalDeviceBuffer>,
     shape: CausalAttentionShape,
     hidden_type: ElementType,
+    kv_type: ElementType,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -2224,13 +2635,17 @@ fn validate_signature(
         (value(5)?, vec![shape.hidden_size, shape.query_features]),
         (value(6)?, vec![shape.head_dim]),
         (value(7)?, vec![shape.head_dim]),
-        (value(8)?, vec![2, shape.key_value_heads, shape.head_dim]),
     ];
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
         || !contiguous(hidden, hidden_type)
         || !contiguous(output, hidden_type)
+        || value(8)?.tensor().dimensions() != [2, shape.key_value_heads, shape.head_dim]
+        || !contiguous(value(8)?, kv_type)
+        || (kv_type == ElementType::I8
+            && (value(9)?.tensor().dimensions() != [2, shape.key_value_heads]
+                || !contiguous(value(9)?, ElementType::F32)))
         || expected.iter().any(|(binding, dimensions)| {
             binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
         })
@@ -2380,10 +2795,18 @@ mod shape_tests {
     #[test]
     fn qwen35_4b_shape_exactly_fits_fixed_page_capability() {
         let shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
-        assert_eq!(shape.state_bytes_per_token().unwrap(), 4096);
-        assert_eq!(shape.maximum_pages().unwrap(), MAXIMUM_KV_PAGES);
+        assert_eq!(shape.state_bytes_per_token(ElementType::F16).unwrap(), 4096);
         assert_eq!(
-            shape.physical_state_bytes(17).unwrap(),
+            shape
+                .physical_state_bytes_with_type(shape.maximum_context_tokens, ElementType::F16)
+                .unwrap()
+                / VNEXT_KV_PAGE_BYTES,
+            MAXIMUM_KV_PAGES
+        );
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(17, ElementType::F16)
+                .unwrap(),
             2 * VNEXT_KV_PAGE_BYTES
         );
         assert_eq!(
@@ -2421,6 +2844,38 @@ mod shape_tests {
                 assert!(layout.split_decode_offset(participant_count).is_err());
             }
         }
+    }
+
+    #[test]
+    fn int8_state_geometry_counts_independent_pages_and_omits_unused_split_decode_scratch() {
+        let mut shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
+        let tokens = 32_768;
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(tokens, ElementType::I8)
+                .unwrap(),
+            64 << 20
+        );
+        assert_eq!(shape.physical_scale_bytes(tokens).unwrap(), 1 << 20);
+        // Both typed pools still need their own first page for a short sequence.
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(1, ElementType::I8)
+                .unwrap(),
+            VNEXT_KV_PAGE_BYTES
+        );
+        assert_eq!(shape.physical_scale_bytes(1).unwrap(), VNEXT_KV_PAGE_BYTES);
+        let scratch = ScratchLayout::new_with_storage(shape, 3, 2, ElementType::I8).unwrap();
+        assert_eq!(
+            scratch.required_bytes,
+            3 * shape.scratch_bytes_per_token().unwrap()
+        );
+        assert_eq!(scratch.split_decode_bytes_per_sequence, 0);
+        shape.maximum_context_tokens *= 2;
+        assert!(shape.validate_page_count(ElementType::F16).is_err());
+        shape.validate_page_count(ElementType::I8).unwrap();
+        shape.maximum_context_tokens += 1;
+        assert!(shape.validate_page_count(ElementType::I8).is_err());
     }
 
     #[test]

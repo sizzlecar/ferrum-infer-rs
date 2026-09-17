@@ -1,4 +1,4 @@
-use super::{identity, write_json, Args};
+use super::{identity, kv, write_json, Args};
 use anyhow::{bail, ensure, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -158,7 +158,11 @@ pub(super) async fn run(
     timeout: Duration,
 ) -> Result<String> {
     let configuration_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run")
-        && (args.runtime_capacity().is_some() || identity::requires_source_evidence(args)?)
+        && (args.runtime_capacity().is_some()
+            || args.kv_dtype.is_some()
+            || args.sequence_fit_policy.is_some()
+            || args.max_num_batched_tokens.is_some()
+            || identity::requires_source_evidence(args)?)
     {
         let path = args
             .report_dir
@@ -189,6 +193,10 @@ pub(super) async fn run(
         }
         identity::validate_source_config(args, &config)
             .with_context(|| format!("{name} actual source selection"))?;
+        super::capacity::validate_effective_policy(args, &config)
+            .with_context(|| format!("{name} effective admission policy"))?;
+        kv::validate_storage(args.kv_dtype, &config)
+            .with_context(|| format!("{name} actual KV storage"))?;
     }
     Ok(stdout)
 }
@@ -216,7 +224,11 @@ impl<'a> Server<'a> {
             "--served-model-name".into(),
             "regression-model".into(),
         ]);
-        if identity::requires_source_evidence(args)? {
+        if args.kv_dtype.is_some()
+            || args.sequence_fit_policy.is_some()
+            || args.max_num_batched_tokens.is_some()
+            || identity::requires_source_evidence(args)?
+        {
             argv.extend([
                 "--effective-config-json".into(),
                 args.report_dir
@@ -258,6 +270,15 @@ impl<'a> Server<'a> {
                     if status.is_success() {
                         let health = serde_json::from_str(&text).context("parse /health")?;
                         identity::validate_serve(args, &health)?;
+                        kv::validate_storage(args.kv_dtype, &health)
+                            .context("serve actual KV storage from /health")?;
+                        if args.kv_dtype.is_some() {
+                            let config: Value = serde_json::from_slice(&fs::read(
+                                args.report_dir.join("serve.effective-config.json"),
+                            )?)?;
+                            kv::validate_storage(args.kv_dtype, &config)
+                                .context("serve actual KV storage from effective config")?;
+                        }
                         let source_identity = identity::source_evidence(args, "serve")?;
                         return Ok(Self {
                             args,
@@ -289,41 +310,75 @@ impl<'a> Server<'a> {
             self.args.report_dir.join(format!("{name}.request.json")),
             body,
         )?;
-        let mut response = self
+        let started = Instant::now();
+        let mut metadata = json!({"path": endpoint.path()});
+        let outcome = async {
+            let mut response = self
+                .client
+                .post(format!("{}{}", self.url, endpoint.path()))
+                .json(body)
+                .send()
+                .await?;
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            metadata["status"] = json!(status.as_u16());
+            metadata["content_type"] = json!(content_type);
+            let mut raw = File::create(self.args.report_dir.join(format!("{name}.response.txt")))?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.is_empty() && !chunk.is_empty() {
+                    // Transport timing only: one chunk need not contain a text token.
+                    metadata["first_body_chunk_ms"] =
+                        json!(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                // Keep partial SSE evidence even if a later read times out.
+                raw.write_all(&chunk)?;
+                bytes.extend_from_slice(&chunk);
+                metadata["response_bytes"] = json!(bytes.len());
+            }
+            let text = String::from_utf8(bytes).context("response is not valid UTF-8")?;
+            ensure!(status.is_success(), "{name} returned HTTP {status}: {text}");
+            ensure!(
+                if body["stream"] == true {
+                    content_type.starts_with("text/event-stream")
+                } else {
+                    content_type.starts_with("application/json")
+                },
+                "unexpected content type {content_type}"
+            );
+            Ok::<_, anyhow::Error>(text)
+        }
+        .await;
+        metadata["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+        metadata["outcome"] = json!(if outcome.is_ok() { "success" } else { "failed" });
+        if let Err(error) = &outcome {
+            metadata["error"] = json!(format!("{error:#}"));
+        }
+        write_json(
+            self.args.report_dir.join(format!("{name}.http.json")),
+            &metadata,
+        )?;
+        outcome
+    }
+
+    pub async fn health_snapshot(&self, name: &str) -> Result<Value> {
+        let response = self
             .client
-            .post(format!("{}{}", self.url, endpoint.path()))
-            .json(body)
+            .get(format!("{}/health", self.url))
             .send()
             .await?;
         let status = response.status();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        write_json(
-            self.args.report_dir.join(format!("{name}.http.json")),
-            &json!({"status": status.as_u16(), "content_type": content_type, "path": endpoint.path()}),
-        )?;
-        let mut raw = File::create(self.args.report_dir.join(format!("{name}.response.txt")))?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            // Keep partial SSE evidence even if a later read times out.
-            raw.write_all(&chunk)?;
-            bytes.extend_from_slice(&chunk);
-        }
-        let text = String::from_utf8(bytes).context("response is not valid UTF-8")?;
-        ensure!(status.is_success(), "{name} returned HTTP {status}: {text}");
-        ensure!(
-            if body["stream"] == true {
-                content_type.starts_with("text/event-stream")
-            } else {
-                content_type.starts_with("application/json")
-            },
-            "unexpected content type {content_type}"
-        );
-        Ok(text)
+        let text = response.text().await?;
+        fs::write(self.args.report_dir.join(format!("{name}.json")), &text)?;
+        ensure!(status.is_success(), "health returned {status}: {text}");
+        let health: Value = serde_json::from_str(&text).context("parse health snapshot")?;
+        kv::validate_storage(self.args.kv_dtype, &health)?;
+        Ok(health)
     }
 
     pub async fn models(&self) -> Result<Value> {

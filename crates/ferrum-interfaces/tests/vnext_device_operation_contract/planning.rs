@@ -384,6 +384,7 @@ fn resolved_model_plan_with_zero_state_and_policy(
         .unwrap();
     let numerical_execution = NumericalProfileResolution::from_static_plan(
         NumericalExecutionPolicy::Auto,
+        ferrum_types::KvStorageFormat::F16,
         &definition,
         &family,
         &catalog,

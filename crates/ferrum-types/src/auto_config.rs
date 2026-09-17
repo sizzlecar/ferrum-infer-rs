@@ -436,6 +436,7 @@ impl ResolvedFerrumConfig {
             "selected_max_sequences": selected_max_sequences,
             "selected_max_model_len": selected_max_model_len,
             "selected_kv_capacity": selected_kv_capacity,
+            "selected_kv_capacity_source": "configured_token_limit",
             "selected_max_batched_tokens": selected_max_batched_tokens,
             "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
             "selected_admission_limit": selected_admission_limit,
@@ -467,6 +468,31 @@ impl ResolvedFerrumConfig {
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
+        let memory_estimate = serde_json::json!({
+            "source": "legacy_f16_geometry_estimate",
+            "applies_to_selected_state_layout": false,
+            "is_resident_usage": false,
+            "selected_state_evidence_source": if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime { "executor.kv_storage.logical_sequence_state" } else { "legacy_runtime" },
+            "vram_bytes": self.hardware_capabilities.vram_bytes,
+            "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
+            "kv_bytes_per_token": kv_bytes_per_token,
+            "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
+            "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
+            "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
+            "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
+            "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
+                (Some(slots), Some(bytes_per_sequence)) => {
+                    (slots as u64).checked_mul(bytes_per_sequence)
+                }
+                _ => None,
+            },
+            "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
+                (Some(tokens), Some(bytes_per_token)) => {
+                    (tokens as u64).checked_mul(bytes_per_token)
+                }
+                _ => None,
+            },
+        });
         serde_json::json!({
             "schema_version": 1,
             "backend": self.hardware_capabilities.backend,
@@ -492,32 +518,15 @@ impl ResolvedFerrumConfig {
             },
             "legacy_recurrent_state_max_slots_estimate": recurrent_state_max_slots,
             "legacy_recurrent_state_limit_applies": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "kv_capacity_source": "legacy_block_preflight_estimate",
+            "kv_capacity_applies_to_selected_state_layout": self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine,
+            "kv_capacity_is_resident_usage": false,
             "kv_block_count": kv_blocks,
             "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
             "kv_capacity_tokens": kv_capacity_tokens,
             "max_model_length": max_model_len,
             "max_batched_tokens": max_batched_tokens,
-            "memory_estimate": {
-                "vram_bytes": self.hardware_capabilities.vram_bytes,
-                "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
-                "kv_bytes_per_token": kv_bytes_per_token,
-                "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
-                "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
-                "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
-                "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
-                "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
-                    (Some(slots), Some(bytes_per_sequence)) => {
-                        (slots as u64).checked_mul(bytes_per_sequence)
-                    }
-                    _ => None,
-                },
-                "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
-                    (Some(tokens), Some(bytes_per_token)) => {
-                        (tokens as u64).checked_mul(bytes_per_token)
-                    }
-                    _ => None,
-                },
-            },
+            "memory_estimate": memory_estimate,
         })
     }
 
@@ -1192,9 +1201,15 @@ impl FerrumConfigBuilder {
         } else {
             max_sequences.value.max(1).saturating_mul(64)
         };
-        let value = target
-            .min(kv_token_capacity)
-            .max(max_sequences.value.max(1));
+        // PlanRuntime admits exact typed states and workspace against its
+        // device budget. Legacy block estimates do not cap its token work.
+        let value = if self.execution_resource_authority == ExecutionResourceAuthority::PlanRuntime
+        {
+            target
+        } else {
+            target.min(kv_token_capacity)
+        }
+        .max(max_sequences.value.max(1));
         ResolvedValue {
             value,
             source: if max_sequences.source == AutoConfigSource::HardwareCapability
@@ -1774,7 +1789,9 @@ impl FerrumConfigBuilder {
             );
         }
         let kv_token_capacity = kv_blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS);
-        if max_batched_tokens > kv_token_capacity {
+        if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
+            && max_batched_tokens > kv_token_capacity
+        {
             return self.invalid(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "exceeds KV cache token capacity",
@@ -1792,7 +1809,9 @@ impl FerrumConfigBuilder {
                     );
                 }
             }
-            if max_model_len > kv_token_capacity {
+            if self.execution_resource_authority == ExecutionResourceAuthority::LegacyEngine
+                && max_model_len > kv_token_capacity
+            {
                 return self.invalid(
                     "FERRUM_KV_MAX_BLOCKS",
                     "KV cache token capacity is smaller than FERRUM_MAX_MODEL_LEN",
@@ -1864,11 +1883,37 @@ impl FerrumConfigBuilder {
                 source_key: None,
             },
         };
-        // This preflight capability must match what the concrete runtime
-        // descriptor advertises. Metal currently provides the portable vNext
-        // provider; only the CUDA composition exposes native-adaptive attention.
-        let native_adaptive_supported =
-            self.is_cuda_backend() && self.hardware.compiled_features.vllm_paged_attn;
+        let kv_dtype = self
+            .raw("FERRUM_KV_DTYPE")
+            .map(|raw| {
+                crate::KvCacheDtype::parse(raw).ok_or_else(|| AutoConfigError::InvalidOverride {
+                    key: "FERRUM_KV_DTYPE".to_owned(),
+                    reason: format!("unknown KV dtype {raw}"),
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let kv_storage = crate::KvStorageFormat::try_from(kv_dtype).map_err(|reason| {
+            AutoConfigError::InvalidOverride {
+                key: "FERRUM_KV_DTYPE".to_owned(),
+                reason,
+            }
+        })?;
+        // The native CUDA ABI consumes F16 pages. Resolve Auto within the
+        // requested typed storage before materializing a default policy into
+        // the runtime snapshot, or a later stage mistakes that default for an
+        // explicit incompatible NativeAdaptive request.
+        if kv_storage != crate::KvStorageFormat::F16
+            && requested.value == AttentionExecutionPolicy::NativeAdaptive
+        {
+            return Err(AutoConfigError::UnsupportedCombination {
+                selection: "attention_execution_policy".to_owned(),
+                reason: "native-adaptive attention does not implement the requested INT8 KV storage; use auto or portable".to_owned(),
+            });
+        }
+        let native_adaptive_supported = self.is_cuda_backend()
+            && self.hardware.compiled_features.vllm_paged_attn
+            && kv_storage == crate::KvStorageFormat::F16;
         let compiled = requested
             .value
             .resolve(native_adaptive_supported)
@@ -3302,6 +3347,170 @@ mod tests {
         assert_eq!(
             document["admission"]["legacy_recurrent_state_limit_applies"],
             serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn plan_runtime_preflight_labels_legacy_estimates_without_breaking_capacity_consumers() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let model = synthetic_tight_recurrent_state_model();
+        for authority in [
+            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionResourceAuthority::LegacyEngine,
+        ] {
+            let document = FerrumConfigBuilder::new(snapshot(&[
+                ("FERRUM_KV_DTYPE", "int8"),
+                ("FERRUM_KV_CAPACITY", "512"),
+            ]))
+            .with_model_capabilities(model.clone())
+            .with_hardware_capabilities(hardware.clone())
+            .with_execution_resource_authority(authority)
+            .resolve()
+            .unwrap()
+            .effective_config_document();
+            assert_eq!(document["selected_kv_capacity"], 512);
+            assert_eq!(
+                document["selected_kv_capacity_source"],
+                "configured_token_limit"
+            );
+            let admission = &document["admission"];
+            for field in [
+                "kv_block_count",
+                "kv_block_size_tokens",
+                "kv_capacity_tokens",
+            ] {
+                assert!(
+                    admission[field].as_u64().is_some(),
+                    "missing compatibility field {field}"
+                );
+            }
+            assert_eq!(
+                admission["kv_capacity_source"],
+                "legacy_block_preflight_estimate"
+            );
+            assert_eq!(admission["kv_capacity_is_resident_usage"], false);
+            assert_eq!(
+                admission["kv_capacity_applies_to_selected_state_layout"],
+                authority == ExecutionResourceAuthority::LegacyEngine
+            );
+            let estimate = &admission["memory_estimate"];
+            assert_eq!(
+                estimate["kv_bytes_per_token"],
+                kv_cache_bytes_per_token_for_model(&model).unwrap()
+            );
+            assert_eq!(estimate["source"], "legacy_f16_geometry_estimate");
+            assert_eq!(estimate["applies_to_selected_state_layout"], false);
+            assert_eq!(estimate["is_resident_usage"], false);
+            if authority == ExecutionResourceAuthority::PlanRuntime {
+                assert_eq!(
+                    estimate["selected_state_evidence_source"],
+                    "executor.kv_storage.logical_sequence_state"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_runtime_int8_implicit_and_explicit_auto_resolve_to_compatible_attention() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let resolve = |dtype, attention: Option<&str>| {
+            let mut entries = vec![("FERRUM_KV_DTYPE", dtype)];
+            if let Some(attention) = attention {
+                entries.push(("FERRUM_ATTENTION_POLICY", attention));
+            }
+            FerrumConfigBuilder::new(snapshot(&entries))
+                .with_hardware_capabilities(hardware.clone())
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve()
+        };
+        for requested in [None, Some("auto"), Some("portable")] {
+            let resolved = resolve("int8", requested).unwrap();
+            assert_eq!(
+                resolved.compiled_attention_policy,
+                Some(AttentionExecutionPolicy::Portable)
+            );
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .runtime
+                    .attention_execution_policy
+                    .resolve(false)
+                    .unwrap(),
+                AttentionExecutionPolicy::Portable
+            );
+            assert_eq!(
+                resolved.requested_attention_policy,
+                Some(if requested == Some("portable") {
+                    AttentionExecutionPolicy::Portable
+                } else {
+                    AttentionExecutionPolicy::Auto
+                })
+            );
+        }
+        assert!(
+            matches!(resolve("int8", Some("native-adaptive")), Err(AutoConfigError::UnsupportedCombination {
+            selection, reason,
+        }) if selection == "attention_execution_policy" && reason.contains("INT8 KV"))
+        );
+        assert_eq!(
+            resolve("fp16", None).unwrap().compiled_attention_policy,
+            Some(AttentionExecutionPolicy::NativeAdaptive)
+        );
+    }
+
+    #[test]
+    fn plan_runtime_context_and_batch_limits_do_not_inherit_legacy_kv_block_estimates() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let mut model = ModelCapabilities::unknown();
+        model.max_context_len = Some(131_072);
+        // A tiny legacy block count is not vNext capacity authority. This is
+        // preflight acceptance only: native admission still charges both INT8
+        // payload and scales, physical alignment and operation workspace.
+        for max_batched in ["16", "32"] {
+            let entries = snapshot(&[
+                ("FERRUM_KV_DTYPE", "int8"),
+                ("FERRUM_KV_MAX_BLOCKS", "1"),
+                ("FERRUM_PAGED_MAX_SEQS", "1"),
+                ("FERRUM_MAX_BATCHED_TOKENS", max_batched),
+                ("FERRUM_MAX_MODEL_LEN", "65536"),
+            ]);
+            let builder = FerrumConfigBuilder::new(entries.clone())
+                .with_hardware_capabilities(hardware.clone())
+                .with_model_capabilities(model.clone());
+            assert!(
+                builder.resolve().is_err(),
+                "legacy capacity must remain enforced"
+            );
+            let resolved = FerrumConfigBuilder::new(entries)
+                .with_hardware_capabilities(hardware.clone())
+                .with_model_capabilities(model.clone())
+                .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+                .resolve()
+                .unwrap();
+            let mut engine = crate::EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert_eq!(engine.runtime.max_model_len, Some(65_536));
+            assert_eq!(
+                engine.batching.max_num_batched_tokens,
+                max_batched.parse::<usize>().unwrap()
+            );
+        }
+        let invalid = FerrumConfigBuilder::new(snapshot(&[("FERRUM_MAX_MODEL_LEN", "131073")]))
+            .with_hardware_capabilities(hardware)
+            .with_model_capabilities(model)
+            .with_execution_resource_authority(ExecutionResourceAuthority::PlanRuntime)
+            .resolve()
+            .unwrap_err();
+        assert!(
+            matches!(invalid, AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_MAX_MODEL_LEN")
         );
     }
 

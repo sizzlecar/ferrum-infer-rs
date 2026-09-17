@@ -76,6 +76,53 @@ fn selected_gguf_is_forwarded_to_both_entrypoints() {
 }
 
 #[test]
+fn local_gguf_metadata_paths_reach_both_entrypoints_without_a_prepared_task() {
+    let base = [
+        "model-regression",
+        "--ferrum-bin",
+        "fixture-ferrum",
+        "--model",
+        "fixture.gguf",
+        "--backend",
+        "metal",
+        "--report-dir",
+        "fixture-report",
+    ];
+    for sources in [
+        vec!["--semantic-source", "metadata with spaces"],
+        vec!["--tokenizer-source", "tokenizer with spaces"],
+        vec![
+            "--semantic-source",
+            "metadata with spaces",
+            "--tokenizer-source",
+            "tokenizer with spaces",
+        ],
+    ] {
+        let selected =
+            Args::try_parse_from(base.into_iter().chain(sources.iter().copied())).unwrap();
+        assert!(selected.source_expectation.is_none());
+        for entrypoint in ["run", "serve"] {
+            let command = selected.common_args(entrypoint);
+            for pair in sources.chunks_exact(2) {
+                assert_eq!(command.windows(2).filter(|words| words == &pair).count(), 1);
+            }
+            for flag in ["--semantic-source", "--tokenizer-source"] {
+                assert_eq!(
+                    command.iter().any(|word| word == flag),
+                    sources.contains(&flag)
+                );
+            }
+        }
+        assert!(Args::try_parse_from(
+            base.into_iter()
+                .chain(sources.iter().copied())
+                .chain(["--expected-task", "prepared.json"])
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn expected_metadata_pins_reach_both_entrypoints_without_overriding_quick_start_capacity() {
     let semantic = format!("author/semantic@{}", "b".repeat(40));
     let tokenizer = format!("author/tokenizer@{}", "c".repeat(40));

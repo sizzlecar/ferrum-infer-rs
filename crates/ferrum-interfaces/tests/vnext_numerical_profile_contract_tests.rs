@@ -42,6 +42,7 @@ struct Family {
 impl Family {
     fn profile(&self, profile_id: &str, dtype: ElementType) -> NumericalExecutionProfile {
         NumericalExecutionProfile {
+            kv_storage: Vec::new(),
             id: id(profile_id),
             family_id: self.family_id.clone(),
             version: ContractVersion::new(1, 0),
@@ -299,7 +300,10 @@ fn unqualified_explicit_profile_does_not_silently_enter_auto_preferences() {
     let profiles = definition.numerical_profiles();
     assert_eq!(
         profiles
-            .candidates(&NumericalExecutionPolicy::Auto)
+            .candidates(
+                &NumericalExecutionPolicy::Auto,
+                ferrum_types::KvStorageFormat::F16
+            )
             .unwrap()
             .iter()
             .map(|p| p.id.as_str())
@@ -308,13 +312,19 @@ fn unqualified_explicit_profile_does_not_silently_enter_auto_preferences() {
     );
     assert_eq!(
         profiles
-            .candidates(&NumericalExecutionPolicy::Require(id("fixture.f16")))
+            .candidates(
+                &NumericalExecutionPolicy::Require(id("fixture.f16")),
+                ferrum_types::KvStorageFormat::F16
+            )
             .unwrap()[0]
             .id,
         id("fixture.f16")
     );
     assert!(profiles
-        .candidates(&NumericalExecutionPolicy::Require(id("fixture.unknown")))
+        .candidates(
+            &NumericalExecutionPolicy::Require(id("fixture.unknown")),
+            ferrum_types::KvStorageFormat::F16
+        )
         .is_err());
 }
 
@@ -391,6 +401,17 @@ fn wire_rebuilds_selected_profile_and_rejects_forged_arithmetic_or_old_semantics
         serde_json::to_value(ElementType::F16).unwrap();
     assert!(PreparedModelFamily::from_json_validated(
         &serde_json::to_vec(&arithmetic).unwrap(),
+        &registry
+    )
+    .is_err());
+    let mut forged_kv = wire.clone();
+    forged_kv["numerical_profile"]["kv_storage"] =
+        serde_json::to_value(vec![KvStateStorage::F16 {
+            state: id("state.unbound"),
+        }])
+        .unwrap();
+    assert!(PreparedModelFamily::from_json_validated(
+        &serde_json::to_vec(&forged_kv).unwrap(),
         &registry
     )
     .is_err());

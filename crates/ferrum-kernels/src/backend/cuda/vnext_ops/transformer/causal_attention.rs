@@ -68,13 +68,22 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.causal_paged_attention.f16";
 const GEMMA4_PROVIDER_ID: &str = "provider.cuda.gemma4_causal_paged_attention.f16";
 const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_attention.f16";
 #[cfg(test)]
+#[path = "causal_attention/int8_tests.rs"]
+mod int8_tests;
+#[cfg(test)]
 #[path = "causal_attention/numerical_tests.rs"]
 mod numerical_tests;
 mod precision;
 use super::native_matrix;
 use crate::backend::cuda::vnext_ops::native_blocks::CudaNativeBlockKernels;
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_f32_master_contract, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
+    causal_paged_attention_int8_kv_contract, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderCheckpointStateLayout,
+    ProviderCheckpointStatePort, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
 };
 use precision::CausalPrecision;
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
@@ -99,6 +108,8 @@ const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
 const BINDING_CONTROL_WORDS: usize = 6;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const BINDING_SEQUENCE_LENGTH_OFFSET: u64 = 3 * std::mem::size_of::<i32>() as u64;
+const BINDING_NUMERICAL_STATUS_OFFSET: u64 = 5 * std::mem::size_of::<i32>() as u64;
+const INT8_NUMERICAL_FAILURE_MASK: u32 = 1 << 31;
 const WARP_THREADS: u32 = 32;
 const GROUPED_FALLBACK_DEFAULT_KV_TILE_TOKENS: u64 = 16;
 const GROUPED_FALLBACK_GEMMA_LOCAL_KV_TILE_TOKENS: u64 = 32;
@@ -127,6 +138,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CausalAttentionSemantics {
     Standard,
+    StandardInt8,
     Gemma4,
 }
 
@@ -134,6 +146,7 @@ impl CausalAttentionSemantics {
     const fn provider_id(self) -> &'static str {
         match self {
             Self::Standard => PROVIDER_ID,
+            Self::StandardInt8 => "provider.cuda.causal_paged_attention.f16.int8-kv",
             Self::Gemma4 => GEMMA4_PROVIDER_ID,
         }
     }
@@ -141,6 +154,7 @@ impl CausalAttentionSemantics {
     const fn estimator_id(self) -> &'static str {
         match self {
             Self::Standard => ESTIMATOR_ID,
+            Self::StandardInt8 => "resource-estimator.cuda.causal_paged_attention.f16.int8-kv",
             Self::Gemma4 => GEMMA4_ESTIMATOR_ID,
         }
     }
@@ -148,6 +162,7 @@ impl CausalAttentionSemantics {
     const fn input_count(self) -> u32 {
         match self {
             Self::Standard => 9,
+            Self::StandardInt8 => 10,
             Self::Gemma4 => 10,
         }
     }
@@ -156,9 +171,18 @@ impl CausalAttentionSemantics {
         matches!(self, Self::Gemma4)
     }
 
+    const fn int8_kv(self) -> bool {
+        matches!(self, Self::StandardInt8)
+    }
+
+    const fn is_state(self, ordinal: u32) -> bool {
+        ordinal == 8 || (self.int8_kv() && ordinal == 9)
+    }
+
     const fn fingerprint_tag(self) -> &'static [u8] {
         match self {
             Self::Standard => b"standard-causal-attention-v2",
+            Self::StandardInt8 => b"standard-causal-attention-int8-f32-scales-v1",
             Self::Gemma4 => b"gemma4-causal-attention-v1",
         }
     }
@@ -179,6 +203,37 @@ struct CausalAttentionFunctions {
 }
 
 impl CudaCausalPagedAttentionProvider {
+    pub(in crate::backend::cuda::vnext_ops) fn new_int8_kv(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = causal_paged_attention_int8_kv_contract().map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+            CausalAttentionSemantics::StandardInt8,
+            CausalPrecision::F16,
+        )
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_int8_kv(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract =
+            causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+            CausalAttentionSemantics::StandardInt8,
+            CausalPrecision::F32Master,
+        )
+    }
+
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
         attention_policy: AttentionExecutionPolicy,
@@ -244,6 +299,11 @@ impl CudaCausalPagedAttentionProvider {
         semantics: CausalAttentionSemantics,
         precision: CausalPrecision,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        if semantics.int8_kv() && attention_policy != AttentionExecutionPolicy::Portable {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA INT8 KV requires the portable attention provider; native-adaptive has no INT8 KV ABI",
+            ));
+        }
         if semantics.has_post_attention_norm() && precision != CausalPrecision::F16 {
             return Err(CudaDeviceRuntimeError::contract(
                 "post-normalized causal attention has no declared F32-master contract",
@@ -407,7 +467,7 @@ impl CudaCausalPagedAttentionProvider {
                 .map_err(contract_error)?,
             );
         }
-        let descriptor = OperationProviderDescriptor::new(
+        let mut descriptor = OperationProviderDescriptor::new(
             ProviderId::new(precision.provider_id(semantics)).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
@@ -427,6 +487,39 @@ impl CudaCausalPagedAttentionProvider {
             estimator_fingerprint,
         )
         .map_err(contract_error)?;
+        if semantics.int8_kv() {
+            let storage = DynamicStorageProfile::new(
+                DynamicStorageAllocator::FixedBlockArena {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+                DynamicStorageView::PagedRegions {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+            )
+            .map_err(contract_error)?;
+            let checkpoint = ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
+            .with_state_ports(
+                (8..=9)
+                    .map(|ordinal| {
+                        ProviderCheckpointStatePort::new(
+                            ResolvedValueRole::Input,
+                            ordinal,
+                            storage,
+                            ProviderCheckpointStateLayout::TokenMajorPrefix,
+                        )
+                    })
+                    .collect(),
+            )
+            .map_err(contract_error)?;
+            descriptor = descriptor.with_checkpoint_capability(
+                ProviderCheckpointCapability::CompletedBoundary(checkpoint),
+            );
+        }
 
         let rms_module = runtime
             .context()
@@ -467,10 +560,22 @@ impl CudaCausalPagedAttentionProvider {
             )?,
             prepare: load_function(
                 &attention_module,
-                PREPARE_FUNCTION,
+                if semantics.int8_kv() {
+                    "vnext_causal_prepare_int8_kv"
+                } else {
+                    PREPARE_FUNCTION
+                },
                 "causal attention prepare",
             )?,
-            attention: load_function(&attention_module, ATTENTION_FUNCTION, "causal attention")?,
+            attention: load_function(
+                &attention_module,
+                if semantics.int8_kv() {
+                    "vnext_causal_attention_int8_kv"
+                } else {
+                    ATTENTION_FUNCTION
+                },
+                "causal attention",
+            )?,
             grouped_attention: load_function(
                 &attention_module,
                 GROUPED_ATTENTION_FUNCTION,
@@ -541,7 +646,7 @@ fn storage_bindings(
             ProviderStorageBindingRequirement::new(
                 ResolvedValueRole::Input,
                 ordinal,
-                if ordinal == 8 {
+                if semantics.is_state(ordinal) {
                     paged.clone()
                 } else {
                     DynamicStorageRequirement::contiguous()
@@ -620,7 +725,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
         let mut values = (0..self.semantics.input_count())
-            .filter(|ordinal| *ordinal != 8)
+            .filter(|ordinal| !self.semantics.is_state(*ordinal))
             .map(|ordinal| {
                 ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
             })
@@ -629,6 +734,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
             ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
         ]);
+        if self.semantics.int8_kv() {
+            values.push(ReusableExecutionValueAddress::program_binding(
+                ResolvedValueRole::Input,
+                9,
+            ));
+        }
         if request
             .reusable_address_scope(
                 &values,
@@ -698,6 +809,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CausalAttentionShape {
+    int8_kv: bool,
     hidden_size: u64,
     query_heads: u64,
     key_value_heads: u64,
@@ -746,6 +858,9 @@ impl CausalAttentionKernelPath {
         active_tokens: u64,
         sequence_tokens: u64,
     ) -> Result<Self, String> {
+        if shape.int8_kv && attention_policy != AttentionExecutionPolicy::Portable {
+            return Err("INT8 causal attention requires resolved portable execution".to_owned());
+        }
         if matches!(shape.kv_layout()?, CausalKvLayout::TokenMajorPages) {
             return Ok(Self::TokenMajorFallback);
         }
@@ -984,6 +1099,7 @@ where
     const DOMAIN: &[u8] = b"ferrum.cuda.causal-attention.reusable-topology.v1\0";
     let mut digest = Sha256::new();
     digest.update(DOMAIN);
+    digest.update([u8::from(shape.int8_kv)]);
     digest.update((row_count as u64).to_le_bytes());
     let mut observed_rows = 0_usize;
     let mut total_tokens = 0_u64;
@@ -1043,7 +1159,7 @@ impl CausalAttentionShape {
             attention_k_eq_v,
             post_attention_norm,
         ) = match semantics {
-            CausalAttentionSemantics::Standard => (
+            CausalAttentionSemantics::Standard | CausalAttentionSemantics::StandardInt8 => (
                 rope_dim,
                 1.0_f32 / (head_dim as f32).sqrt(),
                 0,
@@ -1063,6 +1179,7 @@ impl CausalAttentionShape {
             ),
         };
         let shape = Self {
+            int8_kv: semantics.int8_kv(),
             hidden_size: unsigned_attribute(attributes, "hidden_size")?,
             query_heads: unsigned_attribute(attributes, "query_heads")?,
             key_value_heads: unsigned_attribute(attributes, "key_value_heads")?,
@@ -1075,7 +1192,9 @@ impl CausalAttentionShape {
             // The standard contract rotates a prefix; proportional Gemma
             // semantics pad frequencies before rotating the complete head.
             rope_pair_offset: match semantics {
-                CausalAttentionSemantics::Standard => rope_dim / 2,
+                CausalAttentionSemantics::Standard | CausalAttentionSemantics::StandardInt8 => {
+                    rope_dim / 2
+                }
                 CausalAttentionSemantics::Gemma4 => head_dim / 2,
             },
             maximum_context_tokens: unsigned_attribute(attributes, "maximum_context_tokens")?,
@@ -1121,7 +1240,9 @@ impl CausalAttentionShape {
             "causal attention maximum context",
         )?;
         let maximum_head_dim = match semantics {
-            CausalAttentionSemantics::Standard => MAXIMUM_STANDARD_HEAD_DIM,
+            CausalAttentionSemantics::Standard | CausalAttentionSemantics::StandardInt8 => {
+                MAXIMUM_STANDARD_HEAD_DIM
+            }
             CausalAttentionSemantics::Gemma4 => MAXIMUM_HEAD_DIM,
         };
         if shape.query_heads % shape.key_value_heads != 0
@@ -1146,11 +1267,14 @@ impl CausalAttentionShape {
     fn state_bytes_per_token(self) -> Result<u64, String> {
         self.kv_features
             .checked_mul(2)
-            .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .and_then(|elements| elements.checked_mul(self.kv_element_type().size_bytes()))
             .ok_or_else(|| "causal attention KV bytes per token overflow".to_owned())
     }
 
     fn kv_layout(self) -> Result<CausalKvLayout, String> {
+        if self.int8_kv {
+            return Ok(CausalKvLayout::TokenMajorPages);
+        }
         let combined_block_bytes = self
             .state_bytes_per_token()?
             .checked_mul(VLLM_BLOCK_TOKENS)
@@ -1216,10 +1340,38 @@ impl CausalAttentionShape {
         Ok(self.physical_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES)
     }
 
+    const fn kv_element_type(self) -> ElementType {
+        if self.int8_kv {
+            ElementType::I8
+        } else {
+            ElementType::F16
+        }
+    }
+
+    fn scale_state_bytes(self, tokens: u64) -> Result<u64, String> {
+        if !self.int8_kv {
+            return Ok(0);
+        }
+        if tokens == 0 || tokens > self.maximum_context_tokens {
+            return Err("INT8 KV scale token frontier is outside the admitted context".to_owned());
+        }
+        let bytes = self
+            .key_value_heads
+            .checked_mul(2)
+            .and_then(|values| values.checked_mul(ElementType::F32.size_bytes()))
+            .and_then(|bytes| bytes.checked_mul(tokens))
+            .ok_or_else(|| "INT8 KV scale state size overflows".to_owned())?;
+        align_up(bytes, VNEXT_KV_PAGE_BYTES)
+    }
+
     fn binding_slot_bytes(self) -> Result<u64, String> {
         BINDING_CONTROL_BYTES
             .checked_add(aligned_bytes(
-                self.table_entries(self.maximum_context_tokens)?,
+                self.table_entries(self.maximum_context_tokens)?
+                    .checked_add(
+                        self.scale_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES,
+                    )
+                    .ok_or_else(|| "INT8 KV address table size overflows".to_owned())?,
                 POINTER_BYTES,
             )?)
             .ok_or_else(|| "causal attention binding slot size overflows".to_owned())
@@ -1292,6 +1444,7 @@ impl CausalAttentionShape {
 
     fn cuda_shape(self) -> Result<CudaCausalAttentionShape, String> {
         Ok(CudaCausalAttentionShape {
+            int8_kv: self.int8_kv,
             hidden_size: checked_i32(self.hidden_size, "causal attention hidden size")?,
             query_heads: checked_i32(self.query_heads, "causal attention query heads")?,
             key_value_heads: checked_i32(self.key_value_heads, "causal attention key/value heads")?,
@@ -1327,6 +1480,7 @@ impl CausalAttentionShape {
 
 #[derive(Debug, Clone, Copy)]
 struct CudaCausalAttentionShape {
+    int8_kv: bool,
     hidden_size: i32,
     query_heads: i32,
     key_value_heads: i32,
@@ -1793,6 +1947,8 @@ fn packed_fallback_launch(
 struct CausalAttentionBinding {
     first_page_region: usize,
     page_count: usize,
+    payload_page_count: usize,
+    payload_element_type: ElementType,
     host_binding: usize,
     binding_offset: u64,
 }
@@ -1987,7 +2143,9 @@ fn encode_attention(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
+            shape.kv_element_type(),
         )?;
+        let scale_pages = scale_state_regions(participant, shape, source.end)?;
         let page_count = u64::try_from(pages.len())
             .map_err(|_| "causal attention page count exceeds u64".to_owned())?;
         if page_count > shape.maximum_pages()? {
@@ -2013,14 +2171,20 @@ fn encode_attention(
             sequence_tokens_i32,
             checked_i32(packed_range.start, "causal attention packed token start")?,
             &pages,
+            &scale_pages,
         )?);
-        let page_count = pages.len();
+        let payload_page_count = pages.len();
+        let page_count = payload_page_count + scale_pages.len();
         compute_fence_dependencies.extend(pages.iter().cloned());
+        compute_fence_dependencies.extend(scale_pages.iter().cloned());
         binding_regions.extend(pages);
+        binding_regions.extend(scale_pages);
         let binding_offset = binding_layout.binding_offset(participant_index)?;
         bindings.push(CausalAttentionBinding {
             first_page_region,
             page_count,
+            payload_page_count,
+            payload_element_type: shape.kv_element_type(),
             host_binding,
             binding_offset,
         });
@@ -2114,7 +2278,27 @@ fn encode_attention(
                 false,
             )
         };
+    let numerical_status = shape.int8_kv.then(|| {
+        let offsets = launches
+            .iter()
+            .map(|launch| launch.binding_offset + BINDING_NUMERICAL_STATUS_OFFSET)
+            .collect::<Vec<_>>();
+        (compute_regions[shared.binding].clone(), offsets)
+    });
     let binding_command = binding_command
+        .and_then(|command| {
+            if has_compiled_program_slot {
+                if let Some((source, offsets)) = &numerical_status {
+                    return command.with_numerical_status(
+                        source.clone(),
+                        offsets.clone(),
+                        INT8_NUMERICAL_FAILURE_MASK,
+                        true,
+                    );
+                }
+            }
+            Ok(command)
+        })
         .and_then(|command| {
             command.with_work_attribution(
                 DeviceBatchingForm::ParticipantLoop,
@@ -2151,10 +2335,14 @@ fn encode_attention(
     let compute_dispatch_count = compute_dispatch_count
         .checked_add(projection_extra)
         .ok_or_else(|| "causal compute dispatch count overflows".to_owned())?;
-    let replay_key = launches
-        .iter()
-        .all(|launch| launch.replay_topology.is_partition_stable())
-        .then(|| {
+    let replay_key = (!shape.int8_kv || has_compiled_program_slot)
+        .then_some(())
+        .filter(|_| {
+            launches
+                .iter()
+                .all(|launch| launch.replay_topology.is_partition_stable())
+        })
+        .map(|_| {
             let replay_key =
                 CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
                     .bytes(projection.replay_tag().as_bytes());
@@ -2184,6 +2372,7 @@ fn encode_attention(
                 .boolean(shape.value_rms_norm)
                 .boolean(shape.attention_k_eq_v)
                 .boolean(shape.post_attention_norm)
+                .boolean(shape.int8_kv)
                 .u64(total_tokens)
                 .boolean(packed_enabled)
                 .u64(
@@ -2277,6 +2466,19 @@ fn encode_attention(
             enqueue_compute,
         ),
     }
+    .and_then(|command| {
+        if !has_compiled_program_slot {
+            if let Some((source, offsets)) = numerical_status {
+                return command.with_numerical_status(
+                    source,
+                    offsets,
+                    INT8_NUMERICAL_FAILURE_MASK,
+                    false,
+                );
+            }
+        }
+        Ok(command)
+    })
     .and_then(|command| {
         command.with_work_attribution(
             if packed_enabled {
@@ -2431,7 +2633,9 @@ fn encode_reusable_attention_bindings(
                 source.end,
                 token_range.full_input_tokens(),
             )?,
+            shape.kv_element_type(),
         )?;
+        let scale_pages = scale_state_regions(participant, shape, source.end)?;
         let page_count = u64::try_from(pages.len())
             .map_err(|_| "causal attention page count exceeds u64".to_owned())?;
         if page_count > maximum_pages {
@@ -2449,6 +2653,7 @@ fn encode_reusable_attention_bindings(
             checked_i32(source.end, "causal attention sequence token count")?,
             checked_i32(packed_range.start, "causal attention packed token start")?,
             &pages,
+            &scale_pages,
         )?;
         writes.push(
             super::CudaProgramBindingWrite::new(
@@ -2458,8 +2663,21 @@ fn encode_reusable_attention_bindings(
             .map_err(|error| error.to_string())?,
         );
         fence_dependencies.extend(pages);
+        fence_dependencies.extend(scale_pages);
     }
 
+    let numerical_status = shape.int8_kv.then(|| {
+        (
+            destination.clone(),
+            (0..invocation.participants().len())
+                .map(|index| {
+                    binding_layout
+                        .binding_offset(index)
+                        .map(|offset| offset + BINDING_NUMERICAL_STATUS_OFFSET)
+                })
+                .collect::<Result<Vec<_>, _>>(),
+        )
+    });
     let binding_command = CudaDeviceCommand::program_binding_patch(
         "vnext_causal_paged_attention_bindings",
         program_binding,
@@ -2467,6 +2685,17 @@ fn encode_reusable_attention_bindings(
         writes,
         fence_dependencies,
     )
+    .and_then(|command| {
+        if let Some((source, offsets)) = numerical_status {
+            return command.with_numerical_status(
+                source,
+                offsets.map_err(CudaDeviceRuntimeError::contract)?,
+                INT8_NUMERICAL_FAILURE_MASK,
+                true,
+            );
+        }
+        Ok(command)
+    })
     .and_then(|command| {
         command.with_work_attribution(
             DeviceBatchingForm::ParticipantLoop,
@@ -2503,9 +2732,14 @@ fn enqueue_bindings(
         if regions
             .get(binding.first_page_region..page_region_end)
             .is_none_or(|pages| {
-                pages.iter().any(|page| {
+                pages.iter().enumerate().any(|(index, page)| {
                     page.length_bytes() != VNEXT_KV_PAGE_BYTES
-                        || page.element_type() != ElementType::F16
+                        || page.element_type()
+                            != if index < binding.payload_page_count {
+                                binding.payload_element_type
+                            } else {
+                                ElementType::F32
+                            }
                 })
             })
         {
@@ -3060,7 +3294,13 @@ fn launch_prepare(
     packed: Option<PackedFallbackLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let page_elements = checked_i32_runtime(
-        VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
+        VNEXT_KV_PAGE_BYTES
+            / if shape.int8_kv {
+                ElementType::I8
+            } else {
+                ElementType::F16
+            }
+            .size_bytes(),
         "causal page elements",
     )?;
     let query_head_stride = shape
@@ -3353,7 +3593,7 @@ fn launch_fallback_attention(
     // has no cross-request dispatch overhead to amortize. Keep that latency
     // path unchanged; group Q heads only when multiple packed participants can
     // fill the wider KV-head grid and reuse each loaded K/V tile.
-    if packed.is_some() {
+    if packed.is_some() && !shape.int8_kv {
         if let Some(block_threads) = grouped_fallback_block_threads(shape) {
             return launch_grouped_fallback_attention(
                 stream,
@@ -3373,7 +3613,13 @@ fn launch_fallback_attention(
     }
 
     let page_elements = checked_i32_runtime(
-        VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
+        VNEXT_KV_PAGE_BYTES
+            / if shape.int8_kv {
+                ElementType::I8
+            } else {
+                ElementType::F16
+            }
+            .size_bytes(),
         "causal page elements",
     )?;
     let mut builder = stream.launch_builder(&functions.attention);
@@ -3583,6 +3829,7 @@ fn paged_state_regions(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     state: &ResolvedValueBinding,
     expected_physical_bytes: u64,
+    element_type: ElementType,
 ) -> Result<Vec<CudaBufferRegion>, String> {
     let [component] = state.storage().components() else {
         return Err("causal attention state requires one logical storage component".to_owned());
@@ -3593,8 +3840,8 @@ fn paged_state_regions(
         .find(|view| view.resource_id() == component.resource_id())
         .ok_or_else(|| "causal attention state has no resource view".to_owned())?;
     if component.offset_bytes() != 0
-        || component.element_type() != ElementType::F16
-        || view.descriptor().element_type != ElementType::F16
+        || component.element_type() != element_type
+        || view.descriptor().element_type != element_type
         || view.storage_kind() != OperationBufferStorageKind::DynamicPaged
         || view.descriptor().size_bytes != expected_physical_bytes
         || expected_physical_bytes == 0
@@ -3629,8 +3876,7 @@ fn paged_state_regions(
             let page = buffer
                 .retained_region(start..end, retention.clone())
                 .map_err(|error| error.to_string())?;
-            if page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != ElementType::F16
-            {
+            if page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != element_type {
                 return Err("causal attention physical page differs from its contract".to_owned());
             }
             pages.push(page);
@@ -3646,6 +3892,22 @@ fn paged_state_regions(
     Ok(pages)
 }
 
+fn scale_state_regions(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    shape: CausalAttentionShape,
+    tokens: u64,
+) -> Result<Vec<CudaBufferRegion>, String> {
+    if !shape.int8_kv {
+        return Ok(Vec::new());
+    }
+    paged_state_regions(
+        participant,
+        binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
+        shape.scale_state_bytes(tokens)?,
+        ElementType::F32,
+    )
+}
+
 fn binding_payload(
     layout: CausalKvLayout,
     table_entries: i32,
@@ -3654,12 +3916,14 @@ fn binding_payload(
     sequence_tokens: i32,
     packed_token_start: i32,
     pages: &[CudaBufferRegion],
+    scale_pages: &[CudaBufferRegion],
 ) -> Result<Box<[u8]>, String> {
     let page_addresses = pages
         .iter()
         .map(CudaBufferRegion::device_ptr)
         .collect::<Vec<_>>();
-    let addresses = binding_addresses(layout, table_entries, &page_addresses)?;
+    let mut addresses = binding_addresses(layout, table_entries, &page_addresses)?;
+    addresses.extend(scale_pages.iter().map(CudaBufferRegion::device_ptr));
     let mut payload = Vec::with_capacity(
         BINDING_CONTROL_BYTES as usize + addresses.len() * std::mem::size_of::<u64>(),
     );
@@ -3758,7 +4022,6 @@ fn validate_signature(
         (value(5)?, vec![shape.hidden_size, shape.query_features]),
         (value(6)?, vec![shape.head_dim]),
         (value(7)?, vec![shape.head_dim]),
-        (value(8)?, vec![2, shape.key_value_heads, shape.head_dim]),
     ];
     if semantics.has_post_attention_norm() {
         expected.push((value(9)?, vec![shape.hidden_size]));
@@ -3779,6 +4042,19 @@ fn validate_signature(
         || expected.iter().any(|(binding, dimensions)| {
             binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
         })
+        || value(8)?.tensor().dimensions() != [2, shape.key_value_heads, shape.head_dim]
+        || value(8)?.tensor().element_type() != shape.kv_element_type()
+        || !matches!(
+            value(8)?.tensor().layout(),
+            ResolvedTensorLayout::Contiguous
+        )
+        || (shape.int8_kv
+            && (value(9)?.tensor().dimensions() != [2, shape.key_value_heads]
+                || value(9)?.tensor().element_type() != ElementType::F32
+                || !matches!(
+                    value(9)?.tensor().layout(),
+                    ResolvedTensorLayout::Contiguous
+                )))
     {
         return Err("causal attention signature differs from its resolved shape".to_owned());
     }
@@ -4340,6 +4616,7 @@ mod tests {
         let query_features = query_heads * head_dim;
         let kv_features = key_value_heads * head_dim;
         CausalAttentionShape {
+            int8_kv: false,
             hidden_size: query_features,
             query_heads,
             key_value_heads,

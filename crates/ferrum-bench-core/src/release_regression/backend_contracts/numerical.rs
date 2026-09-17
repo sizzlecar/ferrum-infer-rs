@@ -86,6 +86,25 @@ fn names(backend: Backend) -> Vec<String> {
                 "grouped_decode_head256_with_gate_matches_direct_and_cpu_across_page_boundary_on_real_metal",
                 "gqa_tiled_prefill_head256_with_gate_matches_general_and_cpu_across_prefix_page_and_tail_on_real_metal",
             ]),
+            ("causal_attention::conformance_tests::int8", &[
+                "int8_prepare_matches_reference_rounding_zero_and_subnormal_scales",
+                "int8_prepare_crosses_payload_and_independent_scale_page_frontiers",
+                "int8_attention_matches_cpu_for_gqa_mqa_and_complete_prefix_restore",
+                "int8_prepare_marks_nonfinite_input_in_device_status",
+                "int8_tiled_prefill_and_direct_decode_match_reference_across_payload_page_and_tail",
+                "int8_tiled_dispatch_accounts_for_bounded_dequantization_memory",
+                "int8_general_attention_accepts_a_partial_simd_head",
+                "int8_optimized_attention_reads_across_an_independent_scale_page",
+                "int8_gqa_prefill_reuses_kv_across_heads_and_matches_tiled_f16_and_cpu",
+                "int8_gqa_prefill_reads_across_an_independent_scale_page",
+            ]),
+            ("causal_attention::conformance_tests::int8::packed", &[
+                "packed_partial_head_f16_preserves_contiguous_rows_and_independent_histories",
+                "packed_partial_head_int8_preserves_contiguous_rows_and_independent_histories",
+            ]),
+            ("causal_attention::shape_tests", &[
+                "int8_state_geometry_counts_independent_pages_and_omits_unused_split_decode_scratch",
+            ]),
         ],
         Backend::Cuda => &[
             ("native_blocks::tests", &[
@@ -135,6 +154,12 @@ fn names(backend: Backend) -> Vec<String> {
             ("transformer::causal_attention::rotary_tests", &[
                 "standard_partial_rope_rotates_only_its_prefix_on_cuda",
                 "proportional_partial_rope_retains_padded_head_pairs_on_cuda",
+            ]),
+            ("transformer::causal_attention::int8_tests", &[
+                "int8_kv_geometry_counts_independent_scales_and_rejects_native",
+                "int8_kv_prepare_and_attention_cross_independent_pages_on_cuda",
+                "int8_kv_nonfinite_write_sets_step_status_without_a_device_trap",
+                "int8_kv_packed_mha_gqa_mqa_preserve_independent_absolute_positions_on_cuda",
             ]),
         ],
     };

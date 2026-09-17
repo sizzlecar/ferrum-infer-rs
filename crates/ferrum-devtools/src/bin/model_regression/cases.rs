@@ -2,6 +2,8 @@
 mod auto_tools_json;
 #[path = "boundaries.rs"]
 mod boundaries;
+#[path = "long_context.rs"]
+mod long_context;
 #[path = "observability.rs"]
 mod observability;
 #[path = "state.rs"]
@@ -10,6 +12,7 @@ mod state;
 mod stop;
 pub(super) use auto_tools_json::auto_tools_json;
 pub(super) use boundaries::{run_length, run_reasoning, serve_length, serve_reasoning};
+pub(super) use long_context::{run_long_context, serve_long_context};
 pub(super) use observability::{run_observability, serve_observability};
 pub(super) use state::{run_state, serve_state};
 pub(super) use stop::{run_stop, serve_stop};

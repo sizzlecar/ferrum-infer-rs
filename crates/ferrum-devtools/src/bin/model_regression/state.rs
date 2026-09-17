@@ -58,6 +58,7 @@ async fn exchange(
 }
 
 pub(crate) async fn serve_state(server: &Server<'_>) -> Result<Value> {
+    let health_before = server.health_snapshot("state.before-health").await?;
     let mut evidence = ServeStateEvidence {
         writes: Vec::new(),
         recall_rounds: Vec::new(),
@@ -114,7 +115,14 @@ pub(crate) async fn serve_state(server: &Server<'_>) -> Result<Value> {
             .map_err(anyhow::Error::msg)
     }
     .await;
-    let evidence = json!({"enable_thinking": false, "state": evidence});
+    let health_after = server.health_snapshot("state.after-health").await;
+    let mut evidence = json!({"enable_thinking": false, "state": evidence,
+        "health_before": health_before});
+    match &health_after {
+        Ok(health) => evidence["health_after"] = health.clone(),
+        Err(error) => evidence["health_after_error"] = json!(format!("{error:#}")),
+    }
     result.map_err(|error| super::super::case_failure(evidence.clone(), error))?;
+    health_after.map_err(|error| super::super::case_failure(evidence.clone(), error))?;
     Ok(evidence)
 }

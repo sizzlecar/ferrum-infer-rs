@@ -364,6 +364,25 @@ mod tests {
     }
 
     #[test]
+    fn int8_kv_rejects_unimplemented_sink_window_yarn_attention() {
+        use ferrum_interfaces::vnext::{KvStorageFormat, NumericalExecutionPolicy};
+        let profiles = program::numerical_profiles(
+            &ModelFamilyId::new(FAMILY_ID).unwrap(),
+            &tiny_config().semantic,
+        )
+        .unwrap();
+        assert!(profiles
+            .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
+            .is_ok());
+        assert!(profiles
+            .candidates(
+                &NumericalExecutionPolicy::Auto,
+                KvStorageFormat::Int8PerTokenHeadF32ScaleV1
+            )
+            .is_err());
+    }
+
+    #[test]
     fn production_family_is_canonical_and_selects_harmony() {
         let config = tiny_config();
         let descriptor = production_descriptor(&config).unwrap();

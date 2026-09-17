@@ -70,6 +70,35 @@ impl ModelChatTemplate {
         }
     }
 
+    /// Observe an actual template switch. Reasoning output alone does not prove
+    /// that `enable_thinking` can disable it (an always-open template cannot).
+    pub fn supports_thinking_control(&self) -> bool {
+        let Some((opening, closing)) = model_reasoning_markers(self.output_protocol) else {
+            return false;
+        };
+        let (Some(enabled), Some(disabled)) = (
+            render_reasoning_probe(self, Some(true)),
+            render_reasoning_probe(self, Some(false)),
+        ) else {
+            return false;
+        };
+        let prompt_opened =
+            |prompt: &str| has_unclosed_model_reasoning_block(self.output_protocol, prompt);
+        if prompt_opened(&disabled) {
+            return false;
+        }
+        if prompt_opened(&enabled) {
+            return true;
+        }
+        let completed_blocks = |prompt: &str| {
+            prompt
+                .matches(opening)
+                .count()
+                .min(prompt.matches(closing).count())
+        };
+        completed_blocks(&disabled) > completed_blocks(&enabled)
+    }
+
     /// Bind the resolved model capability after loading its unchanged template
     /// bytes, then probe reasoning with that protocol's actual delimiters.
     pub fn set_output_protocol(&mut self, protocol: ModelOutputProtocol) {
@@ -800,46 +829,17 @@ fn detect_model_reasoning_protocol(
     let Some((opening, closing)) = model_reasoning_markers(model_template.output_protocol) else {
         return (ModelReasoningProtocol::None, false);
     };
-    let messages = [PromptMessage {
-        role: "user".to_string(),
-        content: "reasoning protocol probe".to_string(),
-        reasoning_content: None,
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        function_call: None,
-    }];
-    let now =
-        chrono::NaiveDate::from_ymd_opt(2000, 1, 1).and_then(|date| date.and_hms_opt(0, 0, 0));
-    let render = |enable_thinking| {
-        render_model_template(
-            &messages,
-            &[],
-            model_template,
-            &ChatTemplateOptions {
-                enable_thinking,
-                reasoning_effort: None,
-                now_override: now,
-            },
-            true,
-            None,
-            None,
-            None,
-            None,
-        )
-        .ok()
-    };
-    let Some(enabled) = render(Some(true)) else {
+    let Some(enabled) = render_reasoning_probe(model_template, Some(true)) else {
         return (ModelReasoningProtocol::Unknown, false);
     };
-    let default = render(None);
+    let default = render_reasoning_probe(model_template, None);
     let prompt_opened =
         |prompt: &str| has_unclosed_model_reasoning_block(model_template.output_protocol, prompt);
     if prompt_opened(&enabled) {
         let default_enabled = default.as_deref().is_some_and(prompt_opened);
         return (ModelReasoningProtocol::PromptOpened, default_enabled);
     }
-    let Some(disabled) = render(Some(false)) else {
+    let Some(disabled) = render_reasoning_probe(model_template, Some(false)) else {
         return (ModelReasoningProtocol::Unknown, false);
     };
     let completed_blocks = |prompt: &str| {
@@ -855,6 +855,39 @@ fn detect_model_reasoning_protocol(
         );
     }
     (ModelReasoningProtocol::None, false)
+}
+
+fn render_reasoning_probe(
+    model_template: &ModelChatTemplate,
+    enable_thinking: Option<bool>,
+) -> Option<String> {
+    let messages = [PromptMessage {
+        role: "user".to_string(),
+        content: "reasoning protocol probe".to_string(),
+        reasoning_content: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        function_call: None,
+    }];
+    let now =
+        chrono::NaiveDate::from_ymd_opt(2000, 1, 1).and_then(|date| date.and_hms_opt(0, 0, 0));
+    render_model_template(
+        &messages,
+        &[],
+        model_template,
+        &ChatTemplateOptions {
+            enable_thinking,
+            reasoning_effort: None,
+            now_override: now,
+        },
+        true,
+        None,
+        None,
+        None,
+        None,
+    )
+    .ok()
 }
 
 /// `tojson` matching Python's `json.dumps(..., ensure_ascii=False)` as used

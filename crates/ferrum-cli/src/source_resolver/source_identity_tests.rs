@@ -85,6 +85,7 @@ fn legacy_source_identity_binds_actual_roles_and_retained_template() {
             let defined = define_registered_product_model(
                 Some(&fixture.sources),
                 &ferrum_types::NumericalExecutionPolicy::default(),
+                ferrum_types::KvCacheDtype::Fp16,
             )
             .unwrap();
             assert!(defined.is_none(), "fixture must exercise the legacy path");

@@ -1264,6 +1264,7 @@ pub struct ProductEngineInput {
 pub fn define_registered_product_model(
     sources: Option<&Arc<ProductionModelSourceBundle>>,
     policy: &ferrum_types::NumericalExecutionPolicy,
+    kv_dtype: ferrum_types::KvCacheDtype,
 ) -> Result<Option<Arc<ferrum_models::vnext::DefinedProductionModel>>> {
     if let Some(sources) = sources {
         if let ferrum_models::vnext::ProductionModelRegistration::Registered(registration) =
@@ -1273,7 +1274,11 @@ pub fn define_registered_product_model(
             defined
                 .definition()
                 .numerical_profiles()
-                .candidates(policy)
+                .candidates(
+                    policy,
+                    ferrum_types::KvStorageFormat::try_from(kv_dtype)
+                        .map_err(FerrumError::config)?,
+                )
                 .map_err(|error| FerrumError::config(error.to_string()))?;
             return Ok(Some(Arc::new(defined)));
         }

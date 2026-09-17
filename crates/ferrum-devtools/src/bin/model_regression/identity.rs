@@ -106,6 +106,7 @@ pub(super) fn validate_serve(args: &Args, health: &Value) -> Result<()> {
     if let Some(capacity) = args.runtime_capacity() {
         capacity.verify_health(health).map_err(anyhow::Error::msg)?;
     }
+    super::capacity::validate_runtime_policy(args, health)?;
     Ok(())
 }
 

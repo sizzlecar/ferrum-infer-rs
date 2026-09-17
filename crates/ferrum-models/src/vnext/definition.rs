@@ -7,7 +7,7 @@ use ferrum_interfaces::vnext::{
     ModelFamilyDefinition, ModelFamilyRegistration, NumericalExecutionPolicy, NumericalProfileId,
     StateCapacityDemand, StateLifetime, WeightComponentSource,
 };
-use ferrum_types::{FerrumError, ModelCapabilities, Result};
+use ferrum_types::{FerrumError, KvStorageFormat, ModelCapabilities, Result};
 
 use super::{
     element_type_label, CausalLanguageModelDescriptor, PreparedProductionModel,
@@ -101,11 +101,12 @@ impl DefinedProductionModel {
     pub fn model_capabilities(
         &self,
         policy: &NumericalExecutionPolicy,
+        kv_storage: KvStorageFormat,
     ) -> Result<ModelCapabilities> {
         let candidates = self
             .definition
             .numerical_profiles()
-            .candidates(policy)
+            .candidates(policy, kv_storage)
             .map_err(|error| FerrumError::model(error.to_string()))?;
         let mut recurrent_bytes = 0_u64;
         let mut supported_dtypes = BTreeSet::new();

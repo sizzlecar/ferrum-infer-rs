@@ -1027,6 +1027,7 @@ fn blocker_kind_name(kind: CapacityShortfallKind) -> &'static str {
         CapacityShortfallKind::BackingGrowthRequired => "backing_growth_required",
         CapacityShortfallKind::ActiveSequenceCeiling => "active_sequence_ceiling",
         CapacityShortfallKind::PermanentDomainMaximum => "permanent_domain_maximum",
+        CapacityShortfallKind::PermanentPlanBudget => "permanent_plan_budget",
     }
 }
 

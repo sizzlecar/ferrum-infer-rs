@@ -1,10 +1,14 @@
 //! Exercise a staged Ferrum binary with a real model, independently of this
 //! runner's accelerator features. Run with --help for explicit test inputs.
 
+#[path = "model_regression/capacity.rs"]
+mod capacity;
 #[path = "model_regression/cases.rs"]
 mod cases;
 #[path = "model_regression/identity.rs"]
 mod identity;
+#[path = "model_regression/kv.rs"]
+mod kv;
 #[path = "model_regression/process.rs"]
 mod process;
 #[path = "model_regression/protocol.rs"]
@@ -36,12 +40,28 @@ struct Args {
     /// Exact GGUF artifact; --model must name an immutable HF repository revision.
     #[arg(long)]
     gguf_file: Option<String>,
+    /// Explicit local model metadata, independently of the weight container.
+    #[arg(long, conflicts_with = "expected_task")]
+    semantic_source: Option<PathBuf>,
+    /// Explicit local tokenizer metadata; otherwise retain product resolution.
+    #[arg(long, conflicts_with = "expected_task")]
+    tokenizer_source: Option<PathBuf>,
     /// Retained from the prepared task once, then applied to every child process.
     #[arg(skip)]
     #[serde(skip)]
     source_expectation: Option<ferrum_bench_core::release_regression::GgufSourceProfile>,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
+    /// Explicit vNext causal KV storage, verified against the executing model plan.
+    /// Prepared release tasks do not yet declare this independent selection.
+    #[arg(long, value_enum, conflicts_with = "expected_task")]
+    kv_dtype: Option<kv::KvDtype>,
+    /// Add a deterministic fact-retrieval probe with this many numbered records.
+    #[arg(long, requires_all = ["context_tokens", "long_context_min_prompt_tokens"], conflicts_with = "expected_task", value_parser = clap::value_parser!(u32).range(1..))]
+    long_context_records: Option<u32>,
+    /// Reject a long probe whose actual tokenizer usage falls below this bound.
+    #[arg(long, requires = "long_context_records", value_parser = clap::value_parser!(u32).range(1..))]
+    long_context_min_prompt_tokens: Option<u32>,
     /// Link this execution to a prepared model task. Its configuration is checked before loading.
     #[arg(long)]
     expected_task: Option<PathBuf>,
@@ -75,6 +95,12 @@ struct Args {
     /// Public runtime memory budget for both entrypoints; requires explicit capacity.
     #[arg(long, requires_all = ["context_tokens", "max_num_seqs"], value_parser = clap::value_parser!(u64).range(1..))]
     runtime_memory_budget_bytes: Option<u64>,
+    /// Forward the typed product admission fit gate; prepared tasks keep their declared policy.
+    #[arg(long, value_enum, conflicts_with = "expected_task")]
+    sequence_fit_policy: Option<capacity::SequenceFitPolicy>,
+    /// Limit each scheduled batch through the existing run/serve product option.
+    #[arg(long, conflicts_with = "expected_task", value_parser = clap::value_parser!(u32).range(1..))]
+    max_num_batched_tokens: Option<u32>,
     /// Per-generation test output budget; does not change context or concurrency.
     #[arg(long, default_value = "512", value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
@@ -118,11 +144,28 @@ impl Args {
                 args.extend(["--tokenizer-source".into(), tokenizer.clone()]);
             }
         }
+        for (flag, source) in [
+            ("--semantic-source", &self.semantic_source),
+            ("--tokenizer-source", &self.tokenizer_source),
+        ] {
+            if let Some(source) = source {
+                args.extend([flag.into(), source.to_string_lossy().into_owned()]);
+            }
+        }
         if !self.use_default_backend {
             args.extend(["--backend".into(), self.backend.clone()]);
         }
         if self.disable_thinking {
             args.push("--disable-thinking".into());
+        }
+        if let Some(dtype) = self.kv_dtype {
+            args.extend(["--kv-dtype".into(), dtype.cli_name().into()]);
+        }
+        if let Some(policy) = self.sequence_fit_policy {
+            args.extend(["--sequence-fit-policy".into(), policy.cli_name().into()]);
+        }
+        if let Some(tokens) = self.max_num_batched_tokens {
+            args.extend(["--max-num-batched-tokens".into(), tokens.to_string()]);
         }
         if let Some(capacity) = self.runtime_capacity() {
             if entrypoint == "run" {
@@ -147,6 +190,10 @@ impl Args {
 #[cfg(test)]
 #[path = "model_regression/capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(all(test, unix))]
+#[path = "model_regression/source_tests.rs"]
+mod source_tests;
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     fs::write(path.as_ref(), serde_json::to_vec_pretty(value)?)
@@ -281,6 +328,12 @@ async fn main() -> Result<()> {
         capacity
             .validate(args.max_tokens)
             .map_err(anyhow::Error::msg)?;
+        if let Some(minimum) = args.long_context_min_prompt_tokens {
+            ensure!(
+                minimum < capacity.context_tokens.saturating_sub(args.max_tokens),
+                "long-context minimum plus output budget must fit the selected context"
+            );
+        }
     }
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
     if let Some(filename) = &args.gguf_file {
@@ -307,15 +360,30 @@ async fn main() -> Result<()> {
     );
     args.ferrum_bin = fs::canonicalize(&args.ferrum_bin).context("resolve staged binary")?;
     if Path::new(&args.model).exists() {
-        args.model = fs::canonicalize(&args.model)?
+        args.model =
+            ferrum_bench_core::release_regression::model_sources::normalize_local_model_path(
+                Path::new(&args.model),
+            )?
             .to_str()
             .context("model path is not UTF-8")?
             .to_owned();
     }
+    // Child processes run from their report directory. Resolve caller-relative
+    // metadata paths once, before spawning either product entrypoint.
+    for (flag, source) in [
+        ("--semantic-source", &mut args.semantic_source),
+        ("--tokenizer-source", &mut args.tokenizer_source),
+    ] {
+        if let Some(source) = source {
+            ensure!(!source.as_os_str().is_empty(), "{flag} must not be empty");
+            *source = fs::canonicalize(&*source).with_context(|| format!("resolve {flag}"))?;
+            ensure!(source.to_str().is_some(), "{flag} path is not UTF-8");
+        }
+    }
     if let Some(expected) = &expected {
         if Path::new(&expected.profile.model).exists() {
             ensure!(args.model == expected.profile.model,
-                "bound local model tasks must declare the canonical absolute model path; prepare the task with {}", args.model);
+                "bound local model tasks must declare the resolved absolute model path with its selected filename; prepare the task with {}", args.model);
         }
         verify_model_options(expected, &serde_json::to_value(&args)?)
             .map_err(|issues| anyhow::anyhow!("model task configuration: {}", issues.join("; ")))?;
@@ -401,6 +469,14 @@ async fn main() -> Result<()> {
         )
         .await?;
     }
+    if args.long_context_records.is_some() {
+        record(
+            &mut report,
+            "run-long-context",
+            cases::run_long_context(&args),
+        )
+        .await?;
+    }
     let started = Instant::now();
     match process::Server::start(&args).await {
         Ok(server) => {
@@ -452,6 +528,22 @@ async fn main() -> Result<()> {
                         .await?
                     }
                 }
+            }
+            if args.long_context_records.is_some() {
+                record(
+                    &mut report,
+                    "serve-long-context",
+                    cases::serve_long_context(&server),
+                )
+                .await?;
+            }
+            if args.kv_dtype.is_some() {
+                record(&mut report, "serve-kv-final", async {
+                    let health = server.health_snapshot("serve.final-health").await?;
+                    kv::validate_completed_health(&health)?;
+                    Ok(health)
+                })
+                .await?;
             }
         }
         Err(error) => {

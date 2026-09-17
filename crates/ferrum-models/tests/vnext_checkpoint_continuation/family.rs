@@ -1,7 +1,7 @@
 use super::*;
 
 pub const HIDDEN: u64 = 256;
-pub const MAX_TOKENS: u64 = 80;
+pub const MAX_TOKENS: u64 = 160;
 const VOCAB: u64 = 32;
 const FORMAT: &str = "weight-format.gguf.native-block";
 const PROFILE: &str = "fixture.attention.f32-master";
@@ -10,6 +10,7 @@ const PROFILE: &str = "fixture.attention.f32-master";
 #[serde(tag = "kind")]
 pub enum AttentionKind {
     Causal,
+    CausalInt8,
     GatedDelta,
 }
 
@@ -23,15 +24,24 @@ impl Family {
         Self {
             id: id(match kind {
                 AttentionKind::Causal => "family.fixture.causal-checkpoint",
+                AttentionKind::CausalInt8 => "family.fixture.causal-int8-checkpoint",
                 AttentionKind::GatedDelta => "family.fixture.gdn-checkpoint",
             }),
             kind,
         }
     }
 
+    pub fn profile_id(&self) -> &'static str {
+        match self.kind {
+            AttentionKind::CausalInt8 => "fixture.attention.f32-master.int8-kv",
+            _ => PROFILE,
+        }
+    }
+
     pub fn operation(&self) -> &'static str {
         match self.kind {
             AttentionKind::Causal => CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            AttentionKind::CausalInt8 => CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
             AttentionKind::GatedDelta => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
         }
     }
@@ -39,6 +49,10 @@ impl Family {
     pub fn states(&self) -> Vec<StateSpec> {
         let specs = match self.kind {
             AttentionKind::Causal => vec![("kv", vec![2, 2, 128], ElementType::F16, true)],
+            AttentionKind::CausalInt8 => vec![
+                ("kv_quant", vec![2, 2, 128], ElementType::I8, true),
+                ("kv_scale", vec![2, 2], ElementType::F32, true),
+            ],
             AttentionKind::GatedDelta => vec![
                 ("conv", vec![512, 3], ElementType::F16, false),
                 ("delta", vec![4, 64, 64], ElementType::F32, false),
@@ -87,7 +101,7 @@ impl Family {
             Weight::dense("input_norm", vec![HIDDEN], ElementType::F16),
         ];
         weights.extend(match self.kind {
-            AttentionKind::Causal => vec![
+            AttentionKind::Causal | AttentionKind::CausalInt8 => vec![
                 Weight::quantized("q", vec![1024, HIDDEN]),
                 Weight::quantized("k", vec![256, HIDDEN]),
                 Weight::quantized("v", vec![256, HIDDEN]),
@@ -109,7 +123,7 @@ impl Family {
 
     fn attributes(&self) -> BTreeMap<AttributeId, SemanticValue> {
         let values = match self.kind {
-            AttentionKind::Causal => vec![
+            AttentionKind::Causal | AttentionKind::CausalInt8 => vec![
                 ("query_heads", 4),
                 ("key_value_heads", 2),
                 ("head_dim", 128),
@@ -145,7 +159,7 @@ impl Family {
             SemanticValue::Rational(CanonicalRational::new(1, 1_000_000).unwrap()),
         );
         match self.kind {
-            AttentionKind::Causal => {
+            AttentionKind::Causal | AttentionKind::CausalInt8 => {
                 attributes.insert(
                     id("rope_theta"),
                     SemanticValue::Rational(CanonicalRational::new(10_000_000, 1).unwrap()),
@@ -228,7 +242,17 @@ impl ModelFamilyProvider for Family {
             &self.id,
             ContractVersion::new(1, 0),
             vec![NumericalExecutionProfile {
-                id: id(PROFILE),
+                kv_storage: match self.kind {
+                    AttentionKind::Causal => vec![KvStateStorage::F16 {
+                        state: id("state.kv"),
+                    }],
+                    AttentionKind::CausalInt8 => vec![KvStateStorage::Int8PerTokenHeadF32ScaleV1 {
+                        payload_state: id("state.kv_quant"),
+                        scale_state: id("state.kv_scale"),
+                    }],
+                    AttentionKind::GatedDelta => Vec::new(),
+                },
+                id: id(self.profile_id()),
                 family_id: self.id.clone(),
                 version: ContractVersion::new(1, 0),
                 primary_activation: id("value.embedding"),
@@ -252,7 +276,7 @@ impl ModelFamilyProvider for Family {
                     },
                 ],
             }],
-            vec![id(PROFILE)],
+            vec![id(self.profile_id())],
         )
     }
     fn semantic_program(
@@ -416,6 +440,16 @@ impl Weight {
 
 pub struct Weights(pub BTreeMap<WeightId, Vec<u8>>);
 impl Weights {
+    pub fn set_nonfinite_embedding(&mut self, token: u32) {
+        assert!(u64::from(token) < VOCAB);
+        let bytes = self
+            .0
+            .get_mut(&id::<WeightId>("component.embedding"))
+            .unwrap();
+        let offset = token as usize * HIDDEN as usize * 2;
+        bytes[offset..offset + 2].copy_from_slice(&f16::NAN.to_le_bytes());
+    }
+
     pub fn new(schema: &WeightSchema) -> Self {
         let values = schema
             .components

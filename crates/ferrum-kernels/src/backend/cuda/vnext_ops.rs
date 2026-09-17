@@ -13,13 +13,15 @@ use ferrum_interfaces::vnext::{
     last_token_masked_argmax_f32_contract, logit_softcap_contract, residual_add_contract,
     residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
-    DeviceBatchingForm, DeviceId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EncodedDeviceOperation, EngineProviderDescriptor, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    OperationRuntimeRegistry, PreparedModelFamily, ProfilePhase, ProviderId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    ContractVersion, DeviceBatchingForm, DeviceId, DeviceReusableExecutionTopologyFingerprint,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EncodedDeviceOperation, EngineProviderDescriptor,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, OperationRuntimeRegistry, PreparedModelFamily, ProfilePhase,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderId,
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
@@ -61,9 +63,12 @@ mod native_io;
 mod selection;
 mod transformer;
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_f32_master_contract,
-    gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_f32_contract,
-    token_embedding_f32_master_contract, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
+    causal_paged_attention_int8_kv_contract, gated_delta_recurrent_attention_f32_master_contract,
+    last_token_dense_linear_f32_contract, token_embedding_f32_master_contract,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
@@ -210,6 +215,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
         HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
@@ -363,10 +370,9 @@ mod block_fp8_exact_materializer_tests {
     }
 }
 
-/// Build the exact composition root used for both planning and dispatch.
-pub fn cuda_vnext_operation_registry(
-    runtime: &CudaDeviceRuntime,
-) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
+fn cuda_operation_contracts(
+    attention_policy: AttentionExecutionPolicy,
+) -> Result<Vec<Box<dyn OperationContract>>, CudaDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(token_embedding_f32_master_contract().map_err(contract_error)?),
@@ -391,6 +397,20 @@ pub fn cuda_vnext_operation_registry(
         Box::new(hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
+    // A catalog requires a real provider for every operation contract. Native
+    // F16 compositions must not advertise the portable-only INT8 operations.
+    let contracts = if attention_policy == AttentionExecutionPolicy::Portable {
+        let mut contracts = contracts;
+        contracts.push(Box::new(
+            causal_paged_attention_int8_kv_contract().map_err(contract_error)?,
+        ));
+        contracts.push(Box::new(
+            causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?,
+        ));
+        contracts
+    } else {
+        contracts
+    };
     #[cfg(feature = "vllm-moe-marlin")]
     let contracts = {
         let mut contracts = contracts;
@@ -405,6 +425,14 @@ pub fn cuda_vnext_operation_registry(
         ));
         contracts
     };
+    Ok(contracts)
+}
+
+/// Build the exact composition root used for both planning and dispatch.
+pub fn cuda_vnext_operation_registry(
+    runtime: &CudaDeviceRuntime,
+) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
+    let contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaTokenEmbeddingProvider::new_f32(runtime)?),
@@ -446,6 +474,27 @@ pub fn cuda_vnext_operation_registry(
             runtime,
         )?),
     ];
+    // A native-adaptive runtime has no INT8 native ABI. Composition selects a
+    // portable runtime for an automatic INT8 request; explicit native requests
+    // therefore cannot find an INT8 provider in this registry.
+    let providers = if runtime.attention_execution_policy() == AttentionExecutionPolicy::Portable {
+        let mut providers = providers;
+        providers.push(Box::new(
+            transformer::CudaCausalPagedAttentionProvider::new_int8_kv(
+                runtime,
+                AttentionExecutionPolicy::Portable,
+            )?,
+        ));
+        providers.push(Box::new(
+            transformer::CudaCausalPagedAttentionProvider::new_f32_master_int8_kv(
+                runtime,
+                AttentionExecutionPolicy::Portable,
+            )?,
+        ));
+        providers
+    } else {
+        providers
+    };
     #[cfg(feature = "vllm-marlin")]
     let providers = {
         let mut providers = providers;
@@ -688,8 +737,19 @@ impl CudaTokenEmbeddingProvider {
             ),
         };
         let contract = contract.map_err(contract_error)?;
+        // Lookup reads immutable weights and the exact immediate token IDs;
+        // it has no sequence state or partition-dependent accumulation. Its
+        // completed output can accompany either KV state's retained prefix.
         let descriptor =
-            native_io::descriptor(runtime, &contract, provider, capability, estimator)?;
+            native_io::descriptor(runtime, &contract, provider, capability, estimator)?
+                .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+                    ProviderCheckpointContract::new(
+                        CheckpointInputDependency::ExactTokenPrefix,
+                        CheckpointBoundaryConstraint::any_positive(),
+                        CheckpointPartitionNumerics::CapturedExecutionContinuation,
+                    )
+                    .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+                ));
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::EMBEDDING_LOOKUP.to_owned()))

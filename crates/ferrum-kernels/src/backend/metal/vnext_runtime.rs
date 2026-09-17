@@ -1407,6 +1407,15 @@ type EncodeAction = Box<
         + 'static,
 >;
 
+/// A device-written status word in a retained, budgeted shared workspace.
+/// Only a terminal fence may inspect it; providers must overwrite it before
+/// each invocation and keep its slot distinct until that fence completes.
+struct MetalCompletedU32Check {
+    region_index: usize,
+    offset_bytes: u64,
+    failure: &'static str,
+}
+
 /// Encoded Metal work. Regions and staging buffers remain owned until the
 /// exact submission fence reaches a terminal state.
 pub struct MetalDeviceCommand {
@@ -1419,6 +1428,7 @@ pub struct MetalDeviceCommand {
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
     encode: EncodeAction,
+    completed_u32_checks: Vec<MetalCompletedU32Check>,
 }
 
 impl fmt::Debug for MetalDeviceCommand {
@@ -1461,7 +1471,68 @@ impl MetalDeviceCommand {
             regions,
             staging: Vec::new(),
             encode: Box::new(move |encoder, regions, _staging| encode(encoder, regions)),
+            completed_u32_checks: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_completed_u32_zero_check(
+        mut self,
+        region_index: usize,
+        offset_bytes: u64,
+        failure: &'static str,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let region = self.regions.get(region_index).ok_or_else(|| {
+            MetalDeviceRuntimeError::contract("Metal completion check names a missing region")
+        })?;
+        checked_end(
+            offset_bytes,
+            4,
+            region.length_bytes(),
+            "Metal completion check",
+        )?;
+        let absolute = region
+            .offset_bytes()
+            .checked_add(offset_bytes)
+            .ok_or_else(|| {
+                MetalDeviceRuntimeError::contract("Metal completion check offset overflows")
+            })?;
+        if !absolute.is_multiple_of(4) || region.buffer().storage_mode() != MTLStorageMode::Shared {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal completion check requires an aligned shared status word",
+            ));
+        }
+        self.completed_u32_checks.push(MetalCompletedU32Check {
+            region_index,
+            offset_bytes,
+            failure,
+        });
+        Ok(self)
+    }
+
+    fn check_completed_status(&self) -> Result<(), MetalDeviceRuntimeError> {
+        for check in &self.completed_u32_checks {
+            let region = &self.regions[check.region_index];
+            let offset = checked_usize(
+                region.offset_bytes() + check.offset_bytes,
+                "Metal completion status offset",
+            )?;
+            // SAFETY: construction validated a shared aligned u32 entirely within
+            // this retained region. Callers run only after the command-buffer
+            // terminal status, when device writes are coherent and quiescent.
+            let status = unsafe {
+                region
+                    .buffer()
+                    .contents()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<u32>()
+                    .read()
+            };
+            if status != 0 {
+                return Err(MetalDeviceRuntimeError::contract(check.failure));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn with_work_shape(
@@ -1515,6 +1586,7 @@ impl MetalDeviceCommand {
             regions,
             staging,
             encode,
+            completed_u32_checks: Vec::new(),
         }
     }
 
@@ -1694,6 +1766,7 @@ pub struct MetalDeviceFence {
     stream_state: Arc<MetalStreamState>,
     pending: Arc<MetalPendingSubmissions>,
     terminal_accounted: AtomicBool,
+    completed_status: OnceLock<Result<(), MetalDeviceRuntimeError>>,
     commands: Vec<MetalDeviceCommand>,
     attribution: Option<DeviceSubmissionAttribution>,
 }
@@ -1709,6 +1782,27 @@ impl fmt::Debug for MetalDeviceFence {
 }
 
 impl MetalDeviceFence {
+    fn completed_terminal(&self) -> DeviceTerminalReceipt<MetalDeviceRuntimeError> {
+        // The core may reuse a quiescent binding slot while callers still keep
+        // this fence for diagnostics. A terminal receipt must never change when
+        // a later invocation resets/writes the same slot.
+        let result = self.completed_status.get_or_init(|| {
+            self.commands
+                .iter()
+                .try_for_each(MetalDeviceCommand::check_completed_status)
+        });
+        self.mark_terminal();
+        match result {
+            Ok(()) => self.terminal_receipt(DeviceTerminal::Succeeded),
+            Err(error) => {
+                // Invalid values fail this inference wave, not the Metal queue.
+                // Completion invalidates its target states; subsequent requests
+                // can use the healthy stream after resetting their own flags.
+                self.terminal_receipt(DeviceTerminal::FailedButQuiescent(error.clone()))
+            }
+        }
+    }
+
     fn mark_terminal(&self) {
         if !self.terminal_accounted.swap(true, Ordering::AcqRel) {
             self.pending.remove(self.submission_id);
@@ -2160,6 +2254,7 @@ impl MetalDeviceRuntime {
             stream_state: Arc::clone(&stream.state),
             pending: Arc::clone(&stream.pending),
             terminal_accounted: AtomicBool::new(false),
+            completed_status: OnceLock::new(),
             commands,
             attribution,
         };
@@ -2459,10 +2554,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
             | MTLCommandBufferStatus::Enqueued
             | MTLCommandBufferStatus::Committed
             | MTLCommandBufferStatus::Scheduled => FenceQuery::Pending,
-            MTLCommandBufferStatus::Completed => {
-                fence.mark_terminal();
-                FenceQuery::Terminal(fence.terminal_receipt(DeviceTerminal::Succeeded))
-            }
+            MTLCommandBufferStatus::Completed => FenceQuery::Terminal(fence.completed_terminal()),
             MTLCommandBufferStatus::Error => {
                 FenceQuery::Terminal(fence.failed_terminal("command buffer execution"))
             }
@@ -2475,10 +2567,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
     ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         fence.command_buffer.wait_until_completed();
         match fence.command_buffer.status() {
-            MTLCommandBufferStatus::Completed => {
-                fence.mark_terminal();
-                Ok(fence.terminal_receipt(DeviceTerminal::Succeeded))
-            }
+            MTLCommandBufferStatus::Completed => Ok(fence.completed_terminal()),
             MTLCommandBufferStatus::Error => Ok(fence.failed_terminal("command buffer execution")),
             status => {
                 fence.stream_state.fail();
@@ -3018,6 +3107,126 @@ mod tests {
             drop(owner);
             assert_eq!(region_bytes(&region), expected);
         }
+    }
+
+    #[test]
+    fn completed_device_status_is_checked_after_fence_and_fails_quiescently() {
+        let runtime = runtime();
+        let status = runtime
+            .allocate_request(&buffer_request("resource/completion-status"))
+            .unwrap();
+        let command = MetalDeviceCommand::operation(
+            "test_device_status",
+            vec![status.region(0..8).unwrap()],
+            |encoder, regions| {
+                encoder.with_blit(|blit| {
+                    blit.fill_buffer(
+                        regions[0].buffer(),
+                        NSRange::new(regions[0].offset_bytes(), 4),
+                        1,
+                    )
+                });
+                Ok(())
+            },
+        )
+        .unwrap()
+        .with_completed_u32_zero_check(0, 0, "fixture numerical failure")
+        .unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                compute_entries(vec![command]),
+                DeviceTimingMode::Off,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .unwrap();
+        let receipt = runtime.wait_fence(&fence).unwrap();
+        assert!(matches!(
+            receipt.terminal(),
+            DeviceTerminal::FailedButQuiescent(_)
+        ));
+        assert_eq!(stream.pending.len(), 0);
+        assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
+        assert!(
+            matches!(runtime.query_fence(&fence), FenceQuery::Terminal(receipt) if matches!(receipt.terminal(), DeviceTerminal::FailedButQuiescent(_)))
+        );
+    }
+
+    #[test]
+    fn completed_device_status_reused_slot_is_cleared_by_each_submission() {
+        let runtime = runtime();
+        let status = runtime
+            .allocate_request(&buffer_request("resource/reused-status"))
+            .unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let mut completed = Vec::new();
+        for value in [1_u8, 0, 1, 0] {
+            let command = MetalDeviceCommand::operation(
+                "test_device_status_reset",
+                vec![status.region(0..8).unwrap()],
+                move |encoder, regions| {
+                    encoder.with_blit(|blit| {
+                        blit.fill_buffer(
+                            regions[0].buffer(),
+                            NSRange::new(regions[0].offset_bytes(), 4),
+                            value,
+                        )
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .with_completed_u32_zero_check(0, 0, "fixture numerical failure")
+            .unwrap();
+            let fence = runtime
+                .submit_commands(
+                    &mut stream,
+                    compute_entries(vec![command]),
+                    DeviceTimingMode::Off,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .wait_fence(&fence)
+                    .unwrap()
+                    .terminal()
+                    .is_succeeded(),
+                value == 0
+            );
+            assert_eq!(stream.pending.len(), 0);
+            assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
+            completed.push((fence, value == 0));
+            for (old_fence, succeeded) in &completed {
+                match runtime.query_fence(old_fence) {
+                    FenceQuery::Terminal(receipt) => {
+                        assert_eq!(receipt.terminal().is_succeeded(), *succeeded)
+                    }
+                    FenceQuery::Pending => panic!("a completed fence became pending"),
+                    FenceQuery::Indeterminate(_) => {
+                        panic!("a completed fence became indeterminate")
+                    }
+                }
+                assert_eq!(
+                    runtime
+                        .wait_fence(old_fence)
+                        .unwrap()
+                        .terminal()
+                        .is_succeeded(),
+                    *succeeded
+                );
+            }
+        }
+        let invalid = MetalDeviceCommand::operation(
+            "test_invalid_status",
+            vec![status.region(0..8).unwrap()],
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(invalid
+            .with_completed_u32_zero_check(0, 6, "invalid")
+            .is_err());
     }
 
     #[test]

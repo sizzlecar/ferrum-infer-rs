@@ -3,6 +3,30 @@
 use super::types::{GgufSourceProfile, ModelProfile};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// Resolve a local model before a child changes its working directory, while
+/// retaining a selected artifact's filename. HF snapshot GGUF files are often
+/// symlinks to extensionless blobs; resolving the leaf would change the product
+/// loader selected by the filename and discard the snapshot source identity.
+pub fn normalize_local_model_path(path: &Path) -> std::io::Result<PathBuf> {
+    if std::fs::metadata(path)?.is_file() {
+        let absolute = std::path::absolute(path)?;
+        let parent = absolute.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "model file has no parent")
+        })?;
+        Ok(
+            std::fs::canonicalize(parent)?.join(absolute.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "model file has no filename",
+                )
+            })?),
+        )
+    } else {
+        std::fs::canonicalize(path)
+    }
+}
 
 pub fn pinned_hf_source(model: &str) -> Result<Option<(&str, &str)>, String> {
     let Some((repo, revision)) = model.rsplit_once('@') else {
@@ -208,6 +232,25 @@ fn verify_repository_role(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[cfg(unix)]
+    fn local_gguf_snapshot_filename_survives_absolute_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let blob = root.join("content-address");
+        std::fs::write(&blob, b"fixture").unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        let selected = snapshot.join("selected.gguf");
+        std::os::unix::fs::symlink("../content-address", &selected).unwrap();
+        let resolved = normalize_local_model_path(&selected).unwrap();
+        assert_eq!(resolved, selected);
+        assert_ne!(resolved, blob);
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"fixture");
+        assert_eq!(normalize_local_model_path(&snapshot).unwrap(), snapshot);
+        assert!(normalize_local_model_path(&root.join("missing.gguf")).is_err());
+    }
 
     fn gguf_identity() -> (String, GgufSourceProfile, Value) {
         let model = format!("quantizer/weights@{}", "a".repeat(40));

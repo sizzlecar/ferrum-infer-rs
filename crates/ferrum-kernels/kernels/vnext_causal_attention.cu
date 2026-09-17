@@ -512,6 +512,222 @@ extern "C" __global__ void vnext_causal_attention_f16(
   }
 }
 
+// INT8 KV uses independent token-major I8 payload and F32 scale page tables.
+// The scale table follows control[0] payload pointers. Its length follows from
+// the source frontier and KV head count. control[5] is exclusively an atomic
+// numerical error flag, reset by the binding upload on every invocation.
+__device__ __forceinline__ float* vnext_int8_scale_pointer(
+    const unsigned long long* tables, const int* control,
+    const int page_bytes, const int kv_heads, const long long row) {
+  const int scale_page_elements = page_bytes / sizeof(float);
+  const long long page = row / scale_page_elements;
+  const long long scale_rows = (long long)control[3] * 2 * kv_heads;
+  const long long scale_pages = (scale_rows + scale_page_elements - 1) / scale_page_elements;
+  if (page < 0 || page >= scale_pages) return nullptr;
+  return reinterpret_cast<float*>(static_cast<uintptr_t>(
+      tables[control[0] + page])) + row % scale_page_elements;
+}
+
+__device__ __forceinline__ signed char* vnext_int8_payload_pointer(
+    const unsigned long long* tables, const int* control,
+    const int page_bytes, const long long element) {
+  const long long page = element / page_bytes;
+  if (page < 0 || page >= control[0]) return nullptr;
+  return reinterpret_cast<signed char*>(static_cast<uintptr_t>(tables[page])) +
+         element % page_bytes;
+}
+
+__device__ __forceinline__ float vnext_load_int8_kv(
+    const unsigned long long* tables, const int* control,
+    const int page_bytes, const int token, const int kind, const int head,
+    const int dim, const int kv_heads, const int head_dim) {
+  const long long row = ((long long)token * 2 + kind) * kv_heads + head;
+  const float* scale = vnext_int8_scale_pointer(tables, control, page_bytes, kv_heads, row);
+  const signed char* value = vnext_int8_payload_pointer(
+      tables, control, page_bytes, row * head_dim + dim);
+  return scale != nullptr && value != nullptr ? *scale * (float)*value : 0.0f;
+}
+
+extern "C" __global__ void vnext_causal_prepare_int8_kv(
+    const __half* __restrict__ query_raw,
+    const __half* __restrict__ key_raw,
+    const __half* __restrict__ value_raw,
+    const __half* __restrict__ query_norm_weight,
+    const __half* __restrict__ key_norm_weight,
+    __half* __restrict__ query,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    const int page_bytes, const int kv_layout,
+    const int query_heads, const int kv_heads, const int head_dim,
+    const int rope_dim, const int rope_frequency_denominator,
+    const int rope_pair_offset, const int query_projection_stride,
+    const int query_head_stride, const int kv_projection_stride,
+    const float epsilon, const float rope_theta, const int rope_interleaved,
+    const int value_rms_norm, const unsigned long long binding_slot_bytes) {
+  if (binding_slot_bytes != 0) {
+    control = vnext_participant_control(control, binding_slot_bytes, blockIdx.z);
+    page_pointers = reinterpret_cast<const unsigned long long*>(
+        reinterpret_cast<const char*>(page_pointers) +
+        (unsigned long long)blockIdx.z * binding_slot_bytes);
+  }
+  const int token = blockIdx.x;
+  const int combined_head = blockIdx.y;
+  const int lane = threadIdx.x;
+  if (token >= control[2] || combined_head >= query_heads + 2 * kv_heads ||
+      lane >= VNEXT_WARP_SIZE) return;
+  const int packed_token = (binding_slot_bytes == 0 ? 0 : control[4]) + token;
+  const int position = control[1] + token;
+  const bool is_query = combined_head < query_heads;
+  const bool is_key = !is_query && combined_head < query_heads + kv_heads;
+  const int head = is_query ? combined_head :
+      combined_head - query_heads - (is_key ? 0 : kv_heads);
+  const __half* source = is_query
+      ? query_raw + (long long)packed_token * query_projection_stride + head * query_head_stride
+      : (is_key ? key_raw : value_raw) +
+          (long long)packed_token * kv_projection_stride + head * head_dim;
+  const __half* weight = is_query ? query_norm_weight : key_norm_weight;
+  float norm_scale = 1.0f;
+  if (is_query || is_key || value_rms_norm != 0) {
+    float sum_squares = 0.0f;
+    for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+      const float value = __half2float(source[dim]);
+      sum_squares += value * value;
+    }
+    norm_scale = rsqrtf(warp_reduce_sum(sum_squares) / (float)head_dim + epsilon);
+  }
+  float values[VNEXT_MAX_HEAD_CHUNKS];
+  float maximum = 0.0f;
+  bool invalid = false;
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    float value = 0.0f;
+    if (dim < head_dim) {
+      value = __half2float(source[dim]) * norm_scale;
+      if (is_query || is_key) {
+        value *= __half2float(weight[dim]);
+        const int half_rope = rope_dim / 2;
+        const bool high = rope_interleaved != 0 ? (dim % 2 != 0) : dim >= rope_pair_offset;
+        const int pair = rope_interleaved != 0 ? dim / 2 : (high ? dim - rope_pair_offset : dim);
+        const bool rotated = rope_interleaved != 0 ? dim < rope_dim :
+            dim < half_rope || (dim >= rope_pair_offset && dim < rope_pair_offset + half_rope);
+        if (rotated) {
+          const int low_dim = rope_interleaved != 0 ? pair * 2 : pair;
+          const int high_dim = rope_interleaved != 0 ? low_dim + 1 : pair + rope_pair_offset;
+          const float x0 = __half2float(source[low_dim]) * norm_scale * __half2float(weight[low_dim]);
+          const float x1 = __half2float(source[high_dim]) * norm_scale * __half2float(weight[high_dim]);
+          const float angle = position * powf(rope_theta, -(2.0f * pair) / (float)rope_frequency_denominator);
+          float sine, cosine;
+          sincosf(angle, &sine, &cosine);
+          value = high ? x1 * cosine + x0 * sine : x0 * cosine - x1 * sine;
+        }
+      }
+      // Preserve the established F16 KV write boundary before quantization.
+      value = __half2float(__float2half_rn(value));
+      invalid |= !isfinite(value);
+      maximum = fmaxf(maximum, fabsf(value));
+    }
+    values[chunk] = value;
+  }
+  if (__any_sync(0xffffffff, invalid)) {
+    if (lane == 0) atomicOr(reinterpret_cast<unsigned int*>(const_cast<int*>(control + 5)), 0x80000000u);
+    return;
+  }
+  if (is_query) {
+#pragma unroll
+    for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * VNEXT_WARP_SIZE;
+      if (dim < head_dim)
+        query[((long long)packed_token * query_heads + head) * head_dim + dim] = __float2half_rn(values[chunk]);
+    }
+    return;
+  }
+  for (int offset = VNEXT_WARP_SIZE / 2; offset > 0; offset /= 2)
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+  const float scale = maximum == 0.0f ? 1.0f : __fdiv_rn(maximum, 127.0f);
+  const long long row = ((long long)position * 2 + (is_key ? 0 : 1)) * kv_heads + head;
+  float* scale_destination = vnext_int8_scale_pointer(page_pointers, control, page_bytes, kv_heads, row);
+  if (lane == 0 && scale_destination != nullptr) *scale_destination = scale;
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    if (dim < head_dim) {
+      signed char* destination = vnext_int8_payload_pointer(page_pointers, control, page_bytes, row * head_dim + dim);
+      if (destination != nullptr) {
+        const float rounded_input = fminf(127.0f, fmaxf(-127.0f, __fdiv_rn(values[chunk], scale)));
+        *destination = static_cast<signed char>(__float2int_rn(rounded_input));
+      }
+    }
+  }
+}
+
+extern "C" __global__ void vnext_causal_attention_int8_kv(
+    const __half* __restrict__ query,
+    const __half* __restrict__ query_raw,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_bytes, const int kv_layout, const int query_heads,
+    const int kv_heads, const int head_dim, const int query_projection_stride,
+    const int output_gate, const float attention_scale, const int sliding_window,
+    const unsigned long long binding_slot_bytes) {
+  if (binding_slot_bytes != 0) {
+    control = vnext_participant_control(control, binding_slot_bytes, blockIdx.z);
+    page_pointers = reinterpret_cast<const unsigned long long*>(
+        reinterpret_cast<const char*>(page_pointers) +
+        (unsigned long long)blockIdx.z * binding_slot_bytes);
+  }
+  const int token = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+  if (token >= control[2] || head >= query_heads || lane >= VNEXT_WARP_SIZE) return;
+  const int packed_token = (binding_slot_bytes == 0 ? 0 : control[4]) + token;
+  const int position = control[1] + token;
+  const int kv_head = head / (query_heads / kv_heads);
+  float q[VNEXT_MAX_HEAD_CHUNKS], accumulated[VNEXT_MAX_HEAD_CHUNKS];
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    q[chunk] = dim < head_dim ? __half2float(query[((long long)packed_token * query_heads + head) * head_dim + dim]) : 0.0f;
+    accumulated[chunk] = 0.0f;
+  }
+  float running_max = -CUDART_INF_F, running_sum = 0.0f;
+  const int begin = sliding_window > 0 ? max(0, position - sliding_window + 1) : 0;
+  for (int previous = begin; previous <= position; ++previous) {
+    float dot = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * VNEXT_WARP_SIZE;
+      if (dim < head_dim)
+        dot += q[chunk] * vnext_load_int8_kv(page_pointers, control, page_bytes, previous, 0, kv_head, dim, kv_heads, head_dim);
+    }
+    const float score = warp_reduce_sum(dot) * attention_scale;
+    const float next_max = fmaxf(running_max, score);
+    const float previous_scale = isinf(running_max) ? 0.0f : expf(running_max - next_max);
+    const float next_scale = expf(score - next_max);
+    running_sum = running_sum * previous_scale + next_scale;
+#pragma unroll
+    for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+      const int dim = lane + chunk * VNEXT_WARP_SIZE;
+      if (dim < head_dim)
+        accumulated[chunk] = accumulated[chunk] * previous_scale + next_scale *
+            vnext_load_int8_kv(page_pointers, control, page_bytes, previous, 1, kv_head, dim, kv_heads, head_dim);
+    }
+    running_max = next_max;
+  }
+  const float inverse_sum = 1.0f / running_sum;
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    if (dim < head_dim) {
+      float value = accumulated[chunk] * inverse_sum;
+      if (output_gate != 0) {
+        const float gate = __half2float(query_raw[(long long)packed_token * query_projection_stride + head * 2 * head_dim + head_dim + dim]);
+        value *= 1.0f / (1.0f + expf(-gate));
+      }
+      output[((long long)packed_token * query_heads + head) * head_dim + dim] = __float2half_rn(value);
+    }
+  }
+}
+
 // Decode-oriented grouped-query fallback. One block owns one packed query
 // token and one KV head; its warps own the GQA query heads that share that KV
 // head. K/V are loaded once per tile into shared memory instead of once per Q

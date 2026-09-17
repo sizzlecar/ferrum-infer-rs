@@ -29,6 +29,25 @@ const PRODUCT_COMPOSITION_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const PRODUCT_COMPOSITION_PRODUCER: &str = "ferrum.product-composition";
 const DEFAULT_SAMPLER_SEED: u64 = 42;
 
+/// The current addressed native CUDA ABI consumes F16 pages. Resolve Auto
+/// within the requested storage format instead of letting an incompatible
+/// native provider silently change the user's numerical request.
+pub(crate) fn cuda_attention_policy_for_kv(
+    requested: ferrum_types::AttentionExecutionPolicy,
+    dtype: ferrum_types::KvCacheDtype,
+) -> Result<ferrum_types::AttentionExecutionPolicy> {
+    use ferrum_types::{AttentionExecutionPolicy, KvStorageFormat};
+    match (KvStorageFormat::try_from(dtype).map_err(FerrumError::config)?, requested) {
+        (KvStorageFormat::Int8PerTokenHeadF32ScaleV1, AttentionExecutionPolicy::NativeAdaptive) => {
+            Err(FerrumError::unsupported(
+                "native-adaptive CUDA attention does not implement INT8 KV storage; use portable/auto attention or --kv-dtype fp16",
+            ))
+        }
+        (KvStorageFormat::Int8PerTokenHeadF32ScaleV1, _) => Ok(AttentionExecutionPolicy::Portable),
+        (KvStorageFormat::F16, requested) => Ok(requested),
+    }
+}
+
 pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     engine: &EngineConfig,
     defined: &DefinedProductionModel,
@@ -71,12 +90,14 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
     >,
     executor_config: impl Fn(&ModelInfo, &R) -> Result<VNextExecutorConfig>,
 ) -> Result<VNextModelExecutor<R>> {
+    let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
+        .map_err(FerrumError::config)?;
     let composition =
         VNextRuntimeComposition::new(runtime, operation_registry, weight_materializers, catalog);
     let candidates = defined
         .definition()
         .numerical_profiles()
-        .candidates(&engine.numerical_execution)
+        .candidates(&engine.numerical_execution, requested_kv_storage)
         .map_err(|error| FerrumError::config(error.to_string()))?;
     let mut rejected = Vec::new();
     for profile in candidates {
@@ -118,12 +139,15 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 }
             };
         tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
+            requested_kv_dtype = engine.kv_cache.dtype.as_str(),
+            kv_storage = ?requested_kv_storage,
             numerical_profile = %profile.id, rejected_numerical_profiles = ?rejected,
             family_id = %prepared.family().family_id(),
             "Selected numerical profile using the complete static program");
         return compiled.initialize(|prepared, runtime, catalog, compilation| {
             let numerical_execution = NumericalProfileResolution::from_static_plan(
                 engine.numerical_execution.clone(),
+                requested_kv_storage,
                 defined.definition(),
                 prepared.family(),
                 catalog,
@@ -143,8 +167,9 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         });
     }
     Err(FerrumError::unsupported(format!(
-        "no declared numerical profile satisfies {:?}: {}",
+        "no declared numerical profile satisfies {:?} with KV dtype {}: {}; select --kv-dtype fp16 for the existing storage path",
         engine.numerical_execution,
+        engine.kv_cache.dtype.as_str(),
         rejected
             .iter()
             .map(|rejection| format!(
@@ -538,6 +563,27 @@ const fn decision_source_name(source: ResolutionDecisionSource) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn int8_kv_resolves_attention_without_changing_storage_precision() {
+        use ferrum_types::{AttentionExecutionPolicy as Policy, KvCacheDtype as Dtype};
+        for requested in [Policy::Auto, Policy::Portable] {
+            assert_eq!(
+                cuda_attention_policy_for_kv(requested, Dtype::Int8).unwrap(),
+                Policy::Portable,
+            );
+        }
+        assert!(cuda_attention_policy_for_kv(Policy::NativeAdaptive, Dtype::Int8).is_err());
+        for requested in [Policy::Auto, Policy::Portable, Policy::NativeAdaptive] {
+            assert_eq!(
+                cuda_attention_policy_for_kv(requested, Dtype::Fp16).unwrap(),
+                requested,
+            );
+        }
+        for unsupported in [Dtype::Bf16, Dtype::Fp8] {
+            assert!(cuda_attention_policy_for_kv(Policy::Auto, unsupported).is_err());
+        }
+    }
 
     #[test]
     fn decimal_sampling_values_are_canonical_rationals() {

@@ -305,6 +305,7 @@ pub enum CapacityShortfallKind {
     BackingGrowthRequired,
     ActiveSequenceCeiling,
     PermanentDomainMaximum,
+    PermanentPlanBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -805,6 +806,29 @@ pub struct AdmissionRejected {
 }
 
 impl AdmissionRejected {
+    pub(crate) fn for_plan_budget(
+        immediate_requested: CapacityVector,
+        fit_requested: CapacityVector,
+        maximum: CapacitySnapshot,
+        minimum_required_bytes: u64,
+        usable_bytes: u64,
+    ) -> Self {
+        debug_assert!(minimum_required_bytes > usable_bytes);
+        Self {
+            immediate_requested,
+            fit_requested,
+            maximum,
+            blockers: vec![CapacityShortfall {
+                domain: None,
+                kind: CapacityShortfallKind::PermanentPlanBudget,
+                requested: CapacityUnits::new(minimum_required_bytes),
+                available: CapacityUnits::new(usable_bytes),
+                current_total: CapacityUnits::new(usable_bytes),
+                maximum_total: CapacityUnits::new(usable_bytes),
+            }],
+        }
+    }
+
     pub fn blockers(&self) -> &[CapacityShortfall] {
         &self.blockers
     }
@@ -1011,7 +1035,11 @@ impl CoordinatorState {
                 (CapacityShortfallKind::ActiveSequenceCeiling, None) => {
                     sources.insert(CapacityAvailabilitySource::ActiveSequenceSlots);
                 }
-                (CapacityShortfallKind::PermanentDomainMaximum, _) => {
+                (
+                    CapacityShortfallKind::PermanentDomainMaximum
+                    | CapacityShortfallKind::PermanentPlanBudget,
+                    _,
+                ) => {
                     return Err(invalid_admission(
                         "permanent capacity blocker cannot produce a wait condition",
                     ));

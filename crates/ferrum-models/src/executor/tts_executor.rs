@@ -1801,6 +1801,7 @@ impl ModelExecutor for TtsModelExecutor {
             supported_dtypes: vec![DataType::FP32, DataType::BF16],
             supported_devices: vec![self.info.device.clone()],
             memory_requirements: MemoryRequirements {
+                typed_sequence_state: None,
                 parameter_memory: 0,
                 activation_memory_per_token: 0,
                 kv_cache_memory_per_token: 0,

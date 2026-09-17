@@ -21,6 +21,93 @@ fn checkpoint_harness() -> RestoreHarness {
     })
 }
 
+fn int8_kv_checkpoint_spec() -> checkpoint_fixture::Spec {
+    use crate::vnext::{
+        CheckpointInputDependency, ProviderCheckpointStateLayout, StateCapacityDemand,
+        StateCheckpointCapability, StateCheckpointContents, StateCheckpointContract,
+        StateInitialization,
+    };
+    let mut spec = checkpoint_fixture::Spec {
+        checkpoint_capacity: Some(crate::vnext::CheckpointCapacityPolicy::new(1024).unwrap()),
+        ..Default::default()
+    };
+    for (index, (shape, dtype)) in [
+        (vec![2, 2, 8], ElementType::I8),
+        (vec![2, 2], ElementType::F32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = &mut spec.states[index];
+        state.tensor.dimensions = shape;
+        state.tensor.element_type = dtype;
+        state.capacity_demand = StateCapacityDemand::TokenScaled {
+            bytes_per_token: state.tensor.byte_len().unwrap(),
+            maximum_tokens: 64,
+        };
+        state.initialization = StateInitialization::None;
+        state.checkpoint =
+            StateCheckpointCapability::CompletedBoundary(StateCheckpointContract::new(
+                StateCheckpointContents::PrefixPositions,
+                CheckpointInputDependency::ExactTokenPrefix,
+            ));
+        spec.layouts[index] = ProviderCheckpointStateLayout::TokenMajorPrefix;
+    }
+    spec
+}
+
+#[test]
+fn int8_kv_checkpoint_charges_payload_and_scales_and_retains_both_owners() {
+    let harness = RestoreHarness::new(int8_kv_checkpoint_spec());
+    let (owner, bytes) = allocate_checkpoint(&harness);
+    assert_eq!(bytes.logical_bytes(), 32 + 16);
+    assert_eq!(bytes.resources().len(), 2);
+    assert_eq!(owner.claims().entries().len(), 2);
+    assert!(owner.extent_bytes() >= bytes.logical_bytes());
+    let retained = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .checkpoint_retained_bytes()
+        .unwrap();
+    assert_eq!(retained, owner.extent_bytes());
+    let hold = owner.device_buffer_retention();
+    drop(owner);
+    assert_eq!(
+        harness
+            .root
+            .dynamic_pools
+            .logical_admission
+            .checkpoint_retained_bytes()
+            .unwrap(),
+        retained
+    );
+    drop(hold);
+    assert_checkpoint_budget_released(&harness);
+    harness.close();
+
+    let mut spec = int8_kv_checkpoint_spec();
+    // A budget large enough for the raw payload alone cannot hide the scales.
+    spec.checkpoint_capacity = Some(crate::vnext::CheckpointCapacityPolicy::new(32).unwrap());
+    let harness = RestoreHarness::new(spec);
+    let bytes = harness.fixture.plan.checkpoint_byte_plan(1).unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    assert!(matches!(
+        binding
+            .try_allocate_checkpoint_backing(&bytes.backing_requests().unwrap())
+            .unwrap(),
+        CheckpointBackingAllocationDecision::Skipped(_)
+    ));
+    assert_checkpoint_budget_released(&harness);
+    drop(binding);
+    harness.close();
+}
+
+#[test]
+fn int8_kv_checkpoint_preserves_both_states_through_native_capture_restore_gates() {
+    verify_native_capture_restore_gates(RestoreHarness::new(int8_kv_checkpoint_spec()));
+}
+
 fn reserve_capture(
     session: &Arc<SequenceSession<TestRuntime>>,
 ) -> PreparedSequenceStateTransfer<TestRuntime> {
@@ -191,7 +278,10 @@ fn assert_checkpoint_budget_released(harness: &RestoreHarness) {
 
 #[test]
 fn native_capture_fence_outbox_restore_preserves_gates_and_releases_execution_owners() {
-    let harness = checkpoint_harness();
+    verify_native_capture_restore_gates(checkpoint_harness());
+}
+
+fn verify_native_capture_restore_gates(harness: RestoreHarness) {
     let lane = harness.root.create_execution_lane().unwrap();
     let reaper = CompletionReaper::new();
     prove_source(&harness, &lane, &reaper);

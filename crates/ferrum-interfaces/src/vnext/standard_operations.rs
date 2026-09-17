@@ -73,6 +73,14 @@ pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID: &str =
     "operation.causal_paged_attention.f32-master";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f32-master";
+pub const CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID: &str =
+    "operation.causal_paged_attention.int8-kv";
+pub const CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID: &str =
+    "capability.operation.causal_paged_attention.f16.int8-kv";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID: &str =
+    "operation.causal_paged_attention.f32-master.int8-kv";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID: &str =
+    "capability.operation.causal_paged_attention.f32-master.int8-kv";
 pub const GPT_OSS_CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str =
     "operation.gpt_oss.causal_paged_attention";
 pub const GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
@@ -1218,6 +1226,7 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
         ContractVersion::new(2, 0),
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         ElementType::F16,
+        false,
     )
 }
 
@@ -1228,6 +1237,40 @@ pub fn causal_paged_attention_f32_master_contract() -> Result<StandardOperationC
         ContractVersion::new(1, 0),
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
         ElementType::F32,
+        false,
+    )
+}
+
+/// Causal attention with the existing F16 activation arithmetic and versioned
+/// INT8 KV storage. Input 8 is I8 [2, KV heads, head dimension]; input 9 is F32
+/// [2, KV heads]. Each absolute token position owns one tensor of each kind.
+///
+/// K and V independently round to the existing F16 KV write boundary, then
+/// convert to F32. For each token/head vector, scale = max(abs(x)) / 127;
+/// quantized = clamp(round_ties_even(x / stored_scale), -127, 127). Zero vectors
+/// use scale 1 and payload 0. Non-finite input fails the step; it must not become
+/// a reusable completed boundary. Every attention read, including the current
+/// prefill chunk, consumes q * scale with the original arithmetic boundaries.
+/// Providers may use bounded tiles, never an unaccounted full-history F16 copy.
+pub fn causal_paged_attention_int8_kv_contract() -> Result<StandardOperationContract, VNextError> {
+    causal_paged_attention_contract_with_hidden(
+        CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+        ElementType::F16,
+        true,
+    )
+}
+
+/// The same versioned INT8 KV ABI with the existing F32-master hidden boundary.
+pub fn causal_paged_attention_f32_master_int8_kv_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    causal_paged_attention_contract_with_hidden(
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+        ElementType::F32,
+        true,
     )
 }
 
@@ -1236,8 +1279,9 @@ fn causal_paged_attention_contract_with_hidden(
     version: ContractVersion,
     capability_id: &str,
     hidden_type: ElementType,
+    int8_kv: bool,
 ) -> Result<StandardOperationContract, VNextError> {
-    let descriptor = OperationDescriptor {
+    let mut descriptor = OperationDescriptor {
         id: OperationId::new(operation_id)?,
         version,
         inputs: vec![
@@ -1279,7 +1323,11 @@ fn causal_paged_attention_contract_with_hidden(
             )?,
             contiguous_tensor(
                 vec![exact(2), symbol("key_value_heads"), symbol("head_dim")],
-                [ElementType::F16],
+                [if int8_kv {
+                    ElementType::I8
+                } else {
+                    ElementType::F16
+                }],
                 TensorAccess::ReadWrite,
             )?,
         ],
@@ -1311,6 +1359,13 @@ fn causal_paged_attention_contract_with_hidden(
         provider: provider_requirement(capability_id, version)?,
         profile_phase: ProfilePhase::Forward,
     };
+    if int8_kv {
+        descriptor.inputs.push(contiguous_tensor(
+            vec![exact(2), symbol("key_value_heads")],
+            [ElementType::F32],
+            TensorAccess::ReadWrite,
+        )?);
+    }
     descriptor.validate()?;
     Ok(StandardOperationContract { descriptor })
 }
@@ -1861,6 +1916,44 @@ mod tests {
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
             .unwrap();
+    }
+
+    #[test]
+    fn int8_kv_contracts_require_both_typed_states_without_changing_other_boundaries() {
+        for (f16, quantized) in [
+            (
+                causal_paged_attention_contract().unwrap(),
+                causal_paged_attention_int8_kv_contract().unwrap(),
+            ),
+            (
+                causal_paged_attention_f32_master_contract().unwrap(),
+                causal_paged_attention_f32_master_int8_kv_contract().unwrap(),
+            ),
+        ] {
+            let old = f16.descriptor();
+            let new = quantized.descriptor();
+            assert_eq!(&old.inputs[..8], &new.inputs[..8]);
+            assert_eq!(old.outputs, new.outputs);
+            assert_eq!(old.attributes, new.attributes);
+            assert_eq!(new.inputs.len(), 10);
+            assert_eq!(
+                new.inputs[8].element_types(),
+                &BTreeSet::from([ElementType::I8])
+            );
+            assert_eq!(
+                new.inputs[9].element_types(),
+                &BTreeSet::from([ElementType::F32])
+            );
+            assert_eq!(new.inputs[8].access(), TensorAccess::ReadWrite);
+            assert_eq!(new.inputs[9].access(), TensorAccess::ReadWrite);
+            assert_ne!(old.fingerprint().unwrap(), new.fingerprint().unwrap());
+            quantized
+                .validate_signature(&new.inputs, &new.outputs)
+                .unwrap();
+            assert!(quantized
+                .validate_signature(&old.inputs, &old.outputs)
+                .is_err());
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, causal_paged_attention_f32_master_contract,
+    causal_paged_attention_f32_master_int8_kv_contract, causal_paged_attention_int8_kv_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
     gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_contract,
     last_token_dense_linear_f32_contract, last_token_masked_argmax_contract,
@@ -22,8 +23,9 @@ use ferrum_interfaces::vnext::{
     ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology, SemanticValue, VNextError,
     WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
-    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
@@ -95,6 +97,8 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -121,6 +125,7 @@ pub fn metal_vnext_runtime_config(
             include_str!("gated_delta_attention.metal").as_bytes(),
             include_str!("causal_attention.rs").as_bytes(),
             include_str!("causal_attention.metal").as_bytes(),
+            include_str!("causal_attention_int8.metal").as_bytes(),
         ]),
         capabilities: metal_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([
@@ -149,6 +154,8 @@ pub fn metal_vnext_operation_registry(
     let gated_delta_pipelines = Arc::new(MetalGatedDeltaPipelines::new(runtime.device())?);
     let causal_attention_pipelines =
         Arc::new(MetalCausalAttentionPipelines::new(runtime.device())?);
+    let int8_causal_attention_pipelines =
+        Arc::new(MetalCausalAttentionPipelines::new_int8(runtime.device())?);
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
@@ -169,6 +176,8 @@ pub fn metal_vnext_operation_registry(
         Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_int8_kv_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_f32_master_int8_kv_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<MetalDeviceRuntime>>> = vec![
         Box::new(MetalTokenEmbeddingProvider::new(
@@ -251,6 +260,18 @@ pub fn metal_vnext_operation_registry(
         Box::new(MetalCausalPagedAttentionProvider::new_f32_master(
             runtime,
             causal_attention_pipelines,
+            Arc::clone(&linear_pipelines),
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalCausalPagedAttentionProvider::new(
+            runtime,
+            Arc::clone(&int8_causal_attention_pipelines),
+            Arc::clone(&linear_pipelines),
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalCausalPagedAttentionProvider::new_f32_master(
+            runtime,
+            int8_causal_attention_pipelines,
             linear_pipelines,
             pipelines,
         )?),
@@ -810,8 +831,14 @@ mod tests {
     fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 19);
-        assert_eq!(composition.catalog().device().capabilities.len(), 19);
+        assert_eq!(
+            composition.runtime().descriptor().capabilities,
+            metal_vnext_capabilities().unwrap()
+        );
+        assert_eq!(
+            composition.catalog().device().capabilities,
+            metal_vnext_capabilities().unwrap()
+        );
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
@@ -832,6 +859,8 @@ mod tests {
             LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
+            ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
         ] {
             assert_eq!(
                 composition

@@ -411,3 +411,27 @@ fn attribute(
 ) -> Result<(AttributeId, SemanticValue), VNextError> {
     Ok((AttributeId::new(name)?, value.into_semantic_value()))
 }
+
+#[cfg(test)]
+mod kv_storage_tests {
+    use super::*;
+    use ferrum_interfaces::vnext::{KvStorageFormat, NumericalExecutionPolicy};
+
+    #[test]
+    fn int8_kv_rejects_unimplemented_vnorm_hybrid_attention() {
+        let profiles = numerical_profiles(
+            &ModelFamilyId::new(super::super::FAMILY_ID).unwrap(),
+            &super::super::config::tiny_semantic_config(),
+        )
+        .unwrap();
+        assert!(profiles
+            .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
+            .is_ok());
+        assert!(profiles
+            .candidates(
+                &NumericalExecutionPolicy::Auto,
+                KvStorageFormat::Int8PerTokenHeadF32ScaleV1
+            )
+            .is_err());
+    }
+}

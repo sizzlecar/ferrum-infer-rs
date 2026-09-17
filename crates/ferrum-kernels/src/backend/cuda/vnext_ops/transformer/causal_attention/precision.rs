@@ -19,6 +19,9 @@ impl CausalPrecision {
     pub(super) fn provider_id(self, semantics: CausalAttentionSemantics) -> &'static str {
         match self {
             Self::F16 => semantics.provider_id(),
+            Self::F32Master if semantics.int8_kv() => {
+                "provider.cuda.causal_paged_attention.f32-master.int8-kv"
+            }
             Self::F32Master => "provider.cuda.causal_paged_attention.f32-master",
         }
     }
@@ -26,6 +29,9 @@ impl CausalPrecision {
     pub(super) fn estimator_id(self, semantics: CausalAttentionSemantics) -> &'static str {
         match self {
             Self::F16 => semantics.estimator_id(),
+            Self::F32Master if semantics.int8_kv() => {
+                "resource-estimator.cuda.causal_paged_attention.f32-master.int8-kv"
+            }
             Self::F32Master => "resource-estimator.cuda.causal_paged_attention.f32-master",
         }
     }
