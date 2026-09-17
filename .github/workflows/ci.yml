@@ -641,6 +641,7 @@ jobs:
           retention-days: 14
 
       - name: Build this candidate for the optional CUDA model diagnosis
+        id: cuda_model_probe_build
         if: matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && (inputs.cuda_model_probe == 'llama32-1b' || inputs.cuda_model_probe == 'qwen35-08b-kv-paired')
         timeout-minutes: 60
         env:
@@ -713,7 +714,7 @@ jobs:
           exit "$probe_status"
 
       - name: Save optional CUDA model diagnosis and raw logs
-        if: always() && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && (inputs.cuda_model_probe == 'llama32-1b' || inputs.cuda_model_probe == 'qwen35-08b-kv-paired')
+        if: always() && steps.cuda_model_probe_build.outcome != '' && steps.cuda_model_probe_build.outcome != 'skipped' && matrix.backend == 'cuda' && github.event_name == 'workflow_dispatch' && (inputs.cuda_model_probe == 'llama32-1b' || inputs.cuda_model_probe == 'qwen35-08b-kv-paired')
         uses: actions/upload-artifact@v4
         with:
           name: cuda-model-probe-${{ github.run_id }}-${{ github.run_attempt }}

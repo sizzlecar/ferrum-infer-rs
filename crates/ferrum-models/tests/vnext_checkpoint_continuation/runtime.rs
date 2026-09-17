@@ -553,10 +553,25 @@ impl Fixture {
                 program.is_determinism_ready(),
                 "incomplete replay program: {program:?}"
             );
+            assert!(
+                attention.binding_resource().is_some(),
+                "dual-state attention must declare a typed binding for replay"
+            );
+            // CUDA embedding uses direct kernel arguments; Metal embedding
+            // declares its own binding workspace. Require the exact selected
+            // providers' binding nodes, rather than imposing either topology.
+            let declared_binding_nodes = plan
+                .payload()
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.binding_resource().is_some())
+                .map(|(index, _)| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>();
             assert_eq!(
                 program.per_wave_binding_node_indices(),
-                &[0, 1],
-                "both embedding and dual-state attention must update their typed slots"
+                declared_binding_nodes.as_slice(),
+                "every provider-declared typed binding must update before replay"
             );
             OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
                 self.providers.providers(),
