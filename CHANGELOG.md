@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added opt-in `--kv-dtype int8` / `runtime.kv_dtype` for supported vNext Metal and portable CUDA causal attention, with per-token/head scales, typed capacity accounting, and paired KV checkpoint state. FP16 remains the default; unsupported combinations fail explicitly. See [KV precision](docs/kv-cache-precision.md) and the [measured validation scope](docs/vnext-8bit-kv-validation.zh.md).
+- Exposed resolved KV precision and complete-model logical state requirements in health and effective configuration, separating them from legacy estimates and actual allocator residency.
 - Added native profile summaries that distinguish shared GPU work from per-request observations and avoid duplicate accounting.
 - Added one-command installation on Apple Silicon macOS, Linux x86_64, and Windows x64, with PATH setup and upgrades that keep existing processes running while new launches use the updated version.
 - Added a native Windows EXE installer and portable CUDA package for a single NVIDIA sm89 GPU, bundling CUDA and VC runtimes and using the installed NVIDIA driver.
