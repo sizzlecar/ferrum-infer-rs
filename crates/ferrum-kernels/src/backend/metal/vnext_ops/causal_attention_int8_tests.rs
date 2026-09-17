@@ -114,7 +114,17 @@ impl Inputs {
         attention: bool,
     ) -> Output {
         assert_eq!((self.kv_heads, self.dim), (state.heads, state.dim));
-        let params = CausalAttentionParams {
+        let params = self.params(pipelines, state, start);
+        self.execute_with_params(device, queue, pipelines, state, &params, attention)
+    }
+
+    fn params(
+        &self,
+        pipelines: &MetalCausalAttentionPipelines,
+        state: &State,
+        start: usize,
+    ) -> CausalAttentionParams {
+        CausalAttentionParams {
             page_elements: VNEXT_KV_PAGE_BYTES as u32,
             page_count: state.payload.len() as u32,
             position_start: start as u32,
@@ -132,13 +142,24 @@ impl Inputs {
                 .attention_simdgroups_for_context((start + self.tokens) as u64),
             epsilon: 1e-6,
             rope_theta: 10_000.0,
-        };
+        }
+    }
+
+    fn execute_with_params(
+        &self,
+        device: &Device,
+        queue: &CommandQueueRef,
+        pipelines: &MetalCausalAttentionPipelines,
+        state: &State,
+        params: &CausalAttentionParams,
+        attention: bool,
+    ) -> Output {
         let q = shared_buffer(device, &self.query);
         let k = shared_buffer(device, &self.key);
         let v = shared_buffer(device, &self.value);
         let norm = shared_buffer(device, &vec![f16::ONE; self.dim]);
         let prepared = output_buffer::<f16>(device, self.tokens * self.heads * self.dim);
-        let output = output_buffer::<f16>(device, self.tokens * self.heads * self.dim);
+        let output = GuardedAttentionOutput::new(device, params);
         let arguments = device.new_buffer(
             pipelines.binding_slot_bytes().unwrap(),
             MTLResourceOptions::StorageModeShared,
@@ -174,7 +195,7 @@ impl Inputs {
         }
         encoder.set_buffer(PREPARE_PAGE_TABLE_INDEX, Some(&arguments), 0);
         encoder.set_buffer(8, Some(&arguments), status_offset);
-        set_raw_params(encoder, 7, &params);
+        set_raw_params(encoder, 7, params);
         use_raw_pages(encoder, &state.payload);
         use_raw_pages(encoder, &state.scales);
         encoder.dispatch_thread_groups(
@@ -185,13 +206,13 @@ impl Inputs {
             ),
             MTLSize::new(SIMD_THREADS, 1, 1),
         );
-        let dispatch = attention.then(|| pipelines.dispatch_plan(&params));
+        let dispatch = attention.then(|| pipelines.dispatch_plan(params));
         if let Some(plan) = dispatch {
             set_raw(encoder, 0, &prepared);
             set_raw(encoder, 1, &q);
-            set_raw(encoder, 2, &output);
+            set_raw(encoder, 2, &output.buffer);
             encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&arguments), 0);
-            set_raw_params(encoder, 4, &params);
+            set_raw_params(encoder, 4, params);
             encode_attention_dispatch(pipelines, encoder, plan);
         }
         encoder.end_encoding();
@@ -202,11 +223,13 @@ impl Inputs {
             read::<u32>(&arguments, status_offset as usize / 4 + 1)[status_offset as usize / 4];
         Output {
             query: read::<f16>(&prepared, self.tokens * self.heads * self.dim),
-            attention: if attention {
-                read::<f16>(&output, self.tokens * self.heads * self.dim)
-            } else {
-                Vec::new()
-            },
+            attention: dispatch.map_or_else(Vec::new, |plan| {
+                output
+                    .read_after_completion(plan.kind)
+                    .into_iter()
+                    .map(f16::from_f32)
+                    .collect()
+            }),
             error,
             dispatch: dispatch.map(|plan| plan.kind),
         }
@@ -475,14 +498,23 @@ fn int8_tiled_prefill_and_direct_decode_match_reference_across_payload_page_and_
         let prefix = Inputs::new(prefix_tokens, heads, kv_heads, dim, true);
         let prefix_output = prefix.execute(&device, &queue, &pipelines, &state, 0, true);
         assert_eq!(prefix_output.error, 0);
-        assert_eq!(
-            prefix_output.dispatch,
-            Some(AttentionDispatchKind::TiledPrefill)
-        );
+        let tiled_bytes = (8 * dim + 8 * 32 + 32 * dim) * size_of::<f16>()
+            + (8 * dim + 8 * 32) * size_of::<f32>();
+        let expected_dispatch = if dim == 256
+            && pipelines.supports_gqa_tiled_prefill
+            && pipelines.maximum_threadgroup_memory_length >= 31 * 1024
+        {
+            AttentionDispatchKind::GqaTiledPrefill
+        } else if pipelines.maximum_threadgroup_memory_length >= tiled_bytes as u64 {
+            AttentionDispatchKind::TiledPrefill
+        } else {
+            AttentionDispatchKind::General
+        };
+        assert_eq!(prefix_output.dispatch, Some(expected_dispatch));
         let tail = Inputs::new(9, heads, kv_heads, dim, true);
         let output = tail.execute(&device, &queue, &pipelines, &state, prefix_tokens, true);
         assert_eq!(output.error, 0);
-        assert_eq!(output.dispatch, Some(AttentionDispatchKind::TiledPrefill));
+        assert_eq!(output.dispatch, Some(expected_dispatch));
         for (actual, expected) in
             output
                 .attention
@@ -516,11 +548,21 @@ fn int8_tiled_prefill_and_direct_decode_match_reference_across_payload_page_and_
 fn int8_tiled_dispatch_accounts_for_bounded_dequantization_memory() {
     let mut params = dispatch_test_params(8, 256);
     params.page_elements = VNEXT_KV_PAGE_BYTES as u32;
-    let plan = int8_attention_dispatch_plan(&params, 32 * 1024);
-    assert_eq!(plan.kind, AttentionDispatchKind::TiledPrefill);
-    assert!(plan.threadgroup_memory_bytes.iter().sum::<u64>() <= 32 * 1024);
+    let plan = int8_attention_dispatch_plan(&params, 31 * 1024, true);
+    assert_eq!(plan.kind, AttentionDispatchKind::GqaTiledPrefill);
+    assert_eq!(plan.threadgroup_memory_bytes, [13312, 18432]);
+    assert_eq!(plan.threadgroups, [1, 8, 1]);
+    assert_eq!(plan.threads_per_threadgroup, [32, 8, 1]);
     assert_eq!(
-        int8_attention_dispatch_plan(&params, 16 * 1024).kind,
+        int8_attention_dispatch_plan(&params, 31 * 1024 - 1, true).kind,
+        AttentionDispatchKind::TiledPrefill
+    );
+    assert_eq!(
+        int8_attention_dispatch_plan(&params, 32 * 1024, false).kind,
+        AttentionDispatchKind::TiledPrefill
+    );
+    assert_eq!(
+        int8_attention_dispatch_plan(&params, 16 * 1024, true).kind,
         AttentionDispatchKind::General
     );
     // Gather-based INT8 tiles can cross page boundaries that prevent F16 direct loads.
@@ -530,9 +572,177 @@ fn int8_tiled_dispatch_accounts_for_bounded_dequantization_memory() {
     params.kv_projection_stride = params.key_value_heads * params.head_dim;
     assert!(!page_holds_whole_token_rows(&params));
     assert_eq!(
-        int8_attention_dispatch_plan(&params, 32 * 1024).kind,
-        AttentionDispatchKind::TiledPrefill
+        int8_attention_dispatch_plan(&params, 32 * 1024, true).kind,
+        AttentionDispatchKind::GqaTiledPrefill
     );
+    for (tokens, dim, heads, kv_heads, expected) in [
+        (1, 256, 16, 4, AttentionDispatchKind::DirectDecode),
+        (7, 256, 16, 4, AttentionDispatchKind::General),
+        (8, 128, 16, 4, AttentionDispatchKind::TiledPrefill),
+        (8, 256, 4, 4, AttentionDispatchKind::TiledPrefill),
+        (8, 256, 6, 2, AttentionDispatchKind::TiledPrefill),
+        (8, 34, 2, 1, AttentionDispatchKind::General),
+        (9, 256, 8, 1, AttentionDispatchKind::GqaTiledPrefill),
+    ] {
+        let mut params = dispatch_test_params(tokens, dim);
+        params.page_elements = VNEXT_KV_PAGE_BYTES as u32;
+        params.query_heads = heads;
+        params.key_value_heads = kv_heads;
+        assert_eq!(
+            int8_attention_dispatch_plan(&params, 32 * 1024, true).kind,
+            expected
+        );
+    }
+}
+
+fn check_gqa_prefill_case(
+    heads: usize,
+    kv_heads: usize,
+    prefix_tokens: usize,
+    tokens: usize,
+    gate: bool,
+) {
+    let device = Device::system_default().expect("INT8 GQA prefill conformance requires Metal");
+    let queue = device.new_command_queue();
+    let mut pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
+    assert!(
+        pipelines.supports_gqa_tiled_prefill
+            && pipelines.maximum_threadgroup_memory_length >= 31 * 1024,
+        "INT8 GQA reader not covered on this device: requires 32-lane SIMD, 256 threads and 31744 bytes; actual SIMD={}, threads={}, memory={}",
+        pipelines.gqa_tiled_prefill_attention.thread_execution_width(),
+        pipelines.gqa_tiled_prefill_attention.max_total_threads_per_threadgroup(),
+        pipelines.maximum_threadgroup_memory_length,
+    );
+    let dim = 256;
+    let state = State::new(&device, prefix_tokens + tokens, kv_heads, dim);
+    // Poison unused scales with NaN, including each page's final invalid rows.
+    for scale in &state.scales {
+        // SAFETY: no command has been submitted and this fixture exclusively
+        // owns each shared scale buffer. The first prepare writes valid heads.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                scale.contents().cast::<f32>(),
+                scale.length() as usize / 4,
+            )
+            .fill(f32::NAN);
+        }
+    }
+    if prefix_tokens != 0 {
+        let prefix = Inputs::new(prefix_tokens, heads, kv_heads, dim, gate);
+        assert_eq!(
+            prefix
+                .execute(&device, &queue, &pipelines, &state, 0, false)
+                .error,
+            0
+        );
+    }
+    let inputs = Inputs::new(tokens, heads, kv_heads, dim, gate);
+    let selected = inputs.execute(&device, &queue, &pipelines, &state, prefix_tokens, true);
+    assert_eq!(selected.error, 0);
+    assert_eq!(
+        selected.dispatch,
+        Some(AttentionDispatchKind::GqaTiledPrefill)
+    );
+    let saved_payload = state.payload();
+    let saved_scales = state
+        .scales()
+        .iter()
+        .map(|scale| scale.to_bits())
+        .collect::<Vec<_>>();
+    pipelines.supports_gqa_tiled_prefill = false;
+    let tiled = inputs.execute(&device, &queue, &pipelines, &state, prefix_tokens, true);
+    assert_eq!(tiled.error, 0);
+    assert_eq!(tiled.dispatch, Some(AttentionDispatchKind::TiledPrefill));
+    assert_eq!(state.payload(), saved_payload);
+    assert_eq!(
+        state
+            .scales()
+            .iter()
+            .map(|scale| scale.to_bits())
+            .collect::<Vec<_>>(),
+        saved_scales
+    );
+    let reference = attention_reference(&inputs, &selected, &state, prefix_tokens);
+    let selected_values = selected
+        .attention
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let tiled_values = tiled
+        .attention
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let cpu_error = assert_close(
+        "INT8 GQA/quantized CPU",
+        &selected_values,
+        &reference,
+        0.001,
+    );
+    let tiled_error = assert_close(
+        "INT8 GQA/single-head tiled",
+        &selected_values,
+        &tiled_values,
+        0.001,
+    );
+
+    // Compare the reader with F16 general attention over the same dequantized
+    // values. This isolates the reader from expected INT8 storage error; it is
+    // a test-only conversion, never a provider cache or inference workspace.
+    let f16_pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let page_elements = VNEXT_KV_PAGE_BYTES as usize / size_of::<f16>();
+    let valid_elements = (prefix_tokens + tokens) * 2 * kv_heads * dim;
+    let mut values = vec![f16::NAN; valid_elements.div_ceil(page_elements) * page_elements];
+    let scales = state.scales();
+    for (index, value) in values[..valid_elements].iter_mut().enumerate() {
+        *value = f16::from_f32(f32::from(saved_payload[index]) * scales[index / dim]);
+    }
+    let pages = values
+        .chunks_exact(page_elements)
+        .map(|page| shared_buffer(&device, page))
+        .collect::<Vec<_>>();
+    let mut params = inputs.params(&f16_pipelines, &state, prefix_tokens);
+    params.page_elements = page_elements as u32;
+    params.page_count = pages.len() as u32;
+    let f16_values = run_attention_plan(
+        &device,
+        &queue,
+        &f16_pipelines,
+        &shared_buffer(&device, &selected.query),
+        &shared_buffer(&device, &inputs.query),
+        &pages,
+        &params,
+        general_attention_dispatch_plan(&params),
+    );
+    let f16_error = assert_close(
+        "INT8 GQA/F16 reader on dequantized state",
+        &selected_values,
+        &f16_values,
+        0.001,
+    );
+    eprintln!(
+        "INT8 GQA actual={:?} Hq={heads} Hkv={kv_heads} D={dim} prefix={prefix_tokens} tokens={tokens} gate={gate}; pipeline SIMD={} max_threads={} device_TG_memory={}; max_abs CPU={cpu_error} old_tiled={tiled_error} F16_dequantized={f16_error}",
+        selected.dispatch,
+        pipelines.gqa_tiled_prefill_attention.thread_execution_width(),
+        pipelines.gqa_tiled_prefill_attention.max_total_threads_per_threadgroup(),
+        pipelines.maximum_threadgroup_memory_length,
+    );
+}
+
+#[test]
+fn int8_gqa_prefill_reuses_kv_across_heads_and_matches_tiled_f16_and_cpu() {
+    // GQA4 with a payload-page crossing and query/key tails; GQA2 with a
+    // token split across payload pages; MQA8 with one exact query/key tile.
+    check_gqa_prefill_case(16, 4, 31, 9, true);
+    check_gqa_prefill_case(6, 3, 42, 9, false);
+    check_gqa_prefill_case(8, 1, 0, 8, false);
+}
+
+#[test]
+fn int8_gqa_prefill_reads_across_an_independent_scale_page() {
+    let kv_heads = 4;
+    let prefix_tokens = VNEXT_KV_PAGE_BYTES as usize / (2 * kv_heads * size_of::<f32>()) - 1;
+    check_gqa_prefill_case(16, kv_heads, prefix_tokens, 9, true);
 }
 
 #[test]

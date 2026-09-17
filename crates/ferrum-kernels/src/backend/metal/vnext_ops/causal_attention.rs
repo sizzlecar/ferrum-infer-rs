@@ -83,6 +83,7 @@ const GQA_TILED_PREFILL_KEY_TILE: u64 = 64;
 const TILED_PREFILL_SIMDGROUPS: u64 = 4;
 const GQA_TILED_PREFILL_QUERY_HEADS: u32 = 2;
 const GQA_TILED_PREFILL_SIMDGROUPS: u64 = 8;
+const INT8_GQA_PREFILL_DIM_SLAB: u64 = 64;
 // One SIMD lane reduces each partial, so the reduction supports at most 32.
 const GROUPED_DECODE_MAX_PARTITIONS: u64 = SIMD_THREADS;
 const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = 256;
@@ -101,6 +102,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     binding_alignment: u64,
     maximum_attention_simdgroups: u32,
     maximum_threadgroup_memory_length: u64,
+    supports_gqa_tiled_prefill: bool,
 }
 
 impl MetalCausalAttentionPipelines {
@@ -254,6 +256,7 @@ impl MetalCausalAttentionPipelines {
             binding_alignment,
             maximum_attention_simdgroups,
             maximum_threadgroup_memory_length,
+            supports_gqa_tiled_prefill: true,
         })
     }
 
@@ -298,10 +301,14 @@ impl MetalCausalAttentionPipelines {
         let tiled_function = reader_library
             .get_function("vnext_causal_attention_prefill_tiled_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
+        let gqa_tiled_function = reader_library
+            .get_function("vnext_causal_attention_prefill_gqa_tiled_int8", None)
+            .map_err(MetalDeviceRuntimeError::contract)?;
         let prepare_encoder = prepare_function.new_argument_encoder(PREPARE_PAGE_TABLE_INDEX);
         let attention_encoder = attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
         let direct_encoder = direct_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
         let tiled_encoder = tiled_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let gqa_tiled_encoder = gqa_tiled_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
         let binding_encoded_length = prepare_encoder.encoded_length();
         let binding_alignment = prepare_encoder.alignment();
         if binding_encoded_length == 0
@@ -312,6 +319,8 @@ impl MetalCausalAttentionPipelines {
             || direct_encoder.alignment() != binding_alignment
             || tiled_encoder.encoded_length() != binding_encoded_length
             || tiled_encoder.alignment() != binding_alignment
+            || gqa_tiled_encoder.encoded_length() != binding_encoded_length
+            || gqa_tiled_encoder.alignment() != binding_alignment
         {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal INT8 causal kernels disagree on their two page tables",
@@ -328,6 +337,9 @@ impl MetalCausalAttentionPipelines {
             .map_err(MetalDeviceRuntimeError::contract)?;
         let tiled_prefill_attention = device
             .new_compute_pipeline_state_with_function(&tiled_function)
+            .map_err(MetalDeviceRuntimeError::contract)?;
+        let gqa_tiled_prefill_attention = device
+            .new_compute_pipeline_state_with_function(&gqa_tiled_function)
             .map_err(MetalDeviceRuntimeError::contract)?;
         if prepare.thread_execution_width() != SIMD_THREADS
             || attention.thread_execution_width() != SIMD_THREADS
@@ -347,21 +359,28 @@ impl MetalCausalAttentionPipelines {
             / SIMD_THREADS)
             .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS)
             as u32;
+        // A device with a lower per-pipeline thread limit retains the existing
+        // tiled/general readers; the optional GQA route must not reject it.
+        let supports_gqa_tiled_prefill = gqa_tiled_prefill_attention.thread_execution_width()
+            == SIMD_THREADS
+            && u64::from(gqa_tiled_prefill_attention.max_total_threads_per_threadgroup())
+                >= SIMD_THREADS * GQA_TILED_PREFILL_SIMDGROUPS;
         Ok(Self {
             kv_type: ElementType::I8,
             prepare,
             direct_decode_attention,
-            // These F16-specific routes are never selected for INT8 storage.
+            // Grouped decode remains F16-specific.
             grouped_decode_partial_attention: attention.clone(),
             grouped_decode_reduce_attention: attention.clone(),
             tiled_prefill_attention,
-            gqa_tiled_prefill_attention: attention.clone(),
+            gqa_tiled_prefill_attention,
             attention,
             binding_encoder: Mutex::new(prepare_encoder),
             binding_encoded_length,
             binding_alignment,
             maximum_attention_simdgroups,
             maximum_threadgroup_memory_length: device.max_threadgroup_memory_length() as u64,
+            supports_gqa_tiled_prefill,
         })
     }
 
@@ -387,7 +406,11 @@ impl MetalCausalAttentionPipelines {
 
     fn dispatch_plan(&self, params: &CausalAttentionParams) -> AttentionDispatchPlan {
         if self.kv_type == ElementType::I8 {
-            int8_attention_dispatch_plan(params, self.maximum_threadgroup_memory_length)
+            int8_attention_dispatch_plan(
+                params,
+                self.maximum_threadgroup_memory_length,
+                self.supports_gqa_tiled_prefill,
+            )
         } else {
             attention_dispatch_plan_with_memory_limit(
                 params,
@@ -2146,9 +2169,23 @@ fn attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchP
 fn int8_attention_dispatch_plan(
     params: &CausalAttentionParams,
     maximum_threadgroup_memory_length: u64,
+    supports_gqa_tiled_prefill: bool,
 ) -> AttentionDispatchPlan {
     if uses_direct_decode(params) {
         return direct_decode_attention_dispatch_plan(params);
+    }
+    if supports_gqa_tiled_prefill
+        && params.tokens >= TILED_PREFILL_QUERY_TILE
+        && params.head_dim == 256
+        && query_heads_per_kv_head(params).is_some_and(|heads| {
+            heads >= GQA_TILED_PREFILL_QUERY_HEADS
+                && heads.is_multiple_of(GQA_TILED_PREFILL_QUERY_HEADS)
+        })
+    {
+        let plan = int8_gqa_tiled_prefill_attention_dispatch_plan(params);
+        if plan.threadgroup_memory_bytes.iter().sum::<u64>() <= maximum_threadgroup_memory_length {
+            return plan;
+        }
     }
     // INT8 tiles gather through both page tables, so they do not require the
     // F16 direct-matrix-load page divisibility restriction.
@@ -2166,6 +2203,32 @@ fn int8_attention_dispatch_plan(
         }
     }
     general_attention_dispatch_plan(params)
+}
+
+fn int8_gqa_tiled_prefill_attention_dispatch_plan(
+    params: &CausalAttentionParams,
+) -> AttentionDispatchPlan {
+    let rows = u64::from(TILED_PREFILL_QUERY_TILE * GQA_TILED_PREFILL_QUERY_HEADS);
+    // Q and F32 output remain resident. K/V share one 32 x 64 half slab,
+    // gathered independently through the payload and scale page tables.
+    // For D=256 the two allocations sum to 31 KiB, including every region.
+    let half_elements = rows * u64::from(params.head_dim)
+        + rows * TILED_PREFILL_KEY_TILE
+        + TILED_PREFILL_KEY_TILE * INT8_GQA_PREFILL_DIM_SLAB;
+    let float_elements = rows * (u64::from(params.head_dim) + TILED_PREFILL_KEY_TILE);
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::GqaTiledPrefill,
+        threadgroups: [
+            u64::from(params.tokens).div_ceil(u64::from(TILED_PREFILL_QUERY_TILE)),
+            u64::from(params.query_heads / GQA_TILED_PREFILL_QUERY_HEADS),
+            1,
+        ],
+        threads_per_threadgroup: [SIMD_THREADS, GQA_TILED_PREFILL_SIMDGROUPS, 1],
+        threadgroup_memory_bytes: [
+            half_elements * ElementType::F16.size_bytes(),
+            float_elements * ElementType::F32.size_bytes(),
+        ],
+    }
 }
 
 fn attention_dispatch_plan_with_memory_limit(

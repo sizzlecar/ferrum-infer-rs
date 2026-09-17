@@ -95,6 +95,8 @@ fn names(backend: Backend) -> Vec<String> {
                 "int8_tiled_dispatch_accounts_for_bounded_dequantization_memory",
                 "int8_general_attention_accepts_a_partial_simd_head",
                 "int8_optimized_attention_reads_across_an_independent_scale_page",
+                "int8_gqa_prefill_reuses_kv_across_heads_and_matches_tiled_f16_and_cpu",
+                "int8_gqa_prefill_reads_across_an_independent_scale_page",
             ]),
             ("causal_attention::conformance_tests::int8::packed", &[
                 "packed_partial_head_f16_preserves_contiguous_rows_and_independent_histories",

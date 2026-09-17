@@ -1048,3 +1048,242 @@ kernel void vnext_causal_attention_prefill_tiled_int8(
         simdgroup,
         lane);
 }
+
+// Two query heads share each dequantized K/V slab. Keeping all Q and output
+// rows resident but only 64 K/V dimensions at a time uses 31 KiB, including
+// scores and probabilities, on devices with a 32 KiB threadgroup limit.
+// The existing single-head kernel remains the fallback and decode is separate.
+kernel void vnext_causal_attention_prefill_gqa_tiled_int8(
+    const device half *query [[buffer(0)]],
+    const device half *query_raw [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    device VNextKvPageTable& page_table [[buffer(3)]],
+    constant VNextCausalAttentionParams& params [[buffer(4)]],
+    threadgroup half *shared_half [[threadgroup(0)]],
+    threadgroup float *shared_float [[threadgroup(1)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint HEADS = 2;
+    constexpr uint QUERY_TILE = 8;
+    constexpr uint KEY_TILE = 32;
+    constexpr uint DIM = 256;
+    constexpr uint DIM_SLAB = 64;
+    constexpr uint SIMD_GROUPS = 8;
+    constexpr uint QUERY_ROWS = HEADS * QUERY_TILE;
+    const uint query_start = group.x * QUERY_TILE;
+    const uint query_head_start = group.y * HEADS;
+    // All conditions are uniform across the threadgroup, before any barrier.
+    if (query_start >= params.tokens ||
+        query_head_start + HEADS > params.query_heads ||
+        params.head_dim != DIM || params.key_value_heads == 0u) {
+        return;
+    }
+    const uint heads_per_kv = params.query_heads / params.key_value_heads;
+    if (heads_per_kv < HEADS || heads_per_kv % HEADS != 0u ||
+        params.query_heads % params.key_value_heads != 0u) {
+        return;
+    }
+    const uint kv_head = query_head_start / heads_per_kv;
+    const uint maximum_key_end = params.position_start +
+        min(query_start + QUERY_TILE, params.tokens);
+    threadgroup half *query_tile = shared_half;
+    threadgroup half *probabilities = query_tile + QUERY_ROWS * DIM;
+    threadgroup half *kv_slab = probabilities + QUERY_ROWS * KEY_TILE;
+    threadgroup float *accumulated_output = shared_float;
+    threadgroup float *scores = accumulated_output + QUERY_ROWS * DIM;
+
+    for (uint element = thread_index; element < QUERY_ROWS * DIM;
+         element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+        const uint row = element / DIM;
+        const uint dim = element % DIM;
+        const uint token = query_start + row % QUERY_TILE;
+        const uint head = query_head_start + row / QUERY_TILE;
+        query_tile[element] = token < params.tokens
+            ? query[((ulong)token * params.query_heads + head) * DIM + dim]
+            : half(0.0h);
+        accumulated_output[element] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float running_max[HEADS] = {-INFINITY, -INFINITY};
+    float running_sum[HEADS] = {0.0f, 0.0f};
+    const float attention_scale = rsqrt(float(DIM));
+
+    for (uint key_start = 0; key_start < maximum_key_end; key_start += KEY_TILE) {
+        // All eight SIMD groups compute: four key blocks for each of the
+        // two heads. Both heads consume the same cooperatively gathered slab.
+        const uint score_head = simdgroup / (KEY_TILE / 8u);
+        const uint score_block = simdgroup % (KEY_TILE / 8u);
+        simdgroup_float8x8 score_matrix = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        const uint key_block_start = key_start + score_block * 8u;
+        const uint key_block_rows = key_block_start < maximum_key_end
+            ? min(8u, maximum_key_end - key_block_start) : 0u;
+        for (uint dim_start = 0; dim_start < DIM; dim_start += DIM_SLAB) {
+            for (uint element = thread_index; element < KEY_TILE * DIM_SLAB;
+                 element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+                const uint position = key_start + element / DIM_SLAB;
+                const uint dim = dim_start + element % DIM_SLAB;
+                kv_slab[element] = position < maximum_key_end
+                    ? half(vnext_load_int8_kv(page_table, params, position, 0, kv_head, dim))
+                    : half(0.0h);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (key_block_rows == 8u) {
+                for (uint dim = 0; dim < DIM_SLAB; dim += 8u) {
+                    simdgroup_half8x8 key_matrix;
+                    simdgroup_load(key_matrix, kv_slab + score_block * 8u * DIM_SLAB + dim,
+                                   DIM_SLAB, ulong2(0, 0), true);
+                    simdgroup_half8x8 query_matrix;
+                    simdgroup_load(query_matrix,
+                                   query_tile + score_head * QUERY_TILE * DIM + dim_start + dim,
+                                   DIM, ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(score_matrix, query_matrix, key_matrix, score_matrix);
+                }
+            }
+            // All matrix consumers finish before the next dimension slab.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (key_block_rows == 8u) {
+            simdgroup_store(score_matrix,
+                            scores + score_head * QUERY_TILE * KEY_TILE + score_block * 8u,
+                            KEY_TILE, ulong2(0, 0), false);
+        } else {
+            // Retain the scalar tail's summation order and never read the
+            // uninitialized remainder of the last physical state page.
+            if (lane == 0u) {
+                for (uint row = 0; row < QUERY_TILE; ++row) {
+                    for (uint key_row = 0; key_row < 8u; ++key_row) {
+                        scores[(score_head * QUERY_TILE + row) * KEY_TILE +
+                               score_block * 8u + key_row] = 0.0f;
+                    }
+                }
+            }
+            for (uint query_row = 0; query_row < QUERY_TILE; ++query_row) {
+                for (uint key_row = 0; key_row < key_block_rows; ++key_row) {
+                    float partial_dot = 0.0f;
+                    for (uint dim = lane; dim < DIM; dim += VNEXT_SIMD_WIDTH) {
+                        const float key_value = vnext_load_int8_kv_half(
+                            page_table, params, key_block_start + key_row, 0, kv_head, dim);
+                        partial_dot +=
+                            float(query_tile[(score_head * QUERY_TILE + query_row) * DIM + dim]) *
+                            key_value;
+                    }
+                    const float dot = simd_sum(partial_dot);
+                    if (lane == 0u) {
+                        scores[(score_head * QUERY_TILE + query_row) * KEY_TILE +
+                               score_block * 8u + key_row] = dot;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each SIMD group owns the same query row in the two heads.
+        for (uint head = 0; head < HEADS; ++head) {
+            const uint row = head * QUERY_TILE + simdgroup;
+            const uint token = query_start + simdgroup;
+            const uint key_position = key_start + lane;
+            const bool keep = token < params.tokens &&
+                key_position <= params.position_start + token && key_position < maximum_key_end;
+            const float score = keep ? scores[row * KEY_TILE + lane] * attention_scale : -INFINITY;
+            const float next_maximum = max(running_max[head], simd_max(score));
+            const float previous_scale = isinf(running_max[head])
+                ? 0.0f : exp(running_max[head] - next_maximum);
+            const float probability = keep ? exp(score - next_maximum) : 0.0f;
+            probabilities[row * KEY_TILE + lane] = half(probability);
+            running_sum[head] = running_sum[head] * previous_scale + simd_sum(probability);
+            running_max[head] = next_maximum;
+            for (uint dim = lane; dim < DIM; dim += VNEXT_SIMD_WIDTH) {
+                accumulated_output[row * DIM + dim] *= previous_scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint dim_start = 0; dim_start < DIM; dim_start += DIM_SLAB) {
+            for (uint element = thread_index; element < KEY_TILE * DIM_SLAB;
+                 element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+                const uint position = key_start + element / DIM_SLAB;
+                const uint dim = dim_start + element % DIM_SLAB;
+                kv_slab[element] = position < maximum_key_end
+                    ? half(vnext_load_int8_kv(page_table, params, position, 1, kv_head, dim))
+                    : half(0.0h);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // One eight-column matrix per head/SIMD group fits this slab.
+            simdgroup_float8x8 output_matrices[HEADS];
+            const uint output_column = dim_start + simdgroup * 8u;
+            for (uint head = 0; head < HEADS; ++head) {
+                simdgroup_load(output_matrices[head],
+                               accumulated_output + head * QUERY_TILE * DIM + output_column,
+                               DIM, ulong2(0, 0), false);
+            }
+            for (uint key_block = 0; key_block < KEY_TILE / 8u; ++key_block) {
+                if (key_start + (key_block + 1u) * 8u > maximum_key_end) {
+                    continue;
+                }
+                simdgroup_half8x8 value_matrix;
+                simdgroup_load(value_matrix, kv_slab + key_block * 8u * DIM_SLAB + simdgroup * 8u,
+                               DIM_SLAB, ulong2(0, 0), false);
+                for (uint head = 0; head < HEADS; ++head) {
+                    simdgroup_half8x8 probability_matrix;
+                    simdgroup_load(probability_matrix,
+                                   probabilities + head * QUERY_TILE * KEY_TILE + key_block * 8u,
+                                   KEY_TILE, ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(output_matrices[head], probability_matrix,
+                                                 value_matrix, output_matrices[head]);
+                }
+            }
+            for (uint head = 0; head < HEADS; ++head) {
+                simdgroup_store(output_matrices[head],
+                                accumulated_output + head * QUERY_TILE * DIM + output_column,
+                                DIM, ulong2(0, 0), false);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const uint tail_rows = maximum_key_end % 8u;
+        const uint tail_start = maximum_key_end - tail_rows;
+        if (tail_rows != 0u && tail_start >= key_start && tail_start < key_start + KEY_TILE) {
+            const uint probability_column = tail_start - key_start;
+            for (uint element = thread_index; element < QUERY_TILE * DIM;
+                 element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+                const uint query_row = element / DIM;
+                const uint dim = element % DIM;
+                float tail_values[HEADS] = {0.0f, 0.0f};
+                for (uint key_row = 0; key_row < tail_rows; ++key_row) {
+                    const float value = vnext_load_int8_kv_half(
+                        page_table, params, tail_start + key_row, 1, kv_head, dim);
+                    for (uint head = 0; head < HEADS; ++head) {
+                        tail_values[head] += float(probabilities[
+                            (head * QUERY_TILE + query_row) * KEY_TILE +
+                            probability_column + key_row]) * value;
+                    }
+                }
+                for (uint head = 0; head < HEADS; ++head) {
+                    accumulated_output[head * QUERY_TILE * DIM + element] += tail_values[head];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint head = 0; head < HEADS; ++head) {
+        const uint row = head * QUERY_TILE + simdgroup;
+        const uint token = query_start + simdgroup;
+        const uint query_head = query_head_start + head;
+        if (token >= params.tokens) {
+            continue;
+        }
+        const float inverse_sum = 1.0f / running_sum[head];
+        for (uint dim = lane; dim < DIM; dim += VNEXT_SIMD_WIDTH) {
+            float value = accumulated_output[row * DIM + dim] * inverse_sum;
+            if (params.output_gate != 0u) {
+                const ulong gate_index = (ulong)token * params.query_projection_stride +
+                    (ulong)query_head * (2ul * DIM) + DIM + dim;
+                value *= 1.0f / (1.0f + exp(-float(query_raw[gate_index])));
+            }
+            output[((ulong)token * params.query_heads + query_head) * DIM + dim] = half(value);
+        }
+    }
+}
