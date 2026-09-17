@@ -1,4 +1,4 @@
-use super::{identity, write_json, Args};
+use super::{identity, kv, write_json, Args};
 use anyhow::{bail, ensure, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -158,7 +158,9 @@ pub(super) async fn run(
     timeout: Duration,
 ) -> Result<String> {
     let configuration_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run")
-        && (args.runtime_capacity().is_some() || identity::requires_source_evidence(args)?)
+        && (args.runtime_capacity().is_some()
+            || args.kv_dtype.is_some()
+            || identity::requires_source_evidence(args)?)
     {
         let path = args
             .report_dir
@@ -189,6 +191,8 @@ pub(super) async fn run(
         }
         identity::validate_source_config(args, &config)
             .with_context(|| format!("{name} actual source selection"))?;
+        kv::validate_storage(args.kv_dtype, &config)
+            .with_context(|| format!("{name} actual KV storage"))?;
     }
     Ok(stdout)
 }
@@ -216,7 +220,7 @@ impl<'a> Server<'a> {
             "--served-model-name".into(),
             "regression-model".into(),
         ]);
-        if identity::requires_source_evidence(args)? {
+        if args.kv_dtype.is_some() || identity::requires_source_evidence(args)? {
             argv.extend([
                 "--effective-config-json".into(),
                 args.report_dir
@@ -258,6 +262,15 @@ impl<'a> Server<'a> {
                     if status.is_success() {
                         let health = serde_json::from_str(&text).context("parse /health")?;
                         identity::validate_serve(args, &health)?;
+                        kv::validate_storage(args.kv_dtype, &health)
+                            .context("serve actual KV storage from /health")?;
+                        if args.kv_dtype.is_some() {
+                            let config: Value = serde_json::from_slice(&fs::read(
+                                args.report_dir.join("serve.effective-config.json"),
+                            )?)?;
+                            kv::validate_storage(args.kv_dtype, &config)
+                                .context("serve actual KV storage from effective config")?;
+                        }
                         let source_identity = identity::source_evidence(args, "serve")?;
                         return Ok(Self {
                             args,

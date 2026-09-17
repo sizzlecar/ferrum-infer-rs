@@ -5,6 +5,8 @@
 mod cases;
 #[path = "model_regression/identity.rs"]
 mod identity;
+#[path = "model_regression/kv.rs"]
+mod kv;
 #[path = "model_regression/process.rs"]
 mod process;
 #[path = "model_regression/protocol.rs"]
@@ -42,6 +44,10 @@ struct Args {
     source_expectation: Option<ferrum_bench_core::release_regression::GgufSourceProfile>,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
+    /// Explicit vNext causal KV storage, verified against the executing model plan.
+    /// Prepared release tasks do not yet declare this independent selection.
+    #[arg(long, value_enum, conflicts_with = "expected_task")]
+    kv_dtype: Option<kv::KvDtype>,
     /// Link this execution to a prepared model task. Its configuration is checked before loading.
     #[arg(long)]
     expected_task: Option<PathBuf>,
@@ -123,6 +129,9 @@ impl Args {
         }
         if self.disable_thinking {
             args.push("--disable-thinking".into());
+        }
+        if let Some(dtype) = self.kv_dtype {
+            args.extend(["--kv-dtype".into(), dtype.cli_name().into()]);
         }
         if let Some(capacity) = self.runtime_capacity() {
             if entrypoint == "run" {
