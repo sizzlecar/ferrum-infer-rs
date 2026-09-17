@@ -40,6 +40,15 @@ fn release(draft: bool) -> Value {
 
 #[tokio::test]
 async fn partial_draft_resumes_only_missing_assets_and_formalizes_after_complete_inventory() {
+    resume_partial_draft(false).await;
+}
+
+#[tokio::test]
+async fn draft_hidden_from_tag_lookup_resumes_after_paginated_lookup() {
+    resume_partial_draft(true).await;
+}
+
+async fn resume_partial_draft(hidden_from_tag_lookup: bool) {
     #[derive(Default)]
     struct State {
         uploaded: bool,
@@ -56,7 +65,22 @@ async fn partial_draft_resumes_only_missing_assets_and_formalizes_after_complete
                 json!({"object":{"type":"commit","sha":"a".repeat(40)}}),
             ),
             ("GET", "/repos/test/repo/releases/tags/v2.3.4") => {
-                Response::json(200, release(!state.formal))
+                if hidden_from_tag_lookup && !state.formal {
+                    Response::text(404, "not found")
+                } else {
+                    Response::json(200, release(!state.formal))
+                }
+            }
+            ("GET", "/repos/test/repo/releases?per_page=100&page=1") => Response::json(
+                200,
+                Value::Array(
+                    (0..100)
+                        .map(|n| json!({"id": n + 20, "tag_name": format!("v1.0.{n}")}))
+                        .collect(),
+                ),
+            ),
+            ("GET", "/repos/test/repo/releases?per_page=100&page=2") => {
+                Response::json(200, json!([release(true)]))
             }
             ("GET", "/repos/test/repo/releases/7/assets?per_page=100&page=1") => Response::json(
                 200,
@@ -102,6 +126,112 @@ async fn partial_draft_resumes_only_missing_assets_and_formalizes_after_complete
         ["upload two", "formal"],
         "identical published state must perform no writes"
     );
+}
+
+#[tokio::test]
+async fn release_list_failures_ambiguity_and_metadata_conflicts_do_not_write() {
+    let mut conflicting = release(true);
+    conflicting["body"] = json!("Different accepted notes");
+    let mut duplicate = release(true);
+    duplicate["id"] = json!(8);
+    let scenarios = [
+        (503, json!({}), "not treating this as missing"),
+        (404, json!({}), "not treating this as missing"),
+        (200, json!({}), "not an array"),
+        (200, json!([{}]), "entry has no tag"),
+        (200, json!([release(true), duplicate]), "multiple releases"),
+        (200, json!([conflicting]), "metadata conflicts"),
+    ];
+    for (status, body, expected_error) in scenarios {
+        let writes = Arc::new(Mutex::new(0));
+        let view = writes.clone();
+        let server = Server::new(move |request| {
+            if request.method != "GET" {
+                *view.lock().unwrap() += 1;
+                return Response::text(500, "unexpected mutation");
+            }
+            match request.path.as_str() {
+                "/repos/test/repo/git/ref/tags/v2.3.4" => Response::text(404, "tag absent"),
+                "/repos/test/repo/releases/tags/v2.3.4" => Response::text(404, "not found"),
+                "/repos/test/repo/releases?per_page=100&page=1" => {
+                    Response::json(status, body.clone())
+                }
+                _ => panic!("unexpected read {}", request.path),
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let error = reconcile_release(&api(&server), "test/repo", &accepted(directory.path()))
+            .await
+            .unwrap_err();
+        assert!(error.contains(expected_error), "{error}");
+        assert_eq!(*writes.lock().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn duplicate_release_on_later_page_is_not_accepted_as_unique() {
+    let server = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        match request.path.as_str() {
+            "/repos/test/repo/releases/tags/v2.3.4" => Response::text(404, "not found"),
+            "/repos/test/repo/releases?per_page=100&page=1" => {
+                let mut rows: Vec<_> = (0..99)
+                    .map(|n| json!({"id": n + 20, "tag_name": format!("v1.0.{n}")}))
+                    .collect();
+                rows.push(release(true));
+                Response::json(200, json!(rows))
+            }
+            "/repos/test/repo/releases?per_page=100&page=2" => {
+                let mut duplicate = release(true);
+                duplicate["id"] = json!(8);
+                Response::json(200, json!([duplicate]))
+            }
+            _ => panic!("unexpected read {}", request.path),
+        }
+    });
+    assert!(find_release(&api(&server), "test/repo", "v2.3.4")
+        .await
+        .unwrap_err()
+        .contains("multiple releases"));
+}
+
+#[tokio::test]
+async fn repeated_unrelated_release_page_is_rejected() {
+    let server = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        if request.path == "/repos/test/repo/releases/tags/v2.3.4" {
+            return Response::text(404, "not found");
+        }
+        assert!(request
+            .path
+            .starts_with("/repos/test/repo/releases?per_page=100&page="));
+        Response::json(
+            200,
+            json!((0..100)
+                .map(|n| json!({"id": n + 20, "tag_name": format!("v1.0.{n}")}))
+                .collect::<Vec<_>>()),
+        )
+    });
+    assert!(find_release(&api(&server), "test/repo", "v2.3.4")
+        .await
+        .unwrap_err()
+        .contains("repeats an id"));
+}
+
+#[tokio::test]
+async fn missing_release_requires_a_successful_empty_listing() {
+    let server = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        match request.path.as_str() {
+            "/repos/test/repo/releases/tags/v2.3.4" => Response::text(404, "not found"),
+            "/repos/test/repo/releases?per_page=100&page=1" => Response::json(200, json!([])),
+            _ => panic!("unexpected read {}", request.path),
+        }
+    });
+    assert!(find_release(&api(&server), "test/repo", "v2.3.4")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use super::{
 };
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct GitHub {
     client: Client,
@@ -249,32 +249,17 @@ async fn reconcile_release(
     repo: &str,
     accepted: &AcceptedRelease,
 ) -> Result<(), String> {
-    ensure_tag(api, repo, accepted).await?;
     let tag = format!("v{}", accepted.version);
-    let release = match api.get(&format!("/repos/{repo}/releases/tags/{tag}")).await? {
+    let existing_release = find_release(api, repo, &tag).await?;
+    if let Some(release) = &existing_release {
+        validate_release_metadata(release, &tag, &accepted.notes)?;
+    }
+    ensure_tag(api, repo, accepted).await?;
+    let release = match existing_release {
         Some(release) => release,
         None => api.write(Method::POST, &format!("/repos/{repo}/releases"), &json!({"tag_name": tag, "target_commitish": accepted.candidate_sha, "name": tag, "body": accepted.notes, "draft": true, "prerelease": false})).await?,
     };
-    if release["tag_name"].as_str() != Some(tag.as_str())
-        || release["prerelease"].as_bool() != Some(false)
-        || release["body"].as_str() != Some(accepted.notes.as_str())
-    {
-        return Err("existing release metadata conflicts with accepted version/notes".into());
-    }
-    let id = release["id"]
-        .as_u64()
-        .ok_or("GitHub release is missing id")?;
-    let draft = release["draft"]
-        .as_bool()
-        .ok_or("GitHub release is missing draft state")?;
-    if !draft
-        && release["published_at"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .is_none()
-    {
-        return Err("formal GitHub release is missing publication confirmation".into());
-    }
+    let (id, draft) = validate_release_metadata(&release, &tag, &accepted.notes)?;
     let existing = list_assets(api, repo, id).await?;
     if existing
         .keys()
@@ -306,7 +291,7 @@ async fn reconcile_release(
             .body(bytes)
             .send()
             .await
-            .map_err(|_| "asset upload response unavailable; reconcile before retrying")?;
+            .map_err(|error| asset_upload_error(&asset.name, error))?;
         if !response.status().is_success() {
             return Err(format!(
                 "asset upload returned HTTP {}; reconcile before retrying",
@@ -349,6 +334,107 @@ async fn reconcile_release(
         }
     }
     Ok(())
+}
+
+fn asset_upload_error(name: &str, error: reqwest::Error) -> String {
+    let mut message = format!(
+        "asset upload response unavailable for {name} (timeout={}, connect={}, request={}, body={})",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+    );
+    let error = error.without_url();
+    message.push_str(&format!(": {error}"));
+    // Arbitrary transport messages may contain proxy URLs. Preserve useful
+    // socket diagnostics by type instead of logging raw source strings.
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            message.push_str(&format!(
+                "; IO kind={:?}, errno={:?}",
+                io.kind(),
+                io.raw_os_error()
+            ));
+        }
+        source = cause.source();
+    }
+    message.push_str("; reconcile before retrying");
+    message
+}
+
+fn validate_release_metadata(
+    release: &Value,
+    tag: &str,
+    notes: &str,
+) -> Result<(u64, bool), String> {
+    if release["tag_name"].as_str() != Some(tag)
+        || release["prerelease"].as_bool() != Some(false)
+        || release["body"].as_str() != Some(notes)
+    {
+        return Err("existing release metadata conflicts with accepted version/notes".into());
+    }
+    let id = release["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or("GitHub release is missing id")?;
+    let draft = release["draft"]
+        .as_bool()
+        .ok_or("GitHub release is missing draft state")?;
+    if !draft
+        && release["published_at"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err("formal GitHub release is missing publication confirmation".into());
+    }
+    Ok((id, draft))
+}
+
+async fn find_release(api: &GitHub, repo: &str, tag: &str) -> Result<Option<Value>, String> {
+    if let Some(release) = api
+        .get(&format!("/repos/{repo}/releases/tags/{tag}"))
+        .await?
+    {
+        return Ok(Some(release));
+    }
+    // A token may see a draft in the release list while the tag endpoint returns
+    // 404. Reconcile that draft before attempting to create another release.
+    let mut found = None;
+    let mut seen_ids = BTreeSet::new();
+    let mut page = 1;
+    loop {
+        let response = api
+            .get(&format!("/repos/{repo}/releases?per_page=100&page={page}"))
+            .await?
+            .ok_or("GitHub release list unavailable; not treating this as missing")?;
+        let rows = response
+            .as_array()
+            .ok_or("GitHub release list response is not an array")?;
+        for release in rows {
+            let release_tag = release["tag_name"]
+                .as_str()
+                .ok_or("GitHub release list entry has no tag")?;
+            let id = release["id"]
+                .as_u64()
+                .filter(|id| *id > 0)
+                .ok_or("GitHub release list entry has no id")?;
+            if !seen_ids.insert(id) {
+                return Err("GitHub release list repeats an id; retry reconciliation".into());
+            }
+            if release_tag == tag {
+                if found.is_some() {
+                    return Err("GitHub has multiple releases for the accepted tag".into());
+                }
+                found = Some(release.clone());
+            }
+        }
+        if rows.len() < 100 {
+            return Ok(found);
+        }
+        page += 1;
+    }
 }
 
 async fn reconcile_tap(
