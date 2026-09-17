@@ -255,7 +255,7 @@ admission, queuing, or the model's numerical profile.
 
 ### KV cache precision
 
-Development builds accept `--kv-dtype int8` in both `run` and `serve`. FP16 remains
+Ferrum v0.11.0 accepts `--kv-dtype int8` in both `run` and `serve`. FP16 remains
 the default. INT8 requires supported vNext standard causal attention on Metal or
 portable CUDA; unsupported combinations report an error.
 
@@ -342,7 +342,7 @@ and otherwise selects CPU. You can require a backend or install a specific versi
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.11.0
 ```
 
 To upgrade an installation made with the script, rerun the original install

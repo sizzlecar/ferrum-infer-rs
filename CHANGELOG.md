@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-17
+
 ### Fixed
 
 - Corrected packed Metal attention row offsets for head dimensions whose row size is not 16-byte aligned, covering both FP16 and INT8 KV.

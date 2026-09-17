@@ -546,7 +546,7 @@
     {
       "path": "README.md",
       "before_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
-      "after_sha256": "4d57f05e8ce8c01ab81f4141eedef4fae2752d8156af211feddd89b92d5f3906",
+      "after_sha256": "55b34e2578d255c1013e7abc0ffe2f24921518adb2780ee8a7f423814ce93838",
       "areas": [
         "build",
         "backend_submission",
@@ -554,12 +554,12 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
+      "rationale": "Reviewed the public v0.11.0 installation examples and opt-in run/serve INT8 KV contract: FP16 remains default; supported vNext standard causal attention uses Metal or portable CUDA and unsupported combinations reject explicitly. KV payload and scale storage decreases; model weights and fixed recurrent state do not. Health exposes the actual selected format. Whole-model checkpoint restore requires all model states to support it, while resent conversation history recomputes input. Reviewed optional /v1/models reasoning metadata: an actual thinking switch and its effective default are distinct from explicitly declared effort levels; missing capabilities remain unknown. The historical demo retains Ferrum 0.10.0, Orchestral 0.3.1, the exact Qwen3.5-9B Q4_K_M revision and M1 Max 32 GB scope; no new throughput or whole-model memory claim was added. Retain build, backend submission, template, termination and tool obligations; shared KV, numerical, capacity and checkpoint obligations remain derived from the code changes. This content review does not replace runtime or public installation evidence."
     },
     {
       "path": "README_zh.md",
       "before_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
-      "after_sha256": "c0b0f8a85f5ecca54b980a79695872f410c450b0d3eae7f3a72a8c166061def4",
+      "after_sha256": "c69bd9c7559978cab4ed340577457441a52eed980fef4936f9e0a927ec65b1f3",
       "areas": [
         "build",
         "backend_submission",
@@ -567,7 +567,7 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the added CDN-linked English demo and separate collapsed trial and advanced instructions. Trial uses the public latest installers, one model-only serve command, automatic backend/GGUF resolution and the default localhost port 8000; it does not claim the recording's concurrency or performance. Advanced reproduction retains pinned Ferrum 0.10.0 and Orchestral 0.3.1 installers, exact Qwen3.5-9B Q4_K_M weight revision/file, Metal numerical profile, context/concurrency/memory/prefix controls, model-default thinking, port 8001 model discovery and three independent coding sessions. The recording remains scoped to M1 Max with 32 GB. Retain distribution, backend, template, termination and tool-protocol obligations. This content review does not replace execution or installation evidence."
+      "rationale": "Reviewed the public v0.11.0 installation examples and opt-in run/serve INT8 KV contract: FP16 remains default; supported vNext standard causal attention uses Metal or portable CUDA and unsupported combinations reject explicitly. KV payload and scale storage decreases; model weights and fixed recurrent state do not. Health exposes the actual selected format. Whole-model checkpoint restore requires all model states to support it, while resent conversation history recomputes input. Reviewed optional /v1/models reasoning metadata: an actual thinking switch and its effective default are distinct from explicitly declared effort levels; missing capabilities remain unknown. The historical demo retains Ferrum 0.10.0, Orchestral 0.3.1, the exact Qwen3.5-9B Q4_K_M revision and M1 Max 32 GB scope; no new throughput or whole-model memory claim was added. Retain build, backend submission, template, termination and tool obligations; shared KV, numerical, capacity and checkpoint obligations remain derived from the code changes. This content review does not replace runtime or public installation evidence."
     }
   ],
   "release_profile_ids": [

@@ -235,7 +235,7 @@ reusable_execution_preparation = "auto" # auto、startup、on_demand
 
 ### KV 缓存精度
 
-开发版本的 `run` 和 `serve` 均可使用 `--kv-dtype int8`，默认仍为 FP16。
+Ferrum v0.11.0 的 `run` 和 `serve` 均可使用 `--kv-dtype int8`，默认仍为 FP16。
 此选项需要支持标准 causal attention 的 vNext 模型，以及 Metal 或 portable CUDA
 执行路径；不支持的组合会明确报错。
 
@@ -312,7 +312,7 @@ CUDA 12.4 与 NCCL 运行库时选择 CUDA，否则选择 CPU。也可以明确�
 
 ```bash
 curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.11.0
 ```
 
 使用脚本安装后，重新执行原安装命令即可升级。同版本、同后端已安装且校验通过时，
