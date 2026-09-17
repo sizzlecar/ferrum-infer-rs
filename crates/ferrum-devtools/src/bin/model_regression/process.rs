@@ -160,6 +160,8 @@ pub(super) async fn run(
     let configuration_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run")
         && (args.runtime_capacity().is_some()
             || args.kv_dtype.is_some()
+            || args.sequence_fit_policy.is_some()
+            || args.max_num_batched_tokens.is_some()
             || identity::requires_source_evidence(args)?)
     {
         let path = args
@@ -191,6 +193,8 @@ pub(super) async fn run(
         }
         identity::validate_source_config(args, &config)
             .with_context(|| format!("{name} actual source selection"))?;
+        super::capacity::validate_effective_policy(args, &config)
+            .with_context(|| format!("{name} effective admission policy"))?;
         kv::validate_storage(args.kv_dtype, &config)
             .with_context(|| format!("{name} actual KV storage"))?;
     }
@@ -220,7 +224,11 @@ impl<'a> Server<'a> {
             "--served-model-name".into(),
             "regression-model".into(),
         ]);
-        if args.kv_dtype.is_some() || identity::requires_source_evidence(args)? {
+        if args.kv_dtype.is_some()
+            || args.sequence_fit_policy.is_some()
+            || args.max_num_batched_tokens.is_some()
+            || identity::requires_source_evidence(args)?
+        {
             argv.extend([
                 "--effective-config-json".into(),
                 args.report_dir

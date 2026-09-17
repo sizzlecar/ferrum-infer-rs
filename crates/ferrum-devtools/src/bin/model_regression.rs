@@ -1,6 +1,8 @@
 //! Exercise a staged Ferrum binary with a real model, independently of this
 //! runner's accelerator features. Run with --help for explicit test inputs.
 
+#[path = "model_regression/capacity.rs"]
+mod capacity;
 #[path = "model_regression/cases.rs"]
 mod cases;
 #[path = "model_regression/identity.rs"]
@@ -93,6 +95,12 @@ struct Args {
     /// Public runtime memory budget for both entrypoints; requires explicit capacity.
     #[arg(long, requires_all = ["context_tokens", "max_num_seqs"], value_parser = clap::value_parser!(u64).range(1..))]
     runtime_memory_budget_bytes: Option<u64>,
+    /// Forward the typed product admission fit gate; prepared tasks keep their declared policy.
+    #[arg(long, value_enum, conflicts_with = "expected_task")]
+    sequence_fit_policy: Option<capacity::SequenceFitPolicy>,
+    /// Limit each scheduled batch through the existing run/serve product option.
+    #[arg(long, conflicts_with = "expected_task", value_parser = clap::value_parser!(u32).range(1..))]
+    max_num_batched_tokens: Option<u32>,
     /// Per-generation test output budget; does not change context or concurrency.
     #[arg(long, default_value = "512", value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
@@ -152,6 +160,12 @@ impl Args {
         }
         if let Some(dtype) = self.kv_dtype {
             args.extend(["--kv-dtype".into(), dtype.cli_name().into()]);
+        }
+        if let Some(policy) = self.sequence_fit_policy {
+            args.extend(["--sequence-fit-policy".into(), policy.cli_name().into()]);
+        }
+        if let Some(tokens) = self.max_num_batched_tokens {
+            args.extend(["--max-num-batched-tokens".into(), tokens.to_string()]);
         }
         if let Some(capacity) = self.runtime_capacity() {
             if entrypoint == "run" {
