@@ -630,7 +630,12 @@ where
                 .collect(),
             &mut capacity_blocked,
             &mut maintenance_boundary,
-            deferred.immediate_requested(),
+            // Growing one domain must not reclaim another domain below the
+            // same admission's fit requirement. Otherwise full-input admission
+            // can alternate growth and reclaim forever without becoming
+            // eligible. The typed fit vector includes every immediate claim;
+            // protecting it here does not acquire a logical reservation.
+            deferred.fit_requested(),
             &[],
         );
         match growth {

@@ -1830,6 +1830,204 @@ fn logical_fit_deferral_grows_unclaimed_backing_capacity() {
 }
 
 #[test]
+fn logical_fit_growth_reclaims_unrelated_backing_without_shrinking_sibling_fit() {
+    let target = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let sibling = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'b',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let donor = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'c',
+        1,
+        256,
+        TestDemand::Fixed,
+    );
+    let target_id = target.pool_id.clone();
+    let sibling_id = sibling.pool_id.clone();
+    let donor_id = donor.pool_id.clone();
+    let catalog = combine_catalogs(&[target, sibling, donor]);
+    let runtime = new_runtime(&catalog, 512);
+    let harness = harness(runtime, catalog, 512, false);
+    let maintenance = &harness.root.maintenance_controller;
+    for pool_id in [&target_id, &sibling_id, &donor_id] {
+        maintenance.initialize_pool(pool_id).unwrap();
+    }
+    maintenance.grow_pool(&sibling_id, 128).unwrap();
+    maintenance.grow_pool(&donor_id, 192).unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let admit = || {
+        binding
+            .try_admit_initial_sequence(
+                RequestResourceAdmissionRequest::new(
+                    work_with_ceiling(1, 3),
+                    AdmissionFitPolicy::FullInputMustFit,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap(),
+                SequenceResourceAdmissionRequest::new(
+                    chunked_work(3, 0..1),
+                    AdmissionFitPolicy::FullInputMustFit,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap(),
+                RunId::new("run/full-fit-reclaim").unwrap(),
+                RequestIdentity::new("request/full-fit-reclaim").unwrap(),
+            )
+            .unwrap()
+    };
+    let InitialSequenceResourceAdmissionDecision::Deferred(deferred) = admit() else {
+        panic!("the target must grow from one token to the full three-token fit")
+    };
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = maintenance
+        .maintain_for_admission_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("unrelated idle backing must satisfy the fit growth")
+    };
+    let rebalance = receipt.rebalance().unwrap();
+    assert_eq!(rebalance.pools().len(), 1);
+    assert_eq!(rebalance.pools()[0].pool_id(), &donor_id);
+    // The sibling's smaller idle chunk would be preferred without full-fit
+    // protection, invalidating that domain as soon as this one grows.
+    let status = maintenance.status().unwrap();
+    let sibling = status
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &sibling_id)
+        .unwrap();
+    assert_eq!(sibling.resident_bytes(), 192);
+    assert_eq!(sibling.free_bytes(), 192);
+    let InitialSequenceResourceAdmissionDecision::Admitted(sequence) = admit() else {
+        panic!("one maintenance pass must make the entire full-fit bundle eligible")
+    };
+    // Full fit remains an availability check, not a three-token reservation.
+    assert!(maintenance.status().unwrap().pools().iter().all(|pool| {
+        pool.live_occupancy().total().physical_bytes()
+            == if pool.pool_id() == &donor_id { 0 } else { 64 }
+    }));
+    drop(sequence);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn logical_fit_growth_waits_without_reclaiming_a_required_sibling() {
+    let target = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let sibling = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'b',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let target_id = target.pool_id.clone();
+    let sibling_id = sibling.pool_id.clone();
+    let catalog = combine_catalogs(&[target, sibling]);
+    let runtime = new_runtime(&catalog, 384);
+    let harness = harness(Arc::clone(&runtime), catalog, 384, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&target_id).unwrap();
+    maintenance.initialize_pool(&sibling_id).unwrap();
+    maintenance.grow_pool(&sibling_id, 128).unwrap();
+    // The complete fit is possible under this budget. A temporary reservation
+    // is the release source that currently prevents the remaining growth.
+    let competing =
+        DeviceCapacityReservation::reserve(&harness.root.dynamic_pools.budget, 128).unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let admit = || {
+        binding
+            .try_admit_initial_sequence(
+                RequestResourceAdmissionRequest::new(
+                    work_with_ceiling(1, 3),
+                    AdmissionFitPolicy::FullInputMustFit,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap(),
+                SequenceResourceAdmissionRequest::new(
+                    chunked_work(3, 0..1),
+                    AdmissionFitPolicy::FullInputMustFit,
+                    AdmissionPressureAction::WaitForRelease,
+                )
+                .unwrap(),
+                RunId::new("run/full-fit-wait").unwrap(),
+                RequestIdentity::new("request/full-fit-wait").unwrap(),
+            )
+            .unwrap()
+    };
+    let InitialSequenceResourceAdmissionDecision::Deferred(deferred) = admit() else {
+        panic!("the target's full fit must require backing growth")
+    };
+    let before = maintenance.status().unwrap();
+    let allocations_before = runtime.allocate_calls();
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        wait_condition,
+        maintenance_boundary: Some(boundary),
+        ..
+    } = maintenance
+        .maintain_for_admission_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("temporary budget pressure must wait without stealing sibling fit capacity")
+    };
+    assert!(!boundary.reclaim_sufficient());
+    assert_eq!(boundary.reclaim_candidate_chunks(), 0);
+    assert_eq!(maintenance.status().unwrap(), before);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    let waiter = harness
+        .root
+        .register_capacity_waiter(&wait_condition)
+        .unwrap();
+    assert!(!waiter.recheck().unwrap().should_retry());
+    // Re-observing unchanged pressure must not manufacture an epoch change
+    // that wakes the scheduler and repeats the same allocation/reclaim cycle.
+    assert!(matches!(
+        maintenance
+            .maintain_for_admission_deferred(&deferred)
+            .unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert!(!waiter.recheck().unwrap().should_retry());
+    assert_eq!(maintenance.status().unwrap(), before);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(competing);
+    assert!(waiter.recheck().unwrap().should_retry());
+    assert!(matches!(
+        maintenance
+            .maintain_for_admission_deferred(&deferred)
+            .unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    let InitialSequenceResourceAdmissionDecision::Admitted(sequence) = admit() else {
+        panic!("releasing the real competing reservation must unblock full-fit admission")
+    };
+    drop(sequence);
+    drop(waiter);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_change() {
     let catalog = pool_catalog(
         linear_profile(),
