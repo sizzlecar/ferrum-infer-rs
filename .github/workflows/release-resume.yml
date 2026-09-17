@@ -1,0 +1,191 @@
+name: Resume verified release publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Completed Deliver formal release run whose candidate and frozen evidence will be reused"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: formal-release-delivery
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  publish:
+    if: github.repository == 'sizzlecar/ferrum-infer-rs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the original candidate and unique source artifacts
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$RUNNER_TEMP/source-run.json"
+          jq -e --argjson id "$SOURCE_RUN" --argjson repo "$GITHUB_REPOSITORY_ID" '
+            .id == $id and .repository.id == $repo and .head_repository.id == $repo and
+            .head_branch == "main" and .status == "completed" and .run_attempt > 0 and
+            (.event == "push" or .event == "workflow_dispatch") and
+            (.path | split("@")[0]) == ".github/workflows/release-delivery.yml" and
+            (.head_sha | test("^[0-9a-f]{40}$"))' "$RUNNER_TEMP/source-run.json"
+          candidate=$(jq -er .head_sha "$RUNNER_TEMP/source-run.json")
+          git -C tools merge-base --is-ancestor "$candidate" HEAD
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts?per_page=100" > "$RUNNER_TEMP/source-artifact-pages.json"
+          jq -e --argjson run "$SOURCE_RUN" --arg candidate "$candidate" '
+            [.[].artifacts[] | select(.expired == false)] |
+            if all(.workflow_run.id == $run and .workflow_run.head_sha == $candidate)
+            then . else error("source artifact provenance differs from candidate") end' \
+            "$RUNNER_TEMP/source-artifact-pages.json" > "$RUNNER_TEMP/source-artifacts.json"
+          artifact_id() {
+            jq -er --arg name "$1" '[.[] | select(.name == $name)] |
+              if length == 1 then .[0].id else error("missing or ambiguous named source artifact: " + $name) end' \
+              "$RUNNER_TEMP/source-artifacts.json"
+          }
+          for name in release-plan release-tasks contract-checks installation-linux installation-macos-cpu publication-state; do
+            id=$(artifact_id "$name")
+            printf '%s=%s\n' "${name//-/_}" "$id" >> "$GITHUB_OUTPUT"
+          done
+          jq -e --arg run "$SOURCE_RUN" --arg candidate "$candidate" '
+            [.[] | select(.name | test("^ferrum-(linux|macos|windows)-.*-run-" + $run + "-[1-9][0-9]*-" + $candidate + "$"))] |
+            group_by(.name | sub("-run-[0-9]+-[0-9]+-[0-9a-f]+$"; "")) |
+            if length > 0 and all(length == 1) then flatten
+            else error("missing or ambiguous staged distributions; do not guess an execution attempt") end' \
+            "$RUNNER_TEMP/source-artifacts.json" > "$RUNNER_TEMP/staged-artifacts.json"
+          unix_ids=$(jq -er '[.[] | select(.name | test("^ferrum-(linux|macos)-")) | .id | tostring] |
+            if length > 0 then join(",") else error("missing Unix distributions") end' "$RUNNER_TEMP/staged-artifacts.json")
+          for backend in cpu cuda; do
+            id=$(jq -er --arg prefix "ferrum-windows-x86_64-$backend-run-" '[.[] | select(.name | startswith($prefix))] |
+              if length == 1 then .[0].id else error("missing or ambiguous Windows distribution") end' "$RUNNER_TEMP/staged-artifacts.json")
+            printf 'windows_%s=%s\n' "$backend" "$id" >> "$GITHUB_OUTPUT"
+          done
+          evidence_ids=$(jq -er '[.[] | select(.name | test("^release-.*-evidence$"))] | group_by(.name) |
+            if length > 0 and all(length == 1) then flatten | map(.id | tostring) | join(",")
+            else error("missing or ambiguous release evidence") end' "$RUNNER_TEMP/source-artifacts.json")
+          printf 'candidate=%s\nunix_ids=%s\nevidence_ids=%s\n' "$candidate" "$unix_ids" "$evidence_ids" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.candidate }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools -> target
+          shared-key: release-delivery-controller-rust-1.91
+      - name: Build the reviewed publication controller only
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p ferrum-devtools --bin release_delivery
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.unix_ids }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.windows_cuda }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-windows
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.windows_cpu }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-windows/cpu
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.evidence_ids }}
+          path: ${{ runner.temp }}/evidence
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.release_plan }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/plan
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.release_tasks }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/tasks
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.contract_checks }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/contracts
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.installation_linux }},${{ steps.source.outputs.installation_macos_cpu }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/installation
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.source.outputs.publication_state }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/publication
+      - name: Recheck the original candidate and resume its publication
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+          SOURCE_RUN: ${{ inputs.source_run_id }}
+        run: |
+          version=$(cargo metadata --manifest-path candidate/Cargo.toml --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
+          gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
+            --contracts "$RUNNER_TEMP/contracts/contract-checks.json" --version "$version"
+            --workspace "$GITHUB_WORKSPACE/candidate" --notes "$RUNNER_TEMP/plan/release-notes.md"
+            --windows-staged "$RUNNER_TEMP/staged-windows" --repo "$GITHUB_REPOSITORY" --ci-run-id "$SOURCE_RUN")
+          for abi in "$RUNNER_TEMP/staged/"*.abi.json; do gate_args+=(--abi "$abi"); done
+          for install in "$RUNNER_TEMP/installation/"*.json; do
+            if [ "$install" != "$RUNNER_TEMP/installation/cuda.json" ]; then gate_args+=(--installation "$install"); fi
+          done
+          gate_args+=(--installation "$RUNNER_TEMP/evidence/release-cuda-evidence/installation-cuda.json"
+            --installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
+          while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
+            < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
+          "$GITHUB_WORKSPACE/tools/target/debug/release_delivery" publish "${gate_args[@]}" \
+            --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
+          printf 'Candidate publication resumed from run %s. Public installations remain pending; run Deliver formal release with verify_published_version=%s.\n' \
+            "$SOURCE_RUN" "$version" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publication-state
+          path: ${{ runner.temp }}/publication/
+          if-no-files-found: warn
+          retention-days: 30
