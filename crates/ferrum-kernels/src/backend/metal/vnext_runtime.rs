@@ -1766,6 +1766,7 @@ pub struct MetalDeviceFence {
     stream_state: Arc<MetalStreamState>,
     pending: Arc<MetalPendingSubmissions>,
     terminal_accounted: AtomicBool,
+    completed_status: OnceLock<Result<(), MetalDeviceRuntimeError>>,
     commands: Vec<MetalDeviceCommand>,
     attribution: Option<DeviceSubmissionAttribution>,
 }
@@ -1782,19 +1783,22 @@ impl fmt::Debug for MetalDeviceFence {
 
 impl MetalDeviceFence {
     fn completed_terminal(&self) -> DeviceTerminalReceipt<MetalDeviceRuntimeError> {
-        let result = self
-            .commands
-            .iter()
-            .try_for_each(MetalDeviceCommand::check_completed_status);
+        // The core may reuse a quiescent binding slot while callers still keep
+        // this fence for diagnostics. A terminal receipt must never change when
+        // a later invocation resets/writes the same slot.
+        let result = self.completed_status.get_or_init(|| {
+            self.commands
+                .iter()
+                .try_for_each(MetalDeviceCommand::check_completed_status)
+        });
+        self.mark_terminal();
         match result {
-            Ok(()) => {
-                self.mark_terminal();
-                self.terminal_receipt(DeviceTerminal::Succeeded)
-            }
+            Ok(()) => self.terminal_receipt(DeviceTerminal::Succeeded),
             Err(error) => {
-                self.stream_state.fail();
-                self.mark_terminal();
-                self.terminal_receipt(DeviceTerminal::FailedButQuiescent(error))
+                // Invalid values fail this inference wave, not the Metal queue.
+                // Completion invalidates its target states; subsequent requests
+                // can use the healthy stream after resetting their own flags.
+                self.terminal_receipt(DeviceTerminal::FailedButQuiescent(error.clone()))
             }
         }
     }
@@ -2250,6 +2254,7 @@ impl MetalDeviceRuntime {
             stream_state: Arc::clone(&stream.state),
             pending: Arc::clone(&stream.pending),
             terminal_accounted: AtomicBool::new(false),
+            completed_status: OnceLock::new(),
             commands,
             attribution,
         };
@@ -3142,6 +3147,7 @@ mod tests {
             DeviceTerminal::FailedButQuiescent(_)
         ));
         assert_eq!(stream.pending.len(), 0);
+        assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
         assert!(
             matches!(runtime.query_fence(&fence), FenceQuery::Terminal(receipt) if matches!(receipt.terminal(), DeviceTerminal::FailedButQuiescent(_)))
         );
@@ -3153,9 +3159,9 @@ mod tests {
         let status = runtime
             .allocate_request(&buffer_request("resource/reused-status"))
             .unwrap();
-        for value in [1_u8, 0, 0] {
-            // A fresh stream can reuse this quiescent slot after a numerical failure.
-            let mut stream = runtime.create_stream().unwrap();
+        let mut stream = runtime.create_stream().unwrap();
+        let mut completed = Vec::new();
+        for value in [1_u8, 0, 1, 0] {
             let command = MetalDeviceCommand::operation(
                 "test_device_status_reset",
                 vec![status.region(0..8).unwrap()],
@@ -3190,6 +3196,27 @@ mod tests {
                 value == 0
             );
             assert_eq!(stream.pending.len(), 0);
+            assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
+            completed.push((fence, value == 0));
+            for (old_fence, succeeded) in &completed {
+                match runtime.query_fence(old_fence) {
+                    FenceQuery::Terminal(receipt) => {
+                        assert_eq!(receipt.terminal().is_succeeded(), *succeeded)
+                    }
+                    FenceQuery::Pending => panic!("a completed fence became pending"),
+                    FenceQuery::Indeterminate(_) => {
+                        panic!("a completed fence became indeterminate")
+                    }
+                }
+                assert_eq!(
+                    runtime
+                        .wait_fence(old_fence)
+                        .unwrap()
+                        .terminal()
+                        .is_succeeded(),
+                    *succeeded
+                );
+            }
         }
         let invalid = MetalDeviceCommand::operation(
             "test_invalid_status",

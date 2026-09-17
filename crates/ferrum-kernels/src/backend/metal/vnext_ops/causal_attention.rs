@@ -825,15 +825,11 @@ impl CausalAttentionShape {
         Ok(())
     }
 
-    fn state_bytes_per_token(self) -> Result<u64, String> {
+    fn state_bytes_per_token(self, kv_type: ElementType) -> Result<u64, String> {
         self.kv_features
             .checked_mul(2)
-            .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .and_then(|elements| elements.checked_mul(kv_type.size_bytes()))
             .ok_or_else(|| "Metal causal-attention KV bytes per token overflow".to_owned())
-    }
-
-    fn physical_state_bytes(self, tokens: u64) -> Result<u64, String> {
-        self.physical_state_bytes_with_type(tokens, ElementType::F16)
     }
 
     fn physical_state_bytes_with_type(
@@ -842,10 +838,7 @@ impl CausalAttentionShape {
         kv_type: ElementType,
     ) -> Result<u64, String> {
         let logical = self
-            .kv_features
-            .checked_mul(2)
-            .and_then(|elements| elements.checked_mul(kv_type.size_bytes()))
-            .ok_or_else(|| "Metal causal-attention KV token size overflows".to_owned())?
+            .state_bytes_per_token(kv_type)?
             .checked_mul(tokens)
             .ok_or_else(|| "Metal causal-attention KV state size overflows".to_owned())?;
         align_up(logical, VNEXT_KV_PAGE_BYTES)
@@ -859,21 +852,6 @@ impl CausalAttentionShape {
             .and_then(|bytes| bytes.checked_mul(tokens))
             .ok_or_else(|| "Metal INT8 causal-attention scales size overflows".to_owned())?;
         align_up(logical, VNEXT_KV_PAGE_BYTES)
-    }
-
-    fn physical_state_bytes_for_source_frontier(
-        self,
-        source_end_tokens: u64,
-        full_input_tokens: u64,
-    ) -> Result<u64, String> {
-        if source_end_tokens == 0 || source_end_tokens > full_input_tokens {
-            return Err("Metal causal-attention source frontier exceeds its full input".to_owned());
-        }
-        self.physical_state_bytes(source_end_tokens)
-    }
-
-    fn maximum_pages(self) -> Result<u64, String> {
-        Ok(self.physical_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES)
     }
 
     fn scratch_bytes_per_token(self) -> Result<u64, String> {
@@ -2143,6 +2121,7 @@ struct AttentionDispatchPlan {
     threadgroup_memory_bytes: [u64; 2],
 }
 
+#[cfg(test)]
 fn attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
     attention_dispatch_plan_with_memory_limit(params, u64::MAX)
 }
@@ -2736,10 +2715,18 @@ mod shape_tests {
     #[test]
     fn qwen35_4b_shape_exactly_fits_fixed_page_capability() {
         let shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
-        assert_eq!(shape.state_bytes_per_token().unwrap(), 4096);
-        assert_eq!(shape.maximum_pages().unwrap(), MAXIMUM_KV_PAGES);
+        assert_eq!(shape.state_bytes_per_token(ElementType::F16).unwrap(), 4096);
         assert_eq!(
-            shape.physical_state_bytes(17).unwrap(),
+            shape
+                .physical_state_bytes_with_type(shape.maximum_context_tokens, ElementType::F16)
+                .unwrap()
+                / VNEXT_KV_PAGE_BYTES,
+            MAXIMUM_KV_PAGES
+        );
+        assert_eq!(
+            shape
+                .physical_state_bytes_with_type(17, ElementType::F16)
+                .unwrap(),
             2 * VNEXT_KV_PAGE_BYTES
         );
         assert_eq!(
