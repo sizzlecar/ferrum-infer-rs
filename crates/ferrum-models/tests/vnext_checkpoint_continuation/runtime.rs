@@ -1,6 +1,14 @@
 use super::*;
 use std::ops::Range;
 
+pub type Composition = (
+    Arc<Runtime>,
+    OperationRuntimeRegistry<Runtime>,
+    WeightMaterializerRegistry,
+    WeightMaterializerSelection,
+    CapabilityCatalog,
+);
+
 pub struct Fixture {
     _composition: CompositionParts,
     compilation: ProgramPlanCompilation,
@@ -29,8 +37,7 @@ impl Fixture {
         let family = TypedFamilyRegistration::new(definition)
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
-        let composition = composition(kind);
-        let (runtime, registry, materializers, materializer_id, catalog) = composition.into_parts();
+        let (runtime, registry, materializers, materializer, catalog) = composition(kind, &family);
         let bucket = reusable.then(|| {
             ReusableExecutionBucketSpec::new(
                 ReusableExecutionClassId::new("fixture.checkpoint.decode").unwrap(),
@@ -80,7 +87,7 @@ impl Fixture {
             },
         )]))
         .unwrap();
-        options.require_weight_materializer(materializer_id);
+        options.require_weight_materializer_selection(materializer);
         options.retain_completion_value(id("value.output"));
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             &family,
@@ -345,6 +352,7 @@ impl Fixture {
             .unwrap()
     }
 
+    #[cfg(feature = "cuda")]
     pub fn execute_replayed(
         &self,
         session: &Arc<SequenceSession<Runtime>>,

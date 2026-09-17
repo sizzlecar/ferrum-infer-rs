@@ -24,8 +24,18 @@ use checks::{verify, verify_completed_input, verify_with_timing};
 
 type Runtime = MetalDeviceRuntime;
 
-fn composition(kind: AttentionKind) -> MetalVNextComposition {
-    MetalVNextComposition::create(id(format!("device.metal.checkpoint.{kind:?}"))).unwrap()
+fn composition(kind: AttentionKind, _family: &PreparedModelFamily) -> runtime::Composition {
+    let (runtime, registry, materializers, materializer_id, catalog) =
+        MetalVNextComposition::create(id(format!("device.metal.checkpoint.{kind:?}")))
+            .unwrap()
+            .into_parts();
+    (
+        runtime,
+        registry,
+        materializers,
+        WeightMaterializerSelection::exact(materializer_id),
+        catalog,
+    )
 }
 
 fn id<T>(value: impl Into<String>) -> T

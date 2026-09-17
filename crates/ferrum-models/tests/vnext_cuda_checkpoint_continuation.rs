@@ -2,7 +2,8 @@
 
 use ferrum_interfaces::vnext::*;
 use ferrum_kernels::backend::cuda::{
-    vnext_ops::CudaVNextComposition, vnext_runtime::CudaDeviceRuntime,
+    vnext_ops::{cuda_weight_materializer_selection, CudaVNextComposition},
+    vnext_runtime::CudaDeviceRuntime,
 };
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -24,13 +25,16 @@ use checks::{verify, verify_completed_input};
 
 type Runtime = CudaDeviceRuntime;
 
-fn composition(kind: AttentionKind) -> CudaVNextComposition {
-    CudaVNextComposition::create(
+fn composition(kind: AttentionKind, family: &PreparedModelFamily) -> runtime::Composition {
+    let (runtime, registry, materializers, catalog) = CudaVNextComposition::create(
         0,
         id(format!("device.cuda.checkpoint.{kind:?}")),
         ferrum_types::AttentionExecutionPolicy::Portable,
     )
     .unwrap()
+    .into_parts();
+    let materializer = cuda_weight_materializer_selection(family).unwrap();
+    (runtime, registry, materializers, materializer, catalog)
 }
 
 fn id<T>(value: impl Into<String>) -> T
