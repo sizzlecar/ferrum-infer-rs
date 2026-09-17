@@ -305,13 +305,13 @@ Metal compile 在 macOS 执行；CUDA compile 需要配置好的 CUDA 主机和 
 | 项目 | 当前状态 |
 | --- | --- |
 | 源码路径、现有 F16 限制与 legacy 区分 | 已静态核对；未运行模型 |
-| 新 ABI、profile/config、容量与恢复 | 设计完成，待实现 |
-| Metal / CUDA / run / serve | 待实现、待分别验证 |
+| 新 ABI、profile/config、容量与恢复 | 已实现，typed 合约与 Metal 双状态恢复测试通过；详见验证记录 |
+| Metal / CUDA / run / serve | 实现已进入开发分支；Metal kernel/provider 已本机运行，CUDA 与真实 run/serve 模型验收继续进行 |
 | 质量门槛与冻结语料 | 待在 P0/P1 准备并冻结 |
 | 实际内存、可达容量、延迟与吞吐 | 未测量，无收益承诺 |
 | SSD 保存/加载 | 不属于本项交付 |
 
-本文为文档变更，只做内容、引用和 diff 检查；不以未运行构建或模型测试暗示实现已经验证。
+实施中的命令、实际结果和未完成项记录在 [验证记录](vnext-8bit-kv-validation.zh.md)。设计要求不等同于已验证结果；仅在相应检查真正执行后更新完成状态。
 
 ## 12. 发布新版本任务（2026-09-17 追加）
 
