@@ -263,26 +263,39 @@ impl MetalCausalAttentionPipelines {
                 "Metal INT8 causal attention requires argument-buffer tier 2",
             ));
         }
-        // Precise division and rounding are part of the INT8 storage ABI.
-        let options = CompileOptions::new();
-        options.set_fast_math_enabled(false);
-        let library = device
-            .new_library_with_source(INT8_SHADER_SOURCE, &options)
+        // Precise division, rounding and non-finite detection are part of the
+        // INT8 write ABI. Keep prepare in its own strictly compiled library.
+        let prepare_options = CompileOptions::new();
+        prepare_options.set_fast_math_enabled(false);
+        let prepare_library = device
+            .new_library_with_source(INT8_SHADER_SOURCE, &prepare_options)
             .map_err(|error| {
                 MetalDeviceRuntimeError::contract(format!(
-                    "compile Metal vNext INT8 causal-attention library: {error}"
+                    "compile Metal vNext INT8 causal-prepare library: {error}"
                 ))
             })?;
-        let prepare_function = library
+        let prepare_function = prepare_library
             .get_function("vnext_causal_prepare_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
-        let attention_function = library
+        // Readers use the same default arithmetic policy as the F16 attention
+        // library. They never write the quantized payload, scales or status.
+        // This constructor's source is included in the provider/runtime
+        // implementation fingerprints, so changing its policy invalidates
+        // numerical execution identity without changing the storage contract.
+        let reader_library = device
+            .new_library_with_source(INT8_SHADER_SOURCE, &CompileOptions::new())
+            .map_err(|error| {
+                MetalDeviceRuntimeError::contract(format!(
+                    "compile Metal vNext INT8 causal-attention reader library: {error}"
+                ))
+            })?;
+        let attention_function = reader_library
             .get_function("vnext_causal_attention_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
-        let direct_function = library
+        let direct_function = reader_library
             .get_function("vnext_causal_attention_decode_direct_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
-        let tiled_function = library
+        let tiled_function = reader_library
             .get_function("vnext_causal_attention_prefill_tiled_int8", None)
             .map_err(MetalDeviceRuntimeError::contract)?;
         let prepare_encoder = prepare_function.new_argument_encoder(PREPARE_PAGE_TABLE_INDEX);

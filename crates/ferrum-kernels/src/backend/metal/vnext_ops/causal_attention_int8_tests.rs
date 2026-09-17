@@ -261,8 +261,19 @@ fn int8_prepare_matches_reference_rounding_zero_and_subnormal_scales() {
     let scales = state.scales();
     for head in 0..3 {
         let (expected, scale) = quantize(&inputs.value[head * 32..(head + 1) * 32]);
-        assert_eq!(&payload[(3 + head) * 32..(4 + head) * 32], expected);
+        assert_eq!(&payload[(3 + head) * 32..(4 + head) * 32], &expected);
         assert_eq!(scales[3 + head].to_bits(), scale.to_bits());
+        // A one-token attention row has probability exactly one. Check the
+        // separately compiled reader's conversion too, including F16 subnormals.
+        for (actual, quantized) in output.attention[head * 32..(head + 1) * 32]
+            .iter()
+            .zip(expected)
+        {
+            assert_eq!(
+                actual.to_bits(),
+                f16::from_f32(f32::from(quantized) * scale).to_bits()
+            );
+        }
     }
     assert!(output.attention.iter().all(|value| value.is_finite()));
     assert!(payload[192..].iter().all(|value| *value == 0xa5_u8 as i8));
@@ -431,11 +442,21 @@ fn int8_prepare_marks_nonfinite_input_in_device_status() {
     let queue = device.new_command_queue();
     let pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
     for invalid in [f16::NAN, f16::INFINITY] {
-        let mut inputs = Inputs::new(1, 1, 1, 32, false);
-        inputs.value[7] = invalid;
-        let state = State::new(&device, 1, 1, 32);
-        let output = inputs.execute(&device, &queue, &pipelines, &state, 0, false);
-        assert_ne!(output.error, 0);
+        for operand in ["query", "key", "value"] {
+            let mut inputs = Inputs::new(1, 1, 1, 32, false);
+            match operand {
+                "query" => inputs.query[7] = invalid,
+                "key" => inputs.key[7] = invalid,
+                "value" => inputs.value[7] = invalid,
+                _ => unreachable!(),
+            }
+            let state = State::new(&device, 1, 1, 32);
+            let output = inputs.execute(&device, &queue, &pipelines, &state, 0, false);
+            assert_ne!(
+                output.error, 0,
+                "{operand} must retain non-finite detection"
+            );
+        }
     }
 }
 
