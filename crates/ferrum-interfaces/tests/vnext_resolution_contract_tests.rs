@@ -701,6 +701,15 @@ fn numerical_policy_is_bound_to_external_context_even_for_self_consistent_wire()
 
     for (field, replacement) in [
         ("requested", json!({"require": "fixture.f32"})),
+        (
+            "requested_kv_storage",
+            serde_json::to_value(ferrum_types::KvStorageFormat::Int8PerTokenHeadF32ScaleV1)
+                .unwrap(),
+        ),
+        (
+            "selected_kv_storage",
+            serde_json::to_value(ferrum_types::KvStorageFormat::F16).unwrap(),
+        ),
         ("selected_profile", json!("fixture.other")),
         ("selected_version", json!({"major": 2, "minor": 0})),
         ("qualification_version", json!({"major": 2, "minor": 0})),

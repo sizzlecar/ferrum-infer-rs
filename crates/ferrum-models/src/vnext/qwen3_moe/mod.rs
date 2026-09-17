@@ -372,6 +372,12 @@ mod tests {
             .unwrap()[0];
         let prepared = registration.prepare(&definition, &profile.id).unwrap();
         profile.validate_program(prepared.program()).unwrap();
+        let mut partial = profile.clone();
+        partial.kv_storage.pop();
+        // Remaining INT8 declarations are individually valid, but cannot hide
+        // an omitted required layer's KV state from format selection.
+        partial.validate().unwrap();
+        assert!(partial.validate_program(prepared.program()).is_err());
         let states = prepared.program().states();
         for node in prepared
             .program()

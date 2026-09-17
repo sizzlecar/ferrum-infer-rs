@@ -31,7 +31,7 @@
 - 正式版已经是 [v0.10.0](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/v0.10.0)，2026-09-16 发布，候选提交 `0a7d94f3a5fe8994a9bb12d0ff4b16de7fa2027c`。不能把 9/9、9/11 文档里的待办当成今日缺口。
 - 安装、HF/GGUF、本地文件/目录、revision pin、CPU/Metal/CUDA 路径、Chat/无状态 Responses、工具调用、strict JSON、continuous batching、prefix/state cache、Rust bench-serve/decode-isolation 已有，不重新立项。
 - 正式 CUDA 制品只覆盖 **sm89**；不能因 Reddit 上有人用 3090/5090，就声称 Ferrum 当前预编译包可直接覆盖这些设备。扩大发行硬件范围需要对应制品与真实设备验收。
-- [9/17 旧建议撤回记录](next-release-adoption-2026-09-16.zh.md)和[9/11 需求记录](next-release-user-needs-2026-09-11.zh.md)继续保留；本次没有修改它们。
+- 本地已有的 9/17 旧建议撤回记录和 9/11 需求记录继续保留；它们未纳入本仓库，本次结论与证据在本文独立列出。
 
 最关键的静态证据如下。行号基于本地 HEAD；审计也对照了 main，未运行新模型来验证参数的实际运行表现。
 

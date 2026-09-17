@@ -34,6 +34,31 @@ fn causal_f32_master_q4k_provider_resumes_public_native_checkpoint() {
 }
 
 #[test]
+fn causal_int8_kv_q4k_provider_resumes_payload_and_scales_across_a_page_boundary() {
+    // The I8 payload row is 512 bytes: position 128 crosses its 64 KiB page,
+    // while the independent F32 scales remain inside their own page.
+    verify(
+        AttentionKind::CausalInt8,
+        &[0..128, 128..129],
+        &[129..137, 137..138],
+    );
+    verify(
+        AttentionKind::CausalInt8,
+        &[0..17, 17..129],
+        &[129..137, 137..138],
+    );
+}
+
+#[test]
+fn causal_int8_kv_captures_completed_input_and_restores_an_appended_suffix() {
+    verify_completed_input(
+        AttentionKind::CausalInt8,
+        &[0..128, 128..129],
+        &[129..130, 130..138],
+    );
+}
+
+#[test]
 fn gated_delta_f32_master_q4k_provider_resumes_public_native_checkpoint() {
     verify(AttentionKind::GatedDelta, &[0..2, 2..5], &[5..6, 6..9]);
     verify(AttentionKind::GatedDelta, &[0..5], &[5..6, 6..9]);
@@ -180,6 +205,12 @@ fn verify_with_timing(
     }
     let checkpoint = fixture.capture(&source);
     assert_eq!(checkpoint.completed_tokens(), prefix.last().unwrap().end);
+    if kind == AttentionKind::CausalInt8 {
+        assert_eq!(
+            checkpoint.logical_bytes(),
+            checkpoint.completed_tokens() as u64 * (2 * 2 * 128 + 2 * 2 * 4)
+        );
+    }
     assert_eq!(
         checkpoint.token_prefix(),
         &tokens[..checkpoint.completed_tokens()]

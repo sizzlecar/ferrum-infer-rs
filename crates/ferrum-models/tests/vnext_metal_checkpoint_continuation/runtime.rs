@@ -18,11 +18,9 @@ impl Fixture {
     pub fn new(kind: AttentionKind) -> Self {
         let definition = Family::new(kind);
         let states = definition.states();
+        let profile_id = definition.profile_id();
         let family = TypedFamilyRegistration::new(definition)
-            .prepare_with_profile(
-                &serde_json::to_value(kind).unwrap(),
-                &id("fixture.attention.f32-master"),
-            )
+            .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
         let composition =
             MetalVNextComposition::create(id(format!("device.metal.checkpoint.{kind:?}"))).unwrap();
@@ -505,7 +503,14 @@ impl Fixture {
         drop(identity);
         drop(active);
         step.try_retire_normal().unwrap();
-        Observation { values }
+        Observation {
+            values,
+            state_types: self
+                .states
+                .iter()
+                .map(|s| (s.id.to_string(), s.tensor.element_type))
+                .collect(),
+        }
     }
 
     pub fn capture(&self, source: &Arc<SequenceSession<Runtime>>) -> SequenceCheckpoint<Runtime> {
@@ -770,6 +775,7 @@ fn finish(start: NativeCheckpointStart<Runtime>) -> NativeCheckpointResult<Runti
 
 pub struct Observation {
     values: BTreeMap<String, Vec<u8>>,
+    state_types: BTreeMap<String, ElementType>,
 }
 impl Observation {
     pub fn assert_state_nonzero(&self) {
@@ -777,25 +783,29 @@ impl Observation {
             if name == "output" {
                 continue;
             }
-            let values = if name.ends_with("delta") {
-                bytes
+            let values = match self.state_types[name] {
+                ElementType::F32 => bytes
                     .chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                    .collect::<Vec<_>>()
-            } else {
-                bytes
+                    .collect::<Vec<_>>(),
+                ElementType::F16 => bytes
                     .chunks_exact(2)
                     .map(|bytes| {
                         f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                ElementType::I8 => bytes
+                    .iter()
+                    .map(|byte| i8::from_le_bytes([*byte]) as f32)
+                    .collect::<Vec<_>>(),
+                other => panic!("fixture does not define state observations for {other:?}"),
             };
             assert!(
                 !values.is_empty() && values.iter().all(|value| value.is_finite()),
                 "{name}: state must be finite and nonempty"
             );
             assert!(
-                values.iter().any(|value| value.abs() > 1.0e-6),
+                values.iter().any(|value| *value != 0.0),
                 "{name}: prefix did not produce nonzero state"
             );
         }

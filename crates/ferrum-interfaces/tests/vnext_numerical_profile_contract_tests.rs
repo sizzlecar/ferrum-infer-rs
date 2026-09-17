@@ -404,6 +404,17 @@ fn wire_rebuilds_selected_profile_and_rejects_forged_arithmetic_or_old_semantics
         &registry
     )
     .is_err());
+    let mut forged_kv = wire.clone();
+    forged_kv["numerical_profile"]["kv_storage"] =
+        serde_json::to_value(vec![KvStateStorage::F16 {
+            state: id("state.unbound"),
+        }])
+        .unwrap();
+    assert!(PreparedModelFamily::from_json_validated(
+        &serde_json::to_vec(&forged_kv).unwrap(),
+        &registry
+    )
+    .is_err());
     let mut identity = wire;
     identity["numerical_profile"]["id"] = json!("fixture.f32");
     assert!(PreparedModelFamily::from_json_validated(

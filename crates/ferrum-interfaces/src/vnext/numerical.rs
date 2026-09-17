@@ -190,6 +190,7 @@ impl NumericalExecutionProfile {
                 "program state ABI differs from the numerical profile",
             ));
         }
+        kv_storage::validate_program_kv_storage(self, program)?;
         Ok(())
     }
 

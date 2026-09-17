@@ -120,6 +120,15 @@ fn int8_kv_storage_rejects_missing_wrong_or_incomplete_scale_state() {
     let mut partial_checkpoint = valid.clone();
     partial_checkpoint.states[1].checkpoint = StateCheckpointCapability::Unsupported;
     assert!(partial_checkpoint.validate().is_err());
+    let mut boundary_only = valid.clone();
+    for state in &mut boundary_only.states {
+        state.checkpoint =
+            StateCheckpointCapability::CompletedBoundary(StateCheckpointContract::new(
+                StateCheckpointContents::BoundaryValue,
+                CheckpointInputDependency::ExactTokenPrefix,
+            ));
+    }
+    assert!(boundary_only.validate().is_err());
     let mut padding = valid.clone();
     padding.states[1].capacity_demand = StateCapacityDemand::TokenScaled {
         bytes_per_token: 64,
