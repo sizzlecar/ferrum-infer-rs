@@ -38,6 +38,12 @@ struct Args {
     /// Exact GGUF artifact; --model must name an immutable HF repository revision.
     #[arg(long)]
     gguf_file: Option<String>,
+    /// Explicit local model metadata, independently of the weight container.
+    #[arg(long, conflicts_with = "expected_task")]
+    semantic_source: Option<PathBuf>,
+    /// Explicit local tokenizer metadata; otherwise retain product resolution.
+    #[arg(long, conflicts_with = "expected_task")]
+    tokenizer_source: Option<PathBuf>,
     /// Retained from the prepared task once, then applied to every child process.
     #[arg(skip)]
     #[serde(skip)]
@@ -128,6 +134,14 @@ impl Args {
             args.extend(["--semantic-source".into(), source.semantic_source.clone()]);
             if let Some(tokenizer) = &source.tokenizer_source {
                 args.extend(["--tokenizer-source".into(), tokenizer.clone()]);
+            }
+        }
+        for (flag, source) in [
+            ("--semantic-source", &self.semantic_source),
+            ("--tokenizer-source", &self.tokenizer_source),
+        ] {
+            if let Some(source) = source {
+                args.extend([flag.into(), source.to_string_lossy().into_owned()]);
             }
         }
         if !self.use_default_backend {
@@ -332,6 +346,18 @@ async fn main() -> Result<()> {
             .to_str()
             .context("model path is not UTF-8")?
             .to_owned();
+    }
+    // Child processes run from their report directory. Resolve caller-relative
+    // metadata paths once, before spawning either product entrypoint.
+    for (flag, source) in [
+        ("--semantic-source", &mut args.semantic_source),
+        ("--tokenizer-source", &mut args.tokenizer_source),
+    ] {
+        if let Some(source) = source {
+            ensure!(!source.as_os_str().is_empty(), "{flag} must not be empty");
+            *source = fs::canonicalize(&*source).with_context(|| format!("resolve {flag}"))?;
+            ensure!(source.to_str().is_some(), "{flag} path is not UTF-8");
+        }
     }
     if let Some(expected) = &expected {
         if Path::new(&expected.profile.model).exists() {

@@ -44,6 +44,8 @@ struct LongContext {
 struct Model {
     id: String,
     model: PathBuf,
+    semantic_source: Option<PathBuf>,
+    tokenizer_source: Option<PathBuf>,
     source_label: String,
     precision_label: String,
     #[serde(default = "default_checks")]
@@ -194,6 +196,14 @@ impl Configuration {
         if self.disable_thinking {
             args.push("--disable-thinking".into());
         }
+        for (flag, source) in [
+            ("--semantic-source", &model.semantic_source),
+            ("--tokenizer-source", &model.tokenizer_source),
+        ] {
+            if let Some(source) = source {
+                args.extend([flag.into(), source.to_string_lossy().into_owned()]);
+            }
+        }
         if let Some(budget) = self.runtime_memory_budget_bytes {
             args.extend(["--runtime-memory-budget-bytes".into(), budget.to_string()]);
         }
@@ -322,6 +332,15 @@ fn fp16_and_int8_run_and_serve_preserve_product_behavior() -> Result<()> {
         fs::canonicalize(&config.runner_bin).context("resolve shared Rust model runner")?;
     for model in &mut config.models {
         model.model = fs::canonicalize(&model.model).context("resolve local model")?;
+        for (label, source) in [
+            ("semantic source", &mut model.semantic_source),
+            ("tokenizer source", &mut model.tokenizer_source),
+        ] {
+            if let Some(source) = source {
+                ensure!(!source.as_os_str().is_empty(), "{label} must not be empty");
+                *source = fs::canonicalize(&*source).with_context(|| format!("resolve {label}"))?;
+            }
+        }
     }
     fs::create_dir_all(&config.report_dir)?;
     ensure!(
@@ -433,4 +452,36 @@ fn prefix_evidence_distinguishes_native_restore_from_text_overlap_and_disabled_s
         0
     );
     assert!(prefix_observation(&report, true).is_err());
+}
+
+#[test]
+fn paired_local_gguf_configuration_preserves_independent_metadata_sources() {
+    let document = json!({"ferrum_bin": "/fixture/ferrum", "runner_bin": "/fixture/model_regression",
+        "backend": "metal", "hardware_label": "fixture device", "report_dir": "/fixture/report",
+        "context_tokens": 4096, "max_num_seqs": 1, "max_tokens": 128,
+        "models": [{"id": "gguf", "model": "/fixture/weights.gguf", "source_label": "fixture source",
+            "precision_label": "Q4_K", "semantic_source": "/fixture/metadata with spaces",
+            "tokenizer_source": "/fixture/tokenizer with spaces"}]});
+    let config: Configuration = serde_json::from_value(document.clone()).unwrap();
+    config.validate().unwrap();
+    for dtype in ["fp16", "int8"] {
+        let words = config.runner_args(&config.models[0], dtype, Path::new("/fixture/report"));
+        for pair in [
+            ["--model", "/fixture/weights.gguf"],
+            ["--semantic-source", "/fixture/metadata with spaces"],
+            ["--tokenizer-source", "/fixture/tokenizer with spaces"],
+        ] {
+            assert_eq!(words.windows(2).filter(|words| words == &pair).count(), 1);
+        }
+        assert!(!words.iter().any(|word| word == "--expected-task"));
+    }
+    let mut omitted = document;
+    let model = omitted["models"][0].as_object_mut().unwrap();
+    model.remove("semantic_source");
+    model.remove("tokenizer_source");
+    let config: Configuration = serde_json::from_value(omitted).unwrap();
+    let words = config.runner_args(&config.models[0], "fp16", Path::new("/fixture/report"));
+    assert!(!words
+        .iter()
+        .any(|word| matches!(word.as_str(), "--semantic-source" | "--tokenizer-source")));
 }
