@@ -598,13 +598,16 @@ jobs:
         env:
           BACKEND: ${{ matrix.backend }}
         run: |
-          features="ferrum-kernels/$BACKEND,ferrum-testkit/$BACKEND"
-          targets=(--lib --test op_diff)
+          # Include the public provider/checkpoint harness in this same Cargo
+          # invocation: contract_checks accepts only artifacts reported by its
+          # completed build, even if another step already compiled the target.
+          features="ferrum-kernels/$BACKEND,ferrum-testkit/$BACKEND,ferrum-models/$BACKEND"
+          targets=(--lib --test op_diff --test "vnext_${BACKEND}_checkpoint_continuation")
           if [[ "$BACKEND" == cuda ]]; then
             features="$features,ferrum-kernels/vllm-moe-marlin,ferrum-kernels/vllm-paged-attn-v2"
             targets+=(--test compressed_tensors_marlin_eq)
           fi
-          cargo test --locked -p ferrum-kernels -p ferrum-testkit "${targets[@]}" --features "$features" \
+          cargo test --locked -p ferrum-kernels -p ferrum-testkit -p ferrum-models "${targets[@]}" --features "$features" \
             --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"
           cargo run --locked -p ferrum-devtools --bin contract_checks -- \
             --backend "$BACKEND" --artifacts "$RUNNER_TEMP/device-contract-artifacts.jsonl" \
