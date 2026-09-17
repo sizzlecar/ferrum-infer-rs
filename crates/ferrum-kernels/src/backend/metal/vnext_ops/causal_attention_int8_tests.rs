@@ -7,6 +7,9 @@ use std::mem::size_of;
 #[path = "causal_attention_packed_tests.rs"]
 mod packed;
 
+#[path = "causal_attention_int8_timing_tests.rs"]
+mod timing;
+
 struct State {
     payload: Vec<Buffer>,
     scales: Vec<Buffer>,
@@ -602,6 +605,21 @@ fn check_gqa_prefill_case(
     tokens: usize,
     gate: bool,
 ) {
+    let _ = check_gqa_prefill_inputs(
+        prefix_tokens,
+        Inputs::new(tokens, heads, kv_heads, 256, gate),
+    );
+}
+
+fn check_gqa_prefill_inputs(prefix_tokens: usize, inputs: Inputs) -> (Vec<f16>, Vec<f16>) {
+    let (heads, kv_heads, dim, tokens, gate) = (
+        inputs.heads,
+        inputs.kv_heads,
+        inputs.dim,
+        inputs.tokens,
+        inputs.gate,
+    );
+    assert_eq!(dim, 256);
     let device = Device::system_default().expect("INT8 GQA prefill conformance requires Metal");
     let queue = device.new_command_queue();
     let mut pipelines = MetalCausalAttentionPipelines::new_int8(&device).unwrap();
@@ -613,7 +631,6 @@ fn check_gqa_prefill_case(
         pipelines.gqa_tiled_prefill_attention.max_total_threads_per_threadgroup(),
         pipelines.maximum_threadgroup_memory_length,
     );
-    let dim = 256;
     let state = State::new(&device, prefix_tokens + tokens, kv_heads, dim);
     // Poison unused scales with NaN, including each page's final invalid rows.
     for scale in &state.scales {
@@ -636,7 +653,6 @@ fn check_gqa_prefill_case(
             0
         );
     }
-    let inputs = Inputs::new(tokens, heads, kv_heads, dim, gate);
     let selected = inputs.execute(&device, &queue, &pipelines, &state, prefix_tokens, true);
     assert_eq!(selected.error, 0);
     assert_eq!(
@@ -727,6 +743,7 @@ fn check_gqa_prefill_case(
         pipelines.gqa_tiled_prefill_attention.max_total_threads_per_threadgroup(),
         pipelines.maximum_threadgroup_memory_length,
     );
+    (selected.attention, tiled.attention)
 }
 
 #[test]
@@ -736,6 +753,40 @@ fn int8_gqa_prefill_reuses_kv_across_heads_and_matches_tiled_f16_and_cpu() {
     check_gqa_prefill_case(16, 4, 31, 9, true);
     check_gqa_prefill_case(6, 3, 42, 9, false);
     check_gqa_prefill_case(8, 1, 0, 8, false);
+
+    // Distinct adjacent lanes expose a vector load/store permutation. The
+    // three V heads exercise ordinary signed values, half subnormals and the
+    // canonical zero head/scale; the ninth token retains the scalar key tail.
+    let mut inputs = Inputs::new(9, 6, 3, 256, false);
+    let ordinary = [-1.0_f32, 0.0, 0.25, 0.75];
+    let subnormal = [0x0001, 0x8001, 0x0002, 0x8002];
+    for token in 0..inputs.tokens {
+        for head in 0..inputs.kv_heads {
+            for dim in 0..inputs.dim {
+                let index = (token * inputs.kv_heads + head) * inputs.dim + dim;
+                inputs.value[index] = match head {
+                    0 => f16::from_f32(ordinary[dim % 4] * (1.0 - token as f32 * 0.05)),
+                    1 => f16::from_bits(subnormal[dim % 4]),
+                    _ => f16::ZERO,
+                };
+                if head == 2 {
+                    inputs.key[index] = f16::ZERO;
+                }
+            }
+        }
+    }
+    let (selected, tiled) = check_gqa_prefill_inputs(0, inputs);
+    assert_eq!(
+        selected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        tiled
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        "vector gather changed scalar-reader output bits",
+    );
 }
 
 #[test]

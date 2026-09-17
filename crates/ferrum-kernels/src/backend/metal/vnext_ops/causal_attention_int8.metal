@@ -1049,6 +1049,22 @@ kernel void vnext_causal_attention_prefill_tiled_int8(
         lane);
 }
 
+// The GQA reader has D=256 and the provider binds fixed 64 KiB payload pages.
+// Every four-dimensional vector is four-byte aligned and stays within its
+// head/page, even when a complete token row spans two physical pages. Resolve
+// payload and scale independently; a scale page covers a different frontier.
+inline half4 vnext_load_int8_gqa_kv4(
+    device VNextKvPageTable& page_table,
+    constant VNextCausalAttentionParams& params,
+    uint token, uint kind, uint head, uint dim) {
+    const ulong head_index = vnext_int8_head_index(token, kind, head, params);
+    const ulong element = head_index * 256ul + dim;
+    const device char *payload = page_table.pages[element >> 16u] + (element & 65535ul);
+    const char4 quantized = *reinterpret_cast<const device char4 *>(payload);
+    const float scale = *vnext_int8_scale(page_table, head_index);
+    return half4(float4(quantized) * scale);
+}
+
 // Two query heads share each dequantized K/V slab. Keeping all Q and output
 // rows resident but only 64 K/V dimensions at a time uses 31 KiB, including
 // scores and probabilities, on devices with a 32 KiB threadgroup limit.
@@ -1120,6 +1136,10 @@ kernel void vnext_causal_attention_prefill_gqa_tiled_int8(
         const uint key_block_rows = key_block_start < maximum_key_end
             ? min(8u, maximum_key_end - key_block_start) : 0u;
         for (uint dim_start = 0; dim_start < DIM; dim_start += DIM_SLAB) {
+#if defined(VNEXT_INT8_GQA_SCALAR_GATHER_REFERENCE)
+            // Rust's opt-in device diagnostic compiles the preceding scalar
+            // gather unchanged for a paired measurement. Production never
+            // defines this macro and has no runtime selector for it.
             for (uint element = thread_index; element < KEY_TILE * DIM_SLAB;
                  element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
                 const uint position = key_start + element / DIM_SLAB;
@@ -1128,6 +1148,18 @@ kernel void vnext_causal_attention_prefill_gqa_tiled_int8(
                     ? half(vnext_load_int8_kv(page_table, params, position, 0, kv_head, dim))
                     : half(0.0h);
             }
+#else
+            for (uint vector_index = thread_index; vector_index < KEY_TILE * DIM_SLAB / 4u;
+                 vector_index += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+                const uint element = vector_index * 4u;
+                const uint position = key_start + element / DIM_SLAB;
+                const uint dim = dim_start + element % DIM_SLAB;
+                *reinterpret_cast<threadgroup half4 *>(kv_slab + element) =
+                    position < maximum_key_end
+                        ? vnext_load_int8_gqa_kv4(page_table, params, position, 0, kv_head, dim)
+                        : half4(0.0h);
+            }
+#endif
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (key_block_rows == 8u) {
                 for (uint dim = 0; dim < DIM_SLAB; dim += 8u) {
@@ -1201,6 +1233,7 @@ kernel void vnext_causal_attention_prefill_gqa_tiled_int8(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint dim_start = 0; dim_start < DIM; dim_start += DIM_SLAB) {
+#if defined(VNEXT_INT8_GQA_SCALAR_GATHER_REFERENCE)
             for (uint element = thread_index; element < KEY_TILE * DIM_SLAB;
                  element += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
                 const uint position = key_start + element / DIM_SLAB;
@@ -1209,6 +1242,18 @@ kernel void vnext_causal_attention_prefill_gqa_tiled_int8(
                     ? half(vnext_load_int8_kv(page_table, params, position, 1, kv_head, dim))
                     : half(0.0h);
             }
+#else
+            for (uint vector_index = thread_index; vector_index < KEY_TILE * DIM_SLAB / 4u;
+                 vector_index += SIMD_GROUPS * VNEXT_SIMD_WIDTH) {
+                const uint element = vector_index * 4u;
+                const uint position = key_start + element / DIM_SLAB;
+                const uint dim = dim_start + element % DIM_SLAB;
+                *reinterpret_cast<threadgroup half4 *>(kv_slab + element) =
+                    position < maximum_key_end
+                        ? vnext_load_int8_gqa_kv4(page_table, params, position, 1, kv_head, dim)
+                        : half4(0.0h);
+            }
+#endif
             threadgroup_barrier(mem_flags::mem_threadgroup);
             // One eight-column matrix per head/SIMD group fits this slab.
             simdgroup_float8x8 output_matrices[HEADS];

@@ -21,7 +21,7 @@ const MEASURED_PAIRS: usize = 8;
     unexpected_cfgs,
     reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
 )]
-fn gpu_clock(command: &CommandBufferRef) -> Value {
+pub(super) fn gpu_clock(command: &CommandBufferRef) -> Value {
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
     // SAFETY: check availability before reading the documented double-valued
     // timestamps of this already-completed command. No new samples are taken.
