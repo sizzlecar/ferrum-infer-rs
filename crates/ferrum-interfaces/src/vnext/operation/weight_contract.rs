@@ -9,6 +9,12 @@ use super::super::{
 };
 use super::ElementType;
 
+mod hadamard;
+pub(crate) use hadamard::same_shared_transform_sign_component;
+pub use hadamard::{
+    GroupedFeatureTranspose, HadamardApplication, HadamardSigns, HadamardTransformSpec,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuantizationPacking {
@@ -204,6 +210,8 @@ pub enum WeightComponentRole {
     Permutation,
     Codebook,
     Metadata,
+    /// Immutable F32 signs shared only by typed Hadamard wrappers.
+    TransformSigns,
 }
 
 /// Padding is always explicit and carries the exact semantic padded shape.
@@ -285,7 +293,8 @@ pub const MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH: usize = 16;
 pub const MAX_PHYSICAL_WEIGHT_LAYOUT_NODES: usize = 4096;
 
 /// Typed physical storage tree for one logical weight. Every leaf binds one
-/// physical component exactly once. Recursive composition allows indexing or
+/// physical value component exactly once. Immutable `TransformSigns` may be
+/// shared by Hadamard wrappers. Recursive composition allows indexing or
 /// expert stacking around dense, tiled, strided, or quantized values without
 /// architecture-specific cases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +355,13 @@ pub enum PhysicalWeightLayout {
         block_axis: u32,
         block_padding: PhysicalWeightPadding,
     },
+    /// Stored values use a declared activation basis. Place this wrapper on
+    /// individual composite projections when only some consume that basis.
+    /// Transforming an already-transformed descendant is not supported.
+    Hadamard {
+        values: Box<PhysicalWeightLayout>,
+        transform: HadamardTransformSpec,
+    },
     /// A contiguous logical subrange on one axis is stored by reshaping that
     /// subrange and permuting the reshape axes. This captures checkpoint
     /// layouts such as grouped-to-tiled head order without a model flag,
@@ -387,9 +403,9 @@ impl PhysicalWeightLayout {
                         .then_with(|| left.extents.cmp(&right.extents))
                 });
             }
-            Self::AxisReshapePermutation { values, .. } | Self::Indexed { values, .. } => {
-                values.normalize()
-            }
+            Self::Hadamard { values, .. }
+            | Self::AxisReshapePermutation { values, .. }
+            | Self::Indexed { values, .. } => values.normalize(),
             Self::ExpertStack { experts, .. } => {
                 // Expert vector position is the expert index and is therefore
                 // semantic. Normalize descendants without sorting the vector.
@@ -669,6 +685,9 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
             }
             PhysicalWeightLayout::QuantizedBlockGrid { .. } => 2,
             PhysicalWeightLayout::BlockQuantized { .. } => 1,
+            PhysicalWeightLayout::Hadamard { transform, .. } => {
+                usize::from(matches!(transform.signs, HadamardSigns::Explicit(_)))
+            }
             PhysicalWeightLayout::AxisReshapePermutation { .. } => 0,
             PhysicalWeightLayout::Indexed { .. } => 1,
             PhysicalWeightLayout::Composite { .. } | PhysicalWeightLayout::ExpertStack { .. } => 0,
@@ -690,7 +709,8 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
                     push_physical_layout_child(&mut stack, &part.layout, child_depth, visited)?;
                 }
             }
-            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            PhysicalWeightLayout::Hadamard { values, .. }
+            | PhysicalWeightLayout::AxisReshapePermutation { values, .. }
             | PhysicalWeightLayout::Indexed { values, .. } => {
                 push_physical_layout_child(&mut stack, values, child_depth, visited)?;
             }
@@ -760,6 +780,12 @@ pub(crate) fn physical_component_ids(
                 insert_binding(scales);
             }
             PhysicalWeightLayout::BlockQuantized { blocks, .. } => insert_binding(blocks),
+            PhysicalWeightLayout::Hadamard { values, transform } => {
+                if let HadamardSigns::Explicit(signs) = &transform.signs {
+                    insert_binding(signs);
+                }
+                stack.push(values);
+            }
             PhysicalWeightLayout::AxisReshapePermutation { values, .. } => stack.push(values),
             PhysicalWeightLayout::Indexed {
                 indices, values, ..

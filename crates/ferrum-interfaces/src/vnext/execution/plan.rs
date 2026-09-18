@@ -831,6 +831,10 @@ impl ExecutionPlan {
             tensor: binding.tensor().clone(),
             usage: binding.usage(),
             storage: binding.storage().clone(),
+            readonly_weight: (binding.usage() == BufferUsage::Weights
+                && binding.access() == TensorAccess::Read)
+                .then(|| binding.weight().cloned())
+                .flatten(),
         };
         match values.get(binding.value_id()) {
             Some(previous) if previous != &canonical => Err(invalid_plan(format!(
@@ -860,7 +864,7 @@ impl ExecutionPlan {
                 let ranges = by_resource
                     .entry(component.resource_id().clone())
                     .or_default();
-                if let Some(previous) = ranges.iter().find(|previous| {
+                for previous in ranges.iter().filter(|previous| {
                     previous.value_id != *value_id
                         && previous.offset_bytes < end_bytes
                         && component.offset_bytes() < previous.end_bytes
@@ -870,7 +874,31 @@ impl ExecutionPlan {
                     let previous_binding = values.get(&previous.value_id).ok_or_else(|| {
                         invalid_plan("global alias range has no canonical value binding")
                     })?;
-                    if !same_alias_class || previous_binding.storage != binding.storage {
+                    let shared_signs =
+                        binding
+                            .readonly_weight
+                            .as_ref()
+                            .zip(previous_binding.readonly_weight.as_ref())
+                            .is_some_and(|(weight, previous_weight)| {
+                                previous_binding.storage.components().iter().any(
+                                    |previous_component| {
+                                        previous_component.offset_bytes() == previous.offset_bytes
+                                            && previous_component
+                                                .offset_bytes()
+                                                .checked_add(previous_component.length_bytes())
+                                                == Some(previous.end_bytes)
+                                            && crate::vnext::same_shared_transform_sign_component(
+                                                weight,
+                                                component,
+                                                previous_weight,
+                                                previous_component,
+                                            )
+                                    },
+                                )
+                            });
+                    if (!same_alias_class || previous_binding.storage != binding.storage)
+                        && !shared_signs
+                    {
                         return Err(invalid_plan(format!(
                             "values `{}` and `{value_id}` have undeclared, partial, or non-equivalent overlap in physical resource `{}`",
                             previous.value_id,

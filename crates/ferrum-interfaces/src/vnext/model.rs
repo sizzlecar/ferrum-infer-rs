@@ -14,13 +14,14 @@ pub use checkpoint::{
 use super::{
     checked_elements, physical_component_ids, validate_physical_layout_budget, AttributeId,
     AxisWeightComponent, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart,
-    ContractVersion, ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
-    NodeId, NumericalExecutionProfile, NumericalProfileId, OperationId, PhysicalStorageLayout,
-    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedTensorLayout,
-    ResolvedWeightBinding, ResolvedWeightComponentLayout, ResolvedWeightLogicalValidation,
-    SemanticValue, StateId, StateInitialization, TokenizerId, VNextError, WeightComponentRole,
-    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    ContractVersion, ElementType, ExternalModelMetadataId, FamilyNumericalProfiles,
+    HadamardApplication, HadamardSigns, ModelFamilyId, NodeId, NumericalExecutionProfile,
+    NumericalProfileId, OperationId, PhysicalStorageLayout, PhysicalWeightComponentBinding,
+    PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId, QuantizationGrouping,
+    QuantizationPacking, QuantizationSpec, ResolvedTensorLayout, ResolvedWeightBinding,
+    ResolvedWeightComponentLayout, ResolvedWeightLogicalValidation, SemanticValue, StateId,
+    StateInitialization, TokenizerId, VNextError, WeightComponentRole, WeightEncoding,
+    WeightFormatId, WeightId, WeightLayoutId, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
     MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
 };
 
@@ -201,6 +202,15 @@ impl WeightSchema {
                     reason: error.to_string(),
                 })?;
             let role_encoding_valid = match component.role {
+                WeightComponentRole::TransformSigns => {
+                    component.dimensions.len() == 1
+                        && matches!(
+                            component.encoding,
+                            WeightEncoding::Dense {
+                                element_type: ElementType::F32
+                            }
+                        )
+                }
                 WeightComponentRole::Scales => matches!(
                     component.encoding,
                     WeightEncoding::Dense {
@@ -312,6 +322,7 @@ impl WeightSchema {
             components,
             referenced,
             visited_nodes: 0,
+            hadamard_active: false,
         };
         validator.validate_layout(
             &tensor.physical_layout,
@@ -473,6 +484,7 @@ struct PhysicalLayoutValidator<'schema, 'references> {
     components: &'schema BTreeMap<WeightId, &'schema WeightComponentSpec>,
     referenced: &'references mut BTreeSet<WeightId>,
     visited_nodes: usize,
+    hadamard_active: bool,
 }
 
 impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
@@ -653,6 +665,33 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn bind_transform_signs(
+        &mut self,
+        binding: &PhysicalWeightComponentBinding,
+        width: u64,
+        depth: usize,
+    ) -> Result<(), VNextError> {
+        self.visit_node(depth)?;
+        let component = self.component(&binding.component_id)?;
+        if component.role != WeightComponentRole::TransformSigns
+            || component.encoding
+                != (WeightEncoding::Dense {
+                    element_type: ElementType::F32,
+                })
+            || binding.storage != PhysicalStorageLayout::exact_contiguous()
+        {
+            return Err(
+                self.invalid("Hadamard signs require exact-contiguous TransformSigns F32 storage")
+            );
+        }
+        self.validate_storage(component, &[width], &binding.storage)?;
+        // This narrowly typed, immutable auxiliary resource can be shared.
+        // Ordinary value/scales/index bindings still use bind_component's
+        // duplicate-reference rejection, including across logical tensors.
+        self.referenced.insert(component.id.clone());
         Ok(())
     }
 
@@ -1202,6 +1241,39 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                         self.invalid("block encoding changed while validating the physical layout")
                     );
                 }
+            }
+            PhysicalWeightLayout::Hadamard { values, transform } => {
+                if self.hadamard_active {
+                    return Err(self.invalid("nested Hadamard transforms are not supported"));
+                }
+                if semantic_dimensions.len() < 2
+                    || !matches!(
+                        logical_element_type,
+                        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                    )
+                    || (matches!(
+                        transform.application,
+                        HadamardApplication::AfterEmbeddingLookup
+                    ) && semantic_dimensions.len() != 2)
+                {
+                    return Err(self.invalid("Hadamard requires floating-point matrices; embedding lookup requires rank two"));
+                }
+                let width = *semantic_dimensions.last().unwrap();
+                transform
+                    .validate(width)
+                    .map_err(|error| self.invalid(error.to_string()))?;
+                if let HadamardSigns::Explicit(signs) = &transform.signs {
+                    self.bind_transform_signs(signs, width, depth)?;
+                }
+                self.hadamard_active = true;
+                let result = self.validate_layout(
+                    values,
+                    semantic_dimensions,
+                    logical_element_type,
+                    depth + 1,
+                );
+                self.hadamard_active = false;
+                result?;
             }
             PhysicalWeightLayout::AxisReshapePermutation {
                 values,

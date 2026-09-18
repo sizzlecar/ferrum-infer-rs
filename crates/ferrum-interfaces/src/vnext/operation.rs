@@ -103,11 +103,12 @@ pub use tensor_contract::{
     ResolvedTensorSpec, StrideConstraint, TensorAccess, TensorContract,
 };
 pub(crate) use weight_contract::{
-    checked_elements, physical_component_ids, validate_physical_layout_budget,
-    ResolvedWeightLogicalValidation,
+    checked_elements, physical_component_ids, same_shared_transform_sign_component,
+    validate_physical_layout_budget, ResolvedWeightLogicalValidation,
 };
 pub use weight_contract::{
-    AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, PhysicalStorageLayout,
+    AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, GroupedFeatureTranspose,
+    HadamardApplication, HadamardSigns, HadamardTransformSpec, PhysicalStorageLayout,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
     ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,

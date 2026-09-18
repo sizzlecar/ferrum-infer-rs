@@ -2,6 +2,11 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use candle_core::quantized::gguf_file::{Content, Value};
+use ferrum_interfaces::vnext::{
+    ContractVersion, ElementType, PhysicalWeightLayout, WeightComponentRole, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding, WeightSchema, WeightTensorSpec,
+};
+use ferrum_quantization::gguf::source::{hadamard_sign_component, hadamard_transform_spec};
 use ferrum_quantization::gguf::{
     GgufFile, GgufHadamardDirection, GgufHadamardGdnPermutation, GgufHadamardSigns, GgufInventory,
     GgufModelMetadata, GgufWeightComponentSource, NativeGgufFile,
@@ -424,4 +429,189 @@ fn retained_transform_arrays_reject_nested_types_and_truncation() {
             GgufInventory::read(&mut Cursor::new(&bytes[..length]), bytes.len() as u64).is_err()
         );
     }
+}
+
+fn source_schema(native: &NativeGgufFile) -> WeightSchema {
+    let mut components = Vec::new();
+    let mut tensors = Vec::new();
+    for (index, name) in native.tensor_names().enumerate() {
+        let info = native.tensor_info(name).unwrap();
+        assert_eq!(info.ggml_type, 0);
+        let id: ferrum_interfaces::vnext::WeightId =
+            format!("component.values.{index}").try_into().unwrap();
+        let mut layout = PhysicalWeightLayout::Dense {
+            component_id: id.clone(),
+        };
+        if let Some(transform) = native
+            .hadamard()
+            .and_then(|metadata| hadamard_transform_spec(metadata, name).unwrap())
+        {
+            layout = PhysicalWeightLayout::Hadamard {
+                values: Box::new(layout),
+                transform,
+            };
+        }
+        components.push(WeightComponentSpec {
+            id,
+            role: WeightComponentRole::Values,
+            external_names: vec![name.into()],
+            dimensions: info.dimensions.clone(),
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F32,
+            },
+            required: true,
+        });
+        tensors.push(WeightTensorSpec {
+            id: format!("weight.{index}").try_into().unwrap(),
+            dimensions: info.dimensions.clone(),
+            logical_element_type: ElementType::F32,
+            physical_layout: layout,
+            required: true,
+        });
+    }
+    if let Some(metadata) = native.hadamard() {
+        if matches!(metadata.signs(), GgufHadamardSigns::Explicit(_)) {
+            let widths: std::collections::BTreeSet<_> = metadata
+                .weights()
+                .values()
+                .map(|weight| weight.input_width())
+                .collect();
+            for width in widths {
+                components.push(hadamard_sign_component(width).unwrap());
+            }
+        }
+    }
+    WeightSchema {
+        format_id: "format.fixture.gguf".to_owned().try_into().unwrap(),
+        layout_id: "layout.fixture.gguf".to_owned().try_into().unwrap(),
+        version: ContractVersion::new(1, 0),
+        components,
+        tensors,
+    }
+}
+
+#[test]
+fn schema_binding_registers_read_only_f32_signs_once_per_width() {
+    let mut meta = metadata();
+    meta.insert(
+        "prism.hadamard.weight_names".into(),
+        strings(&["output.weight", "blk.0.attn_q.weight"]),
+    );
+    explicit(&mut meta, &[8], &[1, -1, 1, -1, -1, 1, 1, -1]);
+    let artifact = file(&fixture(
+        &meta,
+        &[("output.weight", 8, 0), ("blk.0.attn_q.weight", 8, 0)],
+    ));
+    let native = NativeGgufFile::open(artifact.path()).unwrap();
+    let schema = source_schema(&native);
+    let source =
+        GgufWeightComponentSource::open_with_schema(artifact.path(), &schema, native.hadamard())
+            .unwrap();
+    let signs: Vec<_> = schema
+        .components
+        .iter()
+        .filter(|component| component.role == WeightComponentRole::TransformSigns)
+        .collect();
+    assert_eq!(signs.len(), 1);
+    assert_eq!(signs[0].physical_bytes().unwrap(), 8 * 4);
+    let first = source.component(signs[0]).unwrap();
+    let second = source.component(signs[0]).unwrap();
+    assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
+    let values: Vec<_> = first
+        .bytes()
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, [1., -1., 1., -1., -1., 1., 1., -1.]);
+    let mut forged = signs[0].clone();
+    forged.external_names[0] = "output.weight".into();
+    assert!(source.component(&forged).is_err());
+}
+
+#[test]
+fn source_binding_rejects_omitted_transforms_wrong_direction_and_changed_sign_identity() {
+    let mut meta = metadata();
+    explicit(&mut meta, &[8], &[1; 8]);
+    let artifact = file(&fixture(&meta, &[("output.weight", 8, 0)]));
+    let native = NativeGgufFile::open(artifact.path()).unwrap();
+    let schema = source_schema(&native);
+    let mut omitted = schema.clone();
+    let PhysicalWeightLayout::Hadamard { values, .. } = &omitted.tensors[0].physical_layout else {
+        panic!("missing transform");
+    };
+    omitted.tensors[0].physical_layout = *values.clone();
+    omitted
+        .components
+        .retain(|component| component.role != WeightComponentRole::TransformSigns);
+    assert!(GgufWeightComponentSource::open_with_schema(
+        artifact.path(),
+        &omitted,
+        native.hadamard()
+    )
+    .is_err());
+    let mut wrong_direction = schema.clone();
+    let PhysicalWeightLayout::Hadamard { transform, .. } =
+        &mut wrong_direction.tensors[0].physical_layout
+    else {
+        unreachable!()
+    };
+    transform.application = ferrum_interfaces::vnext::HadamardApplication::AfterEmbeddingLookup;
+    assert!(GgufWeightComponentSource::open_with_schema(
+        artifact.path(),
+        &wrong_direction,
+        native.hadamard()
+    )
+    .is_err());
+    let mut changed = serde_json::to_value(native.hadamard().unwrap()).unwrap();
+    changed["signs"]["by_width"]["8"][0] = serde_json::json!(-1);
+    let changed = serde_json::from_value(changed).unwrap();
+    assert!(
+        GgufWeightComponentSource::open_with_schema(artifact.path(), &schema, Some(&changed))
+            .is_err()
+    );
+    assert!(GgufWeightComponentSource::open_with_schema(artifact.path(), &schema, None).is_err());
+}
+
+#[test]
+fn restored_metadata_revalidates_geometry_widths_and_signs() {
+    let mut meta = metadata();
+    explicit(&mut meta, &[8], &[1; 8]);
+    let parsed = inventory(&meta, &[("output.weight", 8, 0)])
+        .unwrap()
+        .hadamard
+        .unwrap();
+    let dimensions = [1, 8];
+    parsed
+        .validate_for_tensors(
+            "qwen35",
+            [("output.weight", dimensions.as_slice())].into_iter(),
+            None,
+        )
+        .unwrap();
+    for (field, value) in [
+        ("version", serde_json::json!(2)),
+        ("block_size", serde_json::json!(0)),
+    ] {
+        let mut changed = serde_json::to_value(&parsed).unwrap();
+        changed[field] = value;
+        let changed: ferrum_quantization::gguf::GgufHadamard =
+            serde_json::from_value(changed).unwrap();
+        assert!(changed
+            .validate_for_tensors(
+                "qwen35",
+                [("output.weight", dimensions.as_slice())].into_iter(),
+                None
+            )
+            .is_err());
+    }
+    let mut changed = serde_json::to_value(&parsed).unwrap();
+    changed["weights"]["output.weight"]["input_width"] = serde_json::json!(16);
+    let changed: ferrum_quantization::gguf::GgufHadamard = serde_json::from_value(changed).unwrap();
+    assert!(changed
+        .validate_for_tensors(
+            "qwen35",
+            [("output.weight", dimensions.as_slice())].into_iter(),
+            None
+        )
+        .is_err());
 }

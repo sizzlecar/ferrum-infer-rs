@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use candle_core::quantized::gguf_file::Value;
 use candle_core::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const PREFIX: &str = "prism.hadamard.";
 const KEYS: &[&str] = &[
@@ -25,7 +25,7 @@ const KEYS: &[&str] = &[
     "gdn_v_grouped",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GgufHadamardDirection {
     BeforeMatmul,
@@ -35,14 +35,16 @@ pub enum GgufHadamardDirection {
 /// Reorder features `[head_dim, key_heads, repeats]` to
 /// `[head_dim, repeats, key_heads]`, before applying signs and Hadamard.
 /// These are fastest-axis-first dimensions, matching GGML's `ne[]` order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgufHadamardGdnPermutation {
     pub head_dim: u64,
     pub key_heads: u64,
     pub repeats: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgufHadamardWeight {
     direction: GgufHadamardDirection,
     input_width: u64,
@@ -61,16 +63,43 @@ impl GgufHadamardWeight {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "mode", content = "by_width", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    content = "by_width",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum GgufHadamardSigns {
     Identity,
-    Explicit(BTreeMap<u64, Vec<i8>>),
+    Explicit(#[serde(deserialize_with = "deserialize_sign_widths")] BTreeMap<u64, Vec<i8>>),
 }
 
-/// Constructed only by validated GGUF parsing. Its deterministic serialization
-/// includes every mathematical choice and sign value needed for source identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+fn deserialize_sign_widths<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<u64, Vec<i8>>, D::Error> {
+    // Tagged-enum buffering uses Serde's value deserializer, which does not
+    // apply serde_json's numeric map-key conversion. Parse the canonical keys
+    // explicitly so family JSON roundtrips preserve width-indexed signs.
+    let raw = BTreeMap::<String, Vec<i8>>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(key, signs)| {
+            let width = key.parse::<u64>().map_err(serde::de::Error::custom)?;
+            if key != width.to_string() {
+                return Err(serde::de::Error::custom(
+                    "sign width keys must be canonical unsigned integers",
+                ));
+            }
+            Ok((width, signs))
+        })
+        .collect()
+}
+
+/// GGUF parsing validates this declaration. Family configurations reconstructed
+/// from serialized input must call `validate_for_tensors` before using it.
+/// Deterministic serialization includes all mathematical choices and signs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GgufHadamard {
     version: u32,
     block_size: u32,
@@ -97,6 +126,109 @@ impl GgufHadamard {
     }
     pub fn weight(&self, name: &str) -> Option<&GgufHadamardWeight> {
         self.weights.get(name)
+    }
+
+    /// Revalidate a restored declaration against the family's actual tensor
+    /// dimensions and independent recurrent `(key_heads, value_heads)` geometry.
+    /// Reconstructing the versioned source contract also checks that serialized
+    /// directions, widths and permutations were not changed independently.
+    pub fn validate_for_tensors<'a>(
+        &self,
+        architecture: &str,
+        tensors: impl Iterator<Item = (&'a str, &'a [u64])>,
+        gdn_head_counts: Option<(u32, u32)>,
+    ) -> Result<()> {
+        let mut metadata = BTreeMap::from([
+            (format!("{PREFIX}version"), Value::U32(self.version)),
+            (format!("{PREFIX}block_size"), Value::U32(self.block_size)),
+            (
+                format!("{PREFIX}transform"),
+                Value::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                format!("{PREFIX}axis"),
+                Value::String("input-last-dimension".into()),
+            ),
+            (
+                format!("{PREFIX}gdn_v_grouped"),
+                Value::Bool(self.gdn_v_grouped),
+            ),
+        ]);
+        for (key, direction) in [
+            ("weight_names", GgufHadamardDirection::BeforeMatmul),
+            (
+                "inverse_weight_names",
+                GgufHadamardDirection::AfterEmbeddingLookup,
+            ),
+        ] {
+            metadata.insert(
+                format!("{PREFIX}{key}"),
+                Value::Array(
+                    self.weights
+                        .iter()
+                        .filter(|(_, weight)| weight.direction == direction)
+                        .map(|(name, _)| Value::String(name.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        match &self.signs {
+            GgufHadamardSigns::Identity => {
+                metadata.insert(
+                    format!("{PREFIX}sign_mode"),
+                    Value::String("identity".into()),
+                );
+            }
+            GgufHadamardSigns::Explicit(by_width) => {
+                metadata.insert(
+                    format!("{PREFIX}sign_mode"),
+                    Value::String("explicit".into()),
+                );
+                metadata.insert(
+                    format!("{PREFIX}sign_widths"),
+                    Value::Array(
+                        by_width
+                            .keys()
+                            .map(|width| i32::try_from(*width).map(Value::I32).map_err(Error::wrap))
+                            .collect::<Result<_>>()?,
+                    ),
+                );
+                metadata.insert(
+                    format!("{PREFIX}sign_values"),
+                    Value::Array(
+                        by_width
+                            .values()
+                            .flatten()
+                            .map(|sign| Value::I32(i32::from(*sign)))
+                            .collect(),
+                    ),
+                );
+                // A serialized map must retain each width's own slice, rather
+                // than letting concatenation hide incorrect per-width lengths.
+                if by_width
+                    .iter()
+                    .any(|(width, signs)| *width != signs.len() as u64)
+                {
+                    return Err(invalid("restored sign table length differs from its width"));
+                }
+            }
+        }
+        if let Some((key_heads, value_heads)) = gdn_head_counts {
+            metadata.insert(
+                format!("{architecture}.ssm.group_count"),
+                Value::U32(key_heads),
+            );
+            metadata.insert(
+                format!("{architecture}.ssm.time_step_rank"),
+                Value::U32(value_heads),
+            );
+        }
+        if Self::parse(&metadata, architecture, tensors)?.as_ref() != Some(self) {
+            return Err(invalid(
+                "restored transform differs from the tensor/geometry-derived declaration",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn parse<'a>(
