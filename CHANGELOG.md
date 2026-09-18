@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-18
+
 ### Added
 
 - Added packed GGUF PQ2_0 and declared Hadamard transforms on Metal and CUDA, including embedding inverse transforms and mixed projection layouts, with incompatible metadata rejected explicitly.
