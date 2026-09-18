@@ -1,6 +1,44 @@
 name: Stage Windows release assets
 
 on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Windows package backend
+        type: choice
+        required: true
+        options: [cpu, cuda]
+      version:
+        description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      release_candidate_sha:
+        description: Exact release-candidate commit to build
+        required: true
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        type: string
+      publish_release:
+        description: Safety lock; production staging requires false
+        required: true
+        default: false
+        type: boolean
+      windows_launcher_url:
+        description: Immutable released launcher URL; empty only for its first issuance
+        required: false
+        default: ''
+        type: string
+      windows_launcher_sha256:
+        description: SHA256 paired with windows_launcher_url; the launcher is reused unchanged
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       backend:
@@ -123,7 +161,18 @@ jobs:
           $jobs = [math]::Max(1, [math]::Min($logical, [math]::Floor(($availableGiB - 1) / 2)))
           "CARGO_BUILD_JOBS=$jobs" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           $cache = if ($env:FERRUM_WINDOWS_OBJECT_CACHE) { $env:FERRUM_WINDOWS_OBJECT_CACHE } else { Join-Path $env:USERPROFILE 'ferrum-native-object-cache' }
+          $cache = [IO.Path]::GetFullPath($cache)
           "WINDOWS_OBJECT_CACHE=$cache" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          # A runner service may have Modify on the configured cache while its
+          # parent is read-only. Keep new caches inside that writable root.
+          "WINDOWS_DOWNLOAD_CACHE=$(Join-Path $cache '.release-downloads')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:BACKEND -eq 'cuda') {
+            # Dependency compilers retain the RAM budget. Only the final
+            # executable gets the full jobserver for parallel ThinLTO.
+            "WINDOWS_LINK_BUILD_JOBS=$logical" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            $coreCache = if ($env:FERRUM_CUDA_NATIVE_BUILD_CACHE) { $env:FERRUM_CUDA_NATIVE_BUILD_CACHE } else { Join-Path $cache '.cuda-core' }
+            "FERRUM_CUDA_NATIVE_BUILD_CACHE=$coreCache" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          }
           "Windows build: $logical logical CPUs, $([math]::Round($availableGiB,1)) GiB available RAM, $jobs Cargo jobs." | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
@@ -163,6 +212,24 @@ jobs:
           "FERRUM_MSVC_LIB=$compilerBin\lib.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$compilerBin\link.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "FERRUM_VS_ROOT=$vs" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: actions/cache/restore@v4
+        if: runner.environment == 'github-hosted'
+        id: windows_cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ${{ env.WINDOWS_DOWNLOAD_CACHE }}
+          key: stage-windows-${{ inputs.backend }}-rust-v4-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
+          restore-keys: |
+            stage-windows-${{ inputs.backend }}-rust-v4-
+            stage-windows-${{ inputs.backend }}-rust-v3-
+      - name: Build optimized release download and packaging tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build --locked --profile release-tools -p ferrum-devtools --bin release_delivery --timings
       - name: Install the pinned Inno Setup compiler
         run: |
           $ErrorActionPreference = 'Stop'
@@ -175,7 +242,7 @@ jobs:
             exit 0
           }
           $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
-          curl.exe --fail --location --proto '=https' --retry 3 --output $installer 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' --sha256 '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $installer
           if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') { throw 'Inno installer hash mismatch' }
           $signature = Get-AuthenticodeSignature $installer
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Pyrsys B.V.') { throw 'Inno publisher signature mismatch' }
@@ -228,17 +295,6 @@ jobs:
           "CUDA_ROOT=$toolkit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "$toolkit\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
       - uses: actions/cache/restore@v4
-        if: runner.environment == 'github-hosted'
-        id: windows_cache
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: stage-windows-${{ inputs.backend }}-rust-v3-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
-          restore-keys: |
-            stage-windows-${{ inputs.backend }}-rust-v3-
-      - uses: actions/cache/restore@v4
         if: inputs.backend == 'cuda' && runner.environment == 'github-hosted'
         id: windows_native_cache
         with:
@@ -257,7 +313,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked -p ferrum-native-ops-builder --bin ferrum-native-ops-builder
+          cargo build --locked --profile release-tools -p ferrum-native-ops-builder --bin ferrum-native-ops-builder --timings
       - name: Build the four native CUDA operators with MSVC
         if: inputs.backend == 'cuda'
         id: native_build
@@ -272,21 +328,21 @@ jobs:
           $distribution = Get-Content 'native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json' -Raw | ConvertFrom-Json
           $sourceArchive = Join-Path $work $distribution.archive.file_name
           $sourceUrl = 'https://github.com/{0}/releases/download/{1}/{2}' -f $distribution.distribution.repository, $distribution.distribution.tag, $distribution.distribution.asset_name
-          curl.exe --fail --location --retry 3 --output $sourceArchive $sourceUrl
+          & './target/release-tools/release_delivery.exe' fetch-verified --url $sourceUrl --sha256 $distribution.archive.sha256 --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $sourceArchive | Tee-Object -FilePath (Join-Path $work 'source-download.json')
           if ((Get-FileHash $sourceArchive -Algorithm SHA256).Hash -ne $distribution.archive.sha256) { throw 'Native source archive hash mismatch' }
           tar.exe -xf $sourceArchive -C $source
           # Preserve this historical provider catalog as versioned binding provenance.
           # Windows packages separately pin their actual source plan and MSVC tools;
           # runtime compatibility checks the live provider contracts. No Linux code is linked.
           $referenceArchive = Join-Path $work 'reference.tar.zst'
-          curl.exe --fail --location --retry 3 --output $referenceArchive 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst'
+          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst' --sha256 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $referenceArchive | Tee-Object -FilePath (Join-Path $work 'reference-download.json')
           if ((Get-FileHash $referenceArchive -Algorithm SHA256).Hash -ne 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e') { throw 'Reference archive hash mismatch' }
           tar.exe -xf $referenceArchive -C $reference
           $referenceLockPath = Join-Path $reference 'inputs/native-operator-set.lock.json'
           $referenceLock = Get-Content $referenceLockPath -Raw | ConvertFrom-Json
           $catalog = Join-Path (Split-Path $referenceLockPath) $referenceLock.artifacts[0].g03_catalog.path
           if ((Get-FileHash $catalog -Algorithm SHA256).Hash -ne $referenceLock.g03_catalog_sha256) { throw 'Canonical provider catalog hash mismatch' }
-          $builder = Join-Path $env:GITHUB_WORKSPACE 'target/debug/ferrum-native-ops-builder.exe'
+          $builder = Join-Path $env:GITHUB_WORKSPACE 'target/release-tools/ferrum-native-ops-builder.exe'
           $builderSha = git rev-parse HEAD
           $receiptArgs = @()
           $failedOperators = @()
@@ -338,9 +394,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked -p ferrum-bench-core --example release_candidate
-          & './target/debug/examples/release_candidate.exe' verify --workspace . --version $env:VERSION --candidate-sha $env:RC_SHA --candidate-tag $env:RC_TAG --staging-label $env:STAGING_LABEL --workflow-run-id $env:GITHUB_RUN_ID --workflow-run-attempt $env:GITHUB_RUN_ATTEMPT
-          cargo build --locked -p ferrum-devtools --bin release_delivery
+          cargo build --locked --profile release-tools -p ferrum-bench-core --example release_candidate --timings
+          & './target/release-tools/examples/release_candidate.exe' verify --workspace . --version $env:VERSION --candidate-sha $env:RC_SHA --candidate-tag $env:RC_TAG --staging-label $env:STAGING_LABEL --workflow-run-id $env:GITHUB_RUN_ID --workflow-run-attempt $env:GITHUB_RUN_ATTEMPT
       - name: Select the stable launcher
         run: |
           $ErrorActionPreference = 'Stop'
@@ -352,7 +407,7 @@ jobs:
           New-Item -ItemType Directory $assets | Out-Null
           $launcher = Join-Path $assets 'ferrum-windows-launcher-v1.exe'
           if ($env:WINDOWS_LAUNCHER_URL) {
-            curl.exe --fail --location --proto '=https' --retry 3 --output $launcher $env:WINDOWS_LAUNCHER_URL
+            & './target/release-tools/release_delivery.exe' fetch-verified --url $env:WINDOWS_LAUNCHER_URL --sha256 $env:WINDOWS_LAUNCHER_SHA256 --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $launcher | Tee-Object -FilePath (Join-Path $assets 'launcher-download.json')
             if ((Get-FileHash $launcher -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:WINDOWS_LAUNCHER_SHA256) { throw 'Stable launcher hash mismatch' }
             $origin = @{ mode = 'released'; url = $env:WINDOWS_LAUNCHER_URL; sha256 = $env:WINDOWS_LAUNCHER_SHA256 }
           } else {
@@ -380,13 +435,25 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           if ($env:BACKEND -eq 'cpu') {
             Remove-Item Env:FERRUM_NATIVE_OPERATOR_SET_LOCK -ErrorAction SilentlyContinue
-            cargo build --release --locked -p ferrum-cli --bin ferrum
+            cargo build --release --locked -p ferrum-cli --bin ferrum --timings
+            $binary = 'target/release/ferrum.exe'
+            $profile = 'release'
           } else {
             if (-not (Test-Path $env:FERRUM_NATIVE_OPERATOR_SET_LOCK -PathType Leaf)) { throw 'The native operator set is missing' }
-            cargo build --release --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
-            & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/release/ferrum.exe'
-            & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/release/ferrum.exe'
+            cargo build --profile release-thin --locked -p ferrum-cli --lib --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 --jobs $env:CARGO_BUILD_JOBS --timings
+            cargo build --profile release-thin --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 --jobs $env:WINDOWS_LINK_BUILD_JOBS --timings
+            $binary = 'target/release-thin/ferrum.exe'
+            $profile = 'release-thin'
+            & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf $binary
+            & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx $binary
           }
+          "WINDOWS_RELEASE_BINARY=$binary" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          [ordered]@{
+            profile = $profile; binary = $binary
+            dependency_jobs = [int]$env:CARGO_BUILD_JOBS
+            link_jobs = $(if ($env:BACKEND -eq 'cuda') { [int]$env:WINDOWS_LINK_BUILD_JOBS } else { [int]$env:CARGO_BUILD_JOBS })
+            binary_sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content (Join-Path $env:RUNNER_TEMP 'windows-assets/build-profile.json') -Encoding utf8NoBOM
       - name: Pack the exact release EXE and redistributable runtime bytes
         run: |
           $ErrorActionPreference = 'Stop'
@@ -397,14 +464,14 @@ jobs:
           if ($env:BACKEND -eq 'cuda') {
             # Preserve the original CUDA license from the pinned component archive.
             $cudart = Join-Path $inputs 'cudart.zip'
-            curl.exe --fail --location --proto '=https' --retry 3 --output $cudart 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip'
+            & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip' --sha256 '6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $cudart | Tee-Object -FilePath (Join-Path $assets 'cuda-license-download.json')
             if ((Get-FileHash $cudart -Algorithm SHA256).Hash -ne '6a1c32e68ee1a95ca17334691ff9ad1ffe7f352c24a083d55e4c96b8063b2bcb') { throw 'CUDA license archive hash mismatch' }
             tar.exe -xf $cudart -C $inputs 'cuda_cudart-windows-x86_64-12.4.127-archive/LICENSE'
             $cudaLicense = Join-Path $inputs 'cuda_cudart-windows-x86_64-12.4.127-archive/LICENSE'
             if ((Get-FileHash $cudaLicense -Algorithm SHA256).Hash -ne 'e2c71babfd18a8e69542dd7e9ca018f9caa438094001a58e6bc4d8c999bf0d07') { throw 'CUDA license hash mismatch' }
           }
           $vcLicense = Join-Path $inputs 'Microsoft-VC-Runtime-2015-2022-License.docx'
-          curl.exe --fail --location --proto '=https' --retry 3 --output $vcLicense 'https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx'
+          & './target/release-tools/release_delivery.exe' fetch-verified --url 'https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx' --sha256 'f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1' --cache-dir $env:WINDOWS_DOWNLOAD_CACHE --output $vcLicense | Tee-Object -FilePath (Join-Path $assets 'vc-license-download.json')
           if ((Get-FileHash $vcLicense -Algorithm SHA256).Hash -ne 'f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1') { throw 'VC runtime license hash mismatch' }
           # Use release redistributables from VS, never System32 or debug_nonredist.
           # The runtime may be newer than the selected compiler; record its actual bytes.
@@ -421,7 +488,7 @@ jobs:
             $sources[$Name] = $file.FullName
             $files.Add([ordered]@{ path = $Name; role = $Role; sha256 = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); size_bytes = $file.Length; license = $License })
           }
-          Add-PayloadFile 'ferrum.exe' 'binary' 'target/release/ferrum.exe' 'licenses/Ferrum.txt'
+          Add-PayloadFile 'ferrum.exe' 'binary' $env:WINDOWS_RELEASE_BINARY 'licenses/Ferrum.txt'
           if ($env:BACKEND -eq 'cuda') {
             $cudaHashes = [ordered]@{
               'cudart64_12.dll' = 'd28e42265da7462162a54da6b7a99ea4fa2caf8139d862bb500db875d0b32dfc'
@@ -456,7 +523,7 @@ jobs:
           $suffix = if ($env:BACKEND -eq 'cuda') { 'cuda-sm89' } else { 'cpu' }
           $archive = Join-Path $assets "ferrum-windows-x86_64-$suffix.zip"
           $receipt = "$archive.receipt.json"
-          & './target/debug/release_delivery.exe' portable pack --spec $specPath --archive $archive --receipt $receipt
+          & './target/release-tools/release_delivery.exe' portable pack --spec $specPath --archive $archive --receipt $receipt
           $payload = Join-Path $env:RUNNER_TEMP 'windows-payload'
           $inspectionArgs = @('--archive', $archive, '--receipt', $receipt, '--extract-dir', $payload,
             '--output', (Join-Path $assets 'portable.staging-inspection.json'))
@@ -469,7 +536,7 @@ jobs:
             $inspectionArgs += '--extract-only'
             Write-Host 'No system NVIDIA driver: executable startup checks are deferred; archive bytes are verified.'
           }
-          & './target/debug/release_delivery.exe' portable inspect @inspectionArgs
+          & './target/release-tools/release_delivery.exe' portable inspect @inspectionArgs
           "WINDOWS_PAYLOAD=$payload" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           $provenance = [ordered]@{
             schema_version = 1; version = $env:VERSION; candidate_sha = $env:RC_SHA; candidate_tag = $env:RC_TAG
@@ -525,6 +592,8 @@ jobs:
         with:
           name: ferrum-windows-x86_64-${{ inputs.backend }}-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
           path: ${{ runner.temp }}/windows-assets
+          # The portable ZIP and installer are already compressed.
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
       - name: Preserve Windows staging build evidence
@@ -535,6 +604,7 @@ jobs:
           path: |
             ${{ runner.temp }}/ferrum-windows-native/build
             ${{ runner.temp }}/ferrum-windows-native/operator-set
+            ${{ runner.temp }}/ferrum-windows-native/*-download.json
             ${{ runner.temp }}/windows-runtime-inputs/portable-spec.json
             ${{ runner.temp }}/windows-assets/*.json
             ${{ runner.temp }}/windows-assets/*.pe.txt
@@ -542,6 +612,7 @@ jobs:
             ${{ runner.temp }}/windows-assets/iscc-build.log
             ${{ runner.temp }}/inno-install.log
             ${{ runner.temp }}/windows-installer-contracts
+            target/cargo-timings
           if-no-files-found: warn
           retention-days: 14
       - name: Save Windows staging build caches
@@ -552,4 +623,5 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            ${{ env.WINDOWS_DOWNLOAD_CACHE }}
           key: ${{ steps.windows_cache.outputs.cache-primary-key }}

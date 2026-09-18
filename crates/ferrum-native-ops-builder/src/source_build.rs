@@ -183,7 +183,26 @@ pub struct NativeOperatorSourceBuildReceipt {
     pub archive_sha256: Option<String>,
     pub started_unix_ms: u64,
     pub elapsed_ms: u64,
+    /// Diagnostic only; excluded from object identities and optional in older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_timings: Option<NativeOperatorSourceBuildTimings>,
     pub failure_class: Option<String>,
+}
+
+/// Completed phases of the receipt interval. `None` means not completed/executed,
+/// not zero cost. CUDA/host manifest times are children of `static_toolchain_ms`;
+/// all other fields describe disjoint phases. Source locking precedes this interval.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeOperatorSourceBuildTimings {
+    pub static_toolchain_ms: Option<u64>,
+    pub cuda_manifest_ms: Option<u64>,
+    pub host_manifest_ms: Option<u64>,
+    pub dependency_scope_ms: Option<u64>,
+    pub object_cache_lookup_ms: Option<u64>,
+    pub miss_probe_ms: Option<u64>,
+    pub compile_and_cache_publish_ms: Option<u64>,
+    pub archive_command_ms: Option<u64>,
+    pub final_validation_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,10 +674,14 @@ pub fn run_native_operator_source_build(
         })?;
     }
 
+    let mut phase_timings = NativeOperatorSourceBuildTimings::default();
     let (toolchain, toolchain_failure) = if request.plan_only {
         (None, None)
     } else {
-        match resolve_static_toolchain(request) {
+        let phase_started = Instant::now();
+        let result = resolve_static_toolchain(request, &mut phase_timings);
+        phase_timings.static_toolchain_ms = Some(millis(phase_started.elapsed()));
+        match result {
             Ok(toolchain) => (Some(toolchain), None),
             Err(error) => (None, Some(error.to_string())),
         }
@@ -729,6 +752,7 @@ pub fn run_native_operator_source_build(
         archive_sha256: None,
         started_unix_ms,
         elapsed_ms: 0,
+        phase_timings: Some(phase_timings),
         failure_class: None,
     };
     if request.plan_only {
@@ -744,6 +768,7 @@ pub fn run_native_operator_source_build(
             format!("toolchain_preflight_failed:{error}"),
         );
     }
+    let phase_started = Instant::now();
     let toolchain_dependency_scope = match load_toolchain_dependency_scope(
         &request.output_dir,
         &receipt
@@ -762,6 +787,8 @@ pub fn run_native_operator_source_build(
             );
         }
     };
+    receipt.phase_timings.as_mut().unwrap().dependency_scope_ms =
+        Some(millis(phase_started.elapsed()));
     let object_cache = match NativeBuildArtifactCache::new(&request.object_cache_dir) {
         Ok(cache) => cache,
         Err(error) => {
@@ -802,6 +829,7 @@ pub fn run_native_operator_source_build(
 
     let mut expected_object_identity: Option<NativeOperatorObjectIdentity> = None;
     let mut miss_indices = Vec::new();
+    let cache_lookup_started = Instant::now();
     for index in 0..plan.translation_units.len() {
         let translation_unit = &plan.translation_units[index];
         let object_path = PathBuf::from(
@@ -934,7 +962,7 @@ pub fn run_native_operator_source_build(
                 commands[index].elapsed_ms = Some(millis(lookup_started.elapsed()));
                 append_command_stream(
                     &request.output_dir.join(&commands[index].stdout_log),
-                    b"object-cache-hit: compiler and toolchain probes were not executed\n",
+                    b"object-cache-hit: translation-unit compilation and miss-only probes were not executed\n",
                 )?;
                 receipt
                     .cache_hit_translation_units
@@ -962,11 +990,17 @@ pub fn run_native_operator_source_build(
             }
         }
     }
+    receipt
+        .phase_timings
+        .as_mut()
+        .unwrap()
+        .object_cache_lookup_ms = Some(millis(cache_lookup_started.elapsed()));
     receipt.commands = commands.clone();
     receipt.elapsed_ms = millis(started.elapsed());
     write_json(&receipt_path, &receipt)?;
 
     if !miss_indices.is_empty() {
+        let phase_started = Instant::now();
         let missed_translation_units = miss_indices
             .iter()
             .map(|index| plan.translation_units[*index].path.clone())
@@ -998,9 +1032,12 @@ pub fn run_native_operator_source_build(
             .as_mut()
             .expect("actual source build has a resolved toolchain")
             .miss_probe = Some(probe);
+        receipt.phase_timings.as_mut().unwrap().miss_probe_ms =
+            Some(millis(phase_started.elapsed()));
         write_json(&receipt_path, &receipt)?;
     }
 
+    let compile_started = (!miss_indices.is_empty()).then(Instant::now);
     for index in miss_indices {
         let translation_unit = &plan.translation_units[index];
         let object_path = PathBuf::from(
@@ -1203,6 +1240,11 @@ pub fn run_native_operator_source_build(
         receipt.commands = commands.clone();
         write_json(&receipt_path, &receipt)?;
     }
+    receipt
+        .phase_timings
+        .as_mut()
+        .unwrap()
+        .compile_and_cache_publish_ms = compile_started.map(|started| millis(started.elapsed()));
 
     let archive_index = plan.translation_units.len();
     let archive_command = commands
@@ -1234,6 +1276,7 @@ pub fn run_native_operator_source_build(
         }
     };
     archive_command.elapsed_ms = Some(millis(archive_started.elapsed()));
+    receipt.phase_timings.as_mut().unwrap().archive_command_ms = archive_command.elapsed_ms;
     archive_command.return_code = archive_status.code();
     receipt.commands = commands;
     receipt.elapsed_ms = millis(started.elapsed());
@@ -1241,6 +1284,7 @@ pub fn run_native_operator_source_build(
         return reject_source_build(&receipt_path, &mut receipt, "archive_failed".to_string());
     }
 
+    let final_validation_started = Instant::now();
     let archive_file = platform::archive_file(
         &plan.archive_file,
         platform::is_msvc(
@@ -1323,6 +1367,8 @@ pub fn run_native_operator_source_build(
     receipt.archive_file = Some(archive_file);
     receipt.status = NativeOperatorSourceBuildStatus::Pass;
     receipt.failure_class = None;
+    receipt.phase_timings.as_mut().unwrap().final_validation_ms =
+        Some(millis(final_validation_started.elapsed()));
     receipt.elapsed_ms = millis(started.elapsed());
     write_json(&receipt_path, &receipt)?;
     Ok(receipt)
@@ -3717,6 +3763,7 @@ fn locked_source_file(root: &Path, relative: &str) -> Result<PathBuf> {
 
 fn resolve_static_toolchain(
     request: &NativeOperatorSourceBuildRequest,
+    timings: &mut NativeOperatorSourceBuildTimings,
 ) -> Result<NativeOperatorSourceBuildToolchain> {
     let invocation_root_path = if request.cuda_toolkit_root.is_absolute() {
         request.cuda_toolkit_root.clone()
@@ -3763,7 +3810,9 @@ fn resolve_static_toolchain(
             canonical_root.display()
         )));
     }
+    let manifest_started = Instant::now();
     let manifest = build_cuda_toolkit_manifest(&canonical_root)?;
+    timings.cuda_manifest_ms = Some(millis(manifest_started.elapsed()));
     if !manifest.entries.iter().any(|entry| {
         canonical_root.join(&entry.resolved_path) == canonical_nvcc
             && entry.sha256 == nvcc.sha256
@@ -3795,7 +3844,9 @@ fn resolve_static_toolchain(
         sha256: sha256_file(&manifest_path)?,
         size_bytes: manifest_size,
     };
+    let manifest_started = Instant::now();
     let host_toolchain = resolve_host_toolchain(request)?;
+    timings.host_manifest_ms = Some(millis(manifest_started.elapsed()));
     let toolchain = NativeOperatorSourceBuildToolchain {
         static_identity: NativeOperatorSourceBuildStaticToolchain {
             backend: NativeOperatorBackend::Cuda,
@@ -3848,18 +3899,13 @@ fn resolve_host_toolchain(
         .filter(|manifest| {
             validate_host_toolchain_manifest("<host-toolchain-cache>", manifest).is_ok()
         });
-    let manifest = match cached {
-        Some(cached)
-            if host_toolchain_manifest_matches_current(&cached, &compiler, &environment)? =>
-        {
-            cached
-        }
-        _ => {
-            let probed = probe_host_toolchain_manifest(&compiler, &environment)?;
-            write_json(&cached_path, &probed)?;
-            probed
-        }
-    };
+    let manifest =
+        refresh_host_toolchain_manifest(cached.as_ref(), &compiler, &environment, || {
+            probe_host_toolchain_manifest(&compiler, &environment)
+        })?;
+    if cached.as_ref() != Some(&manifest) {
+        write_json(&cached_path, &manifest)?;
+    }
 
     let relative = "toolchain/host-static-manifest.json";
     let output_path = request.output_dir.join(relative);
@@ -3882,6 +3928,26 @@ fn resolve_host_toolchain(
             size_bytes,
         },
     })
+}
+
+fn refresh_host_toolchain_manifest(
+    cached: Option<&NativeOperatorHostToolchainManifest>,
+    compiler: &NativeOperatorToolFileIdentity,
+    environment: &BTreeMap<String, String>,
+    probe: impl FnOnce() -> Result<NativeOperatorHostToolchainManifest>,
+) -> Result<NativeOperatorHostToolchainManifest> {
+    // A fresh MSVC probe inventories every compiler, SDK, header and library
+    // input and the actual search environment. Rebuilding the old inventory
+    // first repeats the same reads; probing again on a mismatch repeats them
+    // yet again. Reuse this invocation's fresh result, never a cached digest.
+    if !platform::is_msvc_compiler(&compiler.path) {
+        if let Some(cached) = cached {
+            if host_toolchain_manifest_matches_current(cached, compiler, environment)? {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    probe()
 }
 
 fn probe_host_toolchain_manifest(
@@ -4032,11 +4098,15 @@ fn host_toolchain_manifest_matches_current(
     compiler: &NativeOperatorToolFileIdentity,
     environment: &BTreeMap<String, String>,
 ) -> Result<bool> {
-    if &recorded.compiler != compiler || rebuild_host_toolchain_manifest(recorded)? != *recorded {
+    if &recorded.compiler != compiler {
         return Ok(false);
     }
     if platform::is_msvc(recorded.host_abi.as_ref()) {
+        validate_host_toolchain_manifest("<host-toolchain-recorded>", recorded)?;
         return Ok(platform::msvc::probe_manifest(compiler, environment)? == *recorded);
+    }
+    if rebuild_host_toolchain_manifest(recorded)? != *recorded {
+        return Ok(false);
     }
     let discovery = probe_host_compiler_discovery(Path::new(&compiler.path), environment)?;
     Ok(discovery.include_roots == recorded.include_roots
@@ -6922,6 +6992,31 @@ mod tests {
             receipt.inputs_sha256, cached_receipt.inputs_sha256,
             "worker-count and provenance commit changes are not output-content inputs"
         );
+        for (build, compiled) in [(&receipt, true), (&cached_receipt, false)] {
+            let phases = build.phase_timings.as_ref().unwrap();
+            assert!(phases.cuda_manifest_ms.is_some());
+            assert!(phases.host_manifest_ms.is_some());
+            assert_eq!(phases.miss_probe_ms.is_some(), compiled);
+            assert_eq!(phases.compile_and_cache_publish_ms.is_some(), compiled);
+            let completed = [
+                phases.static_toolchain_ms,
+                phases.dependency_scope_ms,
+                phases.object_cache_lookup_ms,
+                phases.archive_command_ms,
+                phases.final_validation_ms,
+            ];
+            assert!(completed.iter().all(Option::is_some));
+            assert!(
+                completed.into_iter().flatten().sum::<u64>()
+                    + phases.miss_probe_ms.unwrap_or(0)
+                    + phases.compile_and_cache_publish_ms.unwrap_or(0)
+                    <= build.elapsed_ms
+            );
+            let encoded = serde_json::to_value(build).unwrap();
+            let decoded: NativeOperatorSourceBuildReceipt =
+                serde_json::from_value(encoded).unwrap();
+            assert_eq!(&decoded, build);
+        }
 
         fs::write(source_root.join("LICENSE"), "fixture license\n").unwrap();
         let package_spec = crate::NativeOperatorPackageSpec {

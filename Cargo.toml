@@ -146,6 +146,20 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Windows CUDA staging builds dependency libraries within its memory budget,
+# then uses parallel ThinLTO for the final executable.
+[profile.release-thin]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
+# Hashing and compressing release assets must not run in an unoptimized build.
+# These internal tools do not need whole-program LTO.
+[profile.release-tools]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [profile.cuda-correctness]
 inherits = "release"
 lto = false

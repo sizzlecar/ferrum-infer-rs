@@ -470,6 +470,7 @@ fn receipt(
         archive_sha256: Some("a".repeat(64)),
         started_unix_ms: 0,
         elapsed_ms: 0,
+        phase_timings: None,
         failure_class: None,
     }
 }
@@ -479,6 +480,10 @@ fn msvc_receipt_replays_native_commands_without_the_build_machine() {
     let root = tempfile::tempdir().unwrap();
     let (plan, path) = plan(root.path());
     let receipt = receipt(&plan, &path);
+    let legacy_json = serde_json::to_value(&receipt).unwrap();
+    assert!(legacy_json.get("phase_timings").is_none());
+    let legacy: NativeOperatorSourceBuildReceipt = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy, receipt);
     verify_source_build_receipt_against_plan_portable(&receipt, &path).unwrap();
     let compile = &receipt.commands[0];
     assert!(compile.object_file.as_ref().unwrap().ends_with(".obj"));
