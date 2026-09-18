@@ -280,6 +280,66 @@ kernel void vnext_native_block_linear_f32_f16(
     native_linear(x, w, y, p, b, group, lane, subgroup);
 }
 
+// PQ2 decode: a SIMD group covers eight output rows. Its lanes partition four
+// 128-value blocks into 16-value spans, sharing each activation span across all
+// eight outputs. This tiling follows ggml's MIT-licensed PQ2 Metal GEMV; unlike
+// its coefficient/floor decoder, retain direct bit decoding and F32 weights.
+// The block's two-byte scale and four packed bytes are loaded once per span.
+template<typename Output>
+static inline void native_pq2_linear_f32(
+    device const float * input, device const uchar * weight, device Output * output,
+    constant NativeLinearParams & p, uint3 group, uint lane, uint subgroup) {
+    const uint first_output = group.x * 16 + subgroup * 8;
+    const uint blocks_per_row = p.in_features / 128;
+    const uint first_in_block = (lane % 8) * 16;
+    float sums[8] = {};
+    for (uint block_index = lane / 8; block_index < blocks_per_row; block_index += 4) {
+        const ulong input_start = ulong(group.y) * p.in_features
+            + ulong(block_index) * 128 + first_in_block;
+        float values[16];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16; ++i) values[i] = input[input_start + i];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 8; ++part) {
+            const uint out_col = first_output + part;
+            if (out_col >= p.out_features) continue;
+            device const uchar * block = weight
+                + (ulong(out_col) * blocks_per_row + block_index) * 34;
+            const float scale = native_half(block, 0);
+            #pragma clang loop unroll(full)
+            for (uint byte = 0; byte < 4; ++byte) {
+                const uint packed = block[2 + first_in_block / 4 + byte];
+                #pragma clang loop unroll(full)
+                for (uint component = 0; component < 4; ++component) {
+                    const float value = scale * float(int((packed >> (2 * component)) & 3) - 1);
+                    sums[part] += values[byte * 4 + component] * value;
+                }
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (uint part = 0; part < 8; ++part) {
+        const float value = simd_sum(sums[part]);
+        const uint out_col = first_output + part;
+        if (lane == 0 && out_col < p.out_features) {
+            output[ulong(group.y) * p.output_stride + p.output_column_offset + out_col]
+                = Output(value);
+        }
+    }
+}
+
+#define NATIVE_PQ2_LINEAR(OUTPUT, SUFFIX) \
+kernel void vnext_pq2_linear_##SUFFIX( \
+    device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], \
+    device OUTPUT * y [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+    uint subgroup [[simdgroup_index_in_threadgroup]]) { \
+    native_pq2_linear_f32(x, w, y, p, group, lane, subgroup); \
+}
+NATIVE_PQ2_LINEAR(float, f32)
+NATIVE_PQ2_LINEAR(half, f32_f16)
+#undef NATIVE_PQ2_LINEAR
+
 // Decode one coefficient for all B independent rows without rounding the
 // weight to half. The typed selector restricts this path to small batches.
 // Each row retains native_linear's lane/column order and FP32 SIMD reduction.

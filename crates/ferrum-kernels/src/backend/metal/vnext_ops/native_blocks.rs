@@ -142,6 +142,8 @@ pub(super) struct MetalNativeBlockPipelines {
     iq4_nl: NativeGemvPipelines,
     iq4_xs: NativeGemvPipelines,
     pq2_0: NativeGemvPipelines,
+    pub(super) pq2_linear_f32: ComputePipelineState,
+    pub(super) pq2_linear_f32_f16: ComputePipelineState,
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
@@ -268,6 +270,8 @@ impl MetalNativeBlockPipelines {
             iq4_nl,
             iq4_xs,
             pq2_0,
+            pq2_linear_f32: pipeline("vnext_pq2_linear_f32")?,
+            pq2_linear_f32_f16: pipeline("vnext_pq2_linear_f32_f16")?,
             shared,
             iq4xs_group_dot_f16: [
                 pipeline("vnext_iq4_group_dot_b1")?,

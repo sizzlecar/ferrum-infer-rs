@@ -125,6 +125,7 @@ pub(super) struct MetalLinearPipelines {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinearDispatchKind {
     CooperativeGemv,
+    Pq2CooperativeGemv,
     SharedWeightGemv,
     TiledGemm,
     NativeTiledGemm,
@@ -1741,7 +1742,16 @@ pub(super) fn dispatch_linear(
             LinearPhysicalFormat::Native(format) => Some(format),
         };
         let (pipeline, dispatch_kind) = if let Some(format) = native {
-            if launch.activation_type == ElementType::F32 {
+            if format == GgufBlockFormat::Pq2_0 && launch.params.rows < NATIVE_TILED_GEMM_MIN_ROWS {
+                (
+                    if launch.activation_type == ElementType::F32 {
+                        &pipelines.native.pq2_linear_f32
+                    } else {
+                        &pipelines.native.pq2_linear_f32_f16
+                    },
+                    LinearDispatchKind::Pq2CooperativeGemv,
+                )
+            } else if launch.activation_type == ElementType::F32 {
                 (
                     pipelines.native.linear_f32(format),
                     LinearDispatchKind::CooperativeGemv,
@@ -1847,6 +1857,14 @@ fn dispatch_linear_grid(
     dispatch_kind: LinearDispatchKind,
 ) {
     match dispatch_kind {
+        LinearDispatchKind::Pq2CooperativeGemv => encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(params.out_features).div_ceil(16),
+                u64::from(params.rows),
+                1,
+            ),
+            MTLSize::new(32, 2, 1),
+        ),
         LinearDispatchKind::CooperativeGemv => encoder.dispatch_thread_groups(
             MTLSize::new(
                 u64::from(params.out_features).div_ceil(4),
@@ -2407,6 +2425,9 @@ mod native_tests;
 
 #[cfg(test)]
 mod hadamard_tests;
+
+#[cfg(test)]
+mod pq2_tests;
 
 #[cfg(test)]
 mod microbench;
