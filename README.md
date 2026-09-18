@@ -273,9 +273,9 @@ is available. With `--enable-prefix-cache`, a compatible hit restores model stat
 and processes the remaining suffix. Session caching stores chat messages; it is
 separate from GPU prefix-state reuse.
 
-### Bonsai 2 PQ2_0 (development)
+### Bonsai 2 PQ2_0 on Metal
 
-The unreleased Bonsai path keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
+Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
 weights packed and applies the Hadamard transforms declared by the model.
 Metal text inference has been validated through `run` and `serve` with FP16 KV,
 including Orchestral tool execution, session continuation, and prefix-state reuse.

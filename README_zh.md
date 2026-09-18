@@ -250,9 +250,9 @@ ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
 checkpoint 时，重新发送历史会重新计算输入；使用 `--enable-prefix-cache` 并命中后，
 可恢复模型状态并计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
 
-### Bonsai 2 PQ2_0（开发中）
+### 在 Metal 上运行 Bonsai 2 PQ2_0
 
-尚未发布的 Bonsai 路径直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
+Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
 并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
 包括 Orchestral 真实工具执行、会话续接和前缀状态复用。下方 8K 上下文和 10 GiB
 运行预算已在 M1 Max 上实测，不是最低硬件要求，也不保证更大负载可用。
