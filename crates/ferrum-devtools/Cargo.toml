@@ -31,9 +31,14 @@ path = "src/bin/native_profile.rs"
 name = "kv_teacher_regression"
 path = "src/bin/kv_teacher_regression.rs"
 
+[[bin]]
+name = "reference_teacher_compare"
+path = "src/bin/reference_teacher_compare.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
+ferrum-interfaces = { workspace = true }
 ferrum-types = { workspace = true }
 serde = { workspace = true }
 # Reconstruct exact tool-result wire text from persisted IEEE-754 values.
