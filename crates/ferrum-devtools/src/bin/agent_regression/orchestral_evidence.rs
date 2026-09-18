@@ -6,6 +6,7 @@
 //! retained in the source files, not reimplemented as a second protocol reducer.
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -83,28 +84,47 @@ pub(crate) fn read(journal: &Path, expected_session: &str) -> Evidence {
 
 fn inspect(journal: &Path, expected_session: &str, evidence: &mut Evidence) -> Result<(), String> {
     require(!expected_session.is_empty(), "empty expected session")?;
+    require(existing_directory(journal)?, "journal directory is missing")?;
     let mut runs = Vec::new();
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(journal).map_err(|error| format!("read journal: {error}"))? {
-        let entry = entry.map_err(|error| format!("read journal entry: {error}"))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let destination = if name.starts_with("run-") && name.ends_with(".json") {
-            &mut runs
-        } else if name.starts_with("session-") && name.ends_with(".json") {
-            &mut sessions
-        } else {
-            continue;
-        };
-        require(
-            entry
-                .file_type()
-                .map_err(|error| error.to_string())?
-                .is_file(),
-            "public journal entry is not a regular file",
-        )?;
-        destination.push(entry.path());
+    let mut directories = vec![journal.to_path_buf()];
+    let shard = session_directory(journal, expected_session);
+    // Read only the explicitly owned session, never discover other sessions.
+    // The older flat format remains supported, but mixing layouts is ambiguous.
+    if existing_directory(&journal.join("sessions"))? && existing_directory(&shard)? {
+        directories.push(shard);
     }
+    let mut populated_layouts = 0;
+    for directory in directories {
+        let before = runs.len() + sessions.len();
+        for entry in fs::read_dir(directory).map_err(|error| format!("read journal: {error}"))? {
+            let entry = entry.map_err(|error| format!("read journal entry: {error}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let destination = if name.starts_with("run-") && name.ends_with(".json") {
+                &mut runs
+            } else if name.starts_with("session-") && name.ends_with(".json") {
+                &mut sessions
+            } else {
+                continue;
+            };
+            require(
+                entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_file(),
+                "public journal entry is not a regular file",
+            )?;
+            destination.push(entry.path());
+        }
+        if before != runs.len() + sessions.len() {
+            populated_layouts += 1;
+        }
+    }
+    require(
+        populated_layouts <= 1,
+        "journals span multiple storage layouts",
+    )?;
     require(
         runs.len() == 1 && sessions.len() == 1,
         "expected exactly one public Run and Session journal",
@@ -297,6 +317,26 @@ fn inspect(journal: &Path, expected_session: &str, evidence: &mut Evidence) -> R
     }
     evidence.lifecycle_complete = accepted && started && input_seen && output_seen;
     Ok(())
+}
+
+fn existing_directory(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            require(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "journal layout component must be a directory, not a symlink",
+            )?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("read journal directory: {error}")),
+    }
+}
+
+fn session_directory(journal: &Path, session: &str) -> PathBuf {
+    journal
+        .join("sessions")
+        .join(format!("{:x}", Sha256::digest(session.as_bytes())))
 }
 
 fn tool_exchange(
@@ -555,6 +595,85 @@ mod tests {
         )
         .unwrap();
         read(dir.path(), "session")
+    }
+
+    fn write_fixture(directory: &Path, run: &Value, session: &Value) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(
+            directory.join("run-test.json"),
+            serde_json::to_vec(run).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("session-test.json"),
+            serde_json::to_vec(session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn exact_session_shard_preserves_public_evidence_without_reading_foreign_shards() {
+        let directory = tempfile::tempdir().unwrap();
+        let (run, session) = fixtures();
+        let shard = session_directory(directory.path(), "session");
+        write_fixture(&shard, &run, &session);
+        let foreign = session_directory(directory.path(), "other");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("run-private.json"), b"must not be parsed").unwrap();
+        let evidence = read(directory.path(), "session");
+        assert!(evidence.complete(), "{:?}", evidence.errors);
+        assert_eq!(evidence.run_path, Some(shard.join("run-test.json")));
+        assert_eq!(evidence.tool_exchanges.len(), 1);
+        assert_eq!(evidence.usage.input_tokens, Some(75));
+        assert!(!read(directory.path(), "absent-session").complete());
+    }
+
+    #[test]
+    fn mixed_layouts_duplicate_runs_and_foreign_shard_identities_are_rejected() {
+        let (run, session) = fixtures();
+        let directory = tempfile::tempdir().unwrap();
+        let shard = session_directory(directory.path(), "session");
+        write_fixture(&shard, &run, &session);
+        write_fixture(directory.path(), &run, &session);
+        assert!(read(directory.path(), "session")
+            .errors
+            .iter()
+            .any(|error| error.contains("multiple storage layouts")));
+        fs::remove_file(directory.path().join("run-test.json")).unwrap();
+        fs::remove_file(directory.path().join("session-test.json")).unwrap();
+        fs::copy(
+            shard.join("run-test.json"),
+            shard.join("run-duplicate.json"),
+        )
+        .unwrap();
+        assert!(!read(directory.path(), "session").complete());
+        fs::remove_file(shard.join("run-duplicate.json")).unwrap();
+        let mut foreign = run;
+        foreign["run"]["registration"]["request"]["run"]["spec"]["session_id"] = json!("other");
+        write_fixture(&shard, &foreign, &session);
+        assert!(read(directory.path(), "session")
+            .errors
+            .iter()
+            .any(|error| error.contains("different session")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_layout_symlink_is_rejected_before_reading_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (run, session) = fixtures();
+        write_fixture(outside.path(), &run, &session);
+        fs::create_dir(directory.path().join("sessions")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            session_directory(directory.path(), "session"),
+        )
+        .unwrap();
+        assert!(read(directory.path(), "session")
+            .errors
+            .iter()
+            .any(|error| error.contains("symlink")));
     }
 
     #[test]
