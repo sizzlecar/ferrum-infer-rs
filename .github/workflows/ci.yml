@@ -848,7 +848,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked -p ferrum-native-ops-builder --lib
           cargo test --locked -p ferrum-devtools --bin release_delivery portable::tests::
+          cargo test --locked -p ferrum-devtools --bin release_delivery fetch_verified::tests::
           cargo test --locked -p ferrum-devtools --bin release_delivery gate::tests::windows_
           cargo test --locked -p ferrum-bench-core --test release_staging_workflows
       - name: Test Windows memory sampling and journal file semantics

@@ -4,6 +4,8 @@ use std::{path::PathBuf, process::ExitCode};
 
 #[path = "release_delivery/cloud.rs"]
 mod cloud;
+#[path = "release_delivery/fetch_verified.rs"]
+mod fetch_verified;
 #[path = "release_delivery/gate.rs"]
 mod gate;
 #[path = "release_delivery/installation.rs"]
@@ -47,6 +49,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Fetch immutable bytes through a fully SHA-256-verified persistent cache.
+    FetchVerified(fetch_verified::FetchArgs),
     /// Package or inspect a Windows CPU/CUDA portable ZIP; no publication gate.
     Portable(portable::PortableArgs),
     Inspect(installation::InspectArgs),
@@ -73,6 +77,7 @@ enum Action {
 }
 async fn run(action: Action) -> Result<(), String> {
     match action {
+        Action::FetchVerified(args) => fetch_verified::execute(args).await,
         Action::Portable(args) => portable::execute(args).await,
         Action::Installed(args) => public_install::verify(args).await,
         Action::Entry(args) => public_entry::verify(args).await,
