@@ -10,7 +10,10 @@ fn id(value: &str) -> WeightId {
 }
 
 fn schema() -> WeightSchema {
-    let format = GgufBlockFormat::Iq4Xs;
+    schema_with_block_format(GgufBlockFormat::Iq4Xs, 512)
+}
+
+fn schema_with_block_format(format: GgufBlockFormat, columns: u64) -> WeightSchema {
     WeightSchema {
         format_id: WeightFormatId::new("weight-format.gguf.native-block").unwrap(),
         layout_id: WeightLayoutId::new("weight-layout.test.native-matrix").unwrap(),
@@ -20,7 +23,7 @@ fn schema() -> WeightSchema {
                 id: id("component.z_first"),
                 role: WeightComponentRole::PackedValues,
                 external_names: vec!["first".into()],
-                dimensions: vec![1, 3, 2],
+                dimensions: vec![1, 3, columns / format.block_values() as u64],
                 encoding: WeightEncoding::BlockQuantized(BlockQuantizationSpec {
                     format_id: QuantizationFormatId::new(format.format_id()).unwrap(),
                     logical_values_per_block: format.block_values() as u32,
@@ -32,7 +35,7 @@ fn schema() -> WeightSchema {
                 id: id("component.a_second"),
                 role: WeightComponentRole::Values,
                 external_names: vec!["second".into()],
-                dimensions: vec![1, 3, 512],
+                dimensions: vec![1, 3, columns],
                 encoding: WeightEncoding::Dense {
                     element_type: ElementType::F16,
                 },
@@ -41,7 +44,7 @@ fn schema() -> WeightSchema {
         ],
         tensors: vec![WeightTensorSpec {
             id: id("weight.matrix"),
-            dimensions: vec![2, 3, 512],
+            dimensions: vec![2, 3, columns],
             logical_element_type: ElementType::F16,
             physical_layout: PhysicalWeightLayout::Composite {
                 parts: vec![
@@ -52,7 +55,7 @@ fn schema() -> WeightSchema {
                             )),
                         }),
                         logical_offsets: vec![1, 0, 0],
-                        extents: vec![1, 3, 512],
+                        extents: vec![1, 3, columns],
                     },
                     CompositeWeightPart {
                         layout: Box::new(PhysicalWeightLayout::BlockQuantized {
@@ -63,7 +66,7 @@ fn schema() -> WeightSchema {
                             block_padding: PhysicalWeightPadding::Exact,
                         }),
                         logical_offsets: vec![0, 0, 0],
-                        extents: vec![1, 3, 512],
+                        extents: vec![1, 3, columns],
                     },
                 ],
             },
@@ -100,6 +103,32 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
             },
         ]
     );
+}
+
+#[test]
+fn pq2_matrix_rows_resolve_their_128_value_blocks_without_aliasing_q8() {
+    for columns in [128, 384] {
+        let mut source = schema_with_block_format(GgufBlockFormat::Pq2_0, columns);
+        let resolved = parts(&source).unwrap();
+        assert_eq!(resolved[0].format.parameters(), [142, 128, 34]);
+        assert_eq!(resolved[0].columns, columns as u32);
+        assert_eq!(resolved[0].rows, 3);
+        assert_eq!(resolved[1].format, MatrixFormat::DenseF16);
+        assert_eq!(resolved[1].output_offset, 3);
+
+        // Q8_0 also occupies 34 bytes, but encodes only 32 values. Neither
+        // its identity nor its physical row extent can substitute for PQ2_0.
+        let WeightEncoding::BlockQuantized(spec) = &mut source.components[0].encoding else {
+            unreachable!()
+        };
+        spec.format_id = QuantizationFormatId::new(GgufBlockFormat::Q8_0.format_id()).unwrap();
+        assert!(parts(&source).is_err());
+        let WeightEncoding::BlockQuantized(spec) = &mut source.components[0].encoding else {
+            unreachable!()
+        };
+        spec.logical_values_per_block = GgufBlockFormat::Q8_0.block_values() as u32;
+        assert!(parts(&source).is_err());
+    }
 }
 
 #[test]

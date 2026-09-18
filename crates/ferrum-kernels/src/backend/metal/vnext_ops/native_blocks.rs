@@ -81,6 +81,7 @@ impl NativeSharedPipelines {
             GgufBlockFormat::Iq4Nl,
             GgufBlockFormat::Iq4Xs,
             GgufBlockFormat::Q5K,
+            GgufBlockFormat::Pq2_0,
         ] {
             for (dtype, suffix) in [(ElementType::F16, "f16"), (ElementType::F32, "f32")] {
                 if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
@@ -139,6 +140,7 @@ pub(super) struct MetalNativeBlockPipelines {
     iq3_s: NativeGemvPipelines,
     iq4_nl: NativeGemvPipelines,
     iq4_xs: NativeGemvPipelines,
+    pq2_0: NativeGemvPipelines,
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
@@ -212,6 +214,7 @@ impl MetalNativeBlockPipelines {
         let iq3_s = specialized(GgufBlockFormat::Iq3S)?;
         let iq4_nl = specialized(GgufBlockFormat::Iq4Nl)?;
         let iq4_xs = specialized(GgufBlockFormat::Iq4Xs)?;
+        let pq2_0 = specialized(GgufBlockFormat::Pq2_0)?;
         #[cfg(test)]
         let specialized_gemv_ns = specialized_started.elapsed().as_nanos() as u64;
         #[cfg(test)]
@@ -261,6 +264,7 @@ impl MetalNativeBlockPipelines {
             iq3_s,
             iq4_nl,
             iq4_xs,
+            pq2_0,
             shared,
             iq4xs_group_dot_f16: [
                 pipeline("vnext_iq4_group_dot_b1")?,
@@ -300,6 +304,7 @@ impl MetalNativeBlockPipelines {
             GgufBlockFormat::Iq3S => &self.iq3_s,
             GgufBlockFormat::Iq4Nl => &self.iq4_nl,
             GgufBlockFormat::Iq4Xs => &self.iq4_xs,
+            GgufBlockFormat::Pq2_0 => &self.pq2_0,
         }
     }
 

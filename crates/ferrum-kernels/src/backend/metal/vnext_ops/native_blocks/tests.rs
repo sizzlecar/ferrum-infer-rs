@@ -4,10 +4,19 @@ use metal::{MTLCommandBufferStatus, MTLResourceOptions, MTLSize};
 
 #[test]
 fn native_block_decoding_matches_cpu_on_real_metal() {
+    assert_native_block_decoding(&FORMATS);
+}
+
+#[test]
+fn pq2_0_block_decoding_matches_cpu_on_real_metal() {
+    assert_native_block_decoding(&[GgufBlockFormat::Pq2_0]);
+}
+
+fn assert_native_block_decoding(formats: &[GgufBlockFormat]) {
     let device = Device::system_default().expect("native block conformance requires Metal");
     let pipelines = MetalNativeBlockPipelines::new(&device).unwrap();
     let queue = device.new_command_queue();
-    for format in FORMATS {
+    for &format in formats {
         let bytes = oracle_blocks(format);
         let count = (bytes.len() / format.block_bytes() * format.block_values()) as u32;
         let mut expected = vec![0.0_f32; count as usize];

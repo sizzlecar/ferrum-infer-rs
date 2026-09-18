@@ -27,6 +27,8 @@ use ferrum_interfaces::vnext::{
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
+use crate::gguf_blocks::GgufBlockFormat;
+
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
     MetalDeviceRuntimeError,
@@ -66,12 +68,18 @@ const LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID: &str =
 const LAST_TOKEN_MASKED_ARGMAX_F32_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_masked_argmax.f32";
 
-const TOKEN_EMBEDDING_QUANTIZATION_FORMATS: &[&str] =
-    &[Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID];
+const PQ2_0_FORMAT_ID: &str = GgufBlockFormat::Pq2_0.format_id();
+const TOKEN_EMBEDDING_QUANTIZATION_FORMATS: &[&str] = &[
+    Q4_K_FORMAT_ID,
+    Q6_K_FORMAT_ID,
+    Q8_0_FORMAT_ID,
+    PQ2_0_FORMAT_ID,
+];
 const EMBEDDING_DENSE_KERNEL: &str = "vnext_embedding_dense_f16";
 const EMBEDDING_Q4_K_KERNEL: &str = "vnext_embedding_q4_k_f16";
 const EMBEDDING_Q6_K_KERNEL: &str = "vnext_embedding_q6_k_f16";
 const EMBEDDING_Q8_0_KERNEL: &str = "vnext_embedding_q8_0_f16";
+const EMBEDDING_PQ2_0_KERNEL: &str = "vnext_embedding_pq2_0_f16";
 const RMS_NORM_KERNEL: &str = "vnext_rms_norm_f16";
 const RESIDUAL_ADD_KERNEL: &str = "vnext_residual_add_f16";
 const LAST_TOKEN_MASKED_ARGMAX_KERNEL: &str = "vnext_last_token_masked_argmax_f16";
@@ -79,6 +87,7 @@ const EMBEDDING_DENSE_F32_KERNEL: &str = "vnext_embedding_dense_f32";
 const EMBEDDING_Q4_K_F32_KERNEL: &str = "vnext_embedding_q4_k_f32";
 const EMBEDDING_Q6_K_F32_KERNEL: &str = "vnext_embedding_q6_k_f32";
 const EMBEDDING_Q8_0_F32_KERNEL: &str = "vnext_embedding_q8_0_f32";
+const EMBEDDING_PQ2_0_F32_KERNEL: &str = "vnext_embedding_pq2_0_f32";
 const RMS_NORM_F32_TO_F16_KERNEL: &str = "vnext_rms_norm_f32_to_f16";
 const RMS_NORM_F32_KERNEL: &str = "vnext_rms_norm_f32";
 const RESIDUAL_ADD_F32_F16_KERNEL: &str = "vnext_residual_add_f32_f16";
@@ -89,6 +98,7 @@ pub(super) struct MetalPrimitivePipelines {
     embedding_q4_k: ComputePipelineState,
     embedding_q6_k: ComputePipelineState,
     embedding_q8_0: ComputePipelineState,
+    embedding_pq2_0: ComputePipelineState,
     rms_norm: ComputePipelineState,
     residual_add: ComputePipelineState,
     last_token_masked_argmax: ComputePipelineState,
@@ -96,6 +106,7 @@ pub(super) struct MetalPrimitivePipelines {
     embedding_q4_k_f32: ComputePipelineState,
     embedding_q6_k_f32: ComputePipelineState,
     embedding_q8_0_f32: ComputePipelineState,
+    embedding_pq2_0_f32: ComputePipelineState,
     rms_norm_f32_to_f16: ComputePipelineState,
     rms_norm_f32: ComputePipelineState,
     residual_add_f32_f16: ComputePipelineState,
@@ -130,6 +141,7 @@ impl MetalPrimitivePipelines {
             embedding_q4_k: pipeline(EMBEDDING_Q4_K_KERNEL)?,
             embedding_q6_k: pipeline(EMBEDDING_Q6_K_KERNEL)?,
             embedding_q8_0: pipeline(EMBEDDING_Q8_0_KERNEL)?,
+            embedding_pq2_0: pipeline(EMBEDDING_PQ2_0_KERNEL)?,
             rms_norm: pipeline(RMS_NORM_KERNEL)?,
             residual_add: pipeline(RESIDUAL_ADD_KERNEL)?,
             last_token_masked_argmax: pipeline(LAST_TOKEN_MASKED_ARGMAX_KERNEL)?,
@@ -137,6 +149,7 @@ impl MetalPrimitivePipelines {
             embedding_q4_k_f32: pipeline(EMBEDDING_Q4_K_F32_KERNEL)?,
             embedding_q6_k_f32: pipeline(EMBEDDING_Q6_K_F32_KERNEL)?,
             embedding_q8_0_f32: pipeline(EMBEDDING_Q8_0_F32_KERNEL)?,
+            embedding_pq2_0_f32: pipeline(EMBEDDING_PQ2_0_F32_KERNEL)?,
             rms_norm_f32_to_f16: pipeline(RMS_NORM_F32_TO_F16_KERNEL)?,
             rms_norm_f32: pipeline(RMS_NORM_F32_KERNEL)?,
             residual_add_f32_f16: pipeline(RESIDUAL_ADD_F32_F16_KERNEL)?,
@@ -685,6 +698,7 @@ enum EmbeddingPhysicalFormat {
     Q4K,
     Q6K,
     Q8_0,
+    Pq2_0,
 }
 
 #[repr(C)]
@@ -874,6 +888,7 @@ fn embedding_weight_format(
                 (Q4_K_FORMAT_ID, 256, 144) => (EmbeddingPhysicalFormat::Q4K, 256),
                 (Q6_K_FORMAT_ID, 256, 210) => (EmbeddingPhysicalFormat::Q6K, 256),
                 (Q8_0_FORMAT_ID, 32, 34) => (EmbeddingPhysicalFormat::Q8_0, 32),
+                (PQ2_0_FORMAT_ID, 128, 34) => (EmbeddingPhysicalFormat::Pq2_0, 128),
                 _ => {
                     return Err(
                         "Metal embedding does not support this quantized block ABI".to_owned()
@@ -1524,10 +1539,12 @@ fn dispatch_embedding(
         (EmbeddingPhysicalFormat::Q4K, ElementType::F16) => &pipelines.embedding_q4_k,
         (EmbeddingPhysicalFormat::Q6K, ElementType::F16) => &pipelines.embedding_q6_k,
         (EmbeddingPhysicalFormat::Q8_0, ElementType::F16) => &pipelines.embedding_q8_0,
+        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F16) => &pipelines.embedding_pq2_0,
         (EmbeddingPhysicalFormat::DenseF16, ElementType::F32) => &pipelines.embedding_dense_f32,
         (EmbeddingPhysicalFormat::Q4K, ElementType::F32) => &pipelines.embedding_q4_k_f32,
         (EmbeddingPhysicalFormat::Q6K, ElementType::F32) => &pipelines.embedding_q6_k_f32,
         (EmbeddingPhysicalFormat::Q8_0, ElementType::F32) => &pipelines.embedding_q8_0_f32,
+        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F32) => &pipelines.embedding_pq2_0_f32,
         (_, other) => panic!("unsupported Metal embedding output type {other:?}"),
     };
     encoder.set_compute_pipeline_state(pipeline);
@@ -1839,6 +1856,97 @@ mod tests {
     #[test]
     fn token_embedding_capability_includes_q4_k() {
         assert!(TOKEN_EMBEDDING_QUANTIZATION_FORMATS.contains(&Q4_K_FORMAT_ID));
+    }
+
+    #[test]
+    fn pq2_0_token_embedding_preserves_codes_blocks_and_f32_range_on_real_metal() {
+        let device = Device::system_default().expect("PQ2_0 embedding conformance requires Metal");
+        let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let format = GgufBlockFormat::Pq2_0;
+        assert!(TOKEN_EMBEDDING_QUANTIZATION_FORMATS.contains(&format.format_id()));
+        let vocabulary = 3;
+        let blocks_per_row = 3;
+        let hidden = blocks_per_row * format.block_values();
+        let mut bytes = vec![0_u8; vocabulary * blocks_per_row * format.block_bytes()];
+        for (index, block) in bytes.chunks_exact_mut(format.block_bytes()).enumerate() {
+            let scale = [0.125, -0.21875, f16::MAX.to_f32()][index % 3];
+            block[..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+            for (position, packed) in block[2..].iter_mut().enumerate() {
+                // Every block contains all four codes; rotate their positions
+                // by row and byte so token and lane permutations are visible.
+                *packed = (0..4).fold(0, |value, lane| {
+                    value | (((index + position + lane) % 4) as u8) << (2 * lane)
+                });
+            }
+        }
+        let mut decoded = vec![0.0; vocabulary * hidden];
+        format.decode(&bytes, &mut decoded).unwrap();
+        assert!(decoded.iter().any(|value| *value > f16::MAX.to_f32()));
+        let tokens = [2_u32, 0, u32::MAX, 1, 2];
+        let count = tokens.len() * hidden;
+        let table = shared_buffer(&device, &bytes);
+        let token_buffer = shared_buffer(&device, &tokens);
+        let guard = -123.0_f32;
+        let output_f16 = shared_buffer(&device, &vec![f16::from_f32(guard); count + 17]);
+        let output_f32 = shared_buffer(&device, &vec![guard; count + 17]);
+        let params = EmbeddingParams {
+            token_count: tokens.len() as u32,
+            hidden_size: hidden as u32,
+            vocabulary_size: vocabulary as u32,
+        };
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        dispatch_raw_embedding(
+            &pipelines,
+            encoder,
+            EmbeddingPhysicalFormat::Pq2_0,
+            &table,
+            &token_buffer,
+            &output_f16,
+            params,
+        );
+        dispatch_raw_embedding_f32(
+            &pipelines,
+            encoder,
+            EmbeddingPhysicalFormat::Pq2_0,
+            &table,
+            &token_buffer,
+            &output_f32,
+            params,
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        let f16_values = read_f16(&output_f16, count + 17);
+        let f32_values = read_f32(&output_f32, count + 17);
+        for index in 0..count + 17 {
+            let expected = if index >= count {
+                guard
+            } else {
+                let token = tokens[index / hidden] as usize;
+                if token >= vocabulary {
+                    0.0
+                } else {
+                    decoded[token * hidden + index % hidden]
+                }
+            };
+            assert_eq!(f32_values[index], expected, "F32 embedding[{index}]");
+            assert_eq!(
+                f16_values[index],
+                f16::from_f32(expected).to_f32(),
+                "F16 embedding[{index}]"
+            );
+        }
+        // SAFETY: Shared inputs are still alive and the command has completed.
+        let table_after =
+            unsafe { std::slice::from_raw_parts(table.contents().cast::<u8>(), bytes.len()) };
+        let tokens_after = unsafe {
+            std::slice::from_raw_parts(token_buffer.contents().cast::<u32>(), tokens.len())
+        };
+        assert_eq!(table_after, bytes);
+        assert_eq!(tokens_after, tokens);
     }
 
     #[test]
@@ -2369,6 +2477,7 @@ mod tests {
             EmbeddingPhysicalFormat::Q4K => &pipelines.embedding_q4_k,
             EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k,
             EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0,
+            EmbeddingPhysicalFormat::Pq2_0 => &pipelines.embedding_pq2_0,
         });
         set_raw(encoder, 0, table);
         set_raw(encoder, 1, token_ids);
@@ -2402,6 +2511,7 @@ mod tests {
             EmbeddingPhysicalFormat::Q4K => &pipelines.embedding_q4_k_f32,
             EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k_f32,
             EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0_f32,
+            EmbeddingPhysicalFormat::Pq2_0 => &pipelines.embedding_pq2_0_f32,
         });
         set_raw(encoder, 0, table);
         set_raw(encoder, 1, token_ids);

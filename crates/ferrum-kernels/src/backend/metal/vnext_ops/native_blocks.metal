@@ -23,6 +23,11 @@ static inline float native_half(device const uchar * b, uint offset) {
     return float(as_type<half>(bits));
 }
 
+// The typed block ABI admits 32, 128, or 256 values per block.
+static inline uint native_block_shift(uint values) {
+    return values == 256 ? 8 : (values == 128 ? 7 : 5);
+}
+
 static inline uint2 native_scale_min(device const uchar * s, uint group) {
     if (group < 4) return uint2(s[group] & 63, s[group + 4] & 63);
     return uint2((s[group + 4] & 15) | ((s[group - 4] >> 6) << 4),
@@ -31,6 +36,10 @@ static inline uint2 native_scale_min(device const uchar * s, uint group) {
 
 static inline float native_block_value(device const uchar * b, uint i, uint format) {
     switch (format) {
+        case 142: {
+            const uint q = (b[2 + i / 4] >> (2 * (i % 4))) & 3;
+            return native_half(b, 0) * float(int(q) - 1);
+        }
         case 11: {
             const uint group = i / 16;
             const uint lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;
@@ -83,12 +92,23 @@ static inline float native_block_value(device const uchar * b, uint i, uint form
 }
 
 // Decode one aligned 16-value fragment directly into the unchanged K x N tile.
-// A fragment stays within one scale group for these four native formats. Keep
+// A fragment stays within one scale group for these native formats. Keep
 // scale products and IQ3 signs in the scalar decoder's FP32 evaluation order.
 // Byte loads also support the two-byte-aligned 110- and 18-byte block layouts.
 static inline void native_gemm_fragment16(
     device const uchar * b, uint first, uint format, threadgroup float * tile) {
     switch (format) {
+        case 142: {
+            const float scale = native_half(b, 0);
+            for (uint j = 0; j < 16; j += 4) {
+                const uint packed = b[2 + (first + j) / 4];
+                for (uint component = 0; component < 4; ++component) {
+                    const uint q = (packed >> (2 * component)) & 3;
+                    tile[(j + component) * 64] = scale * float(int(q) - 1);
+                }
+            }
+            return;
+        }
         case 11: {
             const uint group = first / 16;
             const uint lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;
@@ -182,10 +202,10 @@ static inline void native_linear(
     const uint row = group.y;
     const uint first = group.x * 4 + subgroup * 2;
     const uint format = NATIVE_GEMV_FORMAT == 0 ? block.format : NATIVE_GEMV_FORMAT;
-    // NativeBlockParams admits only 32- or 256-value blocks. Keep the lane
+    // NativeBlockParams admits 32-, 128-, or 256-value blocks. Keep the lane
     // traversal and ulong byte addresses unchanged while sharing this index
     // calculation between the two output columns.
-    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block.values);
     const uint blocks_per_row = p.in_features >> block_shift;
     float sums[2] = {0.0f, 0.0f};
     if (NATIVE_GEMV_FORMAT == 23) {
@@ -262,7 +282,7 @@ static inline void native_shared_linear(
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     uint group, uint lane, uint subgroup) {
     const uint first = group * 4 + subgroup * 2;
-    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block.values);
     const uint blocks_per_row = p.in_features >> block_shift;
     // Complete each independent output before starting the next, keeping only
     // B independent accumulator variables live across the column loop.
@@ -341,9 +361,9 @@ static inline void native_tiled_gemm(
     const uint format = SPECIALIZED ? NATIVE_GEMM_FORMAT : block.format;
     const uint block_values = SPECIALIZED ? NATIVE_GEMM_BLOCK_VALUES : block.values;
     const uint block_bytes = SPECIALIZED ? NATIVE_GEMM_BLOCK_BYTES : block.bytes;
-    // Native GGUF blocks contain 32 or 256 values. A K32 tile cannot cross
+    // Native GGUF blocks contain 32, 128, or 256 values. A K32 tile cannot cross
     // a block boundary, so compute its block address once per K iteration.
-    const uint block_shift = block_values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block_values);
     const ulong blocks_per_row = ulong(p.in_features >> block_shift);
     const uint matrix_row = (simdgroup_index / 2) * 16;
     const uint matrix_column = (simdgroup_index % 2) * 32;

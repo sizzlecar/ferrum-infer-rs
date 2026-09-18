@@ -51,7 +51,7 @@ pub(super) fn descriptor(
             WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
             WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
         ]),
-        [Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
+        [Pq2_0, Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
             .into_iter()
             .map(|format| QuantizationFormatId::new(format.format_id()))
             .collect::<Result<_, _>>()

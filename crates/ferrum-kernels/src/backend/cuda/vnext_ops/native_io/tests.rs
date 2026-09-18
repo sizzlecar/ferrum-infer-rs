@@ -33,10 +33,16 @@ fn token_io_bounds_preserve_nonzero_spans_and_native_launch_capacity() {
             assert!((limit + 1) * u64::from(width) > u64::from(u32::MAX));
         }
     }
+    for width in [128, 384] {
+        let table = part(MatrixFormat::Block(GgufBlockFormat::Pq2_0), 7, width);
+        assert!(embedding_chunk_limit(&table).is_ok());
+    }
     for table in [
         part(MatrixFormat::DenseF16, 1, 0),
         part(MatrixFormat::DenseF16, 0, 512),
         part(MatrixFormat::Block(GgufBlockFormat::Q4K), 1, 257),
+        part(MatrixFormat::Block(GgufBlockFormat::Pq2_0), 1, 127),
+        part(MatrixFormat::Block(GgufBlockFormat::Pq2_0), 1, 129),
         MatrixPart {
             output_offset: 1,
             ..part(MatrixFormat::DenseF16, 1, 512)

@@ -97,6 +97,7 @@ pub(super) const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
     GgufBlockFormat::Iq3S.format_id(),
     GgufBlockFormat::Iq4Nl.format_id(),
     GgufBlockFormat::Iq4Xs.format_id(),
+    GgufBlockFormat::Pq2_0.format_id(),
 ];
 const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = ALL_LINEAR_QUANTIZATION_FORMATS;
 

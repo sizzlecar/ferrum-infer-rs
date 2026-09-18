@@ -11,6 +11,47 @@ fn spec(format: GgufBlockFormat) -> BlockQuantizationSpec {
 }
 
 #[test]
+fn pq2_decodes_adjacent_two_bit_slots_and_independent_group_scales() {
+    // 00, 01, 10, 11 in increasing element order; then the reverse order.
+    // These literal bytes/values describe the source ABI independently of
+    // the decoder and exercise code 3, which represents +2 rather than zero.
+    let mut source = [0b1110_0100_u8; 68];
+    source[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+    source[34..36].copy_from_slice(&f16::from_f32(-2.0).to_le_bytes());
+    source[36..].fill(0b0001_1011);
+    let mut output = [f32::NAN; 256];
+    GgufBlockFormat::Pq2_0.decode(&source, &mut output).unwrap();
+    for group in output[..128].chunks_exact(4) {
+        assert_eq!(group, [-0.5, 0.0, 0.5, 1.0]);
+    }
+    for group in output[128..].chunks_exact(4) {
+        assert_eq!(group, [-4.0, -2.0, 0.0, 2.0]);
+    }
+}
+
+#[test]
+fn pq2_zero_and_subnormal_scales_preserve_source_values() {
+    let mut source = [0b1110_0100_u8; 34];
+    let mut output = [f32::NAN; 128];
+    source[..2].copy_from_slice(&0_u16.to_le_bytes());
+    GgufBlockFormat::Pq2_0.decode(&source, &mut output).unwrap();
+    assert!(output.iter().all(|&value| value == 0.0));
+    source[..2].copy_from_slice(&1_u16.to_le_bytes());
+    GgufBlockFormat::Pq2_0.decode(&source, &mut output).unwrap();
+    for group in output.chunks_exact(4) {
+        assert_eq!(
+            group,
+            [
+                -2.0_f32.powi(-24),
+                0.0,
+                2.0_f32.powi(-24),
+                2.0_f32.powi(-23)
+            ]
+        );
+    }
+}
+
+#[test]
 fn decode_checks_full_abi_and_lengths_before_writing_any_output() {
     for format in FORMATS {
         assert_eq!(GgufBlockFormat::from_spec(&spec(format)).unwrap(), format);
@@ -123,14 +164,30 @@ fn native_k_quant_decoding_matches_candle_cpu_on_quantized_weights() {
 #[test]
 #[ignore = "requires FERRUM_GGML_REFERENCE_LIBRARY pointing to a trusted libggml-base shared library"]
 fn native_blocks_match_independent_ggml_dequantizers() {
+    // PQ2_0 is a Prism extension, so an upstream GGML oracle need not export it.
+    let upstream_formats = FORMATS
+        .into_iter()
+        .filter(|format| *format != GgufBlockFormat::Pq2_0)
+        .collect::<Vec<_>>();
+    compare_ggml_reference(&upstream_formats);
+}
+
+#[test]
+#[ignore = "requires FERRUM_GGML_REFERENCE_LIBRARY pointing to a trusted Prism libggml-base shared library"]
+fn pq2_blocks_match_independent_prism_dequantizer() {
+    compare_ggml_reference(&[GgufBlockFormat::Pq2_0]);
+}
+
+fn compare_ggml_reference(formats: &[GgufBlockFormat]) {
     let path =
         std::env::var_os("FERRUM_GGML_REFERENCE_LIBRARY").expect("FERRUM_GGML_REFERENCE_LIBRARY");
     // SAFETY: This explicit developer test loads the trusted, locally built
     // oracle supplied by its caller. No downloaded library is executed.
     let library = unsafe { libloading::Library::new(path) }.unwrap();
     type Dequantize = unsafe extern "C" fn(*const std::ffi::c_void, *mut f32, i64);
-    for format in FORMATS {
+    for &format in formats {
         let symbol = match format {
+            GgufBlockFormat::Pq2_0 => "dequantize_row_pq2_0",
             GgufBlockFormat::Q3K => "dequantize_row_q3_K",
             GgufBlockFormat::Q4K => "dequantize_row_q4_K",
             GgufBlockFormat::Q5K => "dequantize_row_q5_K",

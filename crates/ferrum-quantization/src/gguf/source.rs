@@ -40,6 +40,11 @@ impl GgufWeightComponentSource {
                 path.display()
             ))
         })?;
+        if file.hadamard().is_some() {
+            return Err(FerrumError::model(
+                super::hadamard::unsupported_execution().to_string(),
+            ));
+        }
         Ok(Self {
             file: Arc::new(file),
             source_file,

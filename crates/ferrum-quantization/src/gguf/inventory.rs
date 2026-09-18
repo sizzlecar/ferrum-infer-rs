@@ -11,7 +11,7 @@ use candle_core::quantized::gguf_file::{Content, Value};
 use candle_core::{Error, Result};
 use serde::Serialize;
 
-use super::{block_quantization_format, GgmlDType};
+use super::{block_quantization_format, GgmlDType, GgufHadamard};
 
 mod header;
 mod metadata;
@@ -48,6 +48,9 @@ pub struct GgufInventory {
     pub schema_version: u32,
     pub architecture: String,
     pub quantization_version: Option<u64>,
+    /// Activation semantics declared by the source, independent of GGML dtype.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hadamard: Option<GgufHadamard>,
     pub declared_file_bytes: u64,
     pub tensor_data_offset: u64,
     pub tensor_payload_bytes: u64,
@@ -78,7 +81,8 @@ impl GgufInventory {
                             | "split.no"
                             | "split.count"
                             | "split.tensors.count"
-                    )
+                    ) || super::hadamard::declares_transform(key)
+                        || super::hadamard::is_geometry_key(key)
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
@@ -132,6 +136,14 @@ impl GgufInventory {
                 "architecture and tensor table must be nonempty".into(),
             ));
         }
+        let hadamard = GgufHadamard::parse(
+            &content.metadata,
+            &architecture,
+            content
+                .tensors
+                .iter()
+                .map(|tensor| (tensor.name.as_str(), tensor.dimensions.as_slice())),
+        )?;
         if content.data_offset > declared_file_bytes {
             return Err(invalid(
                 "tensor data starts beyond the declared file length".into(),
@@ -250,6 +262,7 @@ impl GgufInventory {
                 .get("general.quantization_version")
                 .map(metadata_integer)
                 .transpose()?,
+            hadamard,
             declared_file_bytes,
             tensor_data_offset: content.data_offset,
             tensor_payload_bytes,
@@ -300,6 +313,18 @@ pub(super) fn block_abi(code: u32) -> Result<BlockAbi> {
     // 2-byte d + 2-byte scales_h + 4-byte scales_l + 128-byte quants.
     // https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h
     match code {
+        // Prism-private group-128 Q2_0: F16 scale plus 32 bytes of
+        // adjacent 2-bit slots. Distinct from upstream Q2_0 (group 64).
+        // PrismML-Eng/llama.cpp ggml-common.h, revision 5d80cff0.
+        142 => {
+            return Ok(BlockAbi {
+                name: "PQ2_0".into(),
+                format: Some("quantization.gguf.pq2-0"),
+                values: 128,
+                bytes: 34,
+                candle_dtype_available: false,
+            })
+        }
         23 => {
             return Ok(BlockAbi {
                 name: "IQ4_XS".into(),

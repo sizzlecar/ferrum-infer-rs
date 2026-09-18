@@ -34,6 +34,7 @@ fn native_shared_linears_preserve_independent_rows_offsets_and_precision() {
         GgufBlockFormat::Iq4Nl,
         GgufBlockFormat::Iq4Xs,
         GgufBlockFormat::Q5K,
+        GgufBlockFormat::Pq2_0,
     ] {
         for dtype in [ElementType::F16, ElementType::F32] {
             if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
@@ -212,7 +213,7 @@ fn assert_native_linears_mode(
                 block[..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
             }
         }
-        // Five blocks exercise both 32- and 256-value formats without assuming
+        // Five blocks exercise 32-, 128-, and 256-value formats without assuming
         // a multiple-of-four block count in the shared kernel.
         let blocks = if shared {
             blocks
@@ -691,6 +692,43 @@ fn assert_native_prefill(
         );
     }
     actual.iter().map(|value| value.to_bits()).collect()
+}
+
+#[test]
+fn pq2_0_linears_preserve_blocks_precision_and_production_dispatch_on_real_metal() {
+    let device = Device::system_default().expect("PQ2_0 linear conformance requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    let format = GgufBlockFormat::Pq2_0;
+    assert!(ALL_LINEAR_QUANTIZATION_FORMATS.contains(&format.format_id()));
+    for dtype in [ElementType::F16, ElementType::F32] {
+        for rows in 2..=4 {
+            pipelines.native.shared_linear(format, rows, dtype).unwrap();
+        }
+    }
+    for shared in [false, true] {
+        assert_native_linears(&device, &pipelines, &queue, shared, 7, &[format]);
+    }
+    assert_native_linears(&device, &pipelines, &queue, true, 1025, &[format]);
+    // Three 128-value blocks cross a block boundary twice, with a non-four-
+    // block row pitch. Row/output tails execute the production M32 selector.
+    let blocks = oracle_blocks(format)
+        .chunks_exact(format.block_bytes())
+        .cycle()
+        .take(3)
+        .flat_map(|block| block.iter().copied())
+        .collect::<Vec<_>>();
+    let _ = assert_native_prefill(
+        &device,
+        &pipelines,
+        &queue,
+        format,
+        &blocks,
+        33,
+        1025,
+        |row, column| f16::from_f32(((row * 17 + column) as f32 * 0.073).sin() * 0.03125),
+        PrefillTile::Production,
+    );
 }
 
 #[test]

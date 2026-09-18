@@ -70,9 +70,11 @@ fn native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on
         MatrixFormat::Block(GgufBlockFormat::Q8_0),
         MatrixFormat::Block(GgufBlockFormat::Iq3S),
         MatrixFormat::Block(GgufBlockFormat::Iq4Xs),
+        MatrixFormat::Block(GgufBlockFormat::Pq2_0),
     ];
     for (columns, tokens, formats) in [
         (256, 3, mixed),
+        (384, 3, vec![MatrixFormat::Block(GgufBlockFormat::Pq2_0)]),
         (3, MAX_ROWS as usize + 1, vec![MatrixFormat::DenseF16]),
     ] {
         let mut matrices = Vec::new();

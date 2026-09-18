@@ -46,6 +46,12 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
         }
         case 8:
             return native_half(b, 0) * float(static_cast<signed char>(b[2 + i]));
+        case 142: {
+            // PQ2_0: one F16 scale and 128 values packed low slot first.
+            // All four physical codes are defined, including code 3 = +2.
+            const unsigned q = (b[2 + i / 4] >> (2 * (i % 4))) & 3;
+            return native_half(b, 0) * float(int(q) - 1);
+        }
         case 20: {
             const unsigned q = (b[2 + i % 16] >> (4 * (i / 16))) & 15;
             return native_half(b, 0) * float(iq4_nl_values[q]);

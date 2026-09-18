@@ -61,7 +61,10 @@ fn names(backend: Backend) -> Vec<String> {
         ],
         Backend::Metal => &[
             ("native_blocks::tests", &["native_block_decoding_matches_cpu_on_real_metal"]),
-            ("linear::native_tests", &["native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal"]),
+            ("linear::native_tests", &[
+                "native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal",
+                "pq2_0_linears_preserve_blocks_precision_and_production_dispatch_on_real_metal",
+            ]),
             ("linear::tests", &[
                 "native_linear_formats_match_cpu_oracles_on_real_metal",
                 "native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal",
@@ -73,6 +76,7 @@ fn names(backend: Backend) -> Vec<String> {
             ("primitives::tests", &[
                 "q4_k_token_embedding_matches_cpu_for_f16_and_f32_on_real_metal",
                 "q6_k_and_q8_token_embeddings_preserve_float_boundaries_on_real_metal",
+                "pq2_0_token_embedding_preserves_codes_blocks_and_f32_range_on_real_metal",
                 "f32_master_primitives_preserve_precision_and_residual_aliasing_on_real_metal",
                 "native_f16_primitives_match_cpu_references_on_real_metal",
             ]),

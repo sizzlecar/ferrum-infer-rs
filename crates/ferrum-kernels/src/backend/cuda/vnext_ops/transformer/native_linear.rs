@@ -6,7 +6,7 @@ use crate::gguf_blocks::GgufBlockFormat;
 
 pub(super) fn quantization_formats() -> Result<BTreeSet<QuantizationFormatId>, VNextError> {
     use GgufBlockFormat::*;
-    [Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
+    [Pq2_0, Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
         .into_iter()
         .map(|format| QuantizationFormatId::new(format.format_id()))
         .collect()

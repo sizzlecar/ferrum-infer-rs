@@ -55,6 +55,13 @@ impl GgufFile {
         })?;
         let mut cursor = Cursor::new(&mmap[..]);
         let content = Content::read(&mut cursor)?;
+        if content
+            .metadata
+            .keys()
+            .any(|key| super::hadamard::declares_transform(key))
+        {
+            return Err(super::hadamard::unsupported_execution());
+        }
         Ok(Self { mmap, content })
     }
 
