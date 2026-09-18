@@ -104,6 +104,8 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
             weight_gpu.push(stream.clone_htod(&padded).unwrap());
         }
         let part = |format, rows, columns, offset| MatrixPart {
+            transform: None,
+            signs_region: None,
             component_id: WeightId::new("component.swiglu").unwrap(),
             format,
             rows: rows as u32,
@@ -153,6 +155,7 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
                 tokens as u32,
                 hidden as u32,
                 intermediate as u32,
+                0,
             )
             .unwrap();
             drop((gg, ag, yg));

@@ -88,6 +88,8 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
         parts,
         vec![
             MatrixPart {
+                transform: None,
+                signs_region: None,
                 component_id: id("component.z_first"),
                 format: MatrixFormat::Block(GgufBlockFormat::Iq4Xs),
                 rows: 3,
@@ -95,6 +97,8 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
                 output_offset: 0
             },
             MatrixPart {
+                transform: None,
+                signs_region: None,
                 component_id: id("component.a_second"),
                 format: MatrixFormat::DenseF16,
                 rows: 3,
@@ -103,6 +107,82 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
             },
         ]
     );
+}
+
+#[test]
+fn hadamard_parts_keep_shared_sign_identity_and_independent_projection_transforms() {
+    use ferrum_interfaces::vnext::{
+        GroupedFeatureTranspose, HadamardApplication, HadamardSigns, HadamardTransformSpec,
+    };
+    use std::num::NonZeroU32;
+    let mut schema = schema_with_block_format(GgufBlockFormat::Pq2_0, 512);
+    schema.components.insert(
+        0,
+        WeightComponentSpec {
+            id: id("component.shared-signs"),
+            role: WeightComponentRole::TransformSigns,
+            external_names: vec!["metadata.signs.512".into()],
+            dimensions: vec![512],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F32,
+            },
+            required: true,
+        },
+    );
+    let transform = HadamardTransformSpec {
+        block_size: NonZeroU32::new(256).unwrap(),
+        signs: HadamardSigns::Explicit(PhysicalWeightComponentBinding::exact_contiguous(id(
+            "component.shared-signs",
+        ))),
+        application: HadamardApplication::BeforeMatmul {
+            input_permutation: None,
+        },
+    };
+    let PhysicalWeightLayout::Composite { parts: children } =
+        &mut schema.tensors[0].physical_layout
+    else {
+        panic!()
+    };
+    for child in children.iter_mut() {
+        child.layout = Box::new(PhysicalWeightLayout::Hadamard {
+            values: child.layout.clone(),
+            transform: transform.clone(),
+        });
+    }
+    let resolved = parts(&schema).unwrap();
+    assert_eq!(region_count(&resolved), 3);
+    assert_eq!(resolved[0].signs_region, Some(2));
+    assert_eq!(resolved[1].signs_region, Some(2));
+    assert_eq!(resolved[0].component_id, id("component.z_first"));
+    assert_eq!(dispatches(&resolved), 4);
+    let replay = |parts: &[MatrixPart]| {
+        key(
+            crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder::new(
+                "test.hadamard",
+                "matrix",
+            ),
+            parts,
+        )
+        .finish()
+    };
+    let original_key = replay(&resolved);
+    let mut permuted = resolved.clone();
+    permuted[0].transform.as_mut().unwrap().application = HadamardApplication::BeforeMatmul {
+        input_permutation: Some(GroupedFeatureTranspose {
+            inner_extent: 64,
+            first_outer_extent: 2,
+            second_outer_extent: 4,
+        }),
+    };
+    assert_ne!(original_key, replay(&permuted));
+    let mut plain = resolved.clone();
+    plain[1].transform = None;
+    plain[1].signs_region = None;
+    assert_eq!(dispatches(&plain), 3);
+    assert_ne!(original_key, replay(&plain));
+    let mut relocated = resolved.clone();
+    relocated[0].signs_region = Some(3);
+    assert_ne!(original_key, replay(&relocated));
 }
 
 #[test]

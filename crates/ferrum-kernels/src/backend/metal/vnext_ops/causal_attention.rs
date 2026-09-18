@@ -667,13 +667,23 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
         shape
             .validate_page_count(self.attention.kv_type)
             .map_err(invalid_plan)?;
+        let transform_bytes =
+            super::hadamard::workspace_bytes_per_token(request.values()).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                0,
+                if transform_bytes > 0 {
+                    VALUE_ALIGNMENT_BYTES - 1
+                } else {
+                    0
+                },
                 shape
                     .split_decode_bytes_for_storage(self.attention.kv_type)
                     .map_err(invalid_plan)?,
-                shape.scratch_bytes_per_token().map_err(invalid_plan)?,
+                shape
+                    .scratch_bytes_per_token()
+                    .map_err(invalid_plan)?
+                    .checked_add(transform_bytes)
+                    .ok_or_else(|| invalid_plan("Metal causal transform workspace overflows"))?,
             )?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
@@ -1235,11 +1245,16 @@ fn encode_attention(
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new_with_storage(
+    let mut layout = ScratchLayout::new_with_storage(
         shape,
         total_tokens,
         invocation.participants().len(),
         kv_type,
+    )?;
+    let transform_offset = super::hadamard::append_workspace(
+        &mut layout.required_bytes,
+        first.bindings(),
+        total_tokens,
     )?;
     let binding_layout = BindingLayout::new(
         attention.binding_slot_bytes()?,
@@ -1504,7 +1519,7 @@ fn encode_attention(
             hidden_type,
             total_tokens,
         )?);
-        let packed = PackedLaunch {
+        let mut packed = PackedLaunch {
             input,
             output,
             normalized: layout.normalized,
@@ -1562,6 +1577,19 @@ fn encode_attention(
                 layout.projected,
             )?,
         };
+        for projection in [
+            &mut packed.query_projection,
+            &mut packed.key_projection,
+            &mut packed.value_projection,
+            &mut packed.output_projection,
+        ] {
+            projection.bind_hadamard_workspace(
+                &linear,
+                &regions,
+                shared.scratch,
+                transform_offset,
+            )?;
+        }
         validate_launch_regions_with_raw_workspace(
             &regions,
             &[
@@ -1574,7 +1602,20 @@ fn encode_attention(
         )?;
         Some(packed)
     } else {
-        for launch in &launches {
+        for launch in &mut launches {
+            for projection in [
+                &mut launch.query_projection,
+                &mut launch.key_projection,
+                &mut launch.value_projection,
+                &mut launch.output_projection,
+            ] {
+                projection.bind_hadamard_workspace(
+                    &linear,
+                    &regions,
+                    shared.scratch,
+                    transform_offset,
+                )?;
+            }
             validate_launch_regions_with_raw_workspace(
                 &regions,
                 &[
@@ -1613,8 +1654,35 @@ fn encode_attention(
             attention.dispatch_plan(&launch.params).kind == AttentionDispatchKind::GroupedDecode
         })
         .count() as u64;
+    let transform_dispatches = if let Some(packed) = &packed {
+        [
+            packed.query_projection,
+            packed.key_projection,
+            packed.value_projection,
+            packed.output_projection,
+        ]
+        .iter()
+        .map(|projection| projection.dispatch_count() - 1)
+        .sum::<u64>()
+    } else {
+        launches
+            .iter()
+            .map(|launch| {
+                [
+                    launch.query_projection,
+                    launch.key_projection,
+                    launch.value_projection,
+                    launch.output_projection,
+                ]
+                .iter()
+                .map(|projection| projection.dispatch_count() - 1)
+                .sum::<u64>()
+            })
+            .sum()
+    };
     let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
-        .saturating_add(grouped_decode_reductions);
+        .saturating_add(grouped_decode_reductions)
+        .saturating_add(transform_dispatches);
     let operation_label = if kv_type == ElementType::I8 {
         if hidden_type == ElementType::F32 {
             "vnext_causal_paged_attention_f32_master_int8_kv"

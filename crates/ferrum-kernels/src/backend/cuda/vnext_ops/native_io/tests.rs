@@ -10,6 +10,8 @@ use weights::{MatrixFormat, MatrixPart};
 
 fn part(format: MatrixFormat, rows: u32, columns: u32) -> MatrixPart {
     MatrixPart {
+        transform: None,
+        signs_region: None,
         component_id: WeightId::new("component.token-matrix").unwrap(),
         format,
         rows,

@@ -60,6 +60,7 @@ pub(super) fn descriptor(
             include_str!("native_io.rs").as_bytes(),
             include_str!("../vnext_ops.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
+            include_str!("native_blocks/hadamard.rs").as_bytes(),
             include_str!("native_blocks/weights.rs").as_bytes(),
             crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
             crate::ptx::VNEXT_GGUF.as_bytes(),
@@ -126,15 +127,10 @@ fn matrix_key(
     operation: &'static str,
     weight: &weights::MatrixWeight,
 ) -> CudaCommandReplayKeyBuilder {
-    let mut key =
-        CudaCommandReplayKeyBuilder::new(fingerprint, operation).u64(weight.parts.len() as u64);
-    for part in &weight.parts {
-        key = key.u32(part.rows).u32(part.columns).u32(part.output_offset);
-        for value in part.format.parameters() {
-            key = key.u32(value);
-        }
-    }
-    key
+    weights::key(
+        CudaCommandReplayKeyBuilder::new(fingerprint, operation),
+        &weight.parts,
+    )
 }
 
 pub(super) fn encode_embedding(
@@ -160,6 +156,7 @@ pub(super) fn encode_embedding(
         transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     let mut key = matrix_key(fingerprint, "vnext_native_embedding", &weight);
     let mut regions = weight.regions;
+    let scratch = super::native_blocks::hadamard::retain_workspace(&invocation, &mut regions)?;
     let mut launches = Vec::new();
     for (participant, range) in invocation
         .participants()
@@ -222,7 +219,7 @@ pub(super) fn encode_embedding(
         u32::try_from(launches.len()).map_err(|_| "too many embedding participants")?;
     let tokens = invocation.work_shape().immediate_tokens();
     let dispatches = launches.iter().try_fold(0_u64, |sum, &(_, _, count)| {
-        sum.checked_add(count.div_ceil(chunk_limit))
+        sum.checked_add(count.div_ceil(chunk_limit) * (1 + u64::from(part.transform.is_some())))
             .ok_or("embedding dispatch count overflows")
     })?;
     let part = part.clone();
@@ -252,7 +249,7 @@ pub(super) fn encode_embedding(
                         precision.element().size_bytes(),
                         "native embedding output",
                     )?;
-                    kernels.embedding(
+                    kernels.transformed_embedding(
                         stream,
                         token_ptr,
                         regions[0].device_ptr(),
@@ -260,6 +257,9 @@ pub(super) fn encode_embedding(
                         &part,
                         chunk,
                         precision.element(),
+                        part.signs_region
+                            .map_or(0, |index| regions[index].device_ptr()),
+                        scratch.map_or(0, |index| regions[index].device_ptr()),
                     )?;
                     offset += u64::from(chunk);
                 }
@@ -299,6 +299,7 @@ pub(super) fn encode_projection(
         transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let mut key = matrix_key(fingerprint, "vnext_native_last_token_linear", &weight);
     let mut regions = weight.regions;
+    let scratch = super::native_blocks::hadamard::retain_workspace(&invocation, &mut regions)?;
     let mut launches = Vec::new();
     for (participant, range) in invocation
         .participants()
@@ -344,7 +345,7 @@ pub(super) fn encode_projection(
         u32::try_from(launches.len()).map_err(|_| "too many projection participants")?;
     let stride = u32::try_from(outputs).map_err(|_| "native projection output stride overflows")?;
     let dispatches = (launches.len() as u64)
-        .checked_mul(weight.parts.len() as u64)
+        .checked_mul(weights::dispatches(&weight.parts))
         .ok_or("native projection dispatch count overflows")?;
     let kernels = kernels.clone();
     CudaDeviceCommand::replayable_operation(
@@ -354,7 +355,7 @@ pub(super) fn encode_projection(
         move |stream, regions| {
             for &(input, output) in &launches {
                 for (index, part) in weight.parts.iter().enumerate() {
-                    kernels.linear(
+                    kernels.transformed_linear(
                         stream,
                         regions[input].device_ptr(),
                         regions[index].device_ptr(),
@@ -363,6 +364,9 @@ pub(super) fn encode_projection(
                         1,
                         stride,
                         precision.element(),
+                        part.signs_region
+                            .map_or(0, |index| regions[index].device_ptr()),
+                        scratch.map_or(0, |index| regions[index].device_ptr()),
                     )?;
                 }
             }

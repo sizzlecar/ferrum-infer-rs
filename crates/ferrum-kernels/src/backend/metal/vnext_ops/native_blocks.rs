@@ -56,6 +56,7 @@ impl From<GgufBlockFormat> for NativeBlockParams {
 struct NativeGemvPipelines {
     f16: ComputePipelineState,
     f32: ComputePipelineState,
+    f32_f16: ComputePipelineState,
 }
 
 struct NativeSharedPipelines {
@@ -144,6 +145,7 @@ pub(super) struct MetalNativeBlockPipelines {
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
+    pub(super) gemm_input_f32_output_f16: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -200,6 +202,7 @@ impl MetalNativeBlockPipelines {
             Ok::<_, MetalDeviceRuntimeError>(NativeGemvPipelines {
                 f16: gemv_pipeline("vnext_native_block_linear_f16", format.ggml_type_id())?,
                 f32: gemv_pipeline("vnext_native_block_linear_f32", format.ggml_type_id())?,
+                f32_f16: gemv_pipeline("vnext_native_block_linear_f32_f16", format.ggml_type_id())?,
             })
         };
         // Compile the bounded format set during registry construction. Dispatch
@@ -273,6 +276,7 @@ impl MetalNativeBlockPipelines {
                 pipeline("vnext_iq4_group_dot_b4")?,
             ],
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
+            gemm_input_f32_output_f16: pipeline("vnext_native_block_gemm_input_f32_output_f16")?,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]
@@ -314,6 +318,10 @@ impl MetalNativeBlockPipelines {
 
     pub(super) fn linear_f32(&self, format: GgufBlockFormat) -> &ComputePipelineState {
         &self.gemv(format).f32
+    }
+
+    pub(super) fn linear_f32_f16(&self, format: GgufBlockFormat) -> &ComputePipelineState {
+        &self.gemv(format).f32_f16
     }
 
     pub(super) fn iq4xs_group_dot(&self, rows: u32) -> Option<&ComputePipelineState> {

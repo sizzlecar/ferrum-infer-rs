@@ -110,14 +110,10 @@ kernel void vnext_swiglu_f16(
     activation[index] = half((gate / (1.0f + exp(-gate))) * up);
 }
 
-kernel void vnext_linear_dense_f32(
-    device const float * input [[buffer(0)]],
-    device const half * weight [[buffer(1)]],
-    device float * output [[buffer(2)]],
-    constant LinearParams & params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+template<typename Output>
+static inline void linear_dense_f32(
+    device const float * input, device const half * weight, device Output * output,
+    constant LinearParams & params, uint3 group, uint simd_lane, uint simd_group) {
     const uint row = group.y;
     const uint first_output = group.x * 4 + simd_group * 2;
     float sums[2] = {0.0f, 0.0f};
@@ -137,9 +133,25 @@ kernel void vnext_linear_dense_f32(
         const float total = simd_sum(sums[local_output]);
         if (simd_lane == 0 && output_column < params.out_features) {
             output[ulong(row) * params.output_stride
-                + params.output_column_offset + output_column] = total;
+                + params.output_column_offset + output_column] = Output(total);
         }
     }
+}
+
+kernel void vnext_linear_dense_f32(
+    device const float * input [[buffer(0)]], device const half * weight [[buffer(1)]],
+    device float * output [[buffer(2)]], constant LinearParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    linear_dense_f32(input, weight, output, params, group, simd_lane, simd_group);
+}
+
+kernel void vnext_linear_dense_f32_f16(
+    device const float * input [[buffer(0)]], device const half * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant LinearParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    linear_dense_f32(input, weight, output, params, group, simd_lane, simd_group);
 }
 
 kernel void vnext_linear_q8_0_f32(

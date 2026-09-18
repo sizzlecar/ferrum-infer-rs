@@ -61,6 +61,14 @@ fn names(backend: Backend) -> Vec<String> {
         ],
         Backend::Metal => &[
             ("native_blocks::tests", &["native_block_decoding_matches_cpu_on_real_metal"]),
+            ("hadamard::tests", &[
+                "hadamard_forward_preserves_full_width_signs_blocks_and_input_precision_on_metal",
+                "hadamard_grouped_permutation_precedes_signs_across_blocks_on_metal",
+                "hadamard_inverse_keeps_wide_embedding_values_f32_until_final_store_on_metal",
+            ]),
+            ("linear::hadamard_tests", &[
+                "hadamard_pq2_projection_keeps_f32_transform_through_dot_and_plain_siblings_on_metal",
+            ]),
             ("linear::native_tests", &[
                 "native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal",
                 "pq2_0_linears_preserve_blocks_precision_and_production_dispatch_on_real_metal",
@@ -111,6 +119,11 @@ fn names(backend: Backend) -> Vec<String> {
             ]),
         ],
         Backend::Cuda => &[
+            ("native_blocks::hadamard::tests", &[
+                "hadamard_forward_and_inverse_match_independent_walsh_on_cuda",
+                "hadamard_pq2_embedding_preserves_f32_until_inverse_on_cuda",
+                "hadamard_pq2_projection_mixes_transformed_and_plain_inputs_on_cuda",
+            ]),
             ("native_blocks::tests", &[
                 "native_block_decoding_matches_shared_ggml_oracle_on_cuda",
                 "native_block_embeddings_preserve_f16_and_f32_activations_on_cuda",

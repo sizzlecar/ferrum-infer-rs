@@ -194,9 +194,9 @@ static inline float native_iq4xs_lane_value(
     return (header.d * float(scale)) * float(iq4_nl_values[q]);
 }
 
-template<typename T>
+template<typename Input, typename Output>
 static inline void native_linear(
-    device const T * input, device const uchar * weight, device T * output,
+    device const Input * input, device const uchar * weight, device Output * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     uint3 group, uint lane, uint subgroup) {
     const uint row = group.y;
@@ -254,7 +254,7 @@ static inline void native_linear(
         const float value = simd_sum(sums[part]);
         const uint out_col = first + part;
         if (lane == 0 && out_col < p.out_features) {
-            output[ulong(row) * p.output_stride + p.output_column_offset + out_col] = T(value);
+            output[ulong(row) * p.output_stride + p.output_column_offset + out_col] = Output(value);
         }
     }
 }
@@ -268,6 +268,13 @@ kernel void vnext_native_block_linear_f16(
 
 kernel void vnext_native_block_linear_f32(
     device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], device float * y [[buffer(2)]],
+    constant NativeLinearParams & p [[buffer(3)]], constant NativeBlockParams & b [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint subgroup [[simdgroup_index_in_threadgroup]]) {
+    native_linear(x, w, y, p, b, group, lane, subgroup);
+}
+
+kernel void vnext_native_block_linear_f32_f16(
+    device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], device half * y [[buffer(2)]],
     constant NativeLinearParams & p [[buffer(3)]], constant NativeBlockParams & b [[buffer(4)]],
     uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint subgroup [[simdgroup_index_in_threadgroup]]) {
     native_linear(x, w, y, p, b, group, lane, subgroup);
@@ -348,9 +355,9 @@ NATIVE_SHARED_LINEAR(float, f32, 4)
 // A 32- or 64-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
-template<uint ROW_TILE, bool SPECIALIZED = false>
+template<uint ROW_TILE, bool SPECIALIZED = false, typename Input = half>
 static inline void native_tiled_gemm(
-    device const half * input, device const uchar * weight, device half * output,
+    device const Input * input, device const uchar * weight, device half * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     threadgroup float * workspace, uint3 group, uint thread_index, uint simdgroup_index) {
     constexpr uint THREADS = ROW_TILE * 4;
@@ -469,6 +476,15 @@ NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64, 64, false)
 NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_specialized, 32, true)
 NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64_specialized, 64, true)
 #undef NATIVE_TILED_GEMM
+
+kernel void vnext_native_block_gemm_input_f32_output_f16(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<32, false, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
 
 kernel void vnext_native_block_decode(
     device const uchar * input [[buffer(0)]], device float * output [[buffer(1)]],

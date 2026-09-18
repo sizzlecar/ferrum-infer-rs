@@ -321,7 +321,7 @@ fn token_embedding_contract_with_output(
 ) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(operation_id)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(1, 1),
         inputs: vec![
             contiguous_tensor(
                 vec![DimensionConstraint::Symbol("tokens".to_owned())],
@@ -351,7 +351,9 @@ fn token_embedding_contract_with_output(
         ]))?,
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
-            scratch: ResourcePresenceRequirement::Forbidden,
+            // A transformed table needs bounded activation storage to restore
+            // each selected row without expanding the persistent weights.
+            scratch: ResourcePresenceRequirement::Optional,
             binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
@@ -595,7 +597,7 @@ fn rms_norm_contract_with_types(
 pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(DENSE_LINEAR_OPERATION_ID)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(1, 1),
         inputs: vec![
             contiguous_tensor(
                 vec![
@@ -626,7 +628,12 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
             unsigned_attribute("in_features")?,
             unsigned_attribute("out_features")?,
         ]))?,
-        resources: no_auxiliary_resources(),
+        resources: ResourceRequirements {
+            // Providers may transform the input coordinates before the dot
+            // product. Plain matrix providers still declare no workspace.
+            scratch: ResourcePresenceRequirement::Optional,
+            ..no_auxiliary_resources()
+        },
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(DENSE_LINEAR_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
@@ -1975,7 +1982,9 @@ mod tests {
         assert_eq!(ids.len(), contracts.len());
         for contract in &contracts {
             let descriptor = contract.descriptor();
-            assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+            let minor =
+                u16::from(descriptor.id.as_str() == TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID);
+            assert_eq!(descriptor.version, ContractVersion::new(1, minor));
             assert_eq!(descriptor.provider.required_capabilities.len(), 1);
             contract
                 .validate_signature(&descriptor.inputs, &descriptor.outputs)

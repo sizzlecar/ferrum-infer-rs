@@ -260,8 +260,10 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        let mut provider =
-            Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)?;
+        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+    }
+
+    fn checkpoint_capability() -> Result<ProviderCheckpointCapability, MetalDeviceRuntimeError> {
         // collect+copy commits the complete F16 convolution window. Both
         // recurrent and chunked delta paths write the complete F32 boundary
         // matrix. All remaining workspace is overwritten within the wave.
@@ -293,10 +295,7 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             ),
         ])
         .map_err(super::contract_error)?;
-        provider.descriptor = provider.descriptor.with_checkpoint_capability(
-            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
-        );
-        Ok(provider)
+        Ok(ProviderCheckpointCapability::CompletedBoundary(checkpoint))
     }
 
     fn new_with_hidden_type(
@@ -361,7 +360,8 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
                 GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
                 provider_id.as_bytes(),
             ]),
-        )?;
+        )?
+        .with_checkpoint_capability(Self::checkpoint_capability()?);
         Ok(Self {
             descriptor,
             operation_id,
@@ -396,15 +396,30 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let staging_bytes =
             input_projection_workspace(request.values(), shape).map_err(invalid_plan)?;
+        let transform_bytes =
+            super::hadamard::workspace_bytes_per_token(request.values()).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 shape
                     .fixed_scratch_bytes()
                     .map_err(invalid_plan)?
                     .checked_add(staging_bytes)
+                    .and_then(|bytes| {
+                        bytes.checked_add(if transform_bytes > 0 {
+                            VALUE_ALIGNMENT_BYTES - 1
+                        } else {
+                            0
+                        })
+                    })
                     .ok_or_else(|| invalid_plan("Metal gated-delta fixed scratch overflows"))?,
                 0,
-                shape.scratch_bytes_per_token().map_err(invalid_plan)?,
+                shape
+                    .scratch_bytes_per_token()
+                    .map_err(invalid_plan)?
+                    .checked_add(transform_bytes)
+                    .ok_or_else(|| {
+                        invalid_plan("Metal gated-delta transform workspace overflows")
+                    })?,
             )?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
@@ -1007,8 +1022,13 @@ fn encode_attention(
     }
     let total_tokens = invocation.work_shape().immediate_tokens();
     let staging_bytes = input_projection_workspace(first.bindings(), shape)?;
-    let layout =
+    let mut layout =
         ScratchLayout::new(shape, total_tokens)?.with_projection_workspace(staging_bytes)?;
+    let transform_offset = super::hadamard::append_workspace(
+        &mut layout.required_bytes,
+        first.bindings(),
+        total_tokens,
+    )?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal gated-delta participant ranges are incomplete".to_owned());
@@ -1248,6 +1268,20 @@ fn encode_attention(
                 layout.normalized,
             )?,
         };
+        for projection in &mut packed.input_projections {
+            projection.bind_hadamard_workspace(
+                &linear,
+                &regions,
+                shared.scratch,
+                transform_offset,
+            )?;
+        }
+        packed.output_projection.bind_hadamard_workspace(
+            &linear,
+            &regions,
+            shared.scratch,
+            transform_offset,
+        )?;
         let mut projection_launches = packed.input_projections.clone();
         projection_launches.push(packed.output_projection);
         validate_launch_regions_with_raw_workspace(
@@ -1266,6 +1300,20 @@ fn encode_attention(
         Some(packed)
     } else {
         for launch in &mut launches {
+            for projection in &mut launch.input_projections {
+                projection.bind_hadamard_workspace(
+                    &linear,
+                    &regions,
+                    shared.scratch,
+                    transform_offset,
+                )?;
+            }
+            launch.output_projection.bind_hadamard_workspace(
+                &linear,
+                &regions,
+                shared.scratch,
+                transform_offset,
+            )?;
             let mut projection_launches = launch.input_projections.clone();
             projection_launches.push(launch.output_projection);
             validate_launch_regions_with_raw_workspace(
@@ -1298,17 +1346,18 @@ fn encode_attention(
                 staged_prefill::dispatch_count(*launch, packed.input_projection_workspace)
             })
             .sum::<u64>();
-        launches
-            .iter()
-            .fold(6_u64 + shared_projection_dispatches, |total, launch| {
+        launches.iter().fold(
+            5_u64 + packed.output_projection.dispatch_count() + shared_projection_dispatches,
+            |total, launch| {
                 total
                     .saturating_add(3)
                     .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
-            })
+            },
+        )
     } else {
         launches.iter().fold(0_u64, |total, launch| {
             total
-                .saturating_add(9)
+                .saturating_add(8 + launch.output_projection.dispatch_count())
                 .saturating_add(
                     launch
                         .input_projections

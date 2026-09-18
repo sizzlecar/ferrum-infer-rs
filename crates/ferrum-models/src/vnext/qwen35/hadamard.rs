@@ -5,6 +5,9 @@ use ferrum_quantization::gguf::{GgufHadamardDirection, GgufHadamardSigns};
 
 use super::*;
 
+#[cfg(test)]
+mod real_source;
+
 pub(super) fn validate(
     config: &Qwen35FamilyConfig,
     text: &Qwen35TextConfig,

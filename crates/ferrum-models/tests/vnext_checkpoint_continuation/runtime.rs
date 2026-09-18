@@ -19,6 +19,7 @@ pub struct Fixture {
     states: Vec<StateSpec>,
     checkpoint_timing_mode: DeviceTimingMode,
     reusable_bucket: Option<ReusableExecutionBucketId>,
+    output_type: ElementType,
 }
 
 impl Fixture {
@@ -190,6 +191,7 @@ impl Fixture {
             states,
             checkpoint_timing_mode: DeviceTimingMode::Off,
             reusable_bucket,
+            output_type: kind.activation_type(),
         }
     }
 
@@ -488,7 +490,7 @@ impl Fixture {
         assert!(matches!(
             output_descriptor.demand(),
             DynamicResourceDemand::Tokens { bytes_per_token, .. }
-                if *bytes_per_token == HIDDEN * ElementType::F32.size_bytes()
+                if *bytes_per_token == HIDDEN * self.output_type.size_bytes()
         ));
         // Step-token readbacks are participant-local, unlike uploads' source
         // coordinates. Completion translates this span-local range into the
@@ -498,7 +500,7 @@ impl Fixture {
             0,
             output_component.resource_id().clone(),
             output_component.offset_bytes(),
-            HostTransferLayout::new(ElementType::F32, range.len() as u64 * HIDDEN).unwrap(),
+            HostTransferLayout::new(self.output_type, range.len() as u64 * HIDDEN).unwrap(),
         )
         .unwrap()];
         let mut names =
@@ -675,6 +677,7 @@ impl Fixture {
                 .states
                 .iter()
                 .map(|s| (s.id.to_string(), s.tensor.element_type))
+                .chain(std::iter::once(("output".to_owned(), self.output_type)))
                 .collect(),
         })
     }
@@ -1020,10 +1023,17 @@ impl Observation {
                 );
             }
         }
-        let output = self.values["output"]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
+        let output = match self.state_types["output"] {
+            ElementType::F32 => self.values["output"]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            ElementType::F16 => self.values["output"]
+                .chunks_exact(2)
+                .map(|bytes| f16::from_le_bytes(bytes.try_into().unwrap()).to_f32())
+                .collect::<Vec<_>>(),
+            other => panic!("unexpected output dtype {other:?}"),
+        };
         assert!(
             !output.is_empty() && output.iter().all(|value| value.is_finite()),
             "{label}: output must be finite and nonempty"

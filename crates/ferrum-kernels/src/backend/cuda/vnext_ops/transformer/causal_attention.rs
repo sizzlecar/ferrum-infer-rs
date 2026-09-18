@@ -75,7 +75,7 @@ mod int8_tests;
 mod numerical_tests;
 mod precision;
 use super::native_matrix;
-use crate::backend::cuda::vnext_ops::native_blocks::CudaNativeBlockKernels;
+use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use ferrum_interfaces::vnext::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
     causal_paged_attention_int8_kv_contract, CheckpointBoundaryConstraint,
@@ -328,6 +328,7 @@ impl CudaCausalPagedAttentionProvider {
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
+            include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
             precision.provider_id(semantics).as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
@@ -363,6 +364,7 @@ impl CudaCausalPagedAttentionProvider {
             precision.estimator_id(semantics).as_bytes(),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
+            include_bytes!("../native_blocks/hadamard.rs"),
             include_bytes!("causal_attention/precision.rs"),
             semantics.fingerprint_tag(),
         ]);
@@ -696,7 +698,14 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
                     })
                     .map_err(invalid_plan)?,
                 0,
-                shape.scratch_bytes_per_token().map_err(invalid_plan)?,
+                shape
+                    .scratch_bytes_per_token()
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(projection.transform_bytes_per_token())
+                            .ok_or_else(|| "causal Hadamard scratch size overflows".to_owned())
+                    })
+                    .map_err(invalid_plan)?,
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
@@ -1578,7 +1587,9 @@ fn causal_projection_abi(
 #[derive(Debug, Clone, Copy)]
 enum CausalProjection {
     F16,
-    Native,
+    Native {
+        transform_bytes_per_token: u64,
+    },
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
@@ -1595,7 +1606,10 @@ impl CausalProjection {
         #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
         if native_matrix::uses_native(values, &[2, 3, 4, 5])? {
-            return Ok(Self::Native);
+            return Ok(Self::Native {
+                transform_bytes_per_token:
+                    super::super::native_blocks::hadamard::workspace_bytes_per_token(values)?,
+            });
         }
         #[cfg(not(feature = "vllm-marlin"))]
         {
@@ -1625,9 +1639,18 @@ impl CausalProjection {
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 | Self::Native => Ok(0),
+            Self::F16 | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime } | Self::MarlinInt4 { runtime } => runtime.workspace_bytes(),
+        }
+    }
+
+    fn transform_bytes_per_token(self) -> u64 {
+        match self {
+            Self::Native {
+                transform_bytes_per_token,
+            } => transform_bytes_per_token,
+            _ => 0,
         }
     }
 
@@ -1642,7 +1665,7 @@ impl CausalProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
-            Self::Native => "native-compressed",
+            Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "mixed-fp8-marlin-f16-reduce",
             #[cfg(feature = "vllm-marlin")]
@@ -1654,6 +1677,7 @@ impl CausalProjection {
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
+    transform_workspace: Option<u64>,
     projection_workspace: Option<u64>,
     normalized: u64,
     query_raw: u64,
@@ -1687,6 +1711,13 @@ impl ScratchLayout {
         let projection_workspace_reservation_bytes = projection.workspace_reservation_bytes()?;
         let projection_workspace = (projection_workspace_bytes > 0)
             .then(|| reserve_elements(&mut offset, projection_workspace_bytes, 1))
+            .transpose()?;
+        let transform_bytes = projection
+            .transform_bytes_per_token()
+            .checked_mul(total_tokens)
+            .ok_or("causal Hadamard scratch size overflows")?;
+        let transform_workspace = (transform_bytes > 0)
+            .then(|| reserve_elements(&mut offset, transform_bytes, 1))
             .transpose()?;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
         let query_raw = reserve_tokens(&mut offset, shape.query_projection_features, total_tokens)?;
@@ -1727,12 +1758,14 @@ impl ScratchLayout {
         let expected = token_bytes
             .checked_add(attention_policy_scratch_bytes)
             .and_then(|bytes| bytes.checked_add(projection_workspace_reservation_bytes))
+            .and_then(|bytes| bytes.checked_add(transform_bytes))
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         if offset != expected {
             return Err("causal attention scratch layout differs from its estimate".to_owned());
         }
         Ok(Self {
             required_bytes: offset,
+            transform_workspace,
             projection_workspace,
             normalized,
             query_raw,
@@ -1836,23 +1869,11 @@ impl SharedProjectionWeight {
         &self,
         replay_key: CudaCommandReplayKeyBuilder,
     ) -> CudaCommandReplayKeyBuilder {
-        let mut replay_key = replay_key.bytes(self.replay_tag().as_bytes());
+        let replay_key = replay_key.bytes(self.replay_tag().as_bytes());
         match *self {
             Self::F16 { .. } => replay_key.i32(0),
             Self::Native(ref matrix) => {
-                replay_key = replay_key
-                    .u64(matrix.first_region as u64)
-                    .u64(matrix.parts.len() as u64);
-                for part in matrix.parts.iter() {
-                    replay_key = replay_key
-                        .u32(part.rows)
-                        .u32(part.columns)
-                        .u32(part.output_offset);
-                    for parameter in part.format.parameters() {
-                        replay_key = replay_key.u32(parameter);
-                    }
-                }
-                replay_key
+                weights::key(replay_key.u64(matrix.first_region as u64), &matrix.parts)
             }
             #[cfg(feature = "vllm-marlin")]
             Self::Marlin { group_size, .. } => replay_key.i32(group_size),
@@ -2514,7 +2535,8 @@ fn native_projection_extra_dispatches(shared: &SharedRegions, rows: u64) -> Resu
     .try_fold(0_u64, |total, weight| {
         let extra = match weight {
             SharedProjectionWeight::Native(matrix) => {
-                native_matrix::dispatch_count(matrix.parts.len(), rows)? - 1
+                native_matrix::dispatch_count(weights::dispatches(&matrix.parts) as usize, rows)?
+                    - 1
             }
             _ => 0,
         };
@@ -3201,12 +3223,18 @@ fn launch_causal_projection(
             stream,
             native,
             &matrix.parts,
-            &regions[matrix.first_region..matrix.first_region + matrix.parts.len()],
+            &regions
+                [matrix.first_region..matrix.first_region + weights::region_count(&matrix.parts)],
             input,
             output,
             rows,
             output_features,
             input_features,
+            layout
+                .transform_workspace
+                .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                .transpose()?
+                .unwrap_or(0),
         ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
             blas,
@@ -4801,6 +4829,20 @@ mod tests {
             2 * shape.binding_slot_bytes().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 64);
+        let transformed = ScratchLayout::new(
+            shape,
+            17,
+            CausalProjection::Native {
+                transform_bytes_per_token: 1024 * 4,
+            },
+            AttentionExecutionPolicy::NativeAdaptive,
+        )
+        .unwrap();
+        assert_eq!(
+            transformed.required_bytes,
+            layout.required_bytes + 17 * 1024 * 4
+        );
+        assert!(transformed.transform_workspace.is_some());
     }
 
     #[cfg(feature = "vllm-marlin")]

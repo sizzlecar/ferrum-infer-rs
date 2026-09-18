@@ -329,6 +329,8 @@ fn mixed_matrix_rows<T: Scalar>(
         (MatrixFormat::DenseF16, dp, 1 + outputs as u32),
     ] {
         let part = MatrixPart {
+            transform: None,
+            signs_region: None,
             component_id: WeightId::new("component.matrix").unwrap(),
             format,
             rows: outputs as u32,

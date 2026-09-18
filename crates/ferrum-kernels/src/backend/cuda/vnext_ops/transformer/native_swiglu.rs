@@ -88,13 +88,7 @@ pub(super) fn encode(
         .u64(hidden)
         .u64(intermediate);
     for matrix in matrices {
-        key = key.u64(matrix.parts.len() as u64);
-        for part in &matrix.parts {
-            key = key.u32(part.rows).u32(part.columns).u32(part.output_offset);
-            for parameter in part.format.parameters() {
-                key = key.u32(parameter);
-            }
-        }
+        key = weights::key(key, &matrix.parts);
         regions.extend(matrix.regions);
         parts.push(matrix.parts);
     }
@@ -103,11 +97,16 @@ pub(super) fn encode(
     let down = parts.next().ok_or("missing native down matrix")?;
     let tokens = invocation.work_shape().immediate_tokens();
     let scratch_layout = ScratchLayout::new(tokens, intermediate)?;
+    let transform_bytes =
+        super::super::native_blocks::hadamard::workspace_bytes_per_token(first.bindings())?
+            .checked_mul(tokens)
+            .ok_or("native SwiGLU Hadamard scratch overflows")?;
+    let required_bytes = scratch_layout
+        .total_bytes
+        .checked_add(transform_bytes)
+        .ok_or("native SwiGLU scratch overflows")?;
     let scratch_index = regions.len();
-    regions.push(shared_scratch_region(
-        &invocation,
-        scratch_layout.total_bytes,
-    )?);
+    regions.push(shared_scratch_region(&invocation, required_bytes)?);
     let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     if invocation.participant_token_ranges().len() != invocation.participants().len() {
@@ -176,13 +175,14 @@ pub(super) fn encode(
     }
     let participants = checked_u32(launches.len() as u64, "native SwiGLU participants")?;
     let dispatches = (launches.len() as u64)
-        .checked_mul((gate_up.len() + down.len() + 1) as u64)
+        .checked_mul(weights::dispatches(&gate_up) + weights::dispatches(&down) + 1)
         .ok_or("native SwiGLU dispatch count overflows")?;
     let hidden = checked_u32(hidden, "native SwiGLU hidden")?;
     let intermediate = checked_u32(intermediate, "native SwiGLU intermediate")?;
     key = key
         .u64(scratch_layout.gate_up_bytes)
-        .u64(scratch_layout.total_bytes);
+        .u64(required_bytes)
+        .u64(transform_bytes);
     let kernels = kernels.clone();
     let silu = silu.clone();
     CudaDeviceCommand::replayable_operation(
@@ -194,7 +194,12 @@ pub(super) fn encode(
                 .iter()
                 .map(CudaBufferRegion::device_ptr)
                 .collect::<Vec<_>>();
-            let scratch = regions[scratch_index].device_ptr();
+            let transform_scratch = regions[scratch_index].device_ptr();
+            let scratch = transform_scratch
+                .checked_add(transform_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("SwiGLU scratch pointer overflows")
+                })?;
             for &(input, output, count, packed_start) in &launches {
                 let gate_offset = packed_start
                     .checked_mul(u64::from(intermediate))
@@ -229,6 +234,11 @@ pub(super) fn encode(
                     count,
                     hidden,
                     intermediate,
+                    if transform_bytes > 0 {
+                        transform_scratch
+                    } else {
+                        0
+                    },
                 )?;
             }
             Ok(())
@@ -261,6 +271,7 @@ fn launch(
     tokens: u32,
     hidden: u32,
     intermediate: u32,
+    transform_scratch: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let layout = ScratchLayout::new(u64::from(tokens), u64::from(intermediate))
         .map_err(CudaDeviceRuntimeError::contract)?;
@@ -277,13 +288,14 @@ fn launch(
         layout.gate_up_bytes / 2,
         "native SwiGLU gate/up indexing extent",
     )?;
-    if weights.len() != gate_up.len() + down.len() {
+    let down_start = weights::region_count(gate_up);
+    if weights.len() != down_start + weights::region_count(down) {
         return Err(CudaDeviceRuntimeError::contract(
             "native SwiGLU matrix pointer inventory differs",
         ));
     }
     for (index, part) in gate_up.iter().enumerate() {
-        kernels.linear(
+        kernels.transformed_linear(
             stream,
             input,
             weights[index],
@@ -292,6 +304,8 @@ fn launch(
             tokens,
             doubled,
             ElementType::F16,
+            part.signs_region.map_or(0, |index| weights[index]),
+            transform_scratch,
         )?;
     }
     launch_silu_mul(
@@ -303,15 +317,18 @@ fn launch(
         layout.activation_elements,
     )?;
     for (index, part) in down.iter().enumerate() {
-        kernels.linear(
+        kernels.transformed_linear(
             stream,
             activation,
-            weights[gate_up.len() + index],
+            weights[down_start + index],
             output,
             part,
             tokens,
             hidden,
             ElementType::F16,
+            part.signs_region
+                .map_or(0, |index| weights[down_start + index]),
+            transform_scratch,
         )?;
     }
     Ok(())

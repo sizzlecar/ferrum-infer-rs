@@ -124,6 +124,7 @@ fn mixed_swiglu_staging_keeps_decode_small_work_and_unknown_layouts_on_existing_
         linear_launch(
             PreparedLinearPart {
                 region: 1,
+                transform: None,
                 format,
                 output_offset: 0,
                 out_features: output,
@@ -596,6 +597,7 @@ fn staged_swiglu_sequence_case(formats: [GgufBlockFormat; 3], row_cases: &[(u64,
                 linear_launch(
                     PreparedLinearPart {
                         region: weight_region,
+                        transform: None,
                         format: physical(formats[index]),
                         output_offset: index as u32 * intermediate as u32,
                         out_features: intermediate as u32,
@@ -614,6 +616,7 @@ fn staged_swiglu_sequence_case(formats: [GgufBlockFormat; 3], row_cases: &[(u64,
         let down = linear_launch(
             PreparedLinearPart {
                 region: 3,
+                transform: None,
                 format: physical(formats[2]),
                 output_offset: 0,
                 out_features: hidden as u32,

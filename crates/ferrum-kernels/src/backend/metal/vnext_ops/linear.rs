@@ -24,6 +24,7 @@ use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Devi
 use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
 use crate::gguf_blocks::GgufBlockFormat;
 
+use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
 use super::native_blocks::{bind_native_block, dispatch_m64_grid, MetalNativeBlockPipelines};
 
 use super::super::vnext_runtime::{
@@ -31,16 +32,16 @@ use super::super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 use super::weights::{
-    resolve_weight, MetalResolvedCompositePart, MetalResolvedWeight, MetalResolvedWeightComponent,
-    MetalResolvedWeightLayout,
+    resolve_weight, validate_hadamard_transform, MetalResolvedCompositePart, MetalResolvedWeight,
+    MetalResolvedWeightComponent, MetalResolvedWeightLayout,
 };
 use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
-    contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
-    implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
-    shared_scratch_region, shared_token_region, token_binding_is_packed, unsigned_attribute,
-    DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
-    Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
+    contiguous_token_region, ensure_invocation, f16_contiguous, implementation_fingerprint,
+    invalid_plan, provider_descriptor, provider_failure, shared_scratch_region,
+    shared_token_region, token_binding_is_packed, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
+    GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID,
+    THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("linear.metal");
@@ -50,6 +51,8 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/small_batch.rs"),
     include_str!("linear/small_batch.metal"),
     include_str!("linear/staged_prefill.rs"),
+    include_str!("hadamard.rs"),
+    include_str!("hadamard.metal"),
     include_str!("../q4_k_gemv_v2.metal"),
     include_str!("../q5_k_gemv.metal"),
     include_str!("../q6_k_gemv.metal"),
@@ -102,8 +105,10 @@ pub(super) const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
 const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = ALL_LINEAR_QUANTIZATION_FORMATS;
 
 pub(super) struct MetalLinearPipelines {
+    hadamard: MetalHadamardPipelines,
     dense: ComputePipelineState,
     dense_f32: ComputePipelineState,
+    dense_f32_f16: ComputePipelineState,
     q4_k_gemv: ComputePipelineState,
     q4_k_gemv_f32: ComputePipelineState,
     q5_k_gemv: ComputePipelineState,
@@ -150,8 +155,10 @@ impl MetalLinearPipelines {
                 })
         };
         Ok(Self {
+            hadamard: MetalHadamardPipelines::new(device)?,
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
             dense_f32: pipeline(LINEAR_DENSE_F32_KERNEL)?,
+            dense_f32_f16: pipeline("vnext_linear_dense_f32_f16")?,
             q4_k_gemv: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
             q4_k_gemv_f32: crate::backend::metal::q4_k_gemv_v2::new_f32_batched_pipeline(device)
@@ -329,7 +336,7 @@ impl OperationResourceEstimator for MetalDenseLinearProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)
+        hadamard::estimate_token_workspace(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)
     }
 }
 
@@ -415,12 +422,25 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
         let staging_bytes =
             staged_prefill::workspace_bytes(request.values(), hidden_size, intermediate_size)
                 .map_err(invalid_plan)?;
+        let transform_bytes =
+            hadamard::workspace_bytes_per_token(request.values()).map_err(invalid_plan)?;
         let bytes_per_token = intermediate_size
             .checked_mul(SWIGLU_SCRATCH_PARTS)
             .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .and_then(|bytes| bytes.checked_add(transform_bytes))
             .ok_or_else(|| invalid_plan("Metal dense SwiGLU scratch size overflows"))?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::affine(staging_bytes, 0, bytes_per_token)?,
+            ProviderWorkspaceSizeFormula::affine(
+                staging_bytes
+                    .checked_add(if transform_bytes > 0 {
+                        VALUE_ALIGNMENT_BYTES - 1
+                    } else {
+                        0
+                    })
+                    .ok_or_else(|| invalid_plan("Metal SwiGLU transform alignment overflows"))?,
+                0,
+                bytes_per_token,
+            )?,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
@@ -573,12 +593,21 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
             unsigned_attribute(request.attributes(), "out_features").map_err(invalid_plan)?;
         let hidden_size =
             unsigned_attribute(request.attributes(), "hidden_size").map_err(invalid_plan)?;
+        let transform_bytes =
+            hadamard::workspace_bytes_per_token(request.values()).map_err(invalid_plan)?;
         let bytes_per_sequence =
             last_token_scratch_bytes_per_sequence(hidden_size, out_features, self.activation_type)
-                .map_err(invalid_plan)?;
+                .map_err(invalid_plan)?
+                .checked_add(transform_bytes)
+                .ok_or_else(|| invalid_plan("Metal last-token transform workspace overflows"))?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                LAST_TOKEN_SCRATCH_PADDING_BYTES,
+                LAST_TOKEN_SCRATCH_PADDING_BYTES
+                    + if transform_bytes > 0 {
+                        VALUE_ALIGNMENT_BYTES - 1
+                    } else {
+                        0
+                    },
                 bytes_per_sequence,
                 0,
             )?,
@@ -678,6 +707,23 @@ pub(super) struct PreparedLinearPart {
     format: LinearPhysicalFormat,
     output_offset: u32,
     out_features: u32,
+    transform: Option<HadamardTransform>,
+}
+
+impl PreparedLinearPart {
+    fn relocated(self, base: usize) -> Result<Self, String> {
+        Ok(Self {
+            region: self
+                .region
+                .checked_add(base)
+                .ok_or_else(|| "Metal linear region index overflows".to_owned())?,
+            transform: self
+                .transform
+                .map(|transform| transform.relocate(base))
+                .transpose()?,
+            ..self
+        })
+    }
 }
 
 struct PreparedLinearWeight {
@@ -720,6 +766,75 @@ pub(super) struct LinearLaunch {
     activation_type: ElementType,
     format: LinearPhysicalFormat,
     params: LinearParams,
+    transform: Option<HadamardTransform>,
+    transform_workspace: Option<(usize, u64)>,
+}
+
+impl LinearLaunch {
+    pub(super) fn dispatch_count(self) -> u64 {
+        1 + u64::from(self.transform.is_some())
+    }
+
+    pub(super) fn bind_hadamard_workspace(
+        &mut self,
+        pipelines: &MetalLinearPipelines,
+        regions: &[MetalBufferRegion],
+        workspace_region: usize,
+        workspace_offset: u64,
+    ) -> Result<(), String> {
+        let Some(transform) = self.transform else {
+            return Ok(());
+        };
+        pipelines.hadamard.validate_dispatch(
+            transform,
+            self.params.in_features,
+            self.activation_type,
+            ElementType::F32,
+        )?;
+        let workspace = regions
+            .get(workspace_region)
+            .ok_or_else(|| "Metal linear transform workspace is absent".to_owned())?;
+        let bytes = u64::from(self.params.rows)
+            .checked_mul(u64::from(self.params.in_features))
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| "Metal linear transform workspace overflows".to_owned())?;
+        validate_region_span(
+            workspace,
+            workspace_offset,
+            bytes,
+            "Metal linear transform workspace",
+        )?;
+        if workspace_offset % VALUE_ALIGNMENT_BYTES != 0 {
+            return Err("Metal linear transform workspace is unaligned".to_owned());
+        }
+        for (index, offset, elements) in [
+            (
+                self.input_region,
+                self.input_offset_bytes,
+                u64::from(self.params.rows) * u64::from(self.params.in_features),
+            ),
+            (
+                self.output_region,
+                self.output_offset_bytes,
+                u64::from(self.params.rows) * u64::from(self.params.output_stride),
+            ),
+        ] {
+            let region = regions
+                .get(index)
+                .ok_or_else(|| "Metal linear transform activation is absent".to_owned())?;
+            let start = region.offset_bytes() + offset;
+            let end = start + elements * self.activation_type.size_bytes();
+            let workspace_start = workspace.offset_bytes() + workspace_offset;
+            if std::ptr::eq(region.buffer(), workspace.buffer())
+                && start < workspace_start + bytes
+                && workspace_start < end
+            {
+                return Err("Metal linear transform workspace overlaps an activation".to_owned());
+            }
+        }
+        self.transform_workspace = Some((workspace_region, workspace_offset));
+        Ok(())
+    }
 }
 
 fn encode_dense_linear(
@@ -832,13 +947,25 @@ fn encode_dense_linear(
             )?);
         }
     }
+    let transform_bytes = hadamard::workspace_bytes_per_token(first.bindings())?;
+    if transform_bytes != 0 {
+        let bytes = transform_bytes
+            .checked_mul(invocation.work_shape().immediate_tokens())
+            .ok_or_else(|| "Metal dense-linear transform workspace overflows".to_owned())?;
+        let index = regions.len();
+        regions.push(shared_scratch_region(&invocation, bytes)?);
+        for launch in &mut launches {
+            launch.bind_hadamard_workspace(&pipelines, &regions, index, 0)?;
+        }
+    }
     validate_launch_regions(&regions, &launches)?;
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let dispatch_count = launches.len() as u64;
+    let single_launch = launches.len() == 1;
+    let dispatch_count = launches.iter().map(|launch| launch.dispatch_count()).sum();
     MetalDeviceCommand::operation("vnext_dense_linear", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
         for launch in &launches {
@@ -850,7 +977,7 @@ fn encode_dense_linear(
     .with_work_shape(
         if participant_count == 1 {
             DeviceBatchingForm::Scalar
-        } else if dispatch_count == 1 {
+        } else if single_launch {
             DeviceBatchingForm::Packed
         } else {
             DeviceBatchingForm::ParticipantLoop
@@ -908,12 +1035,22 @@ fn encode_last_token_dense_linear(
         "Metal last-token linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let scratch_layout = LastTokenPackedScratchLayout::new(
+    let mut scratch_layout = LastTokenPackedScratchLayout::new(
         participant_count as u64,
         hidden_size,
         out_features,
         activation_type,
     )?;
+    let transform_bytes_per_sequence = hadamard::workspace_bytes_per_token(first.bindings())?;
+    let transform_offset = if transform_bytes_per_sequence != 0 {
+        align_up_bytes(scratch_layout.required_bytes, VALUE_ALIGNMENT_BYTES)?
+    } else {
+        scratch_layout.required_bytes
+    };
+    scratch_layout.required_bytes = transform_bytes_per_sequence
+        .checked_mul(participant_count as u64)
+        .and_then(|bytes| transform_offset.checked_add(bytes))
+        .ok_or_else(|| "Metal packed last-token transform workspace overflows".to_owned())?;
     let shared_packed_input = packed_last_token_rows(
         input_packed,
         participant_count,
@@ -996,7 +1133,7 @@ fn encode_last_token_dense_linear(
                 return Err("Metal packed last-token scratch is not blit aligned".to_owned());
             }
             regions.push(scratch);
-            let launch = linear_launch_typed(
+            let mut launch = linear_launch_typed(
                 part,
                 shared_input_region.unwrap_or(scratch_region),
                 scratch_region,
@@ -1006,6 +1143,12 @@ fn encode_last_token_dense_linear(
                 0,
                 scratch_layout.output_offset_bytes,
                 activation_type,
+            )?;
+            launch.bind_hadamard_workspace(
+                &pipelines,
+                &regions,
+                scratch_region,
+                transform_offset,
             )?;
             validate_launch_regions_with_raw_workspace(&regions, &[launch], &[scratch_region])?;
             validate_region_span(
@@ -1037,7 +1180,7 @@ fn encode_last_token_dense_linear(
                             }
                         });
                     }
-                    encoder.record_compute_dispatches(1);
+                    encoder.record_compute_dispatches(launch.dispatch_count());
                     dispatch_linear(&pipelines, encoder.compute_encoder(), regions, launch);
                     encoder.with_blit_commands(participant_count as u64, |blit| {
                         for participant_index in 0..participant_count {
@@ -1101,8 +1244,18 @@ fn encode_last_token_dense_linear(
             activation_type,
         )?);
     }
+    if transform_bytes_per_sequence != 0 {
+        let bytes = transform_bytes_per_sequence
+            .checked_mul(participant_count as u64)
+            .ok_or_else(|| "Metal last-token transform workspace overflows".to_owned())?;
+        let index = regions.len();
+        regions.push(shared_scratch_region(&invocation, bytes)?);
+        for launch in &mut launches {
+            launch.bind_hadamard_workspace(&pipelines, &regions, index, 0)?;
+        }
+    }
     validate_launch_regions(&regions, &launches)?;
-    let dispatch_count = launches.len() as u64;
+    let dispatch_count = launches.iter().map(|launch| launch.dispatch_count()).sum();
     let operation_label = if activation_type == ElementType::F32 {
         "vnext_last_token_dense_linear_f32"
     } else {
@@ -1279,9 +1432,19 @@ fn encode_dense_swiglu(
         .ok_or_else(|| "Metal dense SwiGLU total scratch size overflows".to_owned())?;
     let staging_bytes =
         staged_prefill::workspace_bytes(first.bindings(), hidden_size, intermediate_size)?;
-    let required_scratch_bytes = activation_scratch_bytes
+    let transform_bytes = hadamard::workspace_bytes_per_token(first.bindings())?;
+    let existing_scratch_bytes = activation_scratch_bytes
         .checked_add(staging_bytes)
         .ok_or_else(|| "Metal dense SwiGLU staged scratch size overflows".to_owned())?;
+    let transform_offset = if transform_bytes != 0 {
+        align_up_bytes(existing_scratch_bytes, VALUE_ALIGNMENT_BYTES)?
+    } else {
+        existing_scratch_bytes
+    };
+    let required_scratch_bytes = transform_bytes
+        .checked_mul(tokens)
+        .and_then(|bytes| transform_offset.checked_add(bytes))
+        .ok_or_else(|| "Metal dense SwiGLU transform scratch size overflows".to_owned())?;
 
     if gate_up.regions.is_empty() || down.regions.is_empty() {
         return Err("Metal dense SwiGLU resolved empty weight storage".to_owned());
@@ -1328,11 +1491,8 @@ fn encode_dense_swiglu(
             0,
         )?);
     }
-    let adjusted_down = PreparedLinearPart {
-        region: down_region_base + down_part.region,
-        ..down_part
-    };
-    let down_launch = linear_launch(
+    let adjusted_down = down_part.relocated(down_region_base)?;
+    let mut down_launch = linear_launch(
         adjusted_down,
         scratch_region,
         output_region,
@@ -1342,6 +1502,10 @@ fn encode_dense_swiglu(
         gate_up_bytes,
         0,
     )?;
+    for launch in &mut gate_launches {
+        launch.bind_hadamard_workspace(&pipelines, &regions, scratch_region, transform_offset)?;
+    }
+    down_launch.bind_hadamard_workspace(&pipelines, &regions, scratch_region, transform_offset)?;
     validate_launch_regions_with_raw_workspace(&regions, &gate_launches, &[scratch_region])?;
     validate_launch_regions_with_raw_workspace(&regions, &[down_launch], &[scratch_region])?;
     validate_region_span(
@@ -1433,6 +1597,8 @@ fn linear_launch_typed(
         output_offset_bytes,
         activation_type,
         format: part.format,
+        transform: part.transform,
+        transform_workspace: None,
         params: LinearParams {
             rows: checked_u32(rows, "Metal linear row count")?,
             in_features: checked_u32(in_features, "Metal linear input width")?,
@@ -1456,6 +1622,9 @@ pub(super) fn validate_launch_regions_with_raw_workspace(
     raw_workspace_regions: &[usize],
 ) -> Result<(), String> {
     for launch in launches {
+        if launch.transform.is_some() && launch.transform_workspace.is_none() {
+            return Err("Metal linear Hadamard transform has no declared workspace".to_owned());
+        }
         let input = regions
             .get(launch.input_region)
             .ok_or_else(|| "Metal linear input region index is invalid".to_owned())?;
@@ -1545,6 +1714,79 @@ pub(super) fn dispatch_linear(
     regions: &[MetalBufferRegion],
     launch: LinearLaunch,
 ) {
+    if let Some(transform) = launch.transform {
+        let (workspace_region, workspace_offset) = launch
+            .transform_workspace
+            .expect("validated linear transform workspace");
+        let workspace = &regions[workspace_region];
+        pipelines.hadamard.dispatch(
+            encoder,
+            transform,
+            &regions[launch.input_region],
+            launch.input_offset_bytes,
+            launch.activation_type,
+            workspace,
+            workspace_offset,
+            ElementType::F32,
+            regions,
+            launch.params.rows,
+            launch.params.in_features,
+        );
+        let native = match launch.format {
+            LinearPhysicalFormat::DenseF16 => None,
+            LinearPhysicalFormat::Q4K => Some(GgufBlockFormat::Q4K),
+            LinearPhysicalFormat::Q5K => Some(GgufBlockFormat::Q5K),
+            LinearPhysicalFormat::Q6K => Some(GgufBlockFormat::Q6K),
+            LinearPhysicalFormat::Q8_0 => Some(GgufBlockFormat::Q8_0),
+            LinearPhysicalFormat::Native(format) => Some(format),
+        };
+        let (pipeline, dispatch_kind) = if let Some(format) = native {
+            if launch.activation_type == ElementType::F32 {
+                (
+                    pipelines.native.linear_f32(format),
+                    LinearDispatchKind::CooperativeGemv,
+                )
+            } else if launch.params.rows >= NATIVE_TILED_GEMM_MIN_ROWS
+                && launch.params.out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES
+            {
+                (
+                    &pipelines.native.gemm_input_f32_output_f16,
+                    LinearDispatchKind::NativeTiledGemm,
+                )
+            } else {
+                (
+                    pipelines.native.linear_f32_f16(format),
+                    LinearDispatchKind::CooperativeGemv,
+                )
+            }
+        } else if launch.activation_type == ElementType::F32 {
+            (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
+        } else {
+            (
+                &pipelines.dense_f32_f16,
+                LinearDispatchKind::CooperativeGemv,
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        set_region_offset(encoder, 0, workspace, workspace_offset);
+        set_region_offset(encoder, 1, &regions[launch.weight_region], 0);
+        set_region_offset(
+            encoder,
+            2,
+            &regions[launch.output_region],
+            launch.output_offset_bytes,
+        );
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<LinearParams>() as u64,
+            &launch.params as *const _ as *const c_void,
+        );
+        if let Some(format) = native {
+            bind_native_block(encoder, format, 4);
+        }
+        dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+        return;
+    }
     let (pipeline, dispatch_kind) = match launch.activation_type {
         ElementType::F16 => pipelines.linear_pipeline(
             launch.format,
@@ -1750,11 +1992,7 @@ pub(super) fn append_shared_matrix_weight(
     let [part] = prepared.parts.as_slice() else {
         return Err(format!("{context} requires one physical matrix"));
     };
-    let mut part = *part;
-    part.region = part
-        .region
-        .checked_add(regions.len())
-        .ok_or_else(|| format!("{context} region index overflows"))?;
+    let part = part.relocated(regions.len())?;
     regions.extend(prepared.regions);
     Ok(part)
 }
@@ -1786,15 +2024,7 @@ pub(super) fn append_shared_partitioned_matrix_weight(
     let parts = prepared
         .parts
         .into_iter()
-        .map(|part| {
-            Ok(PreparedLinearPart {
-                region: part
-                    .region
-                    .checked_add(region_base)
-                    .ok_or_else(|| format!("{context} region index overflows"))?,
-                ..part
-            })
-        })
+        .map(|part| part.relocated(region_base))
         .collect::<Result<Vec<_>, String>>()?;
     if parts.is_empty() {
         return Err(format!("{context} resolved no physical matrix"));
@@ -1896,15 +2126,7 @@ pub(super) fn append_shared_gate_up_weight(
     let parts = prepared
         .parts
         .into_iter()
-        .map(|part| {
-            Ok(PreparedLinearPart {
-                region: part
-                    .region
-                    .checked_add(region_base)
-                    .ok_or_else(|| format!("{context} region index overflows"))?,
-                ..part
-            })
-        })
+        .map(|part| part.relocated(region_base))
         .collect::<Result<Vec<_>, String>>()?;
     if parts.is_empty() {
         return Err(format!("{context} resolved no physical matrix"));
@@ -1999,6 +2221,16 @@ fn prepare_leaf_part(
     expected_block_axis: u32,
     output_offset: u64,
 ) -> Result<PreparedLinearPart, String> {
+    let (layout, transform) = match layout {
+        MetalResolvedWeightLayout::Hadamard { values, transform } => {
+            if transform.inverse {
+                return Err("Metal linear requires a forward Hadamard transform".to_owned());
+            }
+            validate_hadamard_transform(*transform, in_features, components, regions)?;
+            (values.as_ref(), Some(*transform))
+        }
+        layout => (layout, None),
+    };
     let (component, format) = match layout {
         MetalResolvedWeightLayout::Dense { component }
         | MetalResolvedWeightLayout::Stored { component } => {
@@ -2057,6 +2289,7 @@ fn prepare_leaf_part(
     Ok(PreparedLinearPart {
         region: component,
         format,
+        transform,
         output_offset: checked_u32(output_offset, "Metal linear output offset")?,
         out_features: checked_u32(out_features, "Metal linear output width")?,
     })
@@ -2171,6 +2404,9 @@ fn validate_swiglu_participant(
 
 #[cfg(test)]
 mod native_tests;
+
+#[cfg(test)]
+mod hadamard_tests;
 
 #[cfg(test)]
 mod microbench;
