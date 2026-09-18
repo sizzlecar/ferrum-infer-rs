@@ -76,6 +76,13 @@ pub(crate) fn probe_manifest(
     compiler: &NativeOperatorToolFileIdentity,
     environment: &BTreeMap<String, String>,
 ) -> Result<NativeOperatorHostToolchainManifest> {
+    // The caller's identity may precede this probe (or belong to a completed
+    // build). Preserve compiler drift rejection without rehashing all SDK files.
+    if tool_file_identity(Path::new(&compiler.path))? != *compiler {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC compiler changed before its toolchain probe".to_string(),
+        ));
+    }
     let include = probe_output(Path::new(&compiler.path), environment, false)?;
     let driver = probe_output(Path::new(&compiler.path), environment, true)?;
     let (version, full_version) = validate_probe(&include.stdout)?;
@@ -619,6 +626,107 @@ mod tests {
                 size_bytes: 128,
             }],
         }
+    }
+
+    #[test]
+    fn msvc_refresh_uses_one_fresh_identity_for_hits_and_changed_inputs() {
+        let cached = manifest_fixture();
+        let mut variants = vec![cached.clone()];
+        let mut header = cached.clone();
+        header.files[0].sha256 = "e".repeat(64);
+        variants.push(header);
+        let mut library = cached.clone();
+        library.files.push(NativeOperatorHostToolchainFileIdentity {
+            logical_path: "C:/MSVC/lib/runtime.lib".to_string(),
+            resolved_path: "C:/MSVC/lib/runtime.lib".to_string(),
+            sha256: "f".repeat(64),
+            size_bytes: 128,
+        });
+        variants.push(library);
+        let mut search = cached.clone();
+        search.include_roots.swap(0, 1);
+        search.environment.insert(
+            "INCLUDE".to_string(),
+            "C:/SDK/include;C:/MSVC/include".to_string(),
+        );
+        variants.push(search);
+        let mut driver = cached.clone();
+        driver.driver_probe_sha256 = "0".repeat(64);
+        variants.push(driver);
+        for current in variants {
+            validate_host_toolchain_manifest("fresh-fixture", &current).unwrap();
+            // No C:/MSVC fixture exists on this host. Rebuilding the cached
+            // inventory before/after this already-fresh result would fail.
+            let selected = refresh_host_toolchain_manifest(
+                Some(&cached),
+                &cached.compiler,
+                &cached.environment,
+                || Ok(current.clone()),
+            )
+            .unwrap();
+            assert_eq!(selected, current);
+        }
+        assert!(
+            refresh_host_toolchain_manifest(
+                Some(&cached),
+                &cached.compiler,
+                &cached.environment,
+                || Err(NativeOperatorBuilderError::Invalid(
+                    "probe failed".to_string()
+                )),
+            )
+            .is_err(),
+            "a cached identity must not hide a failed fresh probe"
+        );
+    }
+
+    #[test]
+    fn msvc_inventory_rehashes_same_size_same_mtime_header_library_and_tool_changes() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["fixture.h", "fixture.lib", "cl.exe"] {
+            fs::write(root.path().join(name), b"old contents").unwrap();
+        }
+        let scopes = [root.path().display().to_string()];
+        let original = collect_host_toolchain_scope_files(&scopes).unwrap();
+        assert_eq!(
+            collect_host_toolchain_scope_files(&scopes).unwrap(),
+            original
+        );
+        for name in ["fixture.h", "fixture.lib", "cl.exe"] {
+            let path = root.path().join(name);
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            fs::write(&path, b"new contents").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let current = collect_host_toolchain_scope_files(&scopes).unwrap();
+            let before = original
+                .iter()
+                .find(|file| basename(&file.logical_path) == name)
+                .unwrap();
+            let after = current
+                .iter()
+                .find(|file| basename(&file.logical_path) == name)
+                .unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert_eq!(before.size_bytes, after.size_bytes);
+            assert_ne!(before.sha256, after.sha256);
+            fs::write(&path, b"old contents").unwrap();
+        }
+    }
+
+    #[test]
+    fn msvc_fresh_probe_rejects_compiler_drift_before_executing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cl.exe");
+        fs::write(&path, b"old contents").unwrap();
+        let recorded = tool_file_identity(&path).unwrap();
+        fs::write(&path, b"new contents").unwrap();
+        let error = probe_manifest(&recorded, &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("compiler changed before"));
     }
 
     #[test]
