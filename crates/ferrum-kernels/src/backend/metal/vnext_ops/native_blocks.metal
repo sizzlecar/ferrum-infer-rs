@@ -282,8 +282,9 @@ kernel void vnext_native_block_linear_f32_f16(
 
 // PQ2 decode: a SIMD group covers eight output rows. Its lanes partition four
 // 128-value blocks into 16-value spans, sharing each activation span across all
-// eight outputs. This tiling follows ggml's MIT-licensed PQ2 Metal GEMV; unlike
-// its coefficient/floor decoder, retain direct bit decoding and F32 weights.
+// eight outputs. This tiling follows ggml's MIT-licensed PQ2 Metal GEMV. Unpack
+// only its base-four fields in F32; keep original per-element scale and dot
+// operations instead of cancellation-prone activation coefficients.
 // The block's two-byte scale and four packed bytes are loaded once per span.
 template<typename Output>
 static inline void native_pq2_linear_f32(
@@ -308,10 +309,20 @@ static inline void native_pq2_linear_f32(
             const float scale = native_half(block, 0);
             #pragma clang loop unroll(full)
             for (uint byte = 0; byte < 4; ++byte) {
-                const uint packed = block[2 + first_in_block / 4 + byte];
+                // Byte values and power-of-two quotients are exact in F32.
+                const float packed = float(block[2 + first_in_block / 4 + byte]);
+                const float top = floor(packed * (1.0f / 64.0f));
+                const float middle = floor(packed * (1.0f / 16.0f));
+                const float bottom = floor(packed * (1.0f / 4.0f));
+                const float codes[4] = {
+                    packed - 4.0f * bottom - 1.0f,
+                    bottom - 4.0f * middle - 1.0f,
+                    middle - 4.0f * top - 1.0f,
+                    top - 1.0f,
+                };
                 #pragma clang loop unroll(full)
                 for (uint component = 0; component < 4; ++component) {
-                    const float value = scale * float(int((packed >> (2 * component)) & 3) - 1);
+                    const float value = scale * codes[component];
                     sums[part] += values[byte * 4 + component] * value;
                 }
             }
@@ -544,6 +555,24 @@ kernel void vnext_native_block_gemm_input_f32_output_f16(
     uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
     uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
     native_tiled_gemm<32, false, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
+
+kernel void vnext_native_block_gemm_input_f32_output_f16_specialized(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<32, true, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
+
+kernel void vnext_native_block_gemm_input_f32_output_f16_m64_specialized(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<64, true, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
 }
 
 kernel void vnext_native_block_decode(

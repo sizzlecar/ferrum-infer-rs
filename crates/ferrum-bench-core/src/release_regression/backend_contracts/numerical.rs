@@ -69,6 +69,24 @@ fn names(backend: Backend) -> Vec<String> {
             ("linear::hadamard_tests", &[
                 "hadamard_pq2_projection_keeps_f32_transform_through_dot_and_plain_siblings_on_metal",
             ]),
+            ("linear::pq2_tests", &[
+                "pq2_wide_gemv_preserves_f32_input_codes_blocks_offsets_and_output_tails",
+            ]),
+            ("linear::pq2_decode_tests", &[
+                "pq2_float_floor_decoding_preserves_reference_tails_codes_and_f32_ranges",
+            ]),
+            ("linear::pq2_prefill_tests", &[
+                "pq2_mixed_prefill_specialization_preserves_f32_operands_tiles_and_guards_on_metal",
+                "pq2_mixed_prefill_m64_preserves_f32_operands_tiles_and_guards_on_metal",
+                "pq2_mixed_prefill_m64_selection_requires_aligned_rows_wide_output_and_capability",
+                "pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output",
+            ]),
+            ("linear::narrow_dense_tests", &[
+                "narrow_dense_gemv_preserves_arbitrary_k_output_tails_and_offsets",
+                "narrow_dense_gemv_preserves_cancellation_subnormals_and_half_rounding",
+                "narrow_dense_threadgroup_requires_exact_simd_and_device_capacity",
+                "narrow_dense_production_dispatch_preserves_bounds_and_capability_fallback",
+            ]),
             ("linear::native_tests", &[
                 "native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal",
                 "pq2_0_linears_preserve_blocks_precision_and_production_dispatch_on_real_metal",

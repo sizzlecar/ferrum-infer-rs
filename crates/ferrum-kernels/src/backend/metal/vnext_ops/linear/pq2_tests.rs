@@ -10,7 +10,7 @@ fn buffer<T>(device: &Device, data: &[T]) -> Buffer {
     )
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     params: LinearParams,
     input: Buffer,
     weight: Buffer,
@@ -22,7 +22,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(
+    pub(super) fn new(
         device: &Device,
         rows: u32,
         width: u32,
@@ -79,7 +79,25 @@ impl Fixture {
         }
     }
 
-    fn run(
+    pub(super) fn replace_payload(
+        &mut self,
+        device: &Device,
+        input_values: Vec<f32>,
+        weight_bytes: Vec<u8>,
+    ) {
+        assert_eq!(input_values.len(), self.input_values.len());
+        assert_eq!(weight_bytes.len(), self.weight_bytes.len());
+        let mut padded_input = vec![-123.0; 4];
+        padded_input.extend_from_slice(&input_values);
+        let mut padded_weights = vec![0xcc_u8; 18];
+        padded_weights.extend_from_slice(&weight_bytes);
+        self.input = buffer(device, &padded_input);
+        self.weight = buffer(device, &padded_weights);
+        self.input_values = input_values;
+        self.weight_bytes = weight_bytes;
+    }
+
+    pub(super) fn run(
         &self,
         pipelines: &MetalLinearPipelines,
         queue: &CommandQueueRef,
@@ -105,6 +123,16 @@ impl Fixture {
             ),
             _ => unreachable!(),
         };
+        self.run_pipeline(pipeline, dispatch, queue, repetitions)
+    }
+
+    pub(super) fn run_pipeline(
+        &self,
+        pipeline: &ComputePipelineState,
+        dispatch: LinearDispatchKind,
+        queue: &CommandQueueRef,
+        repetitions: usize,
+    ) -> f64 {
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
@@ -127,7 +155,7 @@ impl Fixture {
         super::microbench::gpu_elapsed_ns(command).unwrap_or(f64::NAN) / 1e9
     }
 
-    fn read(&self) -> Vec<f32> {
+    pub(super) fn read(&self) -> Vec<f32> {
         // SAFETY: StorageModeShared buffers are read only after command completion.
         unsafe {
             match self.output_type {
@@ -148,7 +176,7 @@ impl Fixture {
         }
     }
 
-    fn assert_cpu(&self) {
+    pub(super) fn assert_cpu(&self) {
         let width = self.params.in_features as usize;
         let outputs = self.params.out_features as usize;
         let mut weights = vec![0.0; width * outputs];

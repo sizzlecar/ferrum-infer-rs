@@ -148,6 +148,8 @@ pub(super) struct MetalNativeBlockPipelines {
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
     pub(super) gemm_input_f32_output_f16: ComputePipelineState,
+    pub(super) pq2_gemm_input_f32_output_f16: ComputePipelineState,
+    pub(super) pq2_gemm_input_f32_output_f16_m64: Option<ComputePipelineState>,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -244,6 +246,20 @@ impl MetalNativeBlockPipelines {
             optional_m64_pipeline(device, || pipeline("vnext_native_block_gemm_f16_f32_m64"));
         #[cfg(test)]
         let specialized_gemm_started = std::time::Instant::now();
+        let pq2_gemm_input_f32_output_f16 = gemm_format_pipeline(
+            device,
+            &library,
+            "vnext_native_block_gemm_input_f32_output_f16_specialized",
+            GgufBlockFormat::Pq2_0,
+        )?;
+        let pq2_gemm_input_f32_output_f16_m64 = optional_m64_pipeline(device, || {
+            gemm_format_pipeline(
+                device,
+                &library,
+                "vnext_native_block_gemm_input_f32_output_f16_m64_specialized",
+                GgufBlockFormat::Pq2_0,
+            )
+        });
         let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
             device,
             &library,
@@ -281,6 +297,8 @@ impl MetalNativeBlockPipelines {
             ],
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
             gemm_input_f32_output_f16: pipeline("vnext_native_block_gemm_input_f32_output_f16")?,
+            pq2_gemm_input_f32_output_f16,
+            pq2_gemm_input_f32_output_f16_m64,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]

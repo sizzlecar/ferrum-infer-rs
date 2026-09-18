@@ -87,6 +87,8 @@ mod small_batch;
 pub(super) mod staged_prefill;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
+const LINEAR_DENSE_NARROW_KERNEL: &str = "vnext_linear_dense_narrow_f16_256";
+const NARROW_DENSE_THREADS: u64 = 256;
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
 const LINEAR_DENSE_F32_KERNEL: &str = "vnext_linear_dense_f32";
 const LINEAR_Q8_0_F32_KERNEL: &str = "vnext_linear_q8_0_f32";
@@ -104,9 +106,25 @@ pub(super) const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
 ];
 const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = ALL_LINEAR_QUANTIZATION_FORMATS;
 
+fn pq2_mixed_prefill_m64_supported(
+    format: GgufBlockFormat,
+    params: LinearParams,
+    pipeline_available: bool,
+) -> bool {
+    // M64 reuses decoded weights across twice as many input rows. Partial
+    // row tiles and narrow output matrices lose that benefit in measured
+    // PQ2 mixed-input workloads, so retain M32 for those shapes.
+    format == GgufBlockFormat::Pq2_0
+        && params.rows >= 64
+        && params.rows.is_multiple_of(64)
+        && params.out_features >= 4096
+        && pipeline_available
+}
+
 pub(super) struct MetalLinearPipelines {
     hadamard: MetalHadamardPipelines,
     dense: ComputePipelineState,
+    dense_narrow: Option<ComputePipelineState>,
     dense_f32: ComputePipelineState,
     dense_f32_f16: ComputePipelineState,
     q4_k_gemv: ComputePipelineState,
@@ -125,6 +143,7 @@ pub(super) struct MetalLinearPipelines {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinearDispatchKind {
     CooperativeGemv,
+    NarrowDenseGemv,
     Pq2CooperativeGemv,
     SharedWeightGemv,
     TiledGemm,
@@ -155,9 +174,26 @@ impl MetalLinearPipelines {
                     ))
                 })
         };
+        // The optional specialization must not remove support for devices that
+        // cannot run its fixed eight-SIMD reduction.
+        let dense_narrow = if device.max_threads_per_threadgroup().width >= NARROW_DENSE_THREADS {
+            pipeline(LINEAR_DENSE_NARROW_KERNEL)
+                .ok()
+                .filter(|pipeline| {
+                    supports_narrow_dense_threadgroup(
+                        pipeline.thread_execution_width(),
+                        pipeline.max_total_threads_per_threadgroup(),
+                        pipeline.static_threadgroup_memory_length(),
+                        device.max_threadgroup_memory_length(),
+                    )
+                })
+        } else {
+            None
+        };
         Ok(Self {
             hadamard: MetalHadamardPipelines::new(device)?,
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
+            dense_narrow,
             dense_f32: pipeline(LINEAR_DENSE_F32_KERNEL)?,
             dense_f32_f16: pipeline("vnext_linear_dense_f32_f16")?,
             q4_k_gemv: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
@@ -268,6 +304,54 @@ impl MetalLinearPipelines {
         }
     }
 
+    fn plain_linear_dispatch(
+        &self,
+        format: LinearPhysicalFormat,
+        activation_type: ElementType,
+        params: LinearParams,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        if activation_type == ElementType::F16
+            && format == LinearPhysicalFormat::DenseF16
+            && narrow_dense_shape(params)
+        {
+            if let Some(pipeline) = &self.dense_narrow {
+                return (pipeline, LinearDispatchKind::NarrowDenseGemv);
+            }
+        }
+        match activation_type {
+            ElementType::F16 => self.linear_pipeline(format, params.rows, params.out_features),
+            ElementType::F32 => self
+                .f32_linear_dispatch(format, params.rows, params.out_features)
+                .expect("validated Metal F32 linear format"),
+            _ => unreachable!("validated Metal linear activation ABI"),
+        }
+    }
+
+    fn mixed_input_tiled_pipeline(
+        &self,
+        format: GgufBlockFormat,
+        params: LinearParams,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        let m64 = self.native.pq2_gemm_input_f32_output_f16_m64.as_ref();
+        if pq2_mixed_prefill_m64_supported(format, params, m64.is_some()) {
+            return (
+                m64.expect("PQ2 M64 selection requires an available pipeline"),
+                LinearDispatchKind::NativeTiledGemmM64,
+            );
+        }
+        if format == GgufBlockFormat::Pq2_0 {
+            (
+                &self.native.pq2_gemm_input_f32_output_f16,
+                LinearDispatchKind::NativeTiledGemm,
+            )
+        } else {
+            (
+                &self.native.gemm_input_f32_output_f16,
+                LinearDispatchKind::NativeTiledGemm,
+            )
+        }
+    }
+
     fn f32_linear_pipeline(&self, format: LinearPhysicalFormat) -> Option<&ComputePipelineState> {
         match format {
             LinearPhysicalFormat::DenseF16 => Some(&self.dense_f32),
@@ -299,6 +383,21 @@ impl MetalLinearPipelines {
         self.f32_linear_pipeline(format)
             .map(|pipeline| (pipeline, LinearDispatchKind::CooperativeGemv))
     }
+}
+
+fn supports_narrow_dense_threadgroup(
+    simd_width: u64,
+    max_threads: u64,
+    static_bytes: u64,
+    device_bytes: u64,
+) -> bool {
+    simd_width == 32 && max_threads >= NARROW_DENSE_THREADS && static_bytes <= device_bytes
+}
+
+fn narrow_dense_shape(params: LinearParams) -> bool {
+    // Limit the first rollout to measured long reductions and narrow output
+    // grids. Prefill and short K retain the existing cooperative kernel.
+    params.rows == 1 && params.in_features >= 1024 && (1..=128).contains(&params.out_features)
 }
 
 pub(super) struct MetalDenseLinearProvider {
@@ -1759,10 +1858,7 @@ pub(super) fn dispatch_linear(
             } else if launch.params.rows >= NATIVE_TILED_GEMM_MIN_ROWS
                 && launch.params.out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES
             {
-                (
-                    &pipelines.native.gemm_input_f32_output_f16,
-                    LinearDispatchKind::NativeTiledGemm,
-                )
+                pipelines.mixed_input_tiled_pipeline(format, launch.params)
             } else {
                 (
                     pipelines.native.linear_f32_f16(format),
@@ -1797,21 +1893,8 @@ pub(super) fn dispatch_linear(
         dispatch_linear_grid(encoder, launch.params, dispatch_kind);
         return;
     }
-    let (pipeline, dispatch_kind) = match launch.activation_type {
-        ElementType::F16 => pipelines.linear_pipeline(
-            launch.format,
-            launch.params.rows,
-            launch.params.out_features,
-        ),
-        ElementType::F32 => pipelines
-            .f32_linear_dispatch(
-                launch.format,
-                launch.params.rows,
-                launch.params.out_features,
-            )
-            .expect("validated Metal F32 linear format"),
-        _ => unreachable!("validated Metal linear activation ABI"),
-    };
+    let (pipeline, dispatch_kind) =
+        pipelines.plain_linear_dispatch(launch.format, launch.activation_type, launch.params);
     encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(
         encoder,
@@ -1857,6 +1940,10 @@ fn dispatch_linear_grid(
     dispatch_kind: LinearDispatchKind,
 ) {
     match dispatch_kind {
+        LinearDispatchKind::NarrowDenseGemv => encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.out_features), u64::from(params.rows), 1),
+            MTLSize::new(NARROW_DENSE_THREADS, 1, 1),
+        ),
         LinearDispatchKind::Pq2CooperativeGemv => encoder.dispatch_thread_groups(
             MTLSize::new(
                 u64::from(params.out_features).div_ceil(16),
@@ -2428,6 +2515,14 @@ mod hadamard_tests;
 
 #[cfg(test)]
 mod pq2_tests;
+
+#[cfg(test)]
+mod narrow_dense_tests;
+#[cfg(test)]
+mod pq2_decode_tests;
+
+#[cfg(test)]
+mod pq2_prefill_tests;
 
 #[cfg(test)]
 mod microbench;
