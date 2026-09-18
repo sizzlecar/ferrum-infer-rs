@@ -132,6 +132,69 @@ fn inspect(journal: &Path, expected_session: &str, evidence: &mut Evidence) -> R
     evidence.run_path = Some(runs[0].clone());
     evidence.session_path = Some(sessions[0].clone());
     let run = read_json(&runs[0])?;
+    let session_document = read_json(&sessions[0])?;
+    let records = session_document
+        .as_array()
+        .ok_or("public Session journal is not an array")?;
+    inspect_documents(&run, records, expected_session, 0, evidence)
+}
+
+/// Validate a single appended Run without relaxing the fresh reader's one-Run rule.
+pub(crate) fn read_continuation(
+    run_path: &Path,
+    session_path: &Path,
+    expected_session: &str,
+    prior: &[Value],
+) -> Evidence {
+    let mut evidence = Evidence {
+        run_path: Some(run_path.to_owned()),
+        session_path: Some(session_path.to_owned()),
+        integrity_scope: "public lifecycle with exact immutable prior Session prefix; HTTP replay checked separately",
+        ..Evidence::default()
+    };
+    let mut check = || -> Result<(), String> {
+        let run = read_json(run_path)?;
+        let document = read_json(session_path)?;
+        let records = document
+            .as_array()
+            .ok_or("Session journal is not an array")?;
+        require(
+            !prior.is_empty() && records.starts_with(prior),
+            "prior Session prefix changed",
+        )?;
+        let mut ids = BTreeSet::new();
+        for record in records {
+            require(
+                ids.insert(string(record, "event_id")?),
+                "duplicate event across Session prefix and continuation",
+            )?;
+        }
+        let new_id = &run["run"]["registration"]["request"]["run"]["spec"]["run_id"];
+        require(
+            prior.iter().all(|record| &record["run_id"] != new_id),
+            "continuation reused an old Run identity",
+        )?;
+        inspect_documents(
+            &run,
+            &records[prior.len()..],
+            expected_session,
+            prior.len() as u64,
+            &mut evidence,
+        )
+    };
+    if let Err(error) = (check)() {
+        evidence.errors.push(error);
+    }
+    evidence
+}
+
+fn inspect_documents(
+    run: &Value,
+    records: &[Value],
+    expected_session: &str,
+    sequence_offset: u64,
+    evidence: &mut Evidence,
+) -> Result<(), String> {
     require(
         run["schema_version"] == 1,
         "unsupported public Run journal schema",
@@ -241,17 +304,13 @@ fn inspect(journal: &Path, expected_session: &str, evidence: &mut Evidence) -> R
         "Run has no accepted terminal lifecycle",
     )?;
 
-    let session_document = read_json(&sessions[0])?;
-    let records = session_document
-        .as_array()
-        .ok_or("public Session journal is not an array")?;
     let mut session_ids = BTreeSet::new();
     let mut call_ids = BTreeSet::new();
     let mut input_seen = false;
     let mut output_seen = false;
     let mut usages = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
-        let seq = index as u64 + 1;
+        let seq = sequence_offset + index as u64 + 1;
         require(
             record["session_id"] == session
                 && record["run_id"] == run_id
@@ -609,6 +668,56 @@ mod tests {
             serde_json::to_vec(session).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn continuation_requires_immutable_prefix_new_run_and_actual_sequence_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let (run, session) = fixtures();
+        let prior = vec![
+            json!({"session_id":"session","run_id":"prior-run","event_id":"prior-event","session_seq":1}),
+        ];
+        let mut records = prior.clone();
+        for mut record in session.as_array().unwrap().clone() {
+            record["session_seq"] = json!(record["session_seq"].as_u64().unwrap() + 1);
+            records.push(record);
+        }
+        let read_current = || {
+            read_continuation(
+                &directory.path().join("run-test.json"),
+                &directory.path().join("session-test.json"),
+                "session",
+                &prior,
+            )
+        };
+        write_fixture(directory.path(), &run, &json!(records));
+        assert!(read_current().complete());
+        assert!(
+            !read(directory.path(), "session").complete(),
+            "fresh reader must still reject prior Run records"
+        );
+        for (index, field, value) in [
+            (0, "event_id", json!("changed")),
+            (1, "session_seq", json!(1)),
+            (1, "event_id", json!("prior-event")),
+            (2, "run_id", json!("foreign")),
+        ] {
+            let mut changed = records.clone();
+            changed[index][field] = value;
+            write_fixture(directory.path(), &run, &json!(changed));
+            assert!(!read_current().complete(), "accepted corrupt {field}");
+        }
+        let mut reused = prior.clone();
+        reused[0]["run_id"] = json!("run");
+        records[0] = reused[0].clone();
+        write_fixture(directory.path(), &run, &json!(records));
+        assert!(!read_continuation(
+            &directory.path().join("run-test.json"),
+            &directory.path().join("session-test.json"),
+            "session",
+            &reused
+        )
+        .complete());
     }
 
     #[test]

@@ -10,6 +10,8 @@ mod http_replay;
 mod orchestral;
 #[path = "agent_regression/orchestral_evidence.rs"]
 mod orchestral_evidence;
+#[path = "agent_regression/orchestral_resume.rs"]
+mod orchestral_resume;
 #[path = "agent_regression/orchestral_wire.rs"]
 mod orchestral_wire;
 #[path = "agent_regression/process.rs"]
@@ -46,6 +48,8 @@ struct Args {
 enum Command {
     /// Replay exact streaming OpenAI bodies concurrently, without an agent or tools.
     ReplayHttp(http_replay::Args),
+    /// Resume one verified private Orchestral session with exact HTTP history evidence.
+    ResumeOrchestral(orchestral_resume::Args),
     Run {
         #[arg(long)]
         manifest: PathBuf,
@@ -94,6 +98,7 @@ pub(crate) fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Resu
 async fn main() {
     let result = match Args::parse().command {
         Command::ReplayHttp(args) => http_replay::run(&args).await,
+        Command::ResumeOrchestral(args) => orchestral_resume::run(&args).await,
         Command::Run {
             manifest,
             report_dir,
