@@ -62,6 +62,9 @@ fn names(backend: Backend) -> Vec<String> {
         Backend::Metal => &[
             ("native_blocks::tests", &["native_block_decoding_matches_cpu_on_real_metal"]),
             ("hadamard::tests", &[
+                "hadamard_1024_selection_requires_exact_simd_threads_and_shared_capacity",
+                "hadamard_1024_production_selection_and_generic_fallback_preserve_transforms",
+                "hadamard_1024_shuffle_preserves_generic_f32_order_special_values_and_signed_zero",
                 "hadamard_forward_preserves_full_width_signs_blocks_and_input_precision_on_metal",
                 "hadamard_grouped_permutation_precedes_signs_across_blocks_on_metal",
                 "hadamard_inverse_keeps_wide_embedding_values_f32_until_final_store_on_metal",

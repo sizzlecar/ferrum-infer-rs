@@ -175,7 +175,29 @@ pub(super) struct MetalHadamardPipelines {
     f16_f32: ComputePipelineState,
     f32_f32: ComputePipelineState,
     f32_f16: ComputePipelineState,
+    specialized_1024: Option<Hadamard1024Pipelines>,
     maximum_threadgroup_bytes: u64,
+}
+
+struct Hadamard1024Pipelines {
+    f16_f32: ComputePipelineState,
+    f32_f32: ComputePipelineState,
+    f32_f16: ComputePipelineState,
+}
+
+fn supports_hadamard_1024(
+    simd_width: u64,
+    pipeline_threads: u64,
+    static_bytes: u64,
+    device_threads: u64,
+    device_bytes: u64,
+) -> bool {
+    simd_width == 32
+        && pipeline_threads >= 256
+        && device_threads >= 256
+        && static_bytes
+            .checked_add(4096)
+            .is_some_and(|required| required <= device_bytes)
 }
 
 impl MetalHadamardPipelines {
@@ -195,10 +217,29 @@ impl MetalHadamardPipelines {
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(MetalDeviceRuntimeError::contract)
         };
+        let specialized_pipeline = |name| {
+            pipeline(name).ok().filter(|pipeline| {
+                supports_hadamard_1024(
+                    pipeline.thread_execution_width(),
+                    pipeline.max_total_threads_per_threadgroup(),
+                    pipeline.static_threadgroup_memory_length(),
+                    device.max_threads_per_threadgroup().width,
+                    device.max_threadgroup_memory_length(),
+                )
+            })
+        };
+        let specialized_1024 = (|| {
+            Some(Hadamard1024Pipelines {
+                f16_f32: specialized_pipeline("vnext_hadamard_1024_f16_f32")?,
+                f32_f32: specialized_pipeline("vnext_hadamard_1024_f32_f32")?,
+                f32_f16: specialized_pipeline("vnext_hadamard_1024_f32_f16")?,
+            })
+        })();
         Ok(Self {
             f16_f32: pipeline("vnext_hadamard_f16_f32")?,
             f32_f32: pipeline("vnext_hadamard_f32_f32")?,
             f32_f16: pipeline("vnext_hadamard_f32_f16")?,
+            specialized_1024,
             maximum_threadgroup_bytes: device.max_threadgroup_memory_length(),
         })
     }
@@ -216,6 +257,25 @@ impl MetalHadamardPipelines {
         }
     }
 
+    fn selected_pipeline(
+        &self,
+        transform: HadamardTransform,
+        input: ElementType,
+        output: ElementType,
+    ) -> Result<&ComputePipelineState, String> {
+        if transform.block_size == 1024 {
+            if let Some(pipelines) = &self.specialized_1024 {
+                return match (input, output) {
+                    (ElementType::F16, ElementType::F32) => Ok(&pipelines.f16_f32),
+                    (ElementType::F32, ElementType::F32) => Ok(&pipelines.f32_f32),
+                    (ElementType::F32, ElementType::F16) => Ok(&pipelines.f32_f16),
+                    _ => Err("Metal Hadamard requires F32 intermediate values".to_owned()),
+                };
+            }
+        }
+        self.pipeline(input, output)
+    }
+
     pub(super) fn validate_dispatch(
         &self,
         transform: HadamardTransform,
@@ -229,7 +289,7 @@ impl MetalHadamardPipelines {
         {
             return Err("Metal Hadamard cannot narrow its intermediate transform".to_owned());
         }
-        let pipeline = self.pipeline(input, output)?;
+        let pipeline = self.selected_pipeline(transform, input, output)?;
         let dynamic_bytes = (u64::from(transform.block_size) * 4).next_multiple_of(16);
         let required = dynamic_bytes + pipeline.static_threadgroup_memory_length();
         if required > self.maximum_threadgroup_bytes
@@ -291,7 +351,7 @@ impl MetalHadamardPipelines {
         output_stride: u32,
     ) {
         let pipeline = self
-            .pipeline(input_type, output_type)
+            .selected_pipeline(transform, input_type, output_type)
             .expect("validated Metal Hadamard types");
         let permutation = transform.permutation.unwrap_or(GroupedFeatureTranspose {
             inner_extent: 0,
