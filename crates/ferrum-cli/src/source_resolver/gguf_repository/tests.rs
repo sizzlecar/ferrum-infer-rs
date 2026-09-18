@@ -38,6 +38,7 @@ fn provenance_selects_only_an_unambiguous_huggingface_model_repository() {
         source_repository_url: None,
         base_model_count: None,
         base_model_repository_urls: Default::default(),
+        hadamard: None,
     };
     assert_eq!(declared_metadata_repository(&metadata).unwrap(), None);
     metadata.base_model_count = Some(1);

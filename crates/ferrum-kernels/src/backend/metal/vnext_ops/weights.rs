@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
     AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, ElementType,
-    OperationInvocation, PhysicalWeightLayout, PhysicalWeightPadding, ResolvedValueBinding,
-    ResolvedWeightBinding, ResolvedWeightComponentLayout, WeightEncoding, WeightId,
+    HadamardApplication, HadamardSigns, OperationInvocation, PhysicalWeightLayout,
+    PhysicalWeightPadding, ResolvedValueBinding, ResolvedWeightBinding,
+    ResolvedWeightComponentLayout, WeightEncoding, WeightId,
 };
 
 use super::super::vnext_runtime::{MetalBufferRegion, MetalDeviceBuffer};
+use super::hadamard::{GroupedFeatureTranspose, HadamardTransform};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetalResolvedWeightComponent {
@@ -73,6 +75,10 @@ pub(crate) enum MetalResolvedWeightLayout {
         block_axis: u32,
         block_padding: PhysicalWeightPadding,
     },
+    Hadamard {
+        values: Box<MetalResolvedWeightLayout>,
+        transform: HadamardTransform,
+    },
     AxisReshapePermutation {
         values: Box<MetalResolvedWeightLayout>,
         axis: u32,
@@ -130,6 +136,34 @@ impl MetalResolvedWeight {
     ) {
         (self.regions, self.components, self.layout)
     }
+}
+
+pub(super) fn validate_hadamard_transform(
+    transform: HadamardTransform,
+    width: u64,
+    components: &[MetalResolvedWeightComponent],
+    regions: &[MetalBufferRegion],
+) -> Result<(), String> {
+    transform.validate(width)?;
+    if let Some(index) = transform.signs_region {
+        let component = components
+            .get(index)
+            .ok_or_else(|| "Metal Hadamard signs metadata is absent".to_owned())?;
+        let region = regions
+            .get(index)
+            .ok_or_else(|| "Metal Hadamard signs storage is absent".to_owned())?;
+        if component.encoding()
+            != &(WeightEncoding::Dense {
+                element_type: ElementType::F32,
+            })
+            || component.physical_dimensions() != [width]
+            || region.element_type() != ElementType::F32
+            || width.checked_mul(4) != Some(region.length_bytes())
+        {
+            return Err("Metal Hadamard signs must be a complete F32 feature row".to_owned());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_weight(
@@ -329,6 +363,42 @@ fn resolve_layout_node(
                 spec: spec.clone(),
                 block_axis: *block_axis,
                 block_padding: block_padding.clone(),
+            })
+        }
+        PhysicalWeightLayout::Hadamard { values, transform } => {
+            let signs_region = match &transform.signs {
+                HadamardSigns::Identity => None,
+                HadamardSigns::Explicit(signs) => Some(component_index(&signs.component_id)?),
+            };
+            let (inverse, permutation) = match &transform.application {
+                HadamardApplication::AfterEmbeddingLookup => (true, None),
+                HadamardApplication::BeforeMatmul { input_permutation } => {
+                    let permutation = input_permutation
+                        .as_ref()
+                        .map(|value| {
+                            let extent = |value| {
+                                u32::try_from(value).map_err(|_| {
+                                    "Metal Hadamard permutation extent exceeds u32".to_owned()
+                                })
+                            };
+                            Ok::<_, String>(GroupedFeatureTranspose {
+                                inner_extent: extent(value.inner_extent)?,
+                                first_outer_extent: extent(value.first_outer_extent)?,
+                                second_outer_extent: extent(value.second_outer_extent)?,
+                            })
+                        })
+                        .transpose()?;
+                    (false, permutation)
+                }
+            };
+            Ok(MetalResolvedWeightLayout::Hadamard {
+                values: Box::new(resolve_layout_node(values, weight, index_by_id)?),
+                transform: HadamardTransform {
+                    block_size: transform.block_size.get(),
+                    signs_region,
+                    inverse,
+                    permutation,
+                },
             })
         }
         PhysicalWeightLayout::AxisReshapePermutation {

@@ -88,6 +88,7 @@ pub fn contract_groups(backend: Backend) -> Vec<ContractGroup> {
     if backend != Backend::Cpu {
         let target = format!("vnext_{}_checkpoint_continuation", backend_name(backend));
         let mut names = vec![
+            "gated_delta_hadamard_pq2_shared_signs_and_mixed_projections_resume_public_checkpoint",
             "causal_int8_kv_q4k_provider_resumes_payload_and_scales_across_a_page_boundary",
             "causal_int8_kv_captures_completed_input_and_restores_an_appended_suffix",
             "causal_int8_kv_eager_failure_does_not_poison_the_execution_lane",

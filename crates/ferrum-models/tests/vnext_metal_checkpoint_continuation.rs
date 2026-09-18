@@ -100,6 +100,17 @@ fn gated_delta_f32_master_q4k_provider_resumes_public_native_checkpoint() {
 }
 
 #[test]
+fn gated_delta_hadamard_pq2_shared_signs_and_mixed_projections_resume_public_checkpoint() {
+    for kind in [
+        AttentionKind::GatedDeltaHadamardF16,
+        AttentionKind::GatedDeltaHadamardF32,
+    ] {
+        verify(kind, &[0..2, 2..5], &[5..6, 6..9]);
+        verify_completed_input(kind, &[0..4, 4..5], &[5..6, 6..9]);
+    }
+}
+
+#[test]
 fn native_checkpoint_completion_timing_preserves_metal_continuation() {
     verify_with_timing(
         AttentionKind::Causal,

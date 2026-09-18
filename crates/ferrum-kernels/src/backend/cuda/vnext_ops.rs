@@ -117,6 +117,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
+        include_str!("vnext_ops/native_blocks/hadamard.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
@@ -789,7 +790,7 @@ impl OperationResourceEstimator for CudaTokenEmbeddingProvider {
                 .resource_estimator_implementation_fingerprint(),
             request.input_fingerprint(),
             VALUE_ALIGNMENT_BYTES,
-            None,
+            native_blocks::hadamard::token_workspace(request.values())?,
             None,
         ))
     }
@@ -893,7 +894,7 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
         Ok(transformer::estimate(
             &self.descriptor,
             request.input_fingerprint(),
-            None,
+            native_blocks::hadamard::token_workspace(request.values())?,
         ))
     }
 }

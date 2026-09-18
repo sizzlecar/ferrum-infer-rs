@@ -120,3 +120,14 @@ fn causal_int8_kv_typed_slots_replay_and_recover_after_nonfinite_input() {
 fn causal_int8_kv_eager_failure_does_not_poison_the_execution_lane() {
     checks::verify_eager_numerical_failure();
 }
+
+#[test]
+fn gated_delta_hadamard_pq2_shared_signs_and_mixed_projections_resume_public_checkpoint() {
+    for kind in [
+        AttentionKind::GatedDeltaHadamardF16,
+        AttentionKind::GatedDeltaHadamardF32,
+    ] {
+        verify(kind, &[0..2, 2..5], &[5..6, 6..9]);
+        verify_completed_input(kind, &[0..4, 4..5], &[5..6, 6..9]);
+    }
+}

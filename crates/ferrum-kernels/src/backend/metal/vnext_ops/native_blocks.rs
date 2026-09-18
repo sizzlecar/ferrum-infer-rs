@@ -56,6 +56,7 @@ impl From<GgufBlockFormat> for NativeBlockParams {
 struct NativeGemvPipelines {
     f16: ComputePipelineState,
     f32: ComputePipelineState,
+    f32_f16: ComputePipelineState,
 }
 
 struct NativeSharedPipelines {
@@ -81,6 +82,7 @@ impl NativeSharedPipelines {
             GgufBlockFormat::Iq4Nl,
             GgufBlockFormat::Iq4Xs,
             GgufBlockFormat::Q5K,
+            GgufBlockFormat::Pq2_0,
         ] {
             for (dtype, suffix) in [(ElementType::F16, "f16"), (ElementType::F32, "f32")] {
                 if format == GgufBlockFormat::Q5K && dtype == ElementType::F16 {
@@ -139,9 +141,15 @@ pub(super) struct MetalNativeBlockPipelines {
     iq3_s: NativeGemvPipelines,
     iq4_nl: NativeGemvPipelines,
     iq4_xs: NativeGemvPipelines,
+    pq2_0: NativeGemvPipelines,
+    pub(super) pq2_linear_f32: ComputePipelineState,
+    pub(super) pq2_linear_f32_f16: ComputePipelineState,
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
+    pub(super) gemm_input_f32_output_f16: ComputePipelineState,
+    pub(super) pq2_gemm_input_f32_output_f16: ComputePipelineState,
+    pub(super) pq2_gemm_input_f32_output_f16_m64: Option<ComputePipelineState>,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -198,6 +206,7 @@ impl MetalNativeBlockPipelines {
             Ok::<_, MetalDeviceRuntimeError>(NativeGemvPipelines {
                 f16: gemv_pipeline("vnext_native_block_linear_f16", format.ggml_type_id())?,
                 f32: gemv_pipeline("vnext_native_block_linear_f32", format.ggml_type_id())?,
+                f32_f16: gemv_pipeline("vnext_native_block_linear_f32_f16", format.ggml_type_id())?,
             })
         };
         // Compile the bounded format set during registry construction. Dispatch
@@ -212,6 +221,7 @@ impl MetalNativeBlockPipelines {
         let iq3_s = specialized(GgufBlockFormat::Iq3S)?;
         let iq4_nl = specialized(GgufBlockFormat::Iq4Nl)?;
         let iq4_xs = specialized(GgufBlockFormat::Iq4Xs)?;
+        let pq2_0 = specialized(GgufBlockFormat::Pq2_0)?;
         #[cfg(test)]
         let specialized_gemv_ns = specialized_started.elapsed().as_nanos() as u64;
         #[cfg(test)]
@@ -236,6 +246,20 @@ impl MetalNativeBlockPipelines {
             optional_m64_pipeline(device, || pipeline("vnext_native_block_gemm_f16_f32_m64"));
         #[cfg(test)]
         let specialized_gemm_started = std::time::Instant::now();
+        let pq2_gemm_input_f32_output_f16 = gemm_format_pipeline(
+            device,
+            &library,
+            "vnext_native_block_gemm_input_f32_output_f16_specialized",
+            GgufBlockFormat::Pq2_0,
+        )?;
+        let pq2_gemm_input_f32_output_f16_m64 = optional_m64_pipeline(device, || {
+            gemm_format_pipeline(
+                device,
+                &library,
+                "vnext_native_block_gemm_input_f32_output_f16_m64_specialized",
+                GgufBlockFormat::Pq2_0,
+            )
+        });
         let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
             device,
             &library,
@@ -261,6 +285,9 @@ impl MetalNativeBlockPipelines {
             iq3_s,
             iq4_nl,
             iq4_xs,
+            pq2_0,
+            pq2_linear_f32: pipeline("vnext_pq2_linear_f32")?,
+            pq2_linear_f32_f16: pipeline("vnext_pq2_linear_f32_f16")?,
             shared,
             iq4xs_group_dot_f16: [
                 pipeline("vnext_iq4_group_dot_b1")?,
@@ -269,6 +296,9 @@ impl MetalNativeBlockPipelines {
                 pipeline("vnext_iq4_group_dot_b4")?,
             ],
             gemm_f16_f32: pipeline("vnext_native_block_gemm_f16_f32")?,
+            gemm_input_f32_output_f16: pipeline("vnext_native_block_gemm_input_f32_output_f16")?,
+            pq2_gemm_input_f32_output_f16,
+            pq2_gemm_input_f32_output_f16_m64,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]
@@ -300,6 +330,7 @@ impl MetalNativeBlockPipelines {
             GgufBlockFormat::Iq3S => &self.iq3_s,
             GgufBlockFormat::Iq4Nl => &self.iq4_nl,
             GgufBlockFormat::Iq4Xs => &self.iq4_xs,
+            GgufBlockFormat::Pq2_0 => &self.pq2_0,
         }
     }
 
@@ -309,6 +340,10 @@ impl MetalNativeBlockPipelines {
 
     pub(super) fn linear_f32(&self, format: GgufBlockFormat) -> &ComputePipelineState {
         &self.gemv(format).f32
+    }
+
+    pub(super) fn linear_f32_f16(&self, format: GgufBlockFormat) -> &ComputePipelineState {
+        &self.gemv(format).f32_f16
     }
 
     pub(super) fn iq4xs_group_dot(&self, rows: u32) -> Option<&ComputePipelineState> {

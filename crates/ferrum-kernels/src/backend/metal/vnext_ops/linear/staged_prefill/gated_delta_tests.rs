@@ -70,6 +70,7 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
                 let launch = linear_launch(
                     PreparedLinearPart {
                         region: index + 1,
+                        transform: None,
                         format: *format,
                         output_offset: column_offset,
                         out_features: *width,
@@ -209,6 +210,8 @@ fn half_bytes(values: &[f16]) -> Vec<u8> {
 fn gated_delta_staging_keeps_its_own_width_format_and_f32_boundaries() {
     let launch = LinearLaunch {
         input_region: 0,
+        transform: None,
+        transform_workspace: None,
         weight_region: 1,
         output_region: 2,
         input_offset_bytes: 0,

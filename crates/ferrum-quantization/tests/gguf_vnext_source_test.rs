@@ -53,6 +53,69 @@ fn native_fixture(tensors: &[NativeTensorFixture<'_>]) -> tempfile::NamedTempFil
 }
 
 #[test]
+fn native_pq2_source_keeps_group_128_packing_and_mmap_ownership() {
+    use ferrum_quantization::gguf::{gguf_weight_encoding, GgufInventory};
+
+    let mut packed = [0b1110_0100_u8; 68];
+    packed[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+    packed[34..36].copy_from_slice(&f16::from_f32(-2.0).to_le_bytes());
+    let file = native_fixture(&[NativeTensorFixture {
+        name: "projection.weight",
+        ggml_type: 142,
+        dimensions: &[2, 128],
+        payload: &packed,
+    }]);
+    let source = GgufWeightComponentSource::open(file.path()).unwrap();
+    let bytes = source.file().mmap_bytes();
+    let inventory = GgufInventory::read(&mut Cursor::new(bytes), bytes.len() as u64).unwrap();
+    assert_eq!(inventory.tensor_counts_by_dtype["PQ2_0"], 1);
+    assert_eq!(inventory.tensor_payload_bytes, 68);
+    assert_eq!(inventory.tensors[0].logical_values_per_block, 128);
+    let encoding = gguf_weight_encoding(142).unwrap();
+    assert_eq!(
+        encoding,
+        WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+            format_id: "quantization.gguf.pq2-0".to_owned().try_into().unwrap(),
+            logical_values_per_block: 128,
+            bytes_per_block: 34,
+        })
+    );
+    let binding = component("component.pq2", "projection.weight", vec![2, 1], encoding);
+    let payload = source.component(&binding).unwrap();
+    assert_eq!(payload.bytes(), &packed);
+    assert_eq!(payload.element_type(), ElementType::U8);
+    assert_eq!(
+        payload.bytes().as_ptr(),
+        source
+            .file()
+            .tensor_byte_slice("projection.weight")
+            .unwrap()
+            .as_ptr()
+    );
+    let retained = payload.retained_host_memory().unwrap().clone();
+    drop(payload);
+    drop(source);
+    assert_eq!(retained.bytes(), &packed);
+}
+
+#[test]
+fn native_pq2_source_rejects_truncated_blocks_and_partial_rows() {
+    for (dimensions, payload) in [
+        ([2, 128], vec![0; 67]),
+        // Whole tensor has 256 elements but each row violates the group ABI.
+        ([128, 2], vec![0; 68]),
+    ] {
+        let file = native_fixture(&[NativeTensorFixture {
+            name: "projection.weight",
+            ggml_type: 142,
+            dimensions: &dimensions,
+            payload: &payload,
+        }]);
+        assert!(GgufWeightComponentSource::open(file.path()).is_err());
+    }
+}
+
+#[test]
 fn native_iq_source_preserves_complete_physical_encodings_and_retained_payloads() {
     use ferrum_quantization::gguf::gguf_weight_encoding;
 

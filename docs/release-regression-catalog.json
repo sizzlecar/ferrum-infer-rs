@@ -26,14 +26,21 @@
       {
         "profile_id": "release-llama32-1b-safetensors-cuda",
         "model_source": "unsloth/Llama-3.2-1B-Instruct@5a8abab4a5d6f164389b1079fb721cfab8d7126c",
-        "behaviors": ["architecture_state", "tool_selection", "tool_handoff", "tool_continuation"],
+        "behaviors": [
+          "architecture_state",
+          "tool_selection",
+          "tool_handoff",
+          "tool_continuation"
+        ],
         "reason": "The pinned 1B model/template changes opaque identifier capitalization and refuses a valid calculator continuation in both Ferrum and independent Transformers inference. Its combined semantic probes are not release blockers; basic inference, structured output, termination, backend numerical and protocol contracts remain required. This is uncovered model behavior, not a passing result.",
         "evidence": "docs/validation/llama32-1b-release-limitations.md"
       },
       {
         "profile_id": "release-qwen35-08b-safetensors-cuda",
         "model_source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
-        "behaviors": ["architecture_state"],
+        "behaviors": [
+          "architecture_state"
+        ],
         "reason": "The pinned 0.8B model/template does not follow the exact identifier-only recall instruction in both Ferrum Metal and independent Transformers CPU inference. Its combined model-state semantic probe is not certified; basic run/serve, protocol, device numerical/state-boundary, capacity and installation checks remain required. This model limitation is declared for the same pinned source on both local GPU backends, not a claim that CUDA execution passed.",
         "evidence": "docs/validation/qwen35-08b-release-limitations.md"
       }
@@ -56,7 +63,9 @@
       {
         "profile_id": "release-qwen35-08b-safetensors-metal",
         "model_source": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
-        "behaviors": ["architecture_state"],
+        "behaviors": [
+          "architecture_state"
+        ],
         "reason": "The pinned 0.8B model/template does not follow the exact identifier-only recall instruction in both Ferrum Metal and independent Transformers CPU inference. Its combined model-state semantic probe is not certified; basic run/serve, protocol, device numerical/state-boundary, capacity and installation checks remain required. Existing failed reports remain failures; unexecuted semantics are not passing evidence.",
         "evidence": "docs/validation/qwen35-08b-release-limitations.md"
       }
@@ -545,8 +554,8 @@
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "897418e8b276939bbcd2da77219fc1a0b12e60ac5715f3eb3f259959296024d2",
-      "after_sha256": "55b34e2578d255c1013e7abc0ffe2f24921518adb2780ee8a7f423814ce93838",
+      "before_sha256": "55b34e2578d255c1013e7abc0ffe2f24921518adb2780ee8a7f423814ce93838",
+      "after_sha256": "5970f8dfb19d9c6f02dc3d4fbcb408572d3ba328b8d5428da2198ae3caf2413b",
       "areas": [
         "build",
         "backend_submission",
@@ -554,12 +563,12 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the public v0.11.0 installation examples and opt-in run/serve INT8 KV contract: FP16 remains default; supported vNext standard causal attention uses Metal or portable CUDA and unsupported combinations reject explicitly. KV payload and scale storage decreases; model weights and fixed recurrent state do not. Health exposes the actual selected format. Whole-model checkpoint restore requires all model states to support it, while resent conversation history recomputes input. Reviewed optional /v1/models reasoning metadata: an actual thinking switch and its effective default are distinct from explicitly declared effort levels; missing capabilities remain unknown. The historical demo retains Ferrum 0.10.0, Orchestral 0.3.1, the exact Qwen3.5-9B Q4_K_M revision and M1 Max 32 GB scope; no new throughput or whole-model memory claim was added. Retain build, backend submission, template, termination and tool obligations; shared KV, numerical, capacity and checkpoint obligations remain derived from the code changes. This content review does not replace runtime or public installation evidence."
+      "rationale": "Reviewed Bonsai 2 Metal support: official packed PQ2_0 weights, pinned source metadata and template, FP16 KV run/serve commands, bounded 8K context and 10 GiB example, Orchestral tools, continuation and native prefix-state reuse. These are M1 Max observations, not minimum hardware or general performance claims. CUDA operator evidence is distinct from full 27B validation, which is deferred for this release. Unsupported formats, vision, complete CPU inference and the unvalidated INT8 combination remain explicit. Retain build, backend submission, template, termination and tools obligations; this content review does not replace runtime or public-installation evidence."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "a68022fbb00cb0065fbc946796c3eff5814f6e7b370e31ad406e156f79fc7b59",
-      "after_sha256": "c69bd9c7559978cab4ed340577457441a52eed980fef4936f9e0a927ec65b1f3",
+      "before_sha256": "c69bd9c7559978cab4ed340577457441a52eed980fef4936f9e0a927ec65b1f3",
+      "after_sha256": "64d06f24158f0e9a4af5c2affd2d63e0080249505f99cc29b6b3f21f71be96ca",
       "areas": [
         "build",
         "backend_submission",
@@ -567,7 +576,7 @@
         "termination",
         "tools"
       ],
-      "rationale": "Reviewed the public v0.11.0 installation examples and opt-in run/serve INT8 KV contract: FP16 remains default; supported vNext standard causal attention uses Metal or portable CUDA and unsupported combinations reject explicitly. KV payload and scale storage decreases; model weights and fixed recurrent state do not. Health exposes the actual selected format. Whole-model checkpoint restore requires all model states to support it, while resent conversation history recomputes input. Reviewed optional /v1/models reasoning metadata: an actual thinking switch and its effective default are distinct from explicitly declared effort levels; missing capabilities remain unknown. The historical demo retains Ferrum 0.10.0, Orchestral 0.3.1, the exact Qwen3.5-9B Q4_K_M revision and M1 Max 32 GB scope; no new throughput or whole-model memory claim was added. Retain build, backend submission, template, termination and tool obligations; shared KV, numerical, capacity and checkpoint obligations remain derived from the code changes. This content review does not replace runtime or public installation evidence."
+      "rationale": "Reviewed the Chinese README against the English scope and commands. Reviewed Bonsai 2 Metal support: official packed PQ2_0 weights, pinned source metadata and template, FP16 KV run/serve commands, bounded 8K context and 10 GiB example, Orchestral tools, continuation and native prefix-state reuse. These are M1 Max observations, not minimum hardware or general performance claims. CUDA operator evidence is distinct from full 27B validation, which is deferred for this release. Unsupported formats, vision, complete CPU inference and the unvalidated INT8 combination remain explicit. Retain build, backend submission, template, termination and tools obligations; this content review does not replace runtime or public-installation evidence."
     }
   ],
   "release_profile_ids": [

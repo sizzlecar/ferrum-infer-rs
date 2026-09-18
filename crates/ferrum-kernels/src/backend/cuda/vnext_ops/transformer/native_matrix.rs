@@ -10,6 +10,9 @@ pub(super) fn uses_native(
     values: &[ResolvedValueBinding],
     ordinals: &[u32],
 ) -> Result<bool, String> {
+    // A declared transform outside our launch limits is an admission error,
+    // not permission to silently try an untransformed projection provider.
+    super::super::native_blocks::hadamard::workspace_bytes_per_token(values)?;
     let mut native = false;
     for &ordinal in ordinals {
         let value = binding(values, ResolvedValueRole::Input, ordinal)?;
@@ -91,8 +94,13 @@ pub(super) fn launch(
     rows: i32,
     output_features: i32,
     input_features: i32,
+    transform_scratch: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    if rows <= 0 || output_features <= 0 || input_features <= 0 || regions.len() != parts.len() {
+    if rows <= 0
+        || output_features <= 0
+        || input_features <= 0
+        || regions.len() != weights::region_count(parts)
+    {
         return Err(CudaDeviceRuntimeError::contract(
             "invalid native attention projection extent",
         ));
@@ -100,15 +108,20 @@ pub(super) fn launch(
     launch_parts(
         stream,
         kernels,
-        parts
-            .iter()
-            .zip(regions)
-            .map(|(part, region)| (part, region.device_ptr())),
+        parts.iter().zip(regions).map(|(part, region)| {
+            (
+                part,
+                region.device_ptr(),
+                part.signs_region
+                    .map_or(0, |index| regions[index].device_ptr()),
+            )
+        }),
         input,
         output,
         rows,
         output_features,
         input_features,
+        transform_scratch,
     )
 }
 
@@ -116,12 +129,13 @@ pub(super) fn launch(
 pub(super) fn launch_parts<'a>(
     stream: &CudaStream,
     kernels: &CudaNativeBlockKernels,
-    parts: impl Iterator<Item = (&'a weights::MatrixPart, u64)> + Clone,
+    parts: impl Iterator<Item = (&'a weights::MatrixPart, u64, u64)> + Clone,
     input: u64,
     output: u64,
     rows: i32,
     output_features: i32,
     input_features: i32,
+    transform_scratch: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
     if rows <= 0 || output_features <= 0 || input_features <= 0 || parts.clone().next().is_none() {
         return Err(CudaDeviceRuntimeError::contract(
@@ -133,8 +147,8 @@ pub(super) fn launch_parts<'a>(
         let count = (rows as u64 - start).min(MAX_ROWS) as u32;
         let input = offset_pointer(input, start * input_features as u64 * 2)?;
         let output = offset_pointer(output, start * output_features as u64 * 2)?;
-        for (part, weight) in parts.clone() {
-            kernels.linear(
+        for (part, weight, signs) in parts.clone() {
+            kernels.transformed_linear(
                 stream,
                 input,
                 weight,
@@ -143,6 +157,8 @@ pub(super) fn launch_parts<'a>(
                 count,
                 output_features as u32,
                 ElementType::F16,
+                signs,
+                transform_scratch,
             )?;
         }
         start += u64::from(count);

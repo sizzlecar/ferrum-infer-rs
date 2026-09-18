@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "hadamard.rs"]
+mod hadamard;
+
 pub const HIDDEN: u64 = 256;
 pub const MAX_TOKENS: u64 = 160;
 const VOCAB: u64 = 32;
@@ -12,6 +15,31 @@ pub enum AttentionKind {
     Causal,
     CausalInt8,
     GatedDelta,
+    GatedDeltaHadamardF16,
+    GatedDeltaHadamardF32,
+}
+
+impl AttentionKind {
+    pub fn hadamard(self) -> bool {
+        matches!(
+            self,
+            Self::GatedDeltaHadamardF16 | Self::GatedDeltaHadamardF32
+        )
+    }
+    pub fn activation_type(self) -> ElementType {
+        if self == Self::GatedDeltaHadamardF16 {
+            ElementType::F16
+        } else {
+            ElementType::F32
+        }
+    }
+    fn embedding_operation(self) -> &'static str {
+        if self.activation_type() == ElementType::F16 {
+            TOKEN_EMBEDDING_OPERATION_ID
+        } else {
+            TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID
+        }
+    }
 }
 
 pub struct Family {
@@ -26,6 +54,12 @@ impl Family {
                 AttentionKind::Causal => "family.fixture.causal-checkpoint",
                 AttentionKind::CausalInt8 => "family.fixture.causal-int8-checkpoint",
                 AttentionKind::GatedDelta => "family.fixture.gdn-checkpoint",
+                AttentionKind::GatedDeltaHadamardF16 => {
+                    "family.fixture.gdn-hadamard-f16-checkpoint"
+                }
+                AttentionKind::GatedDeltaHadamardF32 => {
+                    "family.fixture.gdn-hadamard-f32-checkpoint"
+                }
             }),
             kind,
         }
@@ -34,7 +68,16 @@ impl Family {
     pub fn profile_id(&self) -> &'static str {
         match self.kind {
             AttentionKind::CausalInt8 => "fixture.attention.f32-master.int8-kv",
+            AttentionKind::GatedDeltaHadamardF16 => "fixture.attention.f16",
             _ => PROFILE,
+        }
+    }
+
+    fn attention_version(&self) -> ContractVersion {
+        if self.kind == AttentionKind::GatedDeltaHadamardF16 {
+            ContractVersion::new(6, 0)
+        } else {
+            ContractVersion::new(1, 0)
         }
     }
 
@@ -43,6 +86,10 @@ impl Family {
             AttentionKind::Causal => CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
             AttentionKind::CausalInt8 => CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
             AttentionKind::GatedDelta => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            AttentionKind::GatedDeltaHadamardF16 => GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            AttentionKind::GatedDeltaHadamardF32 => {
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
+            }
         }
     }
 
@@ -53,7 +100,9 @@ impl Family {
                 ("kv_quant", vec![2, 2, 128], ElementType::I8, true),
                 ("kv_scale", vec![2, 2], ElementType::F32, true),
             ],
-            AttentionKind::GatedDelta => vec![
+            AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaHadamardF16
+            | AttentionKind::GatedDeltaHadamardF32 => vec![
                 ("conv", vec![512, 3], ElementType::F16, false),
                 ("delta", vec![4, 64, 64], ElementType::F32, false),
             ],
@@ -109,7 +158,9 @@ impl Family {
                 Weight::dense("q_norm", vec![128], ElementType::F16),
                 Weight::dense("k_norm", vec![128], ElementType::F16),
             ],
-            AttentionKind::GatedDelta => vec![
+            AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaHadamardF16
+            | AttentionKind::GatedDeltaHadamardF32 => vec![
                 Weight::quantized("qkvzba", vec![776, HIDDEN]),
                 Weight::dense("conv", vec![512, 4], ElementType::F16),
                 Weight::dense("negative_rate", vec![4], ElementType::F32),
@@ -134,7 +185,9 @@ impl Family {
                 ("rope_dim", 32),
                 ("maximum_context_tokens", MAX_TOKENS),
             ],
-            AttentionKind::GatedDelta => vec![
+            AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaHadamardF16
+            | AttentionKind::GatedDeltaHadamardF32 => vec![
                 ("key_heads", 2),
                 ("value_heads", 4),
                 ("key_head_dim", 64),
@@ -168,7 +221,9 @@ impl Family {
                     attributes.insert(id(key), SemanticValue::Bool(true));
                 }
             }
-            AttentionKind::GatedDelta => {
+            AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaHadamardF16
+            | AttentionKind::GatedDeltaHadamardF32 => {
                 attributes.insert(
                     id("decay_parameterization"),
                     SemanticValue::Text("negative_rate".to_owned()),
@@ -226,13 +281,17 @@ impl ModelFamilyProvider for Family {
     }
     fn weight_schema(&self, _config: &AttentionKind) -> Result<WeightSchema, VNextError> {
         let weights = self.weights();
-        Ok(WeightSchema {
+        let mut schema = WeightSchema {
             format_id: id(FORMAT),
             layout_id: id("weight-layout.fixture.attention.native"),
             version: ContractVersion::new(1, 0),
             components: weights.iter().map(Weight::component).collect(),
             tensors: weights.iter().map(Weight::logical).collect(),
-        })
+        };
+        if self.kind.hadamard() {
+            hadamard::configure(&mut schema);
+        }
+        Ok(schema)
     }
     fn numerical_profiles(
         &self,
@@ -250,27 +309,29 @@ impl ModelFamilyProvider for Family {
                         payload_state: id("state.kv_quant"),
                         scale_state: id("state.kv_scale"),
                     }],
-                    AttentionKind::GatedDelta => Vec::new(),
+                    AttentionKind::GatedDelta
+                    | AttentionKind::GatedDeltaHadamardF16
+                    | AttentionKind::GatedDeltaHadamardF32 => Vec::new(),
                 },
                 id: id(self.profile_id()),
                 family_id: self.id.clone(),
                 version: ContractVersion::new(1, 0),
                 primary_activation: id("value.embedding"),
                 boundaries: BTreeMap::from([
-                    (id("value.embedding"), ElementType::F32),
-                    (id("value.output"), ElementType::F32),
+                    (id("value.embedding"), self.kind.activation_type()),
+                    (id("value.output"), self.kind.activation_type()),
                 ]),
                 states: self.states(),
                 operations: vec![
                     NumericalOperationContract {
-                        operation_id: id(TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID),
+                        operation_id: id(self.kind.embedding_operation()),
                         version: ContractVersion::new(1, 0),
                         multiplication_type: None,
                         accumulation_type: None,
                     },
                     NumericalOperationContract {
                         operation_id: id(self.operation()),
-                        version: ContractVersion::new(1, 0),
+                        version: self.attention_version(),
                         multiplication_type: Some(ElementType::F32),
                         accumulation_type: Some(ElementType::F32),
                     },
@@ -301,7 +362,7 @@ impl ModelFamilyProvider for Family {
                 nodes: vec![
                     ProgramNode {
                         id: id("node.embedding"),
-                        operation_id: id(TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID),
+                        operation_id: id(self.kind.embedding_operation()),
                         required_version: ContractVersion::new(1, 0),
                         work: ProgramNodeWorkSpec::tokens(id("value.tokens"), 0),
                         inputs: vec![id("value.tokens"), id("value.weight.embedding")],
@@ -314,7 +375,7 @@ impl ModelFamilyProvider for Family {
                     ProgramNode {
                         id: id("node.attention"),
                         operation_id: id(self.operation()),
-                        required_version: ContractVersion::new(1, 0),
+                        required_version: self.attention_version(),
                         work: ProgramNodeWorkSpec::tokens(id("value.embedding"), 0),
                         inputs: attention_inputs,
                         outputs: vec![id("value.output")],
@@ -438,12 +499,16 @@ impl Weight {
     }
 }
 
-pub struct Weights(pub BTreeMap<WeightId, Vec<u8>>);
+pub struct Weights {
+    values: BTreeMap<WeightId, Vec<u8>>,
+    source: Option<ferrum_quantization::gguf::GgufWeightComponentSource>,
+    _artifact: Option<tempfile::NamedTempFile>,
+}
 impl Weights {
     pub fn set_nonfinite_embedding(&mut self, token: u32) {
         assert!(u64::from(token) < VOCAB);
         let bytes = self
-            .0
+            .values
             .get_mut(&id::<WeightId>("component.embedding"))
             .unwrap();
         let offset = token as usize * HIDDEN as usize * 2;
@@ -451,7 +516,7 @@ impl Weights {
     }
 
     pub fn new(schema: &WeightSchema) -> Self {
-        let values = schema
+        let values: BTreeMap<WeightId, Vec<u8>> = schema
             .components
             .iter()
             .enumerate()
@@ -474,6 +539,21 @@ impl Weights {
                             }
                         })
                         .collect(),
+                    WeightEncoding::BlockQuantized(spec)
+                        if spec.format_id.as_str() == "quantization.gguf.pq2-0" =>
+                    {
+                        (0..elements)
+                            .flat_map(|block| {
+                                let mut bytes = vec![0; 34];
+                                bytes[..2]
+                                    .copy_from_slice(&f16::from_f32(1.0 / 64.0).to_le_bytes());
+                                for (index, byte) in bytes[2..].iter_mut().enumerate() {
+                                    *byte = ((index * 37 + block * 11 + ordinal * 19) % 256) as u8;
+                                }
+                                bytes
+                            })
+                            .collect()
+                    }
                     WeightEncoding::BlockQuantized(_) => (0..elements)
                         .flat_map(|block| {
                             let mut bytes = vec![0; 144];
@@ -493,7 +573,24 @@ impl Weights {
                 (component.id.clone(), bytes)
             })
             .collect();
-        Self(values)
+        if schema
+            .components
+            .iter()
+            .any(|component| component.role == WeightComponentRole::TransformSigns)
+        {
+            let (artifact, source) = hadamard::source(schema, &values);
+            Self {
+                values,
+                source: Some(source),
+                _artifact: Some(artifact),
+            }
+        } else {
+            Self {
+                values,
+                source: None,
+                _artifact: None,
+            }
+        }
     }
 }
 impl WeightComponentSource for Weights {
@@ -501,13 +598,16 @@ impl WeightComponentSource for Weights {
         &'s self,
         component: &WeightComponentSpec,
     ) -> Result<WeightComponentPayload<'s>, VNextError> {
+        if let Some(source) = &self.source {
+            return source.component(component);
+        }
         WeightComponentPayload::new(
             component,
             component.external_names[0].clone(),
             "generated-native-blocks.bin",
             component.dimensions.clone(),
             component.physical_element_type(),
-            self.0[&component.id].as_slice(),
+            self.values[&component.id].as_slice(),
         )
     }
 }

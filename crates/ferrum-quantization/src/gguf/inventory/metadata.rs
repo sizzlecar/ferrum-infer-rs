@@ -5,6 +5,7 @@ use std::io::{Read, Seek};
 
 use candle_core::{Error, Result};
 
+use super::super::GgufHadamard;
 use super::header::{base_model_repository_index, Header};
 
 /// Declared provenance used to locate independent semantic/tokenizer sources.
@@ -16,6 +17,8 @@ pub struct GgufModelMetadata {
     pub base_model_count: Option<u64>,
     /// Sparse because repository URLs are optional for each declared parent.
     pub base_model_repository_urls: BTreeMap<u64, String>,
+    /// Validated transform declarations, without reading tensor payloads.
+    pub hadamard: Option<GgufHadamard>,
 }
 
 impl GgufModelMetadata {
@@ -47,11 +50,20 @@ impl GgufModelMetadata {
                 base_model_repository_urls.insert(index, value.to_string()?.clone());
             }
         }
+        let hadamard = GgufHadamard::parse(
+            &header.metadata,
+            &architecture,
+            header
+                .tensors
+                .iter()
+                .map(|tensor| (tensor.name.as_str(), tensor.dimensions.as_slice())),
+        )?;
         Ok(Self {
             architecture,
             source_repository_url: string("general.source.repo_url")?,
             base_model_count,
             base_model_repository_urls,
+            hadamard,
         })
     }
 }

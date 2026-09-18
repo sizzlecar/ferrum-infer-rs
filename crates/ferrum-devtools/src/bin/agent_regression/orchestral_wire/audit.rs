@@ -44,6 +44,37 @@ pub(crate) fn audit_saved(
         .context("saved result omitted the native session identity")?;
     let public = orchestral_evidence::read(&task_dir.join("journals"), session);
     let requests = report.join("requests");
+    let (records, request_hashes) = load_records(&requests, task)?;
+    let wire = bind(
+        &public,
+        &records.iter().collect::<Vec<_>>(),
+        &requests,
+        format,
+    );
+    let complete = public.complete() && wire.complete();
+    let evidence = json!({
+        "schema_version": 1,
+        "scope": "Recomputed public journal and uncompacted exact HTTP replay; task validation and timing are not rerun or reclassified",
+        "source_report": report, "source_task_result": result_path, "task_id": task,
+        "manifest_tool_result_format": declared, "selected_tool_result_format": format,
+        "tool_result_format_override": format_override,
+        "source_manifest_sha256": sha(&manifest_bytes), "source_task_result_sha256": sha(&result_bytes),
+        "request_body_sha256": request_hashes,
+        "closed_loop_evidence": complete, "public": public, "wire": wire,
+    });
+    let destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("create new audit {}", output.display()))?;
+    serde_json::to_writer_pretty(destination, &evidence)?;
+    Ok(if complete { 0 } else { 1 })
+}
+
+pub(crate) fn load_records(
+    requests: &Path,
+    task: &str,
+) -> Result<(Vec<RequestRecord>, BTreeMap<u32, String>)> {
     let mut records = Vec::new();
     let mut request_hashes = BTreeMap::new();
     for entry in fs::read_dir(&requests)? {
@@ -71,28 +102,6 @@ pub(crate) fn audit_saved(
             .clone();
         records.push(record);
     }
-    let wire = bind(
-        &public,
-        &records.iter().collect::<Vec<_>>(),
-        &requests,
-        format,
-    );
-    let complete = public.complete() && wire.complete();
-    let evidence = json!({
-        "schema_version": 1,
-        "scope": "Recomputed public journal and uncompacted exact HTTP replay; task validation and timing are not rerun or reclassified",
-        "source_report": report, "source_task_result": result_path, "task_id": task,
-        "manifest_tool_result_format": declared, "selected_tool_result_format": format,
-        "tool_result_format_override": format_override,
-        "source_manifest_sha256": sha(&manifest_bytes), "source_task_result_sha256": sha(&result_bytes),
-        "request_body_sha256": request_hashes,
-        "closed_loop_evidence": complete, "public": public, "wire": wire,
-    });
-    let destination = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .with_context(|| format!("create new audit {}", output.display()))?;
-    serde_json::to_writer_pretty(destination, &evidence)?;
-    Ok(if complete { 0 } else { 1 })
+    records.sort_by_key(|record| record.request_index);
+    Ok((records, request_hashes))
 }

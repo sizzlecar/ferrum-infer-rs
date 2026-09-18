@@ -246,7 +246,48 @@ ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
 
 此选项减少注意力 KV 的存储占用，包含量化所需的 scale；模型权重和固定大小的循环状态
 保持原有大小。通过 `/health` 的 `kv_storage` 可确认实际生效格式。
-整个模型的 checkpoint 恢复需要所有模型状态均支持恢复；重新发送对话历史会重新计算输入。
+整个模型的 checkpoint 恢复需要所有模型状态均支持恢复。关闭 prefix cache 或没有兼容的
+checkpoint 时，重新发送历史会重新计算输入；使用 `--enable-prefix-cache` 并命中后，
+可恢复模型状态并计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
+
+### 在 Metal 上运行 Bonsai 2 PQ2_0
+
+Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
+并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
+包括 Orchestral 真实工具执行、会话续接和前缀状态复用。下方 8K 上下文和 10 GiB
+运行预算已在 M1 Max 上实测，不是最低硬件要求，也不保证更大负载可用。
+
+下载[官方 PQ2_0 文件](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)。
+此 checkpoint 已验证的 metadata 来自[这个固定版本的源模型](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0)：
+将原始 `config.json`、`generation_config.json`、`tokenizer.json`、
+`tokenizer_config.json` 和 `chat_template.jinja` 五个文件保存到下方 metadata 目录。
+
+```sh
+MODEL=/path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf
+METADATA=/path/to/matching-source-metadata
+
+ferrum run "$MODEL" --semantic-source "$METADATA" --tokenizer-source "$METADATA" \
+  --backend metal --numerical-profile qwen3_5.f32-master --kv-dtype fp16 \
+  --max-model-len 8192 --kv-capacity 8192 --max-num-seqs 1 \
+  --max-num-batched-tokens 128 --runtime-memory-budget-bytes 10737418240 \
+  --disable-thinking --prompt "Explain what a hash table does." --max-tokens 128
+
+ferrum serve --model "$MODEL" --semantic-source "$METADATA" --tokenizer-source "$METADATA" \
+  --backend metal --numerical-profile qwen3_5.f32-master --kv-dtype fp16 \
+  --max-model-len 8192 --kv-capacity 8192 --max-num-seqs 1 \
+  --max-num-batched-tokens 128 --runtime-memory-budget-bytes 10737418240 \
+  --disable-thinking --served-model-name bonsai --enable-prefix-cache --session-cache off
+```
+
+服务示例为自行发送完整对话历史的客户端关闭了 session 消息存储。检查 `/health`
+的 `cache.prefix_cache`：真正的模型状态复用应报告
+`source: "vnext-native-sequence-checkpoint-cache"`，兼容请求之后的 `hits` 和
+`saved_prefill_tokens` 应增加。
+
+CUDA PQ2_0/Hadamard 算子和小型混合状态 checkpoint 测试已在真实 GPU 上通过，
+**完整 27B 模型的 CUDA 验收仍未完成**。此 Bonsai 路径不支持 PTQ1_0、旧代
+Q1_0/Q2_0 编码、MLX 包、视觉或完整 CPU 推理；Bonsai 与 INT8 KV 的组合尚未验收。
+模型声明的上下文上限不代表超过上述长度的范围已经实测。
 
 ## 功能
 

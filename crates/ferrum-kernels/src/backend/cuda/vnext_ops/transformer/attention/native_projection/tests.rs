@@ -15,7 +15,15 @@ fn native_attention_projection_accounts_for_partitions_and_cuda_row_capacity() {
     assert!(dispatch_count(usize::MAX, u64::MAX).is_err());
     let mut shape = super::super::tests::test_shape();
     shape.hidden_size = 512;
-    let scratch = ScratchLayout::new(shape, 3, 2, AttentionProjection::Native).unwrap();
+    let scratch = ScratchLayout::new(
+        shape,
+        3,
+        2,
+        AttentionProjection::Native {
+            transform_bytes_per_token: 0,
+        },
+    )
+    .unwrap();
     assert!(scratch.projection_workspace.is_none());
     assert!(scratch.projection_staging.is_none());
     assert_eq!(
@@ -24,6 +32,20 @@ fn native_attention_projection_accounts_for_partitions_and_cuda_row_capacity() {
             + 2 * shape.scratch_bytes_per_sequence().unwrap()
             + 3 * shape.scratch_bytes_per_token().unwrap()
     );
+    let transformed = ScratchLayout::new(
+        shape,
+        3,
+        2,
+        AttentionProjection::Native {
+            transform_bytes_per_token: 512 * 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        transformed.required_bytes,
+        scratch.required_bytes + 3 * 512 * 4
+    );
+    assert!(transformed.projection_staging.is_some());
 }
 
 fn fixture(format: MatrixFormat, rows: usize, columns: usize) -> (Vec<u8>, Vec<f32>) {
@@ -70,9 +92,11 @@ fn native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on
         MatrixFormat::Block(GgufBlockFormat::Q8_0),
         MatrixFormat::Block(GgufBlockFormat::Iq3S),
         MatrixFormat::Block(GgufBlockFormat::Iq4Xs),
+        MatrixFormat::Block(GgufBlockFormat::Pq2_0),
     ];
     for (columns, tokens, formats) in [
         (256, 3, mixed),
+        (384, 3, vec![MatrixFormat::Block(GgufBlockFormat::Pq2_0)]),
         (3, MAX_ROWS as usize + 1, vec![MatrixFormat::DenseF16]),
     ] {
         let mut matrices = Vec::new();
@@ -84,6 +108,8 @@ fn native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on
             let (bytes, decoded) = fixture(format, rows, columns);
             matrices.push(Guarded::new(&stream, &bytes, 0xAB_u8));
             parts.push(MatrixPart {
+                transform: None,
+                signs_region: None,
                 component_id: WeightId::new(format!("weight.test.part-{index}")).unwrap(),
                 format,
                 rows: rows as u32,
@@ -108,12 +134,13 @@ fn native_attention_projection_matches_mixed_matrix_oracle_and_chunk_boundary_on
             parts
                 .iter()
                 .zip(&matrices)
-                .map(|(part, matrix)| (part, matrix.pointer(&stream))),
+                .map(|(part, matrix)| (part, matrix.pointer(&stream), 0)),
             input_gpu.pointer(&stream),
             output_gpu.pointer(&stream),
             tokens as i32,
             output_features as i32,
             columns as i32,
+            0,
         )
         .unwrap();
         let actual = output_gpu.read(&stream);

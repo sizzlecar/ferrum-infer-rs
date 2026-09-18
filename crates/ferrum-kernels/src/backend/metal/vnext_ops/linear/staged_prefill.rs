@@ -259,6 +259,9 @@ pub(super) fn selected(launch: LinearLaunch) -> bool {
 }
 
 fn selected_for(launch: LinearLaunch, policy: StagingPolicy) -> bool {
+    if launch.transform.is_some() {
+        return false;
+    }
     let Some(minimum_rows) =
         policy.minimum_rows(launch.format, u64::from(launch.params.in_features))
     else {
@@ -300,7 +303,13 @@ impl Sequence {
         } else {
             0
         };
-        self.gate_up.len() as u64 + 2 + staged
+        self.gate_up
+            .iter()
+            .map(|launch| launch.dispatch_count())
+            .sum::<u64>()
+            + self.down.dispatch_count()
+            + 1
+            + staged
     }
 
     pub(super) fn encode(
@@ -403,7 +412,8 @@ impl Workspace {
 }
 
 pub(in super::super) fn dispatch_count(launch: LinearLaunch, workspace: Option<Workspace>) -> u64 {
-    1 + u64::from(workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)))
+    launch.dispatch_count()
+        + u64::from(workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)))
 }
 
 pub(in super::super) fn dispatch(

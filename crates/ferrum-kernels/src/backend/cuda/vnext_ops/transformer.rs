@@ -316,6 +316,7 @@ impl CudaDenseLinearProvider {
                 include_str!("transformer.rs").as_bytes(),
                 include_str!("transformer/native_linear.rs").as_bytes(),
                 include_str!("native_blocks.rs").as_bytes(),
+                include_str!("native_blocks/hadamard.rs").as_bytes(),
                 include_str!("native_blocks/weights.rs").as_bytes(),
                 crate::ptx::VNEXT_GGUF.as_bytes(),
                 DENSE_LINEAR_PROVIDER_ID.as_bytes(),
@@ -337,7 +338,12 @@ impl OperationResourceEstimator for CudaDenseLinearProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)
+        ensure_estimator_request(&self.descriptor, &request, DENSE_LINEAR_OPERATION_ID)?;
+        Ok(estimate(
+            &self.descriptor,
+            request.input_fingerprint(),
+            super::native_blocks::hadamard::token_workspace(request.values())?,
+        ))
     }
 }
 
@@ -606,6 +612,7 @@ impl CudaDenseSwiGluProvider {
             include_str!("transformer.rs").as_bytes(),
             include_str!("transformer/native_swiglu.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
+            include_str!("native_blocks/hadamard.rs").as_bytes(),
             include_str!("native_blocks/weights.rs").as_bytes(),
             crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
@@ -679,7 +686,12 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
         let bytes_per_token = intermediate_size
             .checked_mul(SWIGLU_SCRATCH_PARTS)
             .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
-            .ok_or_else(|| invalid_plan("CUDA dense SwiGLU scratch size overflows"))?;
+            .ok_or_else(|| invalid_plan("CUDA dense SwiGLU scratch size overflows"))?
+            .checked_add(
+                super::native_blocks::hadamard::workspace_bytes_per_token(request.values())
+                    .map_err(invalid_plan)?,
+            )
+            .ok_or_else(|| invalid_plan("CUDA Hadamard SwiGLU scratch size overflows"))?;
         #[cfg(not(feature = "vllm-marlin"))]
         let formula = ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?;
         #[cfg(feature = "vllm-marlin")]

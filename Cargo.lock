@@ -1420,6 +1420,7 @@ dependencies = [
  "chrono",
  "clap",
  "ferrum-bench-core",
+ "ferrum-interfaces",
  "ferrum-types",
  "flate2",
  "futures",

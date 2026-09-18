@@ -27,11 +27,14 @@ use ferrum_interfaces::vnext::{
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
+use crate::gguf_blocks::GgufBlockFormat;
+
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
     MetalDeviceRuntimeError,
 };
-use super::weights::{resolve_weight, MetalResolvedWeightLayout};
+use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
+use super::weights::{resolve_weight, validate_hadamard_transform, MetalResolvedWeightLayout};
 use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
     contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
@@ -66,12 +69,18 @@ const LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID: &str =
 const LAST_TOKEN_MASKED_ARGMAX_F32_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_masked_argmax.f32";
 
-const TOKEN_EMBEDDING_QUANTIZATION_FORMATS: &[&str] =
-    &[Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID];
+const PQ2_0_FORMAT_ID: &str = GgufBlockFormat::Pq2_0.format_id();
+const TOKEN_EMBEDDING_QUANTIZATION_FORMATS: &[&str] = &[
+    Q4_K_FORMAT_ID,
+    Q6_K_FORMAT_ID,
+    Q8_0_FORMAT_ID,
+    PQ2_0_FORMAT_ID,
+];
 const EMBEDDING_DENSE_KERNEL: &str = "vnext_embedding_dense_f16";
 const EMBEDDING_Q4_K_KERNEL: &str = "vnext_embedding_q4_k_f16";
 const EMBEDDING_Q6_K_KERNEL: &str = "vnext_embedding_q6_k_f16";
 const EMBEDDING_Q8_0_KERNEL: &str = "vnext_embedding_q8_0_f16";
+const EMBEDDING_PQ2_0_KERNEL: &str = "vnext_embedding_pq2_0_f16";
 const RMS_NORM_KERNEL: &str = "vnext_rms_norm_f16";
 const RESIDUAL_ADD_KERNEL: &str = "vnext_residual_add_f16";
 const LAST_TOKEN_MASKED_ARGMAX_KERNEL: &str = "vnext_last_token_masked_argmax_f16";
@@ -79,16 +88,19 @@ const EMBEDDING_DENSE_F32_KERNEL: &str = "vnext_embedding_dense_f32";
 const EMBEDDING_Q4_K_F32_KERNEL: &str = "vnext_embedding_q4_k_f32";
 const EMBEDDING_Q6_K_F32_KERNEL: &str = "vnext_embedding_q6_k_f32";
 const EMBEDDING_Q8_0_F32_KERNEL: &str = "vnext_embedding_q8_0_f32";
+const EMBEDDING_PQ2_0_F32_KERNEL: &str = "vnext_embedding_pq2_0_f32";
 const RMS_NORM_F32_TO_F16_KERNEL: &str = "vnext_rms_norm_f32_to_f16";
 const RMS_NORM_F32_KERNEL: &str = "vnext_rms_norm_f32";
 const RESIDUAL_ADD_F32_F16_KERNEL: &str = "vnext_residual_add_f32_f16";
 const LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL: &str = "vnext_last_token_masked_argmax_f32";
 
 pub(super) struct MetalPrimitivePipelines {
+    hadamard: MetalHadamardPipelines,
     embedding_dense: ComputePipelineState,
     embedding_q4_k: ComputePipelineState,
     embedding_q6_k: ComputePipelineState,
     embedding_q8_0: ComputePipelineState,
+    embedding_pq2_0: ComputePipelineState,
     rms_norm: ComputePipelineState,
     residual_add: ComputePipelineState,
     last_token_masked_argmax: ComputePipelineState,
@@ -96,6 +108,7 @@ pub(super) struct MetalPrimitivePipelines {
     embedding_q4_k_f32: ComputePipelineState,
     embedding_q6_k_f32: ComputePipelineState,
     embedding_q8_0_f32: ComputePipelineState,
+    embedding_pq2_0_f32: ComputePipelineState,
     rms_norm_f32_to_f16: ComputePipelineState,
     rms_norm_f32: ComputePipelineState,
     residual_add_f32_f16: ComputePipelineState,
@@ -126,10 +139,12 @@ impl MetalPrimitivePipelines {
                 })
         };
         Ok(Self {
+            hadamard: MetalHadamardPipelines::new(device)?,
             embedding_dense: pipeline(EMBEDDING_DENSE_KERNEL)?,
             embedding_q4_k: pipeline(EMBEDDING_Q4_K_KERNEL)?,
             embedding_q6_k: pipeline(EMBEDDING_Q6_K_KERNEL)?,
             embedding_q8_0: pipeline(EMBEDDING_Q8_0_KERNEL)?,
+            embedding_pq2_0: pipeline(EMBEDDING_PQ2_0_KERNEL)?,
             rms_norm: pipeline(RMS_NORM_KERNEL)?,
             residual_add: pipeline(RESIDUAL_ADD_KERNEL)?,
             last_token_masked_argmax: pipeline(LAST_TOKEN_MASKED_ARGMAX_KERNEL)?,
@@ -137,6 +152,7 @@ impl MetalPrimitivePipelines {
             embedding_q4_k_f32: pipeline(EMBEDDING_Q4_K_F32_KERNEL)?,
             embedding_q6_k_f32: pipeline(EMBEDDING_Q6_K_F32_KERNEL)?,
             embedding_q8_0_f32: pipeline(EMBEDDING_Q8_0_F32_KERNEL)?,
+            embedding_pq2_0_f32: pipeline(EMBEDDING_PQ2_0_F32_KERNEL)?,
             rms_norm_f32_to_f16: pipeline(RMS_NORM_F32_TO_F16_KERNEL)?,
             rms_norm_f32: pipeline(RMS_NORM_F32_KERNEL)?,
             residual_add_f32_f16: pipeline(RESIDUAL_ADD_F32_F16_KERNEL)?,
@@ -168,9 +184,18 @@ impl MetalTokenEmbeddingProvider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
+                hadamard::FINGERPRINT_SOURCE.as_bytes(),
                 TOKEN_EMBEDDING_PROVIDER_ID.as_bytes(),
             ]),
-        )?;
+        )?
+        .with_checkpoint_capability(ProviderCheckpointCapability::CompletedBoundary(
+            ProviderCheckpointContract::new(
+                CheckpointInputDependency::ExactTokenPrefix,
+                CheckpointBoundaryConstraint::any_positive(),
+                CheckpointPartitionNumerics::CapturedExecutionContinuation,
+            )
+            .with_completed_input_capture(CheckpointCompletedInputCapture::Supported),
+        ));
         Ok(Self {
             descriptor,
             pipelines,
@@ -187,7 +212,7 @@ impl OperationResourceEstimator for MetalTokenEmbeddingProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, TOKEN_EMBEDDING_OPERATION_ID)
+        hadamard::estimate_token_workspace(&self.descriptor, &request, TOKEN_EMBEDDING_OPERATION_ID)
     }
 }
 
@@ -458,6 +483,7 @@ macro_rules! no_workspace_primitive_provider {
                     implementation_fingerprint(&[
                         include_str!("primitives.rs").as_bytes(),
                         SHADER_SOURCE.as_bytes(),
+                        hadamard::FINGERPRINT_SOURCE.as_bytes(),
                         $provider_id.as_bytes(),
                     ]),
                 )?
@@ -478,7 +504,11 @@ macro_rules! no_workspace_primitive_provider {
                 &self,
                 request: OperationResourceEstimateRequest<'_>,
             ) -> Result<OperationResourceEstimate, VNextError> {
-                estimate_without_workspace(&self.descriptor, &request, $operation_id)
+                if $operation_id == TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID {
+                    hadamard::estimate_token_workspace(&self.descriptor, &request, $operation_id)
+                } else {
+                    estimate_without_workspace(&self.descriptor, &request, $operation_id)
+                }
             }
         }
 
@@ -685,6 +715,7 @@ enum EmbeddingPhysicalFormat {
     Q4K,
     Q6K,
     Q8_0,
+    Pq2_0,
 }
 
 #[repr(C)]
@@ -697,7 +728,11 @@ struct EmbeddingParams {
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddingLaunch {
-    first_region: usize,
+    table_region: usize,
+    tokens_region: usize,
+    output_region: usize,
+    transform: Option<HadamardTransform>,
+    scratch_offset_bytes: u64,
     format: EmbeddingPhysicalFormat,
     params: EmbeddingParams,
 }
@@ -740,6 +775,7 @@ fn encode_token_embedding_typed(
     let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
     let mut launches = Vec::with_capacity(invocation.participants().len());
+    let mut scratch_bytes = 0_u64;
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
         let token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let table = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
@@ -755,13 +791,33 @@ fn encode_token_embedding_typed(
             output_type,
         )?;
         let weight = resolve_weight(participant, table)?;
-        let format = embedding_weight_format(&weight, vocabulary_size, hidden_size)?;
+        let (format, table_component, transform) =
+            embedding_weight_format(&weight, vocabulary_size, hidden_size)?;
         let (mut table_regions, _, _) = weight.into_command_parts();
-        if table_regions.len() != 1 {
-            return Err("Metal token embedding requires one physical table component".to_owned());
-        }
         let first_region = regions.len();
+        let transform = transform
+            .map(|transform| transform.relocate(first_region))
+            .transpose()?;
+        let scratch_offset_bytes = scratch_bytes;
+        if let Some(transform) = transform {
+            pipelines.hadamard.validate_dispatch(
+                transform,
+                checked_u32(hidden_size, "Metal embedding hidden size")?,
+                ElementType::F32,
+                output_type,
+            )?;
+            let bytes_per_row = hidden_size
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(15))
+                .map(|bytes| bytes & !15)
+                .ok_or_else(|| "Metal embedding inverse workspace row size overflows".to_owned())?;
+            scratch_bytes = bytes_per_row
+                .checked_mul(token_range.immediate_tokens())
+                .and_then(|bytes| scratch_bytes.checked_add(bytes))
+                .ok_or_else(|| "Metal embedding inverse workspace size overflows".to_owned())?;
+        }
         regions.append(&mut table_regions);
+        let tokens_region = regions.len();
         regions.push(contiguous_token_region(
             participant,
             token_ids,
@@ -773,6 +829,7 @@ fn encode_token_embedding_typed(
             },
             token_range.immediate_tokens(),
         )?);
+        let output_region = regions.len();
         regions.push(contiguous_token_region(
             participant,
             output,
@@ -781,7 +838,11 @@ fn encode_token_embedding_typed(
             token_range.immediate_tokens(),
         )?);
         launches.push(EmbeddingLaunch {
-            first_region,
+            table_region: first_region + table_component,
+            tokens_region,
+            output_region,
+            transform,
+            scratch_offset_bytes,
             format,
             params: EmbeddingParams {
                 token_count: checked_u32(
@@ -798,21 +859,61 @@ fn encode_token_embedding_typed(
         "Metal embedding participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let dispatch_count = launches.len() as u64;
+    let scratch_region = if scratch_bytes == 0 {
+        None
+    } else {
+        let index = regions.len();
+        regions.push(shared_scratch_region(&invocation, scratch_bytes)?);
+        Some(index)
+    };
+    let dispatch_count = launches
+        .iter()
+        .map(|launch| 1 + u64::from(launch.transform.is_some()))
+        .sum();
     MetalDeviceCommand::operation("vnext_token_embedding", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
         let compute = encoder.compute_encoder();
         for launch in &launches {
-            dispatch_embedding(
-                &pipelines,
-                compute,
-                launch.format,
-                &regions[launch.first_region],
-                &regions[launch.first_region + 1],
-                &regions[launch.first_region + 2],
-                launch.params,
-                output_type,
-            );
+            let output = &regions[launch.output_region];
+            if let Some(transform) = launch.transform {
+                let scratch =
+                    &regions[scratch_region.expect("validated embedding inverse workspace")];
+                dispatch_embedding_at(
+                    &pipelines,
+                    compute,
+                    launch.format,
+                    &regions[launch.table_region],
+                    &regions[launch.tokens_region],
+                    scratch,
+                    launch.scratch_offset_bytes,
+                    launch.params,
+                    ElementType::F32,
+                );
+                pipelines.hadamard.dispatch(
+                    compute,
+                    transform,
+                    scratch,
+                    launch.scratch_offset_bytes,
+                    ElementType::F32,
+                    output,
+                    0,
+                    output_type,
+                    regions,
+                    launch.params.token_count,
+                    launch.params.hidden_size,
+                );
+            } else {
+                dispatch_embedding(
+                    &pipelines,
+                    compute,
+                    launch.format,
+                    &regions[launch.table_region],
+                    &regions[launch.tokens_region],
+                    output,
+                    launch.params,
+                    output_type,
+                );
+            }
         }
         Ok(())
     })
@@ -833,13 +934,28 @@ fn embedding_weight_format(
     weight: &super::weights::MetalResolvedWeight,
     vocabulary_size: u64,
     hidden_size: u64,
-) -> Result<EmbeddingPhysicalFormat, String> {
+) -> Result<(EmbeddingPhysicalFormat, usize, Option<HadamardTransform>), String> {
     if weight.logical_element_type() != ElementType::F16
         || weight.logical_dimensions() != [vocabulary_size, hidden_size]
     {
         return Err("Metal embedding logical weight differs from its contract".to_owned());
     }
-    let (component, format) = match weight.layout() {
+    let (layout, transform) = match weight.layout() {
+        MetalResolvedWeightLayout::Hadamard { values, transform } => {
+            if !transform.inverse {
+                return Err("Metal embedding requires an inverse Hadamard transform".to_owned());
+            }
+            validate_hadamard_transform(
+                *transform,
+                hidden_size,
+                weight.components(),
+                weight.regions(),
+            )?;
+            (values.as_ref(), Some(*transform))
+        }
+        layout => (layout, None),
+    };
+    let (component, format) = match layout {
         MetalResolvedWeightLayout::Dense { component }
         | MetalResolvedWeightLayout::Stored { component } => {
             let component = *component;
@@ -874,6 +990,7 @@ fn embedding_weight_format(
                 (Q4_K_FORMAT_ID, 256, 144) => (EmbeddingPhysicalFormat::Q4K, 256),
                 (Q6_K_FORMAT_ID, 256, 210) => (EmbeddingPhysicalFormat::Q6K, 256),
                 (Q8_0_FORMAT_ID, 32, 34) => (EmbeddingPhysicalFormat::Q8_0, 32),
+                (PQ2_0_FORMAT_ID, 128, 34) => (EmbeddingPhysicalFormat::Pq2_0, 128),
                 _ => {
                     return Err(
                         "Metal embedding does not support this quantized block ABI".to_owned()
@@ -896,10 +1013,16 @@ fn embedding_weight_format(
         }
         _ => return Err("Metal token embedding does not support this physical layout".to_owned()),
     };
-    if component != 0 || weight.regions().len() != 1 {
-        return Err("Metal token embedding requires one canonical table component".to_owned());
+    let signs = transform.and_then(|transform| transform.signs_region);
+    if component >= weight.regions().len()
+        || signs == Some(component)
+        || weight.regions().len() != 1 + usize::from(signs.is_some())
+    {
+        return Err(
+            "Metal token embedding requires one table and its declared transform signs".to_owned(),
+        );
     }
-    Ok(format)
+    Ok((format, component, transform))
 }
 
 fn validate_embedding_signature(
@@ -1519,21 +1642,48 @@ fn dispatch_embedding(
     params: EmbeddingParams,
     output_type: ElementType,
 ) {
+    dispatch_embedding_at(
+        pipelines,
+        encoder,
+        format,
+        table,
+        token_ids,
+        output,
+        0,
+        params,
+        output_type,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_embedding_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    format: EmbeddingPhysicalFormat,
+    table: &MetalBufferRegion,
+    token_ids: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    params: EmbeddingParams,
+    output_type: ElementType,
+) {
     let pipeline = match (format, output_type) {
         (EmbeddingPhysicalFormat::DenseF16, ElementType::F16) => &pipelines.embedding_dense,
         (EmbeddingPhysicalFormat::Q4K, ElementType::F16) => &pipelines.embedding_q4_k,
         (EmbeddingPhysicalFormat::Q6K, ElementType::F16) => &pipelines.embedding_q6_k,
         (EmbeddingPhysicalFormat::Q8_0, ElementType::F16) => &pipelines.embedding_q8_0,
+        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F16) => &pipelines.embedding_pq2_0,
         (EmbeddingPhysicalFormat::DenseF16, ElementType::F32) => &pipelines.embedding_dense_f32,
         (EmbeddingPhysicalFormat::Q4K, ElementType::F32) => &pipelines.embedding_q4_k_f32,
         (EmbeddingPhysicalFormat::Q6K, ElementType::F32) => &pipelines.embedding_q6_k_f32,
         (EmbeddingPhysicalFormat::Q8_0, ElementType::F32) => &pipelines.embedding_q8_0_f32,
+        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F32) => &pipelines.embedding_pq2_0_f32,
         (_, other) => panic!("unsupported Metal embedding output type {other:?}"),
     };
     encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, table);
     set_region(encoder, 1, token_ids);
-    set_region(encoder, 2, output);
+    set_region_offset(encoder, 2, output, output_offset_bytes);
     encoder.set_bytes(
         3,
         std::mem::size_of::<EmbeddingParams>() as u64,
@@ -1839,6 +1989,97 @@ mod tests {
     #[test]
     fn token_embedding_capability_includes_q4_k() {
         assert!(TOKEN_EMBEDDING_QUANTIZATION_FORMATS.contains(&Q4_K_FORMAT_ID));
+    }
+
+    #[test]
+    fn pq2_0_token_embedding_preserves_codes_blocks_and_f32_range_on_real_metal() {
+        let device = Device::system_default().expect("PQ2_0 embedding conformance requires Metal");
+        let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let format = GgufBlockFormat::Pq2_0;
+        assert!(TOKEN_EMBEDDING_QUANTIZATION_FORMATS.contains(&format.format_id()));
+        let vocabulary = 3;
+        let blocks_per_row = 3;
+        let hidden = blocks_per_row * format.block_values();
+        let mut bytes = vec![0_u8; vocabulary * blocks_per_row * format.block_bytes()];
+        for (index, block) in bytes.chunks_exact_mut(format.block_bytes()).enumerate() {
+            let scale = [0.125, -0.21875, f16::MAX.to_f32()][index % 3];
+            block[..2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+            for (position, packed) in block[2..].iter_mut().enumerate() {
+                // Every block contains all four codes; rotate their positions
+                // by row and byte so token and lane permutations are visible.
+                *packed = (0..4).fold(0, |value, lane| {
+                    value | (((index + position + lane) % 4) as u8) << (2 * lane)
+                });
+            }
+        }
+        let mut decoded = vec![0.0; vocabulary * hidden];
+        format.decode(&bytes, &mut decoded).unwrap();
+        assert!(decoded.iter().any(|value| *value > f16::MAX.to_f32()));
+        let tokens = [2_u32, 0, u32::MAX, 1, 2];
+        let count = tokens.len() * hidden;
+        let table = shared_buffer(&device, &bytes);
+        let token_buffer = shared_buffer(&device, &tokens);
+        let guard = -123.0_f32;
+        let output_f16 = shared_buffer(&device, &vec![f16::from_f32(guard); count + 17]);
+        let output_f32 = shared_buffer(&device, &vec![guard; count + 17]);
+        let params = EmbeddingParams {
+            token_count: tokens.len() as u32,
+            hidden_size: hidden as u32,
+            vocabulary_size: vocabulary as u32,
+        };
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        dispatch_raw_embedding(
+            &pipelines,
+            encoder,
+            EmbeddingPhysicalFormat::Pq2_0,
+            &table,
+            &token_buffer,
+            &output_f16,
+            params,
+        );
+        dispatch_raw_embedding_f32(
+            &pipelines,
+            encoder,
+            EmbeddingPhysicalFormat::Pq2_0,
+            &table,
+            &token_buffer,
+            &output_f32,
+            params,
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        let f16_values = read_f16(&output_f16, count + 17);
+        let f32_values = read_f32(&output_f32, count + 17);
+        for index in 0..count + 17 {
+            let expected = if index >= count {
+                guard
+            } else {
+                let token = tokens[index / hidden] as usize;
+                if token >= vocabulary {
+                    0.0
+                } else {
+                    decoded[token * hidden + index % hidden]
+                }
+            };
+            assert_eq!(f32_values[index], expected, "F32 embedding[{index}]");
+            assert_eq!(
+                f16_values[index],
+                f16::from_f32(expected).to_f32(),
+                "F16 embedding[{index}]"
+            );
+        }
+        // SAFETY: Shared inputs are still alive and the command has completed.
+        let table_after =
+            unsafe { std::slice::from_raw_parts(table.contents().cast::<u8>(), bytes.len()) };
+        let tokens_after = unsafe {
+            std::slice::from_raw_parts(token_buffer.contents().cast::<u32>(), tokens.len())
+        };
+        assert_eq!(table_after, bytes);
+        assert_eq!(tokens_after, tokens);
     }
 
     #[test]
@@ -2369,6 +2610,7 @@ mod tests {
             EmbeddingPhysicalFormat::Q4K => &pipelines.embedding_q4_k,
             EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k,
             EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0,
+            EmbeddingPhysicalFormat::Pq2_0 => &pipelines.embedding_pq2_0,
         });
         set_raw(encoder, 0, table);
         set_raw(encoder, 1, token_ids);
@@ -2402,6 +2644,7 @@ mod tests {
             EmbeddingPhysicalFormat::Q4K => &pipelines.embedding_q4_k_f32,
             EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k_f32,
             EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0_f32,
+            EmbeddingPhysicalFormat::Pq2_0 => &pipelines.embedding_pq2_0_f32,
         });
         set_raw(encoder, 0, table);
         set_raw(encoder, 1, token_ids);

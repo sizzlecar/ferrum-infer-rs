@@ -3,12 +3,16 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError, WeightComponentPayload,
-    WeightComponentSource, WeightComponentSpec, WeightEncoding,
+    WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding, WeightSchema,
 };
 use ferrum_types::{FerrumError, Result};
 
-use super::{GgmlDType, GgufFile, NativeGgufFile};
+use super::{GgmlDType, GgufFile, GgufHadamard, NativeGgufFile};
 use crate::safetensors_archive::transcode_dense_bytes;
+
+mod hadamard;
+use hadamard::HadamardRegistry;
+pub use hadamard::{hadamard_sign_component, hadamard_transform_spec};
 
 /// Schema-addressed, mmap-backed GGUF source for vNext static weights.
 /// Fixed-block payloads borrow the immutable file mapping without
@@ -18,10 +22,39 @@ use crate::safetensors_archive::transcode_dense_bytes;
 pub struct GgufWeightComponentSource {
     file: Arc<NativeGgufFile>,
     source_file: String,
+    hadamard_registry: HadamardRegistry,
 }
 
 impl GgufWeightComponentSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let source = Self::open_descriptor(path)?;
+        if source.file.hadamard().is_some() {
+            return Err(FerrumError::model(
+                super::hadamard::unsupported_execution().to_string(),
+            ));
+        }
+        Ok(source)
+    }
+
+    /// Admit source transforms only after exact binding to all corresponding
+    /// per-projection layout declarations. Ordinary `open` stays fail-closed.
+    pub fn open_with_schema(
+        path: impl AsRef<Path>,
+        schema: &WeightSchema,
+        expected_hadamard: Option<&GgufHadamard>,
+    ) -> Result<Self> {
+        let mut source = Self::open_descriptor(path)?;
+        if source.file.hadamard() != expected_hadamard {
+            return Err(FerrumError::model(
+                "GGUF transform metadata/sign values differ from the bound family identity",
+            ));
+        }
+        source.hadamard_registry = HadamardRegistry::bind(&source.file, schema)
+            .map_err(|error| FerrumError::model(error.to_string()))?;
+        Ok(source)
+    }
+
+    fn open_descriptor(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let source_file = path
             .file_name()
@@ -43,6 +76,7 @@ impl GgufWeightComponentSource {
         Ok(Self {
             file: Arc::new(file),
             source_file,
+            hadamard_registry: HadamardRegistry::default(),
         })
     }
 
@@ -60,6 +94,34 @@ impl WeightComponentSource for GgufWeightComponentSource {
         &'source self,
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        if component.role == WeightComponentRole::TransformSigns
+            || self
+                .hadamard_registry
+                .components
+                .contains_key(&component.id)
+        {
+            let (expected, bytes) = self
+                .hadamard_registry
+                .components
+                .get(&component.id)
+                .ok_or_else(|| {
+                    invalid_component(component, "sign component is not in the source registry")
+                })?;
+            if expected != component {
+                return Err(invalid_component(
+                    component,
+                    "sign component differs from its registered source recipe",
+                ));
+            }
+            return WeightComponentPayload::new(
+                component,
+                expected.external_names[0].clone(),
+                self.source_file.clone(),
+                expected.dimensions.clone(),
+                ElementType::F32,
+                bytes.as_slice(),
+            );
+        }
         let [external_name] = component.external_names.as_slice() else {
             return Err(invalid_component(
                 component,

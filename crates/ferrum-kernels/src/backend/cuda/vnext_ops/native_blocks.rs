@@ -8,6 +8,7 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
+pub(super) mod hadamard;
 pub(super) mod weights;
 
 // Must match the bounded row tile instantiated by vnext_gguf_linear_tiled_*.
@@ -19,6 +20,9 @@ pub(super) struct CudaNativeBlockKernels {
     pub linear_f32: CudaFunction,
     linear_tiled_f16: CudaFunction,
     linear_tiled_f32: CudaFunction,
+    linear_f32_f16: CudaFunction,
+    linear_tiled_f32_f16: CudaFunction,
+    hadamard: hadamard::CudaHadamardKernels,
     pub embedding_f16: CudaFunction,
     pub embedding_f32: CudaFunction,
     #[cfg(test)]
@@ -26,6 +30,102 @@ pub(super) struct CudaNativeBlockKernels {
 }
 
 impl CudaNativeBlockKernels {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn transformed_linear(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        weight: u64,
+        output: u64,
+        part: &weights::MatrixPart,
+        rows: u32,
+        output_stride: u32,
+        activation: ferrum_interfaces::vnext::ElementType,
+        signs: u64,
+        scratch: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        use ferrum_interfaces::vnext::{ElementType, HadamardApplication};
+        let (input, input_type) = if let Some(spec) = &part.transform {
+            if !matches!(spec.application, HadamardApplication::BeforeMatmul { .. }) || scratch == 0
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "native linear requires a forward transform and planned F32 scratch",
+                ));
+            }
+            self.hadamard.launch(
+                stream,
+                input,
+                scratch,
+                signs,
+                rows,
+                part.columns,
+                activation,
+                ElementType::F32,
+                spec,
+            )?;
+            (scratch, ElementType::F32)
+        } else {
+            (input, activation)
+        };
+        self.linear_with_precision(
+            stream,
+            input,
+            weight,
+            output,
+            part,
+            rows,
+            output_stride,
+            input_type,
+            activation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn transformed_embedding(
+        &self,
+        stream: &CudaStream,
+        tokens: u64,
+        weight: u64,
+        output: u64,
+        part: &weights::MatrixPart,
+        count: u32,
+        activation: ferrum_interfaces::vnext::ElementType,
+        signs: u64,
+        scratch: u64,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        use ferrum_interfaces::vnext::{ElementType, HadamardApplication};
+        if let Some(spec) = &part.transform {
+            if !matches!(spec.application, HadamardApplication::AfterEmbeddingLookup)
+                || scratch == 0
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "native embedding requires an inverse transform and planned F32 scratch",
+                ));
+            }
+            self.embedding(
+                stream,
+                tokens,
+                weight,
+                scratch,
+                part,
+                count,
+                ElementType::F32,
+            )?;
+            self.hadamard.launch(
+                stream,
+                scratch,
+                output,
+                signs,
+                count,
+                part.columns,
+                ElementType::F32,
+                activation,
+                spec,
+            )
+        } else {
+            self.embedding(stream, tokens, weight, output, part, count, activation)
+        }
+    }
     pub(super) fn load(context: &Arc<CudaContext>) -> Result<Self, CudaDeviceRuntimeError> {
         let module = context
             .load_module(Ptx::from_src(crate::ptx::VNEXT_GGUF.to_owned()))
@@ -40,6 +140,9 @@ impl CudaNativeBlockKernels {
             linear_f32: load("vnext_gguf_linear_f32")?,
             linear_tiled_f16: load("vnext_gguf_linear_tiled_f16")?,
             linear_tiled_f32: load("vnext_gguf_linear_tiled_f32")?,
+            linear_f32_f16: load("vnext_gguf_linear_f32_f16")?,
+            linear_tiled_f32_f16: load("vnext_gguf_linear_tiled_f32_f16")?,
+            hadamard: hadamard::CudaHadamardKernels::load(&module)?,
             embedding_f16: load("vnext_gguf_embedding_f16")?,
             embedding_f32: load("vnext_gguf_embedding_f32")?,
             #[cfg(test)]
@@ -93,6 +196,32 @@ impl CudaNativeBlockKernels {
         output_stride: u32,
         activation: ferrum_interfaces::vnext::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        self.linear_with_precision(
+            stream,
+            input,
+            weight,
+            output,
+            part,
+            rows,
+            output_stride,
+            activation,
+            activation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn linear_with_precision(
+        &self,
+        stream: &CudaStream,
+        input: u64,
+        weight: u64,
+        output: u64,
+        part: &weights::MatrixPart,
+        rows: u32,
+        output_stride: u32,
+        input_type: ferrum_interfaces::vnext::ElementType,
+        output_type: ferrum_interfaces::vnext::ElementType,
+    ) -> Result<(), CudaDeviceRuntimeError> {
         use ferrum_interfaces::vnext::ElementType;
         if rows == 0
             || rows > u16::MAX as u32
@@ -106,11 +235,13 @@ impl CudaNativeBlockKernels {
             ));
         }
         let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
-        let kernel = match (activation, row_tile > 1) {
-            (ElementType::F16, false) => &self.linear_f16,
-            (ElementType::F32, false) => &self.linear_f32,
-            (ElementType::F16, true) => &self.linear_tiled_f16,
-            (ElementType::F32, true) => &self.linear_tiled_f32,
+        let kernel = match (input_type, output_type, row_tile > 1) {
+            (ElementType::F16, ElementType::F16, false) => &self.linear_f16,
+            (ElementType::F32, ElementType::F32, false) => &self.linear_f32,
+            (ElementType::F16, ElementType::F16, true) => &self.linear_tiled_f16,
+            (ElementType::F32, ElementType::F32, true) => &self.linear_tiled_f32,
+            (ElementType::F32, ElementType::F16, false) => &self.linear_f32_f16,
+            (ElementType::F32, ElementType::F16, true) => &self.linear_tiled_f32_f16,
             _ => {
                 return Err(CudaDeviceRuntimeError::contract(
                     "CUDA native linear activation dtype is unsupported",

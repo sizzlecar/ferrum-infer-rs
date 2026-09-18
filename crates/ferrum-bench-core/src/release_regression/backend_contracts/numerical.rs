@@ -61,7 +61,40 @@ fn names(backend: Backend) -> Vec<String> {
         ],
         Backend::Metal => &[
             ("native_blocks::tests", &["native_block_decoding_matches_cpu_on_real_metal"]),
-            ("linear::native_tests", &["native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal"]),
+            ("hadamard::tests", &[
+                "hadamard_1024_selection_requires_exact_simd_threads_and_shared_capacity",
+                "hadamard_1024_production_selection_and_generic_fallback_preserve_transforms",
+                "hadamard_1024_shuffle_preserves_generic_f32_order_special_values_and_signed_zero",
+                "hadamard_forward_preserves_full_width_signs_blocks_and_input_precision_on_metal",
+                "hadamard_grouped_permutation_precedes_signs_across_blocks_on_metal",
+                "hadamard_inverse_keeps_wide_embedding_values_f32_until_final_store_on_metal",
+            ]),
+            ("linear::hadamard_tests", &[
+                "hadamard_pq2_projection_keeps_f32_transform_through_dot_and_plain_siblings_on_metal",
+            ]),
+            ("linear::pq2_tests", &[
+                "pq2_wide_gemv_preserves_f32_input_codes_blocks_offsets_and_output_tails",
+            ]),
+            ("linear::pq2_decode_tests", &[
+                "pq2_float_floor_decoding_preserves_reference_tails_codes_and_f32_ranges",
+            ]),
+            ("linear::pq2_prefill_tests", &[
+                "pq2_mixed_prefill_specialization_preserves_f32_operands_tiles_and_guards_on_metal",
+                "pq2_mixed_prefill_m64_preserves_f32_operands_tiles_and_guards_on_metal",
+                "pq2_mixed_prefill_m64_selection_requires_aligned_rows_wide_output_and_capability",
+                "pq2_hadamard_prefill_selection_preserves_format_dtype_and_shape_boundaries",
+                "pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output",
+            ]),
+            ("linear::narrow_dense_tests", &[
+                "narrow_dense_gemv_preserves_arbitrary_k_output_tails_and_offsets",
+                "narrow_dense_gemv_preserves_cancellation_subnormals_and_half_rounding",
+                "narrow_dense_threadgroup_requires_exact_simd_and_device_capacity",
+                "narrow_dense_production_dispatch_preserves_bounds_and_capability_fallback",
+            ]),
+            ("linear::native_tests", &[
+                "native_block_linears_preserve_rows_offsets_strides_and_precision_on_real_metal",
+                "pq2_0_linears_preserve_blocks_precision_and_production_dispatch_on_real_metal",
+            ]),
             ("linear::tests", &[
                 "native_linear_formats_match_cpu_oracles_on_real_metal",
                 "native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal",
@@ -73,6 +106,7 @@ fn names(backend: Backend) -> Vec<String> {
             ("primitives::tests", &[
                 "q4_k_token_embedding_matches_cpu_for_f16_and_f32_on_real_metal",
                 "q6_k_and_q8_token_embeddings_preserve_float_boundaries_on_real_metal",
+                "pq2_0_token_embedding_preserves_codes_blocks_and_f32_range_on_real_metal",
                 "f32_master_primitives_preserve_precision_and_residual_aliasing_on_real_metal",
                 "native_f16_primitives_match_cpu_references_on_real_metal",
             ]),
@@ -107,6 +141,11 @@ fn names(backend: Backend) -> Vec<String> {
             ]),
         ],
         Backend::Cuda => &[
+            ("native_blocks::hadamard::tests", &[
+                "hadamard_forward_and_inverse_match_independent_walsh_on_cuda",
+                "hadamard_pq2_embedding_preserves_f32_until_inverse_on_cuda",
+                "hadamard_pq2_projection_mixes_transformed_and_plain_inputs_on_cuda",
+            ]),
             ("native_blocks::tests", &[
                 "native_block_decoding_matches_shared_ggml_oracle_on_cuda",
                 "native_block_embeddings_preserve_f16_and_f32_activations_on_cuda",

@@ -3,7 +3,8 @@ use super::{
     DynamicBackingPoolSpec, DynamicResourceDemand, DynamicResourceDescriptor,
     DynamicStorageProfile, ElementType, InvocationLivenessMode, InvocationResourceLiveness, NodeId,
     PlanNode, ProgramValueId, ProviderId, ProviderResourcePlan, RejectedProvider,
-    ResolvedTensorSpec, ResolvedValueStorage, ResourceId, StateId, StateInitialization, VNextError,
+    ResolvedTensorSpec, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, StateId,
+    StateInitialization, VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +12,7 @@ pub(super) struct CanonicalValueBinding {
     pub(super) tensor: ResolvedTensorSpec,
     pub(super) usage: BufferUsage,
     pub(super) storage: ResolvedValueStorage,
+    pub(super) readonly_weight: Option<ResolvedWeightBinding>,
 }
 
 pub(super) struct GlobalValueRange {

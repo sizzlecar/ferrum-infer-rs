@@ -9,18 +9,22 @@ use cudarc::nvrtc::Ptx;
 #[cfg(feature = "vllm-marlin")]
 use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
-    AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicStorageRequirement,
+    AttributeId, BatchedOperationInvocation, CapabilityId, CheckpointBoundaryConstraint,
+    CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
+    ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
     GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
     GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationContract, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
-    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
-    WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase,
+    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderCheckpointStateLayout,
+    ProviderCheckpointStatePort, ProviderId, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
+    ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
+    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -147,6 +151,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
+            include_bytes!("../native_blocks/hadamard.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::LINEAR_ATTENTION.as_bytes(),
@@ -171,6 +176,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
+            include_bytes!("../native_blocks/hadamard.rs"),
             precision.estimator().as_bytes(),
         ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
@@ -253,6 +259,39 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             estimator_fingerprint,
         )
         .map_err(contract_error)?;
+
+        // Both durable state tensors are completely committed before the
+        // command completion fence. All projection/Hadamard storage is scratch
+        // overwritten by the next invocation, including one-token boundaries.
+        let storage = DynamicStorageProfile::new(
+            DynamicStorageAllocator::LinearArena,
+            DynamicStorageView::Contiguous,
+        )
+        .map_err(contract_error)?;
+        let checkpoint = ProviderCheckpointContract::new(
+            CheckpointInputDependency::ExactTokenPrefix,
+            CheckpointBoundaryConstraint::any_positive(),
+            CheckpointPartitionNumerics::CapturedExecutionContinuation,
+        )
+        .with_completed_input_capture(CheckpointCompletedInputCapture::Supported)
+        .with_state_ports(vec![
+            ProviderCheckpointStatePort::new(
+                ResolvedValueRole::Input,
+                8,
+                storage,
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue,
+            ),
+            ProviderCheckpointStatePort::new(
+                ResolvedValueRole::Input,
+                9,
+                storage,
+                ProviderCheckpointStateLayout::ContiguousBoundaryValue,
+            ),
+        ])
+        .map_err(contract_error)?;
+        let descriptor = descriptor.with_checkpoint_capability(
+            ProviderCheckpointCapability::CompletedBoundary(checkpoint),
+        );
 
         let rms_module = runtime
             .context()
@@ -758,7 +797,9 @@ struct CudaAttentionShape {
 #[derive(Debug, Clone, Copy)]
 enum AttentionProjection {
     F16,
-    Native,
+    Native {
+        transform_bytes_per_token: u64,
+    },
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
@@ -776,7 +817,10 @@ impl AttentionProjection {
         #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
         if native_projection::uses_native(values)? {
-            return Ok(Self::Native);
+            return Ok(Self::Native {
+                transform_bytes_per_token:
+                    super::super::native_blocks::hadamard::workspace_bytes_per_token(values)?,
+            });
         }
         #[cfg(not(feature = "vllm-marlin"))]
         {
@@ -844,7 +888,7 @@ impl AttentionProjection {
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 | Self::Native => Ok(0),
+            Self::F16 | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime, .. } => runtime.workspace_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -867,7 +911,10 @@ impl AttentionProjection {
             | Self::MarlinFp8 {
                 segmented: true, ..
             } => segmented_projection_staging_bytes_per_token(qkvzba_features),
-            Self::F16 | Self::Native => Ok(0),
+            Self::F16 => Ok(0),
+            Self::Native {
+                transform_bytes_per_token,
+            } => Ok(transform_bytes_per_token),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -878,7 +925,7 @@ impl AttentionProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
-            Self::Native => "native-compressed",
+            Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -1196,7 +1243,9 @@ impl SharedProjectionWeight {
     fn dispatch_count(&self, rows: u64) -> Result<u64, String> {
         match *self {
             Self::F16 { .. } => Ok(1),
-            Self::Native { ref parts, .. } => native_projection::dispatch_count(parts.len(), rows),
+            Self::Native { ref parts, .. } => {
+                native_projection::dispatch_count(weights::dispatches(parts) as usize, rows)
+            }
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => Ok(1),
             #[cfg(feature = "vllm-marlin")]
@@ -1256,19 +1305,7 @@ impl SharedProjectionWeight {
             Self::Native {
                 first_region,
                 ref parts,
-            } => {
-                replay_key = replay_key.u64(first_region as u64).u64(parts.len() as u64);
-                for part in parts.iter() {
-                    replay_key = replay_key
-                        .u32(part.rows)
-                        .u32(part.columns)
-                        .u32(part.output_offset);
-                    for parameter in part.format.parameters() {
-                        replay_key = replay_key.u32(parameter);
-                    }
-                }
-                replay_key
-            }
+            } => weights::key(replay_key.u64(first_region as u64), parts),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { group_size, .. } => replay_key.i32(group_size),
             #[cfg(feature = "vllm-marlin")]
@@ -2171,12 +2208,17 @@ fn launch_attention_projection(
             stream,
             native,
             parts,
-            &regions[first_region..first_region + parts.len()],
+            &regions[first_region..first_region + weights::region_count(parts)],
             input,
             output,
             rows,
             output_features,
             input_features,
+            layout
+                .projection_staging
+                .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                .transpose()?
+                .unwrap_or(0),
         ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
             blas,

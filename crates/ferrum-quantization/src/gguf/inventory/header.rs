@@ -8,6 +8,8 @@ use std::io::{Read, Seek, SeekFrom};
 use candle_core::quantized::gguf_file::Value;
 use candle_core::{Error, Result};
 
+use super::super::hadamard;
+
 pub(super) struct Header {
     pub metadata: BTreeMap<String, Value>,
     pub tensors: Vec<TensorHeader>,
@@ -61,7 +63,12 @@ impl Header {
                 return Err(invalid("duplicate metadata key"));
             }
             let kind = reader.u32()?;
-            if matches!(
+            if hadamard::declares_transform(&key) {
+                if !hadamard::is_metadata_key(&key) {
+                    return Err(invalid("unknown prism.hadamard metadata field"));
+                }
+                metadata.insert(key, reader.transform_value(kind)?);
+            } else if matches!(
                 key.as_str(),
                 "general.architecture"
                     | "general.alignment"
@@ -72,6 +79,7 @@ impl Header {
                     | "split.count"
                     | "split.tensors.count"
             ) || base_model_repository_index(&key).is_some()
+                || hadamard::is_geometry_key(&key)
             {
                 metadata.insert(key, reader.scalar(kind)?);
             } else {
@@ -195,6 +203,44 @@ impl<R: Read + Seek> Reader<'_, R> {
             12 => Value::F64(f64::from_le_bytes(self.bytes()?)),
             _ => return Err(invalid("selected metadata must be a known scalar")),
         })
+    }
+
+    fn transform_value(&mut self, kind: u32) -> Result<Value> {
+        if kind != 9 {
+            return self.scalar(kind);
+        }
+        let element_type = self.u32()?;
+        let count = self.length()?;
+        // Only flat int32/sign and string/name arrays are part of version 1.
+        // Bound allocation before retaining untrusted metadata; tokenizer
+        // arrays continue to be skipped without allocation.
+        let minimum_bytes = match element_type {
+            5 => 4,
+            8 => {
+                if self.version == 1 {
+                    4
+                } else {
+                    8
+                }
+            }
+            _ => return Err(invalid("Hadamard arrays must contain int32 or strings")),
+        };
+        if count > self.remaining()? / minimum_bytes || count > 1024 * 1024 {
+            return Err(invalid(
+                "Hadamard array is truncated or exceeds the retained entry budget",
+            ));
+        }
+        let start = self.input.stream_position()?;
+        let mut values = Vec::new();
+        for _ in 0..count {
+            values.push(self.scalar(element_type)?);
+            if self.input.stream_position()? - start > 16 * 1024 * 1024 {
+                return Err(invalid(
+                    "Hadamard array exceeds the 16 MiB retained byte budget",
+                ));
+            }
+        }
+        Ok(Value::Array(values))
     }
 
     fn skip(&mut self, count: u64) -> Result<()> {

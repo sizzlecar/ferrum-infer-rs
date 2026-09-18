@@ -62,10 +62,57 @@ pub(crate) fn bind(
         tool_result_format,
         ..Evidence::default()
     };
-    if let Err(error) = bind_inner(public, records, raw_dir, &mut evidence) {
+    if let Err(error) = bind_inner(public, records, raw_dir, &mut evidence, None) {
         evidence.unproven.push(format!("{error:#}"));
     }
     evidence
+}
+
+pub(crate) fn bind_continuation(
+    public: &orchestral_evidence::Evidence,
+    records: &[&RequestRecord],
+    raw_dir: &Path,
+    format: OrchestralToolResultFormat,
+    expected_history: &[Value],
+) -> Evidence {
+    let mut evidence = Evidence {
+        tool_result_format: format,
+        ..Evidence::default()
+    };
+    if let Err(error) = bind_inner(
+        public,
+        records,
+        raw_dir,
+        &mut evidence,
+        Some(expected_history),
+    ) {
+        evidence.unproven.push(format!("{error:#}"));
+    }
+    evidence
+}
+
+/// The caller first authenticates this terminal against the complete fresh Run.
+pub(crate) fn continuation_history(
+    record: &RequestRecord,
+    raw_dir: &Path,
+    followup: &str,
+) -> Result<Vec<Value>> {
+    let response = read_sse(&raw_dir.join(format!(
+        "{}-{}.response.sse",
+        record.task_id, record.request_index
+    )))?;
+    ensure!(
+        response.finish == "stop" && response.calls.is_empty(),
+        "prior terminal is not a plain stop"
+    );
+    let mut messages = normalize_history(&record.messages)?;
+    let mut assistant = json!({"role":"assistant", "content":response.text});
+    if let Some(reasoning) = response.reasoning {
+        assistant["reasoning_content"] = json!(reasoning);
+    }
+    messages.push(assistant);
+    messages.push(json!({"role":"user", "content":followup}));
+    Ok(messages)
 }
 
 fn bind_inner(
@@ -73,6 +120,7 @@ fn bind_inner(
     records: &[&RequestRecord],
     raw_dir: &Path,
     evidence: &mut Evidence,
+    continuation: Option<&[Value]>,
 ) -> Result<()> {
     ensure!(
         public.complete(),
@@ -130,10 +178,17 @@ fn bind_inner(
         last == &json!({"role":"user", "content":input}),
         "initial wire user differs from public input"
     );
-    ensure!(
-        leading.iter().all(|message| message["role"] == "system"),
-        "initial history is not a fresh headless Run"
-    );
+    if let Some(expected) = continuation {
+        ensure!(
+            first.history == expected,
+            "resumed wire history differs from the exact prior terminal plus followup"
+        );
+    } else {
+        ensure!(
+            leading.iter().all(|message| message["role"] == "system"),
+            "initial history is not a fresh headless Run"
+        );
+    }
     let mut expected = first.history.clone();
     let mut seen_requests = BTreeSet::new();
     let mut model_ids = BTreeSet::new();
@@ -420,7 +475,7 @@ mod tool_text_parts;
 
 #[path = "orchestral_wire/audit.rs"]
 mod audit;
-pub(crate) use audit::audit_saved;
+pub(crate) use audit::{audit_saved, load_records};
 
 fn canonical_id(model_request_id: &str, native_id: &str) -> Result<String> {
     Ok(format!(
@@ -641,6 +696,67 @@ mod tests {
         dir: tempfile::TempDir,
         public: orchestral_evidence::Evidence,
         records: Vec<RequestRecord>,
+    }
+
+    #[test]
+    fn continuation_binds_complete_prior_tool_history_and_new_terminal_without_weakening_fresh_run()
+    {
+        let mut fixture = Fixture::new();
+        assert!(fixture.bind().complete());
+        let old = fixture.records.last().unwrap();
+        let expected = continuation_history(old, fixture.dir.path(), "Repair code").unwrap();
+        let mut raw_history = old.messages.clone();
+        raw_history.push(json!({"role":"assistant","content":"Changed and checked."}));
+        raw_history.push(json!({"role":"user","content":"Repair code"}));
+        let current = record(3, raw_history, "stop");
+        write_frames(
+            fixture.dir.path(),
+            3,
+            &[
+                json!({"id":"resumed-response","choices":[{"index":0,"delta":{"content":"Changed and checked."},"finish_reason":"stop"}]}),
+            ],
+        );
+        fixture.public.tool_exchanges.clear();
+        let bind_current = |records: &[&RequestRecord]| {
+            bind_continuation(
+                &fixture.public,
+                records,
+                fixture.dir.path(),
+                OrchestralToolResultFormat::Json,
+                &expected,
+            )
+        };
+        assert!(bind_current(&[&current]).complete());
+        assert!(!bind(
+            &fixture.public,
+            &[&current],
+            fixture.dir.path(),
+            OrchestralToolResultFormat::Json
+        )
+        .complete());
+        for index in [
+            0,
+            1,
+            2,
+            3,
+            current.messages.len() - 2,
+            current.messages.len() - 1,
+        ] {
+            let mut changed = current.clone();
+            changed.messages.remove(index);
+            assert!(
+                !bind_current(&[&changed]).complete(),
+                "accepted removed history message {index}"
+            );
+        }
+        let mut changed = current.clone();
+        changed.messages[2]["tool_calls"][0]["function"]["arguments"] =
+            json!("{\"path\":\"other\"}");
+        assert!(!bind_current(&[&changed]).complete());
+        let mut changed = current.clone();
+        changed.messages[3]["content"] = json!("invented result");
+        assert!(!bind_current(&[&changed]).complete());
+        assert!(!bind_current(&[&current, &current]).complete());
     }
 
     impl Fixture {

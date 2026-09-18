@@ -167,7 +167,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         });
     }
     Err(FerrumError::unsupported(format!(
-        "no declared numerical profile satisfies {:?} with KV dtype {}: {}; select --kv-dtype fp16 for the existing storage path",
+        "no declared numerical profile satisfies {:?} with KV dtype {}: {}",
         engine.numerical_execution,
         engine.kv_cache.dtype.as_str(),
         rejected

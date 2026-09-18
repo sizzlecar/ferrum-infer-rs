@@ -26,6 +26,7 @@
 //!      (`general.architecture`, `<arch>.block_count`, …) in one place.
 
 pub mod file;
+pub mod hadamard;
 pub mod inventory;
 pub mod linear;
 pub mod loader;
@@ -34,6 +35,10 @@ pub mod native;
 pub mod source;
 
 pub use file::GgufFile;
+pub use hadamard::{
+    GgufHadamard, GgufHadamardDirection, GgufHadamardGdnPermutation, GgufHadamardSigns,
+    GgufHadamardWeight,
+};
 pub use inventory::{GgufInventory, GgufModelMetadata, GgufTensorInventory};
 pub use linear::{linear_from_qtensor, GgufLinear};
 pub use loader::GgufLoader;

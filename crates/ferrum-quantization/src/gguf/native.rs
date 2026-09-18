@@ -12,6 +12,7 @@ use ferrum_interfaces::vnext::{BlockQuantizationSpec, ElementType, WeightEncodin
 use memmap2::Mmap;
 
 use super::inventory::{block_abi, GgufInventory};
+use super::GgufHadamard;
 
 #[derive(Debug, Clone)]
 pub struct NativeGgufTensor {
@@ -55,6 +56,7 @@ pub struct NativeGgufFile {
     mmap: Mmap,
     architecture: String,
     quantization_version: Option<u64>,
+    hadamard: Option<GgufHadamard>,
     tensors: BTreeMap<String, NativeGgufTensor>,
 }
 
@@ -96,6 +98,7 @@ impl NativeGgufFile {
             mmap,
             architecture: inventory.architecture,
             quantization_version: inventory.quantization_version,
+            hadamard: inventory.hadamard,
             tensors,
         })
     }
@@ -105,6 +108,9 @@ impl NativeGgufFile {
     }
     pub fn quantization_version(&self) -> Option<u64> {
         self.quantization_version
+    }
+    pub fn hadamard(&self) -> Option<&GgufHadamard> {
+        self.hadamard.as_ref()
     }
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()

@@ -2,7 +2,8 @@
 use super::GgufBlockFormat;
 use half::f16;
 
-pub(crate) const FORMATS: [GgufBlockFormat; 8] = [
+pub(crate) const FORMATS: [GgufBlockFormat; 9] = [
+    GgufBlockFormat::Pq2_0,
     GgufBlockFormat::Q3K,
     GgufBlockFormat::Q4K,
     GgufBlockFormat::Q5K,

@@ -23,6 +23,11 @@ static inline float native_half(device const uchar * b, uint offset) {
     return float(as_type<half>(bits));
 }
 
+// The typed block ABI admits 32, 128, or 256 values per block.
+static inline uint native_block_shift(uint values) {
+    return values == 256 ? 8 : (values == 128 ? 7 : 5);
+}
+
 static inline uint2 native_scale_min(device const uchar * s, uint group) {
     if (group < 4) return uint2(s[group] & 63, s[group + 4] & 63);
     return uint2((s[group + 4] & 15) | ((s[group - 4] >> 6) << 4),
@@ -31,6 +36,10 @@ static inline uint2 native_scale_min(device const uchar * s, uint group) {
 
 static inline float native_block_value(device const uchar * b, uint i, uint format) {
     switch (format) {
+        case 142: {
+            const uint q = (b[2 + i / 4] >> (2 * (i % 4))) & 3;
+            return native_half(b, 0) * float(int(q) - 1);
+        }
         case 11: {
             const uint group = i / 16;
             const uint lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;
@@ -83,12 +92,23 @@ static inline float native_block_value(device const uchar * b, uint i, uint form
 }
 
 // Decode one aligned 16-value fragment directly into the unchanged K x N tile.
-// A fragment stays within one scale group for these four native formats. Keep
+// A fragment stays within one scale group for these native formats. Keep
 // scale products and IQ3 signs in the scalar decoder's FP32 evaluation order.
 // Byte loads also support the two-byte-aligned 110- and 18-byte block layouts.
 static inline void native_gemm_fragment16(
     device const uchar * b, uint first, uint format, threadgroup float * tile) {
     switch (format) {
+        case 142: {
+            const float scale = native_half(b, 0);
+            for (uint j = 0; j < 16; j += 4) {
+                const uint packed = b[2 + (first + j) / 4];
+                for (uint component = 0; component < 4; ++component) {
+                    const uint q = (packed >> (2 * component)) & 3;
+                    tile[(j + component) * 64] = scale * float(int(q) - 1);
+                }
+            }
+            return;
+        }
         case 11: {
             const uint group = first / 16;
             const uint lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;
@@ -174,18 +194,18 @@ static inline float native_iq4xs_lane_value(
     return (header.d * float(scale)) * float(iq4_nl_values[q]);
 }
 
-template<typename T>
+template<typename Input, typename Output>
 static inline void native_linear(
-    device const T * input, device const uchar * weight, device T * output,
+    device const Input * input, device const uchar * weight, device Output * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     uint3 group, uint lane, uint subgroup) {
     const uint row = group.y;
     const uint first = group.x * 4 + subgroup * 2;
     const uint format = NATIVE_GEMV_FORMAT == 0 ? block.format : NATIVE_GEMV_FORMAT;
-    // NativeBlockParams admits only 32- or 256-value blocks. Keep the lane
+    // NativeBlockParams admits 32-, 128-, or 256-value blocks. Keep the lane
     // traversal and ulong byte addresses unchanged while sharing this index
     // calculation between the two output columns.
-    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block.values);
     const uint blocks_per_row = p.in_features >> block_shift;
     float sums[2] = {0.0f, 0.0f};
     if (NATIVE_GEMV_FORMAT == 23) {
@@ -234,7 +254,7 @@ static inline void native_linear(
         const float value = simd_sum(sums[part]);
         const uint out_col = first + part;
         if (lane == 0 && out_col < p.out_features) {
-            output[ulong(row) * p.output_stride + p.output_column_offset + out_col] = T(value);
+            output[ulong(row) * p.output_stride + p.output_column_offset + out_col] = Output(value);
         }
     }
 }
@@ -253,6 +273,84 @@ kernel void vnext_native_block_linear_f32(
     native_linear(x, w, y, p, b, group, lane, subgroup);
 }
 
+kernel void vnext_native_block_linear_f32_f16(
+    device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], device half * y [[buffer(2)]],
+    constant NativeLinearParams & p [[buffer(3)]], constant NativeBlockParams & b [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint subgroup [[simdgroup_index_in_threadgroup]]) {
+    native_linear(x, w, y, p, b, group, lane, subgroup);
+}
+
+// PQ2 decode: a SIMD group covers eight output rows. Its lanes partition four
+// 128-value blocks into 16-value spans, sharing each activation span across all
+// eight outputs. This tiling follows ggml's MIT-licensed PQ2 Metal GEMV. Unpack
+// only its base-four fields in F32; keep original per-element scale and dot
+// operations instead of cancellation-prone activation coefficients.
+// The block's two-byte scale and four packed bytes are loaded once per span.
+template<typename Output>
+static inline void native_pq2_linear_f32(
+    device const float * input, device const uchar * weight, device Output * output,
+    constant NativeLinearParams & p, uint3 group, uint lane, uint subgroup) {
+    const uint first_output = group.x * 16 + subgroup * 8;
+    const uint blocks_per_row = p.in_features / 128;
+    const uint first_in_block = (lane % 8) * 16;
+    float sums[8] = {};
+    for (uint block_index = lane / 8; block_index < blocks_per_row; block_index += 4) {
+        const ulong input_start = ulong(group.y) * p.in_features
+            + ulong(block_index) * 128 + first_in_block;
+        float values[16];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16; ++i) values[i] = input[input_start + i];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 8; ++part) {
+            const uint out_col = first_output + part;
+            if (out_col >= p.out_features) continue;
+            device const uchar * block = weight
+                + (ulong(out_col) * blocks_per_row + block_index) * 34;
+            const float scale = native_half(block, 0);
+            #pragma clang loop unroll(full)
+            for (uint byte = 0; byte < 4; ++byte) {
+                // Byte values and power-of-two quotients are exact in F32.
+                const float packed = float(block[2 + first_in_block / 4 + byte]);
+                const float top = floor(packed * (1.0f / 64.0f));
+                const float middle = floor(packed * (1.0f / 16.0f));
+                const float bottom = floor(packed * (1.0f / 4.0f));
+                const float codes[4] = {
+                    packed - 4.0f * bottom - 1.0f,
+                    bottom - 4.0f * middle - 1.0f,
+                    middle - 4.0f * top - 1.0f,
+                    top - 1.0f,
+                };
+                #pragma clang loop unroll(full)
+                for (uint component = 0; component < 4; ++component) {
+                    const float value = scale * codes[component];
+                    sums[part] += values[byte * 4 + component] * value;
+                }
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (uint part = 0; part < 8; ++part) {
+        const float value = simd_sum(sums[part]);
+        const uint out_col = first_output + part;
+        if (lane == 0 && out_col < p.out_features) {
+            output[ulong(group.y) * p.output_stride + p.output_column_offset + out_col]
+                = Output(value);
+        }
+    }
+}
+
+#define NATIVE_PQ2_LINEAR(OUTPUT, SUFFIX) \
+kernel void vnext_pq2_linear_##SUFFIX( \
+    device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], \
+    device OUTPUT * y [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+    uint subgroup [[simdgroup_index_in_threadgroup]]) { \
+    native_pq2_linear_f32(x, w, y, p, group, lane, subgroup); \
+}
+NATIVE_PQ2_LINEAR(float, f32)
+NATIVE_PQ2_LINEAR(half, f32_f16)
+#undef NATIVE_PQ2_LINEAR
+
 // Decode one coefficient for all B independent rows without rounding the
 // weight to half. The typed selector restricts this path to small batches.
 // Each row retains native_linear's lane/column order and FP32 SIMD reduction.
@@ -262,7 +360,7 @@ static inline void native_shared_linear(
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     uint group, uint lane, uint subgroup) {
     const uint first = group * 4 + subgroup * 2;
-    const uint block_shift = block.values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block.values);
     const uint blocks_per_row = p.in_features >> block_shift;
     // Complete each independent output before starting the next, keeping only
     // B independent accumulator variables live across the column loop.
@@ -328,9 +426,9 @@ NATIVE_SHARED_LINEAR(float, f32, 4)
 // A 32- or 64-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
-template<uint ROW_TILE, bool SPECIALIZED = false>
+template<uint ROW_TILE, bool SPECIALIZED = false, typename Input = half>
 static inline void native_tiled_gemm(
-    device const half * input, device const uchar * weight, device half * output,
+    device const Input * input, device const uchar * weight, device half * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
     threadgroup float * workspace, uint3 group, uint thread_index, uint simdgroup_index) {
     constexpr uint THREADS = ROW_TILE * 4;
@@ -341,9 +439,9 @@ static inline void native_tiled_gemm(
     const uint format = SPECIALIZED ? NATIVE_GEMM_FORMAT : block.format;
     const uint block_values = SPECIALIZED ? NATIVE_GEMM_BLOCK_VALUES : block.values;
     const uint block_bytes = SPECIALIZED ? NATIVE_GEMM_BLOCK_BYTES : block.bytes;
-    // Native GGUF blocks contain 32 or 256 values. A K32 tile cannot cross
+    // Native GGUF blocks contain 32, 128, or 256 values. A K32 tile cannot cross
     // a block boundary, so compute its block address once per K iteration.
-    const uint block_shift = block_values == 256 ? 8 : 5;
+    const uint block_shift = native_block_shift(block_values);
     const ulong blocks_per_row = ulong(p.in_features >> block_shift);
     const uint matrix_row = (simdgroup_index / 2) * 16;
     const uint matrix_column = (simdgroup_index % 2) * 32;
@@ -449,6 +547,33 @@ NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64, 64, false)
 NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_specialized, 32, true)
 NATIVE_TILED_GEMM(vnext_native_block_gemm_f16_f32_m64_specialized, 64, true)
 #undef NATIVE_TILED_GEMM
+
+kernel void vnext_native_block_gemm_input_f32_output_f16(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<32, false, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
+
+kernel void vnext_native_block_gemm_input_f32_output_f16_specialized(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<32, true, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
+
+kernel void vnext_native_block_gemm_input_f32_output_f16_m64_specialized(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<64, true, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
+}
 
 kernel void vnext_native_block_decode(
     device const uchar * input [[buffer(0)]], device float * output [[buffer(1)]],

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::{
-    CanonicalRational, CapabilityId, ContractVersion, OperationId, SemanticValue, VNextError,
+    BufferUsage, CanonicalRational, CapabilityId, ContractVersion, OperationId, SemanticValue,
+    VNextError,
 };
 use super::foundation::invalid_operation;
 use super::{
@@ -294,6 +295,7 @@ impl OperationDescriptor {
                     && (input.value_id() != previous.value_id()
                         || input.access() != TensorAccess::Read
                         || previous.access() != TensorAccess::Read)
+                    && !shares_only_readonly_transform_signs(input, previous)
                 {
                     return Err(invalid_operation(format!(
                         "operation `{}` shares input storage between different or writable values",
@@ -443,6 +445,44 @@ impl OperationDescriptor {
         }
         Ok(())
     }
+}
+
+fn shares_only_readonly_transform_signs(
+    left: &ResolvedValueBinding,
+    right: &ResolvedValueBinding,
+) -> bool {
+    if left.access() != TensorAccess::Read
+        || right.access() != TensorAccess::Read
+        || left.usage() != BufferUsage::Weights
+        || right.usage() != BufferUsage::Weights
+    {
+        return false;
+    }
+    let (Some(left_weight), Some(right_weight)) = (left.weight(), right.weight()) else {
+        return false;
+    };
+    left.storage().components().iter().all(|left_component| {
+        right.storage().components().iter().all(|right_component| {
+            let overlaps = left_component.resource_id() == right_component.resource_id()
+                && left_component.offset_bytes()
+                    < right_component
+                        .offset_bytes()
+                        .saturating_add(right_component.length_bytes())
+                && right_component.offset_bytes()
+                    < left_component
+                        .offset_bytes()
+                        .saturating_add(left_component.length_bytes());
+            if !overlaps {
+                return true;
+            }
+            super::same_shared_transform_sign_component(
+                left_weight,
+                left_component,
+                right_weight,
+                right_component,
+            )
+        })
+    })
 }
 
 fn storage_overlaps(left: &ResolvedValueStorage, right: &ResolvedValueStorage) -> bool {

@@ -89,6 +89,8 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
         (Q(Iq3S), Q(Iq4Xs), D, 256, 256),
         (D, Q(Q3K), Q(Q5K), 256, 256),
         (Q(Iq4Nl), D, Q(Q4K), 256, 256),
+        (Q(Pq2_0), D, Q(Pq2_0), 128, 384),
+        (Q(Pq2_0), Q(Pq2_0), Q(Pq2_0), 384, 128),
         (D, D, D, 33, 17),
     ];
     for (gate_format, up_format, down_format, hidden, intermediate) in cases {
@@ -102,6 +104,8 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
             weight_gpu.push(stream.clone_htod(&padded).unwrap());
         }
         let part = |format, rows, columns, offset| MatrixPart {
+            transform: None,
+            signs_region: None,
             component_id: WeightId::new("component.swiglu").unwrap(),
             format,
             rows: rows as u32,
@@ -151,6 +155,7 @@ fn native_swiglu_mixed_matrices_match_stage_oracles_on_cuda() {
                 tokens as u32,
                 hidden as u32,
                 intermediate as u32,
+                0,
             )
             .unwrap();
             drop((gg, ag, yg));

@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
-    ElementType, OperationInvocation, PhysicalStorageLayout, PhysicalWeightLayout,
-    PhysicalWeightPadding, ResolvedValueBinding, ResolvedWeightBinding,
+    ElementType, HadamardSigns, HadamardTransformSpec, OperationInvocation, PhysicalStorageLayout,
+    PhysicalWeightLayout, PhysicalWeightPadding, ResolvedValueBinding, ResolvedWeightBinding,
     ResolvedWeightComponentLayout, WeightEncoding, WeightId,
 };
 
@@ -37,12 +37,71 @@ pub(in crate::backend::cuda::vnext_ops) struct MatrixPart {
     pub(in crate::backend::cuda::vnext_ops) rows: u32,
     pub(in crate::backend::cuda::vnext_ops) columns: u32,
     pub(in crate::backend::cuda::vnext_ops) output_offset: u32,
+    pub(in crate::backend::cuda::vnext_ops) transform: Option<HadamardTransformSpec>,
+    pub(in crate::backend::cuda::vnext_ops) signs_region: Option<usize>,
 }
 
 pub(in crate::backend::cuda::vnext_ops) struct MatrixWeight {
     pub(in crate::backend::cuda::vnext_ops) parts: Vec<MatrixPart>,
-    // Exactly one region per part, in logical output order.
+    // Matrix payloads in logical output order, followed by unique F32 signs.
     pub(in crate::backend::cuda::vnext_ops) regions: Vec<CudaBufferRegion>,
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn region_count(parts: &[MatrixPart]) -> usize {
+    parts
+        .iter()
+        .filter_map(|part| part.signs_region)
+        .map(|index| index + 1)
+        .max()
+        .unwrap_or(parts.len())
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn dispatches(parts: &[MatrixPart]) -> u64 {
+    parts
+        .iter()
+        .map(|part| 1 + u64::from(part.transform.is_some()))
+        .sum()
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn key(
+    mut key: super::super::CudaCommandReplayKeyBuilder,
+    parts: &[MatrixPart],
+) -> super::super::CudaCommandReplayKeyBuilder {
+    key = key.u64(parts.len() as u64);
+    for part in parts {
+        key = key.u32(part.rows).u32(part.columns).u32(part.output_offset);
+        for parameter in part.format.parameters() {
+            key = key.u32(parameter);
+        }
+        key = key.u64(part.signs_region.map_or(u64::MAX, |index| index as u64));
+        if let Some(spec) = &part.transform {
+            key = key.u32(spec.block_size.get());
+            if let HadamardSigns::Explicit(signs) = &spec.signs {
+                key = key.bytes(signs.component_id.as_str().as_bytes());
+            }
+            match spec.application {
+                ferrum_interfaces::vnext::HadamardApplication::BeforeMatmul {
+                    input_permutation,
+                } => {
+                    key = key.u32(1);
+                    if let Some(p) = input_permutation {
+                        key = key
+                            .u64(p.inner_extent)
+                            .u64(p.first_outer_extent)
+                            .u64(p.second_outer_extent);
+                    } else {
+                        key = key.u64(0).u64(0).u64(0);
+                    }
+                }
+                ferrum_interfaces::vnext::HadamardApplication::AfterEmbeddingLookup => {
+                    key = key.u32(2);
+                }
+            }
+        } else {
+            key = key.u32(0);
+        }
+    }
+    key
 }
 
 pub(in crate::backend::cuda::vnext_ops) fn resolve(
@@ -76,13 +135,28 @@ pub(in crate::backend::cuda::vnext_ops) fn resolve(
         .iter()
         .map(|component| (component.component_id(), component))
         .collect::<BTreeMap<_, _>>();
-    let mut regions = Vec::with_capacity(parts.len());
+    let mut ids = parts
+        .iter()
+        .map(|part| part.component_id.clone())
+        .collect::<Vec<_>>();
     for part in &parts {
+        if let Some(HadamardTransformSpec {
+            signs: HadamardSigns::Explicit(signs),
+            ..
+        }) = &part.transform
+        {
+            if !ids.contains(&signs.component_id) {
+                ids.push(signs.component_id.clone());
+            }
+        }
+    }
+    let mut regions = Vec::with_capacity(ids.len());
+    for id in &ids {
         let component = metadata
-            .get(&part.component_id)
+            .get(id)
             .ok_or("CUDA native matrix metadata component is absent")?;
         let stored = storage
-            .get(&part.component_id)
+            .get(id)
             .ok_or("CUDA native matrix storage component is absent")?;
         let expected_bytes = component
             .physical_bytes()
@@ -168,6 +242,24 @@ pub(in crate::backend::cuda::vnext_ops) fn matrix_parts(
     if cursor != rows {
         return Err("CUDA native matrix partitions do not cover its output".into());
     }
+    let mut signs_indices = BTreeMap::new();
+    let mut next_region = result.len();
+    for part in &mut result {
+        if let Some(HadamardTransformSpec {
+            signs: HadamardSigns::Explicit(signs),
+            ..
+        }) = &part.transform
+        {
+            let index = signs_indices
+                .entry(signs.component_id.clone())
+                .or_insert_with(|| {
+                    let index = next_region;
+                    next_region += 1;
+                    index
+                });
+            part.signs_region = Some(*index);
+        }
+    }
     Ok(result)
 }
 
@@ -178,6 +270,20 @@ fn flatten(
     metadata: &BTreeMap<&WeightId, &ResolvedWeightComponentLayout>,
     parts: &mut Vec<MatrixPart>,
 ) -> Result<(), String> {
+    if let PhysicalWeightLayout::Hadamard { values, transform } = layout {
+        let width = *shape
+            .last()
+            .ok_or("CUDA Hadamard matrix has no feature axis")?;
+        super::hadamard::validate(transform, width)?;
+        let start = parts.len();
+        flatten(values, shape, output_offset, metadata, parts)?;
+        for part in &mut parts[start..] {
+            if part.transform.replace(transform.clone()).is_some() {
+                return Err("CUDA native matrix rejects nested Hadamard transforms".into());
+            }
+        }
+        return Ok(());
+    }
     if let PhysicalWeightLayout::Composite { parts: children } = layout {
         for child in children {
             if child.extents.len() != shape.len()
@@ -281,6 +387,8 @@ fn flatten(
         return Err("CUDA native matrix physical dimensions differ from its logical rows".into());
     }
     parts.push(MatrixPart {
+        transform: None,
+        signs_region: None,
         component_id: id.clone(),
         format,
         rows: dimension(rows)?,

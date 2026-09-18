@@ -2245,11 +2245,39 @@ mod tests {
         std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
         std::fs::write(
             dir.join("tokenizer_config.json"),
-            br#"{"chat_template":"fixture"}"#,
+            br#"{"chat_template":"fixture","eos_token_id":2}"#,
         )
         .unwrap();
         let gguf = dir.join("model.gguf");
-        std::fs::write(&gguf, b"not-a-real-gguf").unwrap();
+        // A valid container with incomplete model tensors must reach the registered
+        // family's typed weight-role validation, regardless of which source
+        // layer performs the common GGUF header check first.
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes()); // tensor count
+        bytes.extend_from_slice(&1_u64.to_le_bytes()); // metadata count
+        let key = "general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes()); // GGUF string
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
+        bytes.extend_from_slice(b"qwen35");
+        let name = "output_norm.weight";
+        bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // rank
+        bytes.extend_from_slice(&2_u64.to_le_bytes()); // hidden size
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // F32
+        bytes.extend_from_slice(&0_u64.to_le_bytes()); // data offset
+        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+        bytes.extend_from_slice(&1_f32.to_le_bytes());
+        bytes.extend_from_slice(&1_f32.to_le_bytes());
+        std::fs::write(&gguf, bytes).unwrap();
+        let source = ferrum_quantization::gguf::NativeGgufFile::open(&gguf).unwrap();
+        assert_eq!(source.architecture().unwrap(), "qwen35");
+        assert_eq!(source.tensor_count(), 1);
+        assert_eq!(source.tensor_info(name).unwrap().dimensions, [2]);
+        drop(source);
         let original = ferrum_interfaces::vnext::OriginalModelSource {
             kind: ferrum_interfaces::vnext::ModelSourceKind::LocalDirectory,
             location: dir.display().to_string(),
@@ -2278,12 +2306,15 @@ mod tests {
         config.model_sources = Some(sources);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("registered Qwen3.5 CPU composition accepted a corrupt GGUF"),
+            Ok(_) => panic!("registered Qwen3.5 CPU composition accepted missing model tensors"),
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("open vNext GGUF source"), "{err}");
-        assert!(err.contains("invalid GGUF header"), "{err}");
+        assert!(
+            err.contains("Qwen3.5 GGUF is missing required role \"embed_tokens\""),
+            "{err}"
+        );
+        assert!(err.contains("token_embd.weight"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

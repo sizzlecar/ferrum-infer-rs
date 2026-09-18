@@ -43,6 +43,7 @@ use super::vnext_runtime::{
 
 mod causal_attention;
 mod gated_delta_attention;
+mod hadamard;
 mod linear;
 mod moe;
 mod native_blocks;
@@ -115,6 +116,7 @@ pub fn metal_vnext_runtime_config(
             include_str!("../vnext_runtime/counter_readback.rs").as_bytes(),
             include_str!("mod.rs").as_bytes(),
             include_str!("weights.rs").as_bytes(),
+            hadamard::FINGERPRINT_SOURCE.as_bytes(),
             include_str!("primitives.rs").as_bytes(),
             include_str!("primitives.metal").as_bytes(),
             linear::FINGERPRINT_SOURCE.as_bytes(),

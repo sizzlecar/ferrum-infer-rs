@@ -118,7 +118,7 @@ fn render(value: &Value, substitutions: &BTreeMap<&str, Value>) -> Result<Value>
     })
 }
 
-fn validate_config(
+pub(super) fn validate_config(
     config: &Value,
     server: &Server,
     tool_result_format: OrchestralToolResultFormat,
@@ -262,7 +262,7 @@ fn bind_tool_result_format(config: &mut Value, format: OrchestralToolResultForma
     Ok(())
 }
 
-fn argv(config: &Path, session: &str, prompt: &str) -> Result<Vec<String>> {
+pub(super) fn argv(config: &Path, session: &str, prompt: &str) -> Result<Vec<String>> {
     Ok(vec![
         "--config".into(),
         config.to_str().context("UTF-8 config path")?.into(),

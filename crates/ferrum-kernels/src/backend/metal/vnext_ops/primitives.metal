@@ -187,6 +187,50 @@ kernel void vnext_embedding_q8_0_f16(
     output[output_index] = half(float(block.d) * float(block.qs[column % QK8_0]));
 }
 
+// PQ2_0 stores a little-endian half scale and four consecutive 2-bit
+// coefficients per byte. Code 3 is legal and decodes to +2, not +1.
+template<typename T>
+static inline void embedding_pq2_0(
+    device const uchar * table, device const uint * token_ids, device T * output,
+    constant EmbeddingParams & params, uint3 group, uint lane) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) return;
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = T(0.0f);
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / 128;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / 128;
+    device const uchar * block = table + block_index * 34;
+    const ushort scale_bits = ushort(block[0]) | (ushort(block[1]) << 8);
+    const uint i = column % 128;
+    const uint q = (block[2 + i / 4] >> (2 * (i % 4))) & 3;
+    output[output_index] = T(float(as_type<half>(scale_bits)) * float(int(q) - 1));
+}
+
+kernel void vnext_embedding_pq2_0_f16(
+    device const uchar * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    embedding_pq2_0(table, token_ids, output, params, group, lane);
+}
+
+kernel void vnext_embedding_pq2_0_f32(
+    device const uchar * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    embedding_pq2_0(table, token_ids, output, params, group, lane);
+}
+
 kernel void vnext_rms_norm_f16(
     device const half * input [[buffer(0)]],
     device const half * weight [[buffer(1)]],

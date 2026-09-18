@@ -6,6 +6,41 @@ use crate::gguf_blocks::{
 use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 use half::f16;
 
+fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
+    if format == GgufBlockFormat::Pq2_0 {
+        assert_eq!((format.block_values(), format.block_bytes()), (128, 34));
+        // Literal low-slot-first bytes and independent values, rather than
+        // feeding the shared decoder back into every CUDA oracle. The fourth
+        // physical code is +2 even when an exporter uses only ternary values.
+        let codes = [
+            -1.0, 0.0, 1.0, 2.0, 2.0, 1.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, 2.0, 2.0, 2.0, 2.0,
+        ];
+        let mut bytes = Vec::new();
+        let mut values = Vec::new();
+        for (bits, scale) in [
+            (0x3800_u16, 0.5_f32),
+            (0xb400, -0.25),
+            (0x0000, 0.0),
+            (0x0400, 1.0 / 16384.0),
+        ] {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+            bytes.extend([0xe4, 0x1b, 0x00, 0xff].into_iter().cycle().take(32));
+            values.extend(
+                codes
+                    .into_iter()
+                    .cycle()
+                    .take(128)
+                    .map(|value| scale * value),
+            );
+        }
+        return (bytes, values);
+    }
+    let bytes = oracle_blocks(format);
+    let mut values = vec![0.0; bytes.len() / format.block_bytes() * format.block_values()];
+    format.decode(&bytes, &mut values).unwrap();
+    (bytes, values)
+}
+
 #[test]
 #[ignore = "requires an actual CUDA device"]
 fn native_block_decoding_matches_shared_ggml_oracle_on_cuda() {
@@ -13,10 +48,10 @@ fn native_block_decoding_matches_shared_ggml_oracle_on_cuda() {
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();
     let stream = context.default_stream();
     for format in FORMATS {
-        let bytes = oracle_blocks(format);
-        let count = bytes.len() / format.block_bytes() * format.block_values();
+        let (bytes, decoded) = decoded_fixture(format);
+        let count = decoded.len();
         let mut expected = vec![-12345.0_f32; count + 8];
-        format.decode(&bytes, &mut expected[4..4 + count]).unwrap();
+        expected[4..4 + count].copy_from_slice(&decoded);
         let mut padded = vec![0xcc_u8; 16];
         padded.extend_from_slice(&bytes);
         let input = stream.clone_htod(&padded).unwrap();
@@ -69,7 +104,7 @@ impl Scalar for f16 {
 }
 
 fn matrix(format: GgufBlockFormat, rows: usize, blocks_per_row: usize) -> (Vec<u8>, Vec<f32>) {
-    let source = oracle_blocks(format);
+    let (source, values) = decoded_fixture(format);
     let bytes = source
         .chunks_exact(format.block_bytes())
         .cycle()
@@ -77,8 +112,11 @@ fn matrix(format: GgufBlockFormat, rows: usize, blocks_per_row: usize) -> (Vec<u
         .flatten()
         .copied()
         .collect::<Vec<_>>();
-    let mut decoded = vec![0.0; rows * blocks_per_row * format.block_values()];
-    format.decode(&bytes, &mut decoded).unwrap();
+    let decoded = values
+        .into_iter()
+        .cycle()
+        .take(rows * blocks_per_row * format.block_values())
+        .collect();
     (bytes, decoded)
 }
 
@@ -249,22 +287,28 @@ fn native_matrix_launcher_preserves_mixed_dense_and_block_partitions() {
 }
 
 fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
-    for rows in [1, 3, 8, 11] {
-        mixed_matrix_rows::<T>(activation, rows);
+    for (format, columns) in [(GgufBlockFormat::Iq4Xs, 512), (GgufBlockFormat::Pq2_0, 384)] {
+        for rows in [1, 3, 8, 11] {
+            mixed_matrix_rows::<T>(activation, format, columns, rows);
+        }
     }
 }
 
-fn mixed_matrix_rows<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType, rows: usize) {
+fn mixed_matrix_rows<T: Scalar>(
+    activation: ferrum_interfaces::vnext::ElementType,
+    format: GgufBlockFormat,
+    columns: usize,
+    rows: usize,
+) {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use ferrum_interfaces::vnext::WeightId;
     use weights::{MatrixFormat, MatrixPart};
     let context = CudaContext::new(0).expect("native matrix conformance requires CUDA");
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();
     let stream = context.default_stream();
-    let columns = 512_usize;
     let outputs = 3_usize;
     let stride = 2 * outputs + 2;
-    let (blocks, decoded) = matrix(GgufBlockFormat::Iq4Xs, outputs, 2);
+    let (blocks, decoded) = matrix(format, outputs, columns / format.block_values());
     let dense = (0..outputs * columns)
         .map(|i| f16::from_f32(((i * 7 % 41) as f32 - 20.0) / 512.0))
         .collect::<Vec<_>>();
@@ -281,10 +325,12 @@ fn mixed_matrix_rows<T: Scalar>(activation: ferrum_interfaces::vnext::ElementTyp
     let (dp, _d_guard) = d.device_ptr(&stream);
     let (yp, y_guard) = output.device_ptr_mut(&stream);
     for (format, pointer, offset) in [
-        (MatrixFormat::Block(GgufBlockFormat::Iq4Xs), qp, 1),
+        (MatrixFormat::Block(format), qp, 1),
         (MatrixFormat::DenseF16, dp, 1 + outputs as u32),
     ] {
         let part = MatrixPart {
+            transform: None,
+            signs_region: None,
             component_id: WeightId::new("component.matrix").unwrap(),
             format,
             rows: outputs as u32,

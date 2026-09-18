@@ -15,6 +15,7 @@ mod block_decode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufBlockFormat {
+    Pq2_0,
     Q3K,
     Q4K,
     Q5K,
@@ -28,6 +29,7 @@ pub enum GgufBlockFormat {
 impl GgufBlockFormat {
     pub const fn ggml_type_id(self) -> u32 {
         match self {
+            Self::Pq2_0 => 142,
             Self::Q3K => 11,
             Self::Q4K => 12,
             Self::Q5K => 13,
@@ -41,6 +43,7 @@ impl GgufBlockFormat {
 
     pub const fn format_id(self) -> &'static str {
         match self {
+            Self::Pq2_0 => "quantization.gguf.pq2-0",
             Self::Q3K => "quantization.gguf.q3-k",
             Self::Q4K => "quantization.gguf.q4-k",
             Self::Q5K => "quantization.gguf.q5-k",
@@ -54,6 +57,7 @@ impl GgufBlockFormat {
 
     pub const fn block_values(self) -> usize {
         match self {
+            Self::Pq2_0 => 128,
             Self::Q8_0 | Self::Iq4Nl => 32,
             _ => 256,
         }
@@ -61,6 +65,7 @@ impl GgufBlockFormat {
 
     pub const fn block_bytes(self) -> usize {
         match self {
+            Self::Pq2_0 => 34,
             Self::Q3K | Self::Iq3S => 110,
             Self::Q4K => 144,
             Self::Q5K => 176,
@@ -74,6 +79,7 @@ impl GgufBlockFormat {
     pub fn from_spec(spec: &BlockQuantizationSpec) -> Result<Self, String> {
         spec.validate().map_err(|error| error.to_string())?;
         let format = match spec.format_id.as_str() {
+            "quantization.gguf.pq2-0" => Self::Pq2_0,
             "quantization.gguf.q3-k" => Self::Q3K,
             "quantization.gguf.q4-k" => Self::Q4K,
             "quantization.gguf.q5-k" => Self::Q5K,
@@ -120,6 +126,13 @@ impl GgufBlockFormat {
     #[inline]
     pub(crate) fn decode_value(self, block: &[u8], index: usize) -> f32 {
         match self {
+            Self::Pq2_0 => {
+                // Prism's group-128 codec stores adjacent values in successive
+                // low-to-high 2-bit slots. Code 3 is defined as +2, even though
+                // ternary checkpoints normally only use codes 0, 1 and 2.
+                let code = (block[2 + index / 4] >> (2 * (index % 4))) & 3;
+                (i32::from(code) - 1) as f32 * half_at(block, 0)
+            }
             Self::Q3K => {
                 let group = index / 16;
                 let scales = &block[96..108];

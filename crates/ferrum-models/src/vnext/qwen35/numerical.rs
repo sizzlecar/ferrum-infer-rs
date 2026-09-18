@@ -44,7 +44,10 @@ pub(super) fn profiles(
         _ => Vec::new(),
     };
     let mut profiles = vec![f16, f32];
-    if !kv_storage.is_empty() {
+    // Activation-rotation execution is qualified separately from KV encoding.
+    // Until their combination has been validated, offer only F16 KV profiles
+    // for source-declared Hadamard weights on both run and serve paths.
+    if !kv_storage.is_empty() && config.gguf_hadamard.is_none() {
         let (states, kv_storage) = states_for_int8(&text, config.max_position_embeddings)?;
         let f16 = profile(family_id, &text, &states, &kv_storage, false, true)?;
         let f32 = profile(family_id, &text, &states, &kv_storage, true, true)?;

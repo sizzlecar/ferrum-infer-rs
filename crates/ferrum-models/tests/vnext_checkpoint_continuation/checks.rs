@@ -103,7 +103,8 @@ pub fn verify_with_timing(
     let cold = fixture.admit("cold", Arc::clone(&tokens));
     let restored = fixture.admit("restored", Arc::clone(&tokens));
     eprintln!(
-        "{kind:?}: F32-master hidden={HIDDEN}, native Q4_K projections, single participant, prefix={prefix:?}, suffix={suffix:?}; real embedding+attention FullPlan, native public capture/restore"
+        "{kind:?}: hidden={HIDDEN}, activation={:?}, native block projections, single participant, prefix={prefix:?}, suffix={suffix:?}; real embedding+attention FullPlan, native public capture/restore",
+        kind.activation_type()
     );
     let mut previous = None;
     for span in prefix {

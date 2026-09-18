@@ -33,9 +33,9 @@ use ferrum_interfaces::vnext::{
     RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
     TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
-use ferrum_quantization::gguf::ferrum_to_gguf_with_arch;
 #[cfg(test)]
 use ferrum_quantization::gguf::{block_quantization_format, GgmlDType};
+use ferrum_quantization::gguf::{ferrum_to_gguf_with_arch, GgufHadamard, NativeGgufFile};
 use ferrum_quantization::{
     BlockFp8SafetensorsSource, CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
     GptqMarlinSafetensorsSource, SafetensorsArchive, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
@@ -64,6 +64,7 @@ use super::{
 pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
+mod hadamard;
 mod numerical;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
@@ -346,6 +347,8 @@ pub struct Qwen35FamilyConfig {
     metadata: ModelSemanticMetadata,
     weight_format: FamilyWeightFormat,
     recurrent_weight_abi: RecurrentWeightAbi,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gguf_hadamard: Option<GgufHadamard>,
     weights: Vec<FamilyWeight>,
 }
 
@@ -367,6 +370,7 @@ impl Qwen35FamilyProvider {
 
     fn validate_typed_config(&self, config: &Qwen35FamilyConfig) -> Result<(), VNextError> {
         let text = Self::text_config(config)?;
+        hadamard::validate(config, &text)?;
         let expected_epsilon = hf_rms_norm_epsilon(&config.hf_config)
             .map_err(|reason| invalid_config("hf_config.text_config.rms_norm_eps", reason))?;
         if config.rms_norm_epsilon != expected_epsilon {
@@ -770,6 +774,14 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         config: &Self::Config,
         profile: &NumericalExecutionProfile,
     ) -> Result<ModelProgram, VNextError> {
+        if config.gguf_hadamard.is_some()
+            && profile
+                .kv_storage
+                .iter()
+                .any(|state| state.format() != KvStorageFormat::F16)
+        {
+            return Err(invalid_config("numerical_profile.kv_storage", "Hadamard weight execution currently requires F16 KV; INT8 KV must be qualified as a separate combination"));
+        }
         let text = Self::text_config(config)?;
         let operations = Qwen35OperationProfile::for_profile(profile)?;
         let mut weight_refs = Vec::with_capacity(config.weights.len());
@@ -2418,7 +2430,7 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
             )?;
         }
     }
-    Ok(WeightSchema {
+    let mut schema = WeightSchema {
         format_id: WeightFormatId::new("weight-format.gguf.native-block")?,
         layout_id: WeightLayoutId::new(if text.is_moe() {
             "weight-layout.qwen3_5.hybrid_moe.gguf.native.packed_gdn_qkvzba"
@@ -2432,7 +2444,9 @@ fn gguf_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNext
         },
         components,
         tensors,
-    })
+    };
+    hadamard::apply_schema(config, &mut schema)?;
+    Ok(schema)
 }
 
 fn append_gguf_moe_weight_schema(
@@ -2688,9 +2702,17 @@ pub(super) fn define_from_sources(
             }
         }
         ProductionWeightArtifact::GgufFile(path) => {
-            let weights = GgufWeightComponentSource::open(path)?;
-            let config = load_gguf_family_config(&sources, &weights)
+            let file = NativeGgufFile::open(path)
+                .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
+            let config = load_gguf_family_config(&sources, &file)
                 .map_err(ferrum_types::FerrumError::model)?;
+            let schema = gguf_weight_schema(&config)
+                .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
+            let weights = GgufWeightComponentSource::open_with_schema(
+                path,
+                &schema,
+                config.gguf_hadamard.as_ref(),
+            )?;
             finish_preparation(sources, weights, config)
         }
     }
@@ -2845,6 +2867,7 @@ fn load_safetensors_family_config(
         rms_norm_epsilon,
         metadata,
         recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
+        gguf_hadamard: None,
         weight_format: match text
             .quantization
             .as_ref()
@@ -2909,7 +2932,7 @@ fn compose_safetensors_hf_config(sources: &ProductionModelSourceBundle) -> Resul
 
 fn load_gguf_family_config(
     sources: &ProductionModelSourceBundle,
-    source: &GgufWeightComponentSource,
+    source: &NativeGgufFile,
 ) -> Result<Qwen35FamilyConfig, String> {
     let hf_config: Value = serde_json::from_slice(sources.config_json())
         .map_err(|error| format!("parse semantic config.json: {error}"))?;
@@ -2921,7 +2944,6 @@ fn load_gguf_family_config(
         );
     }
     let architecture = source
-        .file()
         .architecture()
         .map_err(|error| format!("read GGUF architecture: {error}"))?;
     let expected_architecture = gguf_architecture(&text);
@@ -2980,6 +3002,7 @@ fn load_gguf_family_config(
         rms_norm_epsilon,
         metadata,
         recurrent_weight_abi: RecurrentWeightAbi::NegativeRateInterleaved,
+        gguf_hadamard: source.hadamard().cloned(),
         weight_format: FamilyWeightFormat::GgufNative,
         weights,
     })
@@ -2991,7 +3014,7 @@ fn append_gguf_weights(
     layer_index: Option<u32>,
     tied_embeddings: bool,
     architecture: &str,
-    source: &GgufWeightComponentSource,
+    source: &NativeGgufFile,
 ) -> Result<(), String> {
     for spec in specs
         .iter()
@@ -3006,7 +3029,7 @@ fn append_gguf_weights(
             }
             continue;
         };
-        let Some(info) = source.file().tensor_info(&external_name) else {
+        let Some(info) = source.tensor_info(&external_name) else {
             if spec.required {
                 return Err(format!(
                     "Qwen3.5 GGUF is missing required role {:?} tensor {external_name:?}",
@@ -7059,6 +7082,7 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsDense,
             recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
+            gguf_hadamard: None,
             weights,
         }
     }
@@ -7205,6 +7229,7 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
             recurrent_weight_abi: RecurrentWeightAbi::LogRateGrouped,
+            gguf_hadamard: None,
             weights,
         };
         synchronize_test_block_fp8_exclusions(&mut config);
@@ -7258,7 +7283,8 @@ mod tests {
                     collect_block_fp8_source_pairs(&part.layout, pairs);
                 }
             }
-            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            PhysicalWeightLayout::Hadamard { values, .. }
+            | PhysicalWeightLayout::AxisReshapePermutation { values, .. }
             | PhysicalWeightLayout::Indexed { values, .. } => {
                 collect_block_fp8_source_pairs(values, pairs);
             }
@@ -7296,7 +7322,8 @@ mod tests {
                     collect_marlin_fp8_execution_leaves(&part.layout, leaves, block_grid_count);
                 }
             }
-            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            PhysicalWeightLayout::Hadamard { values, .. }
+            | PhysicalWeightLayout::AxisReshapePermutation { values, .. }
             | PhysicalWeightLayout::Indexed { values, .. } => {
                 collect_marlin_fp8_execution_leaves(values, leaves, block_grid_count);
             }
@@ -7311,7 +7338,7 @@ mod tests {
         }
     }
 
-    fn test_dense_gguf_config() -> Qwen35FamilyConfig {
+    pub(super) fn test_dense_gguf_config() -> Qwen35FamilyConfig {
         let mut config = test_config();
         for weight in &mut config.weights {
             weight.external_name =
@@ -7418,6 +7445,7 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::GgufNative,
             recurrent_weight_abi: RecurrentWeightAbi::NegativeRateInterleaved,
+            gguf_hadamard: None,
             weights,
         }
     }

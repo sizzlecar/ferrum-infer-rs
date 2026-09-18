@@ -6,7 +6,7 @@ use crate::gguf_blocks::GgufBlockFormat;
 
 pub(super) fn quantization_formats() -> Result<BTreeSet<QuantizationFormatId>, VNextError> {
     use GgufBlockFormat::*;
-    [Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
+    [Pq2_0, Q3K, Q4K, Q5K, Q6K, Q8_0, Iq3S, Iq4Nl, Iq4Xs]
         .into_iter()
         .map(|format| QuantizationFormatId::new(format.format_id()))
         .collect()
@@ -32,17 +32,15 @@ pub(super) fn encode(
         return Err("CUDA native linear participant ranges are incomplete".into());
     }
     let mut regions = weight.regions;
+    let weight_regions = regions.len();
+    let scratch =
+        super::super::native_blocks::hadamard::retain_workspace(&invocation, &mut regions)?;
     let mut launches = Vec::new();
     let mut key = CudaCommandReplayKeyBuilder::new(fingerprint, "vnext_native_dense_linear")
         .u64(rows)
         .u64(columns)
         .u64(weight.parts.len() as u64);
-    for part in &weight.parts {
-        key = key.u32(part.rows).u32(part.columns).u32(part.output_offset);
-        for parameter in part.format.parameters() {
-            key = key.u32(parameter);
-        }
-    }
+    key = weights::key(key, &weight.parts);
     for (index, (participant, range)) in invocation
         .participants()
         .iter()
@@ -61,7 +59,7 @@ pub(super) fn encode(
         if index != 0 {
             let candidate = weights::resolve(participant, value, &[rows, columns])?;
             if candidate.parts != weight.parts
-                || candidate.regions.len() != weight.parts.len()
+                || candidate.regions.len() != weight_regions
                 || !candidate
                     .regions
                     .iter()
@@ -116,7 +114,7 @@ pub(super) fn encode(
     let tokens = invocation.work_shape().immediate_tokens();
     let output_stride = checked_u32(rows, "native linear output stride")?;
     let dispatches = (launches.len() as u64)
-        .checked_mul(weight.parts.len() as u64)
+        .checked_mul(weights::dispatches(&weight.parts))
         .ok_or("CUDA native linear dispatch count overflows")?;
     let kernels = kernels.clone();
     CudaDeviceCommand::replayable_operation(
@@ -126,7 +124,7 @@ pub(super) fn encode(
         move |stream, regions| {
             for &(input, output, rows) in &launches {
                 for (index, part) in weight.parts.iter().enumerate() {
-                    kernels.linear(
+                    kernels.transformed_linear(
                         stream,
                         regions[input].device_ptr(),
                         regions[index].device_ptr(),
@@ -135,6 +133,9 @@ pub(super) fn encode(
                         rows,
                         output_stride,
                         ElementType::F16,
+                        part.signs_region
+                            .map_or(0, |index| regions[index].device_ptr()),
+                        scratch.map_or(0, |index| regions[index].device_ptr()),
                     )?;
                 }
             }

@@ -46,6 +46,12 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
         }
         case 8:
             return native_half(b, 0) * float(static_cast<signed char>(b[2 + i]));
+        case 142: {
+            // PQ2_0: one F16 scale and 128 values packed low slot first.
+            // All four physical codes are defined, including code 3 = +2.
+            const unsigned q = (b[2 + i / 4] >> (2 * (i % 4))) & 3;
+            return native_half(b, 0) * float(int(q) - 1);
+        }
         case 20: {
             const unsigned q = (b[2 + i % 16] >> (4 * (i / 16))) & 15;
             return native_half(b, 0) * float(iq4_nl_values[q]);
@@ -72,8 +78,8 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
     return NAN;
 }
 
-template<typename T, unsigned RowTile>
-__device__ void native_linear(const T* x, const byte* w, T* y,
+template<typename Input, typename Output, unsigned RowTile>
+__device__ void native_linear(const Input* x, const byte* w, Output* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset,
     unsigned format, unsigned block_values, unsigned block_bytes) {
     const unsigned row = blockIdx.y * RowTile;
@@ -98,7 +104,7 @@ __device__ void native_linear(const T* x, const byte* w, T* y,
         for (unsigned step = 16; step != 0; step /= 2)
             sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
         if (lane == 0 && row + r < rows)
-            y[size_t(row + r) * stride + offset + column] = T(sums[r]);
+            y[size_t(row + r) * stride + offset + column] = Output(sums[r]);
     }
 }
 
@@ -115,16 +121,18 @@ __device__ void native_embedding(const unsigned* tokens, const byte* w, T* y,
     y[index] = T(native_block_value(w + block * block_bytes, col % block_values, format));
 }
 
-#define NATIVE_LINEAR(T, suffix, tile) \
-extern "C" __global__ void vnext_gguf_linear_##suffix(const T* x, const byte* w, T* y, \
+#define NATIVE_LINEAR(Input, Output, suffix, tile) \
+extern "C" __global__ void vnext_gguf_linear_##suffix(const Input* x, const byte* w, Output* y, \
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
     unsigned format, unsigned values, unsigned bytes) { \
-    native_linear<T, tile>(x, w, y, rows, inputs, outputs, stride, offset, format, values, bytes); \
+    native_linear<Input, Output, tile>(x, w, y, rows, inputs, outputs, stride, offset, format, values, bytes); \
 }
-NATIVE_LINEAR(half, f16, 1)
-NATIVE_LINEAR(float, f32, 1)
-NATIVE_LINEAR(half, tiled_f16, 8)
-NATIVE_LINEAR(float, tiled_f32, 8)
+NATIVE_LINEAR(half, half, f16, 1)
+NATIVE_LINEAR(float, float, f32, 1)
+NATIVE_LINEAR(half, half, tiled_f16, 8)
+NATIVE_LINEAR(float, float, tiled_f32, 8)
+NATIVE_LINEAR(float, half, f32_f16, 1)
+NATIVE_LINEAR(float, half, tiled_f32_f16, 8)
 
 #define NATIVE_EMBEDDING(T, suffix) \
 extern "C" __global__ void vnext_gguf_embedding_##suffix(const unsigned* tokens, const byte* w, T* y, \
@@ -139,3 +147,55 @@ extern "C" __global__ void vnext_gguf_decode(const byte* input, float* output,
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = native_block_value(input + size_t(i / values) * bytes, i % values, format);
 }
+
+// Every block owns one whole Sylvester block. All threads execute every barrier,
+// including lanes beyond the transform width. The complete feature permutation
+// precedes signs and H; inverse lookup applies signs after H instead.
+template<typename Input, typename Output>
+__device__ void native_hadamard(const Input* input, Output* output, const float* signs,
+    unsigned width, unsigned block_size, unsigned inverse,
+    unsigned inner, unsigned first, unsigned second) {
+    extern __shared__ float values[];
+    const size_t row = blockIdx.y;
+    const unsigned base = blockIdx.x * block_size;
+    for (unsigned i = threadIdx.x; i < block_size; i += blockDim.x) {
+        const unsigned feature = base + i;
+        unsigned source = feature;
+        if (inner != 0) {
+            const unsigned a = feature % inner;
+            const unsigned b = (feature / inner) % second;
+            const unsigned c = feature / (inner * second);
+            source = a + inner * (c + first * b);
+        }
+        float value = float(input[row * width + source]);
+        if (!inverse && signs) value *= signs[feature];
+        values[i] = value;
+    }
+    __syncthreads();
+    for (unsigned step = 1; step < block_size; step *= 2) {
+        for (unsigned pair = threadIdx.x; pair < block_size / 2; pair += blockDim.x) {
+            const unsigned lo = (pair / step) * (2 * step) + pair % step;
+            const float a = values[lo];
+            const float b = values[lo + step];
+            values[lo] = a + b;
+            values[lo + step] = a - b;
+        }
+        __syncthreads();
+    }
+    const float scale = 1.0f / sqrtf(float(block_size));
+    for (unsigned i = threadIdx.x; i < block_size; i += blockDim.x) {
+        float value = values[i] * scale;
+        if (inverse && signs) value *= signs[base + i];
+        output[row * width + base + i] = Output(value);
+    }
+}
+
+#define NATIVE_HADAMARD(Input, Output, suffix) \
+extern "C" __global__ void vnext_gguf_hadamard_##suffix( \
+    const Input* input, Output* output, const float* signs, unsigned width, \
+    unsigned block_size, unsigned inverse, unsigned inner, unsigned first, unsigned second) { \
+    native_hadamard(input, output, signs, width, block_size, inverse, inner, first, second); \
+}
+NATIVE_HADAMARD(half, float, f16_f32)
+NATIVE_HADAMARD(float, float, f32_f32)
+NATIVE_HADAMARD(float, half, f32_f16)
