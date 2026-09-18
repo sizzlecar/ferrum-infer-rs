@@ -93,6 +93,61 @@ fn assert_no_unverified_files(root: &Path) {
 }
 
 #[tokio::test]
+async fn inaccessible_cache_namespace_reports_operation_and_path_before_network_access() {
+    let root = tempfile::tempdir().unwrap();
+    let options = args(
+        root.path(),
+        "https://unused.invalid/asset?private-query=must-not-be-printed",
+        b"verified input",
+    );
+    // An existing file prevents directory creation on all supported hosts; the
+    // failure must explain the actual local operation, without exposing the URL.
+    fs::write(&options.cache_dir, b"unrelated existing file").unwrap();
+    let cache_dir = options.cache_dir.clone();
+    let output = options.output.clone();
+    let error = fetch(options).await.unwrap_err();
+    assert!(error.contains("create cache directory"), "{error}");
+    assert!(error.contains(&cache_dir.display().to_string()), "{error}");
+    assert!(!error.contains("private-query"), "{error}");
+    assert_eq!(fs::read(cache_dir).unwrap(), b"unrelated existing file");
+    assert!(!output.exists());
+}
+
+#[test]
+fn cache_read_and_publication_errors_identify_paths_without_clobbering_other_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let options = args(root.path(), "http://127.0.0.1:9/asset", b"verified input");
+    let paths = prepare_paths(&options).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let error = verified_copy(&paths, &options.sha256, deadline).unwrap_err();
+    assert!(
+        error.contains("open cache entry for verification"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&paths.cache_file.display().to_string()),
+        "{error}"
+    );
+    // A different producer may create the destination after initial setup.
+    // Preserve its bytes and report the exact failing publication destination.
+    fs::write(&paths.output, b"another producer's output").unwrap();
+    let mut temporary = NamedTempFile::new_in(paths.output.parent().unwrap()).unwrap();
+    temporary.write_all(b"verified input").unwrap();
+    let temporary_path = temporary.path().to_owned();
+    let error = publish_output(temporary, &paths.output, deadline).unwrap_err();
+    assert!(error.contains("publish verified output"), "{error}");
+    assert!(
+        error.contains(&paths.output.display().to_string()),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&paths.output).unwrap(),
+        b"another producer's output"
+    );
+    assert!(!temporary_path.exists());
+}
+
+#[tokio::test]
 async fn interrupted_body_is_retried_and_only_complete_verified_bytes_are_published() {
     let root = tempfile::tempdir().unwrap();
     let bytes = b"pinned release input\0with binary bytes\xff";

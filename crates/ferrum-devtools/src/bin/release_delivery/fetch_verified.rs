@@ -120,18 +120,26 @@ fn validate(args: &FetchArgs) -> Result<Url, String> {
 }
 
 fn prepare_paths(args: &FetchArgs) -> Result<Paths, String> {
-    fs::create_dir_all(&args.cache_dir).map_err(|error| error.to_string())?;
-    let cache_root = args.cache_dir.canonicalize().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&args.cache_dir)
+        .map_err(|error| path_error("create cache directory", &args.cache_dir, error))?;
+    let cache_root = args
+        .cache_dir
+        .canonicalize()
+        .map_err(|error| path_error("canonicalize cache directory", &args.cache_dir, error))?;
     let cache_parent = cache_root.join("sha256");
     let lock_parent = cache_root.join("locks");
     for directory in [&cache_parent, &lock_parent] {
-        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        fs::create_dir_all(directory)
+            .map_err(|error| path_error("create cache namespace", directory, error))?;
         if fs::symlink_metadata(directory)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| path_error("inspect cache namespace", directory, error))?
             .file_type()
             .is_symlink()
         {
-            return Err("cache namespace must not be a symbolic link".into());
+            return Err(format!(
+                "cache namespace must not be a symbolic link: {}",
+                directory.display()
+            ));
         }
     }
     let name = args.output.file_name().ok_or("output must name a file")?;
@@ -140,8 +148,11 @@ fn prepare_paths(args: &FetchArgs) -> Result<Paths, String> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| path_error("create output directory", parent, error))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| path_error("canonicalize output directory", parent, error))?;
     if parent.starts_with(&cache_root) {
         return Err("output must be outside the persistent cache directory".into());
     }
@@ -149,7 +160,8 @@ fn prepare_paths(args: &FetchArgs) -> Result<Paths, String> {
     if regular_file_exists(&output)? {
         // A stale output is not evidence of a successful download. Never publish
         // partial bytes here, and never remove an unrelated directory/symlink.
-        fs::remove_file(&output).map_err(|error| error.to_string())?;
+        fs::remove_file(&output)
+            .map_err(|error| path_error("remove stale output", &output, error))?;
     }
     Ok(Paths {
         cache_file: cache_parent.join(&args.sha256),
@@ -166,8 +178,12 @@ fn regular_file_exists(path: &Path) -> Result<bool, String> {
             path.display()
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(path_error("inspect file", path, error)),
     }
+}
+
+fn path_error(operation: &str, path: &Path, error: impl std::fmt::Display) -> String {
+    format!("verified fetch: {operation} '{}': {error}", path.display())
 }
 
 async fn fetch_inner(
@@ -185,7 +201,8 @@ async fn fetch_inner(
             publish_output(temporary, &paths.output, deadline)?;
             return Ok(receipt(args, paths, bytes, true, false, 0));
         }
-        fs::remove_file(&paths.cache_file).map_err(|error| error.to_string())?;
+        fs::remove_file(&paths.cache_file)
+            .map_err(|error| path_error("remove corrupt cache entry", &paths.cache_file, error))?;
         discarded_corrupt_cache = true;
         eprintln!("Discarded cache entry with incorrect SHA-256; fetching pinned bytes.");
     }
@@ -217,9 +234,9 @@ async fn fetch_inner(
             Ok(temporary) => {
                 // Both names are on the same filesystem. A concurrent fetch of
                 // this content may also publish the same fully verified bytes.
-                temporary
-                    .persist(&paths.cache_file)
-                    .map_err(|error| error.to_string())?;
+                temporary.persist(&paths.cache_file).map_err(|error| {
+                    path_error("publish verified cache entry", &paths.cache_file, error)
+                })?;
                 let (output, bytes) = verified_copy(paths, &args.sha256, deadline)?
                     .ok_or("cache bytes changed after verified download")?;
                 publish_output(output, &paths.output, deadline)?;
@@ -256,7 +273,7 @@ async fn acquire_cache_lock(paths: &Paths, deadline: Instant) -> Result<File, St
         .create(true)
         .truncate(false)
         .open(&paths.cache_lock)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| path_error("open cache lock", &paths.cache_lock, error))?;
     // Keep this zero-byte lock file across runs; unlinking it would allow two
     // different inodes to be locked for the same key. The OS releases the lock
     // when this handle closes, including process exit; no stale-PID guessing.
@@ -267,7 +284,9 @@ async fn acquire_cache_lock(paths: &Paths, deadline: Instant) -> Result<File, St
             Err(fs::TryLockError::WouldBlock) => {
                 tokio::time::sleep(Duration::from_millis(25)).await
             }
-            Err(fs::TryLockError::Error(error)) => return Err(error.to_string()),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(path_error("lock cache digest", &paths.cache_lock, error));
+            }
         }
     }
 }
@@ -326,14 +345,24 @@ async fn download(
             },
         );
     }
-    let mut temporary = NamedTempFile::new_in(paths.cache_file.parent().unwrap())
-        .map_err(|error| AttemptError::Reject(error.to_string()))?;
+    let cache_parent = paths.cache_file.parent().unwrap();
+    let mut temporary = NamedTempFile::new_in(cache_parent).map_err(|error| {
+        AttemptError::Reject(path_error(
+            "create download temporary file",
+            cache_parent,
+            error,
+        ))
+    })?;
     let mut digest = Sha256::new();
     while let Some(chunk) = response.chunk().await.map_err(network_error)? {
         check_deadline(deadline).map_err(AttemptError::Reject)?;
-        temporary
-            .write_all(&chunk)
-            .map_err(|error| AttemptError::Reject(error.to_string()))?;
+        temporary.write_all(&chunk).map_err(|error| {
+            AttemptError::Reject(path_error(
+                "write download temporary file",
+                temporary.path(),
+                error,
+            ))
+        })?;
         digest.update(&chunk);
     }
     if format!("{:x}", digest.finalize()) != expected {
@@ -341,10 +370,13 @@ async fn download(
             "download SHA-256 mismatch; no bytes published".into(),
         ));
     }
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| AttemptError::Reject(error.to_string()))?;
+    temporary.as_file().sync_all().map_err(|error| {
+        AttemptError::Reject(path_error(
+            "sync download temporary file",
+            temporary.path(),
+            error,
+        ))
+    })?;
     check_deadline(deadline).map_err(AttemptError::Reject)?;
     Ok(temporary)
 }
@@ -366,23 +398,34 @@ fn verified_copy(
     expected: &str,
     deadline: Instant,
 ) -> Result<Option<(NamedTempFile, u64)>, String> {
-    let mut source = File::open(&paths.cache_file).map_err(|error| error.to_string())?;
-    let mut destination =
-        NamedTempFile::new_in(paths.output.parent().unwrap()).map_err(|error| error.to_string())?;
+    let mut source = File::open(&paths.cache_file).map_err(|error| {
+        path_error(
+            "open cache entry for verification",
+            &paths.cache_file,
+            error,
+        )
+    })?;
+    let output_parent = paths.output.parent().unwrap();
+    let mut destination = NamedTempFile::new_in(output_parent)
+        .map_err(|error| path_error("create output temporary file", output_parent, error))?;
     let mut digest = Sha256::new();
     let mut bytes = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         check_deadline(deadline)?;
-        let count = source
-            .read(&mut buffer)
-            .map_err(|error| error.to_string())?;
+        let count = source.read(&mut buffer).map_err(|error| {
+            path_error(
+                "read cache entry for verification",
+                &paths.cache_file,
+                error,
+            )
+        })?;
         if count == 0 {
             break;
         }
-        destination
-            .write_all(&buffer[..count])
-            .map_err(|error| error.to_string())?;
+        destination.write_all(&buffer[..count]).map_err(|error| {
+            path_error("write output temporary file", destination.path(), error)
+        })?;
         digest.update(&buffer[..count]);
         bytes = bytes
             .checked_add(count as u64)
@@ -394,7 +437,7 @@ fn verified_copy(
     destination
         .as_file()
         .sync_all()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| path_error("sync output temporary file", destination.path(), error))?;
     Ok(Some((destination, bytes)))
 }
 
@@ -406,7 +449,7 @@ fn publish_output(
     check_deadline(deadline)?;
     temporary
         .persist_noclobber(output)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| path_error("publish verified output", output, error))?;
     Ok(())
 }
 

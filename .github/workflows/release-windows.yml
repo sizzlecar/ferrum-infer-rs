@@ -163,12 +163,14 @@ jobs:
           $cache = if ($env:FERRUM_WINDOWS_OBJECT_CACHE) { $env:FERRUM_WINDOWS_OBJECT_CACHE } else { Join-Path $env:USERPROFILE 'ferrum-native-object-cache' }
           $cache = [IO.Path]::GetFullPath($cache)
           "WINDOWS_OBJECT_CACHE=$cache" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "WINDOWS_DOWNLOAD_CACHE=$(Join-Path (Split-Path $cache -Parent) 'ferrum-release-download-cache')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          # A runner service may have Modify on the configured cache while its
+          # parent is read-only. Keep new caches inside that writable root.
+          "WINDOWS_DOWNLOAD_CACHE=$(Join-Path $cache '.release-downloads')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           if ($env:BACKEND -eq 'cuda') {
             # Dependency compilers retain the RAM budget. Only the final
             # executable gets the full jobserver for parallel ThinLTO.
             "WINDOWS_LINK_BUILD_JOBS=$logical" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-            $coreCache = if ($env:FERRUM_CUDA_NATIVE_BUILD_CACHE) { $env:FERRUM_CUDA_NATIVE_BUILD_CACHE } else { Join-Path (Split-Path $cache -Parent) 'cuda-core-cache' }
+            $coreCache = if ($env:FERRUM_CUDA_NATIVE_BUILD_CACHE) { $env:FERRUM_CUDA_NATIVE_BUILD_CACHE } else { Join-Path $cache '.cuda-core' }
             "FERRUM_CUDA_NATIVE_BUILD_CACHE=$coreCache" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           }
           "Windows build: $logical logical CPUs, $([math]::Round($availableGiB,1)) GiB available RAM, $jobs Cargo jobs." | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
