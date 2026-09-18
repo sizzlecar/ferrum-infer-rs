@@ -79,6 +79,7 @@ fn names(backend: Backend) -> Vec<String> {
                 "pq2_mixed_prefill_specialization_preserves_f32_operands_tiles_and_guards_on_metal",
                 "pq2_mixed_prefill_m64_preserves_f32_operands_tiles_and_guards_on_metal",
                 "pq2_mixed_prefill_m64_selection_requires_aligned_rows_wide_output_and_capability",
+                "pq2_hadamard_prefill_selection_preserves_format_dtype_and_shape_boundaries",
                 "pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output",
             ]),
             ("linear::narrow_dense_tests", &[

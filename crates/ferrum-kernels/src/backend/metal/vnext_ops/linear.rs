@@ -106,6 +106,21 @@ pub(super) const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
 ];
 const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = ALL_LINEAR_QUANTIZATION_FORMATS;
 
+fn hadamard_tiled_gemm_supported(
+    format: GgufBlockFormat,
+    activation_type: ElementType,
+    params: LinearParams,
+) -> bool {
+    // The transform scratch is F32; the declared activation ABI determines
+    // the final output store. Keep F32 outputs on their existing GEMV path.
+    activation_type == ElementType::F16
+        && ((params.rows >= NATIVE_TILED_GEMM_MIN_ROWS
+            && params.out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES)
+            || (format == GgufBlockFormat::Pq2_0
+                && params.rows >= 20
+                && params.out_features >= 4096))
+}
+
 fn pq2_mixed_prefill_m64_supported(
     format: GgufBlockFormat,
     params: LinearParams,
@@ -324,6 +339,38 @@ impl MetalLinearPipelines {
                 .f32_linear_dispatch(format, params.rows, params.out_features)
                 .expect("validated Metal F32 linear format"),
             _ => unreachable!("validated Metal linear activation ABI"),
+        }
+    }
+
+    fn hadamard_native_dispatch(
+        &self,
+        format: GgufBlockFormat,
+        activation_type: ElementType,
+        params: LinearParams,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        if hadamard_tiled_gemm_supported(format, activation_type, params) {
+            return self.mixed_input_tiled_pipeline(format, params);
+        }
+        if format == GgufBlockFormat::Pq2_0 && params.rows < NATIVE_TILED_GEMM_MIN_ROWS {
+            return (
+                if activation_type == ElementType::F32 {
+                    &self.native.pq2_linear_f32
+                } else {
+                    &self.native.pq2_linear_f32_f16
+                },
+                LinearDispatchKind::Pq2CooperativeGemv,
+            );
+        }
+        if activation_type == ElementType::F32 {
+            (
+                self.native.linear_f32(format),
+                LinearDispatchKind::CooperativeGemv,
+            )
+        } else {
+            (
+                self.native.linear_f32_f16(format),
+                LinearDispatchKind::CooperativeGemv,
+            )
         }
     }
 
@@ -1841,30 +1888,7 @@ pub(super) fn dispatch_linear(
             LinearPhysicalFormat::Native(format) => Some(format),
         };
         let (pipeline, dispatch_kind) = if let Some(format) = native {
-            if format == GgufBlockFormat::Pq2_0 && launch.params.rows < NATIVE_TILED_GEMM_MIN_ROWS {
-                (
-                    if launch.activation_type == ElementType::F32 {
-                        &pipelines.native.pq2_linear_f32
-                    } else {
-                        &pipelines.native.pq2_linear_f32_f16
-                    },
-                    LinearDispatchKind::Pq2CooperativeGemv,
-                )
-            } else if launch.activation_type == ElementType::F32 {
-                (
-                    pipelines.native.linear_f32(format),
-                    LinearDispatchKind::CooperativeGemv,
-                )
-            } else if launch.params.rows >= NATIVE_TILED_GEMM_MIN_ROWS
-                && launch.params.out_features >= NATIVE_TILED_GEMM_MIN_OUTPUT_FEATURES
-            {
-                pipelines.mixed_input_tiled_pipeline(format, launch.params)
-            } else {
-                (
-                    pipelines.native.linear_f32_f16(format),
-                    LinearDispatchKind::CooperativeGemv,
-                )
-            }
+            pipelines.hadamard_native_dispatch(format, launch.activation_type, launch.params)
         } else if launch.activation_type == ElementType::F32 {
             (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
         } else {
