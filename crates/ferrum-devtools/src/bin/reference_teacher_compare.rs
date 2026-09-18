@@ -109,7 +109,7 @@ async fn compare(args: &Args) -> Result<Value> {
         let body: Value = serde_json::from_slice(&response)?;
         let reference =
             distribution::reference_log_probabilities(&body, wave.logits.len(), history.len())?;
-        let metrics = distribution::compare(&reference, &wave.logits, wave.token)?;
+        let metrics = distribution::compare(&reference, &wave.logits, wave.token);
         let raw: Vec<_> = reference
             .iter()
             .flat_map(|value| value.to_le_bytes())
@@ -122,12 +122,15 @@ async fn compare(args: &Args) -> Result<Value> {
             "reference_request":request,"reference_response_sha256":sha256(&response),
             "reference_timings":body.get("timings"),"reference_distribution":{
                 "file":raw_file,"encoding":"f64-le","element_count":reference.len(),
+                "zero_probability_token_count":reference.iter().filter(|p|p.exp()==0.0).count(),
                 "sha256":sha256(&raw),"representation":"pre-sampling-log-probabilities"},
-            "comparison":metrics});
+            "comparison":metrics.as_ref().ok(),
+            "comparison_error":metrics.as_ref().err().map(|error|format!("{error:#}"))});
         write_new(
             &args.output_dir.join(format!("decision-{index:04}.json")),
             &serde_json::to_vec_pretty(&record)?,
         )?;
+        metrics.with_context(|| format!("teacher decision {index} is not measurable; complete reference evidence was retained"))?;
         results.push(record);
         history.push(wave.token);
         eprintln!(

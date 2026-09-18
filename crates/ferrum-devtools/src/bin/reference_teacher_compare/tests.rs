@@ -53,6 +53,48 @@ fn reference_rejects_missing_duplicate_renormalized_or_truncated_evidence() {
     assert!(distribution::compare(&[0.0], &[0.0], 1).is_err());
 }
 
+#[test]
+fn reference_zero_mass_is_retained_but_teacher_nll_must_be_measurable() {
+    let mut body = response(&[0.25, 0.75, 1.0]);
+    // The real native serializer uses float::lowest(), not null or -inf.
+    body["completion_probabilities"][0]["top_logprobs"][0]["logprob"] = json!(f32::MIN);
+    let reference = distribution::reference_log_probabilities(&body, 3, 3).unwrap();
+    assert_eq!(reference.len(), 3);
+    assert_eq!(reference[2], f64::from(f32::MIN));
+    let metrics = distribution::compare(&reference, &[0.0, 0.0, 0.0], 1).unwrap();
+    assert_eq!(metrics["reference_zero_probability_token_count"], 1);
+    assert_eq!(metrics["vocabulary_size"], 3);
+    // Keep the full candidate vocabulary; removing its third token and
+    // renormalizing the remaining two would give a different, smaller KL.
+    let expected_kl = 0.25 * 0.75_f64.ln() + 0.75 * 2.25_f64.ln();
+    assert!(
+        (metrics["kl_reference_to_candidate_nats"].as_f64().unwrap() - expected_kl).abs() < 1e-12
+    );
+    let error = distribution::compare(&reference, &[0.0, 0.0, 0.0], 2).unwrap_err();
+    assert!(error.to_string().contains("not measurable"));
+    let aggregate = distribution::aggregate(&[json!({"comparison":metrics})]).unwrap();
+    assert_eq!(aggregate["reference_zero_probability_token_count_total"], 1);
+    assert_eq!(
+        aggregate["distributions_with_reference_zero_probability"],
+        1
+    );
+}
+
+#[test]
+fn positive_subnormal_reference_probability_is_not_mistaken_for_the_zero_floor() {
+    let tiny = f64::from(f32::from_bits(1));
+    let body = response(&[1.0, tiny]);
+    let reference = distribution::reference_log_probabilities(&body, 2, 3).unwrap();
+    let metrics = distribution::compare(&reference, &[0.0, tiny.ln() as f32], 1).unwrap();
+    assert_eq!(metrics["reference_zero_probability_token_count"], 0);
+    assert!((metrics["reference_nll_nats"].as_f64().unwrap() + tiny.ln()).abs() < 1e-12);
+    let aggregate = distribution::aggregate(&[json!({"comparison":metrics})]).unwrap();
+    assert_eq!(
+        aggregate["distributions_with_reference_zero_probability"],
+        0
+    );
+}
+
 fn fixture() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let prompt = [0, 1, 2];

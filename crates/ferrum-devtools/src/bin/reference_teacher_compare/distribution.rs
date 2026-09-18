@@ -87,10 +87,25 @@ pub(super) fn compare(reference: &[f64], logits: &[f32], teacher: u32) -> Result
     );
     let reference_offset = reference_mass.ln();
     let normalized: Vec<_> = reference.iter().map(|x| x - reference_offset).collect();
+    // Native llama.cpp serializes a zero F32 softmax probability as f32::MIN
+    // to avoid JSON null for -inf. This remains a zero-mass vocabulary entry,
+    // not a measurable finite NLL of approximately 3.4e38.
+    let zero_probability_token_count = normalized.iter().filter(|p| p.exp() == 0.0).count();
+    ensure!(
+        normalized[teacher as usize].exp() > 0.0,
+        "reference teacher token {teacher} has zero probability after F32 softmax (including its serialized floor); NLL and delta NLL are not measurable ({zero_probability_token_count} zero-probability vocabulary entries)"
+    );
     let kl = normalized
         .iter()
         .zip(&candidate)
-        .map(|(p, q)| p.exp() * (p - q))
+        .map(|(p, q)| {
+            let probability = p.exp();
+            if probability == 0.0 {
+                0.0
+            } else {
+                probability * (p - q)
+            }
+        })
         .sum::<f64>()
         .max(0.0);
     let reference_nll = -normalized[teacher as usize];
@@ -111,6 +126,7 @@ pub(super) fn compare(reference: &[f64], logits: &[f32], teacher: u32) -> Result
     );
     Ok(
         json!({"vocabulary_size":logits.len(),"reference_probability_mass":reference_mass,
+        "reference_zero_probability_token_count":zero_probability_token_count,
         "reference_log_normalization_correction":reference_offset,
         "kl_reference_to_candidate_nats":kl,"reference_nll_nats":reference_nll,
         "candidate_nll_nats":candidate_nll,"delta_nll_nats":candidate_nll-reference_nll,
@@ -150,5 +166,25 @@ pub(super) fn aggregate(decisions: &[Value]) -> Result<Value> {
         );
     }
     result.insert("distribution_count".into(), json!(decisions.len()));
+    let zero_counts = decisions
+        .iter()
+        .map(|decision| {
+            decision["comparison"]["reference_zero_probability_token_count"]
+                .as_u64()
+                .context("missing reference zero-probability count")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let total = zero_counts
+        .iter()
+        .try_fold(0_u64, |total, count| total.checked_add(*count))
+        .context("reference zero-probability count overflow")?;
+    result.insert(
+        "reference_zero_probability_token_count_total".into(),
+        json!(total),
+    );
+    result.insert(
+        "distributions_with_reference_zero_probability".into(),
+        json!(zero_counts.iter().filter(|&&count| count != 0).count()),
+    );
     Ok(Value::Object(result))
 }
