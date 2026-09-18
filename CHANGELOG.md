@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added packed GGUF PQ2_0 and declared Hadamard transforms on Metal and CUDA, including embedding inverse transforms and mixed projection layouts, with incompatible metadata rejected explicitly.
+- Validated official Bonsai 2 27B PQ2_0 text inference on Metal with FP16 KV through `run`, `serve`, an 8K-context request, and Orchestral tool execution and continuation. CUDA operator and small checkpoint tests pass on real hardware; full 27B CUDA model validation remains pending.
+- Added native checkpoint restore coverage for PQ2_0/Hadamard hybrid models, including GDN and causal KV state, with actual Bonsai prefix-state reuse verified on Metal and retained state charged to the runtime memory budget.
+
 ## [0.11.0] - 2026-09-17
 
 ### Fixed
