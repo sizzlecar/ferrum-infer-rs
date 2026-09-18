@@ -65,7 +65,7 @@ fn pq2_float_floor_decoding_preserves_reference_tails_codes_and_f32_ranges() {
     let reference = ReferencePipelines::new(&device);
     let queue = device.new_command_queue();
     for output in [ElementType::F16, ElementType::F32] {
-        for (rows, width, outputs) in [(1, 128, 1), (3, 384, 17), (31, 640, 31)] {
+        for (rows, width, outputs) in [(1, 128, 1), (3, 384, 17), (31, 640, 33)] {
             let fixture = Fixture::new(&device, rows, width, outputs, output, true);
             fixture.run(&production, &queue, true, 1);
             let baseline = fixture.read();
@@ -79,7 +79,7 @@ fn pq2_float_floor_decoding_preserves_reference_tails_codes_and_f32_ranges() {
             assert_same_bits(&fixture.read(), &baseline);
         }
         // All 256 packed bytes, non-dyadic inputs, positive and negative scales.
-        for scale in [0x3555, 0xb955, 0x0001, 0] {
+        for scale in [0x3555, 0xb955, 0x0001, 0, 0x8000] {
             let mut fixture = Fixture::new(&device, 1, 1024, 17, output, true);
             fixture.replace_payload(
                 &device,
@@ -104,6 +104,24 @@ fn pq2_float_floor_decoding_preserves_reference_tails_codes_and_f32_ranges() {
             &device,
             (0..128).map(|i| (i as f32 * 1.37).cos()).collect(),
             weights(128, 17, 0x3555, |_| 0x55),
+        );
+        zeros.run(&production, &queue, true, 1);
+        let baseline = zeros.read();
+        zeros.run_pipeline(
+            reference.get(output),
+            LinearDispatchKind::Pq2CooperativeGemv,
+            &queue,
+            1,
+        );
+        zeros.assert_cpu();
+        assert_same_bits(&zeros.read(), &baseline);
+        // Preserve signed zero through scale products and SIMD reduction too.
+        zeros.replace_payload(
+            &device,
+            (0..128)
+                .map(|i| if i % 2 == 0 { 0.0 } else { -0.0 })
+                .collect(),
+            weights(128, 17, 0xb955, |i| i as u8),
         );
         zeros.run(&production, &queue, true, 1);
         let baseline = zeros.read();
@@ -202,7 +220,18 @@ fn pq2_float_floor_decoding_isolated_gpu_timing() {
     let queue = device.new_command_queue();
     for (width, outputs) in [(5120, 17408), (17408, 5120), (6144, 5120)] {
         for output in [ElementType::F16, ElementType::F32] {
-            let fixture = Fixture::new(&device, 1, width, outputs, output, false);
+            let mut fixture = Fixture::new(&device, 1, width, outputs, output, false);
+            // Cover all packed byte values, with a deterministic phase shift
+            // across 256-byte groups. Both decoders receive identical buffers.
+            fixture.replace_payload(
+                &device,
+                (0..width)
+                    .map(|i| ((i * 37 % 63) as i32 - 31) as f32 / 512.0)
+                    .collect(),
+                weights(width, outputs, 0x3000, |i| {
+                    i.wrapping_mul(73).wrapping_add(i >> 8) as u8
+                }),
+            );
             let run = |new, repetitions| {
                 if new {
                     fixture.run(&production, &queue, true, repetitions)
