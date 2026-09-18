@@ -1,6 +1,44 @@
 name: Stage Windows release assets
 
 on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Windows package backend
+        type: choice
+        required: true
+        options: [cpu, cuda]
+      version:
+        description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      release_candidate_sha:
+        description: Exact release-candidate commit to build
+        required: true
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        type: string
+      publish_release:
+        description: Safety lock; production staging requires false
+        required: true
+        default: false
+        type: boolean
+      windows_launcher_url:
+        description: Immutable released launcher URL; empty only for its first issuance
+        required: false
+        default: ''
+        type: string
+      windows_launcher_sha256:
+        description: SHA256 paired with windows_launcher_url; the launcher is reused unchanged
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       backend:
