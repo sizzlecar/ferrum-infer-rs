@@ -88,6 +88,9 @@ const INT8_GQA_PREFILL_DIM_SLAB: u64 = 64;
 const GROUPED_DECODE_MAX_PARTITIONS: u64 = SIMD_THREADS;
 const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = 256;
 
+mod head_dim_specialization;
+use head_dim_specialization::{AttentionHeadDim, SpecializedAttentionPipelines};
+
 pub(super) struct MetalCausalAttentionPipelines {
     kv_type: ElementType,
     prepare: ComputePipelineState,
@@ -97,6 +100,7 @@ pub(super) struct MetalCausalAttentionPipelines {
     grouped_decode_reduce_attention: ComputePipelineState,
     tiled_prefill_attention: ComputePipelineState,
     gqa_tiled_prefill_attention: ComputePipelineState,
+    specialized: [SpecializedAttentionPipelines; 2],
     binding_encoder: Mutex<ArgumentEncoder>,
     binding_encoded_length: u64,
     binding_alignment: u64,
@@ -120,11 +124,16 @@ impl MetalCausalAttentionPipelines {
                 ))
             })?;
         let function = |name: &str| {
-            library.get_function(name, None).map_err(|error| {
-                MetalDeviceRuntimeError::contract(format!(
-                    "load Metal vNext causal-attention `{name}`: {error}"
-                ))
-            })
+            // Resolve optional function constants even for the dynamic route.
+            // An empty set makes is_function_constant_defined false; Metal
+            // cannot build a PSO from an unspecialized function declaration.
+            library
+                .get_function(name, Some(metal::FunctionConstantValues::new()))
+                .map_err(|error| {
+                    MetalDeviceRuntimeError::contract(format!(
+                        "load Metal vNext causal-attention `{name}`: {error}"
+                    ))
+                })
         };
         let prepare_function = function(PREPARE_KERNEL)?;
         let attention_function = function(ATTENTION_KERNEL)?;
@@ -242,6 +251,15 @@ impl MetalCausalAttentionPipelines {
             .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS)
             as u32;
         let maximum_threadgroup_memory_length = device.max_threadgroup_memory_length() as u64;
+        let specialized = AttentionHeadDim::ALL.map(|head_dim| {
+            SpecializedAttentionPipelines::new(
+                device,
+                &library,
+                head_dim,
+                binding_encoded_length,
+                binding_alignment,
+            )
+        });
         Ok(Self {
             kv_type: ElementType::F16,
             prepare,
@@ -251,6 +269,7 @@ impl MetalCausalAttentionPipelines {
             grouped_decode_reduce_attention,
             tiled_prefill_attention,
             gqa_tiled_prefill_attention,
+            specialized,
             binding_encoder: Mutex::new(prepare_encoder),
             binding_encoded_length,
             binding_alignment,
@@ -372,6 +391,7 @@ impl MetalCausalAttentionPipelines {
             // Grouped decode remains F16-specific.
             grouped_decode_partial_attention: attention.clone(),
             grouped_decode_reduce_attention: attention.clone(),
+            specialized: std::array::from_fn(|_| SpecializedAttentionPipelines::default()),
             tiled_prefill_attention,
             gqa_tiled_prefill_attention,
             attention,
@@ -593,6 +613,7 @@ impl MetalCausalPagedAttentionProvider {
             super::linear::ALL_LINEAR_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("causal_attention.rs").as_bytes(),
+                include_str!("causal_attention/head_dim_specialization.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 INT8_SHADER_SOURCE.as_bytes(),
                 super::linear::FINGERPRINT_SOURCE.as_bytes(),
@@ -2194,9 +2215,9 @@ fn dispatch_attention(
     );
     set_params(encoder, 4, &launch.params);
     use_pages(encoder, regions, launch);
-    encode_attention_dispatch(pipelines, encoder, plan);
+    encode_attention_dispatch(pipelines, encoder, plan, &launch.params);
     if plan.kind == AttentionDispatchKind::GroupedDecode {
-        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        encoder.set_compute_pipeline_state(pipelines.grouped_reduce_pipeline(&launch.params));
         set_region_offset(encoder, 0, scratch, launch.split_decode);
         set_region_offset(encoder, 1, scratch, launch.query_raw);
         set_region_offset(encoder, 2, scratch, launch.context);
@@ -2390,14 +2411,9 @@ fn encode_attention_dispatch(
     pipelines: &MetalCausalAttentionPipelines,
     encoder: &ComputeCommandEncoderRef,
     plan: AttentionDispatchPlan,
+    params: &CausalAttentionParams,
 ) {
-    encoder.set_compute_pipeline_state(match plan.kind {
-        AttentionDispatchKind::General => &pipelines.attention,
-        AttentionDispatchKind::DirectDecode => &pipelines.direct_decode_attention,
-        AttentionDispatchKind::GroupedDecode => &pipelines.grouped_decode_partial_attention,
-        AttentionDispatchKind::GqaTiledPrefill => &pipelines.gqa_tiled_prefill_attention,
-        AttentionDispatchKind::TiledPrefill => &pipelines.tiled_prefill_attention,
-    });
+    encoder.set_compute_pipeline_state(pipelines.attention_pipeline(params, plan.kind));
     encoder.set_threadgroup_memory_length(0, plan.threadgroup_memory_bytes[0]);
     encoder.set_threadgroup_memory_length(1, plan.threadgroup_memory_bytes[1]);
     encoder.dispatch_thread_groups(

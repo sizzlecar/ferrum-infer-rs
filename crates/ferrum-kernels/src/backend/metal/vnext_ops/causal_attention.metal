@@ -35,6 +35,14 @@ struct VNextCausalAttentionParams {
     float rope_theta;
 };
 
+// Unbound functions retain the dynamic ABI. Only typed 128/256 pipelines bind
+// this constant; all arithmetic, page addressing and reduction order is shared.
+constant uint VNEXT_ATTENTION_HEAD_DIM [[function_constant(0)]];
+inline uint vnext_attention_head_dim(constant VNextCausalAttentionParams& params) {
+    return is_function_constant_defined(VNEXT_ATTENTION_HEAD_DIM)
+        ? VNEXT_ATTENTION_HEAD_DIM : params.head_dim;
+}
+
 inline ulong vnext_kv_element_index(
     uint token,
     uint kind,
@@ -44,7 +52,7 @@ inline ulong vnext_kv_element_index(
     return (((ulong)token * 2ul + (ulong)kind) *
                 (ulong)params.key_value_heads +
             (ulong)head) *
-               (ulong)params.head_dim +
+               (ulong)vnext_attention_head_dim(params) +
            (ulong)dim;
 }
 
@@ -104,7 +112,7 @@ inline void vnext_store_prepared_value(
     const half converted = half(value);
     if (is_query) {
         query[((ulong)token * (ulong)params.query_heads + (ulong)head) *
-                  (ulong)params.head_dim +
+                  (ulong)vnext_attention_head_dim(params) +
               (ulong)dim] = converted;
     } else {
         vnext_store_kv(
@@ -146,8 +154,8 @@ kernel void vnext_causal_prepare_f16(
     if (!is_query && !is_key) {
         const device half *source =
             value_raw + (ulong)token * (ulong)params.kv_projection_stride +
-            (ulong)head * (ulong)params.head_dim;
-        for (uint dim = lane; dim < params.head_dim; dim += VNEXT_SIMD_WIDTH) {
+            (ulong)head * (ulong)vnext_attention_head_dim(params);
+        for (uint dim = lane; dim < vnext_attention_head_dim(params); dim += VNEXT_SIMD_WIDTH) {
             vnext_store_kv(
                 page_table,
                 params,
@@ -169,16 +177,16 @@ kernel void vnext_causal_prepare_f16(
                                     : key_raw +
                                           (ulong)token *
                                               (ulong)params.kv_projection_stride +
-                                          (ulong)head * (ulong)params.head_dim;
+                                          (ulong)head * (ulong)vnext_attention_head_dim(params);
     const device half *weight = is_query ? query_norm_weight : key_norm_weight;
     float sum_squares = 0.0f;
-    for (uint dim = lane; dim < params.head_dim; dim += VNEXT_SIMD_WIDTH) {
+    for (uint dim = lane; dim < vnext_attention_head_dim(params); dim += VNEXT_SIMD_WIDTH) {
         const float value = float(source[dim]);
         sum_squares += value * value;
     }
     sum_squares = simd_sum(sum_squares);
     const float norm_scale =
-        rsqrt(sum_squares / float(params.head_dim) + params.epsilon);
+        rsqrt(sum_squares / float(vnext_attention_head_dim(params)) + params.epsilon);
     const uint half_rope = params.rope_dim / 2u;
 
     if (params.rope_interleaved != 0u) {
@@ -251,7 +259,7 @@ kernel void vnext_causal_prepare_f16(
         }
     }
 
-    for (uint dim = params.rope_dim + lane; dim < params.head_dim;
+    for (uint dim = params.rope_dim + lane; dim < vnext_attention_head_dim(params);
          dim += VNEXT_SIMD_WIDTH) {
         const float value =
             float(source[dim]) * norm_scale * float(weight[dim]);
@@ -294,10 +302,10 @@ kernel void vnext_causal_attention_f16(
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
         query_values[chunk] =
-            dim < params.head_dim
+            dim < vnext_attention_head_dim(params)
                 ? float(query[((ulong)token * (ulong)params.query_heads +
                                (ulong)query_head) *
-                                  (ulong)params.head_dim +
+                                  (ulong)vnext_attention_head_dim(params) +
                               (ulong)dim])
                 : 0.0f;
         accumulated[chunk] = 0.0f;
@@ -305,13 +313,13 @@ kernel void vnext_causal_attention_f16(
 
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    const float attention_scale = rsqrt(float(params.head_dim));
+    const float attention_scale = rsqrt(float(vnext_attention_head_dim(params)));
     for (uint key_position = simdgroup; key_position <= absolute_position;
          key_position += params.attention_simdgroups) {
         float partial_dot = 0.0f;
         for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
             const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-            if (dim < params.head_dim) {
+            if (dim < vnext_attention_head_dim(params)) {
                 partial_dot += query_values[chunk] *
                                vnext_load_kv(
                                    page_table,
@@ -330,7 +338,7 @@ kernel void vnext_causal_attention_f16(
         running_sum = running_sum * previous_scale + value_scale;
         for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
             const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-            if (dim < params.head_dim) {
+            if (dim < vnext_attention_head_dim(params)) {
                 const float value = vnext_load_kv(
                     page_table,
                     params,
@@ -347,15 +355,15 @@ kernel void vnext_causal_attention_f16(
 
     threadgroup float *partial_outputs = shared;
     threadgroup float *partial_maxima =
-        partial_outputs + params.attention_simdgroups * params.head_dim;
+        partial_outputs + params.attention_simdgroups * vnext_attention_head_dim(params);
     threadgroup float *partial_sums =
         partial_maxima + params.attention_simdgroups;
     threadgroup float *partial_scales =
         partial_sums + params.attention_simdgroups;
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-        if (dim < params.head_dim) {
-            partial_outputs[simdgroup * params.head_dim + dim] =
+        if (dim < vnext_attention_head_dim(params)) {
+            partial_outputs[simdgroup * vnext_attention_head_dim(params) + dim] =
                 accumulated[chunk];
         }
     }
@@ -392,26 +400,26 @@ kernel void vnext_causal_attention_f16(
     const float inverse_sum = 1.0f / partial_sums[0];
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-        if (dim < params.head_dim) {
+        if (dim < vnext_attention_head_dim(params)) {
             float value = 0.0f;
             for (uint partial = 0; partial < params.attention_simdgroups;
                  ++partial) {
                 value += partial_outputs
-                             [partial * params.head_dim + dim] *
+                             [partial * vnext_attention_head_dim(params) + dim] *
                          partial_scales[partial];
             }
             value *= inverse_sum;
             if (params.output_gate != 0u) {
                 const ulong gate_index =
                     (ulong)token * (ulong)params.query_projection_stride +
-                    (ulong)query_head * (2ul * (ulong)params.head_dim) +
-                    (ulong)params.head_dim + (ulong)dim;
+                    (ulong)query_head * (2ul * (ulong)vnext_attention_head_dim(params)) +
+                    (ulong)vnext_attention_head_dim(params) + (ulong)dim;
                 const float gate = float(query_raw[gate_index]);
                 value *= 1.0f / (1.0f + exp(-gate));
             }
             output[((ulong)token * (ulong)params.query_heads +
                     (ulong)query_head) *
-                       (ulong)params.head_dim +
+                       (ulong)vnext_attention_head_dim(params) +
                    (ulong)dim] = half(value);
         }
     }
@@ -444,19 +452,19 @@ kernel void vnext_causal_attention_decode_direct_f16(
         query_head / (params.query_heads / params.key_value_heads);
     const uint absolute_position = params.position_start + token;
     const uint token_elements =
-        2u * params.key_value_heads * params.head_dim;
+        2u * params.key_value_heads * vnext_attention_head_dim(params);
     const uint tokens_per_page = params.page_elements / token_elements;
-    const float attention_scale = rsqrt(float(params.head_dim));
+    const float attention_scale = rsqrt(float(vnext_attention_head_dim(params)));
     float query_values[VNEXT_MAX_HEAD_CHUNKS];
     float accumulated[VNEXT_MAX_HEAD_CHUNKS];
 
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
         query_values[chunk] =
-            dim < params.head_dim
+            dim < vnext_attention_head_dim(params)
                 ? float(query[((ulong)token * (ulong)params.query_heads +
                                (ulong)query_head) *
-                                  (ulong)params.head_dim +
+                                  (ulong)vnext_attention_head_dim(params) +
                               (ulong)dim]) *
                       attention_scale
                 : 0.0f;
@@ -477,17 +485,17 @@ kernel void vnext_causal_attention_decode_direct_f16(
         const device half *key_row =
             page_base +
             (token_in_page * 2u * params.key_value_heads + kv_head) *
-                params.head_dim;
+                vnext_attention_head_dim(params);
         const device half *value_row =
             page_base +
             (token_in_page * 2u * params.key_value_heads +
              params.key_value_heads + kv_head) *
-                params.head_dim;
+                vnext_attention_head_dim(params);
 
         float partial_dot = 0.0f;
         for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
             const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-            if (dim < params.head_dim) {
+            if (dim < vnext_attention_head_dim(params)) {
                 partial_dot += query_values[chunk] * float(key_row[dim]);
             }
         }
@@ -499,7 +507,7 @@ kernel void vnext_causal_attention_decode_direct_f16(
         running_sum = running_sum * previous_scale + value_scale;
         for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
             const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-            if (dim < params.head_dim) {
+            if (dim < vnext_attention_head_dim(params)) {
                 accumulated[chunk] = accumulated[chunk] * previous_scale +
                                      float(value_row[dim]) * value_scale;
             }
@@ -509,15 +517,15 @@ kernel void vnext_causal_attention_decode_direct_f16(
 
     threadgroup float *partial_outputs = shared;
     threadgroup float *partial_maxima =
-        partial_outputs + params.attention_simdgroups * params.head_dim;
+        partial_outputs + params.attention_simdgroups * vnext_attention_head_dim(params);
     threadgroup float *partial_sums =
         partial_maxima + params.attention_simdgroups;
     threadgroup float *partial_scales =
         partial_sums + params.attention_simdgroups;
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-        if (dim < params.head_dim) {
-            partial_outputs[simdgroup * params.head_dim + dim] =
+        if (dim < vnext_attention_head_dim(params)) {
+            partial_outputs[simdgroup * vnext_attention_head_dim(params) + dim] =
                 accumulated[chunk];
         }
     }
@@ -554,26 +562,26 @@ kernel void vnext_causal_attention_decode_direct_f16(
     const float inverse_sum = 1.0f / partial_sums[0];
     for (uint chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
         const uint dim = lane + chunk * VNEXT_SIMD_WIDTH;
-        if (dim < params.head_dim) {
+        if (dim < vnext_attention_head_dim(params)) {
             float value = 0.0f;
             for (uint partial = 0; partial < params.attention_simdgroups;
                  ++partial) {
                 value += partial_outputs
-                             [partial * params.head_dim + dim] *
+                             [partial * vnext_attention_head_dim(params) + dim] *
                          partial_scales[partial];
             }
             value *= inverse_sum;
             if (params.output_gate != 0u) {
                 const ulong gate_index =
                     (ulong)token * (ulong)params.query_projection_stride +
-                    (ulong)query_head * (2ul * (ulong)params.head_dim) +
-                    (ulong)params.head_dim + (ulong)dim;
+                    (ulong)query_head * (2ul * (ulong)vnext_attention_head_dim(params)) +
+                    (ulong)vnext_attention_head_dim(params) + (ulong)dim;
                 const float gate = float(query_raw[gate_index]);
                 value *= 1.0f / (1.0f + exp(-gate));
             }
             output[((ulong)token * (ulong)params.query_heads +
                     (ulong)query_head) *
-                       (ulong)params.head_dim +
+                       (ulong)vnext_attention_head_dim(params) +
                    (ulong)dim] = half(value);
         }
     }
@@ -616,7 +624,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
         params.query_heads / params.key_value_heads;
     const uint query_head_start = kv_head * query_heads_per_kv_head;
     const uint query_elements =
-        VNEXT_PREFILL_QUERY_TILE * params.head_dim;
+        VNEXT_PREFILL_QUERY_TILE * vnext_attention_head_dim(params);
     threadgroup half *query_tile = shared_half;
     threadgroup half *probabilities =
         query_tile + query_elements;
@@ -627,14 +635,14 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
     for (uint element = thread_index;
          element < query_elements;
          element += VNEXT_PREFILL_SIMDGROUPS * VNEXT_SIMD_WIDTH) {
-        const uint query_row = element / params.head_dim;
-        const uint dim = element - query_row * params.head_dim;
+        const uint query_row = element / vnext_attention_head_dim(params);
+        const uint dim = element - query_row * vnext_attention_head_dim(params);
         const uint query_head = query_head_start + query_row;
         query_tile[element] =
             query_row < query_heads_per_kv_head
                 ? query[((ulong)token * (ulong)params.query_heads +
                          (ulong)query_head) *
-                            (ulong)params.head_dim +
+                            (ulong)vnext_attention_head_dim(params) +
                         (ulong)dim]
                 : half(0.0h);
         accumulated_output[element] = 0.0f;
@@ -643,8 +651,8 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
 
     const uint maximum_key_end = params.position_start + token + 1u;
     const uint key_value_row_stride =
-        2u * params.key_value_heads * params.head_dim;
-    const float attention_scale = rsqrt(float(params.head_dim));
+        2u * params.key_value_heads * vnext_attention_head_dim(params);
+    const float attention_scale = rsqrt(float(vnext_attention_head_dim(params)));
     float running_max[VNEXT_PREFILL_QUERY_TILE / VNEXT_PREFILL_SIMDGROUPS];
     float running_sum[VNEXT_PREFILL_QUERY_TILE / VNEXT_PREFILL_SIMDGROUPS];
     for (uint row = 0;
@@ -671,13 +679,13 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
                 vnext_kv_element_index(
                     key_block_start, 0, kv_head, 0, params));
             if (key_block != nullptr) {
-                for (uint dim = 0; dim < params.head_dim; dim += 8u) {
+                for (uint dim = 0; dim < vnext_attention_head_dim(params); dim += 8u) {
                     simdgroup_half8x8 query_matrix;
                     simdgroup_half8x8 key_matrix;
                     simdgroup_load(
                         query_matrix,
                         query_tile + dim,
-                        params.head_dim,
+                        vnext_attention_head_dim(params),
                         ulong2(0, 0),
                         false);
                     simdgroup_load(
@@ -718,11 +726,11 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
                 for (uint key_row = 0; key_row < key_block_rows;
                      ++key_row) {
                     float partial_dot = 0.0f;
-                    for (uint dim = lane; dim < params.head_dim;
+                    for (uint dim = lane; dim < vnext_attention_head_dim(params);
                          dim += VNEXT_SIMD_WIDTH) {
                         partial_dot +=
                             float(query_tile
-                                      [query_row * params.head_dim + dim]) *
+                                      [query_row * vnext_attention_head_dim(params) + dim]) *
                             vnext_load_kv(
                                 page_table,
                                 params,
@@ -770,10 +778,10 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
             running_max[row_slot] = next_maximum;
             probabilities[query_row * VNEXT_PREFILL_KEY_TILE + lane] =
                 half(probability);
-            for (uint dim = lane; dim < params.head_dim;
+            for (uint dim = lane; dim < vnext_attention_head_dim(params);
                  dim += VNEXT_SIMD_WIDTH) {
                 accumulated_output
-                    [query_row * params.head_dim + dim] *=
+                    [query_row * vnext_attention_head_dim(params) + dim] *=
                     previous_scale;
             }
         }
@@ -781,7 +789,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
 
         simdgroup_float8x8 output_matrices[8];
         const uint output_tiles_per_simdgroup =
-            params.head_dim / (VNEXT_PREFILL_SIMDGROUPS * 8u);
+            vnext_attention_head_dim(params) / (VNEXT_PREFILL_SIMDGROUPS * 8u);
         for (uint output_tile = 0;
              output_tile < output_tiles_per_simdgroup;
              ++output_tile) {
@@ -791,7 +799,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
             simdgroup_load(
                 output_matrices[output_tile],
                 accumulated_output + output_column,
-                params.head_dim,
+                vnext_attention_head_dim(params),
                 ulong2(0, 0),
                 false);
         }
@@ -848,7 +856,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
             simdgroup_store(
                 output_matrices[output_tile],
                 accumulated_output + output_column,
-                params.head_dim,
+                vnext_attention_head_dim(params),
                 ulong2(0, 0),
                 false);
         }
@@ -862,8 +870,8 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
             for (uint element = thread_index;
                  element < query_elements;
                  element += VNEXT_PREFILL_SIMDGROUPS * VNEXT_SIMD_WIDTH) {
-                const uint query_row = element / params.head_dim;
-                const uint dim = element - query_row * params.head_dim;
+                const uint query_row = element / vnext_attention_head_dim(params);
+                const uint dim = element - query_row * vnext_attention_head_dim(params);
                 float tail_value = 0.0f;
                 for (uint key_row = 0; key_row < tail_rows; ++key_row) {
                     tail_value +=
@@ -884,7 +892,7 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
         }
     }
 
-    const uint partial_stride = params.head_dim + 2u;
+    const uint partial_stride = vnext_attention_head_dim(params) + 2u;
     for (uint row_slot = 0;
          row_slot < VNEXT_PREFILL_QUERY_TILE / VNEXT_PREFILL_SIMDGROUPS;
          ++row_slot) {
@@ -902,11 +910,11 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
             partials[partial_base] = running_max[row_slot];
             partials[partial_base + 1ul] = running_sum[row_slot];
         }
-        for (uint dim = lane; dim < params.head_dim;
+        for (uint dim = lane; dim < vnext_attention_head_dim(params);
              dim += VNEXT_SIMD_WIDTH) {
             partials[partial_base + 2ul + (ulong)dim] =
                 accumulated_output
-                    [query_row * params.head_dim + dim];
+                    [query_row * vnext_attention_head_dim(params) + dim];
         }
     }
 }
@@ -924,7 +932,7 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
         return;
     }
 
-    const uint partial_stride = params.head_dim + 2u;
+    const uint partial_stride = vnext_attention_head_dim(params) + 2u;
     const uint partitions = vnext_grouped_decode_partitions(params);
     const bool active = lane < partitions;
     const ulong partial_base =
@@ -949,7 +957,7 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float inverse_sum = 1.0f / shared[partitions];
-    for (uint dim = lane; dim < params.head_dim;
+    for (uint dim = lane; dim < vnext_attention_head_dim(params);
          dim += VNEXT_SIMD_WIDTH) {
         float value = 0.0f;
         for (uint partition = 0; partition < partitions;
@@ -965,11 +973,11 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
         if (params.output_gate != 0u) {
             const ulong gate_index =
                 (ulong)query_head * (ulong)params.query_head_stride +
-                (ulong)params.head_dim + (ulong)dim;
+                (ulong)vnext_attention_head_dim(params) + (ulong)dim;
             const float gate = float(query_raw[gate_index]);
             value *= 1.0f / (1.0f + exp(-gate));
         }
-        output[(ulong)query_head * (ulong)params.head_dim +
+        output[(ulong)query_head * (ulong)vnext_attention_head_dim(params) +
                (ulong)dim] = half(value);
     }
 }
@@ -1004,7 +1012,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
     uint lane) {
     constexpr uint query_rows = HEAD_TILES * VNEXT_PREFILL_QUERY_TILE;
     constexpr uint rows_per_simdgroup = query_rows / SIMD_GROUP_COUNT;
-    const uint query_elements = query_rows * params.head_dim;
+    const uint query_elements = query_rows * vnext_attention_head_dim(params);
     threadgroup half *query_tile = shared_half;
     threadgroup half *probabilities =
         query_tile + query_elements;
@@ -1015,8 +1023,8 @@ inline void vnext_causal_attention_prefill_tiled_body(
     for (uint element = thread_index;
          element < query_elements;
          element += SIMD_GROUP_COUNT * VNEXT_SIMD_WIDTH) {
-        const uint logical_row = element / params.head_dim;
-        const uint dim = element - logical_row * params.head_dim;
+        const uint logical_row = element / vnext_attention_head_dim(params);
+        const uint dim = element - logical_row * vnext_attention_head_dim(params);
         const uint head_slot = logical_row / VNEXT_PREFILL_QUERY_TILE;
         const uint query_row =
             logical_row - head_slot * VNEXT_PREFILL_QUERY_TILE;
@@ -1026,7 +1034,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
             token < params.tokens
                 ? query[((ulong)token * (ulong)params.query_heads +
                          (ulong)query_head) *
-                            (ulong)params.head_dim +
+                            (ulong)vnext_attention_head_dim(params) +
                         (ulong)dim]
                 : half(0.0h);
         accumulated_output[element] = 0.0f;
@@ -1038,8 +1046,8 @@ inline void vnext_causal_attention_prefill_tiled_body(
         params.tokens);
     const uint maximum_key_end = params.position_start + query_end;
     const uint key_value_row_stride =
-        2u * params.key_value_heads * params.head_dim;
-    const float attention_scale = rsqrt(float(params.head_dim));
+        2u * params.key_value_heads * vnext_attention_head_dim(params);
+    const float attention_scale = rsqrt(float(vnext_attention_head_dim(params)));
 
     float running_max[rows_per_simdgroup];
     float running_sum[rows_per_simdgroup];
@@ -1068,7 +1076,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
                     vnext_kv_element_index(
                         key_block_start, 0, kv_head, 0, params));
                 if (key_block != nullptr) {
-                    for (uint dim = 0; dim < params.head_dim; dim += 8) {
+                    for (uint dim = 0; dim < vnext_attention_head_dim(params); dim += 8) {
                         simdgroup_half8x8 key_matrix;
                         simdgroup_load(
                             key_matrix,
@@ -1083,9 +1091,9 @@ inline void vnext_causal_attention_prefill_tiled_body(
                                 query_matrix,
                                 query_tile +
                                     head_slot * VNEXT_PREFILL_QUERY_TILE *
-                                        params.head_dim +
+                                        vnext_attention_head_dim(params) +
                                     dim,
-                                params.head_dim,
+                                vnext_attention_head_dim(params),
                                 ulong2(0, 0),
                                 false);
                             simdgroup_multiply_accumulate(
@@ -1127,7 +1135,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
                     for (uint key_row = 0; key_row < key_block_rows;
                          ++key_row) {
                         float partial_dots[2] = {0.0f, 0.0f};
-                        for (uint dim = lane; dim < params.head_dim;
+                        for (uint dim = lane; dim < vnext_attention_head_dim(params);
                              dim += VNEXT_SIMD_WIDTH) {
                             const float key_value = vnext_load_kv(
                                 page_table,
@@ -1143,7 +1151,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
                                     query_row;
                                 partial_dots[head_slot] +=
                                     float(query_tile
-                                              [logical_row * params.head_dim +
+                                              [logical_row * vnext_attention_head_dim(params) +
                                                dim]) *
                                     key_value;
                             }
@@ -1219,10 +1227,10 @@ inline void vnext_causal_attention_prefill_tiled_body(
                 running_sum[row_slot] * previous_scale +
                 tile_sum;
             running_max[row_slot] = next_maximum;
-            for (uint dim = lane; dim < params.head_dim;
+            for (uint dim = lane; dim < vnext_attention_head_dim(params);
                  dim += VNEXT_SIMD_WIDTH) {
                 accumulated_output
-                    [logical_row * params.head_dim + dim] *=
+                    [logical_row * vnext_attention_head_dim(params) + dim] *=
                     previous_scale;
             }
         }
@@ -1230,7 +1238,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
 
         simdgroup_float8x8 output_matrices[8];
         const uint output_tiles_per_head =
-            params.head_dim / (SIMD_GROUP_COUNT * 8);
+            vnext_attention_head_dim(params) / (SIMD_GROUP_COUNT * 8);
         for (uint head_slot = 0; head_slot < HEAD_TILES; ++head_slot) {
             for (uint output_tile = 0;
                  output_tile < output_tiles_per_head;
@@ -1244,9 +1252,9 @@ inline void vnext_causal_attention_prefill_tiled_body(
                     output_matrices[matrix_index],
                     accumulated_output +
                         head_slot * VNEXT_PREFILL_QUERY_TILE *
-                            params.head_dim +
+                            vnext_attention_head_dim(params) +
                         output_column,
-                    params.head_dim,
+                    vnext_attention_head_dim(params),
                     ulong2(0, 0),
                     false);
             }
@@ -1409,9 +1417,9 @@ inline void vnext_causal_attention_prefill_tiled_body(
                     output_matrices[matrix_index],
                     accumulated_output +
                         head_slot * VNEXT_PREFILL_QUERY_TILE *
-                            params.head_dim +
+                            vnext_attention_head_dim(params) +
                         output_column,
-                    params.head_dim,
+                    vnext_attention_head_dim(params),
                     ulong2(0, 0),
                     false);
             }
@@ -1426,10 +1434,10 @@ inline void vnext_causal_attention_prefill_tiled_body(
             tail_start < key_start + KEY_TILE) {
             const uint probability_column = tail_start - key_start;
             for (uint element = thread_index;
-                 element < VNEXT_PREFILL_QUERY_TILE * params.head_dim;
+                 element < VNEXT_PREFILL_QUERY_TILE * vnext_attention_head_dim(params);
                  element += SIMD_GROUP_COUNT * VNEXT_SIMD_WIDTH) {
-                const uint query_row = element / params.head_dim;
-                const uint dim = element - query_row * params.head_dim;
+                const uint query_row = element / vnext_attention_head_dim(params);
+                const uint dim = element - query_row * vnext_attention_head_dim(params);
                 float tail_values[2] = {0.0f, 0.0f};
                 for (uint key_row = 0; key_row < tail_rows; ++key_row) {
                     const float value = vnext_load_kv(
@@ -1455,7 +1463,7 @@ inline void vnext_causal_attention_prefill_tiled_body(
                      ++head_slot) {
                     const uint logical_element =
                         head_slot * VNEXT_PREFILL_QUERY_TILE *
-                            params.head_dim +
+                            vnext_attention_head_dim(params) +
                         element;
                     accumulated_output[logical_element] +=
                         tail_values[head_slot];
@@ -1476,24 +1484,24 @@ inline void vnext_causal_attention_prefill_tiled_body(
             continue;
         }
         const float inverse_sum = 1.0f / running_sum[row_slot];
-        for (uint dim = lane; dim < params.head_dim;
+        for (uint dim = lane; dim < vnext_attention_head_dim(params);
              dim += VNEXT_SIMD_WIDTH) {
             float value =
                 accumulated_output
-                    [logical_row * params.head_dim + dim] *
+                    [logical_row * vnext_attention_head_dim(params) + dim] *
                 inverse_sum;
             if (params.output_gate != 0u) {
                 const ulong gate_index =
                     (ulong)token * (ulong)params.query_projection_stride +
                     (ulong)query_head *
-                        (2ul * (ulong)params.head_dim) +
-                    (ulong)params.head_dim + (ulong)dim;
+                        (2ul * (ulong)vnext_attention_head_dim(params)) +
+                    (ulong)vnext_attention_head_dim(params) + (ulong)dim;
                 const float gate = float(query_raw[gate_index]);
                 value *= 1.0f / (1.0f + exp(-gate));
             }
             output[((ulong)token * (ulong)params.query_heads +
                     (ulong)query_head) *
-                       (ulong)params.head_dim +
+                       (ulong)vnext_attention_head_dim(params) +
                    (ulong)dim] = half(value);
         }
     }

@@ -216,7 +216,7 @@ impl Inputs {
             set_raw(encoder, 2, &output.buffer);
             encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&arguments), 0);
             set_raw_params(encoder, 4, params);
-            encode_attention_dispatch(pipelines, encoder, plan);
+            encode_attention_dispatch(pipelines, encoder, plan, params);
         }
         encoder.end_encoding();
         command.commit();

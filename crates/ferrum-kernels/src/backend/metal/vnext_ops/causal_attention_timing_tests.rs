@@ -14,6 +14,9 @@ use metal::CommandBufferRef;
 use serde_json::{json, Value};
 use std::time::Instant;
 
+#[path = "causal_attention_head_dim_tests.rs"]
+mod head_dim;
+
 const WARMUP_PAIRS: usize = 2;
 const MEASURED_PAIRS: usize = 8;
 
@@ -61,6 +64,7 @@ struct PairedAttention<'a> {
     case: &'a ValidatedPrefillCase,
     output: GuardedAttentionOutput,
     bindings: Buffer,
+    grouped_partials: Option<Buffer>,
 }
 
 impl<'a> PairedAttention<'a> {
@@ -81,26 +85,83 @@ impl<'a> PairedAttention<'a> {
             case,
             output: GuardedAttentionOutput::new(&case.device, &case.params),
             bindings,
+            grouped_partials: (attention_dispatch_plan(&case.params).kind
+                == AttentionDispatchKind::GroupedDecode)
+                .then(|| {
+                    shared_buffer(
+                        &case.device,
+                        &vec![
+                            f32::NAN;
+                            GROUPED_DECODE_MAX_PARTITIONS as usize
+                                * case.params.query_heads as usize
+                                * (case.params.head_dim as usize + 2)
+                        ],
+                    )
+                }),
         }
     }
 
     fn run(&self, plan: AttentionDispatchPlan, dispatches: usize) -> Value {
+        self.run_with_pipelines(&self.case.pipelines, plan, dispatches)
+    }
+
+    fn run_with_pipelines(
+        &self,
+        pipelines: &MetalCausalAttentionPipelines,
+        plan: AttentionDispatchPlan,
+        dispatches: usize,
+    ) -> Value {
         // Neither timed kernel invokes prepare/RoPE or writes KV. Each dispatch
         // overwrites the same output from the same immutable Q/K/V buffers.
         self.output.reset();
+        if let Some(partials) = &self.grouped_partials {
+            // SAFETY: all preceding submits have completed. Poison partials
+            // outside timing so missing candidate writes cannot reuse control.
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    partials.contents().cast::<f32>(),
+                    partials.length() as usize / std::mem::size_of::<f32>(),
+                )
+                .fill(f32::NAN);
+            }
+        }
         let started = Instant::now();
         let command = self.case.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
-        set_raw(encoder, 0, &self.case.query);
-        set_raw(encoder, 1, &self.case.query_raw);
-        set_raw(encoder, 2, &self.output.buffer);
         encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&self.bindings), 0);
         set_raw_params(encoder, 4, &self.case.params);
         for page in &self.case.pages {
             encoder.use_resource(&**page, MTLResourceUsage::Read);
         }
         for _ in 0..dispatches {
-            encode_attention_dispatch(&self.case.pipelines, encoder, plan);
+            set_raw(encoder, 0, &self.case.query);
+            set_raw(encoder, 1, &self.case.query_raw);
+            set_raw(
+                encoder,
+                2,
+                self.grouped_partials
+                    .as_ref()
+                    .unwrap_or(&self.output.buffer),
+            );
+            encode_attention_dispatch(pipelines, encoder, plan, &self.case.params);
+            if let Some(partials) = &self.grouped_partials {
+                assert_eq!(plan.kind, AttentionDispatchKind::GroupedDecode);
+                encoder.set_compute_pipeline_state(
+                    pipelines.grouped_reduce_pipeline(&self.case.params),
+                );
+                set_raw(encoder, 0, partials);
+                set_raw(encoder, 1, &self.case.query_raw);
+                set_raw(encoder, 2, &self.output.buffer);
+                encoder.set_threadgroup_memory_length(
+                    0,
+                    grouped_decode_reduce_threadgroup_memory_bytes(),
+                );
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(u64::from(self.case.params.query_heads), 1, 1),
+                    MTLSize::new(SIMD_THREADS, 1, 1),
+                );
+                encoder.set_threadgroup_memory_length(0, 0);
+            }
         }
         encoder.end_encoding();
         let encode_ns = started.elapsed().as_nanos() as u64;
@@ -113,7 +174,12 @@ impl<'a> PairedAttention<'a> {
         // Full-output numerical validation and guard readback are outside both
         // host intervals and the device command-buffer timestamp interval.
         let output = self.output.read_after_completion(plan.kind);
-        let error = assert_close("timed attention/CPU", &output, &self.case.expected, 0.001);
+        let error = assert_close(
+            "timed attention/reference",
+            &output,
+            &self.case.expected,
+            0.001,
+        );
         json!({
             "route": format!("{:?}", plan.kind),
             "threadgroups": plan.threadgroups,
@@ -121,7 +187,8 @@ impl<'a> PairedAttention<'a> {
             "host_encode_ns": encode_ns,
             "host_submit_wait_ns": submit_wait_ns,
             "gpu_clock": clock,
-            "full_output_cpu_max_abs_error": error,
+            "full_output_reference_max_abs_error": error,
+            "reference_scope": self.case.reference_scope,
             "output_guard_unchanged": true,
         })
     }
