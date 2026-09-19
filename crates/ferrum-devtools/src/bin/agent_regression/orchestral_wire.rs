@@ -454,9 +454,15 @@ fn tool_result_content(
     result: &Value,
     is_error: bool,
 ) -> Result<Value> {
-    let envelope = json!({"result":result,"is_error":is_error});
+    let mut envelope = json!({"result":result,"is_error":is_error});
     match format {
-        OrchestralToolResultFormat::Json => Ok(envelope.to_string().into()),
+        OrchestralToolResultFormat::Json => {
+            // Orchestral's JSON codec serializes sorted object keys. Reproduce
+            // that wire even when another Ferrum crate enables serde_json's
+            // preserve_order feature; actual model-visible text stays exact.
+            envelope.sort_all_objects();
+            Ok(envelope.to_string().into())
+        }
         OrchestralToolResultFormat::Yaml => serde_yaml::to_string(&envelope)
             .map(Value::String)
             .context("serialize declared YAML tool result"),
@@ -692,6 +698,10 @@ mod tests {
         include!("orchestral_wire/text_parts_version_tests.rs");
     }
 
+    mod json_tests {
+        include!("orchestral_wire/json_tests.rs");
+    }
+
     struct Fixture {
         dir: tempfile::TempDir,
         public: orchestral_evidence::Evidence,
@@ -805,7 +815,13 @@ mod tests {
                 history.push(json!({"role":"assistant","content":text,"tool_calls":[{
                     "id":"call_0","type":"function","function":{"name":"file_read","arguments":arguments.to_string()},
                 }]}));
-                history.push(json!({"role":"tool","tool_call_id":"call_0","content":json!({"result":result,"is_error":false}).to_string()}));
+                // Independent producer bytes, not the auditor's serializer or
+                // this build's serde_json object ordering.
+                let wire_result = format!(
+                    r#"{{"is_error":false,"result":{{"text":{}}}}}"#,
+                    result["text"]
+                );
+                history.push(json!({"role":"tool","tool_call_id":"call_0","content":wire_result}));
             }
             session.push(
                 json!({"type":"run_output_committed","request_id":"model-cli-run-3",
@@ -863,7 +879,11 @@ mod tests {
                     if message["role"] == "tool" {
                         let envelope: Value =
                             serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
-                        message["content"] = serde_yaml::to_string(&envelope).unwrap().into();
+                        let yaml_envelope = json!({
+                            "result": envelope["result"],
+                            "is_error": envelope["is_error"],
+                        });
+                        message["content"] = serde_yaml::to_string(&yaml_envelope).unwrap().into();
                     }
                 }
             }
@@ -1112,9 +1132,10 @@ mod tests {
             serde_yaml::from_str::<Value>(yaml).unwrap(),
             json!({"result":result,"is_error":true})
         );
+        let encoded = tool_result_content(OrchestralToolResultFormat::Json, &result, true).unwrap();
         assert_eq!(
-            tool_result_content(OrchestralToolResultFormat::Json, &result, true).unwrap(),
-            json!({"result":result,"is_error":true}).to_string()
+            serde_json::from_str::<Value>(encoded.as_str().unwrap()).unwrap(),
+            json!({"result":result,"is_error":true})
         );
     }
 
