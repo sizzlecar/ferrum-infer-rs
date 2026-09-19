@@ -9,9 +9,18 @@
 
 # Serve LLMs with a single binary.
 
-A Rust-native LLM serving engine. One binary, no Python runtime.
+Serve local LLMs to your apps and coding agents through an OpenAI-compatible API.
+Ferrum is written in Rust and runs as a single binary, with Metal on Apple Silicon
+and CUDA on [supported NVIDIA GPUs](#installation). The inference server needs no
+Python runtime.
 
 [中文说明](README_zh.md)
+
+| What would you like to do? | Start here |
+|---|---|
+| Run a model in your terminal | [Quick Start](#quick-start) |
+| Connect an app or coding agent | [Start the API server](#serve-an-api) · [API compatibility](docs/openai-api-compatibility.md) |
+| Run Bonsai 2 27B PQ2_0 on Apple Silicon | [Metal setup and tested limits](#bonsai-2-pq2_0-on-metal) |
 
 ## See it in action
 

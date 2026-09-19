@@ -9,9 +9,17 @@
 
 # 用一个二进制文件提供大模型服务。
 
-Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。
+通过 OpenAI 兼容 API，将本地大模型接入你的应用和编程 Agent。
+Ferrum 使用 Rust 编写，以单个二进制文件运行，支持 Apple Silicon Metal 和
+[兼容的 NVIDIA GPU](#安装) 上的 CUDA。推理服务自身无需 Python 运行时。
 
 [English](README.md)
+
+| 你想做什么？ | 从这里开始 |
+|---|---|
+| 在终端运行模型 | [快速开始](#快速开始) |
+| 接入应用或编程 Agent | [启动 API 服务](#启动-api-服务) · [API 兼容说明](docs/openai-api-compatibility.md) |
+| 在 Apple Silicon 上运行 Bonsai 2 27B PQ2_0 | [Metal 配置与已验证范围](#在-metal-上运行-bonsai-2-pq2_0) |
 
 ## 看它如何工作
 
