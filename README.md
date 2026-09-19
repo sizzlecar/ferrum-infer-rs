@@ -226,9 +226,11 @@ Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -Conten
 Ferrum does not silently select a model. `run` requires MODEL, and `serve`
 requires either `--model` or an intentional `default_model` in `ferrum.toml`.
 
-A working request returns HTTP 200 with a non-empty assistant response. Ferrum
-uses the model's context limit unless `--max-model-len` is set explicitly; any
-explicit limit must fit the rendered input plus the requested output budget.
+A working request returns HTTP 200 with a non-empty assistant response. Native
+`run` and `serve` start from the model's context limit and fit unset context,
+batch and concurrency settings to currently available device memory. Startup
+reports the effective limits; explicit settings are preserved or rejected with
+a capacity error. The context limit includes both the rendered input and output.
 
 The examples use `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
@@ -306,7 +308,9 @@ Requires Ferrum **0.12.1 or later**. [Install or update Ferrum](#quick-start).
 <summary><strong>Model sources and tested scope</strong></summary>
 
 The shortcut selects the model files; resource configuration follows Ferrum's
-normal defaults and automatic capacity handling. It does not impose a
+normal defaults and automatic capacity handling. Planning uses the selected
+device's available memory and the compiled weights, sequence states and
+operation workspaces. It does not impose a
 Bonsai-specific context length, batch size, concurrency, or memory budget.
 Explicit configuration and CLI options take precedence. Model reasoning
 behavior is preserved; append `--disable-thinking` if you want it off.
@@ -316,8 +320,10 @@ weights packed and applies the Hadamard transforms declared by the model.
 Metal text inference has been validated through `run` and `serve` with FP16 KV,
 including Orchestral tool execution, session continuation, and prefix-state reuse.
 Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
-not been validated on this machine. The model-declared context remains the
-protocol limit; actual requests are admitted against available runtime capacity.
+not been validated on this machine. The effective context cannot exceed the
+model's declaration and may be reduced to fit the machine. Concurrent requests
+share runtime capacity; the concurrency ceiling does not reserve a full context
+for every request.
 
 The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
 and the matching `config.json`,

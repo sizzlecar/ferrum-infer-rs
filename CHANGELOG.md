@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Kept terminal conversation trimming and output budgets within the model-declared context and explicit user limits. Native GGUF chats no longer inherit the legacy automatic 8K KV limit; explicit `--max-model-len` and KV limits retain precedence.
+- Unified native `run` and `serve` capacity selection around available device memory and the compiled resource plan, including actual weight layouts, sequence state and provider workspaces. Unset context, batch and concurrency limits adapt to the machine; explicit limits retain precedence and report capacity errors instead of being silently reduced.
+- Removed legacy automatic KV/context defaults from native GGUF startup. Terminal history, request admission and reported configuration use the same resolved limits.
 
 ## [0.12.0] - 2026-09-18
 
