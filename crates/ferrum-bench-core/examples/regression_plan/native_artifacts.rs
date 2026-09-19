@@ -128,10 +128,13 @@ fn snapshot(repo: &Path, revision: &str) -> Result<Snapshot, String> {
         .chain(CONSUMERS.iter().map(|path| (*path).to_string()))
         .chain(consumers.iter().cloned())
         .collect();
-    let files = paths
+    let mut files = paths
         .into_iter()
         .map(|path| Ok((path.clone(), read(repo, revision, &path)?)))
-        .collect::<Result<_, String>>()?;
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    if let Some(path) = windows_build::helper_path(&files[WINDOWS_WORKFLOW]) {
+        files.insert(path.into(), read(repo, revision, path)?);
+    }
     Ok(Snapshot { files, consumers })
 }
 
@@ -171,6 +174,8 @@ fn require_fragments(script: &str, fragments: &[&str]) -> Result<(), String> {
 
 #[path = "native_artifacts/topology.rs"]
 mod topology;
+#[path = "native_artifacts/windows_build.rs"]
+mod windows_build;
 use topology::producer_jobs;
 
 fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
@@ -184,6 +189,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
             ));
         }
     }
+    let windows_helper = windows_build::unchanged_helper(before, after)?;
     let delivery = yaml(after.get(DELIVERY)?)?;
     let windows_workflow = yaml(after.get(WINDOWS_WORKFLOW)?)?;
     let (linux, windows) =
@@ -280,16 +286,12 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
             "throw (\"Native CUDA operator builds failed:",
         ],
     )?;
-    require_fragments(
+    windows_build::verify_executable(
         step(
             &windows,
             "Build the selected Windows executable exactly once",
         )?,
-        &[
-            "FERRUM_NATIVE_OPERATOR_SET_LOCK",
-            "cargo build --release --locked -p ferrum-cli --bin ferrum",
-            "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
-        ],
+        windows_helper.is_some(),
     )?;
     require_fragments(
         step(
@@ -311,6 +313,7 @@ fn recipes(before: &Snapshot, after: &Snapshot) -> Result<Value, String> {
         "windows_job": WINDOWS, "windows_ci_job": "stage-cuda / Stage Windows x86_64 CUDA sm89",
         "windows_recipe_check": "unchanged local caller, callee and delivery bindings; literal CUDA backend",
         "windows_job_sha256": digest(serde_json::to_string(&windows).unwrap().as_bytes()),
+        "windows_build_helper": windows_helper,
         "windows_workflow_sha256": digest(serde_json::to_string(&windows_workflow).unwrap().as_bytes()),
         "delivery_workflow_sha256": digest(serde_json::to_string(&delivery).unwrap().as_bytes())}),
     )
@@ -574,6 +577,10 @@ mod tests {
             include_str!("../../../../.github/workflows/release-windows.yml").into(),
         );
         snapshot.files.insert(
+            windows_build::HELPER.into(),
+            include_str!("../../../../.github/ci/windows-build.ps1").into(),
+        );
+        snapshot.files.insert(
             DELIVERY.into(),
             include_str!("../../../../.github/workflows/release-delivery.yml").into(),
         );
@@ -657,6 +664,11 @@ mod tests {
         let candidate = commit(repo.path(), &after);
         // An unrelated dirty recipe must not be mistaken for the accepted commit.
         fs::write(repo.path().join(WORKFLOW), "not workflow YAML").unwrap();
+        fs::write(
+            repo.path().join(windows_build::HELPER),
+            "not the committed helper",
+        )
+        .unwrap();
         let kernel = "crates/ferrum-kernels/kernels/rms_norm.cu";
         let protocol = "crates/ferrum-types/src/reasoning_controls.rs";
         let unknown = "crates/ferrum-kernels/src/new_runtime.rs";
@@ -664,6 +676,10 @@ mod tests {
         let original = impact.clone();
         let result = refine(repo.path(), &base, &candidate, &mut impact);
         assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(
+            result["proof"]["recipe"]["windows_build_helper"]["sha256"],
+            digest(after.get(windows_build::HELPER).unwrap().as_bytes())
+        );
         assert_eq!(
             result["proof"]["changed_members"].as_array().unwrap().len(),
             1
@@ -700,6 +716,121 @@ mod tests {
             false
         );
         assert_eq!(impact, original);
+    }
+
+    #[test]
+    fn changed_or_missing_immutable_windows_helper_retains_kernel_scope() {
+        let repo = tempfile::tempdir().unwrap();
+        super::super::git(repo.path(), &["init", "--quiet"]).unwrap();
+        let before = fixture(true, b"old");
+        let base = commit(repo.path(), &before);
+        let mut after = fixture(true, b"new");
+        // No workflow change: a helper-only change still invalidates reuse.
+        after
+            .files
+            .get_mut(windows_build::HELPER)
+            .unwrap()
+            .push_str("\n# changed helper implementation\n");
+        let candidate = commit(repo.path(), &after);
+        // A matching working-tree copy must not hide the committed change.
+        fs::write(
+            repo.path().join(windows_build::HELPER),
+            before.get(windows_build::HELPER).unwrap(),
+        )
+        .unwrap();
+        let original = analyze_paths([BUNDLE, NATIVE, BUILDER, windows_build::HELPER]);
+        let mut impact = original.clone();
+        let result = refine(repo.path(), &base, &candidate, &mut impact);
+        assert_eq!(result["applied"], false, "{result}");
+        assert_eq!(impact, original);
+        assert!(impact.areas.contains(&ChangeArea::Kernel));
+
+        after.files.remove(windows_build::HELPER);
+        fs::remove_file(repo.path().join(windows_build::HELPER)).unwrap();
+        let candidate = commit(repo.path(), &after);
+        let result = refine(repo.path(), &base, &candidate, &mut impact);
+        assert_eq!(result["applied"], false, "{result}");
+        assert_eq!(impact, original);
+        assert!(prove(&after, &before).is_err());
+    }
+
+    #[test]
+    fn helper_calls_require_literal_branch_arguments_and_failure_propagation() {
+        for (from, to) in [
+            (". './.github/ci/windows-build.ps1'", ". $env:BUILD_HELPER"),
+            (
+                "'--features', 'cuda,vllm-moe-marlin,vllm-paged-attn-v2'",
+                "'--features', 'cuda'",
+            ),
+            (
+                "-CargoArguments @(",
+                "-CargoArguments $unused; $unused = @(",
+            ),
+            ("$link = Invoke-FerrumCargo", "# $link = Invoke-FerrumCargo"),
+        ] {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            for snapshot in [&mut before, &mut after] {
+                // Mutate both revisions, so the route checker itself must
+                // reject this, not merely whole-workflow equality.
+                change_file(snapshot, WINDOWS_WORKFLOW, |workflow| {
+                    let build = workflow["jobs"]["build"]["steps"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|s| s["name"] == "Build the selected Windows executable exactly once")
+                        .unwrap();
+                    let source = build["run"].as_str().unwrap();
+                    assert!(source.contains(from));
+                    build["run"] = json!(source.replace(from, to));
+                });
+            }
+            assert!(prove(&before, &after).is_err(), "{from}");
+        }
+        for (prefix, suffix) in [
+            ("<#\n", "\n#>"),
+            ("@'\n", "\n'@"),
+            ("function Uncalled {\n", "\n}"),
+        ] {
+            let mut before = fixture(true, b"old");
+            let mut after = fixture(true, b"new");
+            for snapshot in [&mut before, &mut after] {
+                change_file(snapshot, WINDOWS_WORKFLOW, |workflow| {
+                    let build = workflow["jobs"]["build"]["steps"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|s| s["name"] == "Build the selected Windows executable exactly once")
+                        .unwrap();
+                    build["run"] = json!(format!(
+                        "{prefix}{}{suffix}",
+                        build["run"].as_str().unwrap()
+                    ));
+                });
+            }
+            assert!(prove(&before, &after).is_err(), "{prefix}");
+        }
+        let mut before = fixture(true, b"old");
+        let mut after = fixture(true, b"new");
+        for snapshot in [&mut before, &mut after] {
+            let helper = snapshot.files.get_mut(windows_build::HELPER).unwrap();
+            *helper = helper.replace("$LASTEXITCODE -ne 0", "$false");
+        }
+        assert!(prove(&before, &after).is_err());
+    }
+
+    #[test]
+    fn historical_inline_windows_cargo_route_remains_supported() {
+        let inline = r#"
+            if ($env:BACKEND -eq 'cpu') {
+                Remove-Item Env:FERRUM_NATIVE_OPERATOR_SET_LOCK -ErrorAction SilentlyContinue
+                cargo build --release --locked -p ferrum-cli --bin ferrum
+            } else {
+                cargo build --profile release-thin --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+            }
+        "#;
+        windows_build::verify_executable(inline, false).unwrap();
+        assert!(windows_build::verify_executable(&inline.replace("--locked", ""), false).is_err());
     }
 
     #[test]
