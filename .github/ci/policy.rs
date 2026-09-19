@@ -182,7 +182,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     // A source job may have been rerun since prepare. Recheck
                     // the latest outcomes before admitting its earlier success.
                     let mut current = checks::Plan::fresh(accepted.required);
-                    reuse::reuse(&mut current, &mut Vec::new())?;
+                    let mut notes = Vec::new();
+                    let result = reuse::reuse(&mut current, &mut notes);
+                    for note in notes {
+                        eprintln!("CI evidence: {note}");
+                    }
+                    result?;
                     if current.reused.0 & accepted.reused.0 != accepted.reused.0 {
                         return Err("a reused check no longer has valid successful evidence; rerun the CI plan".into());
                     }

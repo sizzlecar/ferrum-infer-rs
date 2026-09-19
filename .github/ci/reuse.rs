@@ -1,7 +1,7 @@
 //! Reuse individual successful PR checks when their execution scope is unchanged.
 //! Formal releases share these history primitives through release_reuse.
 use super::checks::{affected, Check, Checks, Plan};
-use std::{collections::BTreeMap, env, fs, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, env, fs, path::PathBuf, process::Command, time::Duration};
 
 pub(super) fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new(program)
@@ -10,14 +10,48 @@ pub(super) fn command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("{program}: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "{program} failed while reading prior check evidence"
+            "{program} exited {} while reading prior check evidence: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(output.stdout)
 }
+
+// Retry only idempotent remote acquisition. Each attempt returns its own
+// complete output; failed pagination/archive bytes never enter validation.
+// Parsing and evidence decisions happen after this function, without retries.
+fn retry_read<T>(
+    description: &str,
+    mut operation: impl FnMut() -> Result<T, String>,
+    mut pause: impl FnMut(Duration),
+) -> Result<T, String> {
+    let mut result = operation();
+    for delay in [Duration::from_secs(1), Duration::from_secs(3)] {
+        let Err(error) = &result else {
+            return result;
+        };
+        eprintln!(
+            "CI evidence: {description}: {error}; retrying in {}s",
+            delay.as_secs()
+        );
+        pause(delay);
+        result = operation();
+    }
+    result.map_err(|error| format!("{description}: remote read retries exhausted: {error}"))
+}
+
+fn network_command(description: &str, program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    retry_read(description, || command(program, args), std::thread::sleep)
+}
+
 pub(super) fn api(path: &str, query: &str) -> Result<String, String> {
-    String::from_utf8(command("gh", &["api", path, "--paginate", "--jq", query])?)
-        .map_err(|_| "non-UTF-8 Actions metadata".into())
+    String::from_utf8(network_command(
+        &format!("Actions GET {path}"),
+        "gh",
+        &["api", path, "--paginate", "--jq", query],
+    )?)
+    .map_err(|_| "non-UTF-8 Actions metadata".into())
 }
 
 /// Each page includes its declared total before its projected rows. Never
@@ -73,7 +107,8 @@ pub(super) fn origin(repo: &str, run_id: &str) -> Result<String, String> {
     if ids.len() != 1 || !id(ids[0]) {
         return Err("missing or ambiguous prior CI origin".into());
     }
-    let archive = command(
+    let archive = network_command(
+        &format!("origin archive {} for run {run_id}", ids[0]),
         "gh",
         &[
             "api",
@@ -93,7 +128,8 @@ pub(super) fn origin(repo: &str, run_id: &str) -> Result<String, String> {
     );
     let _ = fs::remove_file(path);
     parse_origin(
-        &String::from_utf8(bytes?).map_err(|_| "invalid prior origin encoding")?,
+        &String::from_utf8(bytes.map_err(|error| format!("origin archive {}: {error}", ids[0]))?)
+            .map_err(|_| "invalid prior origin encoding")?,
         run_id,
     )
 }
@@ -135,7 +171,8 @@ pub(super) fn changes_since_at(revision: &str, workspace: &str) -> Result<Checks
     )
     .is_err()
     {
-        command(
+        network_command(
+            &format!("fetch checked revision {revision}"),
             "git",
             &[
                 "-C",
@@ -161,7 +198,8 @@ pub(super) fn changes_since_at(revision: &str, workspace: &str) -> Result<Checks
             "HEAD",
             "--",
         ],
-    )?;
+    )
+    .map_err(|error| format!("compare checked revision {revision} with HEAD: {error}"))?;
     // Here empty is an observed successful Git comparison of two revisions,
     // unlike missing/truncated stdin to the public path classifier.
     Ok(if diff.is_empty() {
@@ -231,6 +269,41 @@ fn decide(status: &str, conclusion: &str, changed: Option<bool>) -> Decision {
         ("completed", "skipped") => Decision::Older,
         ("completed", "success") if changed == Some(false) => Decision::Reuse,
         _ => Decision::Run,
+    }
+}
+
+fn record_reuse(
+    plan: &mut Plan,
+    notes: &mut Vec<String>,
+    check: Check,
+    execution: &Execution,
+    changed: &Result<Checks, String>,
+) {
+    let observed = changed.as_ref().map(|paths| paths.has(check)).ok();
+    match decide(&execution.status, &execution.conclusion, observed) {
+        Decision::Older => unreachable!("latest excludes skipped jobs"),
+        Decision::Run => {
+            let reason = match changed {
+                Err(error) => format!("its input evidence is unavailable: {error}"),
+                Ok(paths) if paths.has(check) => "its input scope changed".into(),
+                Ok(_) => format!("its conclusion is {}", execution.conclusion),
+            };
+            notes.push(format!(
+                "{}: run; source run {} job {} cannot be reused: {reason}.",
+                check.name(),
+                execution.run_id,
+                execution.job_id
+            ));
+        }
+        Decision::Reuse => {
+            plan.reused.0 |= check.bit();
+            notes.push(format!(
+                "{}: reuse successful source run {} job {}; its input scope is unchanged.",
+                check.name(),
+                execution.run_id,
+                execution.job_id
+            ));
+        }
     }
 }
 
@@ -308,7 +381,7 @@ pub fn reuse(plan: &mut Plan, notes: &mut Vec<String>) -> Result<(), String> {
     }
     // Do not use a prior pull request with a recycled branch name. No secrets
     // or untrusted source code are read from archived artifacts.
-    let runs = String::from_utf8(command("gh", &[
+    let runs = String::from_utf8(network_command("PR Actions run inventory", "gh", &[
         "api", &format!("repos/{repo}/actions/workflows/ci.yml/runs"), "--method", "GET", "--paginate",
         "-f", "event=pull_request", "-f", &format!("branch={branch}"), "-F", "per_page=100", "--jq",
         "([\"total\", .total_count] | @tsv), (.workflow_runs[] | [\"item\", .id, .head_repository.full_name, .head_branch, ([.pull_requests[].number | tostring] | join(\",\"))] | @tsv)",
@@ -360,18 +433,9 @@ pub fn reuse(plan: &mut Plan, notes: &mut Vec<String>) -> Result<(), String> {
             Ok(Some(execution)) => {
                 let run_id = &execution.run_id;
                 let changed = origins.entry(run_id.clone()).or_insert_with(|| {
-                    origin(&repo, run_id)
-                        .and_then(|revision| changes_since(&revision))
-                        .ok()
+                    origin(&repo, run_id).and_then(|revision| changes_since(&revision))
                 });
-                match decide(&execution.status, &execution.conclusion, changed.map(|paths| paths.has(check))) {
-                    Decision::Older => unreachable!("latest excludes skipped jobs"),
-                    Decision::Run => notes.push(format!("{}: run; latest executed check is {} or its unchanged inputs cannot be established.", check.name(), execution.conclusion)),
-                    Decision::Reuse => {
-                        plan.reused.0 |= check.bit();
-                        notes.push(format!("{}: reuse successful [job](https://github.com/{repo}/actions/runs/{run_id}/job/{}); its input scope is unchanged.", check.name(), execution.job_id));
-                    }
-                }
+                record_reuse(plan, notes, check, execution, changed);
             }
             Ok(None) => (),
             Err(reason) => notes.push(format!("{}: run; {reason}.", check.name())),
@@ -379,6 +443,10 @@ pub fn reuse(plan: &mut Plan, notes: &mut Vec<String>) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "reuse_tests.rs"]
+mod acquisition_tests;
 
 pub fn write_origin() -> Result<(), String> {
     let run_id = env::var("GITHUB_RUN_ID").map_err(|_| "run ID missing")?;
