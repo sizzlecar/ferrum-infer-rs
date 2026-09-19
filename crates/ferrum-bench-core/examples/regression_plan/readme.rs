@@ -76,11 +76,13 @@ fn validate(reviews: &[ReadmeReview]) -> Result<(), String> {
                         | ChangeArea::Termination
                         | ChangeArea::Structured
                         | ChangeArea::Tools
+                        | ChangeArea::Scheduler
+                        | ChangeArea::Kv
                 )
             })
         {
             return Err(format!(
-                "README review requires distribution, protocol or device submission areas for {}",
+                "README review requires distribution, protocol, capacity or device submission areas for {}",
                 review.path
             ));
         }

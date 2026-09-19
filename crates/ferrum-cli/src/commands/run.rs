@@ -10,11 +10,11 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
-    should_defer_model_reasoning_stream_delta, FerrumConfigBuilder, FerrumError, FinishReason,
-    InferenceRequest, InferenceResponse, ModelCapabilities, ModelOutputProtocol,
-    ParsedReasoningResponse, Priority, RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary,
-    Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams,
-    StreamChunk, TokenUsage, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
+    should_defer_model_reasoning_stream_delta, FerrumError, FinishReason, InferenceRequest,
+    InferenceResponse, ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority,
+    RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
+    WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -340,6 +340,7 @@ impl RunBudget {
         product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
         legacy_source_path: &Path,
         snapshot: &RuntimeConfigSnapshot,
+        model_context_limit: Option<usize>,
     ) -> Result<Self> {
         let tokenizer = if let Some(path) = explicit_tokenizer {
             Some(tokenizers::Tokenizer::from_file(path).map_err(|error| {
@@ -365,6 +366,7 @@ impl RunBudget {
             .into_iter()
             .filter_map(|key| crate::runtime_env::runtime_snapshot_value(snapshot, key))
             .filter_map(|value| value.parse::<usize>().ok())
+            .chain(model_context_limit)
             .filter(|&value| value > 0)
             .min();
         Ok(Self {
@@ -843,11 +845,9 @@ pub struct RunCommand {
     #[arg(long)]
     pub seed: Option<u64>,
 
-    /// Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's
-    /// `--gpu-memory-utilization`). Auto-sizes the KV pool: at 0.9
-    /// ferrum will use ≤ 90 % of the GPU's reported total memory,
-    /// reserving ~4 GB scratch + the weight bytes. Set to 1.0 for an
-    /// exclusive GPU; leave at 0.9 if other processes share the card.
+    /// Fraction of currently available device memory used by native startup
+    /// planning (default: 0.9). Legacy CUDA models use this fraction of total
+    /// GPU memory for their KV pool estimate.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
@@ -1027,16 +1027,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve graph-clean Qwen3-MoE defaults as typed entries first, then
-    // materialize them only for legacy backend readers.
-    let moe_graph_defaults = crate::runtime_env::moe_graph_default_entries(
-        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
-        ferrum_types::RuntimeConfigSource::Default,
-    );
-    crate::runtime_env::materialize_runtime_env_defaults(&moe_graph_defaults);
-    crate::runtime_env::warn_if_moe_graph_needs_unbuilt_vllm_moe(
-        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
-    );
+    // Capture user input once. Inferred startup values never re-enter this
+    // snapshot through the process environment.
+    let user_environment = RuntimeConfigSnapshot::capture_current();
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
@@ -1061,35 +1054,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let mut startup_cli_runtime_entries =
         run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
-    // The source resolver still contains a small environment compatibility
-    // bridge for GPU autosizing. Materialize only the two typed run-entrypoint
-    // defaults it must see before model resolution, then remove those bridge
-    // values from the later environment snapshot so effective-config evidence
-    // retains the real Default/ConfigFile/CLI source.
-    let early_runtime_config =
-        run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
+    let early_runtime_config = run_base_runtime_config(&config, user_environment);
     let early_effective_runtime_config =
         run_effective_runtime_config(&early_runtime_config, &startup_cli_runtime_entries);
-    let run_product_bridge = run_product_runtime_bridge(&early_effective_runtime_config);
-    let materialized_run_product_keys =
-        crate::runtime_env::materialize_runtime_env_effective(&run_product_bridge);
-    materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
-    let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
-
-    // Resolve the model through the central source resolver. Handles
-    // .gguf paths, local model dirs, HF cache hits, and HF download in
-    // one entry; runs the chat-profile GPU autosize + (for GGUF) sets
-    // the per-arch KV / MoE env-var defaults that `ferrum run` needs
-    // for a single-user multi-turn REPL. The engine then picks up
-    // either the safetensors path (via NativeSafetensorsLoader) or the
-    // GGUF path (via gguf_engine_loader, routed by
-    // `WeightFormat::detect()` inside `LlmExecutorFactory`).
+    // Source resolution selects artifacts only. Resource policy follows the
+    // registered model definition, once its execution authority is known.
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
     let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
         model,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
-        autosize,
+        None,
         &cmd.product_sources,
     )
     .await?;
@@ -1136,7 +1111,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
             startup_cli_runtime_entries =
                 run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
-            materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
         }
     }
     let model_chat_template = match defined_model.as_deref() {
@@ -1162,13 +1136,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     let device_label = format!("{device:?}");
     eprintln!("{}", format!("Using {device_label} backend").dimmed());
-    let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
-        &source.local_path,
-        &device,
-        &ferrum_types::RuntimeConfigSnapshot::capture_current(),
-        ferrum_types::RuntimeConfigSource::Default,
-    );
-    crate::runtime_env::materialize_runtime_env_defaults(&metal_moe_entries);
 
     // Create engine. Big-model loads (15-60 GB safetensors) are slow on
     // first run — print a hint so users don't think it's frozen. Per-
@@ -1190,22 +1157,60 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
-    let runtime_config = run_base_runtime_config(
-        &config,
-        runtime_config_without_keys(
-            RuntimeConfigSnapshot::capture_current(),
-            &materialized_run_product_keys,
-        ),
-    );
+    let runtime_config = early_runtime_config;
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
+    let mut effective_runtime_config =
+        run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
     crate::layer_split_pipeline::insert_backend_option_from_runtime(
-        &runtime_config,
+        &effective_runtime_config,
         &mut engine_config.backend.backend_options,
     )?;
-    let effective_runtime_config =
-        run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
+    let execution_resource_authority = if defined_model.is_some() {
+        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    } else {
+        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+    };
+    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+        let defaults = crate::runtime_env::moe_graph_default_entries(
+            &effective_runtime_config,
+            RuntimeConfigSource::Default,
+        );
+        for entry in defaults {
+            effective_runtime_config.upsert_entry(entry);
+        }
+        if let Some((profile, utilization)) =
+            run_autosize_for_device(&device, cmd.gpu_memory_utilization)
+        {
+            let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
+                &source.local_path,
+                utilization,
+                profile,
+                &effective_runtime_config,
+            );
+            for entry in entries {
+                effective_runtime_config.upsert_entry(entry);
+            }
+            let entries = crate::source_resolver::chat_profile_runtime_entries(
+                &source.local_path,
+                &effective_runtime_config,
+                RuntimeConfigSource::Default,
+            );
+            for entry in entries {
+                effective_runtime_config.upsert_entry(entry);
+            }
+        }
+        let entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
+            &source.local_path,
+            &device,
+            &effective_runtime_config,
+            RuntimeConfigSource::Default,
+        );
+        for entry in entries {
+            effective_runtime_config.upsert_entry(entry);
+        }
+    }
     let typed_model_capabilities = defined_model
         .as_ref()
         .map(|defined| {
@@ -1216,39 +1221,28 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             )
         })
         .transpose()?;
-    let startup_auto_config = run_startup_auto_config(
+    let startup_memory_request = crate::startup::memory_request(
         &device,
+        execution_resource_authority,
+        cmd.gpu_memory_utilization,
+        &effective_runtime_config,
+    )?;
+    let hardware = crate::startup::hardware_for_request(&device, startup_memory_request.as_ref());
+    let mut startup_auto_config = run_startup_auto_config(
+        hardware,
         typed_model_capabilities,
-        if defined_model.is_some() {
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime
-        } else {
-            ferrum_types::ExecutionResourceAuthority::LegacyEngine
-        },
+        execution_resource_authority,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
     )?;
-    // Apply the resolved auto-config knobs the same way `serve` does. Without
-    // this, `ferrum run` ignored the resolved config (e.g. the CUDA GPTQ-MoE
-    // fast path FERRUM_VLLM_MOE / MOE_DEVICE_ROUTE) and fell back to the slow
-    // host-route MoE — ~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B.
+    // One-way compatibility bridge for backend readers. Resource ownership
+    // remains with the typed engine config and its compiled memory plan.
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
-    crate::commands::serve::write_startup_config_artifacts(
-        &startup_auto_config,
-        product_source_identity.as_ref(),
-        &engine_config.numerical_execution,
-        cmd.effective_config_json.as_deref(),
-        cmd.decision_trace_jsonl.as_deref(),
-    )?;
-    let run_budget = RunBudget::from_product_sources(
-        cmd.tokenizer.as_deref(),
-        model_sources.as_deref(),
-        &source.local_path,
-        &startup_auto_config.runtime_config,
-    )?;
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
+    engine_config.runtime.startup_memory_request = startup_memory_request;
     let vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
     validate_teacher_forced_checkpoint_run(&cmd, vnext_checkpoint_capture.as_ref())?;
     let teacher_forcing = vnext_checkpoint_capture
@@ -1268,15 +1262,43 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = match (defined_model, model_sources) {
+    let numerical_execution = engine_config.numerical_execution.clone();
+    let engine_result = match (defined_model, model_sources.clone()) {
         (Some(prepared), _) => {
-            ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
+            ferrum_engine::create_defined_product_engine(engine_config, prepared).await
         }
-        (None, Some(sources)) => {
-            ferrum_engine::create_product_engine(engine_config, sources).await?
-        }
-        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+        (None, Some(sources)) => ferrum_engine::create_product_engine(engine_config, sources).await,
+        (None, None) => ferrum_engine::create_default_engine(engine_config).await,
     };
+    let engine = match engine_result {
+        Ok(engine) => engine,
+        Err(error) => {
+            crate::commands::serve::write_failed_startup_config_artifacts(
+                &startup_auto_config,
+                product_source_identity.as_ref(),
+                &numerical_execution,
+                cmd.effective_config_json.as_deref(),
+                cmd.decision_trace_jsonl.as_deref(),
+                &error,
+            );
+            return Err(error);
+        }
+    };
+    crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
+    crate::commands::serve::write_startup_config_artifacts(
+        &startup_auto_config,
+        product_source_identity.as_ref(),
+        &engine.config().numerical_execution,
+        cmd.effective_config_json.as_deref(),
+        cmd.decision_trace_jsonl.as_deref(),
+    )?;
+    let run_budget = RunBudget::from_product_sources(
+        cmd.tokenizer.as_deref(),
+        model_sources.as_deref(),
+        &source.local_path,
+        &startup_auto_config.runtime_config,
+        engine.context_capacity(),
+    )?;
     crate::commands::serve::write_resolved_execution_config(
         cmd.effective_config_json.as_deref(),
         engine.cache_metrics_snapshot().as_ref(),
@@ -2616,11 +2638,6 @@ fn run_base_runtime_config(
     crate::commands::serve::merge_runtime_config_sources(config_entries, env_snapshot, Vec::new())
 }
 
-const RUN_PRODUCT_RUNTIME_KEYS: [&str; 2] = [
-    "FERRUM_PAGED_MAX_SEQS",
-    "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
-];
-
 fn run_product_default_runtime_entries() -> Vec<RuntimeConfigEntry> {
     vec![
         RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "1", RuntimeConfigSource::Default),
@@ -2630,27 +2647,6 @@ fn run_product_default_runtime_entries() -> Vec<RuntimeConfigEntry> {
             RuntimeConfigSource::Default,
         ),
     ]
-}
-
-fn run_product_runtime_bridge(snapshot: &RuntimeConfigSnapshot) -> RuntimeConfigSnapshot {
-    RuntimeConfigSnapshot::from_entries(
-        snapshot
-            .entries
-            .iter()
-            .filter(|entry| RUN_PRODUCT_RUNTIME_KEYS.contains(&entry.key.as_str()))
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn runtime_config_without_keys(
-    mut snapshot: RuntimeConfigSnapshot,
-    keys: &[String],
-) -> RuntimeConfigSnapshot {
-    snapshot
-        .entries
-        .retain(|entry| !keys.iter().any(|key| key == &entry.key));
-    snapshot
 }
 
 fn run_startup_cli_runtime_entries(
@@ -2797,24 +2793,14 @@ fn bool_cli_override(enable: bool, disable: bool) -> Option<bool> {
     }
 }
 
-fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
-    if entries.is_empty() {
-        return;
-    }
-    crate::runtime_env::materialize_runtime_env_effective(&RuntimeConfigSnapshot::from_entries(
-        entries.to_vec(),
-    ));
-}
-
 fn run_startup_auto_config(
-    device: &ferrum_types::Device,
+    hardware: ferrum_types::HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
-    let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
     let model = typed_model_capabilities
         .or_else(|| model_definition.map(|definition| {
             crate::commands::serve::model_capabilities_from_definition_with_weight_bytes_for_hardware(
@@ -2824,14 +2810,16 @@ fn run_startup_auto_config(
             )
         }))
         .unwrap_or_else(ModelCapabilities::unknown);
-    let workload = WorkloadProfile::serving_default();
-    FerrumConfigBuilder::new(runtime_config)
-        .with_model_capabilities(model)
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .with_execution_resource_authority(execution_resource_authority)
-        .resolve()
-        .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+    let mut workload = WorkloadProfile::serving_default();
+    workload.serving_mode = "interactive".into();
+    workload.priority = ferrum_types::WorkloadPriority::Latency;
+    crate::startup::resolve_config(
+        runtime_config,
+        model,
+        hardware,
+        workload,
+        execution_resource_authority,
+    )
 }
 
 /// Apply the resolved `--kv-dtype` / runtime-config override to an engine
@@ -3257,6 +3245,17 @@ mod tests {
             .expect("missing layer split pipeline mode entry");
         assert_eq!(entry.effective_value, "batch");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+        let mut engine = ferrum_types::EngineConfig::default();
+        crate::layer_split_pipeline::insert_backend_option_from_runtime(
+            &effective,
+            &mut engine.backend.backend_options,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.backend.backend_options
+                [crate::layer_split_pipeline::LAYER_SPLIT_PIPELINE_MODE_BACKEND_OPTION],
+            serde_json::json!("batch")
+        );
     }
 
     #[test]
@@ -3550,7 +3549,7 @@ mod tests {
     #[test]
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
-            &ferrum_types::Device::CPU,
+            crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
             ferrum_types::ExecutionResourceAuthority::LegacyEngine,
             None,
@@ -4312,16 +4311,303 @@ mod tests {
     }
 
     #[test]
+    fn run_plan_context_uses_model_limit_for_engine_and_history() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let requested =
+            run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default());
+        let mut effective = requested.clone();
+        effective.upsert(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "2048",
+            RuntimeConfigSource::MemoryProfile,
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let mut capabilities = ModelCapabilities::unknown();
+        capabilities.max_context_len = Some(262_144);
+        let resolved = run_startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
+            Some(capabilities),
+            authority,
+            None,
+            None,
+            effective,
+        )
+        .unwrap();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.kv_capacity, None);
+        assert_eq!(engine.runtime.max_model_len, Some(262_144));
+        assert_eq!(engine.batching.max_num_batched_tokens, 2048);
+        assert_eq!(engine.scheduler.max_running_requests, 1);
+        assert_eq!(
+            crate::runtime_env::runtime_snapshot_value(
+                &resolved.runtime_config,
+                "FERRUM_KV_CAPACITY"
+            ),
+            None
+        );
+
+        let mut budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
+        budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
+        let long = std::iter::repeat_n("old", 4300)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let history = [
+            RunHistoryMessage::new("user", &long),
+            RunHistoryMessage::new("assistant", &long),
+        ];
+        let cmd = test_run_cmd();
+        let plan = build_run_prompt_plan(
+            &history,
+            "continue",
+            None,
+            "context-fixture",
+            None,
+            &default_template_options(),
+            &cmd,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(plan.kv_capacity, Some(262_144));
+        assert!(plan.prompt_tokens.unwrap() > 8192);
+        assert_eq!(plan.dropped_history_messages, 0);
+        assert_eq!(plan.max_tokens_clamped_from, None);
+        assert_eq!(plan.sampling_params.max_tokens, cmd.max_tokens as usize);
+    }
+
+    #[test]
+    fn run_plan_context_preserves_explicit_kv_limits_and_precedence() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut config = CliConfig::default();
+        config.runtime.kv_capacity = Some(16_384);
+        let config_only = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
+        let with_env = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_KV_CAPACITY", "12288")]),
+        );
+        let mut cmd = test_run_cmd();
+        cmd.kv_capacity = Some(4096);
+        let with_cli =
+            run_effective_runtime_config(&with_env, &run_startup_cli_runtime_entries(&cmd, None));
+
+        for (requested, expected, source) in [
+            (config_only, 16_384, RuntimeConfigSource::ConfigFile),
+            (with_env, 12_288, RuntimeConfigSource::Env),
+            (with_cli, 4096, RuntimeConfigSource::Cli),
+        ] {
+            let effective = requested.clone();
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.runtime.kv_capacity, Some(expected));
+            let entry = effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_KV_CAPACITY")
+                .unwrap();
+            assert_eq!(entry.effective_value, expected.to_string());
+            assert_eq!(entry.source, source);
+            let budget = RunBudget::from_product_sources(
+                None,
+                None,
+                model_dir.path(),
+                &effective,
+                Some(262_144),
+            )
+            .unwrap();
+            assert_eq!(budget.kv_capacity, Some(expected));
+        }
+    }
+
+    #[test]
+    fn legacy_run_keeps_automatic_kv_capacity() {
+        let source = tempfile::tempdir().unwrap();
+        let entries = crate::source_resolver::chat_profile_runtime_entries(
+            source.path(),
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&snapshot).unwrap();
+        assert_eq!(engine.runtime.kv_capacity, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn run_explicit_kv_limit_cannot_expand_the_model_context() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_KV_CAPACITY",
+            "65536",
+            RuntimeConfigSource::Cli,
+        )]);
+        let effective = requested.clone();
+        let mut engine_config = ferrum_types::EngineConfig::default();
+        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        let mut capabilities = ModelCapabilities::unknown();
+        capabilities.max_context_len = Some(32_768);
+        let resolved = run_startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
+            Some(capabilities),
+            authority,
+            None,
+            None,
+            effective,
+        )
+        .unwrap();
+        engine_config
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine_config.runtime.kv_capacity, Some(65_536));
+        assert_eq!(engine_config.runtime.max_model_len, Some(32_768));
+        let maximum = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_MAX_MODEL_LEN")
+            .unwrap();
+        assert_eq!(maximum.source, RuntimeConfigSource::Default);
+        let budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
+        // The CPU stub exercises the production engine's common request guard
+        // without loading weights or requiring the selected native backend.
+        let engine = ferrum_engine::EngineBuilder::new(engine_config)
+            .with_tokenizer("stub")
+            .with_executor("stub")
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(budget.kv_capacity, Some(32_768));
+        assert_eq!(engine.context_capacity(), budget.kv_capacity);
+        assert_eq!(engine.config().runtime.max_model_len, Some(32_768));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn run_memory_plan_updates_artifacts_and_history_budget() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut model = ModelCapabilities::unknown();
+        model.max_context_len = Some(32_768);
+        let mut resolved = run_startup_auto_config(
+            crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
+            Some(model),
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            None,
+            None,
+            run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default()),
+        )
+        .unwrap();
+        let request = ferrum_types::StartupMemoryRequest::from_snapshot(
+            ferrum_types::DeviceMemorySnapshot {
+                capacity_bytes: 1024 * 1024 * 1024,
+                available_bytes: 512 * 1024 * 1024,
+                source: "fixture".into(),
+            },
+            1.0,
+            &resolved.runtime_config,
+        )
+        .unwrap();
+        let plan = ferrum_types::StartupMemoryPlan {
+            request,
+            requested: ferrum_types::StartupResourceLimits {
+                context_tokens: 32_768,
+                max_sequences: 1,
+                max_batch_tokens: 2048,
+            },
+            selected: ferrum_types::StartupResourceLimits {
+                context_tokens: 4096,
+                max_sequences: 1,
+                max_batch_tokens: 256,
+            },
+            context_peak_bytes: 500 * 1024 * 1024,
+            decode_peak_bytes: 480 * 1024 * 1024,
+            reasons: vec!["context and batch reduced to fit compiled workspace".into()],
+        };
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        let artifact = model_dir.path().join("effective.json");
+        let trace = model_dir.path().join("decisions.jsonl");
+        crate::commands::serve::write_failed_startup_config_artifacts(
+            &resolved,
+            None,
+            &engine.numerical_execution,
+            Some(&artifact),
+            Some(&trace),
+            &FerrumError::config("fixture initialization failed"),
+        );
+        let preliminary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(preliminary["startup"]["status"], "failed");
+        assert_eq!(preliminary["startup"]["configuration"], "preliminary");
+        assert_eq!(preliminary["selected_max_model_len"], 32_768);
+        plan.apply_to_engine_config(&mut engine).unwrap();
+        crate::startup::apply_engine_plan(&mut resolved, &engine);
+        let budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            engine.runtime.max_model_len,
+        )
+        .unwrap();
+        assert_eq!(budget.kv_capacity, Some(4096));
+        assert_eq!(resolved.startup_memory_plan.as_ref(), Some(&plan));
+        crate::commands::serve::write_startup_config_artifacts(
+            &resolved,
+            None,
+            &engine.numerical_execution,
+            Some(&artifact),
+            Some(&trace),
+        )
+        .unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+        assert!(document.get("startup").is_none());
+        assert_eq!(document["selected_max_model_len"], 4096);
+        assert_eq!(
+            document["startup_memory_plan"]["selected"]["context_tokens"],
+            4096
+        );
+        assert_eq!(
+            document["startup_memory_plan"]["selected"]["max_batch_tokens"],
+            256
+        );
+        for line in std::fs::read_to_string(trace).unwrap().lines() {
+            let decision: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(decision.get("startup").is_none());
+        }
+    }
+
+    #[test]
     fn run_budget_clamps_generation_to_the_tighter_configured_context_bound() {
         let model_dir = tempfile::tempdir().unwrap();
         let cmd = test_run_cmd();
-        for (model_limit, kv_limit, expected_limit) in [
-            (Some(64), None, 64),
-            (None, Some(48), 48),
-            (Some(64), Some(128), 64),
-            (Some(128), Some(48), 48),
-            (Some(0), Some(48), 48),
-            (Some(64), Some(0), 64),
+        for (declared_limit, model_limit, kv_limit, expected_limit) in [
+            (None, Some(64), None, 64),
+            (None, None, Some(48), 48),
+            (None, Some(64), Some(128), 64),
+            (None, Some(128), Some(48), 48),
+            (None, Some(0), Some(48), 48),
+            (None, Some(64), Some(0), 64),
+            (Some(64), None, None, 64),
+            (Some(32), Some(128), Some(48), 32),
+            (Some(128), Some(64), Some(48), 48),
         ] {
             let snapshot = RuntimeConfigSnapshot::from_entries(
                 [
@@ -4335,8 +4621,14 @@ mod tests {
                     })
                 }),
             );
-            let mut budget =
-                RunBudget::from_product_sources(None, None, model_dir.path(), &snapshot).unwrap();
+            let mut budget = RunBudget::from_product_sources(
+                None,
+                None,
+                model_dir.path(),
+                &snapshot,
+                declared_limit,
+            )
+            .unwrap();
             budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
             let plan = build_run_prompt_plan(
                 &[],
@@ -4370,18 +4662,31 @@ mod tests {
             &run_base_runtime_config(&config, RuntimeConfigSnapshot::default()),
             &run_startup_cli_runtime_entries(&cmd, None),
         );
+        let effective = requested.clone();
+        let maximum = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_MAX_MODEL_LEN")
+            .unwrap();
+        assert_eq!(maximum.source, RuntimeConfigSource::Cli);
+        assert_eq!(maximum.effective_value, "64");
         let resolved = run_startup_auto_config(
-            &ferrum_types::Device::CPU,
+            crate::commands::serve::hardware_capabilities_for_device(&ferrum_types::Device::CPU),
             None,
             ferrum_types::ExecutionResourceAuthority::PlanRuntime,
             None,
             None,
-            requested,
+            effective,
         )
         .unwrap();
-        let mut budget =
-            RunBudget::from_product_sources(None, None, model_dir.path(), &resolved.runtime_config)
-                .unwrap();
+        let mut budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
         budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
         let long = std::iter::repeat_n("old", 80).collect::<Vec<_>>().join(" ");
         let history = [

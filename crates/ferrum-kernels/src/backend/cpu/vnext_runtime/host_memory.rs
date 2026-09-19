@@ -1,34 +1,42 @@
 use super::CpuRuntimeError;
 
+mod available;
+pub(crate) use available::host_memory_available;
+
 /// Hardware/process capacity for the existing typed runtime memory policy.
 /// Provider allocations are separately charged against its admitted ceiling.
 pub(crate) fn host_memory_capacity() -> Result<u64, CpuRuntimeError> {
     let bytes = platform_capacity()?;
     #[cfg(unix)]
     let bytes = {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        // SAFETY: getrlimit initializes the complete output on success.
-        if unsafe { libc::getrlimit(libc::RLIMIT_AS, limit.as_mut_ptr()) } != 0 {
-            return Err(CpuRuntimeError::new(format!(
-                "read CPU address-space limit: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let limit = unsafe { limit.assume_init() };
-        if limit.rlim_cur != libc::RLIM_INFINITY {
-            bytes.min(limit.rlim_cur as u64)
+        if let Some(limit) = address_space_limit()? {
+            bytes.min(limit)
         } else {
             bytes
         }
     };
     #[cfg(target_os = "linux")]
-    let bytes = linux_cgroup_capacity(bytes)?;
+    let bytes = linux_cgroup_bound(bytes, false)?;
     if bytes == 0 || bytes > usize::MAX as u64 {
         return Err(CpuRuntimeError::new(
             "CPU memory capacity is zero or exceeds the process address space",
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn address_space_limit() -> Result<Option<u64>, CpuRuntimeError> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the complete output on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, limit.as_mut_ptr()) } != 0 {
+        return Err(CpuRuntimeError::new(format!(
+            "read CPU address-space limit: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let limit = unsafe { limit.assume_init() };
+    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur as u64))
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -72,19 +80,30 @@ fn platform_capacity() -> Result<u64, CpuRuntimeError> {
 
 #[cfg(target_os = "windows")]
 fn platform_capacity() -> Result<u64, CpuRuntimeError> {
-    // Native ABI: https://learn.microsoft.com/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex
-    #[repr(C)]
-    struct MemoryStatusEx {
-        length: u32,
-        memory_load: u32,
-        total_physical: u64,
-        available_physical: u64,
-        total_page_file: u64,
-        available_page_file: u64,
-        total_virtual: u64,
-        available_virtual: u64,
-        available_extended_virtual: u64,
-    }
+    let status = windows_memory_status()?;
+    Ok(status
+        .total_physical
+        .min(status.total_virtual)
+        .min(status.total_page_file))
+}
+
+// Native ABI: https://learn.microsoft.com/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MemoryStatusEx {
+    length: u32,
+    memory_load: u32,
+    total_physical: u64,
+    available_physical: u64,
+    total_page_file: u64,
+    available_page_file: u64,
+    total_virtual: u64,
+    available_virtual: u64,
+    available_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_memory_status() -> Result<MemoryStatusEx, CpuRuntimeError> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
@@ -98,10 +117,7 @@ fn platform_capacity() -> Result<u64, CpuRuntimeError> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(status
-        .total_physical
-        .min(status.total_virtual)
-        .min(status.total_page_file))
+    Ok(status)
 }
 
 #[cfg(not(any(
@@ -127,10 +143,25 @@ fn parse_cgroup_limit(value: &str) -> Result<Option<u64>, CpuRuntimeError> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_cgroup_capacity(mut bytes: u64) -> Result<u64, CpuRuntimeError> {
-    use std::path::{Component, Path};
+fn linux_cgroup_bound(bytes: u64, available: bool) -> Result<u64, CpuRuntimeError> {
     let membership = std::fs::read_to_string("/proc/self/cgroup")
         .map_err(|error| CpuRuntimeError::new(format!("read CPU cgroup membership: {error}")))?;
+    cgroup_bound(
+        bytes,
+        available,
+        &membership,
+        std::path::Path::new("/sys/fs/cgroup"),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_bound(
+    mut bytes: u64,
+    available: bool,
+    membership: &str,
+    mount: &std::path::Path,
+) -> Result<u64, CpuRuntimeError> {
+    use std::path::{Component, Path};
     for row in membership.lines() {
         let mut columns = row.splitn(3, ':');
         let _hierarchy = columns.next();
@@ -138,13 +169,17 @@ fn linux_cgroup_capacity(mut bytes: u64) -> Result<u64, CpuRuntimeError> {
         let Some(group) = columns.next() else {
             continue;
         };
-        let (root, filename) = if controllers.is_empty() {
-            (Path::new("/sys/fs/cgroup"), "memory.max")
+        let (root, filename, usage_filename) = if controllers.is_empty() {
+            (mount.to_path_buf(), "memory.max", "memory.current")
         } else if controllers
             .split(',')
             .any(|controller| controller == "memory")
         {
-            (Path::new("/sys/fs/cgroup/memory"), "memory.limit_in_bytes")
+            (
+                mount.join("memory"),
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+            )
         } else {
             continue;
         };
@@ -163,7 +198,23 @@ fn linux_cgroup_capacity(mut bytes: u64) -> Result<u64, CpuRuntimeError> {
             match std::fs::read_to_string(directory.join(filename)) {
                 Ok(value) => {
                     if let Some(limit) = parse_cgroup_limit(&value)? {
-                        bytes = bytes.min(limit);
+                        let remaining = if available {
+                            let value = std::fs::read_to_string(directory.join(usage_filename))
+                                .map_err(|error| {
+                                    CpuRuntimeError::new(format!(
+                                        "read CPU cgroup memory usage: {error}"
+                                    ))
+                                })?;
+                            let used = value.trim().parse::<u64>().map_err(|_| {
+                                CpuRuntimeError::new(
+                                    "Linux cgroup memory usage is not an unsigned byte count",
+                                )
+                            })?;
+                            limit.saturating_sub(used)
+                        } else {
+                            limit
+                        };
+                        bytes = bytes.min(remaining);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -184,6 +235,34 @@ fn linux_cgroup_capacity(mut bytes: u64) -> Result<u64, CpuRuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CgroupFixture(std::path::PathBuf);
+
+    impl CgroupFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ferrum-cgroup-memory-{}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, path: &str, value: &str) {
+            let path = self.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        }
+    }
+
+    impl Drop for CgroupFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn host_capacity_is_a_real_addressable_ceiling() {
         let bytes = host_memory_capacity().unwrap();
@@ -198,5 +277,55 @@ mod tests {
         for value in ["-1", "1GB", "", "18446744073709551616"] {
             assert!(parse_cgroup_limit(value).is_err());
         }
+    }
+
+    #[test]
+    fn cgroup_available_obeys_busy_parent_and_does_not_subtract_usage_twice() {
+        let fixture = CgroupFixture::new();
+        fixture.write("memory.max", "1000");
+        fixture.write("memory.current", "900");
+        fixture.write("job/memory.max", "500");
+        fixture.write("job/memory.current", "50");
+        assert_eq!(
+            cgroup_bound(2000, false, "0::/job", &fixture.0).unwrap(),
+            500
+        );
+        assert_eq!(
+            cgroup_bound(2000, true, "0::/job", &fixture.0).unwrap(),
+            100
+        );
+        // Host availability is already a remaining amount, not another limit
+        // from which the 900 bytes of cgroup usage should be deducted.
+        assert_eq!(cgroup_bound(75, true, "0::/job", &fixture.0).unwrap(), 75);
+        fixture.write("memory.current", "1001");
+        assert_eq!(cgroup_bound(2000, true, "0::/job", &fixture.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn cgroup_v1_usage_and_visible_namespace_root_are_respected() {
+        let fixture = CgroupFixture::new();
+        fixture.write("memory/memory.limit_in_bytes", "1000");
+        fixture.write("memory/memory.usage_in_bytes", "200");
+        fixture.write("memory/job/memory.limit_in_bytes", "300");
+        fixture.write("memory/job/memory.usage_in_bytes", "75");
+        assert_eq!(
+            cgroup_bound(2000, true, "2:cpu,memory:/job", &fixture.0).unwrap(),
+            225
+        );
+        assert_eq!(
+            cgroup_bound(2000, true, "2:memory:/../../outer", &fixture.0).unwrap(),
+            800
+        );
+    }
+
+    #[test]
+    fn cgroup_unknown_usage_fails_and_unlimited_capacity_preserves_host_budget() {
+        let fixture = CgroupFixture::new();
+        fixture.write("memory.max", "max");
+        assert_eq!(cgroup_bound(321, true, "0::/", &fixture.0).unwrap(), 321);
+        fixture.write("memory.max", "1000");
+        assert!(cgroup_bound(321, true, "0::/", &fixture.0).is_err());
+        fixture.write("memory.current", "invalid");
+        assert!(cgroup_bound(321, true, "0::/", &fixture.0).is_err());
     }
 }

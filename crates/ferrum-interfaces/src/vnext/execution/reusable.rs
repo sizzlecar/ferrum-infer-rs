@@ -1,6 +1,6 @@
 use super::{
-    canonical_fingerprint, invalid_plan, BTreeMap, Deserialize, Deserializer, DynamicBackingPoolId,
-    Serialize, VNextError,
+    canonical_fingerprint, invalid_plan, BTreeMap, BTreeSet, Deserialize, Deserializer,
+    DynamicBackingPoolId, Serialize, VNextError,
 };
 
 pub const MAX_REUSABLE_EXECUTION_BUCKETS: usize = 64;
@@ -1067,6 +1067,47 @@ impl ReusableExecutionMemoryPlan {
                 *total = total
                     .checked_add(bytes)
                     .ok_or_else(|| invalid_plan("reusable pool workspace ceiling overflows u64"))?;
+            }
+        }
+        Ok(totals)
+    }
+
+    /// Arenas retained by the declared startup capture inventory. Multiple
+    /// programs using one bucket share its lane arena; unreferenced buckets
+    /// remain permissions rather than resident startup allocations.
+    pub(crate) fn startup_sealed_pool_workspace_bytes(
+        &self,
+    ) -> Result<BTreeMap<DynamicBackingPoolId, u64>, VNextError> {
+        let Some(policy) = self
+            .program_policy()
+            .filter(|policy| policy.catalog_lifetime().is_startup_sealed())
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let mut captured = BTreeSet::new();
+        let mut totals = BTreeMap::new();
+        for program in policy.programs() {
+            let shape = program.shape();
+            let bucket = self
+                .smallest_covering_bucket(
+                    program.class_id(),
+                    shape.request_capacity(),
+                    shape.token_capacity(),
+                    0,
+                )
+                .ok_or_else(|| invalid_plan("startup capture program has no workspace bucket"))?;
+            if !captured.insert(bucket.bucket().bucket_id()) {
+                continue;
+            }
+            for budget in bucket.pool_budgets() {
+                let bytes = budget
+                    .total_bytes()?
+                    .checked_mul(u64::from(self.maximum_reusable_lanes))
+                    .ok_or_else(|| invalid_plan("sealed reusable lane workspace overflows u64"))?;
+                let total = totals.entry(budget.pool_id().clone()).or_insert(0_u64);
+                *total = total
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid_plan("sealed reusable pool workspace overflows u64"))?;
             }
         }
         Ok(totals)

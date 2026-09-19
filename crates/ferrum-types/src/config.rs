@@ -144,6 +144,10 @@ impl VNextTeacherForcingConfig {
 /// composition root and tests can vary the knobs per `EngineConfig`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeKnobs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_memory_request: Option<crate::StartupMemoryRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_memory_plan: Option<crate::StartupMemoryPlan>,
     pub kv_capacity: Option<usize>,
     pub max_model_len: Option<usize>,
     pub chunked_prefill_size: Option<usize>,

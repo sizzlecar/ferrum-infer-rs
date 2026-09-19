@@ -550,33 +550,39 @@
       "execution_path": "production-plan-runtime"
     }
   ],
-  "checks": [],
+  "checks": [
+
+  ],
   "readme_reviews": [
     {
       "path": "README.md",
-      "before_sha256": "55b34e2578d255c1013e7abc0ffe2f24921518adb2780ee8a7f423814ce93838",
-      "after_sha256": "5970f8dfb19d9c6f02dc3d4fbcb408572d3ba328b8d5428da2198ae3caf2413b",
+      "before_sha256": "5970f8dfb19d9c6f02dc3d4fbcb408572d3ba328b8d5428da2198ae3caf2413b",
+      "after_sha256": "c9501f0361ef373705422f887509719bc5e550e8d68b8a8039b4b31aa332749e",
       "areas": [
         "build",
         "backend_submission",
         "template",
         "termination",
-        "tools"
+        "tools",
+        "scheduler",
+        "kv"
       ],
-      "rationale": "Reviewed Bonsai 2 Metal support: official packed PQ2_0 weights, pinned source metadata and template, FP16 KV run/serve commands, bounded 8K context and 10 GiB example, Orchestral tools, continuation and native prefix-state reuse. These are M1 Max observations, not minimum hardware or general performance claims. CUDA operator evidence is distinct from full 27B validation, which is deferred for this release. Unsupported formats, vision, complete CPU inference and the unvalidated INT8 combination remain explicit. Retain build, backend submission, template, termination and tools obligations; this content review does not replace runtime or public-installation evidence."
+      "rationale": "Reviewed the source-only Bonsai shortcut and native run/serve startup capacity behavior: pinned official PQ2_0 weights and matching metadata download automatically; available selected-device memory and compiled physical weights, request/sequence state and provider workspaces determine unset context, batch and concurrency limits. Explicit limits remain authoritative or produce a capacity error. Context includes input and output; concurrent requests share capacity rather than reserving one full context each. Retain scheduler and KV capacity/lifecycle obligations in addition to build, device submission, template, termination and tools checks. Historical M1 Max/32 GB observations cover an 8K request, tools, continuation and prefix reuse only; larger contexts, full 27B CUDA, INT8, unsupported formats, vision and complete CPU inference remain uncertified. This content review is not execution, performance or public-installation evidence."
     },
     {
       "path": "README_zh.md",
-      "before_sha256": "c69bd9c7559978cab4ed340577457441a52eed980fef4936f9e0a927ec65b1f3",
-      "after_sha256": "64d06f24158f0e9a4af5c2affd2d63e0080249505f99cc29b6b3f21f71be96ca",
+      "before_sha256": "64d06f24158f0e9a4af5c2affd2d63e0080249505f99cc29b6b3f21f71be96ca",
+      "after_sha256": "c6c64a6ca07688202e6bdb3da044cc10a800133894eb04c213a95e0a52a7f0a6",
       "areas": [
         "build",
         "backend_submission",
         "template",
         "termination",
-        "tools"
+        "tools",
+        "scheduler",
+        "kv"
       ],
-      "rationale": "Reviewed the Chinese README against the English scope and commands. Reviewed Bonsai 2 Metal support: official packed PQ2_0 weights, pinned source metadata and template, FP16 KV run/serve commands, bounded 8K context and 10 GiB example, Orchestral tools, continuation and native prefix-state reuse. These are M1 Max observations, not minimum hardware or general performance claims. CUDA operator evidence is distinct from full 27B validation, which is deferred for this release. Unsupported formats, vision, complete CPU inference and the unvalidated INT8 combination remain explicit. Retain build, backend submission, template, termination and tools obligations; this content review does not replace runtime or public-installation evidence."
+      "rationale": "Reviewed the source-only Bonsai shortcut and native run/serve startup capacity behavior: pinned official PQ2_0 weights and matching metadata download automatically; available selected-device memory and compiled physical weights, request/sequence state and provider workspaces determine unset context, batch and concurrency limits. Explicit limits remain authoritative or produce a capacity error. Context includes input and output; concurrent requests share capacity rather than reserving one full context each. Retain scheduler and KV capacity/lifecycle obligations in addition to build, device submission, template, termination and tools checks. Historical M1 Max/32 GB observations cover an 8K request, tools, continuation and prefix reuse only; larger contexts, full 27B CUDA, INT8, unsupported formats, vision and complete CPU inference remain uncertified. This content review is not execution, performance or public-installation evidence."
     }
   ],
   "release_profile_ids": [

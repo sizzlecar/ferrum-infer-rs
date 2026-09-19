@@ -212,9 +212,10 @@ Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -Conten
 Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提供 `--model`，
 或者在 `ferrum.toml` 中有意设置 `default_model`。
 
-正常时请求会返回 HTTP 200 和非空的 assistant 回答。除非显式设置
-`--max-model-len`，Ferrum 会使用模型自身的上下文上限；显式上限必须容纳渲染后的
-输入与请求的输出预算之和。
+正常时请求会返回 HTTP 200 和非空的 assistant 回答。原生 `run` 和 `serve`
+从模型声明的上下文上限出发，根据设备当前可用内存，自动适配未指定的上下文、
+批次和并发设置，并在启动时显示生效值。显式设置会被保留；容量不足时明确报错。
+上下文上限包含渲染后的输入与输出。
 
 示例使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
 推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking`、Chat 的
@@ -280,15 +281,17 @@ ferrum serve --model bonsai2:27b
 <details>
 <summary><strong>模型来源与实测范围</strong></summary>
 
-快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理，
+快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理。
+规划依据是所选设备的可用内存，以及编译后的权重、序列状态和算子工作区，
 不会为 Bonsai 单独固定上下文、批处理、并发或内存预算。显式配置及 CLI
 参数优先。保留模型原本的思考行为；需要关闭时，追加 `--disable-thinking`。
 
 Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
 并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
 包括 Orchestral 真实工具执行、会话续接和前缀状态复用。在 M1 Max / 32 GB 上
-的测试包括 8K 上下文请求，更长上下文尚未在这台机器上验收。协议上限沿用
-模型声明，实际请求由运行时根据可用容量准入。
+的测试包括 8K 上下文请求，更长上下文尚未在这台机器上验收。生效的上下文上限
+不超过模型声明，并可能根据机器容量缩减。并发请求共享运行时容量；并发上限
+不意味着为每个请求都预留完整上下文。
 
 快捷入口自动下载[官方 PQ2_0 文件](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)，
 以及[固定源模型版本](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0)

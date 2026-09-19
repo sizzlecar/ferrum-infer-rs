@@ -263,6 +263,18 @@ pub fn apply_auto_size(model_dir: &Path, gpu_util: f32) {
 /// dialogues blow past the default 512-token cap fast.
 pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: AutoSizeProfile) {
     let current = RuntimeConfigSnapshot::capture_current();
+    let entries = auto_size_runtime_entries(model_dir, gpu_util, profile, &current);
+    crate::runtime_env::materialize_runtime_env_defaults(&entries);
+}
+
+/// Legacy pool sizing against the caller's typed request. Product startup
+/// keeps these inferred entries separate from the original user environment.
+pub fn auto_size_runtime_entries(
+    model_dir: &Path,
+    gpu_util: f32,
+    profile: AutoSizeProfile,
+    current: &RuntimeConfigSnapshot,
+) -> Vec<RuntimeConfigEntry> {
     let kv_overridden = snapshot_value(&current, "FERRUM_KV_MAX_BLOCKS").is_some();
     let max_seqs_overridden = snapshot_value(&current, "FERRUM_PAGED_MAX_SEQS").is_some();
     let max_batched_tokens_overridden =
@@ -271,7 +283,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     let mut entries = Vec::new();
     // ALL three knobs covered by the user — nothing to set.
     if kv_overridden && max_seqs_overridden && max_batched_tokens_overridden {
-        return;
+        return entries;
     }
     let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
     let preliminary_result = auto_size_kv_blocks_with_pool_copies_for_snapshot(
@@ -303,8 +315,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         );
     }
     if kv_overridden && max_seqs_overridden {
-        crate::runtime_env::materialize_runtime_env_defaults(&entries);
-        return;
+        return entries;
     }
     let mut budget_snapshot = current.clone();
     for entry in &entries {
@@ -321,8 +332,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         )
     };
     let Some(result) = result else {
-        crate::runtime_env::materialize_runtime_env_defaults(&entries);
-        return;
+        return entries;
     };
     result.print_summary();
     let max_blocks = result.max_blocks.max(defaults.kv_block_floor);
@@ -364,7 +374,6 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             RuntimeConfigSource::MemoryProfile,
         ));
     }
-    crate::runtime_env::materialize_runtime_env_defaults(&entries);
     eprintln!(
         "[auto-size] KV_MAX_BLOCKS={} PAGED_MAX_SEQS={} KV_CAPACITY={}",
         if kv_overridden {
@@ -385,6 +394,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
             "<default>".to_string()
         },
     );
+    entries
 }
 
 const MAX_AUTOSIZED_SEQUENCE_TOKENS: usize = 16_384;

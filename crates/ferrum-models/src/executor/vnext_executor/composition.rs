@@ -144,6 +144,60 @@ impl<R: DeviceRuntime> VNextCompiledModel<'_, R> {
         &self.compilation
     }
 
+    /// Evaluate the retained compiled plan without allocating device memory.
+    pub fn startup_peak_bytes(&self, workload: ferrum_types::StartupWorkload) -> Result<u64> {
+        let (context, frontier, sequences, tokens) = match workload {
+            ferrum_types::StartupWorkload::Prefill {
+                context_tokens,
+                chunk_tokens,
+            } => (context_tokens, context_tokens, 1, chunk_tokens),
+            ferrum_types::StartupWorkload::Decode {
+                context_tokens,
+                active_sequences,
+            } => (context_tokens, 1, active_sequences, active_sequences),
+        };
+        let context = u64::try_from(context)
+            .map_err(|_| FerrumError::config("startup context exceeds u64"))?;
+        let frontier = u64::try_from(frontier)
+            .map_err(|_| FerrumError::config("startup sequence frontier exceeds u64"))?;
+        let sequences = u32::try_from(sequences)
+            .map_err(|_| FerrumError::config("startup sequence count exceeds u32"))?;
+        let tokens = u64::try_from(tokens)
+            .map_err(|_| FerrumError::config("startup token count exceeds u64"))?;
+        self.compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory()
+            .startup_workload_peak_bytes(context, frontier, sequences, tokens)
+            .map_err(|error| FerrumError::config(format!("compiled startup memory: {error}")))
+    }
+
+    /// Attach final evaluation evidence after confirming the report describes
+    /// this retained compilation's immutable policy.
+    pub fn set_startup_memory_plan(&mut self, plan: ferrum_types::StartupMemoryPlan) -> Result<()> {
+        let memory = self
+            .compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .memory();
+        if plan.selected.context_tokens != self.config.maximum_model_tokens
+            || plan.selected.max_sequences as u64 != u64::from(memory.maximum_active_sequences())
+            || plan.selected.max_batch_tokens as u64
+                != self.config.runtime_policy.maximum_scheduled_tokens()
+            || plan.request.usable_capacity_bytes != memory.usable_capacity_bytes()
+            || plan.context_peak_bytes > memory.usable_capacity_bytes()
+            || plan.decode_peak_bytes > memory.usable_capacity_bytes()
+        {
+            return Err(FerrumError::config(
+                "startup memory report differs from the retained compiled plan",
+            ));
+        }
+        self.config.startup_memory_plan = Some(plan);
+        Ok(())
+    }
+
     pub fn initialize<F>(self, resolve_plan: F) -> Result<VNextModelExecutor<R>>
     where
         F: FnOnce(

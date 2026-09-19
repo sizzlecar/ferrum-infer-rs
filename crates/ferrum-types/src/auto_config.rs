@@ -326,9 +326,73 @@ pub struct ResolvedFerrumConfig {
     pub hardware_capabilities: HardwareCapabilities,
     pub workload_profile: WorkloadProfile,
     pub decisions: Vec<AutoConfigDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_memory_plan: Option<crate::StartupMemoryPlan>,
 }
 
 impl ResolvedFerrumConfig {
+    /// Publish the same selected limits that the compiled executor and engine
+    /// use. Preserve explicit provenance; only inferred values become memory
+    /// profile decisions.
+    pub fn apply_startup_memory_plan(&mut self, plan: &crate::StartupMemoryPlan) {
+        for (key, selection, value) in [
+            (
+                "FERRUM_MAX_MODEL_LEN",
+                "max_model_len",
+                plan.selected.context_tokens as u64,
+            ),
+            (
+                "FERRUM_PAGED_MAX_SEQS",
+                "max_sequences",
+                plan.selected.max_sequences as u64,
+            ),
+            (
+                "FERRUM_MAX_BATCHED_TOKENS",
+                "max_batched_tokens",
+                plan.selected.max_batch_tokens as u64,
+            ),
+            (
+                "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+                "runtime_memory_budget_bytes",
+                plan.request.usable_capacity_bytes,
+            ),
+        ] {
+            let source = self
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.source)
+                .filter(|source| {
+                    matches!(
+                        source,
+                        RuntimeConfigSource::Cli
+                            | RuntimeConfigSource::Env
+                            | RuntimeConfigSource::ConfigFile
+                            | RuntimeConfigSource::ScriptCase
+                    )
+                })
+                .unwrap_or(RuntimeConfigSource::MemoryProfile);
+            self.runtime_config.upsert(key, value.to_string(), source);
+            self.decisions
+                .retain(|decision| decision.selection != selection);
+            self.decisions.push(AutoConfigDecision {
+                schema_version: 1,
+                selection: selection.to_owned(),
+                selected: value.to_string(),
+                source: auto_config_source_from_runtime(source),
+                source_key: Some(key.to_owned()),
+                candidates: vec![value.to_string()],
+                rejected: Vec::new(),
+                affects: vec![
+                    RuntimeConfigEffect::Memory,
+                    RuntimeConfigEffect::Performance,
+                ],
+            });
+        }
+        self.startup_memory_plan = Some(plan.clone());
+    }
+
     pub fn effective_config_document(&self) -> serde_json::Value {
         let backend = self.hardware_capabilities.backend.clone();
         let requested_gpu_devices = self
@@ -418,6 +482,7 @@ impl ResolvedFerrumConfig {
             "env_hash": self.runtime_env_hash(),
             "backend": backend.clone(),
             "execution_resource_authority": self.execution_resource_authority,
+            "startup_memory_plan": self.startup_memory_plan,
             "requested_gpu_devices": requested_gpu_devices.clone(),
             "selected_gpu_devices": selected_gpu_devices.clone(),
             "cuda_device_count": cuda_device_count,
@@ -864,11 +929,26 @@ impl FerrumConfigBuilder {
             },
         )?;
         let default_max_sequences = self.default_max_sequences();
-        let max_sequences = self.usize_value(
+        let mut max_sequences = self.usize_value(
             "FERRUM_PAGED_MAX_SEQS",
             default_max_sequences.value,
             default_max_sequences.source,
         )?;
+        if plan_runtime
+            && !matches!(
+                max_sequences.source,
+                AutoConfigSource::Cli
+                    | AutoConfigSource::Env
+                    | AutoConfigSource::ConfigFile
+                    | AutoConfigSource::ScriptCase
+            )
+        {
+            if let Some(batch) = self.optional_usize_value("FERRUM_MAX_BATCHED_TOKENS")? {
+                // A configured batch bounds automatic decode width. Explicit
+                // concurrency still reaches validation unchanged.
+                max_sequences.value = max_sequences.value.min(batch.value.max(1));
+            }
+        }
         if plan_runtime && self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
             return self.invalid(
                 "FERRUM_RECURRENT_STATE_MAX_SLOTS",
@@ -905,7 +985,18 @@ impl FerrumConfigBuilder {
             default_max_batched_tokens.value,
             default_max_batched_tokens.source,
         )?;
-        let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
+        let max_model_len = self
+            .optional_usize_value("FERRUM_MAX_MODEL_LEN")?
+            .or_else(|| {
+                plan_runtime
+                    .then_some(self.model.max_context_len)
+                    .flatten()
+                    .map(|value| ResolvedValue {
+                        value,
+                        source: AutoConfigSource::ModelMetadata,
+                        source_key: None,
+                    })
+            });
         let default_prefill_first_until_active =
             self.default_prefill_first_until_active(&max_sequences);
         let default_active_decode_prefill_chunk =
@@ -986,6 +1077,35 @@ impl FerrumConfigBuilder {
         // non-preset path resolved FERRUM_VLLM_MOE as a decision only and the
         // model never saw it (~9.7 vs ~59 tok/s on a 4090 for Qwen3-30B-A3B).
         let mut runtime_config = self.runtime_config.clone();
+        // Native resource selection is one typed decision. A diagnostic-only
+        // decision must never leave the engine running a different default.
+        if plan_runtime {
+            for (key, resolved) in [
+                ("FERRUM_PAGED_MAX_SEQS", Some(&max_sequences)),
+                ("FERRUM_MAX_BATCHED_TOKENS", Some(&max_batched_tokens)),
+                ("FERRUM_MAX_MODEL_LEN", max_model_len.as_ref()),
+            ] {
+                if let Some(resolved) = resolved {
+                    let value = resolved.value.to_string();
+                    if self
+                        .entry(key)
+                        .is_none_or(|entry| entry.effective_value != value)
+                    {
+                        runtime_config.upsert(
+                            key,
+                            value,
+                            if let Some(entry) = self.entry(key) {
+                                entry.source
+                            } else if resolved.source == AutoConfigSource::HardwareCapability {
+                                RuntimeConfigSource::MemoryProfile
+                            } else {
+                                RuntimeConfigSource::Default
+                            },
+                        );
+                    }
+                }
+            }
+        }
         let legacy_attention_values = [
             ("FERRUM_USE_VLLM_PAGED_ATTN", &use_vllm_paged_attn),
             ("FERRUM_VLLM_PAGED_ATTN_V1_SHORT", &vllm_v1_short),
@@ -1117,6 +1237,7 @@ impl FerrumConfigBuilder {
             hardware_capabilities: self.hardware.clone(),
             workload_profile: self.workload.clone(),
             decisions,
+            startup_memory_plan: None,
         })
     }
 

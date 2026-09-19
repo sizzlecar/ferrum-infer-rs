@@ -15,6 +15,15 @@ fn review(path: &str, before: &str, after: &str) -> ReadmeReview {
     }
 }
 
+fn capacity_review(path: &str, before: &str, after: &str) -> ReadmeReview {
+    ReadmeReview {
+        areas: vec![ChangeArea::Scheduler, ChangeArea::Kv],
+        rationale: "Reviewed automatic context, batch and concurrency fitting and explicit capacity limits."
+            .into(),
+        ..review(path, before, after)
+    }
+}
+
 fn input(impact: Impact) -> PlanInput {
     let target = ExecutionTarget {
         architecture: "dense".into(),
@@ -47,12 +56,12 @@ fn input(impact: Impact) -> PlanInput {
 }
 
 #[test]
-fn reviewed_readmes_preserve_source_unknown_paths_and_model_obligations() {
-    let before = "Install the package.";
-    let after = "Install the package and use the reasoning control.";
+fn reviewed_capacity_readmes_preserve_source_unknown_paths_and_model_obligations() {
+    let before = "Run the model.";
+    let after = "Startup fits automatic context, batch and concurrency to available memory.";
     let reviews = [
-        review("README.md", before, after),
-        review("README_zh.md", before, after),
+        capacity_review("README.md", before, after),
+        capacity_review("README_zh.md", before, after),
     ];
     let mut impact = analyze_paths([
         "README.md",
@@ -94,6 +103,87 @@ fn reviewed_readmes_preserve_source_unknown_paths_and_model_obligations() {
         .any(|gap| matches!(gap, Gap::UnmappedChange { .. })));
     assert_eq!(reviewed_plan.obligations, original_plan.obligations);
     assert_eq!(reviewed_plan.selected, original_plan.selected);
+}
+
+#[test]
+fn capacity_review_adds_scheduler_kv_and_model_execution_requirements() {
+    use ferrum_bench_core::release_regression::{Behavior, EvidenceLayer};
+
+    let before = "Run the model.";
+    let after = "Startup fits automatic context, batch and concurrency; explicit limits must fit.";
+    let reviewed = capacity_review("README.md", before, after);
+    let mut catalog = json!({"readme_reviews": [reviewed]});
+    let reviews = take_reviews(&mut catalog).unwrap();
+    let mut impact = analyze_paths(["README.md"]);
+    let original_plan = plan(&input(impact.clone())).unwrap();
+    assert!(original_plan.gaps.contains(&Gap::ProductContractReview));
+    apply_reviews(&mut impact, &reviews, |_| {
+        Ok((before.as_bytes().to_vec(), after.as_bytes().to_vec()))
+    })
+    .unwrap();
+    assert_eq!(impact.areas, [ChangeArea::Scheduler, ChangeArea::Kv]);
+    let reviewed_plan = plan(&input(impact)).unwrap();
+    assert!(!reviewed_plan.gaps.contains(&Gap::ProductContractReview));
+    for (behavior, layer) in [
+        (Behavior::SchedulingProgress, EvidenceLayer::Contract),
+        (Behavior::Cancellation, EvidenceLayer::Contract),
+        (Behavior::CapacityAdmission, EvidenceLayer::Contract),
+        (Behavior::KvIsolation, EvidenceLayer::Contract),
+        (Behavior::KvRelease, EvidenceLayer::Contract),
+        (Behavior::KvResume, EvidenceLayer::Contract),
+        (Behavior::ModelLoad, EvidenceLayer::ModelRuntime),
+        (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+    ] {
+        let (index, _) = reviewed_plan
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| obligation.behavior == behavior && obligation.layer == layer)
+            .expect("capacity review requires the affected contract or model execution");
+        assert!(reviewed_plan
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+    }
+    assert!(!original_plan
+        .obligations
+        .iter()
+        .any(|obligation| obligation.behavior == Behavior::CapacityAdmission));
+}
+
+#[test]
+fn missing_or_stale_capacity_reviews_keep_the_product_review_gap() {
+    let before = "Run the model.";
+    let after = "Automatic context and concurrency fit available memory.";
+    for (reviews, actual_before, actual_after) in [
+        (Vec::new(), before, after),
+        (
+            vec![capacity_review("README.md", before, after)],
+            "Different baseline.",
+            after,
+        ),
+        (
+            vec![capacity_review("README.md", before, after)],
+            before,
+            "Explicit limits are silently reduced.",
+        ),
+    ] {
+        let mut impact = analyze_paths(["README.md"]);
+        let original = impact.clone();
+        let outcome = apply_reviews(&mut impact, &reviews, |_| {
+            Ok((
+                actual_before.as_bytes().to_vec(),
+                actual_after.as_bytes().to_vec(),
+            ))
+        })
+        .unwrap();
+        assert!(outcome.applied.is_empty());
+        assert_eq!(outcome.unmatched.len(), reviews.len());
+        assert_eq!(impact, original);
+        assert!(plan(&input(impact))
+            .unwrap()
+            .gaps
+            .contains(&Gap::ProductContractReview));
+    }
 }
 
 #[test]

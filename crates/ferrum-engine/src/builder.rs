@@ -259,7 +259,7 @@ impl EngineBuilder {
         let typed_model_path = component_config.get_string_option("model_path");
         let has_model_path = typed_model_path.is_some() || self.config.runtime.model_path.is_some();
         let registry = self.registry.clone();
-        let config = self.config;
+        let mut config = self.config;
 
         // Extract custom components. Phase 3e+ deleted the legacy
         // `ComputeBackend` trait, so there's no "backend" component to
@@ -346,6 +346,10 @@ impl EngineBuilder {
                 }
             }
         };
+        if let Some(plan) = executor.startup_memory_plan() {
+            plan.apply_to_engine_config(&mut config)
+                .map_err(FerrumError::config)?;
+        }
         let execution_resource_authority = executor.execution_resource_authority();
 
         let (kv_cache, recurrent_state_manager) = match execution_resource_authority {

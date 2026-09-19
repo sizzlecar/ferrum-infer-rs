@@ -777,6 +777,241 @@ fn dynamic_pool_identity_covers_every_physical_compatibility_dimension() {
 }
 
 #[test]
+fn startup_memory_accounts_for_hybrid_state_and_each_sequences_physical_padding() {
+    let storage = DynamicStorageContract::new(
+        fixed_block_profile(4096),
+        canonical_fingerprint(&"state-layout", "test layout").unwrap(),
+    )
+    .unwrap();
+    let fixed = dynamic_value_descriptor("state/recurrent", storage.clone());
+    let kv = DynamicResourceDescriptor::new(
+        ResourceId::new("state/kv-with-scales").unwrap(),
+        DynamicResourceDemand::tokens(1024, 4096).unwrap(),
+        16,
+        BufferUsage::State,
+        ElementType::F16,
+        AllocationLifetime::Sequence,
+        AllocationKind::Value,
+        storage,
+        StateInitialization::None,
+        16,
+    )
+    .unwrap();
+    let plan =
+        MemoryPlan::from_core(1 << 24, 1 << 24, 0, 16, vec![], vec![fixed, kv], &[], None).unwrap();
+    assert_eq!(plan.startup_peak_bytes(1, 1, 1).unwrap(), 8192);
+    assert_eq!(plan.startup_peak_bytes(5, 1, 1).unwrap(), 12288);
+    assert_eq!(plan.startup_peak_bytes(5, 2, 2).unwrap(), 24576);
+    assert!(plan.startup_peak_bytes(4097, 1, 1).is_err());
+    assert!(plan.startup_peak_bytes(1, 17, 1).is_err());
+}
+
+#[test]
+fn startup_memory_reuses_only_proven_step_slots_and_ordered_invocations() {
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"workspace-layout", "test layout").unwrap(),
+    )
+    .unwrap();
+    let descriptors = vec![
+        step_descriptor(
+            "activation/a",
+            64,
+            BufferUsage::Activations,
+            storage.clone(),
+        ),
+        step_descriptor(
+            "activation/b",
+            128,
+            BufferUsage::Activations,
+            storage.clone(),
+        ),
+        invocation_descriptor("scratch/a", "node/a", 64, storage.clone()),
+        invocation_descriptor("scratch/b", "node/b", 128, storage),
+    ];
+    let ordered = vec![
+        plan_node("node/a", &[], &["activation/a", "scratch/a"]),
+        plan_node("node/middle", &["node/a"], &[]),
+        plan_node("node/b", &["node/middle"], &["activation/b", "scratch/b"]),
+    ];
+    let plan = MemoryPlan::from_core(
+        1 << 24,
+        1 << 24,
+        0,
+        16,
+        vec![],
+        descriptors.clone(),
+        &ordered,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plan.startup_peak_bytes(100, 1, 4).unwrap(), 4 * 128 + 128);
+    let unordered = vec![
+        plan_node("node/a", &[], &["activation/a", "scratch/a"]),
+        plan_node("node/b", &[], &["activation/b", "scratch/b"]),
+    ];
+    let plan = MemoryPlan::from_core(
+        1 << 24,
+        1 << 24,
+        0,
+        16,
+        vec![],
+        descriptors,
+        &unordered,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.startup_peak_bytes(100, 1, 4).unwrap(),
+        4 * (64 + 128) + 64 + 128
+    );
+}
+
+#[test]
+fn startup_memory_counts_reusable_capacity_and_keeps_fallback_bound_monotone() {
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"activation-layout", "test layout").unwrap(),
+    )
+    .unwrap();
+    let descriptor = step_descriptor("activation/a", 16, BufferUsage::Activations, storage);
+    let nodes = [plan_node("node/a", &[], &["activation/a"])];
+    let policy = ReusableExecutionPolicy::new(
+        1,
+        vec![ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new("class/test").unwrap(),
+            ReusableExecutionCapacity::new(1, 8, 1).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let plan = MemoryPlan::from_core(
+        1 << 24,
+        1 << 24,
+        0,
+        16,
+        vec![],
+        vec![descriptor],
+        &nodes,
+        Some(&policy),
+    )
+    .unwrap();
+    assert_eq!(plan.startup_peak_bytes(100, 1, 1).unwrap(), 128);
+    assert_eq!(plan.startup_peak_bytes(100, 1, 9).unwrap(), 144);
+    assert_eq!(plan.startup_peak_bytes(100, 2, 2).unwrap(), 128);
+}
+
+#[test]
+fn startup_memory_decode_preserves_request_ceiling_without_reserving_full_kv_contexts() {
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"state-layout", "test layout").unwrap(),
+    )
+    .unwrap();
+    let descriptor = |name: &str, lifetime, bytes_per_token| {
+        DynamicResourceDescriptor::new(
+            ResourceId::new(name).unwrap(),
+            DynamicResourceDemand::tokens(bytes_per_token, 4096).unwrap(),
+            16,
+            BufferUsage::State,
+            ElementType::U8,
+            lifetime,
+            AllocationKind::Value,
+            storage.clone(),
+            StateInitialization::None,
+            16,
+        )
+        .unwrap()
+    };
+    let plan = MemoryPlan::from_core(
+        1 << 24,
+        1 << 24,
+        0,
+        16,
+        vec![],
+        vec![
+            descriptor("state/request", AllocationLifetime::Request, 4),
+            descriptor("state/sequence", AllocationLifetime::Sequence, 64),
+        ],
+        &[],
+        None,
+    )
+    .unwrap();
+    let full_request_shallow_sequence = plan.startup_workload_peak_bytes(4096, 1, 4, 4).unwrap();
+    assert_eq!(full_request_shallow_sequence, 4 * (4 * 4096 + 64));
+    assert!(full_request_shallow_sequence > plan.startup_peak_bytes(1, 4, 4).unwrap());
+    assert!(full_request_shallow_sequence < plan.startup_peak_bytes(4096, 4, 4).unwrap());
+}
+
+#[test]
+fn startup_memory_sealed_catalog_retains_captured_arenas_beside_eager_workspace() {
+    let storage = DynamicStorageContract::new(
+        linear_profile(),
+        canonical_fingerprint(&"activation-layout", "test layout").unwrap(),
+    )
+    .unwrap();
+    let descriptor = step_descriptor("activation/a", 16, BufferUsage::Activations, storage);
+    let nodes = [plan_node("node/a", &[], &["activation/a"])];
+    let class = ReusableExecutionClassId::new("class/test").unwrap();
+    let buckets = [(1, 4), (2, 8), (4, 16)]
+        .into_iter()
+        .map(|(sequences, tokens)| {
+            ReusableExecutionBucketSpec::new(
+                class.clone(),
+                ReusableExecutionCapacity::new(sequences, tokens, 1).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    // Two exact programs share the second bucket; the third, larger bucket
+    // has no captured program and must not be counted as resident.
+    let programs = [(1, 1), (2, 1), (2, 2)]
+        .into_iter()
+        .map(|(sequences, tokens)| {
+            ReusableExecutionProgramSpec::new(
+                class.clone(),
+                ReusableExecutionProgramShape::uniform_decode(sequences, tokens).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let make_plan = |program_policy| {
+        let policy = ReusableExecutionPolicy::new(2, buckets.clone())
+            .unwrap()
+            .with_program_policy(program_policy)
+            .unwrap();
+        MemoryPlan::from_core(
+            1 << 24,
+            1 << 24,
+            0,
+            16,
+            vec![],
+            vec![descriptor.clone()],
+            &nodes,
+            Some(&policy),
+        )
+        .unwrap()
+    };
+    let sealed = make_plan(
+        ReusableExecutionProgramPolicy::exact_startup_sealed(1, 1, 1, programs.clone()).unwrap(),
+    );
+    let on_demand = make_plan(ReusableExecutionProgramPolicy::exact_on_demand(programs).unwrap());
+    assert_eq!(
+        sealed.startup_peak_bytes(100, 1, 1).unwrap(),
+        2 * (64 + 128) + 64
+    );
+    assert_eq!(
+        sealed.startup_peak_bytes(100, 1, 9).unwrap(),
+        2 * (64 + 128) + 256
+    );
+    assert_eq!(on_demand.startup_peak_bytes(100, 1, 1).unwrap(), 64);
+    let budget_for_only_largest_captured_bucket = 2 * 128 + 64;
+    assert!(
+        sealed.startup_peak_bytes(100, 1, 1).unwrap() > budget_for_only_largest_captured_bucket
+    );
+}
+
+#[test]
 fn memory_plan_wire_rejects_missing_core_derived_pool() {
     let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
     let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");

@@ -141,6 +141,8 @@ async fn bonsai_alias_run_and_serve_download_pinned_weights_and_only_required_me
             let diagnostic_args = [
                 "--effective-config-json".into(),
                 cache.path().join("effective.json").display().to_string(),
+                "--decision-trace-jsonl".into(),
+                cache.path().join("decisions.jsonl").display().to_string(),
             ];
             let output =
                 invoke_with_sources(&hub, model, cache.path(), serve, &diagnostic_args).await;
@@ -173,9 +175,7 @@ async fn bonsai_alias_run_and_serve_download_pinned_weights_and_only_required_me
                 .request_paths()
                 .iter()
                 .all(|path| !path.contains("/main")));
-            let config: serde_json::Value =
-                serde_json::from_slice(&fs::read(cache.path().join("effective.json")).unwrap())
-                    .unwrap();
+            let config = assert_failed_startup_diagnostics(cache.path());
             let identity = &config["resolution_evidence"];
             assert_eq!(identity["requested_model"], model);
             assert_eq!(identity["resolved_model"], weights_repo);
@@ -246,6 +246,8 @@ async fn run_and_serve_download_explicit_metadata_pin_without_following_cached_m
             format!("{metadata_repo}@{REVISION}"),
             "--effective-config-json".into(),
             cache.path().join("effective.json").display().to_string(),
+            "--decision-trace-jsonl".into(),
+            cache.path().join("decisions.jsonl").display().to_string(),
         ];
         let model = format!("{weights_repo}@{REVISION}");
         let output = invoke_with_sources(&hub, &model, cache.path(), serve, &source_args).await;
@@ -336,6 +338,8 @@ async fn run_and_serve_download_independent_tokenizer_pin_with_generation_metada
             format!("{tokenizer_repo}@{REVISION}"),
             "--effective-config-json".into(),
             cache.path().join("effective.json").display().to_string(),
+            "--decision-trace-jsonl".into(),
+            cache.path().join("decisions.jsonl").display().to_string(),
         ];
         let output = invoke_with_sources(&hub, &model, cache.path(), serve, &source_args).await;
         assert!(
@@ -382,6 +386,30 @@ async fn run_and_serve_download_independent_tokenizer_pin_with_generation_metada
     }
 }
 
+fn assert_failed_startup_diagnostics(cache: &Path) -> serde_json::Value {
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(cache.join("effective.json"))
+            .expect("startup must retain actual source evidence before the dummy weight error"),
+    )
+    .unwrap();
+    let failure = &config["startup"];
+    assert_eq!(failure["status"], "failed");
+    assert_eq!(failure["phase"], "engine_initialization");
+    assert_eq!(failure["configuration"], "preliminary");
+    let error = failure["error"].as_str().expect("initialization error");
+    assert!(error.contains("token_embd") || error.contains("model.embed_tokens"));
+    assert!(config["startup_memory_plan"].is_null());
+    let trace = fs::read_to_string(cache.join("decisions.jsonl")).unwrap();
+    assert!(!trace.trim().is_empty());
+    for line in trace.lines() {
+        let decision: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(&decision["startup"], failure);
+        // Failure metadata is additive: consumers can still decode decisions.
+        serde_json::from_value::<ferrum_types::AutoConfigDecision>(decision).unwrap();
+    }
+    config
+}
+
 fn assert_legacy_pinned_identity(
     cache: &Path,
     requested_model: &str,
@@ -389,11 +417,7 @@ fn assert_legacy_pinned_identity(
     semantic_repo: &str,
     tokenizer_repo: &str,
 ) {
-    let config: serde_json::Value = serde_json::from_slice(
-        &fs::read(cache.join("effective.json"))
-            .expect("startup must retain actual source evidence before the dummy weight error"),
-    )
-    .unwrap();
+    let config = assert_failed_startup_diagnostics(cache);
     assert_eq!(config["execution_resource_authority"], "legacy_engine");
     let identity = &config["resolution_evidence"];
     assert_eq!(identity["requested_model"], requested_model);
