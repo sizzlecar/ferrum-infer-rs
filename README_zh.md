@@ -21,123 +21,84 @@ Ferrum 使用 Rust 编写，以单个二进制文件运行，支持 Apple Silico
 | 接入应用或编程 Agent | [启动 API 服务](#启动-api-服务) · [API 兼容说明](docs/openai-api-compatibility.md) |
 | 在 Apple Silicon 上运行 Bonsai 2 27B PQ2_0 | [Metal 配置与已验证范围](#在-metal-上运行-bonsai-2-pq2_0) |
 
-## 看它如何工作
+## 在 Metal 上运行 Bonsai 2 PQ2_0
 
-一个本地模型，三个 Orchestral 终端同时阅读代码、修复问题并运行测试。
+在 Apple Silicon 上启动 **Bonsai 2 27B** 对话：
 
-[![观看 Ferrum + Orchestral 演示](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.png)](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
+```sh
+ferrum run bonsai2:27b
+```
 
-[观看英文演示](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 秒 · 8 倍速。
+或者启动本地 API，供应用调用：
+
+```sh
+ferrum serve --model bonsai2:27b
+```
+
+首次启动自动下载约 **7.2 GB 的 PQ2_0 权重**及匹配元数据，之后复用缓存，
+无需手动准备文件。Ferrum 根据可用内存适配上下文、批处理和并发，你明确
+指定的配置优先。API 地址为 `http://127.0.0.1:8000/v1`。
+
+已在 **M1 Max / 32 GB** 上验证 Metal 文本推理。需要 Ferrum **0.12.1 或更高版本**。
+[安装或更新 Ferrum](#快速开始)。
 
 <details>
-<summary><strong>快速试用</strong></summary>
+<summary><strong>模型来源与实测范围</strong></summary>
 
-在 macOS Apple Silicon 或 Linux x86_64 上安装 Ferrum 和 Orchestral：
+快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理。
+规划依据是所选设备的可用内存，以及编译后的权重、序列状态和算子工作区，
+不会为 Bonsai 单独固定上下文、批处理、并发或内存预算。显式配置及 CLI
+参数优先。保留模型原本的思考行为；需要关闭时，追加 `--disable-thinking`。
+
+Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
+并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
+包括 Orchestral 真实工具执行、会话续接和前缀状态复用。在 M1 Max / 32 GB 上
+的测试包括 8K 上下文请求，更长上下文尚未在这台机器上验收。生效的上下文上限
+不超过模型声明，并可能根据机器容量缩减。并发请求共享运行时容量；并发上限
+不意味着为每个请求都预留完整上下文。
+
+快捷入口自动下载[官方 PQ2_0 文件](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)，
+以及[固定源模型版本](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0)
+中的 `config.json`、`generation_config.json`、`tokenizer.json`、
+`tokenizer_config.json` 和 `chat_template.jinja`，无需手动整理。
+
+CUDA PQ2_0/Hadamard 算子和小型混合状态 checkpoint 测试已在真实 GPU 上通过，
+**完整 27B 模型的 CUDA 验收仍未完成**。此 Bonsai 路径不支持 PTQ1_0、旧代
+Q1_0/Q2_0 编码、MLX 包、视觉或完整 CPU 推理；Bonsai 与 INT8 KV 的组合尚未验收。
+模型声明的上下文上限不代表超过上述长度的范围已经实测。
+
+</details>
+
+## 看它如何工作
+
+**在 M1 Max / 32 GB 上运行 Bonsai 2 27B PQ2_0。** Orchestral 通过 Ferrum
+的本地 API 读取、修改 Rust 代码。
+
+[![观看 Bonsai 2、Ferrum 和 Orchestral 演示](https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8)](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa)
+
+[观看演示](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa) · [录制说明](https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379)
+· [同机实测（已提交）](https://github.com/PrismML-Eng/Bonsai-demo/pull/198)。
+8 倍速回放，保留全部等待过程；模型已缓存。首次修改遇到 Rust 编译错误 `E0282`，
+随后根据编译器反馈修复一次，两项独立 Rust 测试均通过，原测试和需求文件保持不变。
+Agent 的命令执行工具已禁用。
+
+[安装 Ferrum](#快速开始) 和 [Orchestral](https://github.com/sizzlecar/orchestral#install)，
+然后启动模型：
 
 ```sh
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
-curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+ferrum serve --model bonsai2:27b
 ```
 
-Windows x64 请使用 PowerShell：
-
-```powershell
-irm https://ferrum.pandaailabs.com/install.ps1 | iex
-irm https://orch.pandaailabs.com/install.ps1 | iex
-```
-
-安装后打开新终端，一行启动模型：
-
-```sh
-ferrum serve --model unsloth/Qwen3.5-9B-GGUF
-```
-
-Ferrum 会自动选择可用后端、解析 GGUF 文件并下载缺失的权重和元数据，后续启动复用缓存。
-默认配置下，API 地址为 `http://127.0.0.1:8000/v1`。
-
-保持 Ferrum 运行，在另一个终端进入你的项目目录后执行：
+在另一个终端进入你的项目目录，启动 Orchestral：
 
 ```sh
 orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
 ```
 
-模型就绪后，输入任务并按 Enter 即可，无需 JSON 配置或 API key。
-内存需求和速度取决于硬件；这些默认设置用于快速试用，不等于录像的并发和性能配置。
+这两条命令使用自动容量配置；录像的具体配置见录制说明。
 
-</details>
-
-<details>
-<summary><strong>高级：复现录像配置</strong></summary>
-
-视频使用 **M1 Max、32 GB 统一内存的 Mac**，通过 Metal 运行 **Qwen3.5-9B Q4_K_M**。
-以下命令采用相同的服务参数：每个上下文 24,576 token、三个活跃序列、20 GiB 运行时内存预算，
-并保留模型默认的思考行为。这些可选设置不是试用 Ferrum 的前提。
-使用 **Ferrum 0.10.0** 和 **Orchestral 0.3.1**。
-
-先安装两个程序，再打开四个终端格子：
-
-```sh
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0 --backend metal
-curl -fsSL https://orch.pandaailabs.com/install.sh | sh -s -- --version 0.3.1
-export PATH="$HOME/.local/bin:$PATH"
-ferrum --version
-orchestral --version
-```
-
-**终端 1（左上）：启动 Ferrum。** 首次启动会从 Hugging Face 下载指定的 GGUF 和模型、分词器元数据，
-以后启动复用缓存。仓库版本和文件名对应视频使用的模型权重。
-
-```sh
-ferrum serve \
-  --model unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5 \
-  --gguf-file Qwen3.5-9B-Q4_K_M.gguf \
-  --served-model-name Qwen3.5-9B \
-  --backend metal \
-  --numerical-profile qwen3_5.f32-master \
-  --host 127.0.0.1 --port 8001 \
-  --max-model-len 24576 \
-  --max-num-seqs 3 \
-  --max-num-batched-tokens 3072 \
-  --scheduler-prefill-step-chunk 1024 \
-  --scheduler-active-decode-prefill-chunk 256 \
-  --enable-prefix-cache \
-  --runtime-memory-budget-bytes 21474836480 \
-  --prefix-rendezvous-max-wait-ms 180000
-```
-
-保持 Ferrum 运行。在另一个终端检查服务是否就绪，再启动 Agent。
-这条命令会发现服务中的模型，不会生成回答：
-
-```sh
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth doctor --check-connection
-```
-
-**终端 2（右上）：** 将路径替换为你的第一个项目目录。
-
-```sh
-cd /path/to/project-a
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-**终端 3（左下）：** 打开第二个项目。
-
-```sh
-cd /path/to/project-b
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-**终端 4（右下）：** 打开第三个项目。
-
-```sh
-cd /path/to/project-c
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-在每个 Orchestral 终端输入任务并按 Enter，三个会话共用同一个 Ferrum 服务。
-视频使用三个独立的 Rust 项目，机器上已安装 Cargo；每个 Agent 的任务都是修复失败测试、
-保留公开接口、运行 `cargo test`，并用英文解释修改。
-
-</details>
+历史演示：[Qwen3.5-9B 与三个并发 Agent](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
+· [录制说明](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-demo-notes.md)。
 
 ## 愿景
 
@@ -183,8 +144,7 @@ ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 ```
 
 首次运行会下载约 **2.55 GiB**。下载耗时取决于本机到 Hugging Face 的网络链路，
-CLI 会显示下载进度。使用 6 GB 显卡时，可在 `run` 或 `serve` 命令后追加
-`--max-model-len 2048 --max-num-seqs 1`，限制上下文长度和活跃序列数。
+CLI 会显示下载进度。Ferrum 会在启动时根据可用内存适配上下文、批处理和并发。
 
 ### 启动 API 服务
 
@@ -258,52 +218,6 @@ ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
 整个模型的 checkpoint 恢复需要所有模型状态均支持恢复。关闭 prefix cache 或没有兼容的
 checkpoint 时，重新发送历史会重新计算输入；使用 `--enable-prefix-cache` 并命中后，
 可恢复模型状态并计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
-
-### 在 Metal 上运行 Bonsai 2 PQ2_0
-
-在 Apple Silicon 上启动 **Bonsai 2 27B** 对话：
-
-```sh
-ferrum run bonsai2:27b
-```
-
-或者启动本地 API，供应用调用：
-
-```sh
-ferrum serve --model bonsai2:27b
-```
-
-首次启动自动下载约 **7.2 GB 的 PQ2_0 权重**及匹配元数据，之后复用缓存，
-无需手动准备文件。API 地址为 `http://127.0.0.1:8000/v1`。
-
-需要 Ferrum **0.12.1 或更高版本**。[安装或更新 Ferrum](#快速开始)。
-
-<details>
-<summary><strong>模型来源与实测范围</strong></summary>
-
-快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理。
-规划依据是所选设备的可用内存，以及编译后的权重、序列状态和算子工作区，
-不会为 Bonsai 单独固定上下文、批处理、并发或内存预算。显式配置及 CLI
-参数优先。保留模型原本的思考行为；需要关闭时，追加 `--disable-thinking`。
-
-Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
-并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
-包括 Orchestral 真实工具执行、会话续接和前缀状态复用。在 M1 Max / 32 GB 上
-的测试包括 8K 上下文请求，更长上下文尚未在这台机器上验收。生效的上下文上限
-不超过模型声明，并可能根据机器容量缩减。并发请求共享运行时容量；并发上限
-不意味着为每个请求都预留完整上下文。
-
-快捷入口自动下载[官方 PQ2_0 文件](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)，
-以及[固定源模型版本](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0)
-中的 `config.json`、`generation_config.json`、`tokenizer.json`、
-`tokenizer_config.json` 和 `chat_template.jinja`，无需手动整理。
-
-CUDA PQ2_0/Hadamard 算子和小型混合状态 checkpoint 测试已在真实 GPU 上通过，
-**完整 27B 模型的 CUDA 验收仍未完成**。此 Bonsai 路径不支持 PTQ1_0、旧代
-Q1_0/Q2_0 编码、MLX 包、视觉或完整 CPU 推理；Bonsai 与 INT8 KV 的组合尚未验收。
-模型声明的上下文上限不代表超过上述长度的范围已经实测。
-
-</details>
 
 ## 功能
 

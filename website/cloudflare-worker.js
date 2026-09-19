@@ -3,7 +3,10 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
+const DEMO_VIDEO_URL = "https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa";
+const DEMO_POSTER_URL = "https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8";
+const DEMO_NOTES_URL = "https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379";
+const HISTORICAL_DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
 
 const css = String.raw`
 :root {
@@ -122,6 +125,7 @@ const pages = {
     title: "Ferrum — Serve LLMs with a single binary.",
     description: "A Rust-native LLM serving engine. One binary, no Python runtime.",
     nav: [
+      ["Bonsai 2", "#bonsai"],
       ["Quick start", "#quick-start"],
       ["Features", "#features"],
       ["FAQ", "#faq"],
@@ -134,13 +138,20 @@ const pages = {
     primary: "View on GitHub",
     secondary: "Start locally",
     proof: ["MIT licensed", "CPU + Metal + CUDA", "Run + OpenAI-compatible serve"],
-    demoTitle: "One model, three working agents",
-    demoLead: "Ferrum serves Qwen3.5-9B in the upper left. Three native Orchestral terminals inspect code, make changes, and run tests concurrently.",
-    demoCaption: "Three concurrent coding sessions, with all repairs independently tested. M1 Max · Qwen3.5-9B Q4_K_M. Authentic terminal replay · 8× speed.",
+    bonsaiTitle: "Bonsai 2 27B on your Mac",
+    bonsaiLead: "Ferrum downloads the model and fits context, batching, and concurrency to available memory. Your explicit settings take precedence.",
+    bonsaiChat: "Chat locally",
+    bonsaiApi: "Start a local API",
+    bonsaiInstall: "Install or update Ferrum",
+    bonsaiScope: 'Apple Silicon · Metal · PQ2_0 text inference. Tested on M1 Max / 32 GB. <a href="https://github.com/sizzlecar/ferrum-infer-rs#bonsai-2-pq2_0-on-metal">Model details and tested limits</a>.',
+    demoTitle: "Bonsai 2, working on local code",
+    demoLead: "Orchestral reads and edits Rust code through Ferrum's local API. Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB.",
+    demoCaption: "The first edit failed to compile; one repair using compiler feedback passed both independent tests. 8× replay, including all waits; weights already cached.",
     demoDetails: "Recording details",
     demoCommands: "Try it locally",
     demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs#see-it-in-action",
     demoDownload: "Download the terminal demo",
+    demoHistorical: "Earlier demo: Qwen3.5-9B with three concurrent agents",
     featureTitle: "The direct path from model to API",
     featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
     cards: [
@@ -175,7 +186,7 @@ const pages = {
     faq: [
       ["What is Ferrum?", "A Rust-native LLM serving engine. One binary, no Python runtime."],
       ["Does Ferrum require Python?", "No Python runtime is required. Linux CUDA uses the host's NVIDIA driver, CUDA 12.4 and NCCL runtimes. The Windows installer includes CUDA and VC runtimes; its NVIDIA system driver is installed separately."],
-      ["Which models are in the formal release scope?", "Ferrum v0.8 formally covers Qwen3.5 4B and 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense. Other model work may appear as development evidence before entering the support matrix."],
+      ["Which models can I run?", 'Ferrum supports multiple model families and formats; support depends on the model and backend. See the <a href="https://github.com/sizzlecar/ferrum-infer-rs#features">supported models and capabilities</a>, including <a href="https://github.com/sizzlecar/ferrum-infer-rs#bonsai-2-pq2_0-on-metal">Bonsai 2 PQ2_0 on Metal</a>.'],
       ["Can existing OpenAI clients connect to Ferrum?", "Ferrum implements OpenAI-compatible Chat Completions and stateless Responses surfaces. Check the compatibility document for the exact request contract."],
       ["Is Ferrum a hosted AI service?", "No. Ferrum is inference software that runs on hardware you control. Model licenses and data-handling choices remain yours."],
     ],
@@ -192,6 +203,7 @@ const pages = {
     title: "Ferrum — 用一个二进制文件提供大模型服务。",
     description: "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。",
     nav: [
+      ["Bonsai 2", "#bonsai"],
       ["快速开始", "#quick-start"],
       ["功能", "#features"],
       ["常见问题", "#faq"],
@@ -204,13 +216,20 @@ const pages = {
     primary: "查看 GitHub",
     secondary: "开始使用",
     proof: ["MIT 开源", "CPU + Metal + CUDA", "命令行运行 + OpenAI 兼容服务"],
-    demoTitle: "一个模型，三个 Agent 同时工作",
-    demoLead: "左上角是提供 Qwen3.5-9B 推理的 Ferrum；另外三个原生 Orchestral 终端同时读取代码、修改实现并运行测试。",
-    demoCaption: "三个编码会话同时工作，全部修复通过独立测试。M1 Max · Qwen3.5-9B Q4_K_M。真实终端录制，8 倍速回放。",
+    bonsaiTitle: "在 Mac 上运行 Bonsai 2 27B",
+    bonsaiLead: "Ferrum 自动下载模型，并根据可用内存适配上下文、批处理和并发。你明确指定的配置优先。",
+    bonsaiChat: "本地对话",
+    bonsaiApi: "启动本地 API",
+    bonsaiInstall: "安装或更新 Ferrum",
+    bonsaiScope: 'Apple Silicon · Metal · PQ2_0 文本推理。已在 M1 Max / 32 GB 上验证。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#在-metal-上运行-bonsai-2-pq2_0">模型详情与已验证范围</a>。',
+    demoTitle: "让 Bonsai 2 修改本地代码",
+    demoLead: "Orchestral 通过 Ferrum 的本地 API 读取、修改 Rust 代码。Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB。",
+    demoCaption: "首次修改未能编译；根据编译器反馈修复一次后，两项独立测试均通过。8 倍速回放，保留全部等待；权重已缓存。",
     demoDetails: "录制说明",
     demoCommands: "快速试用",
     demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#看它如何工作",
     demoDownload: "下载终端演示视频",
+    demoHistorical: "历史演示：Qwen3.5-9B 与三个并发 Agent",
     featureTitle: "从模型直接到 API",
     featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
     cards: [
@@ -245,7 +264,7 @@ const pages = {
     faq: [
       ["Ferrum 是什么？", "Rust 原生的大模型服务引擎。一个二进制文件，无需 Python 运行时。"],
       ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux CUDA 使用主机的 NVIDIA 驱动、CUDA 12.4 与 NCCL 运行库。Windows 安装包内含 CUDA 与 VC 运行库，NVIDIA 系统驱动需单独安装。"],
-      ["哪些模型属于正式发布范围？", "Ferrum v0.8 正式覆盖 Qwen3.5 4B 与 35B-A3B、Qwen3 30B-A3B 和 Llama 3.1 8B dense。其他模型可能先以开发证据出现，完成发布级门禁后才进入支持矩阵。"],
+      ["可以运行哪些模型？", 'Ferrum 支持多种模型家族与格式，具体能力取决于模型和后端。请查看<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#功能">支持的模型与功能</a>，以及 <a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#在-metal-上运行-bonsai-2-pq2_0">Bonsai 2 PQ2_0 的 Metal 支持范围</a>。'],
       ["现有 OpenAI client 能连接 Ferrum 吗？", "Ferrum 实现 OpenAI 兼容的 Chat Completions 与无状态 Responses 接口；精确请求契约请查看兼容性文档。"],
       ["Ferrum 是托管 AI 服务吗？", "不是。Ferrum 是运行在你控制的硬件上的推理软件；模型许可与数据处理方式仍由你决定。"],
     ],
@@ -287,6 +306,10 @@ function render(page) {
   const faq = page.faq.map(([question, answer]) => `<details><summary>${question}</summary><p>${answer}</p></details>`).join("");
   const nav = page.nav.map(([label, href]) => `<a href="${href}">${label}</a>`).join("");
   const proof = page.proof.map((item) => `<span>${item}</span>`).join("");
+  const bonsaiCommands = [
+    [page.bonsaiChat, "ferrum run bonsai2:27b"],
+    [page.bonsaiApi, "ferrum serve --model bonsai2:27b"],
+  ].map(([label, command], index) => `<div class="code-shell"><div class="code-top"><span>${label}</span><button class="copy-button" type="button" data-copy="bonsai-command-${index}" aria-label="${page.copyLabel}: ${label}" hidden>${page.copyLabel}</button></div><pre><code class="command" id="bonsai-command-${index}">${escapeHtml(command)}</code></pre></div>`).join("");
   const installCommands = [
     ["macOS Apple Silicon · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
     ["Linux x86_64 · Terminal", "curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh"],
@@ -330,15 +353,22 @@ function render(page) {
       <div class="actions"><a class="button primary" href="${REPOSITORY}">${page.primary}</a><a class="button" href="#quick-start">${page.secondary}</a></div>
       <div class="proof">${proof}</div>
     </div></header>
+    <section id="bonsai"><div class="wrap">
+      <div class="section-head"><h2>${page.bonsaiTitle}</h2><p>${page.bonsaiLead}</p><a href="#quick-start">${page.bonsaiInstall} ↗</a></div>
+      <div class="install-commands">${bonsaiCommands}</div>
+      <p class="copy-status" role="status" aria-live="polite"></p>
+      <p class="note">${page.bonsaiScope}</p>
+    </div></section>
     <section id="demo"><div class="wrap">
       <div class="section-head"><h2>${page.demoTitle}</h2><p>${page.demoLead}</p></div>
       <figure class="demo-recording">
-        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_ASSETS}/ferrum-orch-three-agents.png">
-          <source src="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4" type="video/mp4">
-          <a href="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoDownload}</a>
+        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_POSTER_URL}">
+          <source src="${DEMO_VIDEO_URL}" type="video/mp4">
+          <a href="${DEMO_VIDEO_URL}">${page.demoDownload}</a>
         </video>
-        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></figcaption>
+        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_NOTES_URL}">${page.demoDetails} ↗</a></figcaption>
       </figure>
+      <p class="muted"><a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoHistorical}</a> · <a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></p>
     </div></section>
     <section id="quick-start"><div class="wrap">
       <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
@@ -375,10 +405,10 @@ ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thin
   </main>
   <footer><div class="wrap footer-inner"><span>${page.footer}</span><span><a href="${REPOSITORY}">GitHub</a> · <a href="${REPOSITORY}/blob/main/LICENSE">MIT License</a></span></div></footer>
   <script>
-    const status = document.querySelector('.copy-status');
     document.querySelectorAll('[data-copy]').forEach((button) => {
       button.hidden = false;
       button.addEventListener('click', async () => {
+        const status = button.closest('section').querySelector('.copy-status');
         const command = document.getElementById(button.dataset.copy).textContent;
         let copied = false;
         try {
@@ -413,7 +443,7 @@ function response(body, contentType, status = 200) {
     headers: {
       "content-type": `${contentType}; charset=utf-8`,
       "cache-control": contentType === "text/html" ? "public, max-age=60, s-maxage=60" : "public, max-age=300, s-maxage=3600",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com; media-src https://ferrum-downloads.pandaailabs.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com https://github.com https://github-production-user-asset-6210df.s3.amazonaws.com; media-src https://github.com https://github-production-user-asset-6210df.s3.amazonaws.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
       "referrer-policy": "strict-origin-when-cross-origin",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",

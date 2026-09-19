@@ -22,130 +22,96 @@ Python runtime.
 | Connect an app or coding agent | [Start the API server](#serve-an-api) · [API compatibility](docs/openai-api-compatibility.md) |
 | Run Bonsai 2 27B PQ2_0 on Apple Silicon | [Metal setup and tested limits](#bonsai-2-pq2_0-on-metal) |
 
-## See it in action
+## Bonsai 2 PQ2_0 on Metal
 
-One local model. Three Orchestral terminals inspecting code, fixing bugs, and
-running tests concurrently.
+On Apple Silicon, start a chat with **Bonsai 2 27B**:
 
-[![Watch the Ferrum + Orchestral demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.png)](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
+```sh
+ferrum run bonsai2:27b
+```
 
-[Watch the English demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4) · 50 seconds · 8× speed.
+Or start a local API for your apps:
+
+```sh
+ferrum serve --model bonsai2:27b
+```
+
+The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
+matching metadata; later starts reuse the cache. No manual file preparation is
+needed. Ferrum adapts context, batching, and concurrency to available memory;
+your explicit settings take precedence. The API listens at
+`http://127.0.0.1:8000/v1`.
+
+Tested on **M1 Max / 32 GB** with Metal text inference. Requires Ferrum
+**0.12.1 or later**. [Install or update Ferrum](#quick-start).
 
 <details>
-<summary><strong>Try it locally</strong></summary>
+<summary><strong>Model sources and tested scope</strong></summary>
 
-Install Ferrum and Orchestral on macOS Apple Silicon or Linux x86_64:
+The shortcut selects the model files; resource configuration follows Ferrum's
+normal defaults and automatic capacity handling. Planning uses the selected
+device's available memory and the compiled weights, sequence states and
+operation workspaces. It does not impose a
+Bonsai-specific context length, batch size, concurrency, or memory budget.
+Explicit configuration and CLI options take precedence. Model reasoning
+behavior is preserved; append `--disable-thinking` if you want it off.
+
+Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
+weights packed and applies the Hadamard transforms declared by the model.
+Metal text inference has been validated through `run` and `serve` with FP16 KV,
+including Orchestral tool execution, session continuation, and prefix-state reuse.
+Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
+not been validated on this machine. The effective context cannot exceed the
+model's declaration and may be reduced to fit the machine. Concurrent requests
+share runtime capacity; the concurrency ceiling does not reserve a full context
+for every request.
+
+The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
+and the matching `config.json`,
+`generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, and
+`chat_template.jinja` from [this pinned source-model revision](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
+
+CUDA PQ2_0/Hadamard operators and small mixed-state checkpoint tests have passed
+on a real GPU; **the complete 27B CUDA model remains unvalidated**. This Bonsai
+path does not support PTQ1_0, earlier Bonsai Q1_0/Q2_0 encodings, MLX packages,
+vision, or complete CPU inference. Bonsai combined with INT8 KV is not yet
+validated. The model's declared context limit does not establish tested coverage
+beyond the context above.
+
+</details>
+
+## See it in action
+
+**Bonsai 2 27B PQ2_0 on M1 Max / 32 GB.** Orchestral reads and edits Rust
+code through Ferrum's local API.
+
+[![Watch Bonsai 2 with Ferrum and Orchestral](https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8)](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa)
+
+[Watch the demo](https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa) · [Recording details](https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379)
+· [Same-Mac measurements (submitted)](https://github.com/PrismML-Eng/Bonsai-demo/pull/198).
+8× replay with every wait preserved; model already cached. The first attempt
+hit Rust error `E0282`, followed by one repair using compiler feedback.
+Both independent Rust tests then passed; the original tests and specification
+were unchanged. The agent's shell execution was disabled.
+
+[Install Ferrum](#quick-start) and [Orchestral](https://github.com/sizzlecar/orchestral#install),
+then start the model:
 
 ```sh
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
-curl -fsSL https://orch.pandaailabs.com/install.sh | sh
+ferrum serve --model bonsai2:27b
 ```
 
-On Windows x64, use PowerShell:
-
-```powershell
-irm https://ferrum.pandaailabs.com/install.ps1 | iex
-irm https://orch.pandaailabs.com/install.ps1 | iex
-```
-
-After installation, open a new terminal and start the model:
-
-```sh
-ferrum serve --model unsloth/Qwen3.5-9B-GGUF
-```
-
-Ferrum automatically selects an available backend, resolves the GGUF file, and
-downloads any missing weights and metadata. Later starts reuse the cache. With
-the default configuration, the API listens at `http://127.0.0.1:8000/v1`.
-
-Leave Ferrum running. In another terminal, open your project directory and run:
+In another terminal, open your project and start Orchestral:
 
 ```sh
 orchestral --base-url http://127.0.0.1:8000/v1 --no-auth
 ```
 
-Once the model is ready, type a task and press Enter. No JSON configuration or API
-key is required. Memory requirements and speed depend on your hardware; these
-defaults are for trying the model, not reproducing the recording's concurrency
-and performance settings.
+These commands use automatic capacity settings; the recording notes include
+its exact configuration.
 
-</details>
-
-<details>
-<summary><strong>Advanced: reproduce the recording configuration</strong></summary>
-
-The recording uses an **M1 Max Mac with 32 GB unified memory**, Metal, and
-**Qwen3.5-9B Q4_K_M**. The commands below reproduce its serving settings:
-24,576 tokens per context, three active sequences, a 20 GiB runtime memory budget,
-and the model's default thinking behavior. These optional settings are not
-required to try Ferrum. Use **Ferrum 0.10.0** and **Orchestral 0.3.1**.
-
-Install both programs once, then open four terminal panes:
-
-```sh
-curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.10.0 --backend metal
-curl -fsSL https://orch.pandaailabs.com/install.sh | sh -s -- --version 0.3.1
-export PATH="$HOME/.local/bin:$PATH"
-ferrum --version
-orchestral --version
-```
-
-**Terminal 1 — upper left: start Ferrum.** The first start downloads the selected
-GGUF and its model/tokenizer metadata from Hugging Face; subsequent starts reuse
-the cache. The repository revision and filename select the weights used in the video.
-
-```sh
-ferrum serve \
-  --model unsloth/Qwen3.5-9B-GGUF@3885219b6810b007914f3a7950a8d1b469d598a5 \
-  --gguf-file Qwen3.5-9B-Q4_K_M.gguf \
-  --served-model-name Qwen3.5-9B \
-  --backend metal \
-  --numerical-profile qwen3_5.f32-master \
-  --host 127.0.0.1 --port 8001 \
-  --max-model-len 24576 \
-  --max-num-seqs 3 \
-  --max-num-batched-tokens 3072 \
-  --scheduler-prefill-step-chunk 1024 \
-  --scheduler-active-decode-prefill-chunk 256 \
-  --enable-prefix-cache \
-  --runtime-memory-budget-bytes 21474836480 \
-  --prefix-rendezvous-max-wait-ms 180000
-```
-
-Leave Ferrum running. In another terminal, check that it is ready before starting
-the agents. This discovers the served model without generating a response:
-
-```sh
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth doctor --check-connection
-```
-
-**Terminal 2 — upper right:** replace the path with your first project directory.
-
-```sh
-cd /path/to/project-a
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-**Terminal 3 — lower left:** open your second project.
-
-```sh
-cd /path/to/project-b
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-**Terminal 4 — lower right:** open your third project.
-
-```sh
-cd /path/to/project-c
-orchestral --base-url http://127.0.0.1:8001/v1 --no-auth
-```
-
-Type a task in each Orchestral terminal and press Enter. Each session uses the
-same Ferrum server. The video uses three separate Rust projects with Cargo
-installed, and asks each agent to fix failing tests, preserve the public API,
-run `cargo test`, and explain the fix in English.
-
-</details>
+Earlier demo: [Qwen3.5-9B with three concurrent agents](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
+· [Recording details](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-demo-notes.md).
 
 ## Vision
 
@@ -196,9 +162,8 @@ ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 ```
 
 The first run downloads about **2.55 GiB**. Download time depends on your route
-to Hugging Face; the CLI displays download progress. On a 6 GB GPU, append
-`--max-model-len 2048 --max-num-seqs 1` to either `run` or `serve` to limit the
-context and active sequences.
+to Hugging Face; the CLI displays download progress. Ferrum adapts context,
+batching, and concurrency to available memory at startup.
 
 ### Serve an API
 
@@ -283,61 +248,6 @@ recomputes the input when prefix caching is disabled or no compatible checkpoint
 is available. With `--enable-prefix-cache`, a compatible hit restores model state
 and processes the remaining suffix. Session caching stores chat messages; it is
 separate from GPU prefix-state reuse.
-
-### Bonsai 2 PQ2_0 on Metal
-
-On Apple Silicon, start a chat with **Bonsai 2 27B**:
-
-```sh
-ferrum run bonsai2:27b
-```
-
-Or start a local API for your apps:
-
-```sh
-ferrum serve --model bonsai2:27b
-```
-
-The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
-matching metadata; later starts reuse the cache. No manual file preparation is
-needed. The API listens at `http://127.0.0.1:8000/v1`.
-
-Requires Ferrum **0.12.1 or later**. [Install or update Ferrum](#quick-start).
-
-<details>
-<summary><strong>Model sources and tested scope</strong></summary>
-
-The shortcut selects the model files; resource configuration follows Ferrum's
-normal defaults and automatic capacity handling. Planning uses the selected
-device's available memory and the compiled weights, sequence states and
-operation workspaces. It does not impose a
-Bonsai-specific context length, batch size, concurrency, or memory budget.
-Explicit configuration and CLI options take precedence. Model reasoning
-behavior is preserved; append `--disable-thinking` if you want it off.
-
-Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
-weights packed and applies the Hadamard transforms declared by the model.
-Metal text inference has been validated through `run` and `serve` with FP16 KV,
-including Orchestral tool execution, session continuation, and prefix-state reuse.
-Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
-not been validated on this machine. The effective context cannot exceed the
-model's declaration and may be reduced to fit the machine. Concurrent requests
-share runtime capacity; the concurrency ceiling does not reserve a full context
-for every request.
-
-The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
-and the matching `config.json`,
-`generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, and
-`chat_template.jinja` from [this pinned source-model revision](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
-
-CUDA PQ2_0/Hadamard operators and small mixed-state checkpoint tests have passed
-on a real GPU; **the complete 27B CUDA model remains unvalidated**. This Bonsai
-path does not support PTQ1_0, earlier Bonsai Q1_0/Q2_0 encodings, MLX packages,
-vision, or complete CPU inference. Bonsai combined with INT8 KV is not yet
-validated. The model's declared context limit does not establish tested coverage
-beyond the context above.
-
-</details>
 
 ## Features
 
