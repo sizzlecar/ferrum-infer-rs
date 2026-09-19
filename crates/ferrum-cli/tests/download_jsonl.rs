@@ -1,6 +1,7 @@
 //! Download diagnostics must not corrupt `run --output-format jsonl`.
 //! Tiny, deliberately incomplete models reach the CPU weight loader and fail
-//! there. This covers stdout ownership, not inference correctness.
+//! there. This covers source resolution and stdout ownership, not inference
+//! correctness.
 
 #[path = "download_jsonl/hub.rs"]
 mod hub;
@@ -89,6 +90,113 @@ async fn invoke_with_sources(
         .await
         .expect("local download/CPU load timed out; child is killed on drop")
         .expect("launch actual ferrum binary")
+}
+
+#[tokio::test]
+async fn bonsai_alias_run_and_serve_download_pinned_weights_and_only_required_metadata() {
+    let weights_repo = "prism-ml/Ternary-Bonsai-2-27B-gguf";
+    let weights_revision = "6ed5e12bf84b7a63069882c91dd9e9218647d17b";
+    let metadata_repo = "Qwen/Qwen3.8-27B";
+    let metadata_revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0";
+    let filename = "Ternary-Bonsai-2-27B-PQ2_0.gguf";
+    // The official repository names exercise the public alias contract. Their
+    // payloads remain tiny Llama fixtures: this tests fetching and loading the
+    // resolved sources, not Bonsai numerical correctness or backend support.
+    let weights = hub::gguf_without_weights();
+    let mut metadata = hub::sidecar_files();
+    metadata.insert(
+        "generation_config.json".into(),
+        br#"{"eos_token_id":2}"#.to_vec(),
+    );
+    metadata.insert(
+        "chat_template.jinja".into(),
+        b"{% for message in messages %}{{ message.content }}{% endfor %}".to_vec(),
+    );
+    for model in ["bonsai2:27b", "bonsai2:27b-pq2_0"] {
+        for serve in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let mut metadata_files = metadata.clone();
+            metadata_files.insert(
+                "model.safetensors".into(),
+                b"metadata source weights must not be downloaded".to_vec(),
+            );
+            let hub = Hub::start_with_revisions(
+                [
+                    (
+                        weights_repo.to_owned(),
+                        [(filename.to_owned(), weights.clone())].into(),
+                    ),
+                    (metadata_repo.to_owned(), metadata_files),
+                ]
+                .into(),
+                [
+                    (weights_repo.to_owned(), weights_revision.to_owned()),
+                    (metadata_repo.to_owned(), metadata_revision.to_owned()),
+                ]
+                .into(),
+            )
+            .await;
+            // No source or GGUF filename flags: both product entrypoints must
+            // obtain the complete pinned source bundle from the alias alone.
+            let diagnostic_args = [
+                "--effective-config-json".into(),
+                cache.path().join("effective.json").display().to_string(),
+            ];
+            let output =
+                invoke_with_sources(&hub, model, cache.path(), serve, &diagnostic_args).await;
+            assert!(
+                !output.status.success(),
+                "fixture deliberately omits GGUF tensors"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("token_embd") || stderr.contains("model.embed_tokens"),
+                "{model} (serve={serve}) must resolve both pins and reach the weight loader: {stderr}"
+            );
+            let weights_root = cache
+                .path()
+                .join("hub/models--prism-ml--Ternary-Bonsai-2-27B-gguf/snapshots")
+                .join(weights_revision);
+            assert_eq!(fs::read(weights_root.join(filename)).unwrap(), weights);
+            assert!(hub.requested("GET", weights_repo, filename));
+            let metadata_root = cache
+                .path()
+                .join("hub/models--Qwen--Qwen3.8-27B/snapshots")
+                .join(metadata_revision);
+            for (name, bytes) in &metadata {
+                assert_eq!(fs::read(metadata_root.join(name)).unwrap(), *bytes);
+                assert!(hub.requested("GET", metadata_repo, name), "{name}");
+            }
+            assert!(!metadata_root.join("model.safetensors").exists());
+            assert!(!hub.requested("GET", metadata_repo, "model.safetensors"));
+            assert!(hub
+                .request_paths()
+                .iter()
+                .all(|path| !path.contains("/main")));
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(cache.path().join("effective.json")).unwrap())
+                    .unwrap();
+            let identity = &config["resolution_evidence"];
+            assert_eq!(identity["requested_model"], model);
+            assert_eq!(identity["resolved_model"], weights_repo);
+            for (role, repo, revision) in [
+                ("weights", weights_repo, weights_revision),
+                ("semantic", metadata_repo, metadata_revision),
+                ("tokenizer", metadata_repo, metadata_revision),
+            ] {
+                let original = &identity["original_sources"][role];
+                assert_eq!(original["kind"], "repository");
+                assert_eq!(original["location"], repo);
+                assert_eq!(original["requested_revision"], revision);
+                let resolved = &identity["resolved_sources"][role];
+                assert_eq!(resolved["canonical_location"], repo);
+                assert_eq!(resolved["resolved_revision"], revision);
+            }
+            if !serve {
+                assert_loader_failure_and_clean_stdout(output);
+            }
+        }
+    }
 }
 
 #[tokio::test]

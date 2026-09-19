@@ -24,9 +24,16 @@ pub type ModelFiles = BTreeMap<String, Files>;
 
 struct HubState {
     files: ModelFiles,
+    revisions: BTreeMap<String, String>,
     requests: Mutex<Vec<(Method, String)>>,
     failing_gets: Mutex<BTreeSet<(String, String)>>,
     failing_once: Mutex<BTreeSet<(String, String)>>,
+}
+
+impl HubState {
+    fn revision(&self, repo: &str) -> &str {
+        self.revisions.get(repo).map_or(REVISION, String::as_str)
+    }
 }
 
 pub struct Hub {
@@ -37,10 +44,18 @@ pub struct Hub {
 
 impl Hub {
     pub async fn start(files: ModelFiles) -> Self {
+        Self::start_with_revisions(files, BTreeMap::new()).await
+    }
+
+    pub async fn start_with_revisions(
+        files: ModelFiles,
+        revisions: BTreeMap<String, String>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(HubState {
             files,
+            revisions,
             requests: Mutex::new(Vec::new()),
             failing_gets: Mutex::new(BTreeSet::new()),
             failing_once: Mutex::new(BTreeSet::new()),
@@ -64,7 +79,7 @@ impl Hub {
             .iter()
             .any(|(actual, path)| {
                 actual.as_str() == method
-                    && ["main", REVISION]
+                    && ["main", self.state.revision(repo)]
                         .iter()
                         .any(|revision| path == &format!("/{repo}/resolve/{revision}/{filename}"))
             })
@@ -90,7 +105,7 @@ impl Hub {
             .iter()
             .filter(|(method, path)| {
                 method == Method::GET
-                    && ["main", REVISION]
+                    && ["main", self.state.revision(repo)]
                         .iter()
                         .any(|revision| path == &format!("/{repo}/resolve/{revision}/{filename}"))
             })
@@ -138,11 +153,12 @@ async fn handle(State(state): State<Arc<HubState>>, method: Method, uri: Uri) ->
         .unwrap()
         .push((method.clone(), path.to_owned()));
     for (repo, files) in &state.files {
-        for revision in ["main", REVISION] {
+        let pinned_revision = state.revision(repo);
+        for revision in ["main", pinned_revision] {
             if path == format!("/api/models/{repo}/revision/{revision}") {
                 return response(
                     &method,
-                    serde_json::to_vec(&json!({"sha": REVISION})).unwrap(),
+                    serde_json::to_vec(&json!({"sha": pinned_revision})).unwrap(),
                 );
             }
             if path == format!("/api/models/{repo}/tree/{revision}") {

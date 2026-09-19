@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 pub(crate) mod cache;
 mod gguf_repository;
 mod product_source_selection;
+pub(crate) mod recipes;
 #[cfg(test)]
 mod source_identity_tests;
 use cache::{CacheRequirements, CachedModel};
@@ -149,6 +150,9 @@ pub fn public_model_id(source: &ResolvedModelSource) -> String {
 
 /// Resolve an ergonomic model alias to its canonical Hugging Face model id.
 pub fn resolve_model_alias(name: &str) -> String {
+    if let Some(recipe) = recipes::find(name) {
+        return recipe.requested_model.to_owned();
+    }
     match name.to_lowercase().as_str() {
         "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
         "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
@@ -343,6 +347,12 @@ const GGUF_ALIASES: &[GgufAliasEntry] = &[
 
 /// Resolve a GGUF alias to its repository and exact quantized filename.
 pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
+    if let Some(recipe) = recipes::find(name) {
+        return Some((
+            recipe.requested_model.to_owned(),
+            recipe.gguf_file.to_owned(),
+        ));
+    }
     let name = name.to_lowercase();
     GGUF_ALIASES
         .iter()
@@ -1408,6 +1418,16 @@ pub async fn resolve_model_source(
     download: DownloadPolicy,
     autosize: Option<(AutoSizeProfile, f32)>,
 ) -> Result<Resolved> {
+    if recipes::find(model).is_some() {
+        return resolve_model_source_with_product_sources(
+            model,
+            cache_dir,
+            download,
+            autosize,
+            &ProductSourceArgs::default(),
+        )
+        .await;
+    }
     resolve_model_source_internal(
         model,
         cache_dir,
@@ -1711,10 +1731,15 @@ pub async fn resolve_model_source_with_product_sources(
     autosize: Option<(AutoSizeProfile, f32)>,
     source_args: &ProductSourceArgs,
 ) -> Result<Resolved> {
+    let requested_model = model;
+    let recipe = recipes::find(model);
+    let recipe_args = recipe.map(|recipe| recipe.source_args(source_args));
+    let source_args = recipe_args.as_ref().unwrap_or(source_args);
+    let model = recipe.map_or(model, |recipe| recipe.requested_model);
     let selected = product_source_selection::resolve(source_args, cache_dir, download).await?;
     let source_args = &selected.arguments;
     if let Some(filename) = &source_args.gguf_file {
-        let resolved = gguf_repository::selection::resolve(
+        let mut resolved = gguf_repository::selection::resolve(
             model,
             filename,
             cache_dir,
@@ -1723,6 +1748,10 @@ pub async fn resolve_model_source_with_product_sources(
             source_args,
         )
         .await?;
+        resolved.requested_model = requested_model.to_owned();
+        if recipe.is_some() {
+            resolved.source.original = requested_model.to_owned();
+        }
         return apply_explicit_product_sources(resolved, &selected);
     }
     let mut resolved = resolve_model_source_internal(

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-19
+
+### Added
+
+- Added `bonsai2:27b` for `run`, `serve`, and `pull`, with automatic selection of the official PQ2_0 weights and matching metadata at pinned revisions. The alias uses the normal runtime configuration and preserves explicit source overrides.
+
+### Fixed
+
+- Kept terminal conversation trimming and output budgets within the resolved model context limit, including explicit `--max-model-len` overrides.
+
 ## [0.12.0] - 2026-09-18
 
 ### Added
