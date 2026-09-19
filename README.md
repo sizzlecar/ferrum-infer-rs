@@ -300,10 +300,10 @@ The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
 matching metadata; later starts reuse the cache. No manual file preparation is
 needed. The API listens at `http://127.0.0.1:8000/v1`.
 
-Requires Ferrum **0.12.1 or later**. For 0.12.0, use the manual setup below.
+Requires Ferrum **0.12.1 or later**. [Install or update Ferrum](#quick-start).
 
 <details>
-<summary><strong>Defaults, tested limits, and manual setup</strong></summary>
+<summary><strong>Model sources and tested scope</strong></summary>
 
 The shortcut selects the model files; resource configuration follows Ferrum's
 normal defaults and automatic capacity handling. It does not impose a
@@ -315,36 +315,14 @@ Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
 weights packed and applies the Hadamard transforms declared by the model.
 Metal text inference has been validated through `run` and `serve` with FP16 KV,
 including Orchestral tool execution, session continuation, and prefix-state reuse.
-The 8K context and 10 GiB runtime budget below were tested on an M1 Max; they are
-not minimum hardware requirements or guarantees for larger workloads.
+Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
+not been validated on this machine. The model-declared context remains the
+protocol limit; actual requests are admitted against available runtime capacity.
 
-Use the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b).
-For this checkpoint, the validated metadata is the original `config.json`,
+The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
+and the matching `config.json`,
 `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, and
 `chat_template.jinja` from [this pinned source-model revision](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
-Save those five files in the metadata directory below.
-
-```sh
-MODEL=/path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf
-METADATA=/path/to/matching-source-metadata
-
-ferrum run "$MODEL" --semantic-source "$METADATA" --tokenizer-source "$METADATA" \
-  --backend metal --numerical-profile qwen3_5.f32-master --kv-dtype fp16 \
-  --max-model-len 8192 --kv-capacity 8192 --max-num-seqs 1 \
-  --max-num-batched-tokens 128 --runtime-memory-budget-bytes 10737418240 \
-  --disable-thinking --prompt "Explain what a hash table does." --max-tokens 128
-
-ferrum serve --model "$MODEL" --semantic-source "$METADATA" --tokenizer-source "$METADATA" \
-  --backend metal --numerical-profile qwen3_5.f32-master --kv-dtype fp16 \
-  --max-model-len 8192 --kv-capacity 8192 --max-num-seqs 1 \
-  --max-num-batched-tokens 128 --runtime-memory-budget-bytes 10737418240 \
-  --disable-thinking --served-model-name bonsai --enable-prefix-cache --session-cache off
-```
-
-The serving example keeps session-message storage off for clients that already
-send full conversation history. Check `/health` → `cache.prefix_cache`: native
-reuse reports `source: "vnext-native-sequence-checkpoint-cache"`, with increasing
-`hits` and `saved_prefill_tokens` after a compatible request.
 
 CUDA PQ2_0/Hadamard operators and small mixed-state checkpoint tests have passed
 on a real GPU; **the complete 27B CUDA model remains unvalidated**. This Bonsai
