@@ -25,7 +25,10 @@ use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
 use crate::gguf_blocks::GgufBlockFormat;
 
 use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
-use super::native_blocks::{bind_native_block, dispatch_m64_grid, MetalNativeBlockPipelines};
+use super::native_blocks::{
+    bind_native_block, dispatch_m64_grid, pq2_full_tiles_supported,
+    pq2_full_tiles_vector_input_supported, MetalNativeBlockPipelines,
+};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -381,6 +384,14 @@ impl MetalLinearPipelines {
     ) -> (&ComputePipelineState, LinearDispatchKind) {
         let m64 = self.native.pq2_gemm_input_f32_output_f16_m64.as_ref();
         if pq2_mixed_prefill_m64_supported(format, params, m64.is_some()) {
+            // Complete tiles can omit boundary predicates without changing
+            // operand precision, accumulation order or the output ABI. Keep
+            // the guarded M64 pipeline as the capability/compilation fallback.
+            if pq2_full_tiles_supported(64, params.rows, params.in_features, params.out_features) {
+                if let Some(pipeline) = &self.native.pq2_gemm_input_f32_output_f16_m64_full_tiles {
+                    return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                }
+            }
             return (
                 m64.expect("PQ2 M64 selection requires an available pipeline"),
                 LinearDispatchKind::NativeTiledGemmM64,
@@ -397,6 +408,44 @@ impl MetalLinearPipelines {
                 LinearDispatchKind::NativeTiledGemm,
             )
         }
+    }
+
+    fn hadamard_native_dispatch_for_input(
+        &self,
+        format: GgufBlockFormat,
+        activation_type: ElementType,
+        params: LinearParams,
+        input: &MetalBufferRegion,
+        input_offset_bytes: u64,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        let fallback = self.hadamard_native_dispatch(format, activation_type, params);
+        // Shape alone cannot authorize vector loads: the transform workspace
+        // may be a slice with its own base and an inner suballocation offset.
+        // Retain the existing full-M64 cohort and all scalar fallbacks.
+        if format == GgufBlockFormat::Pq2_0
+            && activation_type == ElementType::F16
+            && fallback.1 == LinearDispatchKind::NativeTiledGemmM64
+            && self
+                .native
+                .pq2_gemm_input_f32_output_f16_m64_full_tiles
+                .is_some()
+            && pq2_full_tiles_vector_input_supported(
+                params.rows,
+                params.in_features,
+                params.out_features,
+                input.offset_bytes(),
+                input_offset_bytes,
+                input.length_bytes(),
+            )
+        {
+            if let Some(pipeline) = &self
+                .native
+                .pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input
+            {
+                return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+            }
+        }
+        fallback
     }
 
     fn f32_linear_pipeline(&self, format: LinearPhysicalFormat) -> Option<&ComputePipelineState> {
@@ -1681,8 +1730,11 @@ fn encode_dense_swiglu(
         workspace: staging,
     };
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(sequence.dispatch_count());
-        sequence.encode(&pipelines, encoder.compute_encoder(), regions);
+        encoder.record_compute_dispatches(sequence.dispatch_count(regions));
+        sequence.encode(&pipelines, regions, |subwork, encode| {
+            encoder.begin_compute_subwork(subwork);
+            encode(encoder.compute_encoder());
+        });
         Ok(())
     })
     .map_err(|error| error.to_string())?
@@ -1879,42 +1931,7 @@ pub(super) fn dispatch_linear(
             launch.params.rows,
             launch.params.in_features,
         );
-        let native = match launch.format {
-            LinearPhysicalFormat::DenseF16 => None,
-            LinearPhysicalFormat::Q4K => Some(GgufBlockFormat::Q4K),
-            LinearPhysicalFormat::Q5K => Some(GgufBlockFormat::Q5K),
-            LinearPhysicalFormat::Q6K => Some(GgufBlockFormat::Q6K),
-            LinearPhysicalFormat::Q8_0 => Some(GgufBlockFormat::Q8_0),
-            LinearPhysicalFormat::Native(format) => Some(format),
-        };
-        let (pipeline, dispatch_kind) = if let Some(format) = native {
-            pipelines.hadamard_native_dispatch(format, launch.activation_type, launch.params)
-        } else if launch.activation_type == ElementType::F32 {
-            (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
-        } else {
-            (
-                &pipelines.dense_f32_f16,
-                LinearDispatchKind::CooperativeGemv,
-            )
-        };
-        encoder.set_compute_pipeline_state(pipeline);
-        set_region_offset(encoder, 0, workspace, workspace_offset);
-        set_region_offset(encoder, 1, &regions[launch.weight_region], 0);
-        set_region_offset(
-            encoder,
-            2,
-            &regions[launch.output_region],
-            launch.output_offset_bytes,
-        );
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<LinearParams>() as u64,
-            &launch.params as *const _ as *const c_void,
-        );
-        if let Some(format) = native {
-            bind_native_block(encoder, format, 4);
-        }
-        dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+        dispatch_transformed_linear(pipelines, encoder, regions, launch);
         return;
     }
     let (pipeline, dispatch_kind) =
@@ -1939,6 +1956,62 @@ pub(super) fn dispatch_linear(
         launch.format,
         launch.activation_type,
     );
+    dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+}
+
+// The caller has already produced this launch's Hadamard result. Its input
+// remains F32 while activation_type still declares the original output ABI.
+fn dispatch_transformed_linear(
+    pipelines: &MetalLinearPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    launch: LinearLaunch,
+) {
+    let (workspace_region, workspace_offset) = launch
+        .transform_workspace
+        .expect("validated linear transform workspace");
+    let workspace = &regions[workspace_region];
+    let native = match launch.format {
+        LinearPhysicalFormat::DenseF16 => None,
+        LinearPhysicalFormat::Q4K => Some(GgufBlockFormat::Q4K),
+        LinearPhysicalFormat::Q5K => Some(GgufBlockFormat::Q5K),
+        LinearPhysicalFormat::Q6K => Some(GgufBlockFormat::Q6K),
+        LinearPhysicalFormat::Q8_0 => Some(GgufBlockFormat::Q8_0),
+        LinearPhysicalFormat::Native(format) => Some(format),
+    };
+    let (pipeline, dispatch_kind) = if let Some(format) = native {
+        pipelines.hadamard_native_dispatch_for_input(
+            format,
+            launch.activation_type,
+            launch.params,
+            workspace,
+            workspace_offset,
+        )
+    } else if launch.activation_type == ElementType::F32 {
+        (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
+    } else {
+        (
+            &pipelines.dense_f32_f16,
+            LinearDispatchKind::CooperativeGemv,
+        )
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    set_region_offset(encoder, 0, workspace, workspace_offset);
+    set_region_offset(encoder, 1, &regions[launch.weight_region], 0);
+    set_region_offset(
+        encoder,
+        2,
+        &regions[launch.output_region],
+        launch.output_offset_bytes,
+    );
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<LinearParams>() as u64,
+        &launch.params as *const _ as *const c_void,
+    );
+    if let Some(format) = native {
+        bind_native_block(encoder, format, 4);
+    }
     dispatch_linear_grid(encoder, launch.params, dispatch_kind);
 }
 

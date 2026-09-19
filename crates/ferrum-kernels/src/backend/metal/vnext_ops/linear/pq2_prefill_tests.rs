@@ -4,6 +4,10 @@ use super::*;
 use half::f16;
 use metal::{Buffer, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions};
 
+mod prism_benchmark;
+mod prism_reference;
+mod vector_input_tests;
+
 const INPUT_PREFIX: usize = 4;
 const WEIGHT_PREFIX: usize = 18;
 const OUTPUT_PREFIX: usize = 8;
@@ -45,6 +49,7 @@ struct Fixture {
     // Each row has four different literal weight patterns, repeated across N.
     // This bounds the independent full-output oracle at realistic matrix sizes.
     reference: Vec<[(f64, f64); 4]>,
+    column_reference: Option<Vec<Vec<(f64, f64)>>>,
 }
 
 impl Fixture {
@@ -127,7 +132,50 @@ impl Fixture {
             weight_bytes,
             initial_output,
             reference,
+            column_reference: None,
         }
+    }
+
+    fn use_distinct_weight_rows(&mut self, device: &Device) {
+        let width = self.params.in_features as usize;
+        let outputs = self.params.out_features as usize;
+        let mut scales = vec![vec![0.0_f64; width / 128]; outputs];
+        // Small layout fixtures must distinguish columns separated by 4 or 8,
+        // which the periodic large-matrix oracle intentionally does not.
+        for (column, row_scales) in scales.iter_mut().enumerate() {
+            for (block, scale) in row_scales.iter_mut().enumerate() {
+                let value = f16::from_f32((column + 1) as f32 * (block % 3 + 1) as f32 / 2048.0);
+                *scale = f64::from(value.to_f32());
+                let offset = WEIGHT_PREFIX + (column * (width / 128) + block) * 34;
+                self.weight_bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.column_reference = Some(
+            (0..self.params.rows as usize)
+                .map(|row| {
+                    scales
+                        .iter()
+                        .enumerate()
+                        .map(|(column, row_scales)| {
+                            let mut sum = 0.0;
+                            let mut absolute_sum = 0.0;
+                            for k in 0..width {
+                                let block = k / 128;
+                                let byte = (k % 128) / 4;
+                                let coefficient = COEFFICIENTS[(column + block + byte) % 4][k % 4];
+                                let input =
+                                    f64::from(self.input_values[INPUT_PREFIX + row * width + k]);
+                                let product = input * row_scales[block] * coefficient;
+                                sum += product;
+                                absolute_sum += product.abs();
+                            }
+                            (sum, absolute_sum)
+                        })
+                        .collect()
+                })
+                .collect(),
+        );
+        self.weight = buffer(device, &self.weight_bytes);
     }
 
     fn run(
@@ -238,6 +286,11 @@ impl Fixture {
             weights, self.weight_bytes,
             "mixed prefill modified packed weights"
         );
+        self.validate_output_values(actual)
+    }
+
+    fn validate_output_values(&self, actual: &[f16]) -> Vec<u16> {
+        assert_eq!(actual.len(), self.initial_output.len());
         let stride = self.params.output_stride as usize;
         let columns = self.params.out_features as usize;
         for (index, value) in actual.iter().enumerate() {
@@ -253,7 +306,12 @@ impl Fixture {
                 assert_eq!(*value, f16::from_f32(GUARD), "output guard at {index}");
                 continue;
             };
-            let (expected, absolute_sum) = self.reference[row][column % 4];
+            let (expected, absolute_sum) = self
+                .column_reference
+                .as_ref()
+                .map_or(self.reference[row][column % 4], |reference| {
+                    reference[row][column]
+                });
             // Bound a sequential F32 multiply/add chain and final F16 store,
             // as in native_tests. No F16 operand-rounding allowance is added.
             let n_u = (2 * self.params.in_features + 8) as f64 * f64::from(f32::EPSILON) / 2.0;
@@ -483,6 +541,10 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
     let device = Device::system_default().expect("PQ2 production conformance requires Metal");
     let mut pipelines = MetalLinearPipelines::new(&device).unwrap();
     assert!(pipelines.native.pq2_gemm_input_f32_output_f16_m64.is_some());
+    assert!(pipelines
+        .native
+        .pq2_gemm_input_f32_output_f16_m64_full_tiles
+        .is_some());
     let queue = device.new_command_queue();
     for (rows, outputs, expected_dispatch) in [
         (19, 4096, LinearDispatchKind::Pq2CooperativeGemv),
@@ -494,6 +556,7 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
         (32, 1024, LinearDispatchKind::NativeTiledGemm),
         (32, 4095, LinearDispatchKind::NativeTiledGemm),
         (64, 4096, LinearDispatchKind::NativeTiledGemmM64),
+        (64, 4097, LinearDispatchKind::NativeTiledGemmM64),
         (128, 4096, LinearDispatchKind::NativeTiledGemmM64),
         (96, 4096, LinearDispatchKind::NativeTiledGemm),
         (65, 4096, LinearDispatchKind::NativeTiledGemm),
@@ -501,12 +564,23 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
         (64, 4095, LinearDispatchKind::NativeTiledGemm),
     ] {
         let fixture = Fixture::new(&device, rows, 384, outputs, false);
-        assert_eq!(
-            pipelines
-                .hadamard_native_dispatch(GgufBlockFormat::Pq2_0, ElementType::F16, fixture.params,)
-                .1,
-            expected_dispatch
+        let (pipeline, dispatch) = pipelines.hadamard_native_dispatch(
+            GgufBlockFormat::Pq2_0,
+            ElementType::F16,
+            fixture.params,
         );
+        assert_eq!(dispatch, expected_dispatch);
+        if dispatch == LinearDispatchKind::NativeTiledGemmM64 {
+            let expected = if outputs.is_multiple_of(64) {
+                pipelines
+                    .native
+                    .pq2_gemm_input_f32_output_f16_m64_full_tiles
+                    .as_ref()
+            } else {
+                pipelines.native.pq2_gemm_input_f32_output_f16_m64.as_ref()
+            };
+            assert!(std::ptr::eq(pipeline, expected.unwrap()));
+        }
         let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::GenericM32, 1);
         let reference = fixture.validate();
         let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::Production, 1);
@@ -525,6 +599,28 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
         // preserve every output bit and guard.
         let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::Production, 1);
         assert_eq!(fixture.validate(), actual);
+    }
+    // Shape rejection is checked without executing invalid packed widths.
+    for width in [0, 32, 127, 128, 129, 256, 384] {
+        let params = LinearParams {
+            rows: 64,
+            in_features: width,
+            out_features: 4096,
+            output_stride: 4096,
+            output_column_offset: 0,
+        };
+        let (pipeline, dispatch) =
+            pipelines.hadamard_native_dispatch(GgufBlockFormat::Pq2_0, ElementType::F16, params);
+        assert_eq!(dispatch, LinearDispatchKind::NativeTiledGemmM64);
+        let expected = if width > 0 && width.is_multiple_of(128) {
+            pipelines
+                .native
+                .pq2_gemm_input_f32_output_f16_m64_full_tiles
+                .as_ref()
+        } else {
+            pipelines.native.pq2_gemm_input_f32_output_f16_m64.as_ref()
+        };
+        assert!(std::ptr::eq(pipeline, expected.unwrap()));
     }
     // Check the real outer selector, not only the tiled eligibility predicate:
     // neither F32 outputs nor another packed format gets the early M32 route.
@@ -564,9 +660,40 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
             ));
         }
     }
+    // A missing full-tile PSO must still submit the original guarded M64.
+    let full_tiles = pipelines
+        .native
+        .pq2_gemm_input_f32_output_f16_m64_full_tiles
+        .take();
+    let fixture = Fixture::new(&device, 64, 384, 4096, true);
+    let (pipeline, dispatch) = pipelines.hadamard_native_dispatch(
+        GgufBlockFormat::Pq2_0,
+        ElementType::F16,
+        fixture.params,
+    );
+    assert_eq!(dispatch, LinearDispatchKind::NativeTiledGemmM64);
+    assert!(std::ptr::eq(
+        pipeline,
+        pipelines
+            .native
+            .pq2_gemm_input_f32_output_f16_m64
+            .as_ref()
+            .unwrap()
+    ));
+    let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::GenericM32, 1);
+    let reference = fixture.validate();
+    let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::Production, 1);
+    assert_eq!(fixture.validate(), reference);
+    pipelines
+        .native
+        .pq2_gemm_input_f32_output_f16_m64_full_tiles = full_tiles;
     // Exercise an actual M32 submission for the same M64-eligible shape when
     // device/PSO capabilities cannot supply the optional pipeline.
     pipelines.native.pq2_gemm_input_f32_output_f16_m64 = None;
+    assert!(pipelines
+        .native
+        .pq2_gemm_input_f32_output_f16_m64_full_tiles
+        .is_some());
     let fixture = Fixture::new(&device, 64, 384, 4096, true);
     let (pipeline, dispatch) = pipelines.hadamard_native_dispatch(
         GgufBlockFormat::Pq2_0,
@@ -618,6 +745,25 @@ fn pq2_mixed_prefill_m64_preserves_f32_operands_tiles_and_guards_on_metal() {
             reference,
             "PQ2 M32/M64 changed output bits"
         );
+    }
+}
+
+#[test]
+fn pq2_mixed_prefill_distinct_columns_match_literal_oracle_on_metal() {
+    let device = Device::system_default().expect("PQ2 distinct-column conformance requires Metal");
+    let pipelines = MetalLinearPipelines::new(&device).unwrap();
+    let queue = device.new_command_queue();
+    // Both M32/M64 row tails and N64 column tails must preserve columns that
+    // differ beyond the four-column period used by the large timing fixtures.
+    for (rows, outputs) in [(31, 65), (65, 1025)] {
+        let mut fixture = Fixture::new(&device, rows, 384, outputs, false);
+        fixture.use_distinct_weight_rows(&device);
+        let _ = fixture.run_tile(&pipelines, &queue, PrefillTile::GenericM32, 1);
+        let control = fixture.validate();
+        for tile in [PrefillTile::SpecializedM32, PrefillTile::SpecializedM64] {
+            let _ = fixture.run_tile(&pipelines, &queue, tile, 1);
+            assert_eq!(fixture.validate(), control);
+        }
     }
 }
 
