@@ -300,7 +300,7 @@ The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
 matching metadata; later starts reuse the cache. No manual file preparation is
 needed. The API listens at `http://127.0.0.1:8000/v1`.
 
-The shortcut is new after 0.12.0. For that release, use the manual setup below.
+Requires Ferrum **0.12.1 or later**. For 0.12.0, use the manual setup below.
 
 <details>
 <summary><strong>Defaults, tested limits, and manual setup</strong></summary>

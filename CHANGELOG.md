@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-19
+
 ### Added
 
 - Added `bonsai2:27b` for `run`, `serve`, and `pull`, with automatic selection of the official PQ2_0 weights and matching metadata at pinned revisions. Metal startup defaults no longer require a long list of command-line parameters; explicit user settings retain precedence.
