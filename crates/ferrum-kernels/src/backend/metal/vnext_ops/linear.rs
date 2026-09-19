@@ -1681,7 +1681,7 @@ fn encode_dense_swiglu(
         workspace: staging,
     };
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(sequence.dispatch_count());
+        encoder.record_compute_dispatches(sequence.dispatch_count(regions));
         sequence.encode(&pipelines, regions, |subwork, encode| {
             encoder.begin_compute_subwork(subwork);
             encode(encoder.compute_encoder());
@@ -1882,42 +1882,7 @@ pub(super) fn dispatch_linear(
             launch.params.rows,
             launch.params.in_features,
         );
-        let native = match launch.format {
-            LinearPhysicalFormat::DenseF16 => None,
-            LinearPhysicalFormat::Q4K => Some(GgufBlockFormat::Q4K),
-            LinearPhysicalFormat::Q5K => Some(GgufBlockFormat::Q5K),
-            LinearPhysicalFormat::Q6K => Some(GgufBlockFormat::Q6K),
-            LinearPhysicalFormat::Q8_0 => Some(GgufBlockFormat::Q8_0),
-            LinearPhysicalFormat::Native(format) => Some(format),
-        };
-        let (pipeline, dispatch_kind) = if let Some(format) = native {
-            pipelines.hadamard_native_dispatch(format, launch.activation_type, launch.params)
-        } else if launch.activation_type == ElementType::F32 {
-            (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
-        } else {
-            (
-                &pipelines.dense_f32_f16,
-                LinearDispatchKind::CooperativeGemv,
-            )
-        };
-        encoder.set_compute_pipeline_state(pipeline);
-        set_region_offset(encoder, 0, workspace, workspace_offset);
-        set_region_offset(encoder, 1, &regions[launch.weight_region], 0);
-        set_region_offset(
-            encoder,
-            2,
-            &regions[launch.output_region],
-            launch.output_offset_bytes,
-        );
-        encoder.set_bytes(
-            3,
-            std::mem::size_of::<LinearParams>() as u64,
-            &launch.params as *const _ as *const c_void,
-        );
-        if let Some(format) = native {
-            bind_native_block(encoder, format, 4);
-        }
-        dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+        dispatch_transformed_linear(pipelines, encoder, regions, launch);
         return;
     }
     let (pipeline, dispatch_kind) =
@@ -1942,6 +1907,56 @@ pub(super) fn dispatch_linear(
         launch.format,
         launch.activation_type,
     );
+    dispatch_linear_grid(encoder, launch.params, dispatch_kind);
+}
+
+// The caller has already produced this launch's Hadamard result. Its input
+// remains F32 while activation_type still declares the original output ABI.
+fn dispatch_transformed_linear(
+    pipelines: &MetalLinearPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    launch: LinearLaunch,
+) {
+    let (workspace_region, workspace_offset) = launch
+        .transform_workspace
+        .expect("validated linear transform workspace");
+    let workspace = &regions[workspace_region];
+    let native = match launch.format {
+        LinearPhysicalFormat::DenseF16 => None,
+        LinearPhysicalFormat::Q4K => Some(GgufBlockFormat::Q4K),
+        LinearPhysicalFormat::Q5K => Some(GgufBlockFormat::Q5K),
+        LinearPhysicalFormat::Q6K => Some(GgufBlockFormat::Q6K),
+        LinearPhysicalFormat::Q8_0 => Some(GgufBlockFormat::Q8_0),
+        LinearPhysicalFormat::Native(format) => Some(format),
+    };
+    let (pipeline, dispatch_kind) = if let Some(format) = native {
+        pipelines.hadamard_native_dispatch(format, launch.activation_type, launch.params)
+    } else if launch.activation_type == ElementType::F32 {
+        (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
+    } else {
+        (
+            &pipelines.dense_f32_f16,
+            LinearDispatchKind::CooperativeGemv,
+        )
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    set_region_offset(encoder, 0, workspace, workspace_offset);
+    set_region_offset(encoder, 1, &regions[launch.weight_region], 0);
+    set_region_offset(
+        encoder,
+        2,
+        &regions[launch.output_region],
+        launch.output_offset_bytes,
+    );
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<LinearParams>() as u64,
+        &launch.params as *const _ as *const c_void,
+    );
+    if let Some(format) = native {
+        bind_native_block(encoder, format, 4);
+    }
     dispatch_linear_grid(encoder, launch.params, dispatch_kind);
 }
 

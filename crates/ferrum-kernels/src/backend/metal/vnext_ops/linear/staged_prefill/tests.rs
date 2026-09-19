@@ -686,7 +686,7 @@ fn staged_swiglu_sequence_case(formats: [GgufBlockFormat; 3], row_cases: &[(u64,
             overwrite(&regions[5], &scratch);
             sequence.workspace = if candidate { workspace } else { None };
             assert_eq!(
-                sequence.dispatch_count(),
+                sequence.dispatch_count(&regions),
                 4 + if candidate { staged_dispatches } else { 0 }
             );
             let command = queue.new_command_buffer();
