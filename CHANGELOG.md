@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Kept terminal conversation trimming and output budgets within the resolved model context limit, including explicit `--max-model-len` overrides.
+- Kept terminal conversation trimming and output budgets within the model-declared context and explicit user limits. Native GGUF chats no longer inherit the legacy automatic 8K KV limit; explicit `--max-model-len` and KV limits retain precedence.
 
 ## [0.12.0] - 2026-09-18
 

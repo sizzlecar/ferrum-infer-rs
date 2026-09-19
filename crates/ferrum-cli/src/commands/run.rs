@@ -340,6 +340,7 @@ impl RunBudget {
         product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
         legacy_source_path: &Path,
         snapshot: &RuntimeConfigSnapshot,
+        model_context_limit: Option<usize>,
     ) -> Result<Self> {
         let tokenizer = if let Some(path) = explicit_tokenizer {
             Some(tokenizers::Tokenizer::from_file(path).map_err(|error| {
@@ -365,6 +366,7 @@ impl RunBudget {
             .into_iter()
             .filter_map(|key| crate::runtime_env::runtime_snapshot_value(snapshot, key))
             .filter_map(|value| value.parse::<usize>().ok())
+            .chain(model_context_limit)
             .filter(|&value| value > 0)
             .min();
         Ok(Self {
@@ -1204,8 +1206,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &runtime_config,
         &mut engine_config.backend.backend_options,
     )?;
-    let effective_runtime_config =
+    let mut effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
+    let execution_resource_authority = if defined_model.is_some() {
+        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    } else {
+        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+    };
     let typed_model_capabilities = defined_model
         .as_ref()
         .map(|defined| {
@@ -1216,14 +1223,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             )
         })
         .transpose()?;
+    restore_run_context_limits(
+        execution_resource_authority,
+        typed_model_capabilities
+            .as_ref()
+            .and_then(|model| model.max_context_len),
+        &early_effective_runtime_config,
+        &mut effective_runtime_config,
+        &mut engine_config,
+    );
     let startup_auto_config = run_startup_auto_config(
         &device,
         typed_model_capabilities,
-        if defined_model.is_some() {
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime
-        } else {
-            ferrum_types::ExecutionResourceAuthority::LegacyEngine
-        },
+        execution_resource_authority,
         model_definition_for_config.as_ref(),
         crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
@@ -1245,6 +1257,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         model_sources.as_deref(),
         &source.local_path,
         &startup_auto_config.runtime_config,
+        startup_auto_config.model_capabilities.max_context_len,
     )?;
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
@@ -2605,6 +2618,50 @@ fn run_effective_runtime_config(
         snapshot.upsert_entry(entry.clone());
     }
     snapshot
+}
+
+fn restore_run_context_limits(
+    authority: ferrum_types::ExecutionResourceAuthority,
+    model_context_limit: Option<usize>,
+    requested: &RuntimeConfigSnapshot,
+    effective: &mut RuntimeConfigSnapshot,
+    engine_config: &mut ferrum_types::EngineConfig,
+) {
+    if authority != ferrum_types::ExecutionResourceAuthority::PlanRuntime {
+        return;
+    }
+    // A native plan owns dynamic context capacity. The source resolver's
+    // legacy chat defaults may have materialized 8K/4K into the environment;
+    // only a user value captured before resolution may constrain this path.
+    effective
+        .entries
+        .retain(|entry| entry.key != "FERRUM_KV_CAPACITY");
+    if let Some(entry) = requested.entries.iter().find(|entry| {
+        entry.key == "FERRUM_KV_CAPACITY"
+            && matches!(
+                entry.source,
+                RuntimeConfigSource::ConfigFile
+                    | RuntimeConfigSource::Env
+                    | RuntimeConfigSource::Cli
+            )
+    }) {
+        effective.upsert_entry(entry.clone());
+    }
+    // Applying a snapshot sets present fields but does not clear absent ones.
+    // Remove any earlier bridge value before the final snapshot is applied.
+    engine_config.runtime.kv_capacity = None;
+    // Keep the engine's request guard and the REPL on the same model bound,
+    // even when an explicit KV limit is larger than the model declaration.
+    // An explicit maximum retains its source and normal startup validation.
+    if crate::runtime_env::runtime_snapshot_value(effective, "FERRUM_MAX_MODEL_LEN").is_none() {
+        if let Some(limit) = model_context_limit.filter(|&limit| limit > 0) {
+            effective.upsert(
+                "FERRUM_MAX_MODEL_LEN",
+                limit.to_string(),
+                RuntimeConfigSource::Default,
+            );
+        }
+    }
 }
 
 fn run_base_runtime_config(
@@ -4312,16 +4369,235 @@ mod tests {
     }
 
     #[test]
+    fn run_plan_context_discards_automatic_kv_limit_for_engine_and_history() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let requested =
+            run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default());
+        let mut effective = requested.clone();
+        effective.upsert("FERRUM_KV_CAPACITY", "8192", RuntimeConfigSource::Env);
+        effective.upsert(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "2048",
+            RuntimeConfigSource::MemoryProfile,
+        );
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.runtime.kv_capacity = Some(8192);
+        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        restore_run_context_limits(
+            authority,
+            Some(262_144),
+            &requested,
+            &mut effective,
+            &mut engine,
+        );
+        let mut capabilities = ModelCapabilities::unknown();
+        capabilities.max_context_len = Some(262_144);
+        let resolved = run_startup_auto_config(
+            &ferrum_types::Device::CPU,
+            Some(capabilities),
+            authority,
+            None,
+            None,
+            effective,
+        )
+        .unwrap();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.kv_capacity, None);
+        assert_eq!(engine.runtime.max_model_len, Some(262_144));
+        assert_eq!(engine.batching.max_num_batched_tokens, 2048);
+        assert_eq!(engine.scheduler.max_running_requests, 1);
+        assert_eq!(
+            crate::runtime_env::runtime_snapshot_value(
+                &resolved.runtime_config,
+                "FERRUM_KV_CAPACITY"
+            ),
+            None
+        );
+
+        let mut budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
+        budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
+        let long = std::iter::repeat_n("old", 4300)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let history = [
+            RunHistoryMessage::new("user", &long),
+            RunHistoryMessage::new("assistant", &long),
+        ];
+        let cmd = test_run_cmd();
+        let plan = build_run_prompt_plan(
+            &history,
+            "continue",
+            None,
+            "context-fixture",
+            None,
+            &default_template_options(),
+            &cmd,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(plan.kv_capacity, Some(262_144));
+        assert!(plan.prompt_tokens.unwrap() > 8192);
+        assert_eq!(plan.dropped_history_messages, 0);
+        assert_eq!(plan.max_tokens_clamped_from, None);
+        assert_eq!(plan.sampling_params.max_tokens, cmd.max_tokens as usize);
+    }
+
+    #[test]
+    fn run_plan_context_preserves_explicit_kv_limits_and_precedence() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut config = CliConfig::default();
+        config.runtime.kv_capacity = Some(16_384);
+        let config_only = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
+        let with_env = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_KV_CAPACITY", "12288")]),
+        );
+        let mut cmd = test_run_cmd();
+        cmd.kv_capacity = Some(4096);
+        let with_cli =
+            run_effective_runtime_config(&with_env, &run_startup_cli_runtime_entries(&cmd, None));
+
+        for (requested, expected, source) in [
+            (config_only, 16_384, RuntimeConfigSource::ConfigFile),
+            (with_env, 12_288, RuntimeConfigSource::Env),
+            (with_cli, 4096, RuntimeConfigSource::Cli),
+        ] {
+            let mut effective = requested.clone();
+            effective.upsert("FERRUM_KV_CAPACITY", "8192", RuntimeConfigSource::Env);
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.runtime.kv_capacity = Some(8192);
+            restore_run_context_limits(
+                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                Some(262_144),
+                &requested,
+                &mut effective,
+                &mut engine,
+            );
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.runtime.kv_capacity, Some(expected));
+            let entry = effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_KV_CAPACITY")
+                .unwrap();
+            assert_eq!(entry.effective_value, expected.to_string());
+            assert_eq!(entry.source, source);
+            let budget = RunBudget::from_product_sources(
+                None,
+                None,
+                model_dir.path(),
+                &effective,
+                Some(262_144),
+            )
+            .unwrap();
+            assert_eq!(budget.kv_capacity, Some(expected));
+        }
+    }
+
+    #[test]
+    fn legacy_run_keeps_automatic_kv_capacity() {
+        let mut effective = RuntimeConfigSnapshot::from_env_vars([("FERRUM_KV_CAPACITY", "8192")]);
+        let expected = effective.clone();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.runtime.kv_capacity = Some(8192);
+        restore_run_context_limits(
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+            Some(262_144),
+            &RuntimeConfigSnapshot::default(),
+            &mut effective,
+            &mut engine,
+        );
+        assert_eq!(effective, expected);
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(engine.runtime.kv_capacity, Some(8192));
+    }
+
+    #[tokio::test]
+    async fn run_explicit_kv_limit_cannot_expand_the_model_context() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_KV_CAPACITY",
+            "65536",
+            RuntimeConfigSource::Cli,
+        )]);
+        let mut effective = requested.clone();
+        let mut engine_config = ferrum_types::EngineConfig::default();
+        let authority = ferrum_types::ExecutionResourceAuthority::PlanRuntime;
+        restore_run_context_limits(
+            authority,
+            Some(32_768),
+            &requested,
+            &mut effective,
+            &mut engine_config,
+        );
+        let mut capabilities = ModelCapabilities::unknown();
+        capabilities.max_context_len = Some(32_768);
+        let resolved = run_startup_auto_config(
+            &ferrum_types::Device::CPU,
+            Some(capabilities),
+            authority,
+            None,
+            None,
+            effective,
+        )
+        .unwrap();
+        engine_config
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine_config.runtime.kv_capacity, Some(65_536));
+        assert_eq!(engine_config.runtime.max_model_len, Some(32_768));
+        let maximum = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_MAX_MODEL_LEN")
+            .unwrap();
+        assert_eq!(maximum.source, RuntimeConfigSource::Default);
+        let budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
+        // The CPU stub exercises the production engine's common request guard
+        // without loading weights or requiring the selected native backend.
+        let engine = ferrum_engine::EngineBuilder::new(engine_config)
+            .with_tokenizer("stub")
+            .with_executor("stub")
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(budget.kv_capacity, Some(32_768));
+        assert_eq!(engine.context_capacity(), budget.kv_capacity);
+        assert_eq!(engine.config().runtime.max_model_len, Some(32_768));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
     fn run_budget_clamps_generation_to_the_tighter_configured_context_bound() {
         let model_dir = tempfile::tempdir().unwrap();
         let cmd = test_run_cmd();
-        for (model_limit, kv_limit, expected_limit) in [
-            (Some(64), None, 64),
-            (None, Some(48), 48),
-            (Some(64), Some(128), 64),
-            (Some(128), Some(48), 48),
-            (Some(0), Some(48), 48),
-            (Some(64), Some(0), 64),
+        for (declared_limit, model_limit, kv_limit, expected_limit) in [
+            (None, Some(64), None, 64),
+            (None, None, Some(48), 48),
+            (None, Some(64), Some(128), 64),
+            (None, Some(128), Some(48), 48),
+            (None, Some(0), Some(48), 48),
+            (None, Some(64), Some(0), 64),
+            (Some(64), None, None, 64),
+            (Some(32), Some(128), Some(48), 32),
+            (Some(128), Some(64), Some(48), 48),
         ] {
             let snapshot = RuntimeConfigSnapshot::from_entries(
                 [
@@ -4335,8 +4611,14 @@ mod tests {
                     })
                 }),
             );
-            let mut budget =
-                RunBudget::from_product_sources(None, None, model_dir.path(), &snapshot).unwrap();
+            let mut budget = RunBudget::from_product_sources(
+                None,
+                None,
+                model_dir.path(),
+                &snapshot,
+                declared_limit,
+            )
+            .unwrap();
             budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
             let plan = build_run_prompt_plan(
                 &[],
@@ -4370,18 +4652,39 @@ mod tests {
             &run_base_runtime_config(&config, RuntimeConfigSnapshot::default()),
             &run_startup_cli_runtime_entries(&cmd, None),
         );
+        let mut effective = requested.clone();
+        let mut engine_config = ferrum_types::EngineConfig::default();
+        restore_run_context_limits(
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            Some(8192),
+            &requested,
+            &mut effective,
+            &mut engine_config,
+        );
+        let maximum = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_MAX_MODEL_LEN")
+            .unwrap();
+        assert_eq!(maximum.source, RuntimeConfigSource::Cli);
+        assert_eq!(maximum.effective_value, "64");
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
             None,
             ferrum_types::ExecutionResourceAuthority::PlanRuntime,
             None,
             None,
-            requested,
+            effective,
         )
         .unwrap();
-        let mut budget =
-            RunBudget::from_product_sources(None, None, model_dir.path(), &resolved.runtime_config)
-                .unwrap();
+        let mut budget = RunBudget::from_product_sources(
+            None,
+            None,
+            model_dir.path(),
+            &resolved.runtime_config,
+            resolved.model_capabilities.max_context_len,
+        )
+        .unwrap();
         budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
         let long = std::iter::repeat_n("old", 80).collect::<Vec<_>>().join(" ");
         let history = [
