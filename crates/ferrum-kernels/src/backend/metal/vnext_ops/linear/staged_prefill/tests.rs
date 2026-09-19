@@ -691,7 +691,7 @@ fn staged_swiglu_sequence_case(formats: [GgufBlockFormat; 3], row_cases: &[(u64,
             );
             let command = queue.new_command_buffer();
             let encoder = command.new_compute_command_encoder();
-            sequence.encode(&pipelines, encoder, &regions);
+            sequence.encode(&pipelines, &regions, |_, encode| encode(encoder));
             encoder.end_encoding();
             command.commit();
             command.wait_until_completed();

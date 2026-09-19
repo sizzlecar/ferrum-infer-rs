@@ -1682,7 +1682,10 @@ fn encode_dense_swiglu(
     };
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(sequence.dispatch_count());
-        sequence.encode(&pipelines, encoder.compute_encoder(), regions);
+        sequence.encode(&pipelines, regions, |subwork, encode| {
+            encoder.begin_compute_subwork(subwork);
+            encode(encoder.compute_encoder());
+        });
         Ok(())
     })
     .map_err(|error| error.to_string())?

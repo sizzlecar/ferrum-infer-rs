@@ -312,22 +312,30 @@ impl Sequence {
             + staged
     }
 
+    // The caller can give each stage a profiling encoder boundary while tests
+    // and unprofiled execution retain the same dispatch sequence.
     pub(super) fn encode(
         &self,
         pipelines: &MetalLinearPipelines,
-        encoder: &ComputeCommandEncoderRef,
         regions: &[MetalBufferRegion],
+        mut with_encoder: impl FnMut(&'static str, &dyn Fn(&ComputeCommandEncoderRef)),
     ) {
         for launch in &self.gate_up {
-            dispatch(pipelines, encoder, regions, *launch, self.workspace);
+            with_encoder("dense_swiglu.gate_up_projection", &|encoder| {
+                dispatch(pipelines, encoder, regions, *launch, self.workspace);
+            });
         }
-        dispatch_swiglu(
-            pipelines,
-            encoder,
-            &regions[self.scratch_region],
-            self.activation,
-        );
-        dispatch(pipelines, encoder, regions, self.down, self.workspace);
+        with_encoder("dense_swiglu.activation", &|encoder| {
+            dispatch_swiglu(
+                pipelines,
+                encoder,
+                &regions[self.scratch_region],
+                self.activation,
+            );
+        });
+        with_encoder("dense_swiglu.down_projection", &|encoder| {
+            dispatch(pipelines, encoder, regions, self.down, self.workspace);
+        });
     }
 }
 
