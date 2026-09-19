@@ -26,7 +26,8 @@ use crate::gguf_blocks::GgufBlockFormat;
 
 use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
 use super::native_blocks::{
-    bind_native_block, dispatch_m64_grid, pq2_full_tiles_supported, MetalNativeBlockPipelines,
+    bind_native_block, dispatch_m64_grid, pq2_full_tiles_supported,
+    pq2_full_tiles_vector_input_supported, MetalNativeBlockPipelines,
 };
 
 use super::super::vnext_runtime::{
@@ -407,6 +408,44 @@ impl MetalLinearPipelines {
                 LinearDispatchKind::NativeTiledGemm,
             )
         }
+    }
+
+    fn hadamard_native_dispatch_for_input(
+        &self,
+        format: GgufBlockFormat,
+        activation_type: ElementType,
+        params: LinearParams,
+        input: &MetalBufferRegion,
+        input_offset_bytes: u64,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        let fallback = self.hadamard_native_dispatch(format, activation_type, params);
+        // Shape alone cannot authorize vector loads: the transform workspace
+        // may be a slice with its own base and an inner suballocation offset.
+        // Retain the existing full-M64 cohort and all scalar fallbacks.
+        if format == GgufBlockFormat::Pq2_0
+            && activation_type == ElementType::F16
+            && fallback.1 == LinearDispatchKind::NativeTiledGemmM64
+            && self
+                .native
+                .pq2_gemm_input_f32_output_f16_m64_full_tiles
+                .is_some()
+            && pq2_full_tiles_vector_input_supported(
+                params.rows,
+                params.in_features,
+                params.out_features,
+                input.offset_bytes(),
+                input_offset_bytes,
+                input.length_bytes(),
+            )
+        {
+            if let Some(pipeline) = &self
+                .native
+                .pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input
+            {
+                return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+            }
+        }
+        fallback
     }
 
     fn f32_linear_pipeline(&self, format: LinearPhysicalFormat) -> Option<&ComputePipelineState> {
@@ -1941,7 +1980,13 @@ fn dispatch_transformed_linear(
         LinearPhysicalFormat::Native(format) => Some(format),
     };
     let (pipeline, dispatch_kind) = if let Some(format) = native {
-        pipelines.hadamard_native_dispatch(format, launch.activation_type, launch.params)
+        pipelines.hadamard_native_dispatch_for_input(
+            format,
+            launch.activation_type,
+            launch.params,
+            workspace,
+            workspace_offset,
+        )
     } else if launch.activation_type == ElementType::F32 {
         (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)
     } else {

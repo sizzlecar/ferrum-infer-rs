@@ -6,6 +6,7 @@ use metal::{Buffer, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions}
 
 mod prism_benchmark;
 mod prism_reference;
+mod vector_input_tests;
 
 const INPUT_PREFIX: usize = 4;
 const WEIGHT_PREFIX: usize = 18;
@@ -285,6 +286,11 @@ impl Fixture {
             weights, self.weight_bytes,
             "mixed prefill modified packed weights"
         );
+        self.validate_output_values(actual)
+    }
+
+    fn validate_output_values(&self, actual: &[f16]) -> Vec<u16> {
+        assert_eq!(actual.len(), self.initial_output.len());
         let stride = self.params.output_stride as usize;
         let columns = self.params.out_features as usize;
         for (index, value) in actual.iter().enumerate() {
