@@ -25,7 +25,9 @@ use crate::backend::metal::k_quant_gemm::MetalKQuantGemmPipelines;
 use crate::gguf_blocks::GgufBlockFormat;
 
 use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
-use super::native_blocks::{bind_native_block, dispatch_m64_grid, MetalNativeBlockPipelines};
+use super::native_blocks::{
+    bind_native_block, dispatch_m64_grid, pq2_full_tiles_supported, MetalNativeBlockPipelines,
+};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
@@ -381,6 +383,14 @@ impl MetalLinearPipelines {
     ) -> (&ComputePipelineState, LinearDispatchKind) {
         let m64 = self.native.pq2_gemm_input_f32_output_f16_m64.as_ref();
         if pq2_mixed_prefill_m64_supported(format, params, m64.is_some()) {
+            // Complete tiles can omit boundary predicates without changing
+            // operand precision, accumulation order or the output ABI. Keep
+            // the guarded M64 pipeline as the capability/compilation fallback.
+            if pq2_full_tiles_supported(64, params.rows, params.in_features, params.out_features) {
+                if let Some(pipeline) = &self.native.pq2_gemm_input_f32_output_f16_m64_full_tiles {
+                    return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+                }
+            }
             return (
                 m64.expect("PQ2 M64 selection requires an available pipeline"),
                 LinearDispatchKind::NativeTiledGemmM64,

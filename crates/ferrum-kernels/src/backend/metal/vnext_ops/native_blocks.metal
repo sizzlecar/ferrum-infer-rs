@@ -426,7 +426,7 @@ NATIVE_SHARED_LINEAR(float, f32, 4)
 // A 32- or 64-token x 64-output tile. Decode directly into float so the native
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
-template<uint ROW_TILE, bool SPECIALIZED = false, typename Input = half>
+template<uint ROW_TILE, bool SPECIALIZED = false, typename Input = half, bool FULL_TILES = false>
 static inline void native_tiled_gemm(
     device const Input * input, device const uchar * weight, device half * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
@@ -456,7 +456,7 @@ static inline void native_tiled_gemm(
         for (uint i = thread_index; i < ROW_TILE * 32; i += THREADS) {
             const ulong row = input_start + i / 32;
             const ulong column = k + i % 32;
-            input_tile[i] = row < ulong(p.rows) && column < ulong(p.in_features)
+            input_tile[i] = FULL_TILES || (row < ulong(p.rows) && column < ulong(p.in_features))
                 ? float(input[row * ulong(p.in_features) + column]) : 0.0f;
         }
         // Two threads own the two 16-value fragments of each physical row.
@@ -469,7 +469,7 @@ static inline void native_tiled_gemm(
             const ulong row = output_start + local_row;
             const ulong column = k + local_column;
             threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
-            if (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features)) {
+            if (FULL_TILES || (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features))) {
                 const ulong offset = (row * blocks_per_row + block_index) * ulong(block_bytes);
                 native_gemm_fragment16(weight + offset, in_block_base + local_column,
                     format, weight_fragment);
@@ -525,7 +525,7 @@ static inline void native_tiled_gemm(
     for (uint i = thread_index; i < ROW_TILE * 64; i += THREADS) {
         const ulong row = input_start + i / 64;
         const ulong column = output_start + i % 64;
-        if (row < ulong(p.rows) && column < ulong(p.out_features)) {
+        if (FULL_TILES || (row < ulong(p.rows) && column < ulong(p.out_features))) {
             output[row * ulong(p.output_stride) + ulong(p.output_column_offset) + column]
                 = half(result_tile[i]);
         }
@@ -574,6 +574,23 @@ kernel void vnext_native_block_gemm_input_f32_output_f16_m64_specialized(
     uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
     native_tiled_gemm<64, true, float>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index);
 }
+
+// Full-tile specialization. The caller must verify row-tile, N64 and native
+// PQ2 block divisibility before binding this unchecked variant. Production
+// uses only M64; M32 remains an isolated conformance/performance control.
+#define NATIVE_FULL_TILES_GEMM(NAME, ROW_TILE) \
+kernel void NAME( \
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]], \
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float * workspace [[threadgroup(0)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]], \
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) { \
+    native_tiled_gemm<ROW_TILE, true, float, true>(input, weight, output, p, block, workspace, group, thread_index, simdgroup_index); \
+}
+
+NATIVE_FULL_TILES_GEMM(vnext_native_block_gemm_input_f32_output_f16_full_tiles_specialized, 32)
+NATIVE_FULL_TILES_GEMM(vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_specialized, 64)
+#undef NATIVE_FULL_TILES_GEMM
 
 kernel void vnext_native_block_decode(
     device const uchar * input [[buffer(0)]], device float * output [[buffer(1)]],
