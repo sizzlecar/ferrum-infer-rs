@@ -10,6 +10,10 @@ use std::{fs, path::Path};
 #[path = "release_staging_workflows/installer.rs"]
 mod installer;
 
+#[cfg(windows)]
+#[path = "release_staging_workflows/windows_build.rs"]
+mod windows_build;
+
 fn key(name: &str) -> Value {
     Value::String(name.into())
 }
