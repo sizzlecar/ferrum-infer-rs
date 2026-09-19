@@ -7,6 +7,7 @@ use metal::{Buffer, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions}
 mod prism_benchmark;
 mod prism_reference;
 mod vector_input_tests;
+mod weight_thread_tests;
 
 const INPUT_PREFIX: usize = 4;
 const WEIGHT_PREFIX: usize = 18;
@@ -36,11 +37,14 @@ enum PrefillTile {
     SpecializedM32,
     SpecializedM64,
     Production,
+    ScalarWeightControlM64,
+    WeightThreadsM64,
 }
 
 struct Fixture {
     params: LinearParams,
     input: Buffer,
+    input_offset_bytes: u64,
     weight: Buffer,
     output: Buffer,
     input_values: Vec<f32>,
@@ -126,6 +130,7 @@ impl Fixture {
         Self {
             params,
             input: buffer(device, &input_values),
+            input_offset_bytes: (INPUT_PREFIX * 4) as u64,
             weight: buffer(device, &weight_bytes),
             output: buffer(device, &initial_output),
             input_values,
@@ -240,11 +245,18 @@ impl Fixture {
                 ElementType::F16,
                 self.params,
             ),
+            PrefillTile::ScalarWeightControlM64 | PrefillTile::WeightThreadsM64 => {
+                weight_thread_tests::pipeline(
+                    pipelines,
+                    self,
+                    matches!(tile, PrefillTile::WeightThreadsM64),
+                )
+            }
         };
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(&self.input), 16);
+        encoder.set_buffer(0, Some(&self.input), self.input_offset_bytes);
         encoder.set_buffer(1, Some(&self.weight), WEIGHT_PREFIX as u64);
         encoder.set_buffer(2, Some(&self.output), 16);
         encoder.set_bytes(
