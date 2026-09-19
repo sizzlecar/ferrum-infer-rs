@@ -361,10 +361,12 @@ impl RunBudget {
             discover_run_tokenizer_path(legacy_source_path)
                 .and_then(|path| tokenizers::Tokenizer::from_file(path).ok())
         };
-        let kv_capacity =
-            crate::runtime_env::runtime_snapshot_value(snapshot, "FERRUM_KV_CAPACITY")
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value > 0);
+        let kv_capacity = ["FERRUM_MAX_MODEL_LEN", "FERRUM_KV_CAPACITY"]
+            .into_iter()
+            .filter_map(|key| crate::runtime_env::runtime_snapshot_value(snapshot, key))
+            .filter_map(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .min();
         Ok(Self {
             tokenizer,
             kv_capacity,
@@ -1248,7 +1250,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.tokenizer.as_deref(),
         model_sources.as_deref(),
         &source.local_path,
-        &runtime_config,
+        &startup_auto_config.runtime_config,
     )?;
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
@@ -4355,6 +4357,116 @@ mod tests {
         assert!(prompt_tokens < 64);
         assert_eq!(plan.max_tokens_clamped_from, Some(4096));
         assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
+    }
+
+    #[test]
+    fn run_budget_clamps_generation_to_the_tighter_configured_context_bound() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let cmd = test_run_cmd();
+        for (model_limit, kv_limit, expected_limit) in [
+            (Some(64), None, 64),
+            (None, Some(48), 48),
+            (Some(64), Some(128), 64),
+            (Some(128), Some(48), 48),
+            (Some(0), Some(48), 48),
+            (Some(64), Some(0), 64),
+        ] {
+            let snapshot = RuntimeConfigSnapshot::from_entries(
+                [
+                    ("FERRUM_MAX_MODEL_LEN", model_limit),
+                    ("FERRUM_KV_CAPACITY", kv_limit),
+                ]
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    value.map(|value| {
+                        RuntimeConfigEntry::new(key, value.to_string(), RuntimeConfigSource::Cli)
+                    })
+                }),
+            );
+            let mut budget =
+                RunBudget::from_product_sources(None, None, model_dir.path(), &snapshot).unwrap();
+            budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
+            let plan = build_run_prompt_plan(
+                &[],
+                "demo",
+                None,
+                "tinyllama",
+                None,
+                &default_template_options(),
+                &cmd,
+                &budget,
+            )
+            .unwrap();
+            assert_eq!(plan.kv_capacity, Some(expected_limit));
+            assert_eq!(
+                plan.prompt_tokens.unwrap() + plan.sampling_params.max_tokens,
+                expected_limit,
+            );
+            assert_eq!(plan.max_tokens_clamped_from, Some(cmd.max_tokens as usize));
+        }
+    }
+
+    #[test]
+    fn run_budget_context_shift_uses_the_final_cli_model_length() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut config = CliConfig::default();
+        config.runtime.max_model_len = Some(8192);
+        config.runtime.kv_capacity = Some(8192);
+        let mut cmd = test_run_cmd();
+        cmd.max_model_len = Some(64);
+        let requested = run_effective_runtime_config(
+            &run_base_runtime_config(&config, RuntimeConfigSnapshot::default()),
+            &run_startup_cli_runtime_entries(&cmd, None),
+        );
+        let resolved = run_startup_auto_config(
+            &ferrum_types::Device::CPU,
+            None,
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            None,
+            None,
+            requested,
+        )
+        .unwrap();
+        let mut budget =
+            RunBudget::from_product_sources(None, None, model_dir.path(), &resolved.runtime_config)
+                .unwrap();
+        budget.prompt_token_counter = Some(|prompt| prompt.split_whitespace().count());
+        let long = std::iter::repeat_n("old", 80).collect::<Vec<_>>().join(" ");
+        let history = [
+            RunHistoryMessage::new("user", &long),
+            RunHistoryMessage::new("assistant", &long),
+        ];
+        let plan = build_run_prompt_plan(
+            &history,
+            "demo",
+            None,
+            "tinyllama",
+            None,
+            &default_template_options(),
+            &cmd,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(plan.kv_capacity, Some(64));
+        assert_eq!(plan.dropped_history_turns, 1);
+        assert_eq!(plan.dropped_history_messages, 2);
+        assert_eq!(
+            plan.prompt_tokens.unwrap() + plan.sampling_params.max_tokens,
+            64
+        );
+
+        cmd.no_context_shift = true;
+        assert!(build_run_prompt_plan(
+            &history,
+            "demo",
+            None,
+            "tinyllama",
+            None,
+            &default_template_options(),
+            &cmd,
+            &budget,
+        )
+        .is_err());
     }
 
     #[test]
