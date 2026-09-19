@@ -260,6 +260,30 @@ checkpoint 时，重新发送历史会重新计算输入；使用 `--enable-pref
 
 ### 在 Metal 上运行 Bonsai 2 PQ2_0
 
+在 Apple Silicon 上启动 **Bonsai 2 27B** 对话：
+
+```sh
+ferrum run bonsai2:27b
+```
+
+或者启动本地 API，供应用调用：
+
+```sh
+ferrum serve --model bonsai2:27b
+```
+
+首次启动自动下载约 **7.2 GB 的 PQ2_0 权重**及匹配元数据，之后复用缓存，
+无需手动准备文件。API 地址为 `http://127.0.0.1:8000/v1`。
+
+此快捷入口在 0.12.0 之后新增；使用 0.12.0 时请展开下方手动配置。
+
+<details>
+<summary><strong>默认配置、实测范围与手动配置</strong></summary>
+
+Metal 默认使用 8K 上下文、1 个活跃请求、128-token 批处理预算和 10 GiB
+运行预算。显式配置及 CLI 参数优先。保留模型原本的思考行为；需要关闭时，
+追加 `--disable-thinking`。
+
 Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
 并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，
 包括 Orchestral 真实工具执行、会话续接和前缀状态复用。下方 8K 上下文和 10 GiB
@@ -296,6 +320,8 @@ CUDA PQ2_0/Hadamard 算子和小型混合状态 checkpoint 测试已在真实 GP
 **完整 27B 模型的 CUDA 验收仍未完成**。此 Bonsai 路径不支持 PTQ1_0、旧代
 Q1_0/Q2_0 编码、MLX 包、视觉或完整 CPU 推理；Bonsai 与 INT8 KV 的组合尚未验收。
 模型声明的上下文上限不代表超过上述长度的范围已经实测。
+
+</details>
 
 ## 功能
 

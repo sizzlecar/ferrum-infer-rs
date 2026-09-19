@@ -912,6 +912,19 @@ async fn execute_with_compatibility(
         );
     }
     let autosize_env_before = RuntimeConfigSnapshot::capture_current();
+    let requested_runtime_config = merge_runtime_config_sources(
+        non_env_runtime_entries.clone(),
+        remove_materialized_config_env_entries(
+            autosize_env_before.clone(),
+            &materialized_runtime_keys,
+        ),
+        startup_cli_runtime_entries.clone(),
+    );
+    let model_startup_defaults = crate::model_startup::ModelStartupDefaults::resolve(
+        &model_name,
+        &device,
+        &requested_runtime_config,
+    );
     // GPU-memory auto-sizing must run after the model source resolves.
     // HF-cache models are not `local_dir_path`, but they still need the same
     // KV block sizing as direct local safetensors directories.
@@ -961,6 +974,7 @@ async fn execute_with_compatibility(
         non_env_runtime_entries,
         materialized_runtime_keys,
         startup_cli_runtime_entries,
+        &model_startup_defaults,
     )?;
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
     write_startup_config_artifacts(
@@ -1440,11 +1454,13 @@ fn startup_auto_config(
     non_env_runtime_entries: Vec<RuntimeConfigEntry>,
     materialized_runtime_keys: Vec<String>,
     cli_runtime_entries: Vec<RuntimeConfigEntry>,
+    model_startup_defaults: &crate::model_startup::ModelStartupDefaults,
 ) -> Result<ResolvedFerrumConfig> {
     let mut env_snapshot = RuntimeConfigSnapshot::capture_current();
     env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_runtime_keys);
-    let runtime_config =
+    let mut runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
+    model_startup_defaults.apply(&mut runtime_config);
     let hardware = hardware_capabilities_for_device(device);
     let model = typed_model_capabilities
         .or_else(|| {
@@ -2932,6 +2948,68 @@ mod tests {
         assert_eq!(
             entry(&cli_over_env, "FERRUM_PREFIX_CACHE").source,
             RuntimeConfigSource::Cli
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn serve_bonsai_recipe_preserves_config_env_and_cli_resource_overrides() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            max_model_len: Some(4096),
+            paged_max_seqs: Some(2),
+            max_batched_tokens: Some(256),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let env = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_MAX_BATCHED_TOKENS",
+            "512",
+            RuntimeConfigSource::Env,
+        )]);
+        let cli_entries = serve_cli_runtime_entries(
+            None,
+            None,
+            None,
+            Some(2048),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let requested = merge_runtime_config_sources(config_entries, env, cli_entries);
+        let defaults = crate::model_startup::ModelStartupDefaults::resolve(
+            "bonsai2:27b-pq2_0",
+            &ferrum_types::Device::Metal,
+            &requested,
+        );
+        let mut effective = requested.clone();
+        defaults.apply(&mut effective);
+        for entry in &requested.entries {
+            assert!(effective.entries.contains(entry));
+        }
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(engine.runtime.max_model_len, Some(2048));
+        assert_eq!(engine.scheduler.max_running_requests, 2);
+        assert_eq!(engine.batching.max_num_batched_tokens, 512);
+        assert_eq!(
+            engine.memory.usable_capacity_bytes,
+            Some(10 * 1024 * 1024 * 1024)
         );
     }
 

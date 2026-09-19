@@ -284,6 +284,32 @@ separate from GPU prefix-state reuse.
 
 ### Bonsai 2 PQ2_0 on Metal
 
+On Apple Silicon, start a chat with **Bonsai 2 27B**:
+
+```sh
+ferrum run bonsai2:27b
+```
+
+Or start a local API for your apps:
+
+```sh
+ferrum serve --model bonsai2:27b
+```
+
+The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
+matching metadata; later starts reuse the cache. No manual file preparation is
+needed. The API listens at `http://127.0.0.1:8000/v1`.
+
+The shortcut is new after 0.12.0. For that release, use the manual setup below.
+
+<details>
+<summary><strong>Defaults, tested limits, and manual setup</strong></summary>
+
+On Metal, the shortcut defaults to 8K context, one active request, a 128-token
+batch budget, and a 10 GiB runtime budget. Explicit configuration and CLI options
+take precedence. Model reasoning behavior is preserved; append
+`--disable-thinking` if you want it off.
+
 Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
 weights packed and applies the Hadamard transforms declared by the model.
 Metal text inference has been validated through `run` and `serve` with FP16 KV,
@@ -325,6 +351,8 @@ path does not support PTQ1_0, earlier Bonsai Q1_0/Q2_0 encodings, MLX packages,
 vision, or complete CPU inference. Bonsai combined with INT8 KV is not yet
 validated. The model's declared context limit does not establish tested coverage
 beyond the context above.
+
+</details>
 
 ## Features
 
