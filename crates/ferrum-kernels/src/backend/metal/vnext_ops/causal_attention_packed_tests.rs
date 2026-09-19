@@ -225,7 +225,7 @@ fn run_packed_projected(
         set_raw_params(encoder, 4, &params);
         let plan = pipelines.dispatch_plan(&params);
         assert_eq!(plan.kind, AttentionDispatchKind::General);
-        encode_attention_dispatch(pipelines, encoder, plan);
+        encode_attention_dispatch(pipelines, encoder, plan, &params);
         // The packed output projection consumes contiguous context rows too.
         readback.push((
             query,

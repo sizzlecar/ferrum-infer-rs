@@ -200,6 +200,9 @@ pub(super) struct MetalNativeBlockPipelines {
     pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles: Option<ComputePipelineState>,
     pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input:
         Option<ComputePipelineState>,
+    #[cfg(test)]
+    pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control:
+        Option<ComputePipelineState>,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -338,6 +341,16 @@ impl MetalNativeBlockPipelines {
                 )
             },
         );
+        #[cfg(test)]
+        let pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control =
+            optional_m64_pipeline(device, || {
+                gemm_format_pipeline(
+                    device,
+                    &library,
+                    "vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control_specialized",
+                    GgufBlockFormat::Pq2_0,
+                )
+            });
         let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
             device,
             &library,
@@ -381,6 +394,8 @@ impl MetalNativeBlockPipelines {
             pq2_gemm_input_f32_output_f16_full_tiles,
             pq2_gemm_input_f32_output_f16_m64_full_tiles,
             pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input,
+            #[cfg(test)]
+            pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]
