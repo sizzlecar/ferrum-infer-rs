@@ -1262,14 +1262,27 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = match (defined_model, model_sources.clone()) {
+    let numerical_execution = engine_config.numerical_execution.clone();
+    let engine_result = match (defined_model, model_sources.clone()) {
         (Some(prepared), _) => {
-            ferrum_engine::create_defined_product_engine(engine_config, prepared).await?
+            ferrum_engine::create_defined_product_engine(engine_config, prepared).await
         }
-        (None, Some(sources)) => {
-            ferrum_engine::create_product_engine(engine_config, sources).await?
+        (None, Some(sources)) => ferrum_engine::create_product_engine(engine_config, sources).await,
+        (None, None) => ferrum_engine::create_default_engine(engine_config).await,
+    };
+    let engine = match engine_result {
+        Ok(engine) => engine,
+        Err(error) => {
+            crate::commands::serve::write_failed_startup_config_artifacts(
+                &startup_auto_config,
+                product_source_identity.as_ref(),
+                &numerical_execution,
+                cmd.effective_config_json.as_deref(),
+                cmd.decision_trace_jsonl.as_deref(),
+                &error,
+            );
+            return Err(error);
         }
-        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
     };
     crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
     crate::commands::serve::write_startup_config_artifacts(
@@ -4528,6 +4541,21 @@ mod tests {
         engine
             .apply_runtime_config_snapshot(&resolved.runtime_config)
             .unwrap();
+        let artifact = model_dir.path().join("effective.json");
+        let trace = model_dir.path().join("decisions.jsonl");
+        crate::commands::serve::write_failed_startup_config_artifacts(
+            &resolved,
+            None,
+            &engine.numerical_execution,
+            Some(&artifact),
+            Some(&trace),
+            &FerrumError::config("fixture initialization failed"),
+        );
+        let preliminary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(preliminary["startup"]["status"], "failed");
+        assert_eq!(preliminary["startup"]["configuration"], "preliminary");
+        assert_eq!(preliminary["selected_max_model_len"], 32_768);
         plan.apply_to_engine_config(&mut engine).unwrap();
         crate::startup::apply_engine_plan(&mut resolved, &engine);
         let budget = RunBudget::from_product_sources(
@@ -4540,17 +4568,17 @@ mod tests {
         .unwrap();
         assert_eq!(budget.kv_capacity, Some(4096));
         assert_eq!(resolved.startup_memory_plan.as_ref(), Some(&plan));
-        let artifact = model_dir.path().join("effective.json");
         crate::commands::serve::write_startup_config_artifacts(
             &resolved,
             None,
             &engine.numerical_execution,
             Some(&artifact),
-            None,
+            Some(&trace),
         )
         .unwrap();
         let document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+        assert!(document.get("startup").is_none());
         assert_eq!(document["selected_max_model_len"], 4096);
         assert_eq!(
             document["startup_memory_plan"]["selected"]["context_tokens"],
@@ -4560,6 +4588,10 @@ mod tests {
             document["startup_memory_plan"]["selected"]["max_batch_tokens"],
             256
         );
+        for line in std::fs::read_to_string(trace).unwrap().lines() {
+            let decision: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(decision.get("startup").is_none());
+        }
     }
 
     #[test]

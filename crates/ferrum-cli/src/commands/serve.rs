@@ -991,133 +991,151 @@ async fn execute_with_compatibility(
     let numerical_execution = product_engine_config.numerical_execution.clone();
     let mut resolved_execution_metrics = None;
     let mut cache_allocated_status = None;
-    let server = match arch_for_dispatch {
-        Some(ferrum_models::Architecture::Clip) => {
-            println!("{}", "Initializing CLIP embedding engine...".dimmed());
-            let candle_device = candle_core::Device::Cpu;
-            let executor = ferrum_models::ClipModelExecutor::from_path(
-                &source.local_path.to_string_lossy(),
-                candle_device,
-                candle_core::DType::F32,
-            )?;
-            let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
-            let mut engine_config = product_engine_config;
-            engine_config.sampling.default_params = ferrum_server::default_chat_sampling_params();
-            engine_config.backend.device = device;
-            if let Some(selection) = &gpu_selection {
-                selection.insert_backend_options(&mut engine_config.backend.backend_options);
-            }
-            let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
-                ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
-                    .with_tokenizer(tokenizer),
-            );
-            AxumServer::from_embed(engine)
-        }
-        Some(ferrum_models::Architecture::Whisper) => {
-            println!("{}", "Initializing Whisper ASR engine...".dimmed());
-            let candle_device = to_candle_device(&device)?;
-            let executor = ferrum_models::WhisperModelExecutor::from_path(
-                &source.local_path.to_string_lossy(),
-                candle_device,
-                candle_core::DType::F32,
-            )?;
-            let mut engine_config = product_engine_config;
-            engine_config.backend.device = device;
-            if let Some(selection) = &gpu_selection {
-                selection.insert_backend_options(&mut engine_config.backend.backend_options);
-            }
-            let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
-                ferrum_engine::transcription_engine::TranscriptionEngine::new(
-                    executor,
-                    engine_config,
-                ),
-            );
-            AxumServer::from_transcribe(engine)
-        }
-        Some(ferrum_models::Architecture::Qwen3TTS) => {
-            let n_slots = tts_slots.max(1);
-            println!(
-                "{} ({} slot{})",
-                "Initializing Qwen3-TTS engine...".dimmed(),
-                n_slots,
-                if n_slots > 1 { "s" } else { "" }
-            );
-            let model_path = source.local_path.to_string_lossy().to_string();
-            let mut executors = Vec::with_capacity(n_slots);
-            for i in 0..n_slots {
-                let candle_device = to_candle_device(&device)?;
-                let executor = ferrum_models::TtsModelExecutor::from_path(
-                    &model_path,
+    let server_result: Result<_> = async {
+        Ok(match arch_for_dispatch {
+            Some(ferrum_models::Architecture::Clip) => {
+                println!("{}", "Initializing CLIP embedding engine...".dimmed());
+                let candle_device = candle_core::Device::Cpu;
+                let executor = ferrum_models::ClipModelExecutor::from_path(
+                    &source.local_path.to_string_lossy(),
                     candle_device,
                     candle_core::DType::F32,
                 )?;
-                if i == 0 {
-                    println!("  Slot 0 loaded");
-                } else {
-                    println!("  Slot {} loaded", i);
+                let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
+                let mut engine_config = product_engine_config;
+                engine_config.sampling.default_params =
+                    ferrum_server::default_chat_sampling_params();
+                engine_config.backend.device = device;
+                if let Some(selection) = &gpu_selection {
+                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
                 }
-                executors.push(executor);
-            }
-            let engine: Arc<dyn ferrum_engine::TtsEngine + Send + Sync> =
-                Arc::new(ferrum_engine::tts_engine::TtsService::new_multi(
-                    executors,
-                    ferrum_types::ModelId(model_id.clone()),
-                ));
-            AxumServer::from_tts(engine)
-        }
-        _ => {
-            println!(
-                "{}",
-                "Initializing engine (continuous batching)...".dimmed()
-            );
-            let mut engine_config = product_engine_config;
-            engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
-            engine_config.backend.device = device;
-            engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
-            engine_config
-                .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
-                .map_err(ferrum_types::FerrumError::config)?;
-            engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
-            engine_config.runtime.startup_memory_request = startup_memory_request;
-            engine_config.backend.backend_options.insert(
-                "model_path".to_string(),
-                serde_json::Value::String(engine_model_path.clone()),
-            );
-            if let Some(selection) = &gpu_selection {
-                selection.insert_backend_options(&mut engine_config.backend.backend_options);
-            }
-            crate::layer_split_pipeline::insert_backend_option_from_runtime(
-                &startup_auto_config.runtime_config,
-                &mut engine_config.backend.backend_options,
-            )?;
-            if let Some(draft_path) = engine_spec_draft_path.as_ref() {
-                engine_config.backend.backend_options.insert(
-                    "spec_draft".to_string(),
-                    serde_json::Value::String(draft_path.clone()),
+                let engine: Arc<dyn ferrum_engine::EmbedEngine + Send + Sync> = Arc::new(
+                    ferrum_engine::embedding_engine::EmbeddingEngine::new(executor, engine_config)
+                        .with_tokenizer(tokenizer),
                 );
-                engine_config.backend.backend_options.insert(
-                    "spec_n".to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
+                AxumServer::from_embed(engine)
+            }
+            Some(ferrum_models::Architecture::Whisper) => {
+                println!("{}", "Initializing Whisper ASR engine...".dimmed());
+                let candle_device = to_candle_device(&device)?;
+                let executor = ferrum_models::WhisperModelExecutor::from_path(
+                    &source.local_path.to_string_lossy(),
+                    candle_device,
+                    candle_core::DType::F32,
+                )?;
+                let mut engine_config = product_engine_config;
+                engine_config.backend.device = device;
+                if let Some(selection) = &gpu_selection {
+                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
+                }
+                let engine: Arc<dyn ferrum_engine::TranscribeEngine + Send + Sync> = Arc::new(
+                    ferrum_engine::transcription_engine::TranscriptionEngine::new(
+                        executor,
+                        engine_config,
+                    ),
                 );
+                AxumServer::from_transcribe(engine)
             }
-            super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-            let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                Arc::from(match (defined_model, model_sources) {
-                    (Some(prepared), _) => {
-                        ferrum_engine::create_defined_product_engine(engine_config, prepared)
-                            .await?
+            Some(ferrum_models::Architecture::Qwen3TTS) => {
+                let n_slots = tts_slots.max(1);
+                println!(
+                    "{} ({} slot{})",
+                    "Initializing Qwen3-TTS engine...".dimmed(),
+                    n_slots,
+                    if n_slots > 1 { "s" } else { "" }
+                );
+                let model_path = source.local_path.to_string_lossy().to_string();
+                let mut executors = Vec::with_capacity(n_slots);
+                for i in 0..n_slots {
+                    let candle_device = to_candle_device(&device)?;
+                    let executor = ferrum_models::TtsModelExecutor::from_path(
+                        &model_path,
+                        candle_device,
+                        candle_core::DType::F32,
+                    )?;
+                    if i == 0 {
+                        println!("  Slot 0 loaded");
+                    } else {
+                        println!("  Slot {} loaded", i);
                     }
-                    (None, Some(sources)) => {
-                        ferrum_engine::create_product_engine(engine_config, sources).await?
-                    }
-                    (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
-                });
-            crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
-            resolved_execution_metrics = engine.cache_metrics_snapshot();
-            if product_memory_enabled {
-                cache_allocated_status = Some(engine.status().await);
+                    executors.push(executor);
+                }
+                let engine: Arc<dyn ferrum_engine::TtsEngine + Send + Sync> =
+                    Arc::new(ferrum_engine::tts_engine::TtsService::new_multi(
+                        executors,
+                        ferrum_types::ModelId(model_id.clone()),
+                    ));
+                AxumServer::from_tts(engine)
             }
-            AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
+            _ => {
+                println!(
+                    "{}",
+                    "Initializing engine (continuous batching)...".dimmed()
+                );
+                let mut engine_config = product_engine_config;
+                engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
+                engine_config.backend.device = device;
+                engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
+                engine_config
+                    .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
+                    .map_err(ferrum_types::FerrumError::config)?;
+                engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+                engine_config.runtime.startup_memory_request = startup_memory_request;
+                engine_config.backend.backend_options.insert(
+                    "model_path".to_string(),
+                    serde_json::Value::String(engine_model_path.clone()),
+                );
+                if let Some(selection) = &gpu_selection {
+                    selection.insert_backend_options(&mut engine_config.backend.backend_options);
+                }
+                crate::layer_split_pipeline::insert_backend_option_from_runtime(
+                    &startup_auto_config.runtime_config,
+                    &mut engine_config.backend.backend_options,
+                )?;
+                if let Some(draft_path) = engine_spec_draft_path.as_ref() {
+                    engine_config.backend.backend_options.insert(
+                        "spec_draft".to_string(),
+                        serde_json::Value::String(draft_path.clone()),
+                    );
+                    engine_config.backend.backend_options.insert(
+                        "spec_n".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(spec_tokens)),
+                    );
+                }
+                super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
+                let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
+                    Arc::from(match (defined_model, model_sources) {
+                        (Some(prepared), _) => {
+                            ferrum_engine::create_defined_product_engine(engine_config, prepared)
+                                .await?
+                        }
+                        (None, Some(sources)) => {
+                            ferrum_engine::create_product_engine(engine_config, sources).await?
+                        }
+                        (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
+                    });
+                crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
+                resolved_execution_metrics = engine.cache_metrics_snapshot();
+                if product_memory_enabled {
+                    cache_allocated_status = Some(engine.status().await);
+                }
+                AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
+            }
+        })
+    }
+    .await;
+    let server = match server_result {
+        Ok(server) => server,
+        Err(error) => {
+            write_failed_startup_config_artifacts(
+                &startup_auto_config,
+                product_source_identity.as_ref(),
+                &numerical_execution,
+                effective_config_json.as_deref(),
+                decision_trace_jsonl.as_deref(),
+                &error,
+            );
+            return Err(error);
         }
     };
     write_startup_config_artifacts(
@@ -1795,6 +1813,53 @@ pub(crate) fn write_startup_config_artifacts(
     effective_config_json: Option<&std::path::Path>,
     decision_trace_jsonl: Option<&std::path::Path>,
 ) -> Result<()> {
+    write_startup_config_artifacts_with_failure(
+        auto_config,
+        resolution_evidence,
+        numerical_execution,
+        effective_config_json,
+        decision_trace_jsonl,
+        None,
+    )
+}
+
+/// Preserve resolved sources and requested limits when initialization fails.
+/// These diagnostics do not certify that the preliminary memory limits fit.
+pub(crate) fn write_failed_startup_config_artifacts(
+    auto_config: &ResolvedFerrumConfig,
+    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    numerical_execution: &ferrum_types::NumericalExecutionPolicy,
+    effective_config_json: Option<&std::path::Path>,
+    decision_trace_jsonl: Option<&std::path::Path>,
+    error: &FerrumError,
+) {
+    let failure = serde_json::json!({
+        "status": "failed",
+        "phase": "engine_initialization",
+        "configuration": "preliminary",
+        "error": error.to_string(),
+    });
+    if let Err(artifact_error) = write_startup_config_artifacts_with_failure(
+        auto_config,
+        resolution_evidence,
+        numerical_execution,
+        effective_config_json,
+        decision_trace_jsonl,
+        Some(&failure),
+    ) {
+        // A diagnostic write failure must not replace the initialization error.
+        eprintln!("Could not write startup failure diagnostics: {artifact_error}");
+    }
+}
+
+fn write_startup_config_artifacts_with_failure(
+    auto_config: &ResolvedFerrumConfig,
+    resolution_evidence: Option<&ferrum_interfaces::vnext::ProductModelSourceIdentity>,
+    numerical_execution: &ferrum_types::NumericalExecutionPolicy,
+    effective_config_json: Option<&std::path::Path>,
+    decision_trace_jsonl: Option<&std::path::Path>,
+    failure: Option<&serde_json::Value>,
+) -> Result<()> {
     if let Some(path) = effective_config_json {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1802,6 +1867,9 @@ pub(crate) fn write_startup_config_artifacts(
         }
         let mut document = auto_config.effective_config_document();
         document["numerical_execution"] = serde_json::json!({ "requested": numerical_execution });
+        if let Some(failure) = failure {
+            document["startup"] = failure.clone();
+        }
         if let Some(evidence) = resolution_evidence {
             let object = document.as_object_mut().ok_or_else(|| {
                 ferrum_types::FerrumError::serialization(
@@ -1824,9 +1892,25 @@ pub(crate) fn write_startup_config_artifacts(
             std::fs::create_dir_all(parent)
                 .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
         }
-        let trace = auto_config
-            .decision_trace_jsonl()
-            .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?;
+        let trace = match failure {
+            Some(failure) => {
+                let mut trace = String::new();
+                for decision in &auto_config.decisions {
+                    let mut record = serde_json::to_value(decision)
+                        .map_err(|err| FerrumError::serialization(err.to_string()))?;
+                    record["startup"] = failure.clone();
+                    trace.push_str(
+                        &serde_json::to_string(&record)
+                            .map_err(|err| FerrumError::serialization(err.to_string()))?,
+                    );
+                    trace.push('\n');
+                }
+                trace
+            }
+            None => auto_config
+                .decision_trace_jsonl()
+                .map_err(|err| ferrum_types::FerrumError::serialization(err.to_string()))?,
+        };
         std::fs::write(path, trace)
             .map_err(|err| ferrum_types::FerrumError::io(err.to_string()))?;
     }
