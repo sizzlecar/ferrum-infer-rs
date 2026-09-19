@@ -70,7 +70,7 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         weight_materializers,
         catalog,
         select_materializer,
-        |info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
+        |engine, info, runtime| VNextExecutorConfig::from_engine_config(engine, info, runtime),
     )
 }
 
@@ -88,7 +88,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         WeightMaterializerSelection,
         ferrum_interfaces::vnext::VNextError,
     >,
-    executor_config: impl Fn(&ModelInfo, &R) -> Result<VNextExecutorConfig>,
+    executor_config: impl Fn(&EngineConfig, &ModelInfo, &R) -> Result<VNextExecutorConfig>,
 ) -> Result<VNextModelExecutor<R>> {
     let requested_kv_storage = ferrum_types::KvStorageFormat::try_from(engine.kv_cache.dtype)
         .map_err(FerrumError::config)?;
@@ -114,7 +114,21 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
         };
         let model_info =
             prepared.model_info(engine.model.model_id.clone(), engine.backend.device.clone());
-        let config = executor_config(&model_info, composition.runtime())?;
+        let mut selected_engine = engine.clone();
+        if let Some(request) = &engine.runtime.startup_memory_request {
+            selected_engine.memory.usable_capacity_bytes = Some(
+                usize::try_from(request.usable_capacity_bytes)
+                    .map_err(|_| FerrumError::config("startup memory budget exceeds usize"))?,
+            );
+            if !request.batch_is_explicit {
+                selected_engine.batching.max_num_batched_tokens = selected_engine
+                    .batching
+                    .max_num_batched_tokens
+                    .max(selected_engine.scheduler.max_running_requests);
+            }
+        }
+        let config = executor_config(&selected_engine, &model_info, composition.runtime())?;
+        let compiled_context_tokens = config.maximum_model_tokens;
         let materializer = match select_materializer(prepared.family()) {
             Ok(selection) => selection,
             Err(error) => {
@@ -126,18 +140,101 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
                 continue;
             }
         };
-        let compiled =
-            match composition.compile_model(&prepared, model_info, engine, config, materializer) {
-                Ok(compiled) => compiled,
-                Err(error) => {
-                    rejected.push(NumericalProfileRejection {
-                        profile_id: profile.id.clone(),
-                        stage: NumericalProfileRejectionStage::ProgramCompilation,
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
+        let compiled = match composition.compile_model(
+            &prepared,
+            model_info.clone(),
+            &selected_engine,
+            config,
+            materializer.clone(),
+        ) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                rejected.push(NumericalProfileRejection {
+                    profile_id: profile.id.clone(),
+                    stage: NumericalProfileRejectionStage::ProgramCompilation,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        // Fit the already selected providers and materialized weight layout.
+        // No upload or allocation has occurred. Compile the selected bounds
+        // and budget, then initialize that exact retained final plan.
+        let compiled = if let Some(request) = &engine.runtime.startup_memory_request {
+            let context_tokens = selected_engine
+                .runtime
+                .max_model_len
+                .unwrap_or(model_info.max_sequence_length)
+                .min(model_info.max_sequence_length)
+                .min(selected_engine.runtime.kv_capacity.unwrap_or(usize::MAX));
+            let limits = ferrum_types::StartupResourceLimits {
+                context_tokens,
+                max_sequences: selected_engine.scheduler.max_running_requests,
+                max_batch_tokens: selected_engine.batching.max_num_batched_tokens,
             };
+            let mut fitted = ferrum_types::fit_startup_resources(request, limits, |workload| {
+                compiled
+                    .startup_peak_bytes(workload)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| FerrumError::config(format!("automatic startup capacity: {error}")))?;
+            fitted
+                .apply_to_engine_config(&mut selected_engine)
+                .map_err(FerrumError::config)?;
+            let model_context_tokens = model_info.max_sequence_length;
+            let mut final_compiled = if fitted.selected == limits
+                && limits.context_tokens == compiled_context_tokens
+            {
+                compiled
+            } else {
+                drop(compiled);
+                let config = executor_config(&selected_engine, &model_info, composition.runtime())?;
+                composition.compile_model(
+                    &prepared,
+                    model_info,
+                    &selected_engine,
+                    config,
+                    materializer,
+                )?
+            };
+            // Compilation may select different provider layouts for the final
+            // bounds. Verify those actual layouts before authorizing upload.
+            let exact_request = ferrum_types::StartupMemoryRequest {
+                context_is_explicit: true,
+                sequences_is_explicit: true,
+                batch_is_explicit: true,
+                ..request.clone()
+            };
+            let verified =
+                ferrum_types::fit_startup_resources(&exact_request, fitted.selected, |workload| {
+                    final_compiled
+                        .startup_peak_bytes(workload)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| {
+                    FerrumError::config(format!("final compiled startup capacity: {error}"))
+                })?;
+            fitted.context_peak_bytes = verified.context_peak_bytes;
+            fitted.decode_peak_bytes = verified.decode_peak_bytes;
+            fitted
+                .apply_to_engine_config(&mut selected_engine)
+                .map_err(FerrumError::config)?;
+            tracing::info!(
+                model_context_tokens,
+                effective_context_tokens = fitted.selected.context_tokens,
+                max_sequences = fitted.selected.max_sequences,
+                max_batch_tokens = fitted.selected.max_batch_tokens,
+                usable_capacity_bytes = fitted.request.usable_capacity_bytes,
+                context_peak_bytes = fitted.context_peak_bytes,
+                decode_peak_bytes = fitted.decode_peak_bytes,
+                reasons = ?fitted.reasons,
+                "Adapted runtime limits to the compiled model and available device memory"
+            );
+            final_compiled.set_startup_memory_plan(fitted)?;
+            final_compiled
+        } else {
+            compiled
+        };
         tracing::info!(requested_numerical_policy = ?engine.numerical_execution,
             requested_kv_dtype = engine.kv_cache.dtype.as_str(),
             kv_storage = ?requested_kv_storage,
@@ -146,7 +243,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             "Selected numerical profile using the complete static program");
         return compiled.initialize(|prepared, runtime, catalog, compilation| {
             let numerical_execution = NumericalProfileResolution::from_static_plan(
-                engine.numerical_execution.clone(),
+                selected_engine.numerical_execution.clone(),
                 requested_kv_storage,
                 defined.definition(),
                 prepared.family(),
@@ -157,7 +254,7 @@ pub(crate) fn create_vnext_executor_with_configuration<R: DeviceRuntime>(
             )
             .map_err(|error| FerrumError::model(error.to_string()))?;
             resolve_model_plan(
-                engine,
+                &selected_engine,
                 prepared,
                 catalog,
                 runtime,

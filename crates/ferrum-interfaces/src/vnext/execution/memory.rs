@@ -12,6 +12,8 @@ use super::{
     StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
+mod startup;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoryPlan {
     pub(super) device_capacity_bytes: u64,

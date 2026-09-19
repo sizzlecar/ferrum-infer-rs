@@ -3079,6 +3079,12 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Device-aware limits selected from the exact compiled memory plan before
+    /// static model upload. Legacy executors do not provide this evidence.
+    fn startup_memory_plan(&self) -> Option<&ferrum_types::StartupMemoryPlan> {
+        None
+    }
+
     /// Installs the product-owned execution event sink before requests start.
     ///
     /// Legacy executors have no typed execution journal and keep the default

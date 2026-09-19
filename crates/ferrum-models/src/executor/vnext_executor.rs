@@ -525,6 +525,7 @@ fn budget_reusable_decode_seed_prefill(
 #[derive(Debug, Clone)]
 pub struct VNextExecutorConfig {
     pub maximum_model_tokens: usize,
+    pub startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub device_reusable_execution_enabled: bool,
@@ -786,6 +787,7 @@ impl VNextExecutorConfig {
 
         Ok(Self {
             maximum_model_tokens,
+            startup_memory_plan: engine.runtime.startup_memory_plan.clone(),
             static_initialization,
             runtime_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
@@ -4418,6 +4420,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     io: VNextIoBinding,
     maximum_model_tokens: usize,
     attention_head_dimension: usize,
+    startup_memory_plan: Option<ferrum_types::StartupMemoryPlan>,
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
@@ -4974,6 +4977,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             io,
             maximum_model_tokens: config.maximum_model_tokens,
             attention_head_dimension,
+            startup_memory_plan: config.startup_memory_plan,
             run_id,
             family_fingerprint,
             program_fingerprint,
@@ -9858,6 +9862,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.maximum_model_tokens)
+    }
+
+    fn startup_memory_plan(&self) -> Option<&ferrum_types::StartupMemoryPlan> {
+        self.startup_memory_plan.as_ref()
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {

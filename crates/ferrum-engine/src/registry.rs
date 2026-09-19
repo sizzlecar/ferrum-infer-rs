@@ -2024,7 +2024,7 @@ mod tests {
                 "linear_num_value_heads": 1,
                 "linear_key_head_dim": 1,
                 "linear_value_head_dim": 1,
-                "linear_conv_kernel_dim": 1,
+                "linear_conv_kernel_dim": 2,
                 "mamba_ssm_dtype": "float32",
                 "head_dim": 2,
                 "num_attention_heads": 1,
@@ -2078,7 +2078,7 @@ mod tests {
             ),
             (
                 "model.layers.0.linear_attn.conv1d.weight".to_string(),
-                vec![1.0, 1.0, 1.0],
+                vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
             ),
             ("model.layers.0.linear_attn.A_log".to_string(), vec![0.0]),
             ("model.layers.0.linear_attn.dt_bias".to_string(), vec![0.0]),
@@ -2150,6 +2150,25 @@ mod tests {
         let views = tensors
             .into_iter()
             .map(|(name, values)| {
+                let dimensions =
+                    if name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight") {
+                        vec![3, 2]
+                    } else if name.ends_with("in_proj_qkv.weight") {
+                        vec![3, 2]
+                    } else if ["in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+                    {
+                        vec![1, 2]
+                    } else if name.ends_with("linear_attn.out_proj.weight") {
+                        vec![2, 1]
+                    } else if name.ends_with("conv1d.weight") {
+                        vec![3, 1, 2]
+                    } else if values.len() == 4 {
+                        vec![2, 2]
+                    } else {
+                        vec![values.len()]
+                    };
                 let bytes = values
                     .iter()
                     .flat_map(|value| value.to_le_bytes())
@@ -2158,7 +2177,7 @@ mod tests {
                 let bytes: &'static [u8] = Box::leak(bytes);
                 (
                     name,
-                    TensorView::new(Dtype::F32, vec![values.len()], bytes).unwrap(),
+                    TensorView::new(Dtype::F32, dimensions, bytes).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -2185,6 +2204,180 @@ mod tests {
             serde_json::Value::String(model_dir.to_string_lossy().to_string()),
         );
         ComponentConfig::from_engine_config(&engine_config)
+    }
+
+    #[tokio::test]
+    async fn startup_memory_real_cpu_plan_fits_before_upload_and_reaches_engine_config() {
+        use ferrum_interfaces::vnext::{
+            AllocationLifetime, DeviceId, DynamicResourceDemand, WeightMaterializerSelection,
+        };
+        use ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition;
+        use ferrum_types::{DeviceMemorySnapshot, StartupMemoryRequest};
+
+        let dir = write_qwen35_fixture_model_dir();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        let declared_context = 1 << 20;
+        metadata["max_position_embeddings"] = serde_json::json!(declared_context);
+        metadata["text_config"]["max_position_embeddings"] = serde_json::json!(declared_context);
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"<eos>":2},"unk_token":"<unk>"}}"#).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
+        let defined = Arc::new(ferrum_models::vnext::qwen35::define_from_model_dir(&dir).unwrap());
+        let capacity = 16 * 1024 * 1024;
+        let mut config = qwen35_fixture_component_config(&dir).engine_config;
+        config.scheduler.max_running_requests = 4;
+        config.batching.max_num_batched_tokens = 8;
+        config.backend.enable_reusable_execution = false;
+        let create = |engine: &EngineConfig| {
+            let composition = CpuVNextComposition::create(
+                DeviceId::new(format!("device.cpu.startup-{}", uuid::Uuid::new_v4())).unwrap(),
+                capacity,
+            )
+            .unwrap();
+            let (runtime, operations, materializers, materializer, catalog) =
+                composition.into_parts().unwrap();
+            let observed = Arc::clone(&runtime);
+            let executor = crate::product_composition::create_vnext_executor(
+                engine,
+                &defined,
+                runtime,
+                operations,
+                materializers,
+                catalog,
+                |_| Ok(WeightMaterializerSelection::exact(materializer.clone())),
+            );
+            (observed, executor)
+        };
+        let (_, baseline) = create(&config);
+        let baseline = baseline.unwrap();
+        let memory = baseline
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        let tokens_per_physical_quantum = memory
+            .dynamic_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.lifetime() == AllocationLifetime::Sequence)
+            .filter_map(|descriptor| match descriptor.demand() {
+                DynamicResourceDemand::Tokens {
+                    bytes_per_token, ..
+                } => Some(
+                    descriptor
+                        .physical_allocation_quantum_bytes()
+                        .div_ceil(*bytes_per_token),
+                ),
+                _ => None,
+            })
+            .max()
+            .expect("the hybrid fixture declares token-scaled attention state");
+        let fitted_context_floor = tokens_per_physical_quantum * 2;
+        let budget = memory
+            .startup_peak_bytes(fitted_context_floor, 1, 8)
+            .unwrap()
+            .max(
+                memory
+                    .startup_workload_peak_bytes(fitted_context_floor, 1, 2, 2)
+                    .unwrap(),
+            );
+        assert!(memory.startup_peak_bytes(declared_context, 1, 8).unwrap() > budget);
+        drop(baseline);
+        config.runtime.startup_memory_request = Some(StartupMemoryRequest {
+            device: DeviceMemorySnapshot {
+                capacity_bytes: capacity,
+                available_bytes: capacity,
+                source: "CPU fixture capacity".into(),
+            },
+            usable_capacity_bytes: budget,
+            context_is_explicit: false,
+            sequences_is_explicit: false,
+            batch_is_explicit: false,
+        });
+        let (runtime, executor) = create(&config);
+        let executor = executor.unwrap();
+        let report = executor.startup_memory_plan().unwrap().clone();
+        assert!(
+            report.selected.context_tokens >= fitted_context_floor as usize
+                && report.selected.context_tokens < declared_context as usize
+        );
+        assert!(report.selected.max_sequences > 1);
+        assert_eq!(executor.kv_capacity(), Some(report.selected.context_tokens));
+        let memory = executor
+            .resolved_model_plan()
+            .unwrap()
+            .execution_plan()
+            .payload()
+            .memory();
+        assert_eq!(
+            report.context_peak_bytes,
+            memory
+                .startup_peak_bytes(
+                    report.selected.context_tokens as u64,
+                    1,
+                    report
+                        .selected
+                        .max_batch_tokens
+                        .min(report.selected.context_tokens) as u64,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            report.decode_peak_bytes,
+            memory
+                .startup_workload_peak_bytes(
+                    report.selected.context_tokens as u64,
+                    1,
+                    report.selected.max_sequences as u32,
+                    report.selected.max_sequences as u64,
+                )
+                .unwrap()
+        );
+        assert!(runtime.peak_resident_bytes() > 0);
+        let engine = crate::EngineBuilder::new(config.clone())
+            .with_defined_model(Arc::clone(&defined))
+            .with_custom_executor(Arc::new(executor))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.config().runtime.startup_memory_plan.as_ref(),
+            Some(&report)
+        );
+        assert_eq!(
+            engine.context_capacity(),
+            Some(report.selected.context_tokens)
+        );
+        assert_eq!(
+            engine.config().scheduler.max_running_requests,
+            report.selected.max_sequences
+        );
+        assert_eq!(
+            engine.config().batching.max_num_batched_tokens,
+            report.selected.max_batch_tokens
+        );
+        engine.shutdown().await.unwrap();
+
+        config.runtime.max_model_len = Some(declared_context as usize);
+        let request = config.runtime.startup_memory_request.as_mut().unwrap();
+        request.context_is_explicit = true;
+        request.batch_is_explicit = true;
+        let (runtime, rejected) = create(&config);
+        let error = rejected
+            .err()
+            .expect("explicit capacity must not silently shrink");
+        assert!(error.to_string().contains("explicit"), "{error}");
+        assert_eq!(
+            runtime.peak_resident_bytes(),
+            0,
+            "capacity rejection must precede weight allocation"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn enable_checkpoint_capture(config: &mut ComponentConfig, output_dir: PathBuf) {

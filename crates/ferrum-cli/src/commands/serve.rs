@@ -8,9 +8,9 @@ use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
-    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder, FerrumError,
-    HardwareCapabilities, ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry,
-    RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
+    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumError, HardwareCapabilities,
+    ModelCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
     QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
 use std::collections::HashSet;
@@ -99,10 +99,9 @@ pub struct ServeCommand {
     #[arg(long, default_value = "4")]
     pub spec_tokens: usize,
 
-    /// Fraction of GPU memory ferrum is allowed to use (mirrors vLLM's
-    /// `--gpu-memory-utilization`). Auto-sizes the KV pool to fit
-    /// weights + scratch + KV inside `total_mem * util`. Default 0.9.
-    /// Set 1.0 for an exclusive GPU; lower if you share the card.
+    /// Fraction of currently available device memory used by native startup
+    /// planning (default: 0.9). Legacy CUDA models use this fraction of total
+    /// GPU memory for their KV pool estimate.
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
@@ -522,6 +521,9 @@ async fn execute_with_compatibility(
         return Ok(());
     }
 
+    // Keep the original user environment independent of inferred defaults.
+    let user_environment = RuntimeConfigSnapshot::capture_current();
+
     // Select the requested device before model/cache resolution. Explicit
     // backend requests must fail closed instead of doing model work and then
     // silently running on CPU.
@@ -588,9 +590,11 @@ async fn execute_with_compatibility(
     non_env_runtime_entries.extend(config_runtime_entries);
     let mut non_env_runtime_entries =
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    let mut materialized_runtime_keys =
-        crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
-    let kv_runtime_snapshot = RuntimeConfigSnapshot::capture_current();
+    let kv_runtime_snapshot = merge_runtime_config_sources(
+        non_env_runtime_entries.clone(),
+        user_environment.clone(),
+        Vec::new(),
+    );
     let effective_kv_dtype = resolve_effective_kv_dtype(
         kv_dtype.as_deref(),
         runtime_snapshot_value(&kv_runtime_snapshot, "FERRUM_KV_DTYPE"),
@@ -690,38 +694,41 @@ async fn execute_with_compatibility(
     }
 
     println!("{} {:?}", "Device:".dimmed(), device);
-    let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
-        &source.local_path,
-        &device,
-        vnext_plan_owns_context_capacity,
-        &RuntimeConfigSnapshot::capture_current(),
-        RuntimeConfigSource::Default,
+    let current_runtime = merge_runtime_config_sources(
+        non_env_runtime_entries.clone(),
+        user_environment.clone(),
+        Vec::new(),
     );
+    let serve_profile_entries = if vnext_plan_owns_context_capacity {
+        Vec::new()
+    } else {
+        crate::source_resolver::serve_profile_runtime_entries(
+            &source.local_path,
+            &device,
+            false,
+            &current_runtime,
+            RuntimeConfigSource::Default,
+        )
+    };
     if !serve_profile_entries.is_empty() {
         non_env_runtime_entries.extend(serve_profile_entries.clone());
         non_env_runtime_entries =
             RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
-            &serve_profile_entries,
-        ));
-        materialized_runtime_keys.sort();
-        materialized_runtime_keys.dedup();
     }
-    let metal_moe_entries = crate::source_resolver::metal_gguf_moe_correctness_entries(
-        &source.local_path,
-        &device,
-        &RuntimeConfigSnapshot::capture_current(),
-        RuntimeConfigSource::Default,
-    );
+    let metal_moe_entries = if vnext_plan_owns_context_capacity {
+        Vec::new()
+    } else {
+        crate::source_resolver::metal_gguf_moe_correctness_entries(
+            &source.local_path,
+            &device,
+            &current_runtime,
+            RuntimeConfigSource::Default,
+        )
+    };
     if !metal_moe_entries.is_empty() {
         non_env_runtime_entries.extend(metal_moe_entries.clone());
         non_env_runtime_entries =
             RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
-            &metal_moe_entries,
-        ));
-        materialized_runtime_keys.sort();
-        materialized_runtime_keys.dedup();
     }
 
     // Detect architecture to choose engine type. For GGUF we skip
@@ -780,24 +787,19 @@ async fn execute_with_compatibility(
                 runtime_preset_entries(preset, RuntimeConfigSource::Default)?;
             inferred_entries.extend(non_env_runtime_entries);
             non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(inferred_entries).entries;
-            materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
-                &non_env_runtime_entries,
-            ));
-            materialized_runtime_keys.sort();
-            materialized_runtime_keys.dedup();
         }
     }
 
     // Preserve the historical non-preset serve default for Qwen3-MoE, but
     // route it through the typed startup snapshot instead of a hidden
-    // process-wide env mutation. M3 explicit or model-inferred presets have
-    // already materialized the same graph-clean defaults above.
+    // process-wide env mutation. M3 explicit or model-inferred presets already
+    // carry the same graph-clean defaults in the typed snapshot.
     if selected_runtime_preset_name.is_none()
         && arch_for_dispatch == Some(ferrum_models::Architecture::Qwen3Moe)
     {
         let current_runtime = merge_runtime_config_sources(
             non_env_runtime_entries.clone(),
-            RuntimeConfigSnapshot::capture_current(),
+            user_environment.clone(),
             Vec::new(),
         );
         let mut legacy_entries = crate::runtime_env::moe_graph_default_entries(
@@ -806,11 +808,6 @@ async fn execute_with_compatibility(
         );
         legacy_entries.extend(non_env_runtime_entries);
         non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(legacy_entries).entries;
-        materialized_runtime_keys.extend(crate::runtime_env::materialize_runtime_env_defaults(
-            &non_env_runtime_entries,
-        ));
-        materialized_runtime_keys.sort();
-        materialized_runtime_keys.dedup();
     }
 
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
@@ -906,36 +903,34 @@ async fn execute_with_compatibility(
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
-    if !startup_cli_runtime_entries.is_empty() {
-        crate::runtime_env::materialize_runtime_env_effective(
-            &RuntimeConfigSnapshot::from_entries(startup_cli_runtime_entries.clone()),
+    let execution_resource_authority = if defined_model.is_some() {
+        ferrum_types::ExecutionResourceAuthority::PlanRuntime
+    } else {
+        ferrum_types::ExecutionResourceAuthority::LegacyEngine
+    };
+    let mut runtime_config = merge_runtime_config_sources(
+        non_env_runtime_entries,
+        user_environment,
+        startup_cli_runtime_entries,
+    );
+    if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
+        let entries = crate::gpu_mem_autosize::auto_size_runtime_entries(
+            &source.local_path,
+            gpu_memory_utilization,
+            crate::gpu_mem_autosize::AutoSizeProfile::Server,
+            &runtime_config,
         );
+        for entry in entries {
+            runtime_config.upsert_entry(entry);
+        }
     }
-    let autosize_env_before = RuntimeConfigSnapshot::capture_current();
-    // GPU-memory auto-sizing must run after the model source resolves.
-    // HF-cache models are not `local_dir_path`, but they still need the same
-    // KV block sizing as direct local safetensors directories.
-    crate::gpu_mem_autosize::apply_auto_size(&source.local_path, gpu_memory_utilization);
-    let autosize_runtime_entries = runtime_entries_changed_by_snapshot(
-        &autosize_env_before,
-        &RuntimeConfigSnapshot::capture_current(),
-        SERVE_AUTOSIZE_RUNTIME_KEYS,
-        RuntimeConfigSource::MemoryProfile,
-    );
-    let autosize_runtime_keys: Vec<String> = autosize_runtime_entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect();
-    startup_cli_runtime_entries.retain(|entry| !autosize_runtime_keys.contains(&entry.key));
-    materialized_runtime_keys.extend(
-        autosize_runtime_entries
-            .iter()
-            .map(|entry| entry.key.clone()),
-    );
-    non_env_runtime_entries.extend(autosize_runtime_entries);
-    non_env_runtime_entries = RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
-    materialized_runtime_keys.sort();
-    materialized_runtime_keys.dedup();
+    let startup_memory_request = crate::startup::memory_request(
+        &device,
+        execution_resource_authority,
+        gpu_memory_utilization,
+        &runtime_config,
+    )?;
+    let hardware = crate::startup::hardware_for_request(&device, startup_memory_request.as_ref());
     let typed_model_capabilities = defined_model
         .as_ref()
         .map(|defined| {
@@ -946,48 +941,17 @@ async fn execute_with_compatibility(
             )
         })
         .transpose()?;
-    let startup_auto_config = startup_auto_config(
-        &device,
+    let mut startup_auto_config = startup_auto_config(
+        hardware,
         typed_model_capabilities,
-        if defined_model.is_some() {
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime
-        } else {
-            ferrum_types::ExecutionResourceAuthority::LegacyEngine
-        },
+        execution_resource_authority,
         arch_for_dispatch,
         model_definition.as_ref(),
         model_weight_bytes_from_path(&source.local_path),
         selected_runtime_preset_name.as_deref(),
-        non_env_runtime_entries,
-        materialized_runtime_keys,
-        startup_cli_runtime_entries,
+        runtime_config,
     )?;
     crate::runtime_env::materialize_runtime_env_effective(&startup_auto_config.runtime_config);
-    write_startup_config_artifacts(
-        &startup_auto_config,
-        product_source_identity.as_ref(),
-        &product_engine_config.numerical_execution,
-        effective_config_json.as_deref(),
-        decision_trace_jsonl.as_deref(),
-    )?;
-    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
-        None
-    } else {
-        profile_jsonl.clone()
-    };
-    configure_profile_sink(
-        native_profile_jsonl,
-        ProfileSinkCliFields {
-            commit_sha: profile_commit_sha,
-            env_hash: profile_env_hash,
-            model: profile_model,
-            concurrency: profile_concurrency,
-            runtime_flags_json: profile_runtime_flags_json,
-        },
-        &startup_auto_config,
-        &model_id,
-    )?;
-
     let lora_server_models: Vec<ferrum_server::LoraAdapterModel> = startup_lora_adapters
         .iter()
         .map(|adapter| {
@@ -1024,6 +988,8 @@ async fn execute_with_compatibility(
     )
     .map_err(|error| FerrumError::config(error.to_string()))?;
 
+    let numerical_execution = product_engine_config.numerical_execution.clone();
+    let mut resolved_execution_metrics = None;
     let mut cache_allocated_status = None;
     let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
@@ -1112,6 +1078,7 @@ async fn execute_with_compatibility(
                 .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
                 .map_err(ferrum_types::FerrumError::config)?;
             engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
+            engine_config.runtime.startup_memory_request = startup_memory_request;
             engine_config.backend.backend_options.insert(
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
@@ -1145,19 +1112,47 @@ async fn execute_with_compatibility(
                     }
                     (None, None) => ferrum_engine::create_default_engine(engine_config).await?,
                 });
-            write_resolved_execution_config(
-                effective_config_json.as_deref(),
-                engine.cache_metrics_snapshot().as_ref(),
-            )?;
+            crate::startup::apply_engine_plan(&mut startup_auto_config, engine.config());
+            resolved_execution_metrics = engine.cache_metrics_snapshot();
             if product_memory_enabled {
                 cache_allocated_status = Some(engine.status().await);
             }
             AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
         }
-    }
-    .with_auto_config(startup_auto_config)
-    .with_default_enable_thinking(default_enable_thinking)
-    .with_interleaved_system_coalescing(interleaved_system_coalescing);
+    };
+    write_startup_config_artifacts(
+        &startup_auto_config,
+        product_source_identity.as_ref(),
+        &numerical_execution,
+        effective_config_json.as_deref(),
+        decision_trace_jsonl.as_deref(),
+    )?;
+    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
+        None
+    } else {
+        profile_jsonl.clone()
+    };
+    configure_profile_sink(
+        native_profile_jsonl,
+        ProfileSinkCliFields {
+            commit_sha: profile_commit_sha,
+            env_hash: profile_env_hash,
+            model: profile_model,
+            concurrency: profile_concurrency,
+            runtime_flags_json: profile_runtime_flags_json,
+        },
+        &startup_auto_config,
+        &model_id,
+    )?;
+
+    write_resolved_execution_config(
+        effective_config_json.as_deref(),
+        resolved_execution_metrics.as_ref(),
+    )?;
+    let server = server
+        .with_auto_config(startup_auto_config)
+        .with_default_enable_thinking(default_enable_thinking)
+        .with_interleaved_system_coalescing(interleaved_system_coalescing);
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -1430,22 +1425,15 @@ fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraS
 }
 
 fn startup_auto_config(
-    device: &ferrum_types::Device,
+    hardware: HardwareCapabilities,
     typed_model_capabilities: Option<ModelCapabilities>,
     execution_resource_authority: ferrum_types::ExecutionResourceAuthority,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
     model_weight_bytes: Option<u64>,
     runtime_preset: Option<&str>,
-    non_env_runtime_entries: Vec<RuntimeConfigEntry>,
-    materialized_runtime_keys: Vec<String>,
-    cli_runtime_entries: Vec<RuntimeConfigEntry>,
+    runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
-    let mut env_snapshot = RuntimeConfigSnapshot::capture_current();
-    env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_runtime_keys);
-    let runtime_config =
-        merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
-    let hardware = hardware_capabilities_for_device(device);
     let model = typed_model_capabilities
         .or_else(|| {
             model_definition.map(|definition| {
@@ -1473,13 +1461,13 @@ fn startup_auto_config(
         },
     };
 
-    FerrumConfigBuilder::new(runtime_config)
-        .with_model_capabilities(model)
-        .with_hardware_capabilities(hardware)
-        .with_workload_profile(workload)
-        .with_execution_resource_authority(execution_resource_authority)
-        .resolve()
-        .map_err(|err| ferrum_types::FerrumError::config(format!("invalid auto config: {err}")))
+    crate::startup::resolve_config(
+        runtime_config,
+        model,
+        hardware,
+        workload,
+        execution_resource_authority,
+    )
 }
 
 pub(crate) fn merge_runtime_config_sources(
@@ -1495,44 +1483,6 @@ pub(crate) fn merge_runtime_config_sources(
         runtime_config.upsert_entry(entry);
     }
     runtime_config
-}
-
-fn remove_materialized_config_env_entries(
-    mut env_snapshot: RuntimeConfigSnapshot,
-    materialized_config_runtime_keys: &[String],
-) -> RuntimeConfigSnapshot {
-    env_snapshot
-        .entries
-        .retain(|entry| !materialized_config_runtime_keys.contains(&entry.key));
-    env_snapshot
-}
-
-pub(crate) const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
-    "FERRUM_MAX_BATCHED_TOKENS",
-    "FERRUM_KV_MAX_BLOCKS",
-    "FERRUM_PAGED_MAX_SEQS",
-    "FERRUM_KV_CAPACITY",
-];
-
-pub(crate) fn runtime_entries_changed_by_snapshot(
-    before: &RuntimeConfigSnapshot,
-    after: &RuntimeConfigSnapshot,
-    keys: &[&str],
-    source: RuntimeConfigSource,
-) -> Vec<RuntimeConfigEntry> {
-    keys.iter()
-        .filter_map(|key| {
-            let before_value = runtime_snapshot_value(before, key);
-            let after_value = runtime_snapshot_value(after, key);
-            match (before_value, after_value) {
-                (None, Some(value)) => Some(RuntimeConfigEntry::new(*key, value, source)),
-                (Some(before), Some(after)) if before != after => {
-                    Some(RuntimeConfigEntry::new(*key, after, source))
-                }
-                _ => None,
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn runtime_preset_entries(
@@ -2936,93 +2886,6 @@ mod tests {
     }
 
     #[test]
-    fn autosize_snapshot_diff_marks_new_and_changed_values_as_memory_profile() {
-        let before = RuntimeConfigSnapshot::from_entries([
-            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "512", RuntimeConfigSource::Cli),
-        ]);
-        let after = RuntimeConfigSnapshot::from_entries([
-            RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "256", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new(
-                "FERRUM_MAX_BATCHED_TOKENS",
-                "2048",
-                RuntimeConfigSource::Env,
-            ),
-            RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "32", RuntimeConfigSource::Env),
-        ]);
-
-        let entries = runtime_entries_changed_by_snapshot(
-            &before,
-            &after,
-            SERVE_AUTOSIZE_RUNTIME_KEYS,
-            RuntimeConfigSource::MemoryProfile,
-        );
-        let snapshot = RuntimeConfigSnapshot::from_entries(entries);
-        let entry = |key: &str| {
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-
-        assert_eq!(snapshot.entries.len(), 3);
-        assert_eq!(
-            entry("FERRUM_MAX_BATCHED_TOKENS").source,
-            RuntimeConfigSource::MemoryProfile
-        );
-        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "32");
-        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "256");
-        assert_eq!(
-            entry("FERRUM_KV_CAPACITY").source,
-            RuntimeConfigSource::MemoryProfile
-        );
-        assert!(snapshot
-            .entries
-            .iter()
-            .all(|entry| entry.key != "FERRUM_KV_MAX_BLOCKS"));
-    }
-
-    #[test]
-    fn materialized_autosize_entries_keep_memory_profile_source() {
-        let autosize_entries = vec![RuntimeConfigEntry::new(
-            "FERRUM_MAX_BATCHED_TOKENS",
-            "2048",
-            RuntimeConfigSource::MemoryProfile,
-        )];
-        let materialized_keys = autosize_entries
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<Vec<_>>();
-        let env_snapshot = RuntimeConfigSnapshot::from_entries([
-            RuntimeConfigEntry::new(
-                "FERRUM_MAX_BATCHED_TOKENS",
-                "2048",
-                RuntimeConfigSource::Env,
-            ),
-            RuntimeConfigEntry::new("FERRUM_KV_DTYPE", "fp16", RuntimeConfigSource::Env),
-        ]);
-        let env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_keys);
-        let snapshot = merge_runtime_config_sources(autosize_entries, env_snapshot, Vec::new());
-        let entry = |key: &str| {
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-
-        assert_eq!(
-            entry("FERRUM_MAX_BATCHED_TOKENS").source,
-            RuntimeConfigSource::MemoryProfile
-        );
-        assert_eq!(entry("FERRUM_KV_DTYPE").source, RuntimeConfigSource::Env);
-    }
-
-    #[test]
     fn nvidia_smi_gpu_query_parser_extracts_cuda_hardware_fields() {
         let probe = parse_nvidia_smi_gpu_query("NVIDIA GeForce RTX 4090, 8.9, 24564\n").unwrap();
 
@@ -3369,39 +3232,6 @@ mod tests {
     }
 
     #[test]
-    fn materialized_inferred_m3_entries_keep_default_source() {
-        let inferred_entries =
-            runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Default)
-                .unwrap();
-        let materialized_keys = inferred_entries
-            .iter()
-            .map(|entry| entry.key.clone())
-            .collect::<Vec<_>>();
-        let env_snapshot = RuntimeConfigSnapshot::from_entries([
-            RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
-            RuntimeConfigEntry::new("FERRUM_VLLM_MOE", "1", RuntimeConfigSource::Env),
-        ]);
-        let env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_keys);
-        let snapshot = merge_runtime_config_sources(inferred_entries, env_snapshot, Vec::new());
-        let entry = |key: &str| {
-            snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.key == key)
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-
-        assert_eq!(
-            entry("FERRUM_MOE_GRAPH").source,
-            RuntimeConfigSource::Default
-        );
-        assert_eq!(
-            entry("FERRUM_VLLM_MOE").source,
-            RuntimeConfigSource::Default
-        );
-    }
-
-    #[test]
     fn runtime_config_fields_override_preset_defaults_before_env() {
         let preset_entries =
             runtime_preset_entries(M3_QWEN3_30B_A3B_INT4_PRESET, RuntimeConfigSource::Cli).unwrap();
@@ -3457,33 +3287,6 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Env);
-    }
-
-    #[test]
-    fn materialized_config_env_entries_keep_config_file_source() {
-        let config_entries = crate::config::RuntimeCliConfig {
-            prefix_cache: Some(true),
-            ..Default::default()
-        }
-        .runtime_config_entries();
-        let env_snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
-            "FERRUM_PREFIX_CACHE",
-            "1",
-            RuntimeConfigSource::Env,
-        )]);
-        let env_snapshot = remove_materialized_config_env_entries(
-            env_snapshot,
-            &[String::from("FERRUM_PREFIX_CACHE")],
-        );
-
-        let snapshot = merge_runtime_config_sources(config_entries, env_snapshot, Vec::new());
-        let prefix_cache = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.key == "FERRUM_PREFIX_CACHE")
-            .unwrap();
-        assert_eq!(prefix_cache.effective_value, "1");
-        assert_eq!(prefix_cache.source, RuntimeConfigSource::ConfigFile);
     }
 
     #[test]

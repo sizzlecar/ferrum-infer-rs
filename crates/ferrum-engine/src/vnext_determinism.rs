@@ -70,7 +70,9 @@ pub fn create_cuda_vnext_determinism_collector(
         weight_materializers,
         catalog,
         ferrum_kernels::backend::cuda::vnext_ops::cuda_weight_materializer_selection,
-        |info, runtime| VNextExecutorConfig::for_determinism_collection(engine, info, runtime),
+        |engine, info, runtime| {
+            VNextExecutorConfig::for_determinism_collection(engine, info, runtime)
+        },
     )?;
     Ok(CudaVNextDeterminismCollector::new(executor))
 }

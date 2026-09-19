@@ -24,7 +24,7 @@ mod memory;
 use command::CommandKind;
 pub use command::CpuDeviceCommand;
 pub(crate) use command::CpuKernelLaunch;
-pub(crate) use host_memory::host_memory_capacity;
+pub(crate) use host_memory::{host_memory_available, host_memory_capacity};
 pub(crate) use memory::CpuBufferRegion;
 pub use memory::CpuDeviceBuffer;
 pub(crate) use memory::CpuRegionSet;

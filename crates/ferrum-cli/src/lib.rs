@@ -21,6 +21,7 @@ pub mod observability_product;
 pub mod observability_vertical_slice;
 pub mod runtime_env;
 pub mod source_resolver;
+mod startup;
 pub mod terminal;
 pub mod utils;
 
