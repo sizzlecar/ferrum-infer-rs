@@ -3,7 +3,10 @@ import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
-const DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
+const DEMO_VIDEO_URL = "https://github.com/user-attachments/assets/1f41ab63-48f7-4ff3-b72a-fbbf9d6b33aa";
+const DEMO_POSTER_URL = "https://github.com/user-attachments/assets/5deb7b83-fd96-4495-9f81-b162c4699af8";
+const DEMO_NOTES_URL = "https://github.com/sizzlecar/ferrum-infer-rs/pull/388#issuecomment-5741680379";
+const HISTORICAL_DEMO_ASSETS = "https://ferrum-downloads.pandaailabs.com/v0.3.1";
 
 const css = String.raw`
 :root {
@@ -141,13 +144,14 @@ const pages = {
     bonsaiApi: "Start a local API",
     bonsaiInstall: "Install or update Ferrum",
     bonsaiScope: 'Apple Silicon · Metal · PQ2_0 text inference. Tested on M1 Max / 32 GB. <a href="https://github.com/sizzlecar/ferrum-infer-rs#bonsai-2-pq2_0-on-metal">Model details and tested limits</a>.',
-    demoTitle: "One model, three working agents",
-    demoLead: "This Qwen3.5-9B demo shows three Orchestral terminals inspecting code, making changes, and running tests concurrently. Ferrum serves the model in the upper left.",
-    demoCaption: "Three concurrent coding sessions, with all repairs independently tested. M1 Max · Qwen3.5-9B Q4_K_M. Authentic terminal replay · 8× speed.",
+    demoTitle: "Bonsai 2, working on local code",
+    demoLead: "Orchestral reads and edits Rust code through Ferrum's local API. Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB.",
+    demoCaption: "The first edit failed to compile; one repair using compiler feedback passed both independent tests. 8× replay, including all waits; weights already cached.",
     demoDetails: "Recording details",
     demoCommands: "Try it locally",
     demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs#see-it-in-action",
     demoDownload: "Download the terminal demo",
+    demoHistorical: "Earlier demo: Qwen3.5-9B with three concurrent agents",
     featureTitle: "The direct path from model to API",
     featureLead: "Ferrum keeps the first experience small: inspect the install, name a model explicitly, run a prompt, or expose the same model over HTTP.",
     cards: [
@@ -218,13 +222,14 @@ const pages = {
     bonsaiApi: "启动本地 API",
     bonsaiInstall: "安装或更新 Ferrum",
     bonsaiScope: 'Apple Silicon · Metal · PQ2_0 文本推理。已在 M1 Max / 32 GB 上验证。<a href="https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#在-metal-上运行-bonsai-2-pq2_0">模型详情与已验证范围</a>。',
-    demoTitle: "一个模型，三个 Agent 同时工作",
-    demoLead: "这段 Qwen3.5-9B 演示展示三个 Orchestral 终端同时读取代码、修改实现并运行测试。左上角是提供模型服务的 Ferrum。",
-    demoCaption: "三个编码会话同时工作，全部修复通过独立测试。M1 Max · Qwen3.5-9B Q4_K_M。真实终端录制，8 倍速回放。",
+    demoTitle: "让 Bonsai 2 修改本地代码",
+    demoLead: "Orchestral 通过 Ferrum 的本地 API 读取、修改 Rust 代码。Bonsai 2 27B PQ2_0 · Metal · M1 Max / 32 GB。",
+    demoCaption: "首次修改未能编译；根据编译器反馈修复一次后，两项独立测试均通过。8 倍速回放，保留全部等待；权重已缓存。",
     demoDetails: "录制说明",
     demoCommands: "快速试用",
     demoCommandsUrl: "https://github.com/sizzlecar/ferrum-infer-rs/blob/main/README_zh.md#看它如何工作",
     demoDownload: "下载终端演示视频",
+    demoHistorical: "历史演示：Qwen3.5-9B 与三个并发 Agent",
     featureTitle: "从模型直接到 API",
     featureLead: "Ferrum 让首次体验保持简单：检查安装、明确指定模型、运行一次对话，或者把同一模型开放为 HTTP 服务。",
     cards: [
@@ -357,12 +362,13 @@ function render(page) {
     <section id="demo"><div class="wrap">
       <div class="section-head"><h2>${page.demoTitle}</h2><p>${page.demoLead}</p></div>
       <figure class="demo-recording">
-        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_ASSETS}/ferrum-orch-three-agents.png">
-          <source src="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4" type="video/mp4">
-          <a href="${DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoDownload}</a>
+        <video controls playsinline preload="metadata" aria-describedby="demo-caption" poster="${DEMO_POSTER_URL}">
+          <source src="${DEMO_VIDEO_URL}" type="video/mp4">
+          <a href="${DEMO_VIDEO_URL}">${page.demoDownload}</a>
         </video>
-        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></figcaption>
+        <figcaption id="demo-caption">${page.demoCaption} <a href="${page.demoCommandsUrl}">${page.demoCommands} ↗</a> · <a href="${DEMO_NOTES_URL}">${page.demoDetails} ↗</a></figcaption>
       </figure>
+      <p class="muted"><a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-three-agents.mp4">${page.demoHistorical}</a> · <a href="${HISTORICAL_DEMO_ASSETS}/ferrum-orch-demo-notes.md">${page.demoDetails} ↗</a></p>
     </div></section>
     <section id="quick-start"><div class="wrap">
       <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
@@ -437,7 +443,7 @@ function response(body, contentType, status = 200) {
     headers: {
       "content-type": `${contentType}; charset=utf-8`,
       "cache-control": contentType === "text/html" ? "public, max-age=60, s-maxage=60" : "public, max-age=300, s-maxage=3600",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com; media-src https://ferrum-downloads.pandaailabs.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; style-src 'unsafe-inline'; img-src 'self' data: https://ferrum-downloads.pandaailabs.com https://github.com https://github-production-user-asset-6210df.s3.amazonaws.com; media-src https://github.com https://github-production-user-asset-6210df.s3.amazonaws.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none';",
       "referrer-policy": "strict-origin-when-cross-origin",
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",
