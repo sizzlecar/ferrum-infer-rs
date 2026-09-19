@@ -22,10 +22,68 @@ Python runtime.
 | Connect an app or coding agent | [Start the API server](#serve-an-api) · [API compatibility](docs/openai-api-compatibility.md) |
 | Run Bonsai 2 27B PQ2_0 on Apple Silicon | [Metal setup and tested limits](#bonsai-2-pq2_0-on-metal) |
 
+## Bonsai 2 PQ2_0 on Metal
+
+On Apple Silicon, start a chat with **Bonsai 2 27B**:
+
+```sh
+ferrum run bonsai2:27b
+```
+
+Or start a local API for your apps:
+
+```sh
+ferrum serve --model bonsai2:27b
+```
+
+The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
+matching metadata; later starts reuse the cache. No manual file preparation is
+needed. Ferrum adapts context, batching, and concurrency to available memory;
+your explicit settings take precedence. The API listens at
+`http://127.0.0.1:8000/v1`.
+
+Tested on **M1 Max / 32 GB** with Metal text inference. Requires Ferrum
+**0.12.1 or later**. [Install or update Ferrum](#quick-start).
+
+<details>
+<summary><strong>Model sources and tested scope</strong></summary>
+
+The shortcut selects the model files; resource configuration follows Ferrum's
+normal defaults and automatic capacity handling. Planning uses the selected
+device's available memory and the compiled weights, sequence states and
+operation workspaces. It does not impose a
+Bonsai-specific context length, batch size, concurrency, or memory budget.
+Explicit configuration and CLI options take precedence. Model reasoning
+behavior is preserved; append `--disable-thinking` if you want it off.
+
+Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
+weights packed and applies the Hadamard transforms declared by the model.
+Metal text inference has been validated through `run` and `serve` with FP16 KV,
+including Orchestral tool execution, session continuation, and prefix-state reuse.
+Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
+not been validated on this machine. The effective context cannot exceed the
+model's declaration and may be reduced to fit the machine. Concurrent requests
+share runtime capacity; the concurrency ceiling does not reserve a full context
+for every request.
+
+The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
+and the matching `config.json`,
+`generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, and
+`chat_template.jinja` from [this pinned source-model revision](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
+
+CUDA PQ2_0/Hadamard operators and small mixed-state checkpoint tests have passed
+on a real GPU; **the complete 27B CUDA model remains unvalidated**. This Bonsai
+path does not support PTQ1_0, earlier Bonsai Q1_0/Q2_0 encodings, MLX packages,
+vision, or complete CPU inference. Bonsai combined with INT8 KV is not yet
+validated. The model's declared context limit does not establish tested coverage
+beyond the context above.
+
+</details>
+
 ## See it in action
 
-One local model. Three Orchestral terminals inspecting code, fixing bugs, and
-running tests concurrently.
+Qwen3.5-9B on an M1 Max / 32 GB. Three Orchestral terminals inspecting code,
+fixing bugs, and running tests concurrently.
 
 [![Watch the Ferrum + Orchestral demo](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.png)](https://ferrum-downloads.pandaailabs.com/v0.3.1/ferrum-orch-three-agents.mp4)
 
@@ -196,9 +254,8 @@ ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 ```
 
 The first run downloads about **2.55 GiB**. Download time depends on your route
-to Hugging Face; the CLI displays download progress. On a 6 GB GPU, append
-`--max-model-len 2048 --max-num-seqs 1` to either `run` or `serve` to limit the
-context and active sequences.
+to Hugging Face; the CLI displays download progress. Ferrum adapts context,
+batching, and concurrency to available memory at startup.
 
 ### Serve an API
 
@@ -283,61 +340,6 @@ recomputes the input when prefix caching is disabled or no compatible checkpoint
 is available. With `--enable-prefix-cache`, a compatible hit restores model state
 and processes the remaining suffix. Session caching stores chat messages; it is
 separate from GPU prefix-state reuse.
-
-### Bonsai 2 PQ2_0 on Metal
-
-On Apple Silicon, start a chat with **Bonsai 2 27B**:
-
-```sh
-ferrum run bonsai2:27b
-```
-
-Or start a local API for your apps:
-
-```sh
-ferrum serve --model bonsai2:27b
-```
-
-The first start downloads the approximately **7.2 GB PQ2_0 weights** and their
-matching metadata; later starts reuse the cache. No manual file preparation is
-needed. The API listens at `http://127.0.0.1:8000/v1`.
-
-Requires Ferrum **0.12.1 or later**. [Install or update Ferrum](#quick-start).
-
-<details>
-<summary><strong>Model sources and tested scope</strong></summary>
-
-The shortcut selects the model files; resource configuration follows Ferrum's
-normal defaults and automatic capacity handling. Planning uses the selected
-device's available memory and the compiled weights, sequence states and
-operation workspaces. It does not impose a
-Bonsai-specific context length, batch size, concurrency, or memory budget.
-Explicit configuration and CLI options take precedence. Model reasoning
-behavior is preserved; append `--disable-thinking` if you want it off.
-
-Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
-weights packed and applies the Hadamard transforms declared by the model.
-Metal text inference has been validated through `run` and `serve` with FP16 KV,
-including Orchestral tool execution, session continuation, and prefix-state reuse.
-Testing on an M1 Max / 32 GB includes an 8K-context request. Larger contexts have
-not been validated on this machine. The effective context cannot exceed the
-model's declaration and may be reduced to fit the machine. Concurrent requests
-share runtime capacity; the concurrency ceiling does not reserve a full context
-for every request.
-
-The alias downloads the [official PQ2_0 file](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/tree/6ed5e12bf84b7a63069882c91dd9e9218647d17b)
-and the matching `config.json`,
-`generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, and
-`chat_template.jinja` from [this pinned source-model revision](https://huggingface.co/Qwen/Qwen3.8-27B/tree/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0).
-
-CUDA PQ2_0/Hadamard operators and small mixed-state checkpoint tests have passed
-on a real GPU; **the complete 27B CUDA model remains unvalidated**. This Bonsai
-path does not support PTQ1_0, earlier Bonsai Q1_0/Q2_0 encodings, MLX packages,
-vision, or complete CPU inference. Bonsai combined with INT8 KV is not yet
-validated. The model's declared context limit does not establish tested coverage
-beyond the context above.
-
-</details>
 
 ## Features
 
