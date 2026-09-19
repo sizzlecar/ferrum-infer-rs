@@ -305,10 +305,11 @@ Requires Ferrum **0.12.1 or later**. For 0.12.0, use the manual setup below.
 <details>
 <summary><strong>Defaults, tested limits, and manual setup</strong></summary>
 
-On Metal, the shortcut defaults to 8K context, one active request, a 128-token
-batch budget, and a 10 GiB runtime budget. Explicit configuration and CLI options
-take precedence. Model reasoning behavior is preserved; append
-`--disable-thinking` if you want it off.
+The shortcut selects the model files; resource configuration follows Ferrum's
+normal defaults and automatic capacity handling. It does not impose a
+Bonsai-specific context length, batch size, concurrency, or memory budget.
+Explicit configuration and CLI options take precedence. Model reasoning
+behavior is preserved; append `--disable-thinking` if you want it off.
 
 Ferrum keeps official **Ternary Bonsai 2 27B GGUF PQ2_0**
 weights packed and applies the Hadamard transforms declared by the model.

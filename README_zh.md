@@ -280,9 +280,9 @@ ferrum serve --model bonsai2:27b
 <details>
 <summary><strong>默认配置、实测范围与手动配置</strong></summary>
 
-Metal 默认使用 8K 上下文、1 个活跃请求、128-token 批处理预算和 10 GiB
-运行预算。显式配置及 CLI 参数优先。保留模型原本的思考行为；需要关闭时，
-追加 `--disable-thinking`。
+快捷入口只选择模型文件，资源配置沿用 Ferrum 的通用默认值和自动容量管理，
+不会为 Bonsai 单独固定上下文、批处理、并发或内存预算。显式配置及 CLI
+参数优先。保留模型原本的思考行为；需要关闭时，追加 `--disable-thinking`。
 
 Ferrum 直接使用官方 **Ternary Bonsai 2 27B GGUF PQ2_0** 压缩权重，
 并按模型声明执行 Hadamard 变换。已验证 Metal 文本 `run`、`serve` 和 FP16 KV，

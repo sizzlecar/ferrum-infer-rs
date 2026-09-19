@@ -1070,11 +1070,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
     let early_effective_runtime_config =
         run_effective_runtime_config(&early_runtime_config, &startup_cli_runtime_entries);
-    let model_startup_defaults = crate::model_startup::ModelStartupDefaults::resolve(
-        model,
-        &device,
-        &early_effective_runtime_config,
-    );
     let run_product_bridge = run_product_runtime_bridge(&early_effective_runtime_config);
     let materialized_run_product_keys =
         crate::runtime_env::materialize_runtime_env_effective(&run_product_bridge);
@@ -1209,9 +1204,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         &runtime_config,
         &mut engine_config.backend.backend_options,
     )?;
-    let mut effective_runtime_config =
+    let effective_runtime_config =
         run_effective_runtime_config(&runtime_config, &startup_cli_runtime_entries);
-    model_startup_defaults.apply(&mut effective_runtime_config);
     let typed_model_capabilities = defined_model
         .as_ref()
         .map(|defined| {
@@ -3573,48 +3567,6 @@ mod tests {
         assert_eq!(doc["workload_profile"]["target_concurrency"], 1);
         assert_eq!(doc["admission"]["effective_max_concurrent"], 1);
         assert!(doc["decisions"].is_array());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn run_bonsai_recipe_resolves_bounded_startup_after_legacy_autosizing() {
-        let requested = run_effective_runtime_config(
-            &run_base_runtime_config(&CliConfig::default(), RuntimeConfigSnapshot::default()),
-            &run_startup_cli_runtime_entries(&test_run_cmd(), None),
-        );
-        let device = ferrum_types::Device::Metal;
-        let defaults =
-            crate::model_startup::ModelStartupDefaults::resolve("bonsai2:27b", &device, &requested);
-        let mut effective = requested;
-        // The legacy autosizer bridges this automatic value through the env.
-        effective.upsert(
-            "FERRUM_MAX_BATCHED_TOKENS",
-            "2048",
-            RuntimeConfigSource::Env,
-        );
-        defaults.apply(&mut effective);
-        let resolved = run_startup_auto_config(
-            &device,
-            None,
-            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
-            None,
-            None,
-            effective,
-        )
-        .unwrap();
-        let mut engine = ferrum_types::EngineConfig::default();
-        engine
-            .apply_runtime_config_snapshot(&resolved.runtime_config)
-            .unwrap();
-
-        assert_eq!(engine.runtime.max_model_len, Some(8192));
-        assert_eq!(engine.scheduler.max_running_requests, 1);
-        assert_eq!(engine.batching.max_num_batched_tokens, 128);
-        assert_eq!(
-            engine.memory.usable_capacity_bytes,
-            Some(10 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(engine.kv_cache.dtype, ferrum_types::KvCacheDtype::Fp16);
     }
 
     #[test]

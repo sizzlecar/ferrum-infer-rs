@@ -17,7 +17,6 @@ pub mod gpu_devices;
 pub mod gpu_mem_autosize;
 pub mod layer_split_pipeline;
 pub mod memory_profile;
-mod model_startup;
 pub mod observability_product;
 pub mod observability_vertical_slice;
 pub mod runtime_env;

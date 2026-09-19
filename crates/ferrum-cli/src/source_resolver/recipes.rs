@@ -5,17 +5,11 @@
 
 use super::ProductSourceArgs;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartupProfile {
-    Bonsai2Metal,
-}
-
 #[derive(Debug)]
 pub(crate) struct ModelRecipe {
     pub requested_model: &'static str,
     pub gguf_file: &'static str,
     pub semantic_source: &'static str,
-    pub startup_profile: StartupProfile,
 }
 
 impl ModelRecipe {
@@ -40,7 +34,6 @@ static BONSAI2_27B: ModelRecipe = ModelRecipe {
     requested_model: "prism-ml/Ternary-Bonsai-2-27B-gguf@6ed5e12bf84b7a63069882c91dd9e9218647d17b",
     gguf_file: "Ternary-Bonsai-2-27B-PQ2_0.gguf",
     semantic_source: "Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-    startup_profile: StartupProfile::Bonsai2Metal,
 };
 
 pub(crate) fn find(name: &str) -> Option<&'static ModelRecipe> {
