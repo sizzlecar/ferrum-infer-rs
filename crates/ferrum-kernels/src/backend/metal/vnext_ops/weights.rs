@@ -3,8 +3,6 @@
 //! Providers consume this representation instead of guessing a physical ABI
 //! from a model name, source file, component ordering, or byte length.
 
-use std::collections::BTreeMap;
-
 use ferrum_interfaces::vnext::{
     AxisWeightComponent, BlockQuantizationSpec, CompositeWeightPart, ElementType,
     HadamardApplication, HadamardSigns, OperationInvocation, PhysicalWeightLayout,
@@ -173,28 +171,25 @@ pub(crate) fn resolve_weight(
     let weight = binding
         .weight()
         .ok_or_else(|| "Metal weight binding lacks its typed physical layout".to_owned())?;
-    let stored_by_id = binding
-        .storage()
-        .components()
-        .iter()
-        .map(|component| {
-            component
-                .component_id()
-                .map(|id| (id, component))
-                .ok_or_else(|| "Metal weight component lacks its physical identity".to_owned())
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let stored_components = binding.storage().components();
+    if stored_components.len() != weight.components().len() {
+        return Err("Metal weight component identities are duplicated or incomplete".to_owned());
+    }
 
     let mut components = Vec::with_capacity(weight.components().len());
     let mut regions = Vec::with_capacity(weight.components().len());
-    let mut index_by_id = BTreeMap::new();
-    for component in weight.components() {
-        let stored = stored_by_id.get(component.component_id()).ok_or_else(|| {
-            format!(
+    // Both contracts require canonical component IDs and reject duplicates. Check
+    // their correspondence without rebuilding an index for every invocation.
+    for (component, stored) in weight.components().iter().zip(stored_components) {
+        let stored_id = stored
+            .component_id()
+            .ok_or_else(|| "Metal weight component lacks its physical identity".to_owned())?;
+        if stored_id != component.component_id() {
+            return Err(format!(
                 "Metal weight component `{}` has no resolved storage",
                 component.component_id()
-            )
-        })?;
+            ));
+        }
         if stored.element_type() != component.physical_element_type()
             || stored.length_bytes()
                 != component
@@ -244,17 +239,10 @@ pub(crate) fn resolve_weight(
                 component.component_id()
             ));
         }
-        let index = regions.len();
-        index_by_id.insert(component.component_id().clone(), index);
         components.push(component_metadata(component));
         regions.push(region);
     }
-    if index_by_id.len() != weight.components().len()
-        || stored_by_id.len() != weight.components().len()
-    {
-        return Err("Metal weight component identities are duplicated or incomplete".to_owned());
-    }
-    let layout = resolve_layout(weight, &index_by_id)?;
+    let layout = resolve_layout(weight)?;
     Ok(MetalResolvedWeight {
         logical_dimensions: binding.tensor().dimensions().to_vec(),
         logical_element_type: binding.tensor().element_type(),
@@ -271,22 +259,23 @@ fn component_metadata(component: &ResolvedWeightComponentLayout) -> MetalResolve
     }
 }
 
-fn resolve_layout(
-    weight: &ResolvedWeightBinding,
-    index_by_id: &BTreeMap<WeightId, usize>,
-) -> Result<MetalResolvedWeightLayout, String> {
-    resolve_layout_node(weight.physical_layout(), weight, index_by_id)
+fn resolve_layout(weight: &ResolvedWeightBinding) -> Result<MetalResolvedWeightLayout, String> {
+    resolve_layout_node(weight.physical_layout(), weight)
 }
 
 fn resolve_layout_node(
     layout: &PhysicalWeightLayout,
     weight: &ResolvedWeightBinding,
-    index_by_id: &BTreeMap<WeightId, usize>,
 ) -> Result<MetalResolvedWeightLayout, String> {
     let component_index = |component_id: &WeightId| {
-        index_by_id.get(component_id).copied().ok_or_else(|| {
-            format!("Metal physical layout references absent component `{component_id}`")
-        })
+        // ResolvedWeightBinding validates strict ID order; retained regions
+        // follow this same component order.
+        weight
+            .components()
+            .binary_search_by(|component| component.component_id().cmp(component_id))
+            .map_err(|_| {
+                format!("Metal physical layout references absent component `{component_id}`")
+            })
     };
     let axis_component = |component: &AxisWeightComponent| -> Result<_, String> {
         Ok(MetalResolvedAxisComponent {
@@ -306,7 +295,7 @@ fn resolve_layout_node(
                 .iter()
                 .map(|part: &CompositeWeightPart| {
                     Ok(MetalResolvedCompositePart {
-                        layout: resolve_layout_node(&part.layout, weight, index_by_id)?,
+                        layout: resolve_layout_node(&part.layout, weight)?,
                         logical_offsets: part.logical_offsets.clone(),
                         extents: part.extents.clone(),
                     })
@@ -392,7 +381,7 @@ fn resolve_layout_node(
                 }
             };
             Ok(MetalResolvedWeightLayout::Hadamard {
-                values: Box::new(resolve_layout_node(values, weight, index_by_id)?),
+                values: Box::new(resolve_layout_node(values, weight)?),
                 transform: HadamardTransform {
                     block_size: transform.block_size.get(),
                     signs_region,
@@ -409,7 +398,7 @@ fn resolve_layout_node(
             reshape,
             stored_axis_order,
         } => Ok(MetalResolvedWeightLayout::AxisReshapePermutation {
-            values: Box::new(resolve_layout_node(values, weight, index_by_id)?),
+            values: Box::new(resolve_layout_node(values, weight)?),
             axis: *axis,
             logical_offset: *logical_offset,
             extent: *extent,
@@ -422,7 +411,7 @@ fn resolve_layout_node(
             source_axis_extent,
         } => Ok(MetalResolvedWeightLayout::Indexed {
             indices: axis_component(indices)?,
-            values: Box::new(resolve_layout_node(values, weight, index_by_id)?),
+            values: Box::new(resolve_layout_node(values, weight)?),
             source_axis_extent: *source_axis_extent,
         }),
         PhysicalWeightLayout::ExpertStack {
@@ -431,7 +420,7 @@ fn resolve_layout_node(
         } => Ok(MetalResolvedWeightLayout::ExpertStack {
             experts: experts
                 .iter()
-                .map(|expert| resolve_layout_node(expert, weight, index_by_id))
+                .map(|expert| resolve_layout_node(expert, weight))
                 .collect::<Result<Vec<_>, _>>()?,
             expert_axis: *expert_axis,
         }),
@@ -444,8 +433,8 @@ mod tests {
 
     use super::*;
     use ferrum_interfaces::vnext::{
-        BlockQuantizationSpec, CompositeWeightPart, ContractVersion, ModelFamilyId,
-        PhysicalStorageLayout, PhysicalWeightComponentBinding, QuantizationFormatId,
+        BlockQuantizationSpec, CompositeWeightPart, ContractVersion, HadamardTransformSpec,
+        ModelFamilyId, PhysicalStorageLayout, PhysicalWeightComponentBinding, QuantizationFormatId,
         QuantizationGrouping, QuantizationPacking, QuantizationSpec, WeightComponentRole,
         WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
     };
@@ -519,14 +508,7 @@ mod tests {
         let weight = ResolvedWeightBinding::from_schema(&schema, &id("weight.gate_up")).unwrap();
         assert_eq!(weight.components()[0].component_id(), &up);
         assert_eq!(weight.components()[1].component_id(), &gate);
-        let indexes = weight
-            .components()
-            .iter()
-            .enumerate()
-            .map(|(index, component)| (component.component_id().clone(), index))
-            .collect();
-        let MetalResolvedWeightLayout::Composite { parts } =
-            resolve_layout(&weight, &indexes).unwrap()
+        let MetalResolvedWeightLayout::Composite { parts } = resolve_layout(&weight).unwrap()
         else {
             panic!("expected composite layout");
         };
@@ -546,6 +528,80 @@ mod tests {
         assert_eq!(parts[1].logical_offsets, [1, 0, 0]);
         assert_eq!(weight.components()[first].component_id(), &gate);
         assert_eq!(weight.components()[second].component_id(), &up);
+    }
+
+    #[test]
+    fn hadamard_layout_keeps_signs_distinct_from_block_values_in_either_id_order() {
+        for (values_name, signs_name) in [
+            ("component.a_values", "component.z_signs"),
+            ("component.z_values", "component.a_signs"),
+        ] {
+            let values = id(values_name);
+            let signs = id(signs_name);
+            let mut blocks = block_component(values_name);
+            blocks.dimensions = vec![4, 1];
+            let schema = WeightSchema {
+                format_id: WeightFormatId::new("weight-format.gguf.native-block").unwrap(),
+                layout_id: WeightLayoutId::new("weight-layout.test.hadamard").unwrap(),
+                version: ContractVersion::new(1, 0),
+                components: vec![
+                    blocks,
+                    WeightComponentSpec {
+                        id: signs.clone(),
+                        role: WeightComponentRole::TransformSigns,
+                        external_names: vec!["signs".to_owned()],
+                        dimensions: vec![256],
+                        encoding: WeightEncoding::Dense {
+                            element_type: ElementType::F32,
+                        },
+                        required: true,
+                    },
+                ],
+                tensors: vec![WeightTensorSpec {
+                    id: id("weight.projection"),
+                    dimensions: vec![4, 256],
+                    logical_element_type: ElementType::F16,
+                    physical_layout: PhysicalWeightLayout::Hadamard {
+                        values: Box::new(PhysicalWeightLayout::BlockQuantized {
+                            blocks: PhysicalWeightComponentBinding::exact_contiguous(
+                                values.clone(),
+                            ),
+                            block_axis: 1,
+                            block_padding: PhysicalWeightPadding::Exact,
+                        }),
+                        transform: HadamardTransformSpec {
+                            block_size: NonZeroU32::new(128).unwrap(),
+                            signs: HadamardSigns::Explicit(
+                                PhysicalWeightComponentBinding::exact_contiguous(signs.clone()),
+                            ),
+                            application: HadamardApplication::BeforeMatmul {
+                                input_permutation: None,
+                            },
+                        },
+                    },
+                    required: true,
+                }],
+            };
+            schema
+                .validate(&ModelFamilyId::new("family.test").unwrap())
+                .unwrap();
+            let weight =
+                ResolvedWeightBinding::from_schema(&schema, &id("weight.projection")).unwrap();
+            let MetalResolvedWeightLayout::Hadamard {
+                values: layout,
+                transform,
+            } = resolve_layout(&weight).unwrap()
+            else {
+                panic!("expected Hadamard layout");
+            };
+            let MetalResolvedWeightLayout::BlockQuantized { component, .. } = *layout else {
+                panic!("expected block values");
+            };
+            let signs_region = transform.signs_region.expect("explicit transform signs");
+            assert_ne!(component, signs_region);
+            assert_eq!(weight.components()[component].component_id(), &values);
+            assert_eq!(weight.components()[signs_region].component_id(), &signs);
+        }
     }
 
     #[test]
@@ -604,15 +660,8 @@ mod tests {
             .validate(&ModelFamilyId::new("family.test").unwrap())
             .unwrap();
         let weight = ResolvedWeightBinding::from_schema(&schema, &id("weight.projection")).unwrap();
-        let indexes = weight
-            .components()
-            .iter()
-            .enumerate()
-            .map(|(index, component)| (component.component_id().clone(), index))
-            .collect();
-
         assert_eq!(
-            resolve_layout(&weight, &indexes).unwrap_err(),
+            resolve_layout(&weight).unwrap_err(),
             "Metal does not support quantized block-grid physical weight layouts"
         );
     }
