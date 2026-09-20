@@ -216,8 +216,15 @@ ferrum serve --model unsloth/Qwen3.5-9B-GGUF --kv-dtype int8 --disable-thinking
 此选项减少注意力 KV 的存储占用，包含量化所需的 scale；模型权重和固定大小的循环状态
 保持原有大小。通过 `/health` 的 `kv_storage` 可确认实际生效格式。
 整个模型的 checkpoint 恢复需要所有模型状态均支持恢复。关闭 prefix cache 或没有兼容的
-checkpoint 时，重新发送历史会重新计算输入；使用 `--enable-prefix-cache` 并命中后，
-可恢复模型状态并计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
+checkpoint 时，重新发送历史会重新计算输入；命中兼容缓存后，可恢复模型状态并
+计算剩余后缀。Session cache 保存聊天消息，与 GPU 前缀状态复用是两回事。
+
+`ferrum serve` 默认请求启用 plan runtime 的前缀状态缓存。是否实际启用由编译后的
+模型执行计划及 checkpoint 能力决定；不支持时正常执行完整输入计算。缓存状态与
+推理共享运行时内存预算，并在容量压力下回收。显式 CLI、环境变量、配置文件及
+预设配置优先；`ferrum run` 保持原有默认行为。
+可以通过 `--disable-prefix-cache`、`[runtime] prefix_cache = false` 或
+`FERRUM_PREFIX_CACHE=0` 关闭。使用 `/health` 查看实际启用状态与缓存命中情况。
 
 ## 功能
 
