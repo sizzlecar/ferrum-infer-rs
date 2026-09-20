@@ -67,9 +67,11 @@ fn hadamard_pq2_projection_keeps_f32_transform_through_dot_and_plain_siblings_on
     for (dtype, rows, columns) in [
         (ElementType::F16, 1, 7),
         (ElementType::F16, 3, 17),
+        (ElementType::F16, 3, 16),
         (ElementType::F16, 33, 1025),
         (ElementType::F32, 2, 7),
         (ElementType::F32, 1, 17),
+        (ElementType::F32, 1, 16),
     ] {
         let signs = (0..WIDTH)
             .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 })

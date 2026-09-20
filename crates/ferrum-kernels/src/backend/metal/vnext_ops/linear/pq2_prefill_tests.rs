@@ -648,7 +648,10 @@ fn pq2_mixed_prefill_production_dispatch_and_m32_fallback_preserve_output() {
             pipelines.hadamard_native_dispatch(GgufBlockFormat::Pq2_0, ElementType::F32, params);
         if rows < 32 {
             assert_eq!(dispatch, LinearDispatchKind::Pq2CooperativeGemv);
-            assert!(std::ptr::eq(pipeline, &pipelines.native.pq2_linear_f32));
+            assert!(std::ptr::eq(
+                pipeline,
+                pipelines.native.pq2_linear_f32_complete.as_ref().unwrap()
+            ));
         } else {
             assert_eq!(dispatch, LinearDispatchKind::CooperativeGemv);
             assert!(std::ptr::eq(

@@ -26,7 +26,7 @@ use crate::gguf_blocks::GgufBlockFormat;
 
 use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
 use super::native_blocks::{
-    bind_native_block, dispatch_m64_grid, pq2_full_tiles_supported,
+    bind_native_block, dispatch_m64_grid, pq2_complete_outputs_supported, pq2_full_tiles_supported,
     pq2_full_tiles_vector_input_supported, MetalNativeBlockPipelines,
 };
 
@@ -355,6 +355,17 @@ impl MetalLinearPipelines {
             return self.mixed_input_tiled_pipeline(format, params);
         }
         if format == GgufBlockFormat::Pq2_0 && params.rows < NATIVE_TILED_GEMM_MIN_ROWS {
+            if pq2_complete_outputs_supported(params.rows, params.in_features, params.out_features)
+            {
+                let complete = match activation_type {
+                    ElementType::F32 => self.native.pq2_linear_f32_complete.as_ref(),
+                    ElementType::F16 => self.native.pq2_linear_f32_f16_complete.as_ref(),
+                    _ => None,
+                };
+                if let Some(pipeline) = complete {
+                    return (pipeline, LinearDispatchKind::Pq2CooperativeGemv);
+                }
+            }
             return (
                 if activation_type == ElementType::F32 {
                     &self.native.pq2_linear_f32
