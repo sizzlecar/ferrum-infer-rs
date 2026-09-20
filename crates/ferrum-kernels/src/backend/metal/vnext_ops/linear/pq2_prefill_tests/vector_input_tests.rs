@@ -4,7 +4,7 @@ use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
 use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 
-fn region<T: Copy>(
+pub(super) fn region<T: Copy>(
     runtime: &MetalDeviceRuntime,
     name: &str,
     values: &[T],
@@ -37,7 +37,7 @@ fn region<T: Copy>(
     region
 }
 
-fn read<T: Copy>(region: &MetalBufferRegion) -> Vec<T> {
+pub(super) fn read<T: Copy>(region: &MetalBufferRegion) -> Vec<T> {
     // SAFETY: callers read matching element types after command completion.
     unsafe {
         std::slice::from_raw_parts(
@@ -127,6 +127,7 @@ fn pq2_vector_input_production_dispatch_uses_actual_region_and_workspace_binding
                 permutation: None,
             }),
             transform_workspace: None,
+            transformed_plan: TransformedLinearPlan::Single,
         };
         launch
             .bind_hadamard_workspace(&pipelines, &regions, 0, WORKSPACE_OFFSET)

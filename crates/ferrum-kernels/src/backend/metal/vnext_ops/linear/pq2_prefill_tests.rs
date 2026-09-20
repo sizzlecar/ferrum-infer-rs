@@ -6,6 +6,7 @@ use metal::{Buffer, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions}
 
 mod prism_benchmark;
 mod prism_reference;
+mod split_tail_tests;
 mod vector_input_tests;
 mod weight_thread_tests;
 
@@ -305,14 +306,15 @@ impl Fixture {
         assert_eq!(actual.len(), self.initial_output.len());
         let stride = self.params.output_stride as usize;
         let columns = self.params.out_features as usize;
+        let column_offset = self.params.output_column_offset as usize;
         for (index, value) in actual.iter().enumerate() {
             let location = index
                 .checked_sub(OUTPUT_PREFIX)
                 .filter(|index| *index < self.params.rows as usize * stride)
                 .and_then(|index| {
-                    (2..columns + 2)
+                    (column_offset..columns + column_offset)
                         .contains(&(index % stride))
-                        .then(|| (index / stride, index % stride - 2))
+                        .then(|| (index / stride, index % stride - column_offset))
                 });
             let Some((row, column)) = location else {
                 assert_eq!(*value, f16::from_f32(GUARD), "output guard at {index}");

@@ -54,6 +54,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/small_batch.rs"),
     include_str!("linear/small_batch.metal"),
     include_str!("linear/staged_prefill.rs"),
+    include_str!("linear/transformed_prefill.rs"),
     include_str!("hadamard.rs"),
     include_str!("hadamard.metal"),
     include_str!("../q4_k_gemv_v2.metal"),
@@ -88,6 +89,8 @@ const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
 mod small_batch;
 pub(super) mod staged_prefill;
+mod transformed_prefill;
+use transformed_prefill::TransformedLinearPlan;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_DENSE_NARROW_KERNEL: &str = "vnext_linear_dense_narrow_f16_256";
@@ -429,18 +432,34 @@ impl MetalLinearPipelines {
         input: &MetalBufferRegion,
         input_offset_bytes: u64,
     ) -> (&ComputePipelineState, LinearDispatchKind) {
-        let fallback = self.hadamard_native_dispatch(format, activation_type, params);
         // Shape alone cannot authorize vector loads: the transform workspace
         // may be a slice with its own base and an inner suballocation offset.
         // Retain the existing full-M64 cohort and all scalar fallbacks.
-        if format == GgufBlockFormat::Pq2_0
-            && activation_type == ElementType::F16
-            && fallback.1 == LinearDispatchKind::NativeTiledGemmM64
-            && self
-                .native
-                .pq2_gemm_input_f32_output_f16_m64_full_tiles
-                .is_some()
-            && pq2_full_tiles_vector_input_supported(
+        if format == GgufBlockFormat::Pq2_0 && activation_type == ElementType::F16 {
+            if let Some(pipeline) =
+                self.pq2_vector_input_prefill_pipeline(params, input, input_offset_bytes)
+            {
+                return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
+            }
+        }
+        self.hadamard_native_dispatch(format, activation_type, params)
+    }
+
+    fn pq2_vector_input_prefill_pipeline(
+        &self,
+        params: LinearParams,
+        input: &MetalBufferRegion,
+        input_offset_bytes: u64,
+    ) -> Option<&ComputePipelineState> {
+        if !pq2_mixed_prefill_m64_supported(
+            GgufBlockFormat::Pq2_0,
+            params,
+            self.native.pq2_gemm_input_f32_output_f16_m64.is_some(),
+        ) || self
+            .native
+            .pq2_gemm_input_f32_output_f16_m64_full_tiles
+            .is_none()
+            || !pq2_full_tiles_vector_input_supported(
                 params.rows,
                 params.in_features,
                 params.out_features,
@@ -449,14 +468,11 @@ impl MetalLinearPipelines {
                 input.length_bytes(),
             )
         {
-            if let Some(pipeline) = &self
-                .native
-                .pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input
-            {
-                return (pipeline, LinearDispatchKind::NativeTiledGemmM64);
-            }
+            return None;
         }
-        fallback
+        self.native
+            .pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input
+            .as_ref()
     }
 
     fn f32_linear_pipeline(&self, format: LinearPhysicalFormat) -> Option<&ComputePipelineState> {
@@ -975,11 +991,14 @@ pub(super) struct LinearLaunch {
     params: LinearParams,
     transform: Option<HadamardTransform>,
     transform_workspace: Option<(usize, u64)>,
+    // Prepared with the retained workspace; encoding and physical accounting
+    // consume this same decision without reselecting the partition.
+    transformed_plan: TransformedLinearPlan,
 }
 
 impl LinearLaunch {
     pub(super) fn dispatch_count(self) -> u64 {
-        1 + u64::from(self.transform.is_some())
+        self.transformed_plan.projection_dispatch_count() + u64::from(self.transform.is_some())
     }
 
     pub(super) fn bind_hadamard_workspace(
@@ -989,6 +1008,7 @@ impl LinearLaunch {
         workspace_region: usize,
         workspace_offset: u64,
     ) -> Result<(), String> {
+        self.transformed_plan = TransformedLinearPlan::Single;
         let Some(transform) = self.transform else {
             return Ok(());
         };
@@ -1040,6 +1060,7 @@ impl LinearLaunch {
             }
         }
         self.transform_workspace = Some((workspace_region, workspace_offset));
+        self.transformed_plan = TransformedLinearPlan::for_launch(pipelines, regions, *self);
         Ok(())
     }
 }
@@ -1809,6 +1830,7 @@ fn linear_launch_typed(
         format: part.format,
         transform: part.transform,
         transform_workspace: None,
+        transformed_plan: TransformedLinearPlan::Single,
         params: LinearParams {
             rows: checked_u32(rows, "Metal linear row count")?,
             in_features: checked_u32(in_features, "Metal linear input width")?,
@@ -1973,6 +1995,22 @@ pub(super) fn dispatch_linear(
 // The caller has already produced this launch's Hadamard result. Its input
 // remains F32 while activation_type still declares the original output ABI.
 fn dispatch_transformed_linear(
+    pipelines: &MetalLinearPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    launch: LinearLaunch,
+) {
+    if let Some([head, tail]) = launch.transformed_plan.parts(launch) {
+        // Binding validated this plan against these immutable pipelines and
+        // retained regions. Both projections read the same completed transform.
+        dispatch_single_transformed_linear(pipelines, encoder, regions, head);
+        transformed_prefill::dispatch_tail(pipelines, encoder, regions, tail);
+    } else {
+        dispatch_single_transformed_linear(pipelines, encoder, regions, launch);
+    }
+}
+
+fn dispatch_single_transformed_linear(
     pipelines: &MetalLinearPipelines,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],

@@ -1675,7 +1675,9 @@ fn encode_attention(
             attention.dispatch_plan(&launch.params).kind == AttentionDispatchKind::GroupedDecode
         })
         .count() as u64;
-    let transform_dispatches = if let Some(packed) = &packed {
+    // The base count includes one dispatch per projection. Bound linear plans
+    // can add a Hadamard transform and a split-prefill projection tail.
+    let extra_projection_dispatches = if let Some(packed) = &packed {
         [
             packed.query_projection,
             packed.key_projection,
@@ -1703,7 +1705,7 @@ fn encode_attention(
     };
     let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
         .saturating_add(grouped_decode_reductions)
-        .saturating_add(transform_dispatches);
+        .saturating_add(extra_projection_dispatches);
     let operation_label = if kv_type == ElementType::I8 {
         if hidden_type == ElementType::F32 {
             "vnext_causal_paged_attention_f32_master_int8_kv"

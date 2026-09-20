@@ -28,7 +28,7 @@ fn adjacent_hadamard_reuse_preserves_complete_swiglu_and_fallbacks_on_metal() {
     let queue = runtime.device().new_command_queue();
     const WIDTH: usize = 256;
     const OUTPUTS: usize = 7;
-    for (rows, intermediate) in [(3_usize, 17_usize), (33, 1025)] {
+    for (rows, intermediate) in [(3_usize, 17_usize), (33, 1025), (129, 4096)] {
         let guard = f16::from_f32(-123.0);
         let mut input = vec![guard; 8];
         input.extend(
@@ -104,6 +104,7 @@ fn adjacent_hadamard_reuse_preserves_complete_swiglu_and_fallbacks_on_metal() {
         .unwrap();
         gate.bind_hadamard_workspace(&pipelines, &regions, 5, transform_offset)
             .unwrap();
+        assert_eq!(gate.dispatch_count(), if rows == 129 { 3 } else { 2 });
         let mut up = gate;
         up.weight_region = 2;
         up.params.output_column_offset = intermediate as u32;
