@@ -590,6 +590,7 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/regression_plan/native_artifacts.rs"
             | "examples/regression_plan/native_artifacts/topology.rs"
             | "examples/regression_plan/native_artifacts/publication.rs"
+            | "examples/regression_plan/native_artifacts/windows_build.rs"
             | "examples/regression_plan/readme.rs"
             | "examples/regression_plan/readme_tests.rs"
             | "examples/release_candidate.rs"
@@ -597,6 +598,7 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/release_delivery.rs"
             | "tests/release_staging_workflows.rs"
             | "tests/release_staging_workflows/installer.rs"
+            | "tests/release_staging_workflows/windows_build.rs"
     ) || relative.starts_with("src/release_regression/")
         || relative.starts_with("src/release_candidate/")
         || relative.starts_with("examples/release_candidate/")
@@ -1129,11 +1131,13 @@ mod tests {
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/topology.rs",
             "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/publication.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/native_artifacts/windows_build.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme.rs",
             "crates/ferrum-bench-core/examples/regression_plan/readme_tests.rs",
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
             "crates/ferrum-bench-core/src/stats.rs",
             "crates/ferrum-bench-core/tests/release_staging_workflows/installer.rs",
+            "crates/ferrum-bench-core/tests/release_staging_workflows/windows_build.rs",
         ] {
             let impact = analyze_paths([path]);
             assert_eq!(impact.areas, [ChangeArea::Validation], "{path}");
