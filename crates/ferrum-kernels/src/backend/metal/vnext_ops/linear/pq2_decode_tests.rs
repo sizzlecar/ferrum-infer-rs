@@ -3,7 +3,7 @@ use super::pq2_tests::Fixture;
 use super::*;
 
 mod complete_outputs;
-mod four_outputs;
+mod output_tiles;
 
 struct ReferencePipelines {
     f16: ComputePipelineState,

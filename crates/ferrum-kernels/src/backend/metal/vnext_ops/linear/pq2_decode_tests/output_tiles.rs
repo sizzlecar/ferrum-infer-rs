@@ -7,20 +7,51 @@ struct OutputPipelines {
     guarded: ComputePipelineState,
 }
 
-struct FourOutputPipelines {
+struct TilePipelines {
     f16: OutputPipelines,
     f32: OutputPipelines,
 }
 
-impl FourOutputPipelines {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputTile {
+    Four,
+    Sixteen,
+}
+
+impl OutputTile {
+    const fn outputs_per_simd(self) -> u32 {
+        match self {
+            Self::Four => 4,
+            Self::Sixteen => 16,
+        }
+    }
+
+    const fn outputs_per_group(self) -> u32 {
+        2 * self.outputs_per_simd()
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Four => "four",
+            Self::Sixteen => "sixteen",
+        }
+    }
+}
+
+struct CandidatePipelines {
+    four: TilePipelines,
+    sixteen: TilePipelines,
+}
+
+impl CandidatePipelines {
     fn new(device: &Device) -> Self {
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
-            .new_library_with_source(include_str!("four_outputs.metal"), &options)
+            .new_library_with_source(include_str!("output_tiles.metal"), &options)
             .unwrap();
-        let pipeline = |suffix| {
-            let name = format!("pq2_four_outputs_{suffix}");
+        let pipeline = |tile: OutputTile, suffix| {
+            let name = format!("pq2_output_tile_{}_{suffix}", tile.name());
             let pipeline = device
                 .new_compute_pipeline_state_with_function(
                     &library.get_function(&name, None).unwrap(),
@@ -30,27 +61,40 @@ impl FourOutputPipelines {
             assert!(pipeline.max_total_threads_per_threadgroup() >= 64);
             pipeline
         };
-        Self {
+        let tile_pipelines = |tile| TilePipelines {
             f16: OutputPipelines {
-                complete: pipeline("f16_complete"),
-                guarded: pipeline("f16_guarded"),
+                complete: pipeline(tile, "f16_complete"),
+                guarded: pipeline(tile, "f16_guarded"),
             },
             f32: OutputPipelines {
-                complete: pipeline("f32_complete"),
-                guarded: pipeline("f32_guarded"),
+                complete: pipeline(tile, "f32_complete"),
+                guarded: pipeline(tile, "f32_guarded"),
             },
+        };
+        Self {
+            four: tile_pipelines(OutputTile::Four),
+            sixteen: tile_pipelines(OutputTile::Sixteen),
         }
     }
 
-    fn get(&self, output: ElementType, params: LinearParams) -> &ComputePipelineState {
+    fn get(
+        &self,
+        tile: OutputTile,
+        output: ElementType,
+        params: LinearParams,
+    ) -> &ComputePipelineState {
         assert!(params.rows > 0 && params.out_features > 0);
         assert!(params.in_features > 0 && params.in_features.is_multiple_of(128));
+        let tile_pipelines = match tile {
+            OutputTile::Four => &self.four,
+            OutputTile::Sixteen => &self.sixteen,
+        };
         let pipelines = match output {
-            ElementType::F16 => &self.f16,
-            ElementType::F32 => &self.f32,
+            ElementType::F16 => &tile_pipelines.f16,
+            ElementType::F32 => &tile_pipelines.f32,
             _ => unreachable!(),
         };
-        if params.out_features.is_multiple_of(8) {
+        if params.out_features.is_multiple_of(tile.outputs_per_group()) {
             &pipelines.complete
         } else {
             &pipelines.guarded
@@ -61,21 +105,21 @@ impl FourOutputPipelines {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Variant {
     ProductionEight,
-    CandidateFour,
+    Candidate(OutputTile),
 }
 
 impl Variant {
     const fn outputs_per_group(self) -> u64 {
         match self {
             Self::ProductionEight => 16,
-            Self::CandidateFour => 8,
+            Self::Candidate(tile) => tile.outputs_per_group() as u64,
         }
     }
 }
 
 fn run(
     production: &MetalLinearPipelines,
-    candidate: &FourOutputPipelines,
+    candidate: &CandidatePipelines,
     fixture: &Fixture,
     output: ElementType,
     variant: Variant,
@@ -93,7 +137,7 @@ fn run(
             assert_eq!(dispatch, LinearDispatchKind::Pq2CooperativeGemv);
             pipeline
         }
-        Variant::CandidateFour => candidate.get(output, fixture.params()),
+        Variant::Candidate(tile) => candidate.get(tile, output, fixture.params()),
     };
     fixture.poison_output();
     fixture.run_pipeline_with_dispatch(pipeline, queue, repetitions, |encoder, params| {
@@ -110,11 +154,31 @@ fn run(
 
 fn check(
     production: &MetalLinearPipelines,
-    candidate: &FourOutputPipelines,
+    candidate: &CandidatePipelines,
     fixture: &Fixture,
     output: ElementType,
     queue: &CommandQueueRef,
     cpu: bool,
+) -> Vec<f32> {
+    check_tiles(
+        production,
+        candidate,
+        fixture,
+        output,
+        queue,
+        cpu,
+        &[OutputTile::Four, OutputTile::Sixteen],
+    )
+}
+
+fn check_tiles(
+    production: &MetalLinearPipelines,
+    candidate: &CandidatePipelines,
+    fixture: &Fixture,
+    output: ElementType,
+    queue: &CommandQueueRef,
+    cpu: bool,
+    tiles: &[OutputTile],
 ) -> Vec<f32> {
     run(
         production,
@@ -127,32 +191,34 @@ fn check(
     );
     let expected = fixture.read();
     assert!(expected.iter().all(|value| value.is_finite()));
-    run(
-        production,
-        candidate,
-        fixture,
-        output,
-        Variant::CandidateFour,
-        queue,
-        1,
-    );
-    assert_same_bits(&fixture.read(), &expected);
     if cpu {
         fixture.assert_cpu();
     }
-    fixture.assert_inputs_unchanged();
+    for &tile in tiles {
+        run(
+            production,
+            candidate,
+            fixture,
+            output,
+            Variant::Candidate(tile),
+            queue,
+            1,
+        );
+        assert_same_bits(&fixture.read(), &expected);
+        fixture.assert_inputs_unchanged();
+    }
     expected
 }
 
 #[test]
-fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
-    let device = Device::system_default().expect("PQ2 four-output conformance requires Metal");
+fn pq2_output_tile_decode_preserves_tails_offsets_and_f32_ranges() {
+    let device = Device::system_default().expect("PQ2 output-tile conformance requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = FourOutputPipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device);
     let queue = device.new_command_queue();
     for output in [ElementType::F16, ElementType::F32] {
-        // Exercise both sides of the four-output SIMD and eight-output group
-        // boundaries, including shapes complete only for the candidate. Fixture
+        // Exercise both sides of the 4/8/16-output SIMD and 8/16/32-output group
+        // boundaries, including shapes complete only for smaller tiles. Fixture
         // bindings start at input byte16 / weight byte18 / output byte16 and
         // retain a nonzero output column offset, stride padding, and canaries.
         for outputs in [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33] {
@@ -165,7 +231,7 @@ fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
         }
         // All packed byte values and half scales, without rounding F32 inputs.
         for scale in [0x3555, 0xb955, 0x0001, 0, 0x8000, 0x7bff, 0xfbff] {
-            let mut fixture = Fixture::new(&device, 1, 1024, 24, output, true);
+            let mut fixture = Fixture::new(&device, 1, 1024, 32, output, true);
             let divisor = if scale & 0x7fff == 0x7bff {
                 65536.0
             } else {
@@ -176,7 +242,7 @@ fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
                 (0..1024)
                     .map(|i| (i as f32 * 0.0171).sin() / divisor)
                     .collect(),
-                weights(1024, 24, scale, |i| i as u8),
+                weights(1024, 32, scale, |i| i as u8),
             );
             check(&production, &candidate, &fixture, output, &queue, true);
         }
@@ -203,13 +269,13 @@ fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
         }
     }
     for magnitude in [131008.0, 2.0_f32.powi(125)] {
-        let mut fixture = Fixture::new(&device, 1, 384, 24, ElementType::F32, true);
+        let mut fixture = Fixture::new(&device, 1, 384, 32, ElementType::F32, true);
         fixture.replace_payload(
             &device,
             (0..384)
                 .map(|i| if i % 2 == 0 { magnitude } else { -magnitude })
                 .collect(),
-            weights(384, 24, 0x0001, |i| if i % 2 == 0 { 0xff } else { 0xe4 }),
+            weights(384, 32, 0x0001, |i| if i % 2 == 0 { 0xff } else { 0xe4 }),
         );
         check(
             &production,
@@ -235,7 +301,7 @@ fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
         &queue,
         false,
     );
-    let mut cancellation = Fixture::new(&device, 1, 640, 24, ElementType::F32, true);
+    let mut cancellation = Fixture::new(&device, 1, 640, 32, ElementType::F32, true);
     let mut input = vec![0.0; 640];
     input[..16].fill(2.0_f32.powi(108));
     input[512..528].fill(2.0_f32.powi(108));
@@ -244,7 +310,7 @@ fn pq2_four_output_decode_preserves_tails_offsets_and_f32_ranges() {
         input,
         weights(
             640,
-            24,
+            32,
             0x7800,
             |byte| {
                 if (byte / 32) % 5 == 4 {
@@ -295,10 +361,10 @@ fn projection_fixture(
 }
 
 #[test]
-fn pq2_four_output_decode_matches_f64_on_projection_shapes() {
+fn pq2_output_tile_decode_matches_f64_on_projection_shapes() {
     let device = Device::system_default().expect("PQ2 projection conformance requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = FourOutputPipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device);
     let queue = device.new_command_queue();
     for (_, width, outputs) in PROJECTION_SAMPLES {
         for output in [ElementType::F16, ElementType::F32] {
@@ -310,14 +376,16 @@ fn pq2_four_output_decode_matches_f64_on_projection_shapes() {
 
 #[test]
 #[ignore = "isolated Metal paired GPU timing; exclude compiler and other GPU work"]
-fn pq2_four_output_decode_isolated_gpu_timing() {
+fn pq2_sixteen_output_decode_isolated_gpu_timing() {
     const DISPATCHES: usize = 64;
     const WARMUPS: usize = 2;
     const PAIRS: usize = 5;
     let device = Device::system_default().expect("PQ2 output tiling timing requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = FourOutputPipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device);
     let queue = device.new_command_queue();
+    let timed_tile = OutputTile::Sixteen;
+    let timed_variant = Variant::Candidate(timed_tile);
     for rows in [1, 4] {
         for (shape, width, outputs) in PROJECTION_SAMPLES {
             for output in [ElementType::F16, ElementType::F32] {
@@ -325,7 +393,17 @@ fn pq2_four_output_decode_isolated_gpu_timing() {
                 // Full F64 projection checks live in the non-ignored test. This
                 // independently runnable timing test checks every output bit,
                 // canary and immutable input against production before and after.
-                let expected = check(&production, &candidate, &fixture, output, &queue, false);
+                // Four-output correctness remains covered above; do not dispatch
+                // or time it again in the final sixteen-versus-eight experiment.
+                let expected = check_tiles(
+                    &production,
+                    &candidate,
+                    &fixture,
+                    output,
+                    &queue,
+                    false,
+                    &[timed_tile],
+                );
                 let run = |variant| {
                     run(
                         &production,
@@ -340,14 +418,14 @@ fn pq2_four_output_decode_isolated_gpu_timing() {
                 };
                 for _ in 0..WARMUPS {
                     run(Variant::ProductionEight);
-                    run(Variant::CandidateFour);
+                    run(timed_variant);
                 }
                 let mut samples = Vec::new();
                 for pair in 0..PAIRS {
                     let order = if pair % 2 == 0 {
-                        [Variant::ProductionEight, Variant::CandidateFour]
+                        [Variant::ProductionEight, timed_variant]
                     } else {
-                        [Variant::CandidateFour, Variant::ProductionEight]
+                        [timed_variant, Variant::ProductionEight]
                     };
                     let mut production_us = 0.0;
                     let mut candidate_us = 0.0;
@@ -357,7 +435,7 @@ fn pq2_four_output_decode_isolated_gpu_timing() {
                         assert_same_bits(&fixture.read(), &expected);
                         match variant {
                             Variant::ProductionEight => production_us = us,
-                            Variant::CandidateFour => candidate_us = us,
+                            Variant::Candidate(_) => candidate_us = us,
                         }
                     }
                     samples.push(serde_json::json!({
@@ -370,15 +448,18 @@ fn pq2_four_output_decode_isolated_gpu_timing() {
                 }
                 fixture.assert_inputs_unchanged();
                 eprintln!(
-                    "PQ2_FOUR_OUTPUT_GPU {}",
+                    "PQ2_OUTPUT_TILE_GPU {}",
                     serde_json::json!({
                         "schema_version": 1, "device": device.name(),
-                        "kind": "pq2_four_output_decode_paired_gpu_microbench",
+                        "kind": "pq2_output_tile_decode_paired_gpu_microbench",
                         "rows": rows, "shape": shape, "in_features": width,
                         "out_features": outputs, "output_dtype": format!("{output:?}"),
                         "input_dtype": "f32", "operand_dtype": "f32",
                         "accumulator_dtype": "f32", "weight_format": "quantization.gguf.pq2-0",
-                        "production_outputs_per_simd": 8, "candidate_outputs_per_simd": 4,
+                        "production_outputs_per_simd": 8,
+                        "candidate_outputs_per_simd": timed_tile.outputs_per_simd(),
+                        "production_outputs_per_group": Variant::ProductionEight.outputs_per_group(),
+                        "candidate_outputs_per_group": timed_variant.outputs_per_group(),
                         "threads_per_group": 64, "output_stride": fixture.params().output_stride,
                         "output_column_offset": fixture.params().output_column_offset,
                         "input_offset_bytes": 16, "weight_offset_bytes": 18,
