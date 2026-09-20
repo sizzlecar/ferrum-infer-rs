@@ -1,28 +1,28 @@
 //! Dynamic pool-set orchestration over backing owned by `dynamic_pool`.
 
 use super::{
-    align_up_resource, backing_segment_range, bind_lane_stable_slot_projections,
-    compile_program_binding_layouts, compile_submission_wave_domain_layout,
-    compile_submission_wave_reusable_capacity_layouts, contiguous_packing_growth_bytes,
-    free_extent_layout_fingerprint, invalid_resource, lane_stable_layout_key,
-    rollback_free_extent_journal, validate_runtime_descriptor_for_admission,
-    AllocatedDynamicGrowth, AllocationLifetime, AllocationSeal, Arc, AtomicU64, BTreeMap,
-    BackingChunkIdentity, BackingClaimCertificate, BackingPrepareDecision, BackingSegment,
-    BufferRequest, CapacityAvailabilityEpoch, CapacityDomainId, CapacityEntry, CapacityEpochs,
-    CapacityUnits, CapacityVector, DeviceAllocationPermit, DeviceBufferRetention,
-    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityReservation,
-    DeviceRuntime, Digest, DynamicBackingBlocker, DynamicBackingClaimOccupancy,
-    DynamicBackingClaimResidency, DynamicBackingClaimScope, DynamicBackingDeferralReason,
-    DynamicBackingDeferred, DynamicBackingPackingEnvelope, DynamicBackingPool,
-    DynamicBackingPoolId, DynamicBackingPoolState, DynamicChunkQuarantineReason,
-    DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec, DynamicPoolGrowthIntent,
-    DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus,
-    DynamicPoolMaintenanceBoundaryChunk, DynamicPoolMaintenanceBoundaryPool,
-    DynamicPoolMaintenanceBoundaryReceipt, DynamicPoolRebalanceReceipt, DynamicResourceShape,
-    DynamicStorageView, EvaluatedBackingRequest, ExecutionLane, FreeExtentIndex,
-    IdleChunkReclaimCandidate, InvocationLivenessMode, LaneBackingPrepareDecision,
-    LaneStableArenaEntry, LaneStableArenaEvictionCandidate, LaneStableArenaLane,
-    LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
+    align_up_resource, backing_segment_range, backing_segment_range_matches,
+    bind_lane_stable_slot_projections, compile_program_binding_layouts,
+    compile_submission_wave_domain_layout, compile_submission_wave_reusable_capacity_layouts,
+    contiguous_packing_growth_bytes, free_extent_layout_fingerprint, invalid_resource,
+    lane_stable_layout_key, rollback_free_extent_journal,
+    validate_runtime_descriptor_for_admission, AllocatedDynamicGrowth, AllocationLifetime,
+    AllocationSeal, Arc, AtomicU64, BTreeMap, BackingChunkIdentity, BackingClaimCertificate,
+    BackingPrepareDecision, BackingSegment, BufferRequest, CapacityAvailabilityEpoch,
+    CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
+    DeviceAllocationPermit, DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot,
+    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
+    DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
+    DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
+    DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
+    DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec,
+    DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim,
+    DynamicPoolLiveOccupancyStatus, DynamicPoolMaintenanceBoundaryChunk,
+    DynamicPoolMaintenanceBoundaryPool, DynamicPoolMaintenanceBoundaryReceipt,
+    DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest,
+    ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode,
+    LaneBackingPrepareDecision, LaneStableArenaEntry, LaneStableArenaEvictionCandidate,
+    LaneStableArenaLane, LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
     LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
     LogicalBackingSegmentBinding, LogicalBackingSliceAllocationEvidence,
     LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard,
@@ -572,7 +572,8 @@ where
             logical_capacity_epoch: logical.capacity_epoch(),
             plan_device_capacity_epoch: capacity_availability.plan_epoch(),
             process_device_capacity_epoch: capacity_availability.process_epoch(),
-            pressure: pressure.clone(),
+            pressure: pressure.clone().into(),
+            reclaim_attempted: true,
             planned_domains,
             protected_immediate: protected_immediate.clone(),
             protected_packing_envelopes,
@@ -2561,12 +2562,12 @@ where
                 "logical backing authority belongs to another dynamic pool instance",
             ));
         }
-        let expected_projection = backing_segment_range(
+        if !backing_segment_range_matches(
             &authority.segment_lease.segments,
             authority.evidence.physical_offset_bytes,
             authority.evidence.capacity_size_bytes,
-        )?;
-        if expected_projection != authority.evidence.segments {
+            &authority.evidence.segments,
+        )? {
             return Err(invalid_resource(
                 "logical backing projection differs from its shared physical extent",
             ));

@@ -729,6 +729,10 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
+    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

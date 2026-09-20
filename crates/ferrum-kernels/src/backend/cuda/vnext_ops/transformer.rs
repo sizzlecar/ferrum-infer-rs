@@ -315,6 +315,7 @@ impl CudaDenseLinearProvider {
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
                 include_str!("transformer/native_linear.rs").as_bytes(),
+                include_str!("transformer/native_matrix.rs").as_bytes(),
                 include_str!("native_blocks.rs").as_bytes(),
                 include_str!("native_blocks/hadamard.rs").as_bytes(),
                 include_str!("native_blocks/weights.rs").as_bytes(),
@@ -611,6 +612,7 @@ impl CudaDenseSwiGluProvider {
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("transformer.rs").as_bytes(),
             include_str!("transformer/native_swiglu.rs").as_bytes(),
+            include_str!("transformer/native_matrix.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
             include_str!("native_blocks/hadamard.rs").as_bytes(),
             include_str!("native_blocks/weights.rs").as_bytes(),

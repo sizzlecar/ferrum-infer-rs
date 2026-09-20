@@ -22,7 +22,7 @@ use super::{
     DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
     HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
     NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResourceId,
-    StreamState, VNextError,
+    ReusableExecutionCatalogLifetime, StreamState, VNextError,
 };
 
 mod readback_collection;
@@ -376,9 +376,12 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             // A sealed resident catalog owns lane-stable backing that the
             // immutable plan already budgets as reusable workspace. Releasing
             // it to reclaim one idle slot invalidates the entire catalog; keep
-            // that inventory resident until the lane is torn down.
+            // that inventory resident until the lane is torn down. A bounded
+            // on-demand cache can instead recapture real work after trimming;
+            // advancing its epoch below invalidates stale program snapshots.
             if preparation.state() == DeviceReusableExecutionPreparationState::Ready
                 && preparation.resident_executables() != 0
+                && preparation.catalog_lifetime() == ReusableExecutionCatalogLifetime::StartupSealed
             {
                 return Ok(None);
             }

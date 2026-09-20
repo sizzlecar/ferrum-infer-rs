@@ -19,6 +19,8 @@ use metal::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
+mod q6_shared_groups;
+
 const WARMUP_ROUNDS: usize = 2;
 const MEASURED_ROUNDS: usize = 8;
 const DISPATCHES_PER_COMMAND: usize = 8;

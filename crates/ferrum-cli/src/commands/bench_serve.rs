@@ -221,7 +221,8 @@ pub struct BenchServeCommand {
     #[arg(long)]
     pub require_ci: bool,
 
-    /// Deterministic prompt-generation seed. Repeat i uses a stable derivation.
+    /// Deterministic prompt and open-loop arrival seed. Each repeat uses a
+    /// stable derivation; generation sampling has its own --sampling-seed.
     #[arg(long)]
     pub seed: Option<u64>,
 
@@ -417,6 +418,8 @@ async fn stream_one_observed(
         prompt_sha256.clone(),
         Some(correlation.clone()),
     );
+    state.expected_completion_tokens = ignore_eos
+        .then(|| u32::try_from(max_tokens).expect("validated output token limit fits u32"));
 
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
@@ -721,6 +724,7 @@ struct StreamState {
     last_token_time: Option<Instant>,
     output_delta_events: u32,
     usage_completion_tokens: Option<u32>,
+    expected_completion_tokens: Option<u32>,
     itl_ms: Vec<f64>,
     transport_coalesced_output_chunks: u32,
     done_count: u32,
@@ -752,6 +756,7 @@ impl StreamState {
             last_token_time: None,
             output_delta_events: 0,
             usage_completion_tokens: None,
+            expected_completion_tokens: None,
             itl_ms: Vec::new(),
             transport_coalesced_output_chunks: 0,
             done_count: 0,
@@ -844,6 +849,15 @@ impl StreamState {
     }
 
     fn finish(mut self) -> RequestRecord {
+        if let Some(expected) = self.expected_completion_tokens {
+            if self.usage_completion_tokens != Some(expected) {
+                eprintln!(
+                    "[err] fixed-output contract prompt_sha256={}: expected usage completion_tokens={}, got {:?}",
+                    self.prompt_sha256, expected, self.usage_completion_tokens
+                );
+                self.quality_issues.bad_output = 1;
+            }
+        }
         let (output_tokens, source) = match self.usage_completion_tokens {
             Some(tokens) => (tokens, OutputTokenCountSource::Usage),
             None if self.output_delta_events > 0 => (
@@ -1494,6 +1508,7 @@ async fn run_open_loop(
     rate: f64,
     cell_id: &str,
     repeat_index: u32,
+    seed: Option<u64>,
 ) -> RunRecord {
     let n_warmup = warmup_requests as usize;
     let total = prompts.len();
@@ -1528,9 +1543,8 @@ async fn run_open_loop(
     let warmup = summarize_warmup(n_warmup, &warmup_records, 0);
 
     // Pre-compute arrival schedule (re-zeroed after warmup).
-    let mut rng = rand::rng();
     let measurement_count = total - n_warmup;
-    let schedule = poisson_arrival_times(rate, measurement_count, &mut rng);
+    let schedule = open_loop_arrival_schedule(rate, measurement_count, seed, repeat_index);
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(measurement_count);
@@ -1578,6 +1592,26 @@ async fn run_open_loop(
             .expect("measured request count overflow"),
         duration_s,
         warmup,
+    }
+}
+
+fn open_loop_arrival_schedule(
+    rate: f64,
+    count: usize,
+    seed: Option<u64>,
+    repeat_index: u32,
+) -> Vec<f64> {
+    if let Some(seed) = seed {
+        // Keep arrivals independent of prompt generation while reproducing
+        // the same offered load across servers for this cell and repeat.
+        let mut rng = StdRng::seed_from_u64(
+            seed ^ ((repeat_index as u64) << 32)
+                ^ cell_seed(Cell::Open(rate))
+                ^ 0x6172_7269_7661_6c73,
+        );
+        poisson_arrival_times(rate, count, &mut rng)
+    } else {
+        poisson_arrival_times(rate, count, &mut rand::rng())
     }
 }
 
@@ -1733,7 +1767,16 @@ async fn execute_cell(
                 run_closed_loop(ctx, prompts, cmd.warmup_requests, c, cell_id, repeat_idx).await
             }
             Cell::Open(r) => {
-                run_open_loop(ctx, prompts, cmd.warmup_requests, r, cell_id, repeat_idx).await
+                run_open_loop(
+                    ctx,
+                    prompts,
+                    cmd.warmup_requests,
+                    r,
+                    cell_id,
+                    repeat_idx,
+                    cmd.seed,
+                )
+                .await
             }
         };
         eprintln!(
@@ -2593,6 +2636,57 @@ mod tests {
         );
         assert_eq!(record.itl_evidence.output_events, 1);
         assert_eq!(record.itl_evidence.usage_output_tokens, Some(3));
+    }
+
+    #[test]
+    fn fixed_output_requires_exact_usage_not_stream_event_count() {
+        for usage in [None, Some(2), Some(3), Some(4)] {
+            let mut state = StreamState::new(Instant::now(), 7);
+            state.expected_completion_tokens = Some(3);
+            state
+                .handle_payload(r#"{"choices":[{"delta":{"content":"one merged text event"}}]}"#)
+                .unwrap();
+            if let Some(tokens) = usage {
+                state
+                    .handle_payload(&format!(
+                        r#"{{"choices":[],"usage":{{"completion_tokens":{tokens}}}}}"#
+                    ))
+                    .unwrap();
+            }
+            state.done_count = 1;
+            let record = state.finish();
+            assert_eq!(record.success, usage == Some(3), "usage={usage:?}");
+            assert_eq!(
+                record.quality_issues.bad_output,
+                u32::from(usage != Some(3))
+            );
+            assert_eq!(record.itl_evidence.output_events, 1);
+            assert_eq!(record.itl_evidence.usage_output_tokens, usage);
+        }
+    }
+
+    #[test]
+    fn natural_eos_does_not_require_a_fixed_output_length() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        state
+            .handle_payload(
+                r#"{"choices":[{"delta":{"content":"done"}}],"usage":{"completion_tokens":1}}"#,
+            )
+            .unwrap();
+        state.done_count = 1;
+        let record = state.finish();
+        assert!(record.success);
+        assert_eq!(record.quality_issues.bad_output, 0);
+    }
+
+    #[test]
+    fn open_loop_arrivals_reproduce_seeded_offered_load_per_repeat() {
+        let first = open_loop_arrival_schedule(2.5, 24, Some(42), 0);
+        assert_eq!(first, open_loop_arrival_schedule(2.5, 24, Some(42), 0));
+        assert_ne!(first, open_loop_arrival_schedule(2.5, 24, Some(42), 1));
+        assert_ne!(first, open_loop_arrival_schedule(2.5, 24, Some(43), 0));
+        assert_eq!(first.len(), 24);
+        assert!(first.windows(2).all(|pair| pair[1] > pair[0]));
     }
 
     #[test]

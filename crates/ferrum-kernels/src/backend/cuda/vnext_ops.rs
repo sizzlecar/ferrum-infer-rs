@@ -58,6 +58,8 @@ use super::vnext_runtime::{
     CudaDeviceRuntimeConfig, CudaDeviceRuntimeError,
 };
 
+#[cfg(test)]
+mod last_token_linear_tests;
 mod native_blocks;
 mod native_io;
 mod selection;
@@ -73,7 +75,7 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
-use selection::ArgmaxPrecision;
+use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -891,10 +893,17 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
             &request,
             self.precision.projection_operation(),
         )?;
+        let scratch = if last_token_uses_dense_f16(self.precision, request.values()) {
+            let hidden = unsigned_attribute(request.attributes(), "hidden_size")
+                .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
+            Some(last_token_gather_workspace(hidden)?)
+        } else {
+            native_blocks::hadamard::token_workspace(request.values())?
+        };
         Ok(transformer::estimate(
             &self.descriptor,
             request.input_fingerprint(),
-            native_blocks::hadamard::token_workspace(request.values())?,
+            scratch,
         ))
     }
 }
@@ -904,9 +913,18 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
+        // A dense F16 batch may gather even when its semantic spans are unit
+        // rows: physical input windows can still have gaps. Capture therefore
+        // requires the declared scratch address as well as every value address.
+        if last_token_uses_dense_f16(self.precision, request.bindings())
+            && request.work_shape().participant_token_ranges().len() > 1
+            && request.scratch_reusable_address_scope()?.is_none()
+        {
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        }
         reusable_token_topology(
             &request,
-            b"ferrum.cuda.last-token-linear.reusable-topology.v2\0",
+            b"ferrum.cuda.last-token-linear.reusable-topology.v3\0",
         )
     }
 
@@ -939,7 +957,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
 
 pub struct CudaLastTokenMaskedArgmaxProvider {
     descriptor: OperationProviderDescriptor,
-    function: CudaFunction,
+    functions: ArgmaxFunctions,
     precision: ArgmaxPrecision,
 }
 
@@ -971,16 +989,10 @@ impl CudaLastTokenMaskedArgmaxProvider {
                 precision.kernel().as_bytes(),
             ]),
         )?;
-        let module = runtime
-            .context()
-            .load_module(Ptx::from_src(crate::ptx::ARGMAX_ROWS.to_owned()))
-            .map_err(|error| CudaDeviceRuntimeError::driver("masked argmax module load", error))?;
-        let function = module.load_function(precision.kernel()).map_err(|error| {
-            CudaDeviceRuntimeError::driver("masked argmax preserving-logits function load", error)
-        })?;
+        let functions = ArgmaxFunctions::load(runtime.context(), precision)?;
         Ok(Self {
             descriptor,
-            function,
+            functions,
             precision,
         })
     }
@@ -1037,7 +1049,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_last_token_masked_argmax(
-            &self.function,
+            &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
             self.precision,
             invocation,
@@ -1058,7 +1070,7 @@ struct MaskedArgmaxLaunch {
 }
 
 fn encode_last_token_masked_argmax(
-    function: &CudaFunction,
+    functions: &ArgmaxFunctions,
     provider_fingerprint: &str,
     precision: ArgmaxPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -1136,8 +1148,11 @@ fn encode_last_token_masked_argmax(
 
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "masked argmax participant count exceeds u32".to_owned())?;
+    let dispatches_per_participant = argmax_dispatches(launches[0].vocabulary_size);
+    let parallel = dispatches_per_participant == 2;
     let mut replay_key =
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_masked_argmax")
+            .u64(dispatches_per_participant)
             .u64(launches.len() as u64);
     for launch in &launches {
         replay_key = replay_key
@@ -1146,7 +1161,7 @@ fn encode_last_token_masked_argmax(
             .i32(launch.vocabulary_size)
             .i32(launch.repetition_capacity);
     }
-    let function = function.clone();
+    let functions = functions.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_last_token_masked_argmax",
         regions,
@@ -1167,27 +1182,21 @@ fn encode_last_token_masked_argmax(
                             "vNext masked argmax scratch pointer overflows",
                         )
                     })?;
-                let mut builder = stream.launch_builder(&function);
-                builder.arg(&logits);
-                builder.arg(&scratch);
-                builder.arg(&launch.vocabulary_size);
-                builder.arg(&valid_mask);
-                builder.arg(&launch.vocabulary_size);
-                builder.arg(&repetition_offsets);
-                builder.arg(&repetition_token_ids);
-                builder.arg(&repetition_penalty);
-                builder.arg(&launch.repetition_capacity);
-                builder.arg(&output);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (THREADS_PER_BLOCK, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("vNext masked argmax launch", error)
-                })?;
+                functions.launch(
+                    stream,
+                    ArgmaxArguments {
+                        logits,
+                        scratch,
+                        valid_mask,
+                        repetition_offsets,
+                        repetition_token_ids,
+                        repetition_penalty,
+                        output,
+                        vocabulary_size: launch.vocabulary_size,
+                        repetition_capacity: launch.repetition_capacity,
+                    },
+                    parallel,
+                )?;
             }
             Ok(())
         },
@@ -1201,7 +1210,7 @@ fn encode_last_token_masked_argmax(
             },
             participant_count,
             u64::from(participant_count),
-            u64::from(participant_count),
+            u64::from(participant_count) * dispatches_per_participant,
             0,
         )
     })
@@ -1265,6 +1274,253 @@ fn validate_masked_argmax_signature(
 struct LastTokenDenseLinearLaunch {
     input_region: usize,
     output_region: usize,
+    rows: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastTokenF16Row {
+    input_pointer: u64,
+    input_bytes: u64,
+    output_pointer: u64,
+    output_bytes: u64,
+}
+
+fn last_token_uses_dense_f16(precision: TokenPrecision, values: &[ResolvedValueBinding]) -> bool {
+    precision == TokenPrecision::F16
+        && !values.iter().any(|value| {
+            value.role() == ResolvedValueRole::Input
+                && value.ordinal() == 1
+                && value.weight().is_some_and(|weight| {
+                    !matches!(
+                        weight.physical_layout(),
+                        ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                    )
+                })
+        })
+}
+
+fn last_token_gather_workspace(hidden: u64) -> Result<ProviderWorkspaceRequirement, VNextError> {
+    let bytes = hidden
+        .checked_mul(2)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| VNextError::InvalidExecutionPlan {
+            reason: "CUDA last-token gather row extent is zero or overflowing".into(),
+        })?;
+    ProviderWorkspaceRequirement::from_formula(
+        ProviderWorkspaceSizeFormula::actual_sequences(bytes)?,
+        VALUE_ALIGNMENT_BYTES,
+        ProviderWorkspaceScope::Invocation,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+        DynamicStorageRequirement::contiguous(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LastTokenByteSpan {
+    pointer: u64,
+    bytes: u64,
+}
+
+fn last_token_access_range(
+    span: LastTokenByteSpan,
+    bytes: u64,
+) -> Result<std::ops::Range<u64>, String> {
+    if span.pointer == 0
+        || span.pointer % 2 != 0
+        || bytes == 0
+        || span.bytes < bytes
+        || span.pointer.checked_add(span.bytes).is_none()
+    {
+        return Err("CUDA last-token matrix has an invalid physical extent".into());
+    }
+    Ok(span.pointer
+        ..span
+            .pointer
+            .checked_add(bytes)
+            .ok_or("CUDA last-token address overflows")?)
+}
+
+fn last_token_ranges_overlap(a: &std::ops::Range<u64>, b: &std::ops::Range<u64>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// Validate actual reads/writes before either packing or the scalar fallback.
+/// Padding outside a semantic row is not accessed, and read/read alias is legal.
+fn validate_last_token_f16_access(
+    hidden: u64,
+    outputs: u64,
+    weight: LastTokenByteSpan,
+    rows: &[LastTokenF16Row],
+) -> Result<(), String> {
+    let input_bytes = hidden
+        .checked_mul(2)
+        .ok_or("CUDA last-token input extent overflows")?;
+    let output_bytes = outputs
+        .checked_mul(2)
+        .ok_or("CUDA last-token output extent overflows")?;
+    let weight_bytes = input_bytes
+        .checked_mul(outputs)
+        .ok_or("CUDA last-token weight extent overflows")?;
+    let weight_read = last_token_access_range(weight, weight_bytes)?;
+    let inputs = rows
+        .iter()
+        .map(|row| {
+            last_token_access_range(
+                LastTokenByteSpan {
+                    pointer: row.input_pointer,
+                    bytes: row.input_bytes,
+                },
+                input_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let writes = rows
+        .iter()
+        .map(|row| {
+            last_token_access_range(
+                LastTokenByteSpan {
+                    pointer: row.output_pointer,
+                    bytes: row.output_bytes,
+                },
+                output_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty()
+        || writes.iter().enumerate().any(|(index, write)| {
+            last_token_ranges_overlap(write, &weight_read)
+                || inputs
+                    .iter()
+                    .any(|read| last_token_ranges_overlap(write, read))
+                || writes[..index]
+                    .iter()
+                    .any(|prior| last_token_ranges_overlap(write, prior))
+        })
+    {
+        return Err(
+            "CUDA last-token matrix has overlapping participant writes or read/write alias".into(),
+        );
+    }
+    Ok(())
+}
+
+fn last_token_output_rows_are_contiguous(outputs: u64, rows: &[LastTokenF16Row]) -> bool {
+    let Some(bytes) = outputs.checked_mul(2).filter(|bytes| *bytes > 0) else {
+        return false;
+    };
+    rows.len() > 1
+        && rows.iter().all(|row| row.output_bytes == bytes)
+        && rows
+            .windows(2)
+            .all(|pair| pair[0].output_pointer.checked_add(bytes) == Some(pair[1].output_pointer))
+}
+
+/// Scratch is optional to the old routes. Alias here rejects only the gather
+/// optimization; the ordinary read/write contract was already checked above.
+fn last_token_gather_scratch_is_disjoint(
+    hidden: u64,
+    outputs: u64,
+    weight: LastTokenByteSpan,
+    scratch: LastTokenByteSpan,
+    rows: &[LastTokenF16Row],
+) -> bool {
+    let Some(input_bytes) = hidden.checked_mul(2) else {
+        return false;
+    };
+    let Some(output_bytes) = outputs.checked_mul(2) else {
+        return false;
+    };
+    let Some(weight_bytes) = input_bytes.checked_mul(outputs) else {
+        return false;
+    };
+    let Some(required) = input_bytes.checked_mul(rows.len() as u64) else {
+        return false;
+    };
+    if scratch.pointer % VALUE_ALIGNMENT_BYTES != 0 {
+        return false;
+    }
+    let Ok(write) = last_token_access_range(scratch, required) else {
+        return false;
+    };
+    let Ok(weight_read) = last_token_access_range(weight, weight_bytes) else {
+        return false;
+    };
+    !last_token_ranges_overlap(&write, &weight_read) && rows.iter().all(|row| {
+        let input = last_token_access_range(LastTokenByteSpan { pointer: row.input_pointer, bytes: row.input_bytes }, input_bytes);
+        let output = last_token_access_range(LastTokenByteSpan { pointer: row.output_pointer, bytes: row.output_bytes }, output_bytes);
+        matches!((input, output), (Ok(input), Ok(output)) if !last_token_ranges_overlap(&write, &input) && !last_token_ranges_overlap(&write, &output))
+    })
+}
+
+fn copy_last_token_rows_f16(
+    stream: &cudarc::driver::CudaStream,
+    destination: u64,
+    row_bytes: usize,
+    sources: impl ExactSizeIterator<Item = u64>,
+) -> Result<(), CudaDeviceRuntimeError> {
+    for (row, source) in sources.enumerate() {
+        let offset = row
+            .checked_mul(row_bytes)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .and_then(|offset| destination.checked_add(offset))
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("CUDA last-token copy offset overflows")
+            })?;
+        // SAFETY: the encoder proves each complete source row and the disjoint
+        // packed destination extent; command regions retain every allocation.
+        // Copies and the following GEMM are enqueued on this same stream.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(offset, source, row_bytes, stream.cu_stream())
+        }
+        .map_err(|error| CudaDeviceRuntimeError::driver("CUDA last-token row gather", error))?;
+    }
+    Ok(())
+}
+
+/// Proves that individually retained F16 row regions cover two dense matrices.
+/// Product logits use participant windows, whose aligned stride need not equal
+/// their semantic row width. Neither shared backing nor unit token ranges alone
+/// therefore authorize a multi-row GEMM.
+fn packed_last_token_rows(
+    input_packed: bool,
+    hidden_size: u64,
+    out_features: u64,
+    token_ranges: impl ExactSizeIterator<Item = std::ops::Range<u64>>,
+    regions: impl ExactSizeIterator<Item = LastTokenF16Row>,
+) -> Option<i32> {
+    let count = token_ranges.len();
+    if !input_packed || count < 2 || regions.len() != count {
+        return None;
+    }
+    let rows = i32::try_from(count).ok()?;
+    let input_bytes = hidden_size.checked_mul(2).filter(|bytes| *bytes > 0)?;
+    let output_bytes = out_features.checked_mul(2).filter(|bytes| *bytes > 0)?;
+    let mut input_start = None;
+    let mut output_start = None;
+    let mut input_end = None;
+    let mut output_end = None;
+    for (index, (range, region)) in token_ranges.zip(regions).enumerate() {
+        let row = u64::try_from(index).ok()?;
+        if range != (row..row.checked_add(1)?)
+            || region.input_bytes != input_bytes
+            || region.output_bytes != output_bytes
+            || region.input_pointer == 0
+            || region.output_pointer == 0
+            || input_end.is_some_and(|end| region.input_pointer != end)
+            || output_end.is_some_and(|end| region.output_pointer != end)
+        {
+            return None;
+        }
+        input_start.get_or_insert(region.input_pointer);
+        output_start.get_or_insert(region.output_pointer);
+        input_end = Some(region.input_pointer.checked_add(input_bytes)?);
+        output_end = Some(region.output_pointer.checked_add(output_bytes)?);
+    }
+    // cuBLAS must not overwrite an input row that another matrix column reads.
+    if input_start? < output_end? && output_start? < input_end? {
+        return None;
+    }
+    Some(rows)
 }
 
 fn encode_last_token_dense_linear(
@@ -1329,42 +1585,117 @@ fn encode_last_token_dense_linear(
         launches.push(LastTokenDenseLinearLaunch {
             input_region,
             output_region,
+            rows: 1,
         });
     }
 
+    let physical_rows = launches
+        .iter()
+        .map(|launch| {
+            let input = &regions[launch.input_region];
+            let output = &regions[launch.output_region];
+            LastTokenF16Row {
+                input_pointer: input.device_ptr(),
+                input_bytes: input.length_bytes(),
+                output_pointer: output.device_ptr(),
+                output_bytes: output.length_bytes(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let weight_span = LastTokenByteSpan {
+        pointer: regions[0].device_ptr(),
+        bytes: regions[0].length_bytes(),
+    };
+    validate_last_token_f16_access(hidden_size, out_features, weight_span, &physical_rows)?;
+    let packed_rows = packed_last_token_rows(
+        input_packed,
+        hidden_size,
+        out_features,
+        token_ranges
+            .iter()
+            .map(|range| range.immediate_token_range()),
+        physical_rows.iter().copied(),
+    );
+    let row_bytes = hidden_size
+        .checked_mul(2)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or("CUDA last-token gather row bytes overflow usize")?;
+    let mut gather_sources = Vec::new();
+    let mut gather_scratch = None;
+    if let Some(rows) = packed_rows {
+        // Keep every original region lease, including all output windows. Only
+        // coalesce dispatches after proving they form a contiguous matrix.
+        launches.truncate(1);
+        launches[0].rows = rows;
+    } else if last_token_output_rows_are_contiguous(out_features, &physical_rows) {
+        let required = row_bytes
+            .checked_mul(physical_rows.len())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or("CUDA last-token gather workspace extent overflows")?;
+        let scratch = transformer::shared_scratch_region(&invocation, required)?;
+        if last_token_gather_scratch_is_disjoint(
+            hidden_size,
+            out_features,
+            weight_span,
+            LastTokenByteSpan {
+                pointer: scratch.device_ptr(),
+                bytes: scratch.length_bytes(),
+            },
+            &physical_rows,
+        ) {
+            gather_sources = launches.iter().map(|launch| launch.input_region).collect();
+            let index = regions.len();
+            regions.push(scratch);
+            gather_scratch = Some(index);
+            let rows = i32::try_from(launches.len())
+                .map_err(|_| "CUDA last-token gather rows exceed i32")?;
+            launches.truncate(1);
+            launches[0].input_region = index;
+            launches[0].rows = rows;
+        }
+    }
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "last-token dense-linear participant count exceeds u32".to_owned())?;
     let token_count = u64::from(participant_count);
     let compute_dispatch_count = launches.len() as u64;
-    let rows = 1_i32;
+    let transfer_command_count = gather_sources.len() as u64;
     let hidden_size = i32::try_from(hidden_size)
         .map_err(|_| "last-token dense-linear hidden size exceeds i32".to_owned())?;
     let out_features = i32::try_from(out_features)
         .map_err(|_| "last-token dense-linear output width exceeds i32".to_owned())?;
-    let mut replay_key =
-        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_dense_linear")
-            .i32(rows)
-            .i32(hidden_size)
-            .i32(out_features)
-            .u64(launches.len() as u64);
-    for launch in &launches {
-        replay_key = replay_key
-            .u64(launch.input_region as u64)
-            .u64(launch.output_region as u64);
-    }
+    let replay_key = last_token_linear_replay_key(
+        provider_fingerprint,
+        packed_rows.is_some(),
+        hidden_size,
+        out_features,
+        &launches,
+        gather_scratch,
+        &gather_sources,
+        row_bytes,
+    );
     CudaDeviceCommand::replayable_operation_with_blas(
         "vnext_last_token_dense_linear",
         regions,
-        replay_key.finish(),
-        move |_stream, blas, regions| {
+        replay_key,
+        move |stream, blas, regions| {
             let weight = regions[0].device_ptr();
+            if let Some(index) = gather_scratch {
+                copy_last_token_rows_f16(
+                    stream,
+                    regions[index].device_ptr(),
+                    row_bytes,
+                    gather_sources
+                        .iter()
+                        .map(|source| regions[*source].device_ptr()),
+                )?;
+            }
             for launch in &launches {
                 transformer::launch_gemm_f16(
                     blas,
                     regions[launch.input_region].device_ptr(),
                     weight,
                     regions[launch.output_region].device_ptr(),
-                    rows,
+                    launch.rows,
                     out_features,
                     hidden_size,
                     "vNext last-token dense-linear GEMM",
@@ -1375,14 +1706,54 @@ fn encode_last_token_dense_linear(
     )
     .and_then(|command| {
         command.with_work_attribution(
-            DeviceBatchingForm::ParticipantLoop,
+            if packed_rows.is_some() || gather_scratch.is_some() {
+                DeviceBatchingForm::Packed
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
             participant_count,
             token_count,
             compute_dispatch_count,
-            0,
+            transfer_command_count,
         )
     })
     .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn last_token_linear_replay_key(
+    provider_fingerprint: &str,
+    packed: bool,
+    hidden_size: i32,
+    out_features: i32,
+    launches: &[LastTokenDenseLinearLaunch],
+    gather_scratch: Option<usize>,
+    gather_sources: &[usize],
+    row_bytes: usize,
+) -> super::vnext_replay::CudaCommandReplayKey {
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_dense_linear")
+            .boolean(packed)
+            .boolean(gather_scratch.is_some())
+            .i32(hidden_size)
+            .i32(out_features)
+            .u64(launches.len() as u64);
+    if let Some(index) = gather_scratch {
+        replay_key = replay_key
+            .u64(index as u64)
+            .u64(row_bytes as u64)
+            .u64(gather_sources.len() as u64);
+        for (row, source) in gather_sources.iter().enumerate() {
+            replay_key = replay_key.u64(*source as u64).u64((row * row_bytes) as u64);
+        }
+    }
+    for launch in launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .i32(launch.rows);
+    }
+    replay_key.finish()
 }
 
 fn validate_last_token_dense_linear_signature(

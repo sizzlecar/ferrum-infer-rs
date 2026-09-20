@@ -118,6 +118,7 @@ fn pq2_scale_load_production_dispatch_uses_weight_region_and_fallbacks() {
                 }),
                 transform_workspace: None,
                 transformed_plan: TransformedLinearPlan::Single,
+                plain_plan: PlainLinearPlan::Single,
             };
             launch
                 .bind_hadamard_workspace(&pipelines, &regions, 3, 16)

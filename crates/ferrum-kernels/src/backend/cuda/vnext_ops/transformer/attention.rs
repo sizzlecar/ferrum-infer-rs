@@ -441,6 +441,10 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
+    fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
+        ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,

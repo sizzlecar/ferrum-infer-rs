@@ -388,6 +388,47 @@ fn recurrent_cuda_semantics_preserve_f64_oracle_state_carry_and_isolated_slots()
 
 #[test]
 #[ignore = "requires an actual CUDA device"]
+fn recurrent_cuda_mixed_chunk_boundaries_preserve_f32_state_and_slot_isolation() {
+    let runtime = CudaDeviceRuntime::new(
+        cuda_vnext_runtime_config(
+            0,
+            DeviceId::new("device.test.recurrent-chunks").unwrap(),
+            AttentionExecutionPolicy::default(),
+        )
+        .unwrap(),
+    )
+    .expect("recurrent chunk conformance requires CUDA");
+    let provider = CudaGatedDeltaRecurrentAttentionProvider::new(&runtime).unwrap();
+    let stream = runtime.context().default_stream();
+    for decay in GatedDeltaDecayParameterization::ALL {
+        for mapping in GatedDeltaValueHeadMapping::ALL {
+            let mut shape = super::tests::test_shape();
+            shape.key_head_dim = 128;
+            shape.value_head_dim = 128;
+            shape.value_heads = 6;
+            shape.value_features = shape.value_heads * shape.value_head_dim;
+            shape.qkv_features = 2 * shape.key_heads * shape.key_head_dim + shape.value_features;
+            shape.qkvz_features = shape.qkv_features + shape.value_features;
+            shape.ba_features = 2 * shape.value_heads;
+            shape.qkvzba_features = shape.qkvz_features + shape.ba_features;
+            shape.decay_parameterization = decay;
+            shape.value_head_mapping = mapping;
+            // Empty slot, one-token decodes, a 64-token prefill, and its tail
+            // exercise the real mixed shape while carrying the same F32 state.
+            let split = exercise(
+                &stream,
+                &provider.functions,
+                shape,
+                &[[0, 1, 64], [0, 1, 1], [0, 1, 63]],
+            );
+            let whole = exercise(&stream, &provider.functions, shape, &[[0, 3, 128]]);
+            assert_eq!(split, whole, "mixed chunk state carry differs: {shape:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
 fn recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on_cuda() {
     let runtime = CudaDeviceRuntime::new(
         cuda_vnext_runtime_config(

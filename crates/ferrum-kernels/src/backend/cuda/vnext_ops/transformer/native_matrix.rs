@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 pub(super) const MAX_ROWS: u64 = u16::MAX as u64;
 
+pub(super) fn single_launch_rows(tokens: u64) -> Option<u32> {
+    (1..=MAX_ROWS).contains(&tokens).then_some(tokens as u32)
+}
+
 pub(super) fn uses_native(
     values: &[ResolvedValueBinding],
     ordinals: &[u32],

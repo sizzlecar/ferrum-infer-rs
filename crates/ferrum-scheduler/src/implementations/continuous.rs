@@ -74,6 +74,7 @@ struct ContinuousBatchRuntimeConfig {
     prefill_first_until_active: Option<usize>,
     prefill_step_chunk: Option<usize>,
     active_decode_prefill_chunk: Option<usize>,
+    active_decode_prefill_token_budget: Option<usize>,
     scheduler_none_prof: bool,
 }
 
@@ -84,6 +85,9 @@ impl ContinuousBatchRuntimeConfig {
             prefill_first_until_active: config.prefill_first_until_active,
             prefill_step_chunk: config.prefill_step_chunk,
             active_decode_prefill_chunk: config.active_decode_prefill_chunk,
+            active_decode_prefill_token_budget: config
+                .active_decode_prefill_token_budget
+                .filter(|budget| *budget > 0),
             scheduler_none_prof: config.scheduler_none_prof,
         }
     }
@@ -1700,7 +1704,13 @@ impl ContinuousBatchScheduler {
     /// admitted prefills consume the budget first; a waiting request that does
     /// not fit seals the fair prefix instead of reserving unused authority.
     pub fn fill_first_dynamic_admission_limit(&self, hint: &BatchHint, target: usize) -> usize {
-        if !self.fill_first_initial_cohort_armed.load(Ordering::Acquire) {
+        if !self.fill_first_initial_cohort_armed.load(Ordering::Acquire)
+            || (self
+                .runtime_config
+                .active_decode_prefill_token_budget
+                .is_some()
+                && self.decoding_count() > 0)
+        {
             return 0;
         }
         let mut remaining_tokens = hint.max_tokens;
@@ -2950,7 +2960,10 @@ impl ContinuousBatchScheduler {
         if scheduled_decode_count < self.decode_pressure_prefill_cap_threshold(hint)
             && !capacity_deferred_decode_backpressure
         {
-            return None;
+            // An explicit iteration budget protects even one decoder. It also
+            // provides a bounded request frontier for the existing capacity-
+            // deferred recompute path when no narrower chunk policy applies.
+            return self.runtime_config.active_decode_prefill_token_budget;
         }
         Some(self.default_active_decode_prefill_chunk())
     }
@@ -3100,10 +3113,14 @@ impl ContinuousBatchScheduler {
         let target_chunks =
             self.active_decode_prefill_target_chunks(hint, scheduled_decode_count, prefill_backlog);
 
+        let existing_budget = chunk
+            .saturating_mul(target_chunks)
+            .min(remaining_step_tokens);
         Some(
-            chunk
-                .saturating_mul(target_chunks)
-                .min(remaining_step_tokens),
+            self.runtime_config
+                .active_decode_prefill_token_budget
+                .map(|budget| budget.min(existing_budget))
+                .unwrap_or(existing_budget),
         )
     }
 
@@ -3556,6 +3573,11 @@ impl ContinuousBatchScheduler {
         let fill_first_initial_cohort_armed =
             self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
         let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+            && !(self
+                .runtime_config
+                .active_decode_prefill_token_budget
+                .is_some()
+                && decoding_count > 0)
             && (self.config.prefix_rendezvous_max_wait_ms.is_none()
                 || self.prefix_held_waiting_count() == 0)
             && prefill_first_target > 0
@@ -4454,6 +4476,8 @@ impl std::fmt::Debug for ContinuousBatchScheduler {
 mod tests {
     use super::*;
     use ferrum_types::{ModelId, SamplingParams};
+
+    mod active_decode_budget;
 
     fn create_test_request(priority: Priority) -> InferenceRequest {
         InferenceRequest {

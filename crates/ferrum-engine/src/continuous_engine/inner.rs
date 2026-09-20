@@ -6,6 +6,7 @@ use ferrum_interfaces::vnext::DynamicBackingPressure;
 mod batch;
 mod completion;
 mod decode;
+mod mixed;
 mod prefill;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;

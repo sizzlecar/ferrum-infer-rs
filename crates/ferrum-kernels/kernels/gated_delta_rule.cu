@@ -966,6 +966,97 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
       value_dim, use_qk_l2norm, scale);
 }
 
+// The 128-key case assigns two value rows to each warp. Keep the recurrent
+// state in FP32 registers throughout this sequence's chunk; only the initial
+// and final state cross the global-memory boundary. The four lane-local
+// products are combined in the same 64, 32, 16, ... tree as the block reduction
+// below, rather than changing the numerical profile to a chunkwise algorithm.
+static __device__ float recurrent_dot128(const float* products) {
+  float sum = __fadd_rn(__fadd_rn(products[0], products[2]),
+                        __fadd_rn(products[1], products[3]));
+  for (int stride = 16; stride > 0; stride >>= 1) {
+    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, stride));
+  }
+  return __shfl_sync(0xffffffff, sum, 0);
+}
+
+template <bool InterleavedByKeyHead>
+static __device__ void recurrent_gated_delta_rule_varlen_warp128_f32(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const float* __restrict__ initial_state,
+    float* __restrict__ final_state,
+    float* __restrict__ out,
+    const int token_start,
+    const int token_end,
+    const int key_heads,
+    const int value_heads,
+    const int value_dim,
+    const float scale) {
+  const int lane = threadIdx.x % 32;
+  const int first_value = blockIdx.x * 16 + (threadIdx.x / 32) * 2;
+  const int value_head = blockIdx.y;
+  const int key_head = InterleavedByKeyHead
+      ? value_head % key_heads : value_head / (value_heads / key_heads);
+  float states[2][4];
+#pragma unroll
+  for (int row = 0; row < 2; ++row) {
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+      const int index = (value_head * value_dim + first_value + row) * 128
+          + lane + part * 32;
+      states[row][part] = first_value + row < value_dim
+          ? initial_state[index] : 0.0f;
+    }
+  }
+  for (int token = token_start; token < token_end; ++token) {
+    const int gate_index = token * value_heads + value_head;
+    const float decay = expf(g[gate_index]);
+    const float beta_t = beta[gate_index];
+    float keys[4], queries[4];
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+      const int index = (token * key_heads + key_head) * 128 + lane + part * 32;
+      keys[part] = key[index];
+      queries[part] = __fmul_rn(query[index], scale);
+    }
+#pragma unroll
+    for (int row = 0; row < 2; ++row) {
+      if (first_value + row >= value_dim) continue;
+      float products[4];
+#pragma unroll
+      for (int part = 0; part < 4; ++part) {
+        states[row][part] = __fmul_rn(states[row][part], decay);
+        products[part] = __fmul_rn(states[row][part], keys[part]);
+      }
+      const float predicted = recurrent_dot128(products);
+      const int value_index = (token * value_heads + value_head) * value_dim
+          + first_value + row;
+      const float delta = (value[value_index] - predicted) * beta_t;
+#pragma unroll
+      for (int part = 0; part < 4; ++part) {
+        states[row][part] = states[row][part] + delta * keys[part];
+        products[part] = __fmul_rn(states[row][part], queries[part]);
+      }
+      const float result = recurrent_dot128(products);
+      if (lane == 0) out[value_index] = result;
+    }
+  }
+#pragma unroll
+  for (int row = 0; row < 2; ++row) {
+    if (first_value + row >= value_dim) continue;
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+      const int index = (value_head * value_dim + first_value + row) * 128
+          + lane + part * 32;
+      final_state[index] = states[row][part];
+    }
+  }
+}
+
 template <typename StateT, int BV_TILE, bool InterleavedByKeyHead = false>
 static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const float* __restrict__ query,
@@ -1009,6 +1100,19 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       state_bindings == nullptr
           ? final_states + seq * state_len
           : reinterpret_cast<StateT*>(state_bindings[seq * 2 + 1]);
+
+  // F16 state retains its per-step storage rounding in the original path.
+  // This specialization changes neither global scratch nor launch dimensions.
+  if constexpr (sizeof(StateT) == sizeof(float) && BV_TILE == 16) {
+    if (key_dim == 128 && blockDim.x == 256) {
+      recurrent_gated_delta_rule_varlen_warp128_f32<InterleavedByKeyHead>(
+          query, key, value, g, beta,
+          reinterpret_cast<const float*>(sequence_initial_state),
+          reinterpret_cast<float*>(sequence_final_state), out,
+          token_start, token_end, key_heads, value_heads, value_dim, scale);
+      return;
+    }
+  }
 
   __shared__ float partial[BV_TILE][256];
   __shared__ float delta[BV_TILE];

@@ -1928,6 +1928,8 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
     use std::path::{Path, PathBuf};
 
+    mod mixed_batch_tests;
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(

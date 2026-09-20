@@ -69,8 +69,10 @@ pub struct DecodeIsolationScenarioContract {
     pub post_aggressor_observable_progress_required_per_incumbent: bool,
     /// Minimum number of scheduler token chunks covered by the long prefill.
     pub minimum_aggressor_scheduled_chunks: u32,
-    pub kv_capacity_headroom_numerator: u32,
-    pub kv_capacity_headroom_denominator: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_capacity_headroom_numerator: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_capacity_headroom_denominator: Option<u32>,
     pub invalid_evidence_policy: DecodeIsolationErrorPolicy,
     pub warmup_failure_always_fatal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,11 +84,23 @@ pub struct DecodeIsolationCapabilities {
     pub effective_max_concurrent: u32,
     pub maximum_scheduled_tokens: u64,
     pub max_model_length: u64,
-    pub kv_capacity_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_capacity_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_kv_capacity_tokens: Option<u64>,
-    pub kv_block_size_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_block_size_tokens: Option<u64>,
     pub kv_block_size_source: String,
+    /// Native logical state evidence is not converted into a KV token budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_sequence_state: Option<DecodeIsolationNativeSequenceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodeIsolationNativeSequenceState {
+    pub kv_bytes_per_token: u64,
+    pub other_token_scaled_bytes_per_token: u64,
+    pub fixed_bytes_per_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,18 +113,22 @@ pub struct DecodeIsolationConfig {
     pub aggressor_input_source: String,
     pub aggressor_scheduled_chunks: u64,
     pub aggressor_output_tokens: u64,
-    pub aggregate_kv_budget_tokens: u64,
-    pub aggregate_kv_budget_blocks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_kv_budget_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_kv_budget_blocks: Option<u64>,
     /// Sum of logical request token budgets before allocator rounding.
     pub estimated_unrounded_aggregate_kv_tokens: u64,
     /// Aggregate KV allocation after rounding each sequence to a KV block.
-    pub estimated_aggregate_kv_tokens: u64,
-    pub estimated_aggregate_kv_blocks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_aggregate_kv_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_aggregate_kv_blocks: Option<u64>,
     pub capabilities: DecodeIsolationCapabilities,
     pub contract: DecodeIsolationScenarioContract,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodeIsolationRequestEvidence {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +136,9 @@ pub struct DecodeIsolationRequestEvidence {
     pub success: bool,
     pub contract_valid: bool,
     pub input_tokens: u32,
+    /// Server usage includes the applied chat template; local input_tokens does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_input_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_output_tokens: Option<u32>,
     pub output_token_count_source: String,
@@ -125,7 +146,67 @@ pub struct DecodeIsolationRequestEvidence {
     pub observable_output_intervals: u32,
     pub transport_coalesced_output_chunks: u32,
     pub output_event_timing_valid: bool,
+    /// Client-observed first visible text event, not an engine token commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_time_to_first_output_event_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_e2e_ms: Option<f64>,
     pub quality_issues: QualityIssueCounts,
+}
+
+/// Complete measured request cohort, from the earliest HTTP request start to
+/// the latest stream completion. Warmup and prompt construction are excluded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecodeIsolationThroughput {
+    pub duration_ms: f64,
+    pub usage_input_tokens: u64,
+    pub usage_output_tokens: u64,
+    pub usage_output_tokens_per_second: f64,
+    pub usage_total_tokens_per_second: f64,
+}
+
+pub fn decode_isolation_throughput(
+    requests: &[DecodeIsolationRequestEvidence],
+    duration_ms: f64,
+) -> Result<DecodeIsolationThroughput, String> {
+    if requests.is_empty() || !duration_ms.is_finite() || duration_ms <= 0.0 {
+        return Err("throughput requires a nonempty cohort and positive finite duration".into());
+    }
+    let mut input = 0_u64;
+    let mut output = 0_u64;
+    for request in requests {
+        let (Some(prompt), Some(completion)) =
+            (request.usage_input_tokens, request.usage_output_tokens)
+        else {
+            return Err("throughput requires server prompt and completion usage".into());
+        };
+        if !request.contract_valid
+            || request.output_token_count_source != "usage"
+            || prompt == 0
+            || completion == 0
+        {
+            return Err("throughput requires valid nonempty request usage".into());
+        }
+        input = input
+            .checked_add(u64::from(prompt))
+            .ok_or("input usage overflow")?;
+        output = output
+            .checked_add(u64::from(completion))
+            .ok_or("output usage overflow")?;
+    }
+    let total = input.checked_add(output).ok_or("total usage overflow")?;
+    let output_rate = output as f64 / duration_ms * 1000.0;
+    let total_rate = total as f64 / duration_ms * 1000.0;
+    if !output_rate.is_finite() || !total_rate.is_finite() {
+        return Err("throughput rate is not finite".into());
+    }
+    Ok(DecodeIsolationThroughput {
+        duration_ms,
+        usage_input_tokens: input,
+        usage_output_tokens: output,
+        usage_output_tokens_per_second: output_rate,
+        usage_total_tokens_per_second: total_rate,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +243,8 @@ pub struct DecodeIsolationRunReport {
     /// Absent under the same validity rule as `metrics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggressor_time_to_first_output_event_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput: Option<DecodeIsolationThroughput>,
     pub incumbents: Vec<DecodeIsolationRequestEvidence>,
     pub aggressor: DecodeIsolationRequestEvidence,
 }
@@ -177,6 +260,10 @@ pub struct DecodeIsolationAggregate {
     pub incumbents_with_observable_output_progress: ScalarStats,
     pub incumbent_observable_output_progress_fraction: ScalarStats,
     pub aggressor_time_to_first_output_event_ms: ScalarStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_output_tokens_per_second: Option<ScalarStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_total_tokens_per_second: Option<ScalarStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +308,12 @@ pub fn aggregate_decode_isolation_runs(
     let stats = |value: fn(&(&DecodeIsolationWindowMetrics, f64, u32)) -> f64| {
         ScalarStats::from_samples(&valid.iter().map(value).collect::<Vec<_>>())
     };
+    let throughput_stats = |value: fn(&DecodeIsolationThroughput) -> f64| {
+        runs.iter()
+            .map(|run| run.throughput.as_ref().map(value))
+            .collect::<Option<Vec<_>>>()
+            .map(|values| ScalarStats::from_samples(&values))
+    };
     Some(DecodeIsolationAggregate {
         baseline_output_event_gap_p50_ms: stats(|(metrics, _, _)| {
             metrics.baseline_output_event_gap.p50_ms
@@ -249,6 +342,12 @@ pub fn aggregate_decode_isolation_runs(
             }
         }),
         aggressor_time_to_first_output_event_ms: stats(|(_, first_event_ms, _)| *first_event_ms),
+        usage_output_tokens_per_second: throughput_stats(|value| {
+            value.usage_output_tokens_per_second
+        }),
+        usage_total_tokens_per_second: throughput_stats(|value| {
+            value.usage_total_tokens_per_second
+        }),
     })
 }
 
@@ -333,12 +432,15 @@ mod tests {
             success: true,
             contract_valid: true,
             input_tokens: 8,
+            usage_input_tokens: Some(10),
             usage_output_tokens: Some(4),
             output_token_count_source: "usage".to_string(),
             observable_output_events: 4,
             observable_output_intervals: 3,
             transport_coalesced_output_chunks: 0,
             output_event_timing_valid: true,
+            client_time_to_first_output_event_ms: Some(2.0),
+            client_e2e_ms: Some(10.0),
             quality_issues: QualityIssueCounts::default(),
         };
         DecodeIsolationRunReport {
@@ -368,6 +470,7 @@ mod tests {
                 incumbents_with_observable_output_progress: 1,
             }),
             aggressor_time_to_first_output_event_ms: Some(5.0),
+            throughput: None,
             incumbents: vec![evidence.clone()],
             aggressor: DecodeIsolationRequestEvidence {
                 role: "aggressor".to_string(),
@@ -451,19 +554,20 @@ mod tests {
                 aggressor_input_source: "cli".to_string(),
                 aggressor_scheduled_chunks: 2,
                 aggressor_output_tokens: 1,
-                aggregate_kv_budget_tokens: 128,
-                aggregate_kv_budget_blocks: 128,
+                aggregate_kv_budget_tokens: Some(128),
+                aggregate_kv_budget_blocks: Some(128),
                 estimated_unrounded_aggregate_kv_tokens: 78,
-                estimated_aggregate_kv_tokens: 78,
-                estimated_aggregate_kv_blocks: 78,
+                estimated_aggregate_kv_tokens: Some(78),
+                estimated_aggregate_kv_blocks: Some(78),
                 capabilities: DecodeIsolationCapabilities {
                     effective_max_concurrent: 3,
                     maximum_scheduled_tokens: 64,
                     max_model_length: 128,
-                    kv_capacity_tokens: 144,
+                    kv_capacity_tokens: Some(144),
                     selected_kv_capacity_tokens: Some(128),
-                    kv_block_size_tokens: 1,
+                    kv_block_size_tokens: Some(1),
                     kv_block_size_source: "default_unit_block".to_string(),
+                    native_sequence_state: None,
                 },
                 contract: DecodeIsolationScenarioContract {
                     baseline_output_events_per_incumbent: 2,
@@ -472,8 +576,8 @@ mod tests {
                     interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
                     post_aggressor_observable_progress_required_per_incumbent: true,
                     minimum_aggressor_scheduled_chunks: 2,
-                    kv_capacity_headroom_numerator: 9,
-                    kv_capacity_headroom_denominator: 10,
+                    kv_capacity_headroom_numerator: Some(9),
+                    kv_capacity_headroom_denominator: Some(10),
                     invalid_evidence_policy: DecodeIsolationErrorPolicy::EmitDiagnostics,
                     warmup_failure_always_fatal: true,
                     measured_error_rate_limit: None,
@@ -504,5 +608,45 @@ mod tests {
         let mut invalid = valid_run();
         invalid.validity.all_valid = false;
         assert!(aggregate_decode_isolation_runs(&[valid_run(), invalid]).is_none());
+    }
+
+    #[test]
+    fn throughput_uses_usage_including_template_tokens_not_visible_events() {
+        let run = valid_run();
+        let mut requests = run.incumbents;
+        requests.push(run.aggressor);
+        requests[0].observable_output_events = 2;
+        let measured = decode_isolation_throughput(&requests, 500.0).unwrap();
+        assert_eq!(measured.usage_input_tokens, 20);
+        assert_eq!(measured.usage_output_tokens, 5);
+        assert_eq!(measured.usage_output_tokens_per_second, 10.0);
+        assert_eq!(measured.usage_total_tokens_per_second, 50.0);
+        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MIN_POSITIVE] {
+            assert!(decode_isolation_throughput(&requests, duration).is_err());
+        }
+        requests[0].usage_input_tokens = None;
+        assert!(decode_isolation_throughput(&requests, 500.0).is_err());
+        requests[0].usage_input_tokens = Some(0);
+        assert!(decode_isolation_throughput(&requests, 500.0).is_err());
+    }
+
+    #[test]
+    fn older_request_reports_remain_readable_without_inventing_timings_or_rates() {
+        let mut value = serde_json::to_value(valid_run()).unwrap();
+        for request in value["incumbents"].as_array_mut().unwrap() {
+            for field in [
+                "usage_input_tokens",
+                "client_time_to_first_output_event_ms",
+                "client_e2e_ms",
+            ] {
+                request.as_object_mut().unwrap().remove(field);
+            }
+        }
+        let report: DecodeIsolationRunReport = serde_json::from_value(value).unwrap();
+        assert_eq!(report.incumbents[0].usage_input_tokens, None);
+        assert_eq!(report.incumbents[0].client_e2e_ms, None);
+        let aggregate = aggregate_decode_isolation_runs(&[report]).unwrap();
+        assert!(aggregate.usage_output_tokens_per_second.is_none());
+        assert!(aggregate.usage_total_tokens_per_second.is_none());
     }
 }

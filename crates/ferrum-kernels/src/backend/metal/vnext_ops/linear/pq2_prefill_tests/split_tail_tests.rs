@@ -108,6 +108,7 @@ impl BoundFixture {
             }),
             transform_workspace: None,
             transformed_plan: TransformedLinearPlan::Single,
+            plain_plan: PlainLinearPlan::Single,
         };
         launch
             .bind_hadamard_workspace(pipelines, &regions, 0, WORKSPACE_OFFSET)

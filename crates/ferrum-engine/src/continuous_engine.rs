@@ -2821,15 +2821,21 @@ impl ContinuousBatchEngine {
                 execution_profile_journals.push(journal.clone());
             }
         }
-        if !execution_profile_journals.is_empty() {
-            let sink: Arc<dyn ExecutionEventSink> =
-                Arc::new(VNextProfileExecutionEventSink::with_journals(
+        let execution_sink: Option<Arc<dyn ExecutionEventSink>> =
+            if !execution_profile_journals.is_empty() {
+                Some(Arc::new(VNextProfileExecutionEventSink::with_journals(
                     execution_profile_journals,
                     runtime_config
                         .profile_entrypoint
                         .unwrap_or(ProfileEntrypoint::Synthetic),
                     &config,
-                ));
+                )))
+            } else if config.runtime.profile_detail == ObservabilityProfileDetail::Basic {
+                Some(Arc::new(MetricsOnlyExecutionEventSink))
+            } else {
+                None
+            };
+        if let Some(sink) = execution_sink {
             model_executor.attach_execution_event_sink(Arc::clone(&sink));
             if let Some(draft_executor) = draft_executor.as_ref() {
                 draft_executor.attach_execution_event_sink(sink);

@@ -1605,6 +1605,8 @@ pub enum DeviceReusableExecutionPreparationState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeviceReusableExecutionPreparation {
     state: DeviceReusableExecutionPreparationState,
+    #[serde(skip_serializing_if = "ReusableExecutionCatalogLifetime::is_startup_sealed")]
+    catalog_lifetime: ReusableExecutionCatalogLifetime,
     maximum_executables: u64,
     resident_executables: u64,
     rejected_executables: u64,
@@ -1617,6 +1619,7 @@ impl DeviceReusableExecutionPreparation {
     pub const fn unsupported() -> Self {
         Self {
             state: DeviceReusableExecutionPreparationState::Unsupported,
+            catalog_lifetime: ReusableExecutionCatalogLifetime::StartupSealed,
             maximum_executables: 0,
             resident_executables: 0,
             rejected_executables: 0,
@@ -1629,6 +1632,7 @@ impl DeviceReusableExecutionPreparation {
     pub fn preparing(plan: DeviceReusableExecutionPlan) -> Self {
         Self {
             state: DeviceReusableExecutionPreparationState::Preparing,
+            catalog_lifetime: plan.catalog_lifetime(),
             maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
             ..Self::unsupported()
         }
@@ -1692,6 +1696,7 @@ impl DeviceReusableExecutionPreparation {
         }
         Ok(Self {
             state,
+            catalog_lifetime: plan.catalog_lifetime(),
             maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
             resident_executables: u64::try_from(resident_executables).unwrap_or(u64::MAX),
             rejected_executables: u64::try_from(rejected_executables).unwrap_or(u64::MAX),
@@ -1703,6 +1708,10 @@ impl DeviceReusableExecutionPreparation {
 
     pub const fn state(self) -> DeviceReusableExecutionPreparationState {
         self.state
+    }
+
+    pub const fn catalog_lifetime(self) -> ReusableExecutionCatalogLifetime {
+        self.catalog_lifetime
     }
 
     pub const fn maximum_executables(self) -> u64 {

@@ -45,6 +45,33 @@ impl Default for SequenceFitPolicy {
     }
 }
 
+/// Physical execution policy for a PlanRuntime batch containing prefill and decode.
+/// Legacy executors retain their existing execution policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillDecodeExecution {
+    #[default]
+    Split,
+    Mixed,
+}
+
+impl PrefillDecodeExecution {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "split" => Ok(Self::Split),
+            "mixed" => Ok(Self::Mixed),
+            _ => Err(format!("expected split or mixed; got {raw:?}")),
+        }
+    }
+}
+
 /// Explicit one-shot faults used to prove product-path failure attribution.
 /// These are never inferred and remain disabled in normal execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +238,11 @@ impl EngineConfig {
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
         self.scheduler.apply_runtime_config_snapshot(snapshot)?;
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFILL_DECODE_EXECUTION") {
+            self.batching.prefill_decode_execution =
+                PrefillDecodeExecution::parse_runtime_value(value)
+                    .map_err(|reason| format!("FERRUM_PREFILL_DECODE_EXECUTION: {reason}"))?;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_KV_MAX_BLOCKS") {
             self.kv_cache.max_blocks =
                 parse_required_positive_usize("FERRUM_KV_MAX_BLOCKS", value)?;
@@ -437,6 +469,11 @@ pub struct SchedulerConfig {
     /// Cap prefill admission chunks only while decode requests are already active.
     #[serde(default)]
     pub active_decode_prefill_chunk: Option<usize>,
+    /// Limit total prefill tokens across one iteration that schedules runnable
+    /// decode work. This is independent of the per-request chunk cap and does
+    /// not restrict pure-prefill iterations. `None` or zero disables the limit.
+    #[serde(default)]
+    pub active_decode_prefill_token_budget: Option<usize>,
     /// Emit diagnostic scheduler None/SOME decisions.
     #[serde(default)]
     pub scheduler_none_prof: bool,
@@ -460,6 +497,7 @@ impl Default for SchedulerConfig {
             prefix_rendezvous_max_wait_ms: None,
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
+            active_decode_prefill_token_budget: None,
             scheduler_none_prof: false,
             sequence_fit_policy: SequenceFitPolicy::default(),
         }
@@ -500,6 +538,12 @@ impl SchedulerConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
             self.active_decode_prefill_chunk =
                 parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", value)?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET")
+        {
+            self.active_decode_prefill_token_budget =
+                parse_optional_positive_usize("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET", value)?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
             self.scheduler_none_prof = parse_presence_bool(value)
@@ -1102,6 +1146,9 @@ impl Default for MonitoringConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchConfig {
+    /// Physical execution policy for PlanRuntime prefill/decode scheduler batches.
+    #[serde(default)]
+    pub prefill_decode_execution: PrefillDecodeExecution,
     pub max_batch_size: usize,
     pub max_wait_ms: u64,
     pub enable_dynamic: bool,
@@ -1125,6 +1172,7 @@ impl BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
+            prefill_decode_execution: PrefillDecodeExecution::default(),
             max_batch_size: 32,
             max_wait_ms: 8,
             enable_dynamic: true,
@@ -1137,6 +1185,49 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_decode_execution_defaults_to_split_and_validates_runtime_overrides() {
+        let mut config = EngineConfig::default();
+        assert_eq!(
+            config.batching.prefill_decode_execution,
+            PrefillDecodeExecution::Split
+        );
+        let mut serialized = serde_json::to_value(&config.batching).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("prefill_decode_execution");
+        let restored: BatchConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            restored.prefill_decode_execution,
+            PrefillDecodeExecution::Split
+        );
+        for policy in [PrefillDecodeExecution::Mixed, PrefillDecodeExecution::Split] {
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                    "FERRUM_PREFILL_DECODE_EXECUTION",
+                    policy.as_runtime_value(),
+                )]))
+                .unwrap();
+            assert_eq!(config.batching.prefill_decode_execution, policy);
+            assert_eq!(
+                serde_json::to_value(policy).unwrap(),
+                policy.as_runtime_value()
+            );
+            config
+                .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+                .unwrap();
+            assert_eq!(config.batching.prefill_decode_execution, policy);
+        }
+        let error = config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_PREFILL_DECODE_EXECUTION",
+                "automatic",
+            )]))
+            .unwrap_err();
+        assert!(error.contains("FERRUM_PREFILL_DECODE_EXECUTION"));
+    }
 
     #[test]
     fn prefix_state_cache_canonical_boolean_overrides_and_missing_key_preserves() {
@@ -1198,6 +1289,53 @@ mod tests {
             SchedulerConfig::default().sequence_fit_policy,
             SequenceFitPolicy::ImmediateOnly
         );
+    }
+
+    #[test]
+    fn active_decode_prefill_token_budget_is_optional_in_existing_configs() {
+        let default = SchedulerConfig::default();
+        assert_eq!(default.active_decode_prefill_token_budget, None);
+        let mut serialized = serde_json::to_value(default).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("active_decode_prefill_token_budget");
+        let restored: SchedulerConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.active_decode_prefill_token_budget, None);
+    }
+
+    #[test]
+    fn active_decode_prefill_token_budget_runtime_value_is_independent_of_chunk_cap() {
+        let mut config = SchedulerConfig {
+            active_decode_prefill_chunk: Some(11),
+            ..SchedulerConfig::default()
+        };
+        config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+                "29",
+            )]))
+            .unwrap();
+        assert_eq!(config.active_decode_prefill_token_budget, Some(29));
+        assert_eq!(config.active_decode_prefill_chunk, Some(11));
+        config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::default())
+            .unwrap();
+        assert_eq!(config.active_decode_prefill_token_budget, Some(29));
+        config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+                "0",
+            )]))
+            .unwrap();
+        assert_eq!(config.active_decode_prefill_token_budget, None);
+        assert_eq!(config.active_decode_prefill_chunk, Some(11));
+        assert!(config
+            .apply_runtime_config_snapshot(&RuntimeConfigSnapshot::from_env_vars([(
+                "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+                "invalid",
+            )]))
+            .is_err());
     }
 
     #[test]

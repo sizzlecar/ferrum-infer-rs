@@ -574,9 +574,29 @@ pub enum ReusableExecutionTopology {
     EagerBoundary,
 }
 
+/// Physical views required when patching an already resident executable.
+/// This does not change the operation's complete semantic bindings or confer
+/// replay authority; dispatch must first validate the exact live program.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReusableBindingResources {
+    #[default]
+    All,
+    /// Retain every Request/Sequence resource, the complete component closure
+    /// of values that use those resources, and the program-binding workspace.
+    /// Captured weights and scratch remain owned by the resident executable.
+    RequestStateAndBinding,
+}
+
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Opts a binding-only encoder into a smaller physical view projection.
+    /// The default preserves the full invocation, including for providers
+    /// whose binding encoder delegates to `encode_selected`.
+    fn reusable_binding_resources(&self) -> ReusableBindingResources {
+        ReusableBindingResources::All
+    }
+
     /// Publishes the provider-private compute topology that must match a
     /// resident reusable program. Static topology and an eager boundary are
     /// intentionally distinct states: a provider may never silently turn a
@@ -730,8 +750,12 @@ where
     ) -> Result<BoundOperationProvider<'registry, R>, VNextError> {
         let provider = self.selected_provider(resolved, node_id)?;
         let plan = resolved.execution_plan();
-        let dispatch =
-            PreparedOperationDispatchBinding::prepare(resolved, provider.descriptor(), node_id)?;
+        let dispatch = PreparedOperationDispatchBinding::prepare(
+            resolved,
+            provider.descriptor(),
+            node_id,
+            provider.reusable_binding_resources(),
+        )?;
         Ok(BoundOperationProvider {
             provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
             plan_id: plan.payload().plan_id().clone(),
@@ -762,6 +786,7 @@ where
                     resolved,
                     provider.descriptor(),
                     node.id(),
+                    provider.reusable_binding_resources(),
                 )?;
                 Ok(BoundOperationProvider {
                     provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),

@@ -690,6 +690,8 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) reusable_binding_resources: ReusableBindingResources,
+    pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
     pub(crate) reusable_topology_packed_input_coordinates: Vec<bool>,
     pub(crate) encode_calls: u64,
@@ -774,6 +776,10 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn reusable_binding_resources(&self) -> ReusableBindingResources {
+        self.trace.lock().unwrap().reusable_binding_resources
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -986,6 +992,31 @@ impl OperationProvider<TestRuntime> for TestProvider {
         }
         let mut trace = self.trace.lock().unwrap();
         trace.reusable_binding_encode_calls += 1;
+        for participant in invocation.participants() {
+            let resources = participant
+                .views()
+                .iter()
+                .map(|view| {
+                    let translated = view.translate(0, view.descriptor().size_bytes).unwrap();
+                    assert_eq!(
+                        translated
+                            .iter()
+                            .map(|region| region.length_bytes())
+                            .sum::<u64>(),
+                        view.descriptor().size_bytes,
+                    );
+                    view.resource_id().clone()
+                })
+                .collect();
+            let values = participant
+                .bindings()
+                .iter()
+                .map(|binding| binding.value_id().clone())
+                .collect();
+            trace
+                .reusable_views
+                .push((participant.node_id().clone(), resources, values));
+        }
         let binding = invocation
             .program_binding()
             .expect("program-binding behavior requires a compiled binding slot");

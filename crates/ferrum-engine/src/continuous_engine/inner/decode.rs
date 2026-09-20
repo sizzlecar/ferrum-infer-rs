@@ -17,7 +17,10 @@ impl EngineInner {
     /// Close the request-local host-loop interval immediately before the
     /// PlanRuntime executor call. Ordinary inference returns before locking
     /// sequence state or reading another clock.
-    fn close_plan_runtime_decode_scheduling(&self, request_ids: &[RequestId]) -> Option<Instant> {
+    pub(super) fn close_plan_runtime_decode_scheduling(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Option<Instant> {
         if !self
             .config
             .runtime
@@ -47,7 +50,7 @@ impl EngineInner {
         Some(submitted_at)
     }
 
-    fn record_plan_runtime_decode_execution(
+    pub(super) fn record_plan_runtime_decode_execution(
         &self,
         request_ids: &[RequestId],
         started_at: Instant,
@@ -58,18 +61,18 @@ impl EngineInner {
             let Some(sequence) = sequences.get_mut(request_id) else {
                 continue;
             };
+            // Mixed attempts leave scheduling open until they prove completion;
+            // unsupported/zero-submission attempts may still fall back or wait.
+            // The pure decode path already closed this interval before its call.
+            sequence.close_decode_scheduling(started_at);
             sequence.record_decode_execution(started_at, ended_at);
         }
     }
 
-    /// Executes one PlanRuntime decode cohort through the typed batch API.
-    /// Output cardinality and cache identity are validated before any request
-    /// publishes a sampled token or updated physical-resource handle.
-    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode(
+    pub(super) fn prepare_plan_runtime_decodes(
         &self,
         request_ids: &[RequestId],
-    ) -> Result<PlanRuntimeDecodeBatchOutcome> {
-        let mut rids = Vec::with_capacity(request_ids.len());
+    ) -> Vec<PlanRuntimeDecodeInput> {
         let mut inputs = Vec::with_capacity(request_ids.len());
         {
             let sequences = self.sequences.read();
@@ -87,20 +90,26 @@ impl EngineInner {
                 )
                 .with_logits_policy(sequence.model_decode_logits_policy());
                 inputs.push(input);
-                rids.push(rid.clone());
             }
         }
+        inputs
+    }
+
+    /// Executes one PlanRuntime decode cohort through the typed batch API.
+    /// Output cardinality and cache identity are validated before any request
+    /// publishes a sampled token or updated physical-resource handle.
+    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<PlanRuntimeDecodeBatchOutcome> {
+        let inputs = self.prepare_plan_runtime_decodes(request_ids);
         if inputs.is_empty() {
             return Ok(PlanRuntimeDecodeBatchOutcome::Completed { submitted_width: 0 });
         }
 
-        let input_cache_ids = inputs
+        let rids = inputs
             .iter()
-            .map(|input| input.kv_cache.cache_id())
-            .collect::<Vec<_>>();
-        let input_logits_policies = inputs
-            .iter()
-            .map(|input| input.logits_policy.clone())
+            .map(|input| input.request_id.clone())
             .collect::<Vec<_>>();
         let decode_execution_started_at = self.close_plan_runtime_decode_scheduling(&rids);
         let (outputs, postprocess_started_at) = match self
@@ -125,27 +134,47 @@ impl EngineInner {
             }
             Err(error) => return Err(error),
         };
-        if outputs.len() != rids.len() {
+        self.validate_plan_runtime_decode_outputs(&inputs, &outputs)?;
+        self.commit_plan_runtime_decode_outputs(&rids, outputs, postprocess_started_at)
+            .await?;
+        Ok(PlanRuntimeDecodeBatchOutcome::Completed {
+            submitted_width: rids.len(),
+        })
+    }
+
+    pub(super) fn validate_plan_runtime_decode_outputs(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        outputs: &[ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput],
+    ) -> Result<()> {
+        if outputs.len() != inputs.len() {
             return Err(FerrumError::internal(format!(
                 "PlanRuntime batch_decode returned {} outputs for {} requests",
                 outputs.len(),
-                rids.len()
+                inputs.len()
             )));
         }
-        for (index, (output, expected_cache_id)) in outputs.iter().zip(&input_cache_ids).enumerate()
-        {
+        for (index, (output, input)) in outputs.iter().zip(inputs).enumerate() {
+            let expected_cache_id = input.kv_cache.cache_id();
             let actual_cache_id = output.kv_cache.cache_id();
-            if &actual_cache_id != expected_cache_id {
+            if actual_cache_id != expected_cache_id {
                 return Err(FerrumError::internal(format!(
                     "PlanRuntime batch_decode output {index} returned cache `{actual_cache_id}`, expected `{expected_cache_id}`"
                 )));
             }
-            output.sampling_output.validate_for_policy(
-                &input_logits_policies[index],
-                self.model_executor.info().vocab_size,
-            )?;
+            output
+                .sampling_output
+                .validate_for_policy(&input.logits_policy, self.model_executor.info().vocab_size)?;
         }
+        Ok(())
+    }
 
+    pub(super) async fn commit_plan_runtime_decode_outputs(
+        &self,
+        rids: &[RequestId],
+        outputs: Vec<ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput>,
+        postprocess_started_at: Option<Instant>,
+    ) -> Result<()> {
         for (rid, output) in rids.iter().zip(outputs) {
             let next_token_result = {
                 let mut sequences = self.sequences.write();
@@ -201,9 +230,7 @@ impl EngineInner {
                 self.complete_request(rid, reason).await?;
             }
         }
-        Ok(PlanRuntimeDecodeBatchOutcome::Completed {
-            submitted_width: rids.len(),
-        })
+        Ok(())
     }
 
     pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode_adaptive(

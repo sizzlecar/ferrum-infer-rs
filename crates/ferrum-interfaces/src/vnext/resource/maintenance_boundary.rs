@@ -4,11 +4,11 @@ use super::{
     BackingChunkIdentity, CapacityDomainId, CapacityVector, DynamicBackingPackingEnvelope,
     DynamicBackingPoolId, DynamicPoolLiveOccupancyStatus, LogicalAdmissionCoordinatorId,
 };
-use crate::vnext::DeviceCapacityPressure;
+use crate::vnext::DynamicBackingPressure;
 
-pub const DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION: u32 = 1;
+pub const DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION: u32 = 2;
 
-/// One resident chunk as observed while every pool maintenance/state lock is
+/// One resident chunk as observed while the relevant maintenance/state locks are
 /// held and before a pressure-driven rebalance mutates residency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolMaintenanceBoundaryChunk {
@@ -57,7 +57,7 @@ impl DynamicPoolMaintenanceBoundaryChunk {
 }
 
 /// Event-bound physical and logical state for one pool at a failed device
-/// reservation. Consumers can recompute the complete reclaim frontier instead
+/// reservation or pool resident ceiling. Consumers can recompute its reclaim frontier instead
 /// of inferring it from a later health snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolMaintenanceBoundaryPool {
@@ -176,7 +176,11 @@ pub struct DynamicPoolMaintenanceBoundaryReceipt {
     pub(in crate::vnext::resource) logical_capacity_epoch: u64,
     pub(in crate::vnext::resource) plan_device_capacity_epoch: u64,
     pub(in crate::vnext::resource) process_device_capacity_epoch: u64,
-    pub(in crate::vnext::resource) pressure: DeviceCapacityPressure,
+    pub(in crate::vnext::resource) pressure: DynamicBackingPressure,
+    /// False records a fresh failed device reservation after this bounded
+    /// maintenance already reclaimed a resident pool. No allocator snapshot
+    /// or additional reclaim decision is claimed in that case.
+    pub(in crate::vnext::resource) reclaim_attempted: bool,
     pub(in crate::vnext::resource) planned_domains: Vec<CapacityDomainId>,
     pub(in crate::vnext::resource) protected_immediate: CapacityVector,
     pub(in crate::vnext::resource) protected_packing_envelopes: Vec<DynamicBackingPackingEnvelope>,
@@ -213,8 +217,12 @@ impl DynamicPoolMaintenanceBoundaryReceipt {
         self.process_device_capacity_epoch
     }
 
-    pub const fn pressure(&self) -> &DeviceCapacityPressure {
+    pub const fn pressure(&self) -> &DynamicBackingPressure {
         &self.pressure
+    }
+
+    pub const fn reclaim_attempted(&self) -> bool {
+        self.reclaim_attempted
     }
 
     pub fn planned_domains(&self) -> &[CapacityDomainId] {

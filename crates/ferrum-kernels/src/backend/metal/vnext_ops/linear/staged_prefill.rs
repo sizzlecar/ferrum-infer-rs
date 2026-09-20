@@ -565,8 +565,13 @@ impl Workspace {
 }
 
 pub(in super::super) fn dispatch_count(launch: LinearLaunch, workspace: Option<Workspace>) -> u64 {
-    launch.dispatch_count()
-        + u64::from(workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)))
+    if workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)) {
+        // Staging bypasses the plain projection plan: one dequantization and
+        // one GEMM cover the entire matrix, including any partial token tile.
+        2
+    } else {
+        launch.dispatch_count()
+    }
 }
 
 pub(in super::super) fn dispatch(

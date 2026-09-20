@@ -31,6 +31,11 @@ pub(super) fn encode(
     if invocation.participant_token_ranges().len() != invocation.participants().len() {
         return Err("CUDA native linear participant ranges are incomplete".into());
     }
+    let tokens = invocation.work_shape().immediate_tokens();
+    // Preserve the participant path when an aggregate batch exceeds the native
+    // launch extent. Each participant may still fit independently.
+    let packed_rows =
+        native_matrix::single_launch_rows(tokens).filter(|_| input_packed && output_packed);
     let mut regions = weight.regions;
     let weight_regions = regions.len();
     let scratch =
@@ -39,7 +44,8 @@ pub(super) fn encode(
     let mut key = CudaCommandReplayKeyBuilder::new(fingerprint, "vnext_native_dense_linear")
         .u64(rows)
         .u64(columns)
-        .u64(weight.parts.len() as u64);
+        .u64(weight.parts.len() as u64)
+        .boolean(packed_rows.is_some());
     key = weights::key(key, &weight.parts);
     for (index, (participant, range)) in invocation
         .participants()
@@ -75,6 +81,9 @@ pub(super) fn encode(
         if tokens == 0 || tokens > u16::MAX as u32 {
             return Err("CUDA native linear token count exceeds its launch extent".into());
         }
+        if packed_rows.is_some() {
+            continue;
+        }
         let packed = range.immediate_token_range();
         let source = range.source_token_range();
         let input_index = regions.len();
@@ -107,11 +116,30 @@ pub(super) fn encode(
             .u64(output_index as u64)
             .u32(tokens);
     }
+    if let Some(rows) = packed_rows {
+        let input = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            tokens,
+        )?);
+        let output = regions.len();
+        regions.push(shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            tokens,
+        )?);
+        launches.push((input, output, rows));
+        key = key.u64(input as u64).u64(output as u64).u32(rows);
+    }
     let participants = checked_u32(
         invocation.participants().len() as u64,
         "native linear participants",
     )?;
-    let tokens = invocation.work_shape().immediate_tokens();
     let output_stride = checked_u32(rows, "native linear output stride")?;
     let dispatches = (launches.len() as u64)
         .checked_mul(weights::dispatches(&weight.parts))
@@ -146,6 +174,8 @@ pub(super) fn encode(
         command.with_work_attribution(
             if participants == 1 {
                 DeviceBatchingForm::Scalar
+            } else if packed_rows.is_some() {
+                DeviceBatchingForm::Packed
             } else {
                 DeviceBatchingForm::ParticipantLoop
             },

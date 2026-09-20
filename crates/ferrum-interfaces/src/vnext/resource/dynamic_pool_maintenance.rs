@@ -325,22 +325,45 @@ where
         )
     }
 
-    fn capacity_wait_outcome(
+    pub(super) fn capacity_wait_outcome(
         &self,
         logical_snapshot: CapacityWaitSnapshot,
         blocked: DynamicDeviceCapacityBlocked,
-        maintenance_boundary: DynamicPoolMaintenanceBoundaryReceipt,
+        maintenance_boundary: Option<DynamicPoolMaintenanceBoundaryReceipt>,
+        protected_immediate: &CapacityVector,
+        protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        if maintenance_boundary.pressure() != &blocked.pressure
-            || maintenance_boundary.plan_device_capacity_epoch()
-                != blocked.availability.plan_epoch()
-            || maintenance_boundary.process_device_capacity_epoch()
-                != blocked.availability.process_epoch()
-        {
+        if maintenance_boundary.as_ref().is_some_and(|boundary| {
+            boundary.pressure().device_capacity() != Some(&blocked.pressure)
+                || boundary.plan_device_capacity_epoch() != blocked.availability.plan_epoch()
+                || boundary.process_device_capacity_epoch() != blocked.availability.process_epoch()
+        }) {
             return Err(invalid_resource(
                 "dynamic maintenance boundary differs from its capacity failure",
             ));
         }
+        let maintenance_boundary = match maintenance_boundary {
+            Some(boundary) => boundary,
+            None => DynamicPoolMaintenanceBoundaryReceipt {
+                schema_version: super::DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION,
+                coordinator_id: logical_snapshot.epochs().coordinator_id(),
+                logical_release_epoch: logical_snapshot.epochs().release_epoch(),
+                logical_capacity_epoch: logical_snapshot.epochs().capacity_epoch(),
+                plan_device_capacity_epoch: blocked.availability.plan_epoch(),
+                process_device_capacity_epoch: blocked.availability.process_epoch(),
+                pressure: blocked.pressure.clone().into(),
+                reclaim_attempted: false,
+                planned_domains: blocked.planned_domains.clone(),
+                protected_immediate: protected_immediate.clone(),
+                protected_packing_envelopes: protected_packing_envelopes.to_vec(),
+                pools: Vec::new(),
+                reclaim_candidate_chunks: 0,
+                reclaim_candidate_bytes: 0,
+                selected_chunks: Vec::new(),
+                selected_bytes: 0,
+                reclaim_sufficient: false,
+            },
+        };
         let logical_snapshot = logical_snapshot.narrow_to_domains(blocked.planned_domains)?;
         let mut observed = logical_snapshot.wait_condition().observed().to_vec();
         observed.push(blocked.availability.epoch_for_pressure(&blocked.pressure));
@@ -391,6 +414,27 @@ where
             .pools
             .maintain_pools_observed(intents, capacity_blocked)
         {
+            Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
+                let Some((rebalance, boundary)) =
+                    self.pools.reclaim_idle_chunks_for_pool_resident_pressure(
+                        &pressure,
+                        protected_immediate,
+                        protected_packing_envelopes,
+                    )?
+                else {
+                    return Err(VNextError::DynamicPoolResidentUnavailable(pressure));
+                };
+                // Reclaim is not an allocation permit. Retry once through the
+                // ordinary budget reservation and fresh packing checks. A
+                // competing reservation can now cause real device pressure;
+                // that bounded wait has no device-reclaim boundary to report.
+                let mut receipt = self
+                    .pools
+                    .maintain_pools_observed(retry_intents, capacity_blocked)?;
+                receipt.rebalance = Some(rebalance);
+                receipt.maintenance_boundary = Some(boundary);
+                Ok(receipt)
+            }
             Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
                 let planned_domains = capacity_blocked
                     .as_ref()
@@ -478,8 +522,9 @@ where
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
-                maintenance_boundary
-                    .expect("typed capacity rebalance failure retains its maintenance boundary"),
+                maintenance_boundary,
+                deferred.protected_immediate(),
+                deferred.protected_packing_envelopes(),
             ),
             Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
                 self.pool_resident_wait_outcome(logical_snapshot, pressure)
@@ -643,8 +688,9 @@ where
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
-                maintenance_boundary
-                    .expect("typed capacity rebalance failure retains its maintenance boundary"),
+                maintenance_boundary,
+                deferred.fit_requested(),
+                &[],
             ),
             Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
                 self.pool_resident_wait_outcome(logical_snapshot, pressure)

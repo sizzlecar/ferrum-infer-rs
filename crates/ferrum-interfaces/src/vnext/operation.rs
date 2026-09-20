@@ -13,6 +13,8 @@ mod dispatch_contract;
 mod foundation;
 mod identity;
 mod invocation;
+#[cfg(test)]
+pub(crate) use invocation::test_only_backing_window_coverage;
 mod provider;
 mod registry;
 mod resolved_value;
@@ -86,8 +88,8 @@ pub use registry::{
     BoundOperationProvider, BoundOperationProviderSet, OperationPlanningHandle,
     OperationPlanningRegistry, OperationProvider, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
-    ReusableExecutionWorkspaceAddress,
+    ReusableBindingResources, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress,
 };
 pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,

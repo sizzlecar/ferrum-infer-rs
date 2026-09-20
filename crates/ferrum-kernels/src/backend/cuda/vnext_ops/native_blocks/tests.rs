@@ -6,6 +6,8 @@ use crate::gguf_blocks::{
 use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 use half::f16;
 
+mod q4k;
+
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
     if format == GgufBlockFormat::Pq2_0 {
         assert_eq!((format.block_values(), format.block_bytes()), (128, 34));
@@ -287,7 +289,11 @@ fn native_matrix_launcher_preserves_mixed_dense_and_block_partitions() {
 }
 
 fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
-    for (format, columns) in [(GgufBlockFormat::Iq4Xs, 512), (GgufBlockFormat::Pq2_0, 384)] {
+    for (format, columns) in [
+        (GgufBlockFormat::Iq4Xs, 512),
+        (GgufBlockFormat::Pq2_0, 384),
+        (GgufBlockFormat::Q4K, 768),
+    ] {
         for rows in [1, 3, 8, 11] {
             mixed_matrix_rows::<T>(activation, format, columns, rows);
         }

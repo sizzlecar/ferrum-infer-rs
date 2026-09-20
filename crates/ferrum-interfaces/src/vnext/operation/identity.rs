@@ -63,7 +63,7 @@ impl BatchOperationParticipantIdentity {
 
 /// One immutable-plan node inside a physical command batch. Participant
 /// identities stay node-local even when several nodes share one submission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone)]
 pub struct BatchOperationNodeIdentity {
     node_index: u32,
     node_id: NodeId,
@@ -73,7 +73,58 @@ pub struct BatchOperationNodeIdentity {
     provider_execution_semantics: ProviderExecutionSemantics,
     work_shape_fingerprint: String,
     participants: Vec<BatchOperationParticipantIdentity>,
-    fingerprint: String,
+    fingerprint: OnceLock<String>,
+}
+
+impl PartialEq for BatchOperationNodeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.node_index == other.node_index
+            && self.node_id == other.node_id
+            && self.operation_id == other.operation_id
+            && self.provider_id == other.provider_id
+            && self.provider_implementation_fingerprint == other.provider_implementation_fingerprint
+            && self.provider_execution_semantics == other.provider_execution_semantics
+            && self.work_shape_fingerprint == other.work_shape_fingerprint
+            && self.participants == other.participants
+    }
+}
+
+impl Eq for BatchOperationNodeIdentity {}
+
+impl Serialize for BatchOperationNodeIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Preserve the public wire representation, including field order. A
+        // fingerprint is evidence derived from these immutable fields, not
+        // additional dispatch authority or mutable identity state.
+        #[derive(Serialize)]
+        #[serde(rename = "BatchOperationNodeIdentity")]
+        struct Wire<'a> {
+            node_index: u32,
+            node_id: &'a NodeId,
+            operation_id: &'a OperationId,
+            provider_id: &'a ProviderId,
+            provider_implementation_fingerprint: &'a str,
+            provider_execution_semantics: ProviderExecutionSemantics,
+            work_shape_fingerprint: &'a str,
+            participants: &'a [BatchOperationParticipantIdentity],
+            fingerprint: &'a str,
+        }
+        Wire {
+            node_index: self.node_index,
+            node_id: &self.node_id,
+            operation_id: &self.operation_id,
+            provider_id: &self.provider_id,
+            provider_implementation_fingerprint: &self.provider_implementation_fingerprint,
+            provider_execution_semantics: self.provider_execution_semantics,
+            work_shape_fingerprint: &self.work_shape_fingerprint,
+            participants: &self.participants,
+            fingerprint: self.fingerprint(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl BatchOperationNodeIdentity {
@@ -111,6 +162,20 @@ impl BatchOperationNodeIdentity {
                 "batch node identity is empty, non-canonical, or differs from its participant projections",
             ));
         }
+        Ok(Self {
+            node_index,
+            node_id,
+            operation_id,
+            provider_id,
+            provider_implementation_fingerprint,
+            provider_execution_semantics,
+            work_shape_fingerprint,
+            participants,
+            fingerprint: OnceLock::new(),
+        })
+    }
+
+    fn calculate_fingerprint(&self) -> String {
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
@@ -123,31 +188,25 @@ impl BatchOperationNodeIdentity {
             work_shape_fingerprint: &'a str,
             participants: &'a [BatchOperationParticipantIdentity],
         }
-        let fingerprint = canonical_operation_fingerprint(
+        canonical_operation_fingerprint(
             &FingerprintInput {
                 domain: "ferrum.runtime-vnext.batch-operation-node-identity.v2",
-                node_index,
-                node_id: &node_id,
-                operation_id: &operation_id,
-                provider_id: &provider_id,
-                provider_implementation_fingerprint: &provider_implementation_fingerprint,
-                provider_execution_semantics,
-                work_shape_fingerprint: &work_shape_fingerprint,
-                participants: &participants,
+                node_index: self.node_index,
+                node_id: &self.node_id,
+                operation_id: &self.operation_id,
+                provider_id: &self.provider_id,
+                provider_implementation_fingerprint: &self.provider_implementation_fingerprint,
+                provider_execution_semantics: self.provider_execution_semantics,
+                work_shape_fingerprint: &self.work_shape_fingerprint,
+                participants: &self.participants,
             },
             "batch node identity encode failed",
-        )?;
-        Ok(Self {
-            node_index,
-            node_id,
-            operation_id,
-            provider_id,
-            provider_implementation_fingerprint,
-            provider_execution_semantics,
-            work_shape_fingerprint,
-            participants,
-            fingerprint,
-        })
+        )
+        // This private schema consists solely of integers, strings, fixed
+        // enums and typed participant envelopes; the SHA writer cannot fail.
+        // All identity validation still happens in from_validated, before a
+        // caller can dispatch or request this derived evidence.
+        .expect("validated node identity has infallible canonical serialization")
     }
 
     pub const fn node_index(&self) -> u32 {
@@ -183,7 +242,8 @@ impl BatchOperationNodeIdentity {
     }
 
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        self.fingerprint
+            .get_or_init(|| self.calculate_fingerprint())
     }
 
     pub(super) fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
@@ -962,7 +1022,9 @@ mod batch_operation_identity_fingerprint_tests {
             provider_execution_semantics: ProviderExecutionSemantics::bitwise_eager_and_replay(),
             work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
             participants: Vec::new(),
-            fingerprint: std::iter::repeat_n(marker, 64).collect(),
+            fingerprint: std::sync::OnceLock::from(
+                std::iter::repeat_n(marker, 64).collect::<String>(),
+            ),
         }
     }
 
@@ -1000,3 +1062,6 @@ mod batch_operation_identity_fingerprint_tests {
         assert!(!encoded.contains("participants"));
     }
 }
+
+#[cfg(test)]
+mod lazy_fingerprint_tests;

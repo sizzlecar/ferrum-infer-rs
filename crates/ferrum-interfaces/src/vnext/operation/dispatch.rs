@@ -1568,10 +1568,19 @@ impl OperationDispatch {
                                 ))
                             })?;
                         let provider = &providers[binding_node_index];
+                        let identity_stage = SubmissionWaveDispatchStageTimer::start(
+                            timing_sink,
+                            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+                        );
                         let node_identity = batch_identity
                             .materialize_node(binding_node_index)
                             .map_err(SubmissionWaveDispatchError::Contract)?;
-                        let invocation = BatchedOperationInvocation::from_wave_node(
+                        drop(identity_stage);
+                        let invocation_stage = SubmissionWaveDispatchStageTimer::start(
+                            timing_sink,
+                            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+                        );
+                        let invocation = BatchedOperationInvocation::from_reusable_wave_node(
                             runtime,
                             resolved,
                             provider.dispatch(),
@@ -1582,8 +1591,13 @@ impl OperationDispatch {
                             active_bindings.clone(),
                         )
                         .map_err(SubmissionWaveDispatchError::Contract)?;
+                        drop(invocation_stage);
                         let expected_phase = invocation.operation().profile_phase;
                         let program_binding = invocation.program_binding().cloned();
+                        let binding_stage = SubmissionWaveDispatchStageTimer::start(
+                            timing_sink,
+                            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+                        );
                         let bindings = match provider
                             .provider()
                             .encode_reusable_execution_bindings(invocation)
@@ -1603,6 +1617,11 @@ impl OperationDispatch {
                                 ));
                             }
                         };
+                        drop(binding_stage);
+                        let validation_stage = SubmissionWaveDispatchStageTimer::start(
+                            timing_sink,
+                            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+                        );
                         let program_binding_count = bindings.program_binding_count();
                         validate_program_binding_patch(
                             resolved,
@@ -1612,6 +1631,7 @@ impl OperationDispatch {
                             &mut program_binding_resources,
                         )
                         .map_err(SubmissionWaveDispatchError::Contract)?;
+                        drop(validation_stage);
                         let (mut node_program_bindings, mut dynamic_bindings, mut result_bindings) =
                             bindings.into_parts();
                         program_bindings.append(&mut node_program_bindings);
@@ -1681,9 +1701,18 @@ impl OperationDispatch {
                     )));
                 }
                 let provider = &providers[node_index];
+                let identity_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+                );
                 let node_identity = batch_identity
                     .materialize_node(node_index)
                     .map_err(SubmissionWaveDispatchError::Contract)?;
+                drop(identity_stage);
+                let invocation_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::NodeInvocationConstruct,
+                );
                 let invocation = BatchedOperationInvocation::from_wave_node(
                     runtime,
                     resolved,
@@ -1695,6 +1724,7 @@ impl OperationDispatch {
                     active_bindings.clone(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+                drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
                 let operation = match provider.provider().encode_selected(invocation) {
@@ -1711,6 +1741,10 @@ impl OperationDispatch {
                         )));
                     }
                 };
+                let validation_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+                );
                 let program_binding_count = operation.program_binding_count();
                 validate_program_binding_patch(
                     resolved,
@@ -1720,6 +1754,7 @@ impl OperationDispatch {
                     &mut program_binding_resources,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+                drop(validation_stage);
                 let operation_command_count = operation
                     .dynamic_binding_count()
                     .checked_add(1)
@@ -1758,9 +1793,19 @@ impl OperationDispatch {
                 )));
             }
         } else {
+            let identity_stage = SubmissionWaveDispatchStageTimer::start(
+                timing_sink,
+                SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+            );
+            let node_identities = batch_identity.nodes();
+            drop(identity_stage);
             for (node_index, (provider, node_identity)) in
-                providers.iter().zip(batch_identity.nodes()).enumerate()
+                providers.iter().zip(node_identities).enumerate()
             {
+                let invocation_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::NodeInvocationConstruct,
+                );
                 let invocation = BatchedOperationInvocation::from_wave_node(
                     runtime,
                     resolved,
@@ -1772,6 +1817,7 @@ impl OperationDispatch {
                     active_bindings.clone(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+                drop(invocation_stage);
                 let expected_phase = invocation.operation().profile_phase;
                 let program_binding = invocation.program_binding().cloned();
                 let operation = match provider.provider().encode_selected(invocation) {
@@ -1788,6 +1834,10 @@ impl OperationDispatch {
                     )));
                     }
                 };
+                let validation_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+                );
                 let program_binding_count = operation.program_binding_count();
                 validate_program_binding_patch(
                     resolved,
@@ -1797,6 +1847,7 @@ impl OperationDispatch {
                     &mut program_binding_resources,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+                drop(validation_stage);
                 let operation_command_count = operation
                     .dynamic_binding_count()
                     .checked_add(1)
@@ -1830,6 +1881,10 @@ impl OperationDispatch {
                 encoded_operations.push((node_index, dynamic_bindings, compute, result_bindings));
             }
         }
+        let validation_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+        );
         if let Some(layout) = completion.wave().claimed_backing().program_binding_layout() {
             let selected_plan_nodes = completion
                 .wave()
@@ -1868,6 +1923,7 @@ impl OperationDispatch {
                 "device runtime changed the program binding boundary cardinality illegally",
             )));
         }
+        drop(validation_stage);
         encoded_provider_command_count = encoded_provider_command_count
             .checked_add(coalesced_program_bindings.len())
             .ok_or_else(|| {

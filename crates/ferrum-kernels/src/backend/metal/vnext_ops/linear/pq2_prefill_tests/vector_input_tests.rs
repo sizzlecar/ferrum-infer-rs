@@ -128,6 +128,7 @@ fn pq2_vector_input_production_dispatch_uses_actual_region_and_workspace_binding
             }),
             transform_workspace: None,
             transformed_plan: TransformedLinearPlan::Single,
+            plain_plan: PlainLinearPlan::Single,
         };
         launch
             .bind_hadamard_workspace(&pipelines, &regions, 0, WORKSPACE_OFFSET)

@@ -239,6 +239,10 @@ pub enum SubmissionWaveDispatchStage {
     ContractValidateAndReserve,
     BackingAndInputEncode,
     ProviderNodeEncode,
+    NodeIdentityMaterialize,
+    NodeInvocationConstruct,
+    ProviderDynamicBindingEncode,
+    BindingValidateAndCoalesce,
     LaneReserve,
     DeviceRuntimeSubmit,
     CompletionArm,
@@ -335,11 +339,17 @@ mod submission_wave_dispatch_timing_tests {
 
     #[test]
     fn disabled_submission_timing_does_not_record() {
-        let timer = SubmissionWaveDispatchStageTimer::start(
-            &DisabledPanicSink,
+        for stage in [
             SubmissionWaveDispatchStage::ProviderNodeEncode,
-        );
-        drop(timer);
+            SubmissionWaveDispatchStage::NodeIdentityMaterialize,
+            SubmissionWaveDispatchStage::NodeInvocationConstruct,
+            SubmissionWaveDispatchStage::ProviderDynamicBindingEncode,
+            SubmissionWaveDispatchStage::BindingValidateAndCoalesce,
+        ] {
+            let timer = SubmissionWaveDispatchStageTimer::start(&DisabledPanicSink, stage);
+            assert!(timer.started.is_none());
+            drop(timer);
+        }
 
         assert!(!DisabledPanicSink::ENABLED);
     }

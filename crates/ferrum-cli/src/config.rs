@@ -231,6 +231,11 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub max_batched_tokens: Option<usize>,
 
+    /// Native plan-runtime prefill/decode policy (`FERRUM_PREFILL_DECODE_EXECUTION`).
+    /// Legacy executors retain their existing execution policy.
+    #[serde(default)]
+    pub prefill_decode_execution: Option<ferrum_types::PrefillDecodeExecution>,
+
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -243,6 +248,11 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`.
     #[serde(default)]
     pub scheduler_active_decode_prefill_chunk: Option<usize>,
+
+    /// Total prefill tokens per scheduler iteration with active decode,
+    /// equivalent to `FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET`. Zero disables it.
+    #[serde(default)]
+    pub scheduler_active_decode_prefill_token_budget: Option<usize>,
 
     /// Prefix-state cache override, equivalent to `FERRUM_PREFIX_CACHE`.
     /// When absent, serve requests native caching and run leaves it disabled.
@@ -454,6 +464,12 @@ impl RuntimeCliConfig {
             "FERRUM_MAX_BATCHED_TOKENS",
             self.max_batched_tokens,
         );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_PREFILL_DECODE_EXECUTION",
+            self.prefill_decode_execution
+                .map(ferrum_types::PrefillDecodeExecution::as_runtime_value),
+        );
         push_usize_entry(
             &mut entries,
             "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
@@ -463,6 +479,11 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
             self.scheduler_active_decode_prefill_chunk,
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
+            self.scheduler_active_decode_prefill_token_budget,
         );
         push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
         push_string_entry(
@@ -1011,9 +1032,11 @@ mod tests {
             recurrent_state_max_slots: Some(16),
             attention_policy: Some(AttentionExecutionPolicy::NativeAdaptive),
             max_batched_tokens: Some(2048),
+            prefill_decode_execution: Some(ferrum_types::PrefillDecodeExecution::Mixed),
             scheduler_prefill_first_until_active: Some(16),
             prefix_rendezvous_max_wait_ms: std::num::NonZeroU64::new(321),
             scheduler_active_decode_prefill_chunk: Some(24),
+            scheduler_active_decode_prefill_token_budget: Some(96),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
@@ -1117,6 +1140,10 @@ mod tests {
             .contains(&RuntimeConfigEffect::Performance));
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
+            entry("FERRUM_PREFILL_DECODE_EXECUTION").effective_value,
+            "mixed"
+        );
+        assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "16"
         );
@@ -1124,6 +1151,13 @@ mod tests {
             entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
             "24"
         );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET").effective_value,
+            "96"
+        );
+        assert!(entry("FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET")
+            .affects
+            .contains(&RuntimeConfigEffect::Performance));
         assert_eq!(
             entry("FERRUM_LAYER_SPLIT_PIPELINE_MODE").effective_value,
             "batch"

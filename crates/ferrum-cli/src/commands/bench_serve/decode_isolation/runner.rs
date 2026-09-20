@@ -3,8 +3,8 @@ use super::super::{
     BenchServeCommand, DecodeStreamProgress, ObservedRequest, PromptCase, RunContext,
 };
 use ferrum_bench_core::decode_isolation::{
-    analyze_decode_isolation, DecodeEventTimeline, DecodeIsolationConfig,
-    DecodeIsolationEvidenceValidity, DecodeIsolationOrchestrationEvidence,
+    analyze_decode_isolation, decode_isolation_throughput, DecodeEventTimeline,
+    DecodeIsolationConfig, DecodeIsolationEvidenceValidity, DecodeIsolationOrchestrationEvidence,
     DecodeIsolationRequestEvidence, DecodeIsolationRunReport,
 };
 use ferrum_bench_core::{
@@ -400,7 +400,7 @@ fn finish_report(
     aggressor: Option<ObservedRequest>,
     mut invalid_reasons: Vec<String>,
 ) -> DecodeIsolationRunReport {
-    let incumbent_evidence: Vec<_> = incumbents
+    let mut incumbent_evidence: Vec<_> = incumbents
         .iter()
         .map(|request| {
             request
@@ -415,7 +415,7 @@ fn finish_report(
                 .unwrap_or_else(|| missing_evidence("incumbent"))
         })
         .collect();
-    let aggressor_evidence = aggressor
+    let mut aggressor_evidence = aggressor
         .as_ref()
         .map(|request| {
             request_evidence(
@@ -498,8 +498,41 @@ fn finish_report(
     } else {
         (None, None)
     };
-    let all_valid =
+    let mut all_valid =
         all_valid && metrics.is_some() && aggressor_time_to_first_output_event_ms.is_some();
+    let throughput = if all_valid {
+        let requests: Vec<_> = incumbents
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(aggressor.iter())
+            .collect();
+        let evidence: Vec<_> = incumbent_evidence
+            .iter()
+            .chain(std::iter::once(&aggressor_evidence))
+            .cloned()
+            .collect();
+        match measured_duration_ms(&requests)
+            .and_then(|duration| decode_isolation_throughput(&evidence, duration))
+        {
+            Ok(throughput) => Some(throughput),
+            Err(error) => {
+                invalid_reasons.push(format!("invalid throughput evidence: {error}"));
+                all_valid = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !all_valid {
+        for evidence in incumbent_evidence
+            .iter_mut()
+            .chain(std::iter::once(&mut aggressor_evidence))
+        {
+            evidence.client_time_to_first_output_event_ms = None;
+            evidence.client_e2e_ms = None;
+        }
+    }
     DecodeIsolationRunReport {
         repeat,
         orchestration: DecodeIsolationOrchestrationEvidence {
@@ -521,11 +554,30 @@ fn finish_report(
             all_valid,
             invalid_reasons,
         },
-        metrics,
-        aggressor_time_to_first_output_event_ms,
+        metrics: all_valid.then_some(metrics).flatten(),
+        aggressor_time_to_first_output_event_ms: all_valid
+            .then_some(aggressor_time_to_first_output_event_ms)
+            .flatten(),
+        throughput,
         incumbents: incumbent_evidence,
         aggressor: aggressor_evidence,
     }
+}
+
+fn measured_duration_ms(requests: &[&ObservedRequest]) -> std::result::Result<f64, String> {
+    let origin = requests
+        .iter()
+        .map(|request| request.started_at)
+        .min()
+        .ok_or("missing measured requests")?;
+    let mut duration = 0.0_f64;
+    for request in requests {
+        if !request.record.e2e_ms.is_finite() || request.record.e2e_ms <= 0.0 {
+            return Err("invalid measured request duration".into());
+        }
+        duration = duration.max(elapsed_ms(origin, request.started_at) + request.record.e2e_ms);
+    }
+    Ok(duration)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -563,7 +615,13 @@ fn record_contract_valid(
 ) -> bool {
     record.success
         && record.output_token_count_source == OutputTokenCountSource::Usage
+        && record.server_input_tokens.is_some_and(|tokens| tokens > 0)
         && usize::try_from(record.output_tokens).ok() == Some(expected_output_tokens)
+        && record.ttft_ms.is_finite()
+        && record.ttft_ms >= 0.0
+        && record.e2e_ms.is_finite()
+        && record.e2e_ms > 0.0
+        && record.ttft_ms <= record.e2e_ms
         && output_event_timing_valid(record)
 }
 
@@ -587,6 +645,7 @@ fn request_evidence(
         success: request.record.success,
         contract_valid: record_contract_valid(&request.record, expected_output_tokens),
         input_tokens: request.record.input_tokens,
+        usage_input_tokens: request.record.server_input_tokens,
         usage_output_tokens: (request.record.output_token_count_source
             == OutputTokenCountSource::Usage)
             .then_some(request.record.output_tokens),
@@ -602,6 +661,8 @@ fn request_evidence(
             .itl_evidence
             .transport_coalesced_output_chunks,
         output_event_timing_valid,
+        client_time_to_first_output_event_ms: Some(request.record.ttft_ms),
+        client_e2e_ms: Some(request.record.e2e_ms),
         quality_issues: request.record.quality_issues.clone(),
     }
 }
@@ -615,12 +676,15 @@ fn missing_evidence(role: &str) -> DecodeIsolationRequestEvidence {
         success: false,
         contract_valid: false,
         input_tokens: 0,
+        usage_input_tokens: None,
         usage_output_tokens: None,
         output_token_count_source: "none".to_string(),
         observable_output_events: 0,
         observable_output_intervals: 0,
         transport_coalesced_output_chunks: 0,
         output_event_timing_valid: false,
+        client_time_to_first_output_event_ms: None,
+        client_e2e_ms: None,
         quality_issues,
     }
 }
@@ -878,7 +942,7 @@ mod tests {
         usage: usize,
     ) {
         let usage = format!(
-            "data: {{\"id\":\"chatcmpl-{request_index}\",\"choices\":[],\"usage\":{{\"completion_tokens\":{usage}}}}}\n\n"
+            "data: {{\"id\":\"chatcmpl-{request_index}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":{usage}}}}}\n\n"
         );
         let _ = tx.send(Ok(Bytes::from(usage))).await;
         let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
@@ -894,19 +958,20 @@ mod tests {
             aggressor_input_source: "test".to_string(),
             aggressor_scheduled_chunks: 4,
             aggressor_output_tokens: 1,
-            aggregate_kv_budget_tokens: 1024,
-            aggregate_kv_budget_blocks: 64,
+            aggregate_kv_budget_tokens: Some(1024),
+            aggregate_kv_budget_blocks: Some(64),
             estimated_unrounded_aggregate_kv_tokens: 400,
-            estimated_aggregate_kv_tokens: 416,
-            estimated_aggregate_kv_blocks: 26,
+            estimated_aggregate_kv_tokens: Some(416),
+            estimated_aggregate_kv_blocks: Some(26),
             capabilities: DecodeIsolationCapabilities {
                 effective_max_concurrent: 3,
                 maximum_scheduled_tokens: 128,
                 max_model_length: 512,
-                kv_capacity_tokens: 1152,
+                kv_capacity_tokens: Some(1152),
                 selected_kv_capacity_tokens: Some(512),
-                kv_block_size_tokens: 16,
+                kv_block_size_tokens: Some(16),
                 kv_block_size_source: "test".to_string(),
+                native_sequence_state: None,
             },
             contract: DecodeIsolationScenarioContract {
                 baseline_output_events_per_incumbent: 2,
@@ -915,8 +980,8 @@ mod tests {
                 interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
                 post_aggressor_observable_progress_required_per_incumbent: true,
                 minimum_aggressor_scheduled_chunks: 4,
-                kv_capacity_headroom_numerator: 9,
-                kv_capacity_headroom_denominator: 10,
+                kv_capacity_headroom_numerator: Some(9),
+                kv_capacity_headroom_denominator: Some(10),
                 invalid_evidence_policy: DecodeIsolationErrorPolicy::EmitDiagnostics,
                 warmup_failure_always_fatal: true,
                 measured_error_rate_limit: None,
@@ -1013,7 +1078,7 @@ mod tests {
             let run = prepared(1);
             let prompts = run.warmups.into_iter().chain(run.incumbents).collect();
             let record = if open_loop {
-                run_open_loop(&ctx, prompts, 1, 1000.0, "sampling", 0).await
+                run_open_loop(&ctx, prompts, 1, 1000.0, "sampling", 0, Some(42)).await
             } else {
                 run_closed_loop(&ctx, prompts, 1, 1, "sampling", 0).await
             };
@@ -1055,7 +1120,7 @@ mod tests {
             ttft_ms: 1.0,
             e2e_ms: 2.0,
             input_tokens: 8,
-            server_input_tokens: None,
+            server_input_tokens: Some(10),
             output_tokens: usage_tokens,
             output_token_count_source: OutputTokenCountSource::Usage,
             itl_evidence: RequestItlEvidence::sse(
@@ -1100,6 +1165,51 @@ mod tests {
         assert!(!evidence.contract_valid);
     }
 
+    #[test]
+    fn usage_and_client_duration_are_required_for_performance_evidence() {
+        let record = request_record(4, 3, 0);
+        for input in [None, Some(0)] {
+            let mut invalid = record.clone();
+            invalid.server_input_tokens = input;
+            assert!(!record_contract_valid(&invalid, 4));
+        }
+        for (ttft, e2e) in [
+            (3.0, 2.0),
+            (f64::NAN, 2.0),
+            (1.0, f64::INFINITY),
+            (0.0, 0.0),
+        ] {
+            let mut invalid = record.clone();
+            invalid.ttft_ms = ttft;
+            invalid.e2e_ms = e2e;
+            assert!(!record_contract_valid(&invalid, 4));
+        }
+        assert!(!record_contract_valid(&request_record(5, 3, 0), 4));
+        assert!(!record_contract_valid(&request_record(0, 0, 0), 4));
+    }
+
+    #[test]
+    fn throughput_duration_spans_overlapping_requests_instead_of_summing_them() {
+        let start = Instant::now();
+        let mut incumbent = ObservedRequest {
+            record: request_record(4, 3, 0),
+            started_at: start,
+            output_event_times: vec![],
+        };
+        incumbent.record.e2e_ms = 100.0;
+        let mut aggressor = ObservedRequest {
+            record: request_record(1, 1, 0),
+            started_at: start + Duration::from_millis(40),
+            output_event_times: vec![],
+        };
+        aggressor.record.e2e_ms = 80.0;
+        assert_eq!(
+            measured_duration_ms(&[&aggressor, &incumbent]).unwrap(),
+            120.0
+        );
+        assert!(measured_duration_ms(&[]).is_err());
+    }
+
     #[tokio::test]
     async fn progress_wait_distinguishes_ready_finished_and_timeout() {
         let (tx, mut rx) = watch::channel(DecodeStreamProgress::default());
@@ -1139,6 +1249,14 @@ mod tests {
         .await;
         assert!(report.validity.all_valid, "{:?}", report.validity);
         assert!(report.metrics.is_some());
+        let throughput = report.throughput.as_ref().unwrap();
+        assert_eq!(throughput.usage_output_tokens, 7);
+        assert_eq!(throughput.usage_input_tokens, 20);
+        assert!(throughput.duration_ms >= report.incumbents[0].client_e2e_ms.unwrap());
+        assert!(report
+            .aggressor
+            .client_time_to_first_output_event_ms
+            .is_some());
         assert!(
             report
                 .orchestration
@@ -1214,6 +1332,11 @@ mod tests {
         assert!(!report.validity.all_valid);
         assert!(report.metrics.is_none());
         assert!(report.aggressor_time_to_first_output_event_ms.is_none());
+        assert!(report.throughput.is_none());
+        assert!(report
+            .incumbents
+            .iter()
+            .all(|request| request.client_e2e_ms.is_none()));
         assert!(report.orchestration.all_tasks_drained);
     }
 
