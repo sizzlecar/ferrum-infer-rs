@@ -194,6 +194,20 @@ impl Fixture {
         queue: &CommandQueueRef,
         repetitions: usize,
     ) -> f64 {
+        self.run_pipeline_with_dispatch(pipeline, queue, repetitions, |encoder, params| {
+            dispatch_linear_grid(encoder, params, dispatch);
+        })
+    }
+
+    /// Test candidates can change output tiling without changing production's
+    /// dispatch enum or duplicating the offset/guard fixture's buffer binding.
+    pub(super) fn run_pipeline_with_dispatch(
+        &self,
+        pipeline: &ComputePipelineState,
+        queue: &CommandQueueRef,
+        repetitions: usize,
+        dispatch: impl Fn(&ComputeCommandEncoderRef, LinearParams),
+    ) -> f64 {
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(pipeline);
@@ -207,7 +221,7 @@ impl Fixture {
         );
         bind_native_block(encoder, GgufBlockFormat::Pq2_0, 4);
         for _ in 0..repetitions {
-            dispatch_linear_grid(encoder, self.params, dispatch);
+            dispatch(encoder, self.params);
         }
         encoder.end_encoding();
         command.commit();
