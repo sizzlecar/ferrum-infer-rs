@@ -204,6 +204,8 @@ pub(super) struct MetalNativeBlockPipelines {
     pub(super) pq2_linear_f32_f16: ComputePipelineState,
     pub(super) pq2_linear_f32_complete: Option<ComputePipelineState>,
     pub(super) pq2_linear_f32_f16_complete: Option<ComputePipelineState>,
+    pub(super) pq2_linear_f32_complete_aligned_scale: Option<ComputePipelineState>,
+    pub(super) pq2_linear_f32_f16_complete_aligned_scale: Option<ComputePipelineState>,
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
@@ -399,6 +401,12 @@ impl MetalNativeBlockPipelines {
             }),
             pq2_linear_f32_f16_complete: optional_pq2_gemv_pipeline(device, || {
                 pipeline("vnext_pq2_linear_f32_f16_complete")
+            }),
+            pq2_linear_f32_complete_aligned_scale: optional_pq2_gemv_pipeline(device, || {
+                pipeline("vnext_pq2_linear_f32_complete_aligned_scale")
+            }),
+            pq2_linear_f32_f16_complete_aligned_scale: optional_pq2_gemv_pipeline(device, || {
+                pipeline("vnext_pq2_linear_f32_f16_complete_aligned_scale")
             }),
             shared,
             iq4xs_group_dot_f16: [

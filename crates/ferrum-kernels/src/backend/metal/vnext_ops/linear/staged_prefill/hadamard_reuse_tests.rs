@@ -18,6 +18,261 @@ fn pq2_weights(width: usize, columns: usize, phase: usize) -> Vec<u8> {
     bytes
 }
 
+struct GatedDeltaProjectionCase {
+    regions: Vec<MetalBufferRegion>,
+    launches: Vec<LinearLaunch>,
+    initial: Vec<u8>,
+    immutable: Vec<Vec<u8>>,
+    activation_type: ElementType,
+    output_offset: usize,
+    output_end: usize,
+    transform_offset: usize,
+    transform_end: usize,
+}
+
+impl GatedDeltaProjectionCase {
+    fn new(
+        runtime: &MetalDeviceRuntime,
+        pipelines: &MetalLinearPipelines,
+        rows: usize,
+        width: usize,
+        leaves: &[usize],
+        activation_type: ElementType,
+    ) -> Self {
+        assert!(matches!(leaves.len(), 2 | 4));
+        let output_width = leaves.iter().sum::<usize>();
+        let element_bytes = activation_type.size_bytes() as usize;
+        let encode_value = |value: f32| match activation_type {
+            ElementType::F16 => f16::from_f32(value).to_le_bytes().to_vec(),
+            ElementType::F32 => value.to_le_bytes().to_vec(),
+            _ => unreachable!(),
+        };
+        let input_offset = 64_usize;
+        let output_offset = input_offset + rows * width * element_bytes + 64;
+        let output_end = output_offset + rows * output_width * element_bytes;
+        let transform_offset = align_up_bytes((output_end + 64) as u64, 64).unwrap();
+        let transform_end = transform_offset as usize + rows * width * 4;
+        let mut initial = vec![0xa5_u8; transform_end + 64];
+        for index in 0..rows * width {
+            let start = input_offset + index * element_bytes;
+            initial[start..start + element_bytes]
+                .copy_from_slice(&encode_value((index as f32 * 0.031).sin() * 0.125));
+        }
+        for value in initial[output_offset..output_end].chunks_exact_mut(element_bytes) {
+            value.copy_from_slice(&encode_value(f32::NAN));
+        }
+        let signs = (0..width)
+            .map(|index| if index % 3 == 0 { -1.0_f32 } else { 1.0 })
+            .collect::<Vec<_>>();
+        let mut regions = vec![region(runtime, "gdn.scratch", &initial, ElementType::U8)];
+        for (index, &columns) in leaves.iter().enumerate() {
+            let weights = if index < 2 {
+                pq2_weights(width, columns, index)
+            } else {
+                (0..width * columns)
+                    .flat_map(|value| {
+                        f16::from_f32(if (value + index) % 3 == 0 {
+                            -0.03125
+                        } else {
+                            0.015625
+                        })
+                        .to_le_bytes()
+                    })
+                    .collect()
+            };
+            regions.push(region(
+                runtime,
+                &format!("gdn.projection.{index}"),
+                &weights,
+                if index < 2 {
+                    ElementType::U8
+                } else {
+                    ElementType::F16
+                },
+            ));
+        }
+        let signs_region = regions.len();
+        regions.push(region(runtime, "gdn.signs", &signs, ElementType::F32));
+        let immutable = regions[1..].iter().map(bytes).collect::<Vec<_>>();
+        let mut column_offset = 0_u32;
+        let launches = leaves
+            .iter()
+            .enumerate()
+            .map(|(index, &columns)| {
+                let mut launch = linear_launch_typed(
+                    PreparedLinearPart {
+                        region: index + 1,
+                        format: if index < 2 {
+                            LinearPhysicalFormat::Native(GgufBlockFormat::Pq2_0)
+                        } else {
+                            LinearPhysicalFormat::DenseF16
+                        },
+                        output_offset: column_offset,
+                        out_features: columns as u32,
+                        transform: (index < 2).then_some(HadamardTransform {
+                            block_size: 128,
+                            signs_region: Some(signs_region),
+                            inverse: false,
+                            permutation: None,
+                        }),
+                    },
+                    0,
+                    0,
+                    rows as u64,
+                    width as u64,
+                    output_width as u64,
+                    input_offset as u64,
+                    output_offset as u64,
+                    activation_type,
+                )
+                .unwrap();
+                launch
+                    .bind_hadamard_workspace(pipelines, &regions, 0, transform_offset)
+                    .unwrap();
+                column_offset += columns as u32;
+                launch
+            })
+            .collect::<Vec<_>>();
+        validate_launch_regions_with_raw_workspace(&regions, &launches, &[0]).unwrap();
+        assert_eq!(
+            projection_steps(&launches, &regions)
+                .map(|step| step.reuse_hadamard)
+                .collect::<Vec<_>>(),
+            (0..leaves.len())
+                .map(|index| index == 1)
+                .collect::<Vec<_>>()
+        );
+        let fixture = Self {
+            regions,
+            launches,
+            initial,
+            immutable,
+            activation_type,
+            output_offset,
+            output_end,
+            transform_offset: transform_offset as usize,
+            transform_end,
+        };
+        assert_eq!(
+            fixture.dispatch_count(true),
+            fixture.dispatch_count(false) - 1,
+            "exactly one of the two input transforms remains"
+        );
+        fixture
+    }
+
+    fn reset(&self) {
+        overwrite(&self.regions[0], &self.initial);
+    }
+
+    fn dispatch_count(&self, reuse: bool) -> u64 {
+        if reuse {
+            projection_steps(&self.launches, &self.regions)
+                .map(|step| step.dispatch_count(None))
+                .sum()
+        } else {
+            self.launches
+                .iter()
+                .map(|&launch| dispatch_count(launch, None))
+                .sum()
+        }
+    }
+
+    fn encode(
+        &self,
+        pipelines: &MetalLinearPipelines,
+        encoder: &ComputeCommandEncoderRef,
+        reuse: bool,
+    ) {
+        if reuse {
+            for step in projection_steps(&self.launches, &self.regions) {
+                step.encode(pipelines, encoder, &self.regions, None);
+            }
+        } else {
+            // The prior GDN projection loop, including its staging fallback.
+            for &launch in &self.launches {
+                dispatch(pipelines, encoder, &self.regions, launch, None);
+            }
+        }
+    }
+
+    fn checked_output(&self) -> Vec<u8> {
+        let actual = bytes(&self.regions[0]);
+        assert_eq!(
+            &actual[..self.output_offset],
+            &self.initial[..self.output_offset]
+        );
+        assert_eq!(
+            &actual[self.output_end..self.transform_offset],
+            &self.initial[self.output_end..self.transform_offset]
+        );
+        assert_eq!(
+            &actual[self.transform_end..],
+            &self.initial[self.transform_end..]
+        );
+        assert!(actual[self.output_offset..self.output_end]
+            .chunks_exact(self.activation_type.size_bytes() as usize)
+            .all(|value| match self.activation_type {
+                ElementType::F16 => f16::from_le_bytes(value.try_into().unwrap()).is_finite(),
+                ElementType::F32 => f32::from_le_bytes(value.try_into().unwrap()).is_finite(),
+                _ => unreachable!(),
+            }));
+        actual
+    }
+
+    fn assert_sources_unchanged(&self) {
+        assert_eq!(
+            self.regions[1..].iter().map(bytes).collect::<Vec<_>>(),
+            self.immutable
+        );
+    }
+}
+
+#[test]
+fn adjacent_gated_delta_hadamard_reuse_preserves_projection_leaves_on_metal() {
+    let composition =
+        MetalVNextComposition::create(DeviceId::new("metal.gated-delta.hadamard.reuse").unwrap())
+            .unwrap();
+    let runtime = composition.runtime();
+    let pipelines = MetalLinearPipelines::new(runtime.device()).unwrap();
+    let queue = runtime.device().new_command_queue();
+    // QKV and Z use the rotated input; the two gate projections must continue
+    // reading the original normalized input, including after reuse of Z.
+    for activation_type in [ElementType::F16, ElementType::F32] {
+        // One decode row, packed decode rows, and prefill use the same route.
+        for rows in [1_usize, 3, 129] {
+            let fixture = GatedDeltaProjectionCase::new(
+                runtime,
+                &pipelines,
+                rows,
+                256,
+                &[192, 64, 2, 2],
+                activation_type,
+            );
+            let mut reference = None;
+            for reuse in [false, true] {
+                fixture.reset();
+                let command = queue.new_command_buffer();
+                let encoder = command.new_compute_command_encoder();
+                fixture.encode(&pipelines, encoder, reuse);
+                encoder.end_encoding();
+                command.commit();
+                command.wait_until_completed();
+                assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+                let actual = fixture.checked_output();
+                if let Some(reference) = &reference {
+                    assert_eq!(&actual, reference, "{activation_type:?} rows={rows}");
+                } else {
+                    reference = Some(actual);
+                }
+                fixture.assert_sources_unchanged();
+            }
+        }
+    }
+}
+
+mod gated_delta_microbench;
+
 #[test]
 fn adjacent_hadamard_reuse_preserves_complete_swiglu_and_fallbacks_on_metal() {
     let composition =
@@ -194,9 +449,8 @@ fn adjacent_hadamard_reuse_preserves_complete_swiglu_and_fallbacks_on_metal() {
             validate_launch_regions_with_raw_workspace(&regions, &sequence.gate_up, &[5]).unwrap();
             validate_launch_regions_with_raw_workspace(&regions, &[down], &[5]).unwrap();
             assert_eq!(
-                sequence
-                    .gate_up_steps(&regions)
-                    .map(|(_, reuse)| reuse)
+                projection_steps(&sequence.gate_up, &regions)
+                    .map(|step| step.reuse_hadamard)
                     .collect::<Vec<_>>(),
                 [false, reuse],
                 "{case}"

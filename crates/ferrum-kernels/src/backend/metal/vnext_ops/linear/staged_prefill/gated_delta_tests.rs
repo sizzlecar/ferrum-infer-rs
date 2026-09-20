@@ -145,16 +145,15 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
             overwrite(&regions[0], &initial);
             let active = if candidate { workspace } else { None };
             assert_eq!(
-                launches
-                    .iter()
-                    .map(|launch| dispatch_count(*launch, active))
+                projection_steps(&launches, &regions)
+                    .map(|step| step.dispatch_count(active))
                     .sum::<u64>(),
                 4 + if candidate && rows >= 768 { 2 } else { 0 }
             );
             let command = queue.new_command_buffer();
             let encoder = command.new_compute_command_encoder();
-            for launch in &launches {
-                dispatch(&pipelines, encoder, &regions, *launch, active);
+            for step in projection_steps(&launches, &regions) {
+                step.encode(&pipelines, encoder, &regions, active);
             }
             encoder.end_encoding();
             command.commit();

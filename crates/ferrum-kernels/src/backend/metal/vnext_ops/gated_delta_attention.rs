@@ -1339,13 +1339,10 @@ fn encode_attention(
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
     let dispatch_count = if let Some(packed) = &packed {
-        let shared_projection_dispatches = packed
-            .input_projections
-            .iter()
-            .map(|launch| {
-                staged_prefill::dispatch_count(*launch, packed.input_projection_workspace)
-            })
-            .sum::<u64>();
+        let shared_projection_dispatches =
+            staged_prefill::projection_steps(&packed.input_projections, &regions)
+                .map(|step| step.dispatch_count(packed.input_projection_workspace))
+                .sum::<u64>();
         launches.iter().fold(
             5_u64 + packed.output_projection.dispatch_count() + shared_projection_dispatches,
             |total, launch| {
@@ -1359,15 +1356,8 @@ fn encode_attention(
             total
                 .saturating_add(8 + launch.output_projection.dispatch_count())
                 .saturating_add(
-                    launch
-                        .input_projections
-                        .iter()
-                        .map(|projection| {
-                            staged_prefill::dispatch_count(
-                                *projection,
-                                launch.input_projection_workspace,
-                            )
-                        })
+                    staged_prefill::projection_steps(&launch.input_projections, &regions)
+                        .map(|step| step.dispatch_count(launch.input_projection_workspace))
                         .sum::<u64>(),
                 )
                 .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
@@ -1556,12 +1546,11 @@ fn enqueue_attention(
         launch.params.hidden_size,
         launch.params.epsilon,
     );
-    for projection in &launch.input_projections {
-        staged_prefill::dispatch(
+    for step in staged_prefill::projection_steps(&launch.input_projections, regions) {
+        step.encode(
             linear,
             compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
-            *projection,
             launch.input_projection_workspace,
         );
     }
@@ -1648,12 +1637,11 @@ fn enqueue_packed_attention(
         packed.params.hidden_size,
         packed.params.epsilon,
     );
-    for projection in &packed.input_projections {
-        staged_prefill::dispatch(
+    for step in staged_prefill::projection_steps(&packed.input_projections, regions) {
+        step.encode(
             linear,
             compute_subwork(encoder, "gated_delta.qkvzba_projection"),
             regions,
-            *projection,
             packed.input_projection_workspace,
         );
     }

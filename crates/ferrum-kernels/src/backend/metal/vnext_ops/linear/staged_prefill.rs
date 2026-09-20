@@ -254,7 +254,8 @@ pub(in super::super) fn partitioned_workspace_bytes(
     Ok(if next_row == out_features { largest } else { 0 })
 }
 
-pub(super) fn selected(launch: LinearLaunch) -> bool {
+#[cfg(test)]
+fn selected(launch: LinearLaunch) -> bool {
     selected_for(launch, StagingPolicy::SwiGlu)
 }
 
@@ -291,39 +292,55 @@ pub(super) struct Sequence {
     pub(super) workspace: Option<Workspace>,
 }
 
-impl Sequence {
-    fn gate_up_steps<'a>(
-        &'a self,
-        regions: &'a [MetalBufferRegion],
-    ) -> impl Iterator<Item = (LinearLaunch, bool)> + 'a {
-        self.gate_up
-            .iter()
-            .enumerate()
-            .map(move |(index, &launch)| {
-                let reuse = index.checked_sub(1).is_some_and(|previous| {
-                    can_reuse_hadamard(self.gate_up[previous], launch, regions)
-                });
-                (launch, reuse)
-            })
+// Only adjacent projections may share their invocation-local transformed input.
+// Keep dispatch accounting and encoding on the same checked reuse decision.
+pub(in super::super) struct ProjectionStep {
+    launch: LinearLaunch,
+    reuse_hadamard: bool,
+}
+
+impl ProjectionStep {
+    pub(in super::super) fn dispatch_count(&self, workspace: Option<Workspace>) -> u64 {
+        dispatch_count(self.launch, workspace) - u64::from(self.reuse_hadamard)
     }
 
-    pub(super) fn dispatch_count(&self, regions: &[MetalBufferRegion]) -> u64 {
-        let staged = if self.workspace.is_some() {
-            self.gate_up
-                .iter()
-                .copied()
-                .chain([self.down])
-                .filter(|launch| selected(*launch))
-                .count() as u64
+    pub(in super::super) fn encode(
+        &self,
+        pipelines: &MetalLinearPipelines,
+        encoder: &ComputeCommandEncoderRef,
+        regions: &[MetalBufferRegion],
+        workspace: Option<Workspace>,
+    ) {
+        if self.reuse_hadamard {
+            dispatch_transformed_linear(pipelines, encoder, regions, self.launch);
         } else {
-            0
-        };
-        self.gate_up_steps(regions)
-            .map(|(launch, reuse)| launch.dispatch_count() - u64::from(reuse))
+            dispatch(pipelines, encoder, regions, self.launch, workspace);
+        }
+    }
+}
+
+pub(in super::super) fn projection_steps<'a>(
+    launches: &'a [LinearLaunch],
+    regions: &'a [MetalBufferRegion],
+) -> impl Iterator<Item = ProjectionStep> + 'a {
+    launches.iter().enumerate().map(move |(index, &launch)| {
+        let reuse_hadamard = index
+            .checked_sub(1)
+            .is_some_and(|previous| can_reuse_hadamard(launches[previous], launch, regions));
+        ProjectionStep {
+            launch,
+            reuse_hadamard,
+        }
+    })
+}
+
+impl Sequence {
+    pub(super) fn dispatch_count(&self, regions: &[MetalBufferRegion]) -> u64 {
+        projection_steps(&self.gate_up, regions)
+            .map(|step| step.dispatch_count(self.workspace))
             .sum::<u64>()
-            + self.down.dispatch_count()
+            + dispatch_count(self.down, self.workspace)
             + 1
-            + staged
     }
 
     // The caller can give each stage a profiling encoder boundary while tests
@@ -334,13 +351,9 @@ impl Sequence {
         regions: &[MetalBufferRegion],
         mut with_encoder: impl FnMut(&'static str, &dyn Fn(&ComputeCommandEncoderRef)),
     ) {
-        for (launch, reuse) in self.gate_up_steps(regions) {
+        for step in projection_steps(&self.gate_up, regions) {
             with_encoder("dense_swiglu.gate_up_projection", &|encoder| {
-                if reuse {
-                    dispatch_transformed_linear(pipelines, encoder, regions, launch);
-                } else {
-                    dispatch(pipelines, encoder, regions, launch, self.workspace);
-                }
+                step.encode(pipelines, encoder, regions, self.workspace);
             });
         }
         with_encoder("dense_swiglu.activation", &|encoder| {
