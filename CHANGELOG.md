@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-20
+
+### Changed
+
+- Enabled native prefix-state reuse by default in `serve` when the compiled model plan supports checkpoints. Retained state shares the runtime memory budget and pressure eviction; explicit cache settings retain precedence, and `run` keeps its existing default.
+- Optimized Metal PQ2_0 prefill and decode with aligned input loads, complete-tile specialization, shared weight unpacking and reduced address calculations. Reused identical adjacent Hadamard transforms and specialized supported causal-attention head dimensions while preserving F32 arithmetic and fallback paths.
+- Removed duplicate prompt retention and text-prefix scanning from native serving, and added separate SwiGLU projection and activation timing to profiling.
+
+### Fixed
+
+- Refreshed Windows build parallelism from available capacity before each build phase, and improved release evidence retrieval and failure reporting.
+- Stabilized Orchestral tool-result auditing when other workspace crates enable order-preserving JSON serialization.
+
 ## [0.12.1] - 2026-09-19
 
 ### Added
