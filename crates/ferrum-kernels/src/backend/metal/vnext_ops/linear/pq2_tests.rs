@@ -2,6 +2,8 @@ use super::*;
 use half::f16;
 use metal::{Buffer, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions};
 
+mod scale_load_binding;
+
 fn buffer<T>(device: &Device, data: &[T]) -> Buffer {
     device.new_buffer_with_data(
         data.as_ptr().cast(),

@@ -424,6 +424,48 @@ impl MetalLinearPipelines {
         }
     }
 
+    fn hadamard_native_dispatch_for_bindings(
+        &self,
+        format: GgufBlockFormat,
+        activation_type: ElementType,
+        params: LinearParams,
+        input: &MetalBufferRegion,
+        input_offset_bytes: u64,
+        weight: &MetalBufferRegion,
+    ) -> (&ComputePipelineState, LinearDispatchKind) {
+        let selected = self.hadamard_native_dispatch_for_input(
+            format,
+            activation_type,
+            params,
+            input,
+            input_offset_bytes,
+        );
+        // Refine only the original complete-eight route; prefill priority and
+        // optional-pipeline fallbacks remain owned by the existing selector.
+        // The bound component starts at its retained region's actual offset.
+        if weight.offset_bytes().is_multiple_of(2) {
+            let (complete, aligned) = match activation_type {
+                ElementType::F16 => (
+                    self.native.pq2_linear_f32_f16_complete.as_ref(),
+                    self.native
+                        .pq2_linear_f32_f16_complete_aligned_scale
+                        .as_ref(),
+                ),
+                ElementType::F32 => (
+                    self.native.pq2_linear_f32_complete.as_ref(),
+                    self.native.pq2_linear_f32_complete_aligned_scale.as_ref(),
+                ),
+                _ => (None, None),
+            };
+            if let (Some(complete), Some(aligned)) = (complete, aligned) {
+                if std::ptr::eq(selected.0, complete) {
+                    return (aligned, selected.1);
+                }
+            }
+        }
+        selected
+    }
+
     fn hadamard_native_dispatch_for_input(
         &self,
         format: GgufBlockFormat,
@@ -2029,12 +2071,13 @@ fn dispatch_single_transformed_linear(
         LinearPhysicalFormat::Native(format) => Some(format),
     };
     let (pipeline, dispatch_kind) = if let Some(format) = native {
-        pipelines.hadamard_native_dispatch_for_input(
+        pipelines.hadamard_native_dispatch_for_bindings(
             format,
             launch.activation_type,
             launch.params,
             workspace,
             workspace_offset,
+            &regions[launch.weight_region],
         )
     } else if launch.activation_type == ElementType::F32 {
         (&pipelines.dense_f32, LinearDispatchKind::CooperativeGemv)

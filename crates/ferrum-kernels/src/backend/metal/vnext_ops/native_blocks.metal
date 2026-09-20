@@ -368,7 +368,7 @@ NATIVE_PQ2_LINEAR(half, f32_f16)
 // Complete output tiles retain the guarded kernel's F32 arithmetic and SIMD
 // reduction order. Hoist row bases and advance block offsets once per K step;
 // the host validates N16 / K128 and keeps the guarded pipeline for all tails.
-template<typename Output>
+template<typename Output, bool ALIGNED_SCALE = false>
 static inline void native_pq2_linear_f32_complete(
     device const float * input, device const uchar * weight, device Output * output,
     constant NativeLinearParams & p, uint3 group, uint lane, uint subgroup) {
@@ -391,7 +391,15 @@ static inline void native_pq2_linear_f32_complete(
         #pragma clang loop unroll(full)
         for (uint part = 0; part < 8; ++part) {
             device const uchar * block = weight_rows[part] + weight_block_offset;
-            const float scale = native_half(block, 0);
+            float scale;
+            if constexpr (ALIGNED_SCALE) {
+                // The typed entrypoint and actual retained weight offset
+                // guarantee 2-byte alignment; every PQ2 block is 34 bytes.
+                const ushort bits = *reinterpret_cast<device const ushort *>(block);
+                scale = float(as_type<half>(bits));
+            } else {
+                scale = native_half(block, 0);
+            }
             #pragma clang loop unroll(full)
             for (uint byte = 0; byte < 4; ++byte) {
                 const float packed = float(block[2 + first_in_block / 4 + byte]);
@@ -434,6 +442,19 @@ kernel void vnext_pq2_linear_##SUFFIX##_complete( \
 NATIVE_PQ2_COMPLETE(float, f32)
 NATIVE_PQ2_COMPLETE(half, f32_f16)
 #undef NATIVE_PQ2_COMPLETE
+
+#define NATIVE_PQ2_COMPLETE_ALIGNED_SCALE(OUTPUT, SUFFIX) \
+kernel void vnext_pq2_linear_##SUFFIX##_complete_aligned_scale( \
+    device const float * x [[buffer(0)]], device const ushort * w [[buffer(1)]], \
+    device OUTPUT * y [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+    uint subgroup [[simdgroup_index_in_threadgroup]]) { \
+    native_pq2_linear_f32_complete<OUTPUT, true>( \
+        x, reinterpret_cast<device const uchar *>(w), y, p, group, lane, subgroup); \
+}
+NATIVE_PQ2_COMPLETE_ALIGNED_SCALE(float, f32)
+NATIVE_PQ2_COMPLETE_ALIGNED_SCALE(half, f32_f16)
+#undef NATIVE_PQ2_COMPLETE_ALIGNED_SCALE
 
 // Decode one coefficient for all B independent rows without rounding the
 // weight to half. The typed selector restricts this path to small batches.
