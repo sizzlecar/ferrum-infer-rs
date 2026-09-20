@@ -30,14 +30,15 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
-    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
-    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
-    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, NativeChatOutputProjector,
-    ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
-    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
-    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
-    ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart,
-    TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus,
+    ExecutionResourceAuthority, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
+    FinishReason, InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId,
+    ModelOutputProtocol, NativeChatOutputProjector, ParsedReasoningResponse, Priority,
+    ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
+    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_OPENED_REASONING_METADATA_KEY, THINK_END_TAG,
     THINK_START_TAG,
 };
@@ -379,6 +380,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
+        if self.llm.as_ref().is_some_and(|engine| {
+            engine.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime
+        }) {
+            // Native cache health already reports actual reuse or an unsupported
+            // plan. The legacy text-LCP estimate would only duplicate full raw
+            // prompts and scan them under a lock, outside the runtime budget.
+            return;
+        }
+        self.cache.record_prefix_prompt(prompt, policy);
+    }
+
     pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
         if self.served_model_registry.is_empty() {
             self.served_model_registry = Arc::new(single_model_registry(
@@ -1271,9 +1284,7 @@ async fn chat_completions_handler_with_phases(
     inference_request
         .evidence_request
         .capture_engine_token_timing = state.profile_detail.captures_engine_token_timing();
-    state
-        .cache
-        .record_prefix_prompt(&inference_request.prompt, &cache_policy);
+    state.record_prefix_prompt(&inference_request.prompt, &cache_policy);
     if let Err(err) =
         write_chat_request_replay_bundle(&state, &headers, &request, &inference_request)
     {
@@ -6050,6 +6061,7 @@ mod tests {
 
     struct StubLlm {
         config: EngineConfig,
+        resource_authority: ExecutionResourceAuthority,
         context_capacity: Option<usize>,
         text: String,
         stream_chunks: Option<Vec<String>>,
@@ -6072,6 +6084,7 @@ mod tests {
             config.model.model_id = ModelId::new("stub-model");
             Self {
                 config,
+                resource_authority: ExecutionResourceAuthority::LegacyEngine,
                 text: text.to_string(),
                 context_capacity: None,
                 stream_chunks: None,
@@ -6646,6 +6659,10 @@ mod tests {
 
     #[async_trait]
     impl LlmInferenceEngine for StubLlm {
+        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+            self.resource_authority
+        }
+
         fn context_capacity(&self) -> Option<usize> {
             self.context_capacity
         }
@@ -14559,6 +14576,53 @@ mod tests {
             let parsed: serde_json::Value =
                 serde_json::from_str(content).expect("strict content JSON");
             assert_eq!(parsed["answer"], "yes");
+        }
+    }
+
+    #[test]
+    fn server_prefix_prompt_observation_follows_engine_authority() {
+        let policy = CachePolicy {
+            prefix_cache_enabled: true,
+            session_cache_mode: "off".to_string(),
+            session_cache_max_entries: 128,
+            session_cache_max_tokens: 4096,
+        };
+        for authority in [
+            ExecutionResourceAuthority::PlanRuntime,
+            ExecutionResourceAuthority::LegacyEngine,
+        ] {
+            let engine = StubLlm {
+                resource_authority: authority,
+                ..StubLlm::new("ok")
+            };
+            // There is deliberately no cache metrics snapshot. Native authority
+            // alone must skip the text fallback, including unsupported plans.
+            assert!(engine.cache_metrics_snapshot().is_none());
+            let state = AppState::default().with_llm(Arc::new(engine));
+            state.record_prefix_prompt("alpha beta gamma", &policy);
+            state.record_prefix_prompt("alpha beta delta", &policy);
+            let stats = state.cache.stats();
+            let prompts = state.cache.prefix_prompts.lock().unwrap();
+            match authority {
+                ExecutionResourceAuthority::PlanRuntime => {
+                    assert!(prompts.is_empty());
+                    assert_eq!(stats.prefix_entries, 0);
+                    assert_eq!(stats.prefix_bytes, 0);
+                    assert_eq!(stats.prefix_hits, 0);
+                    assert_eq!(stats.prefix_misses, 0);
+                    assert_eq!(stats.prefix_saved_prefill_tokens, 0);
+                }
+                ExecutionResourceAuthority::LegacyEngine => {
+                    assert_eq!(prompts.len(), 2);
+                    assert!(prompts.contains_key("alpha beta gamma"));
+                    assert!(prompts.contains_key("alpha beta delta"));
+                    assert_eq!(stats.prefix_entries, 2);
+                    assert_eq!(stats.prefix_bytes, 32);
+                    assert_eq!(stats.prefix_hits, 1);
+                    assert_eq!(stats.prefix_misses, 1);
+                    assert!(stats.prefix_saved_prefill_tokens > 0);
+                }
+            }
         }
     }
 

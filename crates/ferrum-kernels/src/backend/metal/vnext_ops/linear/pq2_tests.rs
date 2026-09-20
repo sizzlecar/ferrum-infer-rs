@@ -22,6 +22,67 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
+    pub(super) fn params(&self) -> LinearParams {
+        self.params
+    }
+
+    pub(super) fn poison_output(&self) {
+        let prefix = 16 / self.output_type.size_bytes() as usize;
+        // SAFETY: tests call this only after the previous command completes.
+        unsafe {
+            match self.output_type {
+                ElementType::F32 => {
+                    let values = std::slice::from_raw_parts_mut(
+                        self.output.contents().cast::<f32>(),
+                        self.output_elements,
+                    );
+                    values.fill(-123.0);
+                    for row in 0..self.params.rows as usize {
+                        let start = prefix + row * self.params.output_stride as usize + 2;
+                        values[start..start + self.params.out_features as usize].fill(f32::NAN);
+                    }
+                }
+                ElementType::F16 => {
+                    let values = std::slice::from_raw_parts_mut(
+                        self.output.contents().cast::<f16>(),
+                        self.output_elements,
+                    );
+                    values.fill(f16::from_f32(-123.0));
+                    for row in 0..self.params.rows as usize {
+                        let start = prefix + row * self.params.output_stride as usize + 2;
+                        values[start..start + self.params.out_features as usize]
+                            .fill(f16::from_f32(f32::NAN));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub(super) fn assert_inputs_unchanged(&self) {
+        // SAFETY: StorageModeShared buffers are read after command completion.
+        unsafe {
+            let input = std::slice::from_raw_parts(
+                self.input.contents().cast::<f32>(),
+                self.input.length() as usize / 4,
+            );
+            assert!(input[..4].iter().all(|&value| value == -123.0));
+            assert_eq!(
+                input[4..].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                self.input_values
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let weight = std::slice::from_raw_parts(
+                self.weight.contents().cast::<u8>(),
+                self.weight.length() as usize,
+            );
+            assert!(weight[..18].iter().all(|&value| value == 0xcc));
+            assert_eq!(&weight[18..], &self.weight_bytes);
+        }
+    }
+
     pub(super) fn new(
         device: &Device,
         rows: u32,

@@ -245,9 +245,17 @@ weights and fixed recurrent state retain their existing sizes. Inspect
 `/health` → `kv_storage` to confirm the selected format. Whole-model checkpoint
 restore requires support for every model state; resending conversation history
 recomputes the input when prefix caching is disabled or no compatible checkpoint
-is available. With `--enable-prefix-cache`, a compatible hit restores model state
-and processes the remaining suffix. Session caching stores chat messages; it is
-separate from GPU prefix-state reuse.
+is available. A compatible hit restores model state and processes the remaining
+suffix. Session caching stores chat messages; it is separate from GPU prefix-state
+reuse.
+
+`ferrum serve` automatically requests prefix-state caching for the plan runtime.
+The selected execution plan must support checkpointing every model state;
+unsupported plans continue without caching. Retained state shares the existing
+runtime memory budget and yields to foreground requests under memory pressure.
+Use `--disable-prefix-cache`, `[runtime] prefix_cache = false`, or
+`FERRUM_PREFIX_CACHE=0` to disable it; explicit configuration and preset choices
+are preserved. `ferrum run` leaves cross-request caching off by default.
 
 ## Features
 

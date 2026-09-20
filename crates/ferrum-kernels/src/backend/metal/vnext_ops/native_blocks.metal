@@ -176,6 +176,20 @@ static inline void native_gemm_fragment16(
     }
 }
 
+// PQ2 eight-value fragment: identical byte extraction, F32 scale
+// products and K x N shared layout, with four threads per physical weight row.
+static inline void native_pq2_fragment8(
+    device const uchar * b, uint first, threadgroup float * tile) {
+    const float scale = native_half(b, 0);
+    for (uint j = 0; j < 8; j += 4) {
+        const uint packed = b[2 + (first + j) / 4];
+        for (uint component = 0; component < 4; ++component) {
+            const uint q = (packed >> (2 * component)) & 3;
+            tile[(j + component) * 64] = scale * float(int(q) - 1);
+        }
+    }
+}
+
 // IQ4_XS has one half scale and six packed scale bytes per 256 values.
 // Keep only this header live; each g still evaluates (d * scale) * q in FP32.
 struct NativeIq4XsHeader { float d; uint scales_h; uint scales_l; };
@@ -351,6 +365,76 @@ NATIVE_PQ2_LINEAR(float, f32)
 NATIVE_PQ2_LINEAR(half, f32_f16)
 #undef NATIVE_PQ2_LINEAR
 
+// Complete output tiles retain the guarded kernel's F32 arithmetic and SIMD
+// reduction order. Hoist row bases and advance block offsets once per K step;
+// the host validates N16 / K128 and keeps the guarded pipeline for all tails.
+template<typename Output>
+static inline void native_pq2_linear_f32_complete(
+    device const float * input, device const uchar * weight, device Output * output,
+    constant NativeLinearParams & p, uint3 group, uint lane, uint subgroup) {
+    const uint first_output = group.x * 16 + subgroup * 8;
+    const uint blocks_per_row = p.in_features / 128;
+    const uint first_in_block = (lane % 8) * 16;
+    device const float * input_row = input + ulong(group.y) * p.in_features + first_in_block;
+    const ulong row_bytes = ulong(blocks_per_row) * 34;
+    device const uchar * weight_rows[8];
+    #pragma clang loop unroll(full)
+    for (uint part = 0; part < 8; ++part)
+        weight_rows[part] = weight + ulong(first_output + part) * row_bytes;
+    ulong input_block_offset = ulong(lane / 8) * 128;
+    ulong weight_block_offset = ulong(lane / 8) * 34;
+    float sums[8] = {};
+    for (uint block_index = lane / 8; block_index < blocks_per_row; block_index += 4) {
+        float values[16];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16; ++i) values[i] = input_row[input_block_offset + i];
+        #pragma clang loop unroll(full)
+        for (uint part = 0; part < 8; ++part) {
+            device const uchar * block = weight_rows[part] + weight_block_offset;
+            const float scale = native_half(block, 0);
+            #pragma clang loop unroll(full)
+            for (uint byte = 0; byte < 4; ++byte) {
+                const float packed = float(block[2 + first_in_block / 4 + byte]);
+                const float top = floor(packed * (1.0f / 64.0f));
+                const float middle = floor(packed * (1.0f / 16.0f));
+                const float bottom = floor(packed * (1.0f / 4.0f));
+                const float codes[4] = {
+                    packed - 4.0f * bottom - 1.0f,
+                    bottom - 4.0f * middle - 1.0f,
+                    middle - 4.0f * top - 1.0f,
+                    top - 1.0f,
+                };
+                #pragma clang loop unroll(full)
+                for (uint component = 0; component < 4; ++component) {
+                    const float value = scale * codes[component];
+                    sums[part] += values[byte * 4 + component] * value;
+                }
+            }
+        }
+        input_block_offset += 4 * 128;
+        weight_block_offset += 4 * 34;
+    }
+    #pragma clang loop unroll(full)
+    for (uint part = 0; part < 8; ++part) {
+        const float value = simd_sum(sums[part]);
+        if (lane == 0)
+            output[ulong(group.y) * p.output_stride + p.output_column_offset + first_output + part]
+                = Output(value);
+    }
+}
+
+#define NATIVE_PQ2_COMPLETE(OUTPUT, SUFFIX) \
+kernel void vnext_pq2_linear_##SUFFIX##_complete( \
+    device const float * x [[buffer(0)]], device const uchar * w [[buffer(1)]], \
+    device OUTPUT * y [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]], \
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+    uint subgroup [[simdgroup_index_in_threadgroup]]) { \
+    native_pq2_linear_f32_complete(x, w, y, p, group, lane, subgroup); \
+}
+NATIVE_PQ2_COMPLETE(float, f32)
+NATIVE_PQ2_COMPLETE(half, f32_f16)
+#undef NATIVE_PQ2_COMPLETE
+
 // Decode one coefficient for all B independent rows without rounding the
 // weight to half. The typed selector restricts this path to small batches.
 // Each row retains native_linear's lane/column order and FP32 SIMD reduction.
@@ -427,7 +511,7 @@ NATIVE_SHARED_LINEAR(float, f32, 4)
 // weight values do not acquire a half rounding before multiplication.
 // MMA changes the reduction grouping relative to native_linear's lane sums.
 template<uint ROW_TILE, bool SPECIALIZED = false, typename Input = half, bool FULL_TILES = false,
-    bool VECTOR_INPUT = false>
+    bool VECTOR_INPUT = false, bool ALL_WEIGHT_THREADS = false>
 static inline void native_tiled_gemm(
     device const Input * input, device const uchar * weight, device half * output,
     constant NativeLinearParams & p, constant NativeBlockParams & block,
@@ -477,20 +561,24 @@ static inline void native_tiled_gemm(
                     ? float(input[row * ulong(p.in_features) + column]) : 0.0f;
             }
         }
-        // Two threads own the two 16-value fragments of each physical row.
-        // Reuse decoded headers within a thread while keeping the K x N tile.
-        // Additional M64 SIMD groups reuse this same weight tile. Every thread
-        // still reaches both barriers, including those without a weight load.
-        if (thread_index < 128) {
-            const uint local_row = thread_index / 2;
-            const uint local_column = (thread_index % 2) * 16;
+        // Full PQ2 M64 vector input uses all 256 threads: four eight-value
+        // fragments per weight row. Other entrypoints retain two 16-value
+        // fragments. Both keep the K x N tile and the same F32 products.
+        // Every thread still reaches both barriers.
+        if (ALL_WEIGHT_THREADS || thread_index < 128) {
+            const uint local_row = ALL_WEIGHT_THREADS ? thread_index / 4 : thread_index / 2;
+            const uint local_column = ALL_WEIGHT_THREADS ? (thread_index % 4) * 8 : (thread_index % 2) * 16;
             const ulong row = output_start + local_row;
             const ulong column = k + local_column;
             threadgroup float * weight_fragment = weight_tile + local_column * 64 + local_row;
             if (FULL_TILES || (row < ulong(p.out_features) && column + 16 <= ulong(p.in_features))) {
                 const ulong offset = (row * blocks_per_row + block_index) * ulong(block_bytes);
-                native_gemm_fragment16(weight + offset, in_block_base + local_column,
-                    format, weight_fragment);
+                if (ALL_WEIGHT_THREADS) {
+                    native_pq2_fragment8(weight + offset, in_block_base + local_column, weight_fragment);
+                } else {
+                    native_gemm_fragment16(weight + offset, in_block_base + local_column,
+                        format, weight_fragment);
+                }
             } else {
                 // Keep every consumed tile element initialized, including tails.
                 for (uint j = 0; j < 16; ++j) {
@@ -612,6 +700,18 @@ NATIVE_FULL_TILES_GEMM(vnext_native_block_gemm_input_f32_output_f16_m64_full_til
 
 // Full M64 specialization for a retained, float4-aligned F32 input span.
 kernel void vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_vector_input_specialized(
+    device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
+    device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
+    constant NativeBlockParams & block [[buffer(4)]], threadgroup float4 * workspace [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    native_tiled_gemm<64, true, float, true, true, true>(input, weight, output, p, block,
+        reinterpret_cast<threadgroup float *>(workspace), group, thread_index, simdgroup_index);
+}
+
+// Frozen test control: vector input with the original 128-thread weight decode.
+// This entrypoint is never selected by production and stays independent of it.
+kernel void vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control_specialized(
     device const float * input [[buffer(0)]], device const uchar * weight [[buffer(1)]],
     device half * output [[buffer(2)]], constant NativeLinearParams & p [[buffer(3)]],
     constant NativeBlockParams & block [[buffer(4)]], threadgroup float4 * workspace [[threadgroup(0)]],

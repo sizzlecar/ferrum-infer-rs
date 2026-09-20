@@ -789,6 +789,7 @@ struct ValidatedPrefillCase {
     params: CausalAttentionParams,
     state: Vec<f16>,
     expected: Vec<f32>,
+    reference_scope: &'static str,
 }
 
 impl ValidatedPrefillCase {
@@ -958,6 +959,7 @@ fn run_prefill_cpu_case(
         params,
         state,
         expected,
+        reference_scope: "full independent CPU output",
     };
     case.assert_kv_unchanged(label);
     case
@@ -1208,9 +1210,9 @@ fn run_attention_plan(
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, params);
     use_raw_pages(encoder, pages);
-    encode_attention_dispatch(pipelines, encoder, plan);
+    encode_attention_dispatch(pipelines, encoder, plan, params);
     if let Some(grouped_partials) = grouped_partials.as_ref() {
-        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        encoder.set_compute_pipeline_state(pipelines.grouped_reduce_pipeline(params));
         set_raw(encoder, 0, grouped_partials);
         set_raw(encoder, 1, query_raw);
         set_raw(encoder, 2, &output.buffer);
@@ -1478,9 +1480,9 @@ fn run_segment_bits(
     encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&argument_buffer), 0);
     set_raw_params(encoder, 4, &params);
     use_raw_pages(encoder, pages);
-    encode_attention_dispatch(pipelines, encoder, plan);
+    encode_attention_dispatch(pipelines, encoder, plan, params);
     if let Some(grouped_partials) = grouped_partials.as_ref() {
-        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        encoder.set_compute_pipeline_state(pipelines.grouped_reduce_pipeline(params));
         set_raw(encoder, 0, grouped_partials);
         set_raw(encoder, 1, &query_raw);
         set_raw(encoder, 2, &output);

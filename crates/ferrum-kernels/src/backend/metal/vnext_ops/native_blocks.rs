@@ -23,6 +23,19 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
 const M64_THREADGROUP_BYTES: u64 = 16384;
 const M64_THREADS: u64 = 256;
 
+pub(super) fn pq2_complete_outputs_supported(rows: u32, width: u32, outputs: u32) -> bool {
+    rows > 0 && width > 0 && width.is_multiple_of(128) && outputs > 0 && outputs.is_multiple_of(16)
+}
+
+pub(super) fn supports_pq2_gemv_threadgroup(
+    execution_width: u64,
+    maximum_threads: u64,
+    static_bytes: u64,
+    maximum_bytes: u64,
+) -> bool {
+    execution_width == 32 && maximum_threads >= 64 && static_bytes <= maximum_bytes
+}
+
 pub(super) fn pq2_full_tiles_supported(
     row_tile: u32,
     rows: u32,
@@ -189,6 +202,8 @@ pub(super) struct MetalNativeBlockPipelines {
     pq2_0: NativeGemvPipelines,
     pub(super) pq2_linear_f32: ComputePipelineState,
     pub(super) pq2_linear_f32_f16: ComputePipelineState,
+    pub(super) pq2_linear_f32_complete: Option<ComputePipelineState>,
+    pub(super) pq2_linear_f32_f16_complete: Option<ComputePipelineState>,
     shared: NativeSharedPipelines,
     iq4xs_group_dot_f16: [ComputePipelineState; 4],
     pub(super) gemm_f16_f32: ComputePipelineState,
@@ -199,6 +214,9 @@ pub(super) struct MetalNativeBlockPipelines {
     pub(super) pq2_gemm_input_f32_output_f16_full_tiles: Option<ComputePipelineState>,
     pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles: Option<ComputePipelineState>,
     pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input:
+        Option<ComputePipelineState>,
+    #[cfg(test)]
+    pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control:
         Option<ComputePipelineState>,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
@@ -338,6 +356,16 @@ impl MetalNativeBlockPipelines {
                 )
             },
         );
+        #[cfg(test)]
+        let pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control =
+            optional_m64_pipeline(device, || {
+                gemm_format_pipeline(
+                    device,
+                    &library,
+                    "vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control_specialized",
+                    GgufBlockFormat::Pq2_0,
+                )
+            });
         let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
             device,
             &library,
@@ -366,6 +394,12 @@ impl MetalNativeBlockPipelines {
             pq2_0,
             pq2_linear_f32: pipeline("vnext_pq2_linear_f32")?,
             pq2_linear_f32_f16: pipeline("vnext_pq2_linear_f32_f16")?,
+            pq2_linear_f32_complete: optional_pq2_gemv_pipeline(device, || {
+                pipeline("vnext_pq2_linear_f32_complete")
+            }),
+            pq2_linear_f32_f16_complete: optional_pq2_gemv_pipeline(device, || {
+                pipeline("vnext_pq2_linear_f32_f16_complete")
+            }),
             shared,
             iq4xs_group_dot_f16: [
                 pipeline("vnext_iq4_group_dot_b1")?,
@@ -381,6 +415,8 @@ impl MetalNativeBlockPipelines {
             pq2_gemm_input_f32_output_f16_full_tiles,
             pq2_gemm_input_f32_output_f16_m64_full_tiles,
             pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input,
+            #[cfg(test)]
+            pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input_control,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]
@@ -440,6 +476,24 @@ impl MetalNativeBlockPipelines {
     ) -> Option<&ComputePipelineState> {
         self.shared.pipeline(format, rows, activation_type)
     }
+}
+
+fn optional_pq2_gemv_pipeline(
+    device: &Device,
+    create: impl FnOnce() -> Result<ComputePipelineState, MetalDeviceRuntimeError>,
+) -> Option<ComputePipelineState> {
+    let limits = device.max_threads_per_threadgroup();
+    if limits.width < 32 || limits.height < 2 {
+        return None;
+    }
+    create().ok().filter(|pipeline| {
+        supports_pq2_gemv_threadgroup(
+            pipeline.thread_execution_width(),
+            pipeline.max_total_threads_per_threadgroup(),
+            pipeline.static_threadgroup_memory_length(),
+            device.max_threadgroup_memory_length(),
+        )
+    })
 }
 
 #[cfg(test)]

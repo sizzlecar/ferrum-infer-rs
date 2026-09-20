@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 use ferrum_types::{
-    EngineConfig, ExecutorAdmissionSnapshot, InferenceRequest, InferenceResponse, Result,
-    StreamChunk,
+    EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest,
+    InferenceResponse, Result, StreamChunk,
 };
 use futures::Stream;
 use std::pin::Pin;
@@ -70,6 +70,14 @@ pub trait InferenceEngine: Send + Sync {
 /// `/v1/chat/completions` and `/v1/completions`.
 #[async_trait]
 pub trait LlmInferenceEngine: InferenceEngine {
+    /// Authoritative owner of request-lifetime state and capacity. This is a
+    /// cheap capability query; it must not construct a metrics snapshot.
+    /// Plan-runtime engines supply native prefix observations even when their
+    /// selected plan cannot retain checkpoints.
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::LegacyEngine
+    }
+
     /// Effective per-request capacity in tokens, including input and output.
     /// Implementations must report the limit used by request admission, not
     /// the model weights' nominal context window. None means unreported.

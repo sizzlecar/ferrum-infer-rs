@@ -2984,6 +2984,10 @@ impl ContinuousBatchEngine {
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        self.inner.resource_composition.authority()
+    }
+
     fn context_capacity(&self) -> Option<usize> {
         effective_request_context_capacity(
             &self.inner.config,
