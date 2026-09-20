@@ -584,6 +584,26 @@ pub(crate) struct MetalBufferRegion {
 }
 
 impl MetalBufferRegion {
+    #[cfg(test)]
+    pub(crate) fn test_subregion(
+        &self,
+        range: Range<u64>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        if range.start >= range.end || range.end > self.length_bytes {
+            return Err(MetalDeviceRuntimeError::contract(
+                "Metal test subregion is empty or outside its retained parent",
+            ));
+        }
+        let offset_bytes = self.offset_bytes.checked_add(range.start).ok_or_else(|| {
+            MetalDeviceRuntimeError::contract("Metal test subregion offset overflows")
+        })?;
+        Ok(Self {
+            offset_bytes,
+            length_bytes: range.end - range.start,
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn buffer(&self) -> &BufferRef {
         &self.allocation.base
     }

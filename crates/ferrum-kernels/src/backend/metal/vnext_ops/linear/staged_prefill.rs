@@ -292,7 +292,22 @@ pub(super) struct Sequence {
 }
 
 impl Sequence {
-    pub(super) fn dispatch_count(&self) -> u64 {
+    fn gate_up_steps<'a>(
+        &'a self,
+        regions: &'a [MetalBufferRegion],
+    ) -> impl Iterator<Item = (LinearLaunch, bool)> + 'a {
+        self.gate_up
+            .iter()
+            .enumerate()
+            .map(move |(index, &launch)| {
+                let reuse = index.checked_sub(1).is_some_and(|previous| {
+                    can_reuse_hadamard(self.gate_up[previous], launch, regions)
+                });
+                (launch, reuse)
+            })
+    }
+
+    pub(super) fn dispatch_count(&self, regions: &[MetalBufferRegion]) -> u64 {
         let staged = if self.workspace.is_some() {
             self.gate_up
                 .iter()
@@ -303,32 +318,157 @@ impl Sequence {
         } else {
             0
         };
-        self.gate_up
-            .iter()
-            .map(|launch| launch.dispatch_count())
+        self.gate_up_steps(regions)
+            .map(|(launch, reuse)| launch.dispatch_count() - u64::from(reuse))
             .sum::<u64>()
             + self.down.dispatch_count()
             + 1
             + staged
     }
 
+    // The caller can give each stage a profiling encoder boundary while tests
+    // and unprofiled execution retain the same dispatch sequence.
     pub(super) fn encode(
         &self,
         pipelines: &MetalLinearPipelines,
-        encoder: &ComputeCommandEncoderRef,
         regions: &[MetalBufferRegion],
+        mut with_encoder: impl FnMut(&'static str, &dyn Fn(&ComputeCommandEncoderRef)),
     ) {
-        for launch in &self.gate_up {
-            dispatch(pipelines, encoder, regions, *launch, self.workspace);
+        for (launch, reuse) in self.gate_up_steps(regions) {
+            with_encoder("dense_swiglu.gate_up_projection", &|encoder| {
+                if reuse {
+                    dispatch_transformed_linear(pipelines, encoder, regions, launch);
+                } else {
+                    dispatch(pipelines, encoder, regions, launch, self.workspace);
+                }
+            });
         }
-        dispatch_swiglu(
-            pipelines,
-            encoder,
-            &regions[self.scratch_region],
-            self.activation,
-        );
-        dispatch(pipelines, encoder, regions, self.down, self.workspace);
+        with_encoder("dense_swiglu.activation", &|encoder| {
+            dispatch_swiglu(
+                pipelines,
+                encoder,
+                &regions[self.scratch_region],
+                self.activation,
+            );
+        });
+        with_encoder("dense_swiglu.down_projection", &|encoder| {
+            dispatch(pipelines, encoder, regions, self.down, self.workspace);
+        });
     }
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalSpan<'a> {
+    buffer: &'a metal::BufferRef,
+    start: u64,
+    end: u64,
+}
+
+impl PhysicalSpan<'_> {
+    fn same(self, other: Self) -> bool {
+        std::ptr::eq(self.buffer, other.buffer)
+            && self.start == other.start
+            && self.end == other.end
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        std::ptr::eq(self.buffer, other.buffer) && self.start < other.end && other.start < self.end
+    }
+}
+
+fn physical_span(
+    regions: &[MetalBufferRegion],
+    index: usize,
+    offset: u64,
+    bytes: u64,
+) -> Option<PhysicalSpan<'_>> {
+    let region = regions.get(index)?;
+    if bytes == 0 || offset.checked_add(bytes)? > region.length_bytes() {
+        return None;
+    }
+    let start = region.offset_bytes().checked_add(offset)?;
+    Some(PhysicalSpan {
+        buffer: region.buffer(),
+        start,
+        end: start.checked_add(bytes)?,
+    })
+}
+
+fn can_reuse_hadamard(
+    previous: LinearLaunch,
+    current: LinearLaunch,
+    regions: &[MetalBufferRegion],
+) -> bool {
+    let compatible = || -> Option<bool> {
+        let before = previous.transform?;
+        let after = current.transform?;
+        if before.block_size != after.block_size
+            || before.inverse != after.inverse
+            || before.permutation != after.permutation
+            || previous.activation_type != current.activation_type
+            || previous.params.rows != current.params.rows
+            || previous.params.in_features != current.params.in_features
+        {
+            return Some(false);
+        }
+        let elements =
+            u64::from(current.params.rows).checked_mul(u64::from(current.params.in_features))?;
+        let input_bytes = elements.checked_mul(current.activation_type.size_bytes())?;
+        let input = physical_span(
+            regions,
+            current.input_region,
+            current.input_offset_bytes,
+            input_bytes,
+        )?;
+        let previous_input = physical_span(
+            regions,
+            previous.input_region,
+            previous.input_offset_bytes,
+            input_bytes,
+        )?;
+        let (before_region, before_offset) = previous.transform_workspace?;
+        let (after_region, after_offset) = current.transform_workspace?;
+        let workspace_bytes = elements.checked_mul(4)?;
+        let workspace = physical_span(regions, after_region, after_offset, workspace_bytes)?;
+        let previous_workspace =
+            physical_span(regions, before_region, before_offset, workspace_bytes)?;
+        if !input.same(previous_input)
+            || !workspace.same(previous_workspace)
+            || workspace.overlaps(input)
+        {
+            return Some(false);
+        }
+        let signs = match (before.signs_region, after.signs_region) {
+            (None, None) => None,
+            (Some(before), Some(after)) => {
+                let a = physical_span(regions, before, 0, regions.get(before)?.length_bytes())?;
+                let b = physical_span(regions, after, 0, regions.get(after)?.length_bytes())?;
+                if !a.same(b) || workspace.overlaps(b) {
+                    return Some(false);
+                }
+                Some(b)
+            }
+            _ => return Some(false),
+        };
+        // Conservatively cover whole output rows, including stride padding.
+        // Neither the preceding transform nor its projection may mutate data
+        // that another execution of this transform would read or overwrite.
+        let output_bytes = u64::from(previous.params.rows)
+            .checked_mul(u64::from(previous.params.output_stride))?
+            .checked_mul(previous.activation_type.size_bytes())?;
+        let output = physical_span(
+            regions,
+            previous.output_region,
+            previous.output_offset_bytes,
+            output_bytes,
+        )?;
+        Some(
+            !output.overlaps(input)
+                && !output.overlaps(workspace)
+                && signs.is_none_or(|signs| !output.overlaps(signs)),
+        )
+    };
+    compatible().unwrap_or(false)
 }
 
 impl Workspace {
@@ -468,3 +608,6 @@ mod tests;
 
 #[cfg(test)]
 mod gated_delta_tests;
+
+#[cfg(test)]
+mod hadamard_reuse_tests;

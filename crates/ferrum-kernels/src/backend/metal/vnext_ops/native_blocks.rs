@@ -23,6 +23,51 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
 const M64_THREADGROUP_BYTES: u64 = 16384;
 const M64_THREADS: u64 = 256;
 
+pub(super) fn pq2_full_tiles_supported(
+    row_tile: u32,
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+) -> bool {
+    matches!(row_tile, 32 | 64)
+        && rows > 0
+        && rows.is_multiple_of(row_tile)
+        && in_features > 0
+        && in_features.is_multiple_of(128)
+        && out_features > 0
+        && out_features.is_multiple_of(64)
+}
+
+pub(super) fn pq2_full_tiles_vector_input_supported(
+    rows: u32,
+    in_features: u32,
+    out_features: u32,
+    input_region_offset_bytes: u64,
+    input_offset_bytes: u64,
+    input_region_bytes: u64,
+) -> bool {
+    if !pq2_full_tiles_supported(64, rows, in_features, out_features) {
+        return false;
+    }
+    let Some(start) = input_region_offset_bytes.checked_add(input_offset_bytes) else {
+        return false;
+    };
+    let Some(bytes) = u64::from(rows)
+        .checked_mul(u64::from(in_features))
+        .and_then(|elements| elements.checked_mul(4))
+    else {
+        return false;
+    };
+    // Metal buffer bases are aligned; eligibility depends on the complete
+    // bound span's start, including a region's base and any workspace offset.
+    // K128 divisibility also keeps every row and K32 iteration float4-aligned.
+    start.is_multiple_of(16)
+        && start.checked_add(bytes).is_some()
+        && input_offset_bytes
+            .checked_add(bytes)
+            .is_some_and(|end| end <= input_region_bytes)
+}
+
 pub(super) fn supports_m64_threadgroup(
     execution_width: u64,
     maximum_threads: u64,
@@ -150,6 +195,11 @@ pub(super) struct MetalNativeBlockPipelines {
     pub(super) gemm_input_f32_output_f16: ComputePipelineState,
     pub(super) pq2_gemm_input_f32_output_f16: ComputePipelineState,
     pub(super) pq2_gemm_input_f32_output_f16_m64: Option<ComputePipelineState>,
+    #[cfg(test)]
+    pub(super) pq2_gemm_input_f32_output_f16_full_tiles: Option<ComputePipelineState>,
+    pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles: Option<ComputePipelineState>,
+    pub(super) pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input:
+        Option<ComputePipelineState>,
     pub(super) iq4xs_gemm_f16_f32: ComputePipelineState,
     pub(super) iq4xs_gemm_f16_f32_m64: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -260,6 +310,34 @@ impl MetalNativeBlockPipelines {
                 GgufBlockFormat::Pq2_0,
             )
         });
+        #[cfg(test)]
+        let pq2_gemm_input_f32_output_f16_full_tiles = optional_m32_pipeline(device, || {
+            gemm_format_pipeline(
+                device,
+                &library,
+                "vnext_native_block_gemm_input_f32_output_f16_full_tiles_specialized",
+                GgufBlockFormat::Pq2_0,
+            )
+        });
+        let pq2_gemm_input_f32_output_f16_m64_full_tiles = optional_m64_pipeline(device, || {
+            gemm_format_pipeline(
+                device,
+                &library,
+                "vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_specialized",
+                GgufBlockFormat::Pq2_0,
+            )
+        });
+        let pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input = optional_m64_pipeline(
+            device,
+            || {
+                gemm_format_pipeline(
+                    device,
+                    &library,
+                    "vnext_native_block_gemm_input_f32_output_f16_m64_full_tiles_vector_input_specialized",
+                    GgufBlockFormat::Pq2_0,
+                )
+            },
+        );
         let iq4xs_gemm_f16_f32 = gemm_format_pipeline(
             device,
             &library,
@@ -299,6 +377,10 @@ impl MetalNativeBlockPipelines {
             gemm_input_f32_output_f16: pipeline("vnext_native_block_gemm_input_f32_output_f16")?,
             pq2_gemm_input_f32_output_f16,
             pq2_gemm_input_f32_output_f16_m64,
+            #[cfg(test)]
+            pq2_gemm_input_f32_output_f16_full_tiles,
+            pq2_gemm_input_f32_output_f16_m64_full_tiles,
+            pq2_gemm_input_f32_output_f16_m64_full_tiles_vector_input,
             iq4xs_gemm_f16_f32,
             iq4xs_gemm_f16_f32_m64,
             #[cfg(test)]
@@ -358,6 +440,26 @@ impl MetalNativeBlockPipelines {
     ) -> Option<&ComputePipelineState> {
         self.shared.pipeline(format, rows, activation_type)
     }
+}
+
+#[cfg(test)]
+fn optional_m32_pipeline(
+    device: &Device,
+    create: impl FnOnce() -> Result<ComputePipelineState, MetalDeviceRuntimeError>,
+) -> Option<ComputePipelineState> {
+    if device.max_threads_per_threadgroup().width < 128
+        || device.max_threadgroup_memory_length() < 12288
+    {
+        return None;
+    }
+    create().ok().filter(|pipeline| {
+        pipeline.thread_execution_width() == 32
+            && pipeline.max_total_threads_per_threadgroup() >= 128
+            && pipeline
+                .static_threadgroup_memory_length()
+                .checked_add(12288)
+                .is_some_and(|bytes| bytes <= device.max_threadgroup_memory_length())
+    })
 }
 
 fn optional_m64_pipeline(
