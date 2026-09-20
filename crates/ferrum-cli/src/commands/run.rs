@@ -2819,6 +2819,7 @@ fn run_startup_auto_config(
         hardware,
         workload,
         execution_resource_authority,
+        crate::startup::StartupUsage::SingleRequest,
     )
 }
 
@@ -3134,17 +3135,33 @@ mod tests {
 
     #[test]
     fn run_prefix_state_cache_config_reaches_typed_engine_config() {
-        for enabled in [true, false] {
-            let config: CliConfig =
-                toml::from_str(&format!("[runtime]\nprefix_cache = {enabled}\n")).unwrap();
+        for configured in [None, Some(true), Some(false)] {
+            let config: CliConfig = match configured {
+                Some(enabled) => {
+                    toml::from_str(&format!("[runtime]\nprefix_cache = {enabled}\n")).unwrap()
+                }
+                None => CliConfig::default(),
+            };
             let base = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
             let effective = run_effective_runtime_config(
                 &base,
                 &run_startup_cli_runtime_entries(&test_run_cmd(), None),
             );
+            let resolved = run_startup_auto_config(
+                ferrum_types::HardwareCapabilities::unknown(),
+                Some(ModelCapabilities::unknown()),
+                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                None,
+                None,
+                effective,
+            )
+            .unwrap();
+            let enabled = configured.unwrap_or(false);
             let mut engine = ferrum_types::EngineConfig::default();
             engine.runtime.prefix_state_cache_enabled = !enabled;
-            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
             assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
             assert!(!engine.runtime.prefix_cache_enabled);
         }

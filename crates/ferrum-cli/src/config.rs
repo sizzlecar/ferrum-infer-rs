@@ -244,7 +244,8 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub scheduler_active_decode_prefill_chunk: Option<usize>,
 
-    /// Prefix cache opt-in, equivalent to `FERRUM_PREFIX_CACHE`.
+    /// Prefix-state cache override, equivalent to `FERRUM_PREFIX_CACHE`.
+    /// When absent, serve requests native caching and run leaves it disabled.
     #[serde(default)]
     pub prefix_cache: Option<bool>,
 

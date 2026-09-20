@@ -1485,6 +1485,7 @@ fn startup_auto_config(
         hardware,
         workload,
         execution_resource_authority,
+        crate::startup::StartupUsage::PersistentServing,
     )
 }
 
@@ -3417,6 +3418,27 @@ mod tests {
     }
 
     #[test]
+    fn serve_startup_requests_native_prefix_state_cache_by_default() {
+        let resolved = startup_auto_config(
+            HardwareCapabilities::unknown(),
+            Some(ModelCapabilities::unknown()),
+            ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+            None,
+            None,
+            None,
+            None,
+            RuntimeConfigSnapshot::default(),
+        )
+        .unwrap();
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert!(engine.runtime.prefix_state_cache_enabled);
+        assert!(!engine.runtime.prefix_cache_enabled);
+    }
+
+    #[test]
     fn prefix_cache_vllm_and_product_aliases_resolve_identically() {
         assert_eq!(
             prefix_cache_cli_override(true, false, false, false),
@@ -3557,9 +3579,22 @@ mod tests {
                 RuntimeConfigSource::Env,
             )]);
             let effective = merge_runtime_config_sources(config_entries, environment, entries);
+            let resolved = startup_auto_config(
+                HardwareCapabilities::unknown(),
+                Some(ModelCapabilities::unknown()),
+                ferrum_types::ExecutionResourceAuthority::PlanRuntime,
+                None,
+                None,
+                None,
+                None,
+                effective,
+            )
+            .unwrap();
             let mut engine = ferrum_types::EngineConfig::default();
             engine.runtime.prefix_state_cache_enabled = !enabled;
-            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
             assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
             assert!(!engine.runtime.prefix_cache_enabled);
         }

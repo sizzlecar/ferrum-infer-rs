@@ -3663,6 +3663,20 @@ fn resource_composition_mismatch_is_a_configuration_error() {
 }
 
 #[test]
+fn public_engine_authority_reports_validated_resource_composition() {
+    let legacy = test_continuous_engine();
+    let (native, _, _, _) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    for (engine, expected) in [
+        (&legacy, ExecutionResourceAuthority::LegacyEngine),
+        (&native, ExecutionResourceAuthority::PlanRuntime),
+    ] {
+        let engine: &dyn LlmInferenceEngine = engine;
+        assert_eq!(engine.execution_resource_authority(), expected);
+    }
+}
+
+#[test]
 fn resource_composition_rejects_unpaired_or_mismatched_speculation() {
     let config = EngineConfig::default();
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));

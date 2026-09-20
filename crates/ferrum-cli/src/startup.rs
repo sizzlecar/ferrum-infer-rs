@@ -6,13 +6,36 @@ use ferrum_types::{
     RuntimeConfigSource, StartupMemoryRequest, WorkloadProfile,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupUsage {
+    SingleRequest,
+    PersistentServing,
+}
+
 pub(crate) fn resolve_config(
     mut requested: RuntimeConfigSnapshot,
     model: ModelCapabilities,
     hardware: HardwareCapabilities,
     workload: WorkloadProfile,
     authority: ExecutionResourceAuthority,
+    usage: StartupUsage,
 ) -> Result<ResolvedFerrumConfig> {
+    if authority == ExecutionResourceAuthority::PlanRuntime
+        && crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_PREFIX_CACHE").is_none()
+    {
+        // This requests optional native state retention within the existing
+        // runtime memory budget. The compiled plan and selected providers
+        // determine whether checkpoints are usable; unsupported plans keep
+        // executing without a cache. Explicit values, including presets, win.
+        requested.upsert(
+            "FERRUM_PREFIX_CACHE",
+            match usage {
+                StartupUsage::SingleRequest => "0",
+                StartupUsage::PersistentServing => "1",
+            },
+            RuntimeConfigSource::Default,
+        );
+    }
     if authority == ExecutionResourceAuthority::PlanRuntime
         && crate::runtime_env::runtime_snapshot_value(&requested, "FERRUM_MAX_BATCHED_TOKENS")
             .is_none()
@@ -101,6 +124,119 @@ mod tests {
         model
     }
 
+    fn assert_prefix_state_cache(
+        resolved: &ResolvedFerrumConfig,
+        enabled: bool,
+        source: RuntimeConfigSource,
+    ) {
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_PREFIX_CACHE")
+            .expect("resolved prefix-state request");
+        assert_eq!(entry.effective_value, if enabled { "1" } else { "0" });
+        assert_eq!(entry.source, source);
+        let decision = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "prefix_cache_policy")
+            .expect("prefix-cache decision");
+        assert_eq!(
+            decision.selected,
+            if enabled {
+                "prefix_cache_enabled"
+            } else {
+                "prefix_cache_disabled"
+            }
+        );
+        assert_eq!(decision.source_key.as_deref(), Some("FERRUM_PREFIX_CACHE"));
+        let mut engine = EngineConfig::default();
+        engine.runtime.prefix_state_cache_enabled = !enabled;
+        engine
+            .apply_runtime_config_snapshot(&resolved.runtime_config)
+            .unwrap();
+        assert_eq!(engine.runtime.prefix_state_cache_enabled, enabled);
+        assert!(!engine.runtime.prefix_cache_enabled);
+    }
+
+    #[test]
+    fn native_prefix_default_matches_product_usage_and_engine_config() {
+        for (usage, enabled) in [
+            (StartupUsage::SingleRequest, false),
+            (StartupUsage::PersistentServing, true),
+        ] {
+            let resolved = resolve_config(
+                RuntimeConfigSnapshot::default(),
+                model(),
+                HardwareCapabilities::unknown(),
+                WorkloadProfile::serving_default(),
+                ExecutionResourceAuthority::PlanRuntime,
+                usage,
+            )
+            .unwrap();
+            assert_prefix_state_cache(&resolved, enabled, RuntimeConfigSource::Default);
+        }
+    }
+
+    #[test]
+    fn native_prefix_defaults_preserve_explicit_values_and_preset_sources() {
+        for source in [
+            RuntimeConfigSource::ConfigFile,
+            RuntimeConfigSource::Env,
+            RuntimeConfigSource::Cli,
+            RuntimeConfigSource::ScriptCase,
+            RuntimeConfigSource::Default,
+        ] {
+            for (usage, enabled) in [
+                (StartupUsage::SingleRequest, true),
+                (StartupUsage::PersistentServing, false),
+            ] {
+                let requested = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                    "FERRUM_PREFIX_CACHE",
+                    if enabled { "1" } else { "0" },
+                    source,
+                )]);
+                let resolved = resolve_config(
+                    requested,
+                    model(),
+                    hardware(),
+                    WorkloadProfile::serving_default(),
+                    ExecutionResourceAuthority::PlanRuntime,
+                    usage,
+                )
+                .unwrap();
+                assert_prefix_state_cache(&resolved, enabled, source);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_prefix_default_remains_disabled_for_both_product_usages() {
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let resolved = resolve_config(
+                RuntimeConfigSnapshot::default(),
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionResourceAuthority::LegacyEngine,
+                usage,
+            )
+            .unwrap();
+            assert!(crate::runtime_env::runtime_snapshot_value(
+                &resolved.runtime_config,
+                "FERRUM_PREFIX_CACHE",
+            )
+            .is_none());
+            let mut engine = EngineConfig::default();
+            engine
+                .apply_runtime_config_snapshot(&resolved.runtime_config)
+                .unwrap();
+            assert!(!engine.runtime.prefix_state_cache_enabled);
+            assert!(!engine.runtime.prefix_cache_enabled);
+        }
+    }
+
     #[test]
     fn native_workloads_share_context_policy_without_legacy_kv_defaults() {
         for workload in [
@@ -114,6 +250,7 @@ mod tests {
                 hardware(),
                 workload,
                 ExecutionResourceAuthority::PlanRuntime,
+                StartupUsage::PersistentServing,
             )
             .unwrap();
             let mut engine = EngineConfig::default();
@@ -141,6 +278,7 @@ mod tests {
             hardware(),
             WorkloadProfile::serving_default_for_hardware(&hardware()),
             ExecutionResourceAuthority::PlanRuntime,
+            StartupUsage::PersistentServing,
         )
         .unwrap();
         let mut engine = EngineConfig::default();
@@ -166,6 +304,7 @@ mod tests {
             hardware(),
             workload.clone(),
             ExecutionResourceAuthority::PlanRuntime,
+            StartupUsage::PersistentServing,
         )
         .unwrap();
         let mut engine = EngineConfig::default();
@@ -188,6 +327,7 @@ mod tests {
             hardware(),
             workload,
             ExecutionResourceAuthority::PlanRuntime,
+            StartupUsage::PersistentServing,
         )
         .is_err());
     }
@@ -224,6 +364,7 @@ mod tests {
                 hardware(),
                 WorkloadProfile::serving_default_for_hardware(&hardware()),
                 ExecutionResourceAuthority::PlanRuntime,
+                StartupUsage::PersistentServing,
             )
             .unwrap();
             for entry in requested.entries {
