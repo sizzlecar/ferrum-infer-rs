@@ -191,6 +191,9 @@ pub(super) struct NativePipelineInitialization {
 }
 
 pub(super) struct MetalNativeBlockPipelines {
+    // Let conformance experiments use the exact production shader functions.
+    #[cfg(test)]
+    pub(super) source_library: metal::Library,
     q3_k: NativeGemvPipelines,
     q4_k: NativeGemvPipelines,
     q5_k: NativeGemvPipelines,
@@ -383,6 +386,8 @@ impl MetalNativeBlockPipelines {
         #[cfg(test)]
         let specialized_gemm_ns = specialized_gemm_started.elapsed().as_nanos() as u64;
         Ok(Self {
+            #[cfg(test)]
+            source_library: library.clone(),
             q3_k,
             q4_k,
             q5_k,

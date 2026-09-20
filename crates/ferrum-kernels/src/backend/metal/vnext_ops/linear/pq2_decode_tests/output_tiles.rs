@@ -1,7 +1,7 @@
 //! Test-only output tiling and independent-sum interleaving experiments.
 //! Production selection remains unchanged.
 use super::*;
-use metal::CommandQueueRef;
+use metal::{CommandQueueRef, ComputePipelineDescriptor, MTLPipelineOption};
 
 struct OutputPipelines {
     complete: ComputePipelineState,
@@ -18,6 +18,8 @@ enum DecodeCandidate {
     Four,
     Sixteen,
     InterleavedEight,
+    DescriptorDefaultEight,
+    DescriptorBoundedEight,
 }
 
 impl DecodeCandidate {
@@ -25,7 +27,9 @@ impl DecodeCandidate {
         match self {
             Self::Four => 4,
             Self::Sixteen => 16,
-            Self::InterleavedEight => 8,
+            Self::InterleavedEight
+            | Self::DescriptorDefaultEight
+            | Self::DescriptorBoundedEight => 8,
         }
     }
 
@@ -38,7 +42,13 @@ impl DecodeCandidate {
             Self::Four => "four",
             Self::Sixteen => "sixteen",
             Self::InterleavedEight => "interleaved_eight",
+            Self::DescriptorDefaultEight => "descriptor_default_eight",
+            Self::DescriptorBoundedEight => "descriptor_bounded_eight",
         }
+    }
+
+    const fn requires_complete(self) -> bool {
+        !matches!(self, Self::Four | Self::Sixteen)
     }
 
     fn supports(self, params: LinearParams) -> bool {
@@ -46,7 +56,7 @@ impl DecodeCandidate {
             && params.in_features > 0
             && params.in_features.is_multiple_of(128)
             && params.out_features > 0
-            && (self != Self::InterleavedEight || params.out_features.is_multiple_of(16))
+            && (!self.requires_complete() || params.out_features.is_multiple_of(16))
     }
 }
 
@@ -54,10 +64,12 @@ struct CandidatePipelines {
     four: TilePipelines,
     sixteen: TilePipelines,
     interleaved_eight: TilePipelines,
+    descriptor_default_eight: TilePipelines,
+    descriptor_bounded_eight: TilePipelines,
 }
 
 impl CandidatePipelines {
-    fn new(device: &Device) -> Self {
+    fn new(device: &Device, production: &MetalLinearPipelines) -> Self {
         let options = CompileOptions::new();
         options.set_fast_math_enabled(false);
         let library = device
@@ -67,6 +79,41 @@ impl CandidatePipelines {
             .new_library_with_source(include_str!("interleaved_eight.metal"), &options)
             .unwrap();
         let pipeline = |candidate: DecodeCandidate, suffix| {
+            if matches!(
+                candidate,
+                DecodeCandidate::DescriptorDefaultEight | DecodeCandidate::DescriptorBoundedEight
+            ) {
+                let name = match suffix {
+                    "f16_complete" => "vnext_pq2_linear_f32_f16_complete",
+                    "f32_complete" => "vnext_pq2_linear_f32_complete",
+                    _ => unreachable!("descriptor experiment supports complete outputs only"),
+                };
+                let function = production
+                    .native
+                    .source_library
+                    .get_function(name, None)
+                    .unwrap();
+                let descriptor = ComputePipelineDescriptor::new();
+                descriptor.set_compute_function(Some(&function));
+                descriptor.set_max_total_threads_per_threadgroup(
+                    if candidate == DecodeCandidate::DescriptorBoundedEight {
+                        64
+                    } else {
+                        0
+                    },
+                );
+                // One variable only: leave the SIMD-multiple hint at its default.
+                assert!(!descriptor.thread_group_size_is_multiple_of_thread_execution_width());
+                let (pipeline, _reflection) = device
+                    .new_compute_pipeline_state_with_reflection(
+                        &descriptor,
+                        MTLPipelineOption::ArgumentInfo,
+                    )
+                    .unwrap();
+                assert_eq!(pipeline.thread_execution_width(), 32);
+                assert!(pipeline.max_total_threads_per_threadgroup() >= 64);
+                return pipeline;
+            }
             let (library, name) = if candidate == DecodeCandidate::InterleavedEight {
                 (
                     &interleaved_library,
@@ -90,19 +137,19 @@ impl CandidatePipelines {
         let tile_pipelines = |tile: DecodeCandidate| TilePipelines {
             f16: OutputPipelines {
                 complete: pipeline(tile, "f16_complete"),
-                guarded: (tile != DecodeCandidate::InterleavedEight)
-                    .then(|| pipeline(tile, "f16_guarded")),
+                guarded: (!tile.requires_complete()).then(|| pipeline(tile, "f16_guarded")),
             },
             f32: OutputPipelines {
                 complete: pipeline(tile, "f32_complete"),
-                guarded: (tile != DecodeCandidate::InterleavedEight)
-                    .then(|| pipeline(tile, "f32_guarded")),
+                guarded: (!tile.requires_complete()).then(|| pipeline(tile, "f32_guarded")),
             },
         };
         Self {
             four: tile_pipelines(DecodeCandidate::Four),
             sixteen: tile_pipelines(DecodeCandidate::Sixteen),
             interleaved_eight: tile_pipelines(DecodeCandidate::InterleavedEight),
+            descriptor_default_eight: tile_pipelines(DecodeCandidate::DescriptorDefaultEight),
+            descriptor_bounded_eight: tile_pipelines(DecodeCandidate::DescriptorBoundedEight),
         }
     }
 
@@ -119,6 +166,8 @@ impl CandidatePipelines {
             DecodeCandidate::Four => &self.four,
             DecodeCandidate::Sixteen => &self.sixteen,
             DecodeCandidate::InterleavedEight => &self.interleaved_eight,
+            DecodeCandidate::DescriptorDefaultEight => &self.descriptor_default_eight,
+            DecodeCandidate::DescriptorBoundedEight => &self.descriptor_bounded_eight,
         };
         let pipelines = match output {
             ElementType::F16 => &tile_pipelines.f16,
@@ -213,7 +262,7 @@ fn check_candidates(
             // Interleaving has no guarded kernel. Never disguise production or
             // another candidate as a successful interleaved tail dispatch.
             let params = fixture.params();
-            assert_eq!(kind, DecodeCandidate::InterleavedEight);
+            assert!(kind.requires_complete());
             assert!(params.rows > 0 && params.in_features > 0);
             assert!(params.in_features.is_multiple_of(128));
             assert!(params.out_features > 0 && !params.out_features.is_multiple_of(16));
@@ -248,10 +297,18 @@ fn pq2_interleaved_eight_decode_preserves_complete_tiles_offsets_and_f32_ranges(
     check_ranges(&[DecodeCandidate::InterleavedEight]);
 }
 
+#[test]
+fn pq2_bounded_threads_decode_preserves_complete_tiles_offsets_and_f32_ranges() {
+    check_ranges(&[
+        DecodeCandidate::DescriptorDefaultEight,
+        DecodeCandidate::DescriptorBoundedEight,
+    ]);
+}
+
 fn check_ranges(kinds: &[DecodeCandidate]) {
     let device = Device::system_default().expect("PQ2 output-tile conformance requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = CandidatePipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device, &production);
     let queue = device.new_command_queue();
     let check = |fixture: &Fixture, output, cpu| {
         check_candidates(&production, &candidate, fixture, output, &queue, cpu, kinds)
@@ -405,10 +462,18 @@ fn pq2_interleaved_eight_decode_matches_f64_on_projection_shapes() {
     check_projection_shapes(&[DecodeCandidate::InterleavedEight]);
 }
 
+#[test]
+fn pq2_bounded_threads_decode_matches_f64_on_projection_shapes() {
+    check_projection_shapes(&[
+        DecodeCandidate::DescriptorDefaultEight,
+        DecodeCandidate::DescriptorBoundedEight,
+    ]);
+}
+
 fn check_projection_shapes(kinds: &[DecodeCandidate]) {
     let device = Device::system_default().expect("PQ2 projection conformance requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = CandidatePipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device, &production);
     let queue = device.new_command_queue();
     for (_, width, outputs) in PROJECTION_SAMPLES {
         for output in [ElementType::F16, ElementType::F32] {
@@ -438,6 +503,15 @@ fn pq2_interleaved_eight_decode_isolated_gpu_timing() {
     paired_gpu_timing(DecodeCandidate::InterleavedEight);
 }
 
+#[test]
+#[ignore = "isolated Metal paired GPU timing; exclude compiler and other GPU work"]
+fn pq2_bounded_threads_decode_isolated_gpu_timing() {
+    paired_gpu_timing_with_control(
+        Variant::Candidate(DecodeCandidate::DescriptorDefaultEight),
+        DecodeCandidate::DescriptorBoundedEight,
+    );
+}
+
 fn pipeline_properties(pipeline: &ComputePipelineState) -> serde_json::Value {
     serde_json::json!({
         "thread_execution_width": pipeline.thread_execution_width(),
@@ -447,12 +521,16 @@ fn pipeline_properties(pipeline: &ComputePipelineState) -> serde_json::Value {
 }
 
 fn paired_gpu_timing(timed_candidate: DecodeCandidate) {
+    paired_gpu_timing_with_control(Variant::ProductionEight, timed_candidate);
+}
+
+fn paired_gpu_timing_with_control(control: Variant, timed_candidate: DecodeCandidate) {
     const DISPATCHES: usize = 64;
     const WARMUPS: usize = 2;
     const PAIRS: usize = 5;
     let device = Device::system_default().expect("PQ2 output tiling timing requires Metal");
     let production = MetalLinearPipelines::new(&device).unwrap();
-    let candidate = CandidatePipelines::new(&device);
+    let candidate = CandidatePipelines::new(&device, &production);
     let queue = device.new_command_queue();
     let timed_variant = Variant::Candidate(timed_candidate);
     for rows in [1, 4] {
@@ -472,12 +550,29 @@ fn paired_gpu_timing(timed_candidate: DecodeCandidate) {
                     false,
                     &[timed_candidate],
                 );
+                if let Variant::Candidate(kind) = control {
+                    check_candidates(
+                        &production,
+                        &candidate,
+                        &fixture,
+                        output,
+                        &queue,
+                        false,
+                        &[kind],
+                    );
+                }
                 let (production_pipeline, dispatch) = production.hadamard_native_dispatch(
                     GgufBlockFormat::Pq2_0,
                     output,
                     fixture.params(),
                 );
                 assert_eq!(dispatch, LinearDispatchKind::Pq2CooperativeGemv);
+                let control_pipeline = match control {
+                    Variant::ProductionEight => production_pipeline,
+                    Variant::Candidate(kind) => {
+                        candidate.get(kind, output, fixture.params()).unwrap()
+                    }
+                };
                 let candidate_pipeline = candidate
                     .get(timed_candidate, output, fixture.params())
                     .expect("timing shape must support the requested candidate");
@@ -494,40 +589,41 @@ fn paired_gpu_timing(timed_candidate: DecodeCandidate) {
                         / DISPATCHES as f64
                 };
                 for _ in 0..WARMUPS {
-                    run(Variant::ProductionEight);
+                    run(control);
                     run(timed_variant);
                 }
                 let mut samples = Vec::new();
                 for pair in 0..PAIRS {
                     let order = if pair % 2 == 0 {
-                        [Variant::ProductionEight, timed_variant]
+                        [control, timed_variant]
                     } else {
-                        [timed_variant, Variant::ProductionEight]
+                        [timed_variant, control]
                     };
-                    let mut production_us = 0.0;
+                    let mut control_us = 0.0;
                     let mut candidate_us = 0.0;
                     for variant in order {
                         let us = run(variant);
                         assert!(us.is_finite() && us > 0.0);
                         assert_same_bits(&fixture.read(), &expected);
-                        match variant {
-                            Variant::ProductionEight => production_us = us,
-                            Variant::Candidate(_) => candidate_us = us,
+                        if variant == control {
+                            control_us = us;
+                        } else {
+                            candidate_us = us;
                         }
                     }
                     samples.push(serde_json::json!({
                         "pair": pair,
                         "order": order.map(|variant| format!("{variant:?}")),
-                        "production_gpu_us": production_us,
+                        "control_gpu_us": control_us,
                         "candidate_gpu_us": candidate_us,
-                        "candidate_over_production": candidate_us / production_us,
+                        "candidate_over_control": candidate_us / control_us,
                     }));
                 }
                 fixture.assert_inputs_unchanged();
                 eprintln!(
                     "PQ2_OUTPUT_TILE_GPU {}",
                     serde_json::json!({
-                        "schema_version": 1, "device": device.name(),
+                        "schema_version": 2, "device": device.name(),
                         "kind": "pq2_output_tile_decode_paired_gpu_microbench",
                         "rows": rows, "shape": shape, "in_features": width,
                         "out_features": outputs, "output_dtype": format!("{output:?}"),
@@ -540,6 +636,8 @@ fn paired_gpu_timing(timed_candidate: DecodeCandidate) {
                         "candidate_outputs_per_group": timed_variant.outputs_per_group(),
                         "threads_per_group": 64, "output_stride": fixture.params().output_stride,
                         "production_pipeline": pipeline_properties(production_pipeline),
+                        "control_variant": format!("{control:?}"),
+                        "control_pipeline": pipeline_properties(control_pipeline),
                         "candidate_pipeline": pipeline_properties(candidate_pipeline),
                         "output_column_offset": fixture.params().output_column_offset,
                         "input_offset_bytes": 16, "weight_offset_bytes": 18,
