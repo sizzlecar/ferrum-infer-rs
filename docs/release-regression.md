@@ -363,20 +363,37 @@ At lease acquisition, maintenance runs once if the whole cache exceeds 48 GiB
 or its filesystem has less than 16 GiB free. Repository variables
 `METAL_CACHE_MAX_GIB` and `METAL_CACHE_MIN_FREE_GIB` configure these thresholds.
 `cargo metadata --offline --locked` selects current workspace members whose
-names start with `ferrum-`; `cargo clean --profile dev --package ...` removes
-their dev artifacts across all cached versions. Cargo clean ignores package
-URL/version qualifiers: another checkout's same-named Ferrum package can also
-need recompilation. Release, differently named packages such as Orch, other
-target triples, and nested trybuild targets are preserved. Unused dependency
-artifacts are not guessed from hashed filenames. This is a bounded cleanup,
-not a hard cap: protected artifacts can keep the cache above 48 GiB. In that
+names start with `ferrum-`. The default `--cleanup-mode dep-info` makes one
+unsorted pass through `debug/deps`. A rustc `.d` record must contain exactly one
+`CARGO_MANIFEST_DIR` matching a selected package's canonical directory and list
+itself among its rule targets. Only ordinary files explicitly named as targets
+in that same `debug/deps` directory can be removed. Paths are parsed literally,
+including Makefile escaping; hashes and prerequisite paths are not used to
+guess ownership. Missing ownership records, unsupported syntax and symlinks
+are retained. Records naming other checkouts, release, Orch, other target triples, trybuild,
+incremental, build-script output and unrelated dependencies remain untouched.
+
+The metadata pass is bounded by 30 seconds, 50,000 dep-info files and 256 MiB
+of records, with a 4 MiB limit per file. It reports progress and removes large
+selected artifacts first, retaining their ownership records until afterward.
+The whole pass stops selecting/deleting at a two-minute budget. Logs state
+whether scanning completed; selected logical bytes are not a claim about
+physical space reclaimed, which is checked separately afterward.
+The old Cargo package cleanup is available only with explicit
+`--cleanup-mode cargo`, with its ten-minute failure limit. It is not an automatic
+fallback: Cargo's repeated glob sorting took several minutes on a large shared
+cache. It also cleans all versions/sources with the selected package names.
+
+This is a bounded cleanup, not a hard cap: retained or unproven artifacts can
+keep the cache above 48 GiB. In that
 case a small marker beside the lock records the residual and configured limit.
 Size-only cleanup resumes after another quarter of the limit in growth (at
 least 1 GiB; 12 GiB with the default), instead of repeating on every job solely
-because the protected residual exceeds the goal. Changing the limit or reducing
+because the retained residual exceeds the goal. Changing the limit or reducing
 the cache below it also re-enables the ordinary size trigger. The low-free-space
 trigger remains active. If free space remains below the reserve, the new command fails before building rather
-than broadening deletion. A cleanup exceeding ten minutes also fails the step.
+than broadening deletion. Neither a partial pass nor an explicit Cargo-clean
+timeout is described as a complete cache cleanup.
 
 The helper never cleans during another participating command. It records paths,
 thresholds, before/after usage, the cleanup command, and command exit status in

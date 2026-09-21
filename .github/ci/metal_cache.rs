@@ -1,12 +1,16 @@
 //! Standalone Metal CI cache lease and bounded package cleanup.
 //! Build with rustc, not Cargo: maintenance must not first fill the cache.
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::{fs::OpenOptionsExt, process::ExitStatusExt},
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            process::ExitStatusExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -22,12 +26,19 @@ unsafe extern "C" {
     fn fcntl(fd: i32, command: i32, ...) -> i32;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    DepInfo,
+    Cargo,
+}
+
 struct Options {
     workspace: PathBuf,
     target: PathBuf,
     report: PathBuf,
     max_bytes: u64,
     min_free: u64,
+    cleanup_mode: CleanupMode,
     command: Vec<std::ffi::OsString>,
 }
 
@@ -35,6 +46,7 @@ fn options() -> Result<Options, String> {
     let mut args = env::args_os().skip(1);
     let (mut workspace, mut target, mut report) = (None, None, None);
     let (mut max_bytes, mut min_free) = (48 * GIB, 16 * GIB);
+    let mut cleanup_mode = CleanupMode::DepInfo;
     while let Some(arg) = args.next() {
         if arg == "--" {
             let command: Vec<_> = args.collect();
@@ -47,6 +59,7 @@ fn options() -> Result<Options, String> {
                 report: report.ok_or("missing --report")?,
                 max_bytes,
                 min_free,
+                cleanup_mode,
                 command,
             });
         }
@@ -55,6 +68,13 @@ fn options() -> Result<Options, String> {
             Some("--workspace") => workspace = Some(PathBuf::from(value)),
             Some("--target") => target = Some(PathBuf::from(value)),
             Some("--report") => report = Some(PathBuf::from(value)),
+            Some("--cleanup-mode") => {
+                cleanup_mode = match value.to_str() {
+                    Some("dep-info") => CleanupMode::DepInfo,
+                    Some("cargo") => CleanupMode::Cargo,
+                    _ => return Err("cleanup mode must be dep-info or cargo".into()),
+                }
+            }
             Some("--max-gib" | "--min-free-gib") => {
                 let bytes = value
                     .to_str()
@@ -179,7 +199,12 @@ fn usage(target: &Path) -> Result<Usage, String> {
     })
 }
 
-fn package_names(workspace: &Path) -> Result<Vec<String>, String> {
+struct Package {
+    name: String,
+    manifest_dir: PathBuf,
+}
+
+fn packages(workspace: &Path) -> Result<Vec<Package>, String> {
     let metadata = output(
         Command::new("cargo")
             .args([
@@ -195,7 +220,7 @@ fn package_names(workspace: &Path) -> Result<Vec<String>, String> {
     )?;
     // jq is already a dependency of these workflows. Avoid an incomplete TOML
     // parser or filename globs pretending to identify Cargo package ownership.
-    let mut jq = Command::new("jq").args(["-er", ". as $m | .packages[] | select(.id as $id | $m.workspace_members | index($id)) | select(.name | startswith(\"ferrum-\")) | .name"])
+    let mut jq = Command::new("jq").args(["-er", ". as $m | .packages[] | select(.id as $id | $m.workspace_members | index($id)) | select(.name | startswith(\"ferrum-\")) | (.name + \"\t\" + .manifest_path)"])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     jq.stdin
         .take()
@@ -209,19 +234,212 @@ fn package_names(workspace: &Path) -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&result.stderr)
         ));
     }
-    let names: Vec<String> = String::from_utf8(result.stdout)
+    let packages = String::from_utf8(result.stdout)
         .map_err(|e| e.to_string())?
         .lines()
-        .map(str::to_owned)
-        .collect();
-    if names.is_empty()
-        || names
-            .iter()
-            .any(|s| s.is_empty() || s.chars().any(char::is_control))
-    {
-        return Err("no unambiguous Ferrum workspace package names".into());
+        .map(|line| {
+            let (name, manifest) = line.split_once('\t').ok_or("missing package manifest")?;
+            if !name.starts_with("ferrum-")
+                || name.chars().chain(manifest.chars()).any(char::is_control)
+            {
+                return Err("ambiguous package metadata".to_owned());
+            }
+            let manifest = Path::new(manifest);
+            let directory = manifest.parent().ok_or("missing manifest directory")?;
+            if manifest.file_name() != Some(std::ffi::OsStr::new("Cargo.toml"))
+                || !directory.starts_with(workspace)
+                || directory.canonicalize().map_err(|e| e.to_string())? != directory
+            {
+                return Err("package manifest is outside the canonical workspace".into());
+            }
+            Ok(Package {
+                name: name.into(),
+                manifest_dir: directory.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if packages.is_empty() {
+        return Err("no Ferrum workspace packages".into());
     }
-    Ok(names)
+    Ok(packages)
+}
+
+// Parse only a single dep-info rule's targets, never prerequisite paths or
+// filename patterns. Unknown Make syntax fails closed for this dep-info file.
+fn rule_targets(line: &str) -> Option<Vec<PathBuf>> {
+    let mut chars = line.chars();
+    let mut token = String::new();
+    let mut targets = Vec::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ':' => {
+                if !token.is_empty() {
+                    targets.push(PathBuf::from(token));
+                }
+                return Some(targets);
+            }
+            '\\' => match chars.next()? {
+                escaped @ (' ' | '\t' | '\\' | '#' | ':') => token.push(escaped),
+                _ => return None,
+            },
+            '$' if chars.next()? == '$' => token.push('$'),
+            '$' | '#' => return None,
+            ch if ch.is_whitespace() => {
+                if !token.is_empty() {
+                    targets.push(PathBuf::from(std::mem::take(&mut token)));
+                }
+            }
+            ch => token.push(ch),
+        }
+    }
+    None
+}
+
+fn owned_outputs(
+    text: &str,
+    depfile: &Path,
+    directory: &Path,
+    packages: &[Package],
+) -> Option<BTreeSet<PathBuf>> {
+    let owners: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("# env-dep:CARGO_MANIFEST_DIR="))
+        .collect();
+    if owners.len() != 1
+        || !packages
+            .iter()
+            .any(|package| package.manifest_dir == Path::new(owners[0]))
+    {
+        return None;
+    }
+    let mut outputs = BTreeSet::new();
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        for path in rule_targets(line)? {
+            if path.is_absolute()
+                && path.parent() == Some(directory)
+                && !path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                outputs.insert(path);
+            }
+        }
+    }
+    // rustc lists the dep-info file itself as a target. Its presence ties this
+    // ownership record to this physical directory; no hash/suffix is inferred.
+    outputs.contains(depfile).then_some(outputs)
+}
+
+fn clean_dep_info(target: &Path, packages: &[Package], report: &mut File) -> Result<(), String> {
+    let directory = target.join("debug/deps");
+    for directory in [target.join("debug"), directory.clone()] {
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            _ => return Err("dep-info cleanup requires real debug/deps directories".into()),
+        }
+    }
+    let started = Instant::now();
+    let mut progress = started;
+    let (mut scanned, mut read_bytes, mut matched) = (0_u64, 0_u64, 0_u64);
+    let mut artifacts = BTreeMap::new();
+    let mut complete = true;
+    // One unsorted traversal, bounded metadata reads, and no nested targets.
+    // Large legacy caches must not repeat Cargo's per-package directory sorts.
+    for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
+        if started.elapsed() >= Duration::from_secs(30)
+            || read_bytes >= 256 * 1024 * 1024
+            || scanned >= 50_000
+        {
+            complete = false;
+            break;
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("d"))
+            || !entry.file_type().map_err(|e| e.to_string())?.is_file()
+        {
+            continue;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        file.take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        scanned += 1;
+        read_bytes += bytes.len() as u64;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if bytes.len() <= 4 * 1024 * 1024 {
+            if let Some(outputs) = owned_outputs(text, &path, &directory, packages) {
+                matched += 1;
+                for output in outputs {
+                    if let Ok(metadata) = fs::symlink_metadata(&output) {
+                        if metadata.is_file() {
+                            artifacts.entry(output).or_insert((metadata, path.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if progress.elapsed() >= Duration::from_secs(5) {
+            note(
+                report,
+                format!("dep_info_scan files={scanned} matched={matched} bytes={read_bytes}"),
+            )?;
+            progress = Instant::now();
+        }
+    }
+    note(report, format!("dep_info_scan_complete={complete} files={scanned} matched={matched} metadata_bytes={read_bytes} selected_files={}", artifacts.len()))?;
+    let mut artifacts: Vec<_> = artifacts.into_iter().collect();
+    // Keep the ownership records until their large outputs have been removed,
+    // including when the bounded pass is interrupted or cancelled.
+    artifacts.sort_unstable_by_key(|(path, (metadata, _))| {
+        (
+            path.extension() == Some(std::ffi::OsStr::new("d")),
+            std::cmp::Reverse(metadata.len()),
+        )
+    });
+    let (mut removed, mut logical_bytes) = (0, 0_u64);
+    for (path, (observed, depfile)) in artifacts {
+        if started.elapsed() >= Duration::from_secs(120) {
+            note(
+                report,
+                "dep_info_cleanup_budget_exhausted=true remaining_artifacts_retained",
+            )?;
+            break;
+        }
+        let current = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !current.is_file()
+            || (current.dev(), current.ino(), current.len())
+                != (observed.dev(), observed.ino(), observed.len())
+        {
+            return Err(format!("artifact changed while cache lease held: {path:?}"));
+        }
+        note(
+            report,
+            format!(
+                "remove_owned_artifact_intent={path:?} dep_info={depfile:?} logical_bytes={}",
+                current.len()
+            ),
+        )?;
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+        removed += 1;
+        logical_bytes = logical_bytes.saturating_add(current.len());
+    }
+    note(report, format!("dep_info_cleanup removed_files={removed} logical_bytes={logical_bytes} elapsed_ms={} actual_free_space_checked_afterward=true", started.elapsed().as_millis()))
 }
 
 fn clean(
@@ -282,7 +500,7 @@ fn maintain(
     target: &Path,
     report: &mut File,
 ) -> Result<(), String> {
-    // A protected residual larger than the size goal cannot be fixed by
+    // A retained residual larger than the size goal cannot be fixed by
     // repeatedly deleting the same Ferrum artifacts on every job. Remember
     // that condition under the lease; disk-reserve enforcement stays active.
     let marker = target.with_file_name(format!(
@@ -325,8 +543,31 @@ fn maintain(
     }
     let size_trigger = size_cleanup_needed(before.bytes, options.max_bytes, previous_limit);
     if size_trigger || before.free < options.min_free {
-        let names = package_names(workspace)?;
-        clean(workspace, target, &names, report)?;
+        let packages = packages(workspace)?;
+        let cleanup = match options.cleanup_mode {
+            CleanupMode::DepInfo => clean_dep_info(target, &packages, report),
+            CleanupMode::Cargo => clean(
+                workspace,
+                target,
+                &packages
+                    .iter()
+                    .map(|package| package.name.clone())
+                    .collect::<Vec<_>>(),
+                report,
+            ),
+        };
+        if let Err(error) = cleanup {
+            // A timeout or cancellation can have removed some files. Preserve
+            // that evidence without replacing the original cleanup failure.
+            let _ = note(
+                report,
+                format!(
+                    "cleanup_failed={error:?} usage_after_failure={:?}",
+                    usage(target)
+                ),
+            );
+            return Err(error);
+        }
         let after = usage(target)?;
         note(report, format!("after={after:?}"))?;
         if after.bytes > options.max_bytes {
@@ -342,7 +583,7 @@ fn maintain(
             note(
                 report,
                 format!(
-                    "protected_residual={} size_retrigger_growth={} disk_reserve=active",
+                    "retained_residual={} size_retrigger_growth={} disk_reserve=active",
                     after.bytes,
                     (options.max_bytes / 4).max(GIB)
                 ),
@@ -358,7 +599,7 @@ fn maintain(
     } else if before.bytes > options.max_bytes {
         note(
             report,
-            "cleanup=skipped_protected_residual_growth_below_margin disk_reserve=satisfied",
+            "cleanup=skipped_retained_residual_growth_below_margin disk_reserve=satisfied",
         )?;
     } else {
         note(report, "cleanup=not_needed")?;

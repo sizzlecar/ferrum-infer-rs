@@ -173,6 +173,7 @@ fn command_failure_is_preserved_and_recorded() {
             report: report.clone(),
             max_bytes: u64::MAX,
             min_free: 0,
+            cleanup_mode: CleanupMode::DepInfo,
             command: vec!["/usr/bin/false".into()],
         })
         .unwrap(),
@@ -184,15 +185,23 @@ fn command_failure_is_preserved_and_recorded() {
 }
 
 fn crate_fixture(root: &Path, name: &str) {
+    crate_fixture_version(root, name, "0.0.0");
+}
+
+fn crate_fixture_version(root: &Path, name: &str, version: &str) {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("Cargo.toml"),
         format!(
-            "[package]\nname = {name:?}\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n"
+            "[package]\nname = {name:?}\nversion = {version:?}\nedition = \"2021\"\n[workspace]\n"
         ),
     )
     .unwrap();
-    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"CARGO_MANIFEST_DIR\")); }\n",
+    )
+    .unwrap();
 }
 
 fn build_fixture(workspace: &Path, target: &Path, release: bool) {
@@ -233,7 +242,14 @@ fn exact_dev_cleanup_preserves_release_other_project_and_nested_targets() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"retained").unwrap();
     }
-    assert_eq!(package_names(&workspace).unwrap(), ["ferrum-cache-fixture"]);
+    assert_eq!(
+        packages(&workspace)
+            .unwrap()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ferrum-cache-fixture"]
+    );
     let _lease = lease(&target).unwrap();
     let mut report = File::create(fixture.path("clean.log")).unwrap();
     assert!(clean(&workspace, &target, &[], &mut report).is_err());
@@ -244,6 +260,7 @@ fn exact_dev_cleanup_preserves_release_other_project_and_nested_targets() {
         report: fixture.path("unused"),
         max_bytes: 0,
         min_free: 0,
+        cleanup_mode: CleanupMode::Cargo,
         command: vec![],
     };
     maintain(&options, &workspace, &target, &mut report).unwrap();
@@ -275,4 +292,170 @@ fn exact_dev_cleanup_preserves_release_other_project_and_nested_targets() {
     };
     maintain(&options, &workspace, &target, &mut report).unwrap();
     assert!(!fixture.path(".target.capacity-limit").exists());
+}
+
+#[test]
+fn dep_info_requires_exact_owner_self_target_and_literal_paths() {
+    let directory = Path::new("/cache/debug/deps");
+    let depfile = directory.join("a file.d");
+    let packages = [Package {
+        name: "ferrum-fixture".into(),
+        manifest_dir: "/workspace/crate".into(),
+    }];
+    let record = "/cache/debug/deps/a\\ file.d: source.rs\n/cache/debug/deps/a\\ file: source.rs\nsource.rs:\n# env-dep:CARGO_MANIFEST_DIR=/workspace/crate\n";
+    assert_eq!(
+        owned_outputs(record, &depfile, directory, &packages).unwrap(),
+        BTreeSet::from([depfile.clone(), directory.join("a file")])
+    );
+    for invalid in [
+        record.replace("CARGO_MANIFEST_DIR", "OTHER_DIR"),
+        record.replace("/workspace/crate", "/another/crate"),
+        record.replace("a\\ file.d", "unrelated.d"),
+        record.replace("a\\ file:", "$(arbitrary):"),
+        format!("{record}# env-dep:CARGO_MANIFEST_DIR=/workspace/crate\n"),
+    ] {
+        assert!(owned_outputs(&invalid, &depfile, directory, &packages).is_none());
+    }
+    let outside = format!("{record}/cache/debug/deps/../../release/keep: source.rs\n/cache/wasm32/debug/deps/keep: source.rs\n");
+    assert_eq!(
+        owned_outputs(&outside, &depfile, directory, &packages),
+        owned_outputs(record, &depfile, directory, &packages)
+    );
+    assert_eq!(
+        rule_targets("/a/escaped\\#name /a/dollar$$file: dependencies"),
+        Some(vec!["/a/escaped#name".into(), "/a/dollar$file".into()])
+    );
+}
+
+#[test]
+fn dep_info_cleanup_retains_unowned_files_and_symlink_targets() {
+    let fixture = Fixture::new();
+    let target = fixture.path("target");
+    let directory = target.join("debug/deps");
+    fs::create_dir_all(&directory).unwrap();
+    let packages = [Package {
+        name: "ferrum-fixture".into(),
+        manifest_dir: fixture.path("workspace"),
+    }];
+    let protected = fixture.path("protected");
+    fs::write(&protected, b"user file").unwrap();
+    let output = directory.join("linked-output");
+    symlink(&protected, &output).unwrap();
+    let record = directory.join("owned.d");
+    fs::write(
+        &record,
+        format!(
+            "{}: source.rs\n{}: source.rs\n# env-dep:CARGO_MANIFEST_DIR={}\n",
+            record.display(),
+            output.display(),
+            packages[0].manifest_dir.display()
+        ),
+    )
+    .unwrap();
+    let missing_owner = directory.join("unproven.d");
+    fs::write(
+        &missing_owner,
+        format!("{}: source.rs\n", missing_owner.display()),
+    )
+    .unwrap();
+    symlink(&protected, directory.join("linked.d")).unwrap();
+    let mut report = File::create(fixture.path("report")).unwrap();
+    clean_dep_info(&target, &packages, &mut report).unwrap();
+    assert_eq!(fs::read(&protected).unwrap(), b"user file");
+    assert!(fs::symlink_metadata(output).unwrap().is_symlink());
+    assert!(missing_owner.exists());
+    assert!(fs::symlink_metadata(directory.join("linked.d"))
+        .unwrap()
+        .is_symlink());
+    fs::remove_dir_all(target.join("debug")).unwrap();
+    symlink(fixture.path("protected-directory"), target.join("debug")).unwrap();
+    assert!(clean_dep_info(&target, &packages, &mut report).is_err());
+}
+
+#[test]
+fn dep_info_removal_rebuilds_with_cargo_and_preserves_other_sources() {
+    let fixture = Fixture::new();
+    let workspace = fixture.path("ferrum");
+    let other = fixture.path("other-ferrum-source");
+    let orch = fixture.path("orch");
+    let target = fixture.path("target");
+    crate_fixture(&workspace, "ferrum-cache-fixture");
+    // The same package name at another path is explicitly protected here;
+    // unlike Cargo clean -p, a name alone does not authorize deletion.
+    crate_fixture_version(&other, "ferrum-cache-fixture", "0.0.1");
+    crate_fixture(&orch, "orchestral-cache-fixture");
+    build_fixture(&workspace, &target, false);
+    build_fixture(&workspace, &target, true);
+    build_fixture(&other, &target, false);
+    build_fixture(&orch, &target, false);
+    let directory = target.join("debug/deps");
+    let workspace_packages = packages(&workspace).unwrap();
+    let output_paths = |packages: &[Package]| {
+        fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.extension() != Some(std::ffi::OsStr::new("d")) {
+                    return None;
+                }
+                let text = fs::read_to_string(&path).unwrap();
+                owned_outputs(&text, &path, &directory, packages)
+            })
+            .flatten()
+            .collect::<BTreeSet<_>>()
+    };
+    let original = output_paths(&workspace_packages);
+    assert!(original
+        .iter()
+        .any(|path| path.extension() != Some(std::ffi::OsStr::new("d"))));
+    let other_paths = output_paths(&packages(&other).unwrap());
+    assert!(!other_paths.is_empty());
+    for relative in [
+        "tests/trybuild/debug/keep",
+        "wasm32-unknown-unknown/debug/deps/keep",
+    ] {
+        let path = target.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"protected").unwrap();
+    }
+    let _lease = lease(&target).unwrap();
+    let mut report = File::create(fixture.path("dep-info.log")).unwrap();
+    clean_dep_info(&target, &workspace_packages, &mut report).unwrap();
+    assert!(original.iter().all(|path| !path.exists()));
+    assert!(other_paths.iter().all(|path| path.exists()));
+    assert!(target.join("release/ferrum-cache-fixture").exists());
+    assert!(target.join("debug/orchestral-cache-fixture").exists());
+    build_fixture(&workspace, &target, false);
+    assert!(
+        original.iter().all(|path| path.exists()),
+        "Cargo must recreate missing artifacts, not trust stale fingerprints"
+    );
+    let result = Command::new(target.join("debug/ferrum-cache-fixture"))
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap().trim(),
+        workspace.to_str().unwrap()
+    );
+    let options = Options {
+        workspace: workspace.clone(),
+        target: target.clone(),
+        report: fixture.path("unused"),
+        max_bytes: 0,
+        min_free: u64::MAX,
+        cleanup_mode: CleanupMode::DepInfo,
+        command: vec![],
+    };
+    assert!(maintain(&options, &workspace, &target, &mut report)
+        .unwrap_err()
+        .contains("below reserve"));
+    assert!(other_paths.iter().all(|path| path.exists()));
+    assert!(target.join("release/ferrum-cache-fixture").exists());
+    for relative in [
+        "tests/trybuild/debug/keep",
+        "wasm32-unknown-unknown/debug/deps/keep",
+    ] {
+        assert_eq!(fs::read(target.join(relative)).unwrap(), b"protected");
+    }
 }
