@@ -9225,9 +9225,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 let buffered = async {
-                    pending.cohort.wait().await?;
+                    let row = pending.cohort.read_submitted_row(pending.row).await?;
                     self.refresh_on_demand_reusable_execution_catalog()?;
-                    let row = pending.cohort.peek_row(pending.row)?;
                     let CompletionReadbackDisposition::Succeeded(output) = row.disposition() else {
                         return Err(FerrumError::backend("vNext pending decode readback failed"));
                     };

@@ -444,6 +444,57 @@ async fn abandoned_preobserved_parent_aborts_without_repeating_fence_observation
     }
 }
 
+#[tokio::test]
+async fn discarding_row_during_accepted_read_preserves_physical_output_and_peer() {
+    let setup = PairFixture::new();
+    let worker = VNextCompletionWorker::new().unwrap();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = sync_channel::<()>(1);
+    let (parent, cohort) = submit_pair_with_observer(
+        worker.reserve().await.unwrap(),
+        setup.parent,
+        setup.child,
+        Arc::clone(&setup.reaper),
+        move |result| {
+            assert!(result.is_ok());
+            let _ = entered.send(());
+            // Dropping the sender also releases this gate on test failure.
+            let _ = wait_release.recv();
+        },
+    );
+    let (_, guard) = parent.wait().await.unwrap();
+    let sequence = product_sequence(&setup.sessions[0], &cohort, 0);
+    let pending = sequence.pending_decode.lock().clone().unwrap();
+    guard.retire_normal().unwrap();
+    observed.await.unwrap();
+    let read = pending.cohort.read_submitted_row(pending.row);
+    tokio::pin!(read);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    // This is the exact synchronous cancellation action used by release_cache,
+    // after the accepted caller cloned its pending row and began awaiting it.
+    sequence.abort();
+    assert!(sequence.pending_decode.lock().is_none());
+    drop(release);
+    let output = read
+        .await
+        .expect("accepted read must retain its real submitted output");
+    assert_row(output.disposition(), 55);
+    assert!(
+        cohort.peek_row(0).is_err(),
+        "discarded row has no consumption right"
+    );
+    assert!(cohort.take_row(0).is_err());
+    assert_row(cohort.take_row(1).unwrap().disposition(), 129);
+    setup.sessions[1].try_complete().unwrap();
+    assert_eq!(setup.reaper.retained_count(), 0);
+    assert_eq!(setup.lane.in_flight_count(), 0);
+}
+
 fn product_sequence(
     session: &Arc<SequenceSession<TestRuntime>>,
     cohort: &Arc<PendingDecodeCohort>,

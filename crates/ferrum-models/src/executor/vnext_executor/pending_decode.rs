@@ -217,6 +217,18 @@ impl PendingDecodeCohort {
         Ok(BufferedDecodeRow { receipt, row })
     }
 
+    /// Observe an already accepted invocation's immutable physical output.
+    /// Cancellation may discard the right to consume a row while that caller
+    /// awaits completion; it cannot erase this submitted output or turn a
+    /// cancelled participant into a failure of its surviving peers.
+    pub(super) async fn read_submitted_row(&self, row: usize) -> Result<BufferedDecodeRow> {
+        let receipt = self.wait().await?;
+        if row >= receipt.dispositions().len() {
+            return Err(FerrumError::backend("submitted decode row is out of range"));
+        }
+        Ok(BufferedDecodeRow { receipt, row })
+    }
+
     /// The caller must first retire/abort its parent guard. Awaiting this while
     /// retaining that guard would wait for the caller's own acknowledgement.
     pub(super) async fn wait(&self) -> Result<Arc<CompletionReadbackBatchReceipt>> {
