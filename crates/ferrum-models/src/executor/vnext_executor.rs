@@ -1858,6 +1858,25 @@ impl<'a> VNextProductTokenMaskResidencyTransaction<'a> {
         self.residency.lock().clear();
         self.settled = true;
     }
+
+    fn invalidate_targets_before_slot_release(&mut self) {
+        debug_assert!(!self.published);
+        let mut ledger = self.residency.lock();
+        if self.plans.iter().any(|plan| plan.target.is_none()) {
+            // Without an exact Step slot, the potentially overwritten ranges
+            // cannot be distinguished from other cached product inputs.
+            ledger.clear();
+        } else {
+            for plan in &self.plans {
+                if let Some(target) = &plan.target {
+                    // Remove even a cache hit: an asynchronous child does not
+                    // publish terminal-success proof back into this ledger.
+                    ledger.entries.remove(&target.cache_key());
+                }
+            }
+        }
+        self.settled = true;
+    }
 }
 
 impl Drop for VNextProductTokenMaskResidencyTransaction<'_> {
@@ -12327,6 +12346,117 @@ mod tests {
             [first],
         );
         assert!(transaction.plans()[0].upload_required);
+    }
+
+    #[test]
+    fn product_token_mask_residency_child_invalidation_preserves_other_slot_and_rows() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let mask = TokenSelectionMask::new(vec![1, 0, 1]);
+        let selection = test_selection_content(&mask);
+        let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
+        for (slot, contents) in [
+            (7, vec![selection.clone(), selection.clone()]),
+            (8, vec![neutral.clone(), selection.clone(), selection.clone()]),
+        ] {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(slot),
+                contents,
+            );
+            transaction.publish();
+            transaction.settle_success();
+        }
+
+        {
+            let mut child = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(8),
+                [neutral.clone(), neutral.clone()],
+            );
+            assert!(!child.plans()[0].upload_required);
+            assert!(child.plans()[1].upload_required);
+            // Covers both an unchanged mask and an overwritten old selection.
+            // Neither child range is published ahead of terminal success.
+            child.invalidate_targets_before_slot_release();
+        }
+
+        let mut ledger = residency.lock();
+        for row in 0..2 {
+            assert!(
+                !ledger
+                    .prepare(Some(test_token_mask_target(7, row)), selection.clone())
+                    .upload_required,
+                "child invalidation must preserve the parent's successful slot"
+            );
+            assert!(
+                ledger
+                    .prepare(Some(test_token_mask_target(8, row)), neutral.clone())
+                    .upload_required,
+                "the child must not leave or publish residency proof"
+            );
+        }
+        assert!(
+            !ledger
+                .prepare(Some(test_token_mask_target(8, 2)), selection)
+                .upload_required,
+            "a participant range untouched by the child retains its proof"
+        );
+    }
+
+    #[test]
+    fn product_token_mask_residency_child_unknown_slot_invalidates_all() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
+        for slot in [7, 8] {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(slot),
+                [neutral.clone()],
+            );
+            transaction.publish();
+            transaction.settle_success();
+        }
+        let mut child = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+            &residency,
+            None,
+            [neutral],
+        );
+        assert!(child.plans()[0].upload_required);
+        child.invalidate_targets_before_slot_release();
+        assert!(residency.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn product_token_mask_residency_unclassified_failure_still_invalidates_all_slots() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
+        for explicitly_failed in [false, true] {
+            for slot in [7, 8] {
+                let mut transaction =
+                    VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                        &residency,
+                        Some(slot),
+                        [neutral.clone()],
+                    );
+                transaction.publish();
+                transaction.settle_success();
+            }
+            {
+                let mut transaction =
+                    VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                        &residency,
+                        Some(8),
+                        [neutral.clone()],
+                    );
+                assert!(!transaction.plans()[0].upload_required);
+                if explicitly_failed {
+                    transaction.invalidate_before_slot_release();
+                }
+                // Dropping an unsettled transaction remains conservative even
+                // when its target is known and the original plan was a hit.
+            }
+            assert!(residency.lock().entries.is_empty());
+        }
     }
 
     #[test]

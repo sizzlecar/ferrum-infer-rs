@@ -278,11 +278,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 });
             }
         };
-        // No residency claim is published ahead of child completion. Upload
-        // the neutral masks and invalidate stale slot evidence before reuse.
+        // The child exclusively owns its Step slot through terminal completion,
+        // just like the parent. Preserve proof for other slots while discarding
+        // the child's affected ranges: child success is not published here.
+        let token_mask_slot_identity = self
+            .io
+            .token_mask_residency_eligible
+            .then(|| {
+                wave.step_resources()
+                    .claimed_backing()
+                    .lane_stable_slot_identity()
+            })
+            .flatten();
         let mut masks = VNextProductTokenMaskResidencyTransaction::prepare(
             &self.product_token_mask_residency,
-            None,
+            token_mask_slot_identity,
             participants.iter().map(|_| {
                 VNextProductTokenMaskContent::from_policy(
                     None,
@@ -299,7 +309,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             masks.plans(),
             false,
         );
-        masks.invalidate_before_slot_release();
+        masks.invalidate_targets_before_slot_release();
         Ok(DispatchedDecodeSuccessor {
             step,
             outcome,
