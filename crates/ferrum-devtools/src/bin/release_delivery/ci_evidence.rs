@@ -23,7 +23,7 @@ use std::{
 };
 
 const SUBMISSION_JOB: &str = "Quality / GPU runtime (metal)";
-const SUBMISSION_EXECUTE: &str = "Require MetalContext submission and completion outputs";
+const SUBMISSION_EXECUTE: &str = "Metal cache maintenance and complete build-use lifecycle";
 const SUBMISSION_UPLOAD: &str = "Save raw numerical evidence";
 const DEVICE_EXECUTE: &str = "Execute required device correctness contracts";
 const PERFORMANCE_JOB: &str = "Metal release models";
@@ -72,6 +72,13 @@ fn device_producer(backend: Backend) -> (&'static str, &'static str) {
         Backend::Cpu => ("backend-numerics-cpu", "Quality / CPU (Linux)"),
         Backend::Metal => ("backend-numerics-metal", SUBMISSION_JOB),
         Backend::Cuda => ("backend-numerics-cuda", "Quality / GPU runtime (cuda)"),
+    }
+}
+
+fn device_execute(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Metal => SUBMISSION_EXECUTE,
+        Backend::Cpu | Backend::Cuda => DEVICE_EXECUTE,
     }
 }
 
@@ -759,7 +766,7 @@ async fn load_inner(
         uploaded_during(
             &raw.metadata,
             &raw.producer,
-            DEVICE_EXECUTE,
+            device_execute(backend),
             SUBMISSION_UPLOAD,
         )?;
         let report: BackendContractReport =

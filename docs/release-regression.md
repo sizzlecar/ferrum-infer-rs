@@ -350,6 +350,42 @@ without deletion or overwrite. An already-running job is not cancelled or
 modified; migration starts when that runner picks up a later job.
 Toolchain and source changes can still require recompilation. CUDA is unchanged.
 
+Both Metal device Quality and Homebrew installation verification use the
+[standalone cache helper](../.github/ci/metal_cache.rs). It is compiled directly
+with Rust 1.91 into `RUNNER_TEMP`, and holds a per-cache file lock across the
+entire build and execution sequence, including already-compiled tests and
+numerical checkers. The command inherits the lock descriptor: cancelling the
+supervisor cannot release the lock while its command or descendants still run.
+Local commands sharing this target must use the same helper; an older command
+that bypasses this protocol is not protected by Cargo's compilation lock.
+
+At lease acquisition, maintenance runs once if the whole cache exceeds 48 GiB
+or its filesystem has less than 16 GiB free. Repository variables
+`METAL_CACHE_MAX_GIB` and `METAL_CACHE_MIN_FREE_GIB` configure these thresholds.
+`cargo metadata --offline --locked` selects current workspace members whose
+names start with `ferrum-`; `cargo clean --profile dev --package ...` removes
+their dev artifacts across all cached versions. Cargo clean ignores package
+URL/version qualifiers: another checkout's same-named Ferrum package can also
+need recompilation. Release, differently named packages such as Orch, other
+target triples, and nested trybuild targets are preserved. Unused dependency
+artifacts are not guessed from hashed filenames. This is a bounded cleanup,
+not a hard cap: protected artifacts can keep the cache above 48 GiB. In that
+case a small marker beside the lock records the residual and configured limit.
+Size-only cleanup resumes after another quarter of the limit in growth (at
+least 1 GiB; 12 GiB with the default), instead of repeating on every job solely
+because the protected residual exceeds the goal. Changing the limit or reducing
+the cache below it also re-enables the ordinary size trigger. The low-free-space
+trigger remains active. If free space remains below the reserve, the new command fails before building rather
+than broadening deletion. A cleanup exceeding ten minutes also fails the step.
+
+The helper never cleans during another participating command. It records paths,
+thresholds, before/after usage, the cleanup command, and command exit status in
+`RUNNER_TEMP/metal-cache.log`, uploaded with `always()` for fourteen days.
+Cancellation may leave a final `phase=running` record; it does not imply success.
+Cleanup occurs before tests, so their failure status is preserved. The normal
+CI debug-info and incremental settings remain zero. No existing local cache is
+cleaned merely by updating these workflow files.
+
 The Metal model job pins the official artifact downloader containing the
 [upstream timeout-rejection fix](https://github.com/actions/toolkit/pull/2124).
 Its artifact IDs, extraction directories and independent archive/ABI checks

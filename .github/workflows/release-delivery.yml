@@ -1011,28 +1011,49 @@ jobs:
           BREW: ${{ matrix.brew }}
           FORMULA: ${{ matrix.formula }}
           BACKEND: ${{ matrix.backend }}
+          METAL_CACHE_MAX_GIB: ${{ vars.METAL_CACHE_MAX_GIB || '48' }}
+          METAL_CACHE_MIN_FREE_GIB: ${{ vars.METAL_CACHE_MIN_FREE_GIB || '16' }}
           # Run the explicit update below once; tap's implicit update can still
           # hold the update lock when the next command starts on a shared host.
           HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
-          helper_target=target
+          cache_runner=()
           if [ "$BACKEND" = metal ]; then
-            # Reuse the Metal test cache without recreating checkout/target.
-            helper_target="${RUNNER_TOOL_CACHE:?}/ferrum-metal-cargo-target"
+            rustc --edition=2021 .github/ci/metal_cache.rs -o "$RUNNER_TEMP/metal-cache"
+            cache_runner=("$RUNNER_TEMP/metal-cache" --workspace "$GITHUB_WORKSPACE"
+              --target "${RUNNER_TOOL_CACHE:?}/ferrum-metal-cargo-target"
+              --report "$RUNNER_TEMP/metal-cache.log"
+              --max-gib "$METAL_CACHE_MAX_GIB" --min-free-gib "$METAL_CACHE_MIN_FREE_GIB" --)
           fi
-          cargo build --locked -p ferrum-devtools --bin release_delivery --target-dir "$helper_target"
-          "$BREW" tap sizzlecar/ferrum
-          "$BREW" update
-          "$BREW" trust --formula sizzlecar/ferrum/ferrum
-          "$BREW" trust --formula sizzlecar/ferrum/ferrum-cuda
-          if "$BREW" list --versions "$FORMULA"; then
-            "$BREW" upgrade "sizzlecar/ferrum/$FORMULA"
-          else
-            "$BREW" install "sizzlecar/ferrum/$FORMULA"
-          fi
-          binary="$("$BREW" --prefix "$FORMULA")/bin/ferrum"
-          "$helper_target/debug/release_delivery" installed --channel homebrew --version "$VERSION" \
-            --binary "$binary" --output "$RUNNER_TEMP/public-homebrew.json"
+          # Hold the same lease through the final cached helper invocation.
+          "${cache_runner[@]}" bash -e -o pipefail -c '
+            helper_target=target
+            if [ "$BACKEND" = metal ]; then
+              helper_target="${RUNNER_TOOL_CACHE:?}/ferrum-metal-cargo-target"
+            fi
+            cargo build --locked -p ferrum-devtools --bin release_delivery --target-dir "$helper_target"
+            "$BREW" tap sizzlecar/ferrum
+            "$BREW" update
+            "$BREW" trust --formula sizzlecar/ferrum/ferrum
+            "$BREW" trust --formula sizzlecar/ferrum/ferrum-cuda
+            if "$BREW" list --versions "$FORMULA"; then
+              "$BREW" upgrade "sizzlecar/ferrum/$FORMULA"
+            else
+              "$BREW" install "sizzlecar/ferrum/$FORMULA"
+            fi
+            binary="$("$BREW" --prefix "$FORMULA")/bin/ferrum"
+            "$helper_target/debug/release_delivery" installed --channel homebrew --version "$VERSION" \
+              --binary "$binary" --output "$RUNNER_TEMP/public-homebrew.json"
+          '
+      - name: Save Metal cache maintenance status
+        if: always() && matrix.backend == 'metal'
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-cache-homebrew-installation
+          overwrite: true
+          path: ${{ runner.temp }}/metal-cache.log
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: always()
         with:

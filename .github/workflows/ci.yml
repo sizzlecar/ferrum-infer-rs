@@ -551,21 +551,70 @@ jobs:
           nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
           /usr/local/cuda/bin/nvcc --version
 
-      - name: Metal feature unit integration and documentation tests
+      - name: Test the standalone Metal cache helper
         if: matrix.backend == 'metal'
         run: |
-          # Retain the former macOS feature suite, including integration tests
-          # beyond op_diff and doctests. CPU/OS contracts also run in their own
-          # platform jobs; their isolated changes do not invalidate GPU results.
-          cargo test --locked --workspace --all-targets --features metal
-          cargo test --locked --workspace --doc --features metal
+          rustc --edition=2021 --test .github/ci/metal_cache.rs -o "$RUNNER_TEMP/metal-cache-tests"
+          "$RUNNER_TEMP/metal-cache-tests" --test-threads=1
+
+      - name: Metal cache maintenance and complete build-use lifecycle
+        if: matrix.backend == 'metal'
+        env:
+          METAL_CARGO_TARGET: ${{ steps.metal_cargo_cache.outputs.path }}
+          METAL_CACHE_MAX_GIB: ${{ vars.METAL_CACHE_MAX_GIB || '48' }}
+          METAL_CACHE_MIN_FREE_GIB: ${{ vars.METAL_CACHE_MIN_FREE_GIB || '16' }}
+        run: |
+          # No workspace build is needed to maintain an already-full cache.
+          rustc --edition=2021 .github/ci/metal_cache.rs -o "$RUNNER_TEMP/metal-cache"
+          "$RUNNER_TEMP/metal-cache" --workspace "$GITHUB_WORKSPACE" \
+            --target "$METAL_CARGO_TARGET" --report "$RUNNER_TEMP/metal-cache.log" \
+            --max-gib "$METAL_CACHE_MAX_GIB" --min-free-gib "$METAL_CACHE_MIN_FREE_GIB" -- \
+            bash -e -o pipefail -c '
+              cargo test --locked --workspace --all-targets --features metal
+              cargo test --locked --workspace --doc --features metal
+              cargo build --locked -p ferrum-testkit --example backend_numerics --features metal
+              mkdir -p "$RUNNER_TEMP/backend-numerics"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op rms-norm --tokens 4 --dim 128 --seed 42 --report "$RUNNER_TEMP/backend-numerics/aligned.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op rms-norm --tokens 3 --dim 33 --seed 7 --report "$RUNNER_TEMP/backend-numerics/tail.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op gemm --m 64 --n 32 --k 32 --seed 42 --report "$RUNNER_TEMP/backend-numerics/gemm-aligned.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op gemm --m 64 --n 33 --k 35 --seed 7 --report "$RUNNER_TEMP/backend-numerics/gemm-tail.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op silu-mul --tokens 4 --intermediate 256 --seed 42 --report "$RUNNER_TEMP/backend-numerics/silu-aligned.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op silu-mul --tokens 3 --intermediate 257 --seed 7 --report "$RUNNER_TEMP/backend-numerics/silu-tail.json"
+              ./target/debug/examples/backend_numerics --require-backend metal \
+                --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 --report "$RUNNER_TEMP/backend-numerics/submission.json"
+              cargo test --locked -p ferrum-kernels -p ferrum-testkit -p ferrum-models \
+                --lib --test op_diff --test vnext_metal_checkpoint_continuation \
+                --features ferrum-kernels/metal,ferrum-testkit/metal,ferrum-models/metal \
+                --no-run --message-format=json > "$RUNNER_TEMP/device-contract-artifacts.jsonl"
+              cargo run --locked -p ferrum-devtools --bin contract_checks -- \
+                --backend metal --artifacts "$RUNNER_TEMP/device-contract-artifacts.jsonl" \
+                --output "$RUNNER_TEMP/backend-numerics/contracts.json"
+            '
+
+      - name: Save Metal cache maintenance status
+        if: always() && matrix.backend == 'metal'
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-cache-${{ github.job }}
+          overwrite: true
+          path: ${{ runner.temp }}/metal-cache.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Build required-backend numerical checker
+        if: matrix.backend == 'cuda'
         env:
           BACKEND: ${{ matrix.backend }}
         run: cargo build --locked -p ferrum-testkit --example backend_numerics --features "$BACKEND"
 
       - name: Require real GPU outputs for aligned and tail dimensions
+        if: matrix.backend == 'cuda'
         env:
           BACKEND: ${{ matrix.backend }}
         run: |
@@ -589,14 +638,8 @@ jobs:
             --op silu-mul --tokens 3 --intermediate 257 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/silu-tail.json"
 
-      - name: Require MetalContext submission and completion outputs
-        if: matrix.backend == 'metal'
-        run: |
-          ./target/debug/examples/backend_numerics --require-backend metal \
-            --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 \
-            --report "$RUNNER_TEMP/backend-numerics/submission.json"
-
       - name: Execute required device correctness contracts
+        if: matrix.backend == 'cuda'
         env:
           BACKEND: ${{ matrix.backend }}
         run: |

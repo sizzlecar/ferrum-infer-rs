@@ -16,6 +16,35 @@ fn origin() -> Origin {
         job_id: 21,
     }
 }
+
+#[test]
+fn metal_evidence_requires_the_successful_complete_build_use_step() {
+    let mut actual = job();
+    actual.name = device_producer(Backend::Metal).1.into();
+    actual.steps.truncate(2);
+    actual.steps[0].name = device_execute(Backend::Metal).into();
+    actual.steps[1].name = SUBMISSION_UPLOAD.into();
+    let verify = |actual: &Job| {
+        uploaded_during(
+            &artifact_record(),
+            actual,
+            device_execute(Backend::Metal),
+            SUBMISSION_UPLOAD,
+        )
+    };
+    verify(&actual).unwrap();
+    assert_eq!(device_execute(Backend::Cpu), DEVICE_EXECUTE);
+    assert_eq!(device_execute(Backend::Cuda), DEVICE_EXECUTE);
+    // A skipped combined command cannot be replaced by another backend's step.
+    actual.steps[0].conclusion = Some("skipped".into());
+    assert!(verify(&actual).is_err());
+    actual.steps[0].conclusion = Some("success".into());
+    actual.steps[0].name = DEVICE_EXECUTE.into();
+    assert!(verify(&actual).is_err());
+    actual.steps[0].name = device_execute(Backend::Metal).into();
+    actual.steps.push(actual.steps[0].clone());
+    assert!(verify(&actual).is_err());
+}
 fn job() -> Job {
     serde_json::from_value(json!({
         "id":21,"run_id":17,"run_attempt":1,"head_sha":"a".repeat(40),
