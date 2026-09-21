@@ -127,6 +127,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Allow one eligible pure-decode successor; disabled by default.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub decode_lookahead: Option<bool>,
+
     /// Sequence fit gate used before prefill admission.
     #[arg(long, value_enum)]
     pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
@@ -406,6 +410,7 @@ async fn execute_with_compatibility(
         max_num_seqs,
         max_num_batched_tokens,
         prefill_decode_execution,
+        decode_lookahead,
         sequence_fit_policy,
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
@@ -858,6 +863,7 @@ async fn execute_with_compatibility(
         profile_detail.as_str(),
         RuntimeConfigSource::Cli,
     ));
+    push_decode_lookahead_cli_entry(&mut startup_cli_runtime_entries, decode_lookahead);
     if let Some(wait) = prefix_rendezvous_max_wait_ms {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS",
@@ -1500,6 +1506,14 @@ fn startup_auto_config(
         execution_resource_authority,
         crate::startup::StartupUsage::PersistentServing,
     )
+}
+
+fn push_decode_lookahead_cli_entry(entries: &mut Vec<RuntimeConfigEntry>, enabled: Option<bool>) {
+    push_cli_runtime_entry(
+        entries,
+        "FERRUM_DECODE_LOOKAHEAD",
+        enabled.map(|enabled| if enabled { "1" } else { "0" }),
+    );
 }
 
 pub(crate) fn merge_runtime_config_sources(
@@ -2925,6 +2939,40 @@ mod tests {
             .unwrap();
         assert_eq!(sequence_fit.effective_value, "full-input-must-fit");
         assert_eq!(sequence_fit.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn serve_decode_lookahead_false_overrides_enabled_config_file() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            decode_lookahead: Some(true),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        for selected in [None, Some(false), Some(true)] {
+            let mut cli_entries = Vec::new();
+            push_decode_lookahead_cli_entry(&mut cli_entries, selected);
+            let effective = merge_runtime_config_sources(
+                config_entries.clone(),
+                RuntimeConfigSnapshot::default(),
+                cli_entries,
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.batching.decode_lookahead, selected.unwrap_or(true));
+            let entry = effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_DECODE_LOOKAHEAD")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if selected.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
+        }
     }
 
     #[test]

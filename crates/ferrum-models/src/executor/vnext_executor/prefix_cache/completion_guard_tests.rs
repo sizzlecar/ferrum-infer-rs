@@ -36,6 +36,7 @@ fn completion_sequence(
         active_binding,
         request_origin: ExecutorRequestOrigin::Product,
         tokens: Mutex::new(vec![1]),
+        pending_decode: Mutex::new(None),
         maximum_tokens: 1,
         active: AtomicBool::new(true),
         operation: AsyncMutex::new(()),
@@ -210,7 +211,7 @@ async fn completed_native_session_disarms_completion_ownership() {
         operation: Some(sequence.operation.lock().await),
         completed: false,
     };
-    sequence.complete(&completion).unwrap();
+    sequence.complete(&completion).await.unwrap();
     guard.completed = true;
     drop(guard);
     assert!(!sequence.active.load(Ordering::Acquire));

@@ -238,6 +238,10 @@ impl EngineConfig {
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
         self.scheduler.apply_runtime_config_snapshot(snapshot)?;
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_DECODE_LOOKAHEAD") {
+            self.batching.decode_lookahead = parse_bool_env_value(value)
+                .map_err(|reason| format!("FERRUM_DECODE_LOOKAHEAD: {reason}"))?;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFILL_DECODE_EXECUTION") {
             self.batching.prefill_decode_execution =
                 PrefillDecodeExecution::parse_runtime_value(value)
@@ -1146,6 +1150,10 @@ impl Default for MonitoringConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchConfig {
+    /// Allow one device-token successor behind an eligible pure decode wave.
+    /// Unsupported models and ineligible sampling policies remain serial.
+    #[serde(default)]
+    pub decode_lookahead: bool,
     /// Physical execution policy for PlanRuntime prefill/decode scheduler batches.
     #[serde(default)]
     pub prefill_decode_execution: PrefillDecodeExecution,
@@ -1172,6 +1180,7 @@ impl BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
+            decode_lookahead: false,
             prefill_decode_execution: PrefillDecodeExecution::default(),
             max_batch_size: 32,
             max_wait_ms: 8,
@@ -1184,6 +1193,35 @@ impl Default for BatchConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_lookahead_is_opt_in_for_existing_configs_and_runtime_snapshots() {
+        let mut serialized = serde_json::to_value(super::BatchConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("decode_lookahead");
+        let restored: super::BatchConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!restored.decode_lookahead);
+        let mut config = super::EngineConfig::default();
+        for (value, expected) in [("1", true), ("false", false)] {
+            let snapshot =
+                crate::RuntimeConfigSnapshot::from_entries(vec![crate::RuntimeConfigEntry::new(
+                    "FERRUM_DECODE_LOOKAHEAD",
+                    value,
+                    crate::RuntimeConfigSource::Cli,
+                )]);
+            config.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(config.batching.decode_lookahead, expected);
+        }
+        let snapshot =
+            crate::RuntimeConfigSnapshot::from_entries(vec![crate::RuntimeConfigEntry::new(
+                "FERRUM_DECODE_LOOKAHEAD",
+                "two-steps",
+                crate::RuntimeConfigSource::Cli,
+            )]);
+        assert!(config.apply_runtime_config_snapshot(&snapshot).is_err());
+    }
+
     use super::*;
 
     #[test]

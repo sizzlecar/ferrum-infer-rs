@@ -89,9 +89,22 @@ PlanRuntime mixed API 保留两组输入和各自顺序，共享物理执行并�
 
 ### CPU 准备与 GPU 执行的重叠边界
 
-CUDA 的整轮 graph replay 已存在；它减少设备提交开销，但当前 engine 仍在本轮完成、回读和状态提交之后，准备下一轮。优化方向之一是减少重复的 host 绑定工作，再评估有界的批次流水，避免 GPU 等待下一轮 CPU 准备。Mixed 本身不建立这种跨轮重叠。
+CUDA 的整轮 graph replay 已存在；它减少设备提交开销。默认路径仍在本轮完成、回读和状态提交之后准备下一轮。Mixed 本身不建立跨轮重叠。
 
-异步流水尚未实现，不能通过删除 fence wait 获得。它需要区分已预留、已提交和已完成的请求进度，声明设备端 token 反馈及 KV/GDN 的前置依赖，并按序处理 EOS、取消和提交后错误。资源槽必须保留到所有引用它的设备工作结束；未知采样结果不能当作真实 token 推进。该设计同时影响 `run`、`serve` 和共享资源协议，需要独立的正确性与端到端性能验证。
+实验性一步 decode 前瞻正在接入产品路径，默认关闭。`run` 与 `serve` 使用同一个 `BatchConfig.decode_lookahead` 开关，可通过 `--decode-lookahead` 启用，也可在 CLI 配置文件中设置：
+
+```toml
+[runtime]
+decode_lookahead = true
+```
+
+显式 `--decode-lookahead=false` 可以覆盖配置文件中的启用设置。未指定时保持现有配置优先级；旧配置没有这个字段时，行为仍为关闭。这是执行选项，不是已验证的性能 preset。
+
+入口只为纯 decode、当前实际 `LogitsReturnPolicy::GreedyArgmax`、至少还允许输出两个 token 且两轮输入均能容纳的请求授予 `OneStepDecodeGrant`。授权绑定准确的 request、cache 和当前 token frontier；开启开关不等于每个请求都会执行前瞻。Mixed 不授予该授权；已有待消费 child 的请求交回纯 decode 路径。诊断事件、checkpoint capture 和 prefix restore 等当前不兼容的执行方式继续走原路径，资源不足或不满足 successor admission 契约时也不能绕过预算。
+
+前瞻深度仅为一轮。已确认的 parent 设备 U32 token 经同一 lane 的 typed copy 成为 child 输入，不以占位 token 伪造输入。parent 与 child 的 Step、输出和前置依赖保留到各自 fence 完成，并按 parent、child 顺序提交。child 保留完整 logits，等 parent 的 host 状态提交之后再按当时的采样策略处理；不能把尚未确认的 child argmax 继续用作下一轮输入。
+
+EOS、stop、最后一个输出 token 或取消可能使已经提交的 child 不再需要。这时仍排空已有工作，仅丢弃对应请求的结果，其他同批请求可以继续。child 已推进的 recurrent state 不得冒充 parent frontier 导出 prefix 或 checkpoint。该实验同时影响 `run`、`serve` 和共享资源协议；硬件无关协议测试、真实设备回归与端到端性能测量需要分别验证，不能把具备前瞻入口当作吞吐或延迟目标已经达成。
 
 ### Mixed 的小回传边界
 

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "forwarded_input_tests/cold_child.rs"]
+mod cold_child;
+
 fn token_source(row: u32) -> CompletionReadbackRequest {
     CompletionReadbackRequest::new(
         id("node.tail"),

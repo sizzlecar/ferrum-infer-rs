@@ -65,6 +65,25 @@ mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
 
+    #[test]
+    fn decode_lookahead_is_explicit_and_disableable_for_run_and_serve() {
+        for command in ["run", "serve"] {
+            for (flag, expected) in [
+                (None, None),
+                (Some("--decode-lookahead"), Some(true)),
+                (Some("--decode-lookahead=false"), Some(false)),
+            ] {
+                let mut args = vec!["ferrum", command, "test-model"];
+                args.extend(flag);
+                let value = match TestCli::try_parse_from(args).unwrap().command {
+                    TestCommand::Run(cmd) => cmd.decode_lookahead,
+                    TestCommand::Serve(cmd) => cmd.decode_lookahead,
+                };
+                assert_eq!(value, expected);
+            }
+        }
+    }
+
     #[derive(Parser)]
     struct TestCli {
         #[command(subcommand)]

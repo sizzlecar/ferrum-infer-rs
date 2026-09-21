@@ -752,6 +752,9 @@ pub struct PlanRuntimeDecodeInput {
     pub input_token: TokenId,
     pub kv_cache: Arc<dyn KvCacheHandle>,
     pub logits_policy: LogitsReturnPolicy,
+    /// One optional successor, bound to this request's current cache frontier.
+    /// This never authorizes publishing a token before ordinary host policy checks.
+    pub lookahead: Option<OneStepDecodeGrant>,
 }
 
 impl PlanRuntimeDecodeInput {
@@ -765,12 +768,55 @@ impl PlanRuntimeDecodeInput {
             input_token,
             kv_cache,
             logits_policy: LogitsReturnPolicy::FullLogits,
+            lookahead: None,
         }
     }
 
     pub fn with_logits_policy(mut self, logits_policy: LogitsReturnPolicy) -> Self {
         self.logits_policy = logits_policy;
         self
+    }
+}
+
+/// Permission to prepare one successor from a confirmed parent Greedy token.
+/// The executor must still reserve both frames, validate model capabilities,
+/// and re-evaluate the successor sampling policy after committing its parent.
+#[derive(Debug, Clone)]
+pub struct OneStepDecodeGrant {
+    request_id: RequestId,
+    cache_id: String,
+    cache_tokens: usize,
+    successor_input_tokens: usize,
+}
+
+impl OneStepDecodeGrant {
+    pub fn for_input(
+        input: &PlanRuntimeDecodeInput,
+        remaining_output_tokens: usize,
+    ) -> Option<Self> {
+        if remaining_output_tokens < 2
+            || !matches!(input.logits_policy, LogitsReturnPolicy::GreedyArgmax { .. })
+        {
+            return None;
+        }
+        let cache_tokens = input.kv_cache.num_tokens();
+        Some(Self {
+            request_id: input.request_id.clone(),
+            cache_id: input.kv_cache.cache_id(),
+            cache_tokens,
+            successor_input_tokens: cache_tokens.checked_add(2)?,
+        })
+    }
+
+    pub fn matches_input(&self, input: &PlanRuntimeDecodeInput) -> bool {
+        self.request_id == input.request_id
+            && self.cache_id == input.kv_cache.cache_id()
+            && self.cache_tokens == input.kv_cache.num_tokens()
+            && matches!(input.logits_policy, LogitsReturnPolicy::GreedyArgmax { .. })
+    }
+
+    pub const fn successor_input_tokens(&self) -> usize {
+        self.successor_input_tokens
     }
 }
 

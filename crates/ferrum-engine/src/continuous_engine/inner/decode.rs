@@ -69,9 +69,10 @@ impl EngineInner {
         }
     }
 
-    pub(super) fn prepare_plan_runtime_decodes(
+    pub(in crate::continuous_engine) fn prepare_plan_runtime_decodes(
         &self,
         request_ids: &[RequestId],
+        allow_lookahead: bool,
     ) -> Vec<PlanRuntimeDecodeInput> {
         let mut inputs = Vec::with_capacity(request_ids.len());
         {
@@ -83,12 +84,28 @@ impl EngineInner {
                 let Some(resources) = sequence.ready_decode_resources(rid) else {
                     continue;
                 };
-                let input = PlanRuntimeDecodeInput::new(
+                let mut input = PlanRuntimeDecodeInput::new(
                     rid.clone(),
                     resources.last_token,
                     resources.kv_cache,
                 )
                 .with_logits_policy(sequence.model_decode_logits_policy());
+                if allow_lookahead && self.config.batching.decode_lookahead {
+                    let context_capacity = effective_request_context_capacity(
+                        &self.config,
+                        &self.runtime_config,
+                        self.model_executor.kv_capacity(),
+                    );
+                    input.lookahead = ferrum_interfaces::OneStepDecodeGrant::for_input(
+                        &input,
+                        sequence.remaining_output_tokens(),
+                    )
+                    .filter(|grant| {
+                        grant.successor_input_tokens() <= sequence.model_maximum_sequence_tokens()
+                            && context_capacity
+                                .is_none_or(|capacity| grant.successor_input_tokens() <= capacity)
+                    });
+                }
                 inputs.push(input);
             }
         }
@@ -102,7 +119,7 @@ impl EngineInner {
         &self,
         request_ids: &[RequestId],
     ) -> Result<PlanRuntimeDecodeBatchOutcome> {
-        let inputs = self.prepare_plan_runtime_decodes(request_ids);
+        let inputs = self.prepare_plan_runtime_decodes(request_ids, true);
         if inputs.is_empty() {
             return Ok(PlanRuntimeDecodeBatchOutcome::Completed { submitted_width: 0 });
         }

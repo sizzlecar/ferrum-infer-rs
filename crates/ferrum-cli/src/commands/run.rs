@@ -874,6 +874,10 @@ pub struct RunCommand {
     #[arg(long, value_enum)]
     pub prefill_decode_execution: Option<crate::commands::PrefillDecodeExecutionArg>,
 
+    /// Allow one eligible pure-decode successor; disabled by default.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub decode_lookahead: Option<bool>,
+
     /// Cap total prefill tokens per scheduler iteration with active decode; 0 disables.
     #[arg(long, value_name = "N")]
     pub scheduler_active_decode_prefill_token_budget: Option<usize>,
@@ -2700,6 +2704,12 @@ fn run_startup_cli_runtime_entries(
         cmd.prefill_decode_execution
             .map(crate::commands::PrefillDecodeExecutionArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_DECODE_LOOKAHEAD",
+        cmd.decode_lookahead
+            .map(|enabled| if enabled { "1" } else { "0" }),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_ACTIVE_DECODE_PREFILL_TOKEN_BUDGET",
@@ -2925,6 +2935,7 @@ mod tests {
             max_num_seqs: None,
             max_num_batched_tokens: None,
             prefill_decode_execution: None,
+            decode_lookahead: None,
             scheduler_active_decode_prefill_token_budget: None,
             sequence_fit_policy: None,
             prefix_rendezvous_max_wait_ms: None,
@@ -3029,6 +3040,41 @@ mod tests {
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_decode_lookahead_false_overrides_enabled_config_file() {
+        let configured = RuntimeConfigSnapshot::from_entries(
+            crate::config::RuntimeCliConfig {
+                decode_lookahead: Some(true),
+                ..Default::default()
+            }
+            .runtime_config_entries(),
+        );
+        for selected in [None, Some(false), Some(true)] {
+            let mut cmd = test_run_cmd();
+            cmd.decode_lookahead = selected;
+            let effective = run_effective_runtime_config(
+                &configured,
+                &run_startup_cli_runtime_entries(&cmd, None),
+            );
+            let mut engine = ferrum_types::EngineConfig::default();
+            engine.apply_runtime_config_snapshot(&effective).unwrap();
+            assert_eq!(engine.batching.decode_lookahead, selected.unwrap_or(true));
+            let entry = effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == "FERRUM_DECODE_LOOKAHEAD")
+                .unwrap();
+            assert_eq!(
+                entry.source,
+                if selected.is_some() {
+                    RuntimeConfigSource::Cli
+                } else {
+                    RuntimeConfigSource::ConfigFile
+                }
+            );
+        }
     }
 
     #[test]
