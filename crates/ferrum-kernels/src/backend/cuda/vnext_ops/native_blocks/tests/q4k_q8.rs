@@ -854,6 +854,36 @@ fn q8_prefill_pack_plus_shared_matmul_microbench() {
     }
 }
 
+#[test]
+#[ignore = "paired GDN projection timing including activation pack; exclusive SM80+ CUDA access"]
+fn native_gdn_projection_mappings_microbench() {
+    // QKV, gate and output geometries from the 4B native GGUF inventory.
+    // These are individual synthetic projections, not a recurrent-attention
+    // implementation or a qualification of Q8 recurrent-state numerics.
+    let context = CudaContext::new(0).expect("GDN projection timing requires CUDA");
+    let stream = context.default_stream();
+    let retained = CudaNativeBlockKernels::load(&context).unwrap();
+    for (format, inputs, outputs) in [
+        (Format::Q5, 2560, 8192),
+        (Format::Q4, 2560, 4096),
+        (Format::Q5, 4096, 2560),
+    ] {
+        let prototype = Prototype::load(&context, format);
+        for rows in [8, 32, 64, 512] {
+            // At 512 rows the existing strict provider already uses shared
+            // GEMM. At medium widths, measure both strict mappings before
+            // changing their selection; their crossover differs by format.
+            let mappings: &[Mapping] = match rows {
+                8 => &[Mapping::Strict, Mapping::Mma],
+                32 | 64 => &[Mapping::Strict, Mapping::StrictShared, Mapping::Mma],
+                _ => &[Mapping::StrictShared, Mapping::Mma],
+            };
+            let mut case = Case::with_format(&stream, format, rows, inputs, outputs);
+            run_microbench_mappings(&mut case, &stream, &prototype, &retained, mappings);
+        }
+    }
+}
+
 fn run_microbench(
     case: &mut Case,
     stream: &Arc<CudaStream>,
