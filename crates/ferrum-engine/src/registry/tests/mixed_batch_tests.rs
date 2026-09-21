@@ -14,9 +14,10 @@ use ferrum_models::VNextModelExecutor;
 use ferrum_types::{RequestId, TokenId};
 
 mod greedy_readback;
+mod profile_wave_phase;
 
 struct CpuFixture {
-    executor: VNextModelExecutor<CpuDeviceRuntime>,
+    executor: Arc<VNextModelExecutor<CpuDeviceRuntime>>,
     directory: PathBuf,
 }
 
@@ -49,7 +50,7 @@ impl CpuFixture {
         .unwrap();
         executor.prepare_startup().await.unwrap();
         Self {
-            executor,
+            executor: Arc::new(executor),
             directory,
         }
     }

@@ -630,7 +630,13 @@ impl MetalBufferRegion {
     }
 }
 
-const METAL_COUNTER_SAMPLES_PER_PAGE: u64 = 256;
+// Profile-only, lazily allocated, and still bounded. Keep the existing page
+// count: increasing the number of small counter buffers exhausted the tested
+// device's allocations. Larger pages hold 8192 paired intervals, covering the
+// measured C32 recurrent workload that exceeded the old 2048-interval limit.
+// This is not a guarantee for arbitrary models/batches. Sample + resolve
+// payload is at most 256 KiB per submission; driver alignment/metadata is extra.
+const METAL_COUNTER_SAMPLES_PER_PAGE: u64 = 1024;
 const METAL_COUNTER_MAX_PAGES: usize = 16;
 const METAL_COUNTER_ERROR_VALUE: u64 = u64::MAX;
 
@@ -800,6 +806,13 @@ impl MetalCounterCaptureBuilder {
             .is_none_or(|page| page.used_samples + 2 > METAL_COUNTER_SAMPLES_PER_PAGE)
         {
             if let Err(_cause) = self.add_page() {
+                tracing::debug!(
+                    cause = _cause,
+                    command_index,
+                    pages = self.pages.len(),
+                    maximum_pages = METAL_COUNTER_MAX_PAGES,
+                    "Metal counter reservation unavailable"
+                );
                 #[cfg(test)]
                 counter_diagnostic::report(
                     _cause,
@@ -2709,6 +2722,9 @@ mod counter_lifecycle_tests;
 mod counter_diagnostic;
 
 #[cfg(test)]
+mod counter_capacity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
@@ -2717,7 +2733,7 @@ mod tests {
     };
     use std::ptr::NonNull;
 
-    fn runtime() -> MetalDeviceRuntime {
+    pub(super) fn runtime() -> MetalDeviceRuntime {
         MetalDeviceRuntime::new(MetalDeviceRuntimeConfig {
             device_id: DeviceId::new("device/metal/test").expect("device id"),
             runtime_implementation_fingerprint: "a".repeat(64),
@@ -2731,7 +2747,7 @@ mod tests {
         .expect("Metal runtime")
     }
 
-    fn buffer_request(resource: &str) -> BufferRequest {
+    pub(super) fn buffer_request(resource: &str) -> BufferRequest {
         BufferRequest::new(
             ResourceId::new(resource).expect("resource id"),
             8,
@@ -2781,7 +2797,7 @@ mod tests {
         .expect("weight payload")
     }
 
-    fn region_bytes(region: &MetalBufferRegion) -> &[u8] {
+    pub(super) fn region_bytes(region: &MetalBufferRegion) -> &[u8] {
         let start = usize::try_from(region.offset_bytes()).expect("region offset");
         let length = usize::try_from(region.length_bytes()).expect("region length");
         // SAFETY: MetalBufferRegion retains the allocation and validates that

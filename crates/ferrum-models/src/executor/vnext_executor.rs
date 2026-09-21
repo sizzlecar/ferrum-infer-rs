@@ -2033,6 +2033,15 @@ enum VNextTerminalReadbacks {
 }
 
 impl VNextExecutionWaveKind {
+    const fn profile_phase(self) -> ferrum_interfaces::vnext::ProfileWavePhase {
+        use ferrum_interfaces::vnext::ProfileWavePhase;
+        match self {
+            Self::Prefill => ProfileWavePhase::Prefill,
+            Self::Decode => ProfileWavePhase::Decode,
+            Self::Mixed => ProfileWavePhase::Mixed,
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Prefill => "prefill",
@@ -8308,8 +8317,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(attribution) => {
                     let sink = self.event_sink.read().clone();
                     if let Some(sink) = sink {
-                        if let Err(error) = sink.record_device_submission_attribution(&attribution)
-                        {
+                        if let Err(error) = sink.record_device_submission_attribution_for_wave(
+                            &attribution,
+                            kind.profile_phase(),
+                        ) {
                             execution_event_error.get_or_insert_with(|| error.to_string());
                         }
                     }
@@ -8324,9 +8335,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ) {
             let sink = self.event_sink.read().clone();
             if let Some(sink) = sink {
-                if let Err(error) =
-                    sink.record_physical_device_submission_timing(receipt.completion())
-                {
+                if let Err(error) = sink.record_physical_device_submission_timing_for_wave(
+                    receipt.completion(),
+                    kind.profile_phase(),
+                ) {
                     execution_event_error.get_or_insert_with(|| error.to_string());
                 }
             }

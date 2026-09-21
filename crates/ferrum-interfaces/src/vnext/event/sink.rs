@@ -34,6 +34,26 @@ impl fmt::Display for ExecutionEventSinkError {
 
 impl Error for ExecutionEventSinkError {}
 
+/// Scheduler/executor wave classification used only for diagnostic attribution.
+/// It is supplied by the actual execution path, never inferred from token counts.
+/// It does not change submission identity or grant execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileWavePhase {
+    Prefill,
+    Decode,
+    Mixed,
+}
+
+impl ProfileWavePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
 mod event_sink_seal {
     pub struct Seal;
 }
@@ -161,6 +181,23 @@ pub trait ExecutionEventSink: Send + Sync {
         _completion: &super::super::OperationCompletionReceipt,
     ) -> Result<(), ExecutionEventSinkError> {
         Ok(())
+    }
+
+    /// Contextual form preserves legacy sinks that only consume attribution.
+    fn record_device_submission_attribution_for_wave(
+        &self,
+        attribution: &super::super::BoundDeviceSubmissionAttribution,
+        _phase: ProfileWavePhase,
+    ) -> Result<(), ExecutionEventSinkError> {
+        self.record_device_submission_attribution(attribution)
+    }
+
+    fn record_physical_device_submission_timing_for_wave(
+        &self,
+        completion: &super::super::OperationCompletionReceipt,
+        _phase: ProfileWavePhase,
+    ) -> Result<(), ExecutionEventSinkError> {
+        self.record_physical_device_submission_timing(completion)
     }
 
     /// Resource maintenance is a plan/batch event and therefore does not run

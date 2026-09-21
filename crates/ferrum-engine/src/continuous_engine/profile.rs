@@ -876,6 +876,7 @@ impl VNextProfileEventContext {
         &self,
         completion: &OperationCompletionReceipt,
         timestamp: chrono::DateTime<chrono::Utc>,
+        wave_phase: Option<ferrum_interfaces::vnext::ProfileWavePhase>,
     ) -> std::result::Result<Option<FerrumProfileEvent>, ExecutionEventSinkError> {
         let submission = completion.submission();
         let batch = submission.batch_identity();
@@ -1034,6 +1035,9 @@ impl VNextProfileEventContext {
                 serde_json::json!(reason),
             );
         }
+        if let Some(phase) = wave_phase {
+            attributes.insert("wave_phase".to_string(), serde_json::json!(phase.as_str()));
+        }
         let event = FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
             ts_unix_nanos: timestamp
@@ -1081,6 +1085,7 @@ impl VNextProfileEventContext {
         &self,
         attribution: &BoundDeviceSubmissionAttribution,
         timestamp: chrono::DateTime<chrono::Utc>,
+        wave_phase: Option<ferrum_interfaces::vnext::ProfileWavePhase>,
     ) -> std::result::Result<Vec<FerrumProfileEvent>, ExecutionEventSinkError> {
         let batch = attribution.batch_identity();
         let measured_timings = match attribution.terminal_timing() {
@@ -1334,6 +1339,9 @@ impl VNextProfileEventContext {
                     serde_json::json!(semantics.replay_equivalence().as_str()),
                 );
             }
+            if let Some(phase) = wave_phase {
+                attributes.insert("wave_phase".to_string(), serde_json::json!(phase.as_str()));
+            }
             attributes.insert(
                 "device_timing_status".to_string(),
                 serde_json::json!(timing.status),
@@ -1554,6 +1562,9 @@ impl VNextProfileEventContext {
                         serde_json::json!(format!("{reason:?}").to_ascii_lowercase()),
                     );
                 }
+                if let Some(phase) = wave_phase {
+                    attributes.insert("wave_phase".to_string(), serde_json::json!(phase.as_str()));
+                }
                 if let Some(fingerprint) = span.reusable_executable_fingerprint() {
                     attributes.insert(
                         "reusable_executable_fingerprint".to_string(),
@@ -1693,9 +1704,11 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         &self,
         attribution: &BoundDeviceSubmissionAttribution,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let events = self
-            .context
-            .device_submission_attribution_events(attribution, chrono::Utc::now())?;
+        let events = self.context.device_submission_attribution_events(
+            attribution,
+            chrono::Utc::now(),
+            None,
+        )?;
         if events.is_empty() {
             return Ok(());
         }
@@ -1706,9 +1719,43 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         &self,
         completion: &OperationCompletionReceipt,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let Some(event) = self
-            .context
-            .physical_device_submission_timing_event(completion, chrono::Utc::now())?
+        let Some(event) = self.context.physical_device_submission_timing_event(
+            completion,
+            chrono::Utc::now(),
+            None,
+        )?
+        else {
+            return Ok(());
+        };
+        self.enqueue_profile_batch(vec![event])
+    }
+
+    fn record_device_submission_attribution_for_wave(
+        &self,
+        attribution: &BoundDeviceSubmissionAttribution,
+        phase: ferrum_interfaces::vnext::ProfileWavePhase,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let events = self.context.device_submission_attribution_events(
+            attribution,
+            chrono::Utc::now(),
+            Some(phase),
+        )?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_profile_batch(events)
+    }
+
+    fn record_physical_device_submission_timing_for_wave(
+        &self,
+        completion: &OperationCompletionReceipt,
+        phase: ferrum_interfaces::vnext::ProfileWavePhase,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let Some(event) = self.context.physical_device_submission_timing_event(
+            completion,
+            chrono::Utc::now(),
+            Some(phase),
+        )?
         else {
             return Ok(());
         };
