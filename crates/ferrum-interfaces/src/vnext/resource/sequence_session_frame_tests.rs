@@ -38,9 +38,8 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
                     fingerprint: fingerprint.clone(),
                     phase: SequenceSessionPhase::Open,
                     next_frame: Some(frame(next_frame)),
-                    active_frame: None,
+                    frames: SequenceFrameSlots::default(),
                     participant_flights: BTreeMap::new(),
-                    submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
                     completed_boundary: SequenceCompletedFrontier::default(),
                     retired_frames: next_frame - 1,
@@ -50,6 +49,160 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
         epoch,
         fingerprint,
     }
+}
+
+fn submission_wave_flight(active: &ActiveSequenceSessionState) -> Option<ParticipantFlightPhase> {
+    active
+        .frames
+        .head()
+        .and_then(|frame| active.frames.get(frame))
+        .and_then(|record| record.submission_wave_flight)
+}
+
+/// Sets up the post-admission state for bookkeeping tests only. This does not
+/// mint a submitted-fence authority or exercise successor admission; that
+/// boundary is tested through the completion-owned predecessor API.
+fn admitted_successor_fixture(
+    session: &SequenceFrameCandidate,
+    parent: &SessionFrameHold,
+    batch_step_id: BatchStepId,
+) -> SessionFrameHold {
+    let mut state = session.slot.state.lock().unwrap();
+    let SequenceSessionSlotState::Active(active) = &mut *state else {
+        panic!("fixture session must be active")
+    };
+    assert_eq!(active.frames.head().unwrap().frame_id, parent.frame_id);
+    assert_eq!(
+        submission_wave_flight(active),
+        Some(ParticipantFlightPhase::InFlight)
+    );
+    let frame_id = active.next_frame.unwrap();
+    active.frames.insert_successor(ActiveSequenceFrame {
+        frame_id,
+        batch_step_id,
+    });
+    active.next_frame = ExecutionFrameId::try_from(frame_id.get() + 1).ok();
+    SessionFrameHold {
+        slot: Arc::clone(&session.slot),
+        epoch: session.epoch,
+        fingerprint: session.fingerprint.clone(),
+        frame_id,
+        batch_step_id,
+        finalized: false,
+    }
+}
+
+#[test]
+fn retiring_parent_preserves_successor_flight_and_contiguous_frame_accounting() {
+    let session = active_candidate(1, "parent-successor-retirement");
+    let mut parent = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
+    let mut parent_flight =
+        prepare_submission_wave_participant_flights(&[flight_candidate(&session, &parent[0])])
+            .unwrap();
+    begin_submission_wave_participant_flights_dispatch(&mut parent_flight).unwrap();
+    let mut child = [admitted_successor_fixture(&session, &parent[0], step(2))];
+    let mut child_flight =
+        prepare_submission_wave_participant_flights(&[flight_candidate(&session, &child[0])])
+            .unwrap();
+    begin_submission_wave_participant_flights_dispatch(&mut child_flight).unwrap();
+    assert!(acquire_session_frames(std::slice::from_ref(&session), step(3)).is_err());
+
+    drop(parent_flight);
+    retire(&mut parent);
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            panic!()
+        };
+        assert_eq!(active.frames.head().unwrap().frame_id, child[0].frame_id);
+        assert!(active.frames.successor().is_none());
+        assert_eq!(
+            submission_wave_flight(active),
+            Some(ParticipantFlightPhase::InFlight)
+        );
+        assert_eq!(active.participant_flight_count(), 1);
+        assert_eq!(active.retired_frames, 1);
+        assert_eq!(active.next_frame, Some(frame(3)));
+    }
+    drop(child_flight);
+    retire(&mut child);
+    let mut next = acquire_session_frames(std::slice::from_ref(&session), step(3)).unwrap();
+    assert_eq!(next[0].frame_id, frame(3));
+    retire(&mut next);
+}
+
+#[test]
+fn unsubmitted_successor_can_roll_back_without_retiring_or_resetting_parent() {
+    let session = active_candidate(7, "successor-capacity-rollback");
+    let mut parent = acquire_session_frames(std::slice::from_ref(&session), step(11)).unwrap();
+    let mut parent_flight =
+        prepare_submission_wave_participant_flights(&[flight_candidate(&session, &parent[0])])
+            .unwrap();
+    begin_submission_wave_participant_flights_dispatch(&mut parent_flight).unwrap();
+    let mut child = admitted_successor_fixture(&session, &parent[0], step(12));
+    assert!(finalize_session_frames(&mut [&mut child], StepFrameFinalization::Commit).is_err());
+    assert_eq!(
+        finalize_session_frames(
+            &mut [&mut child],
+            StepFrameFinalization::RollbackUnsubmitted
+        )
+        .unwrap(),
+        [StepParticipantRetirementDisposition::RolledBackUnsubmitted],
+    );
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            panic!()
+        };
+        assert_eq!(active.frames.head().unwrap().frame_id, frame(7));
+        assert!(active.frames.successor().is_none());
+        assert_eq!(
+            submission_wave_flight(active),
+            Some(ParticipantFlightPhase::InFlight)
+        );
+        assert_eq!(active.next_frame, Some(frame(8)));
+        assert_eq!(active.retired_frames, 6);
+    }
+    drop(parent_flight);
+    retire(&mut parent);
+    let mut retry = acquire_session_frames(std::slice::from_ref(&session), step(13)).unwrap();
+    assert_eq!(retry[0].frame_id, frame(8));
+    retire(&mut retry);
+}
+
+#[test]
+fn aborting_successor_keeps_parent_flight_until_its_own_drain() {
+    let session = active_candidate(1, "successor-abort-parent-drain");
+    let mut parent = acquire_session_frames(std::slice::from_ref(&session), step(21)).unwrap();
+    let mut parent_flight =
+        prepare_submission_wave_participant_flights(&[flight_candidate(&session, &parent[0])])
+            .unwrap();
+    begin_submission_wave_participant_flights_dispatch(&mut parent_flight).unwrap();
+    let mut child = admitted_successor_fixture(&session, &parent[0], step(22));
+    finalize_session_frames(&mut [&mut child], StepFrameFinalization::Abort).unwrap();
+    {
+        let state = session.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            panic!()
+        };
+        assert_eq!(active.phase, SequenceSessionPhase::Poisoned);
+        assert_eq!(active.frames.head().unwrap().frame_id, frame(1));
+        assert_eq!(
+            submission_wave_flight(active),
+            Some(ParticipantFlightPhase::InFlight)
+        );
+        assert_eq!(active.next_frame, Some(frame(3)));
+    }
+    assert!(finalize_session_frames(&mut [&mut parent[0]], StepFrameFinalization::Abort).is_err());
+    drop(parent_flight);
+    finalize_session_frames(&mut [&mut parent[0]], StepFrameFinalization::Abort).unwrap();
+    let state = session.slot.state.lock().unwrap();
+    let SequenceSessionSlotState::Active(active) = &*state else {
+        panic!()
+    };
+    assert!(active.frames.is_empty());
+    assert!(!active.has_participant_flights());
+    assert_eq!(active.phase, SequenceSessionPhase::Poisoned);
 }
 
 fn retire(holds: &mut [SessionFrameHold]) -> Vec<StepParticipantRetirementDisposition> {
@@ -133,7 +286,7 @@ fn cancelled_participant_rejects_the_entire_frame_acquire_atomically() {
         unreachable!();
     };
     assert_eq!(active.next_frame, Some(frame(1)));
-    assert_eq!(active.active_frame, None);
+    assert_eq!(active.frames.head(), None);
 }
 
 #[test]
@@ -173,7 +326,7 @@ fn frame_hold_drop_is_fail_closed_and_never_reuses_the_frame() {
         unreachable!();
     };
     assert_eq!(active.phase, SequenceSessionPhase::Poisoned);
-    assert_eq!(active.active_frame.unwrap().frame_id, frame(1));
+    assert_eq!(active.frames.head().unwrap().frame_id, frame(1));
     assert_eq!(active.next_frame, Some(frame(2)));
     drop(state);
     assert!(acquire_session_frames(std::slice::from_ref(&candidate), step(2)).is_err());
@@ -196,7 +349,7 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
         unreachable!();
     };
     assert_eq!(active.phase, SequenceSessionPhase::Poisoned);
-    assert_eq!(active.active_frame, None);
+    assert_eq!(active.frames.head(), None);
     assert_eq!(active.next_frame, Some(frame(2)));
     drop(state);
     assert!(acquire_session_frames(std::slice::from_ref(&candidate), step(2)).is_err());
@@ -221,7 +374,7 @@ fn unsubmitted_frame_rollback_restores_the_unexecuted_frame_for_retry() {
             unreachable!();
         };
         assert_eq!(active.phase, SequenceSessionPhase::Open);
-        assert_eq!(active.active_frame, None);
+        assert_eq!(active.frames.head(), None);
         assert_eq!(active.retired_frames, 0);
         assert_eq!(active.next_frame, Some(frame(1)));
     }
@@ -693,7 +846,7 @@ fn submission_wave_transitions_one_session_once_and_retries_atomically() {
         };
         assert!(active.participant_flights.is_empty());
         assert_eq!(
-            active.submission_wave_flight,
+            submission_wave_flight(active),
             Some(ParticipantFlightPhase::Prepared)
         );
     }
@@ -705,7 +858,7 @@ fn submission_wave_transitions_one_session_once_and_retries_atomically() {
             unreachable!();
         };
         assert_eq!(
-            active.submission_wave_flight,
+            submission_wave_flight(active),
             Some(ParticipantFlightPhase::InFlight)
         );
     }
@@ -718,7 +871,7 @@ fn submission_wave_transitions_one_session_once_and_retries_atomically() {
             unreachable!();
         };
         assert!(active.participant_flights.is_empty());
-        assert!(active.submission_wave_flight.is_none());
+        assert!(submission_wave_flight(active).is_none());
     }
     retire(&mut frames);
 }
@@ -735,7 +888,7 @@ fn duplicate_participant_in_wave_rejects_without_partial_participant_flight() {
             unreachable!();
         };
         assert!(active.participant_flights.is_empty());
-        assert!(active.submission_wave_flight.is_none());
+        assert!(submission_wave_flight(active).is_none());
     }
     retire(&mut frames);
 }
@@ -793,7 +946,7 @@ fn submission_wave_and_standalone_node_flights_are_mutually_exclusive() {
             unreachable!();
         };
         assert_eq!(active.participant_flights.len(), 1);
-        assert!(active.submission_wave_flight.is_none());
+        assert!(submission_wave_flight(active).is_none());
     }
     drop(node_flight);
     retire(&mut node_first_frames);
@@ -817,7 +970,7 @@ fn submission_wave_and_standalone_node_flights_are_mutually_exclusive() {
         };
         assert!(active.participant_flights.is_empty());
         assert_eq!(
-            active.submission_wave_flight,
+            submission_wave_flight(active),
             Some(ParticipantFlightPhase::Prepared)
         );
     }
@@ -847,7 +1000,7 @@ fn cancel_before_submission_wave_dispatch_preserves_atomic_prepared_state() {
             unreachable!();
         };
         assert_eq!(
-            active.submission_wave_flight,
+            submission_wave_flight(active),
             Some(ParticipantFlightPhase::Prepared)
         );
     }

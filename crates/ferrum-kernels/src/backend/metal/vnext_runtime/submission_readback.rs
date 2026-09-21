@@ -206,6 +206,128 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_tokens_copy_on_the_parent_queue_and_retain_dropped_buffers() {
+        let runtime = MetalDeviceRuntime::new(MetalDeviceRuntimeConfig {
+            device_id: DeviceId::new("device/metal/forwarded-token").unwrap(),
+            runtime_implementation_fingerprint: "b".repeat(64),
+            capabilities: BTreeSet::new(),
+            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )
+            .unwrap()]),
+        })
+        .unwrap();
+        let allocate = |name| {
+            runtime
+                .allocate_request(
+                    &BufferRequest::new(
+                        ResourceId::new(name).unwrap(),
+                        8,
+                        64,
+                        BufferUsage::Activations,
+                        ElementType::U32,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        let source = allocate("resource/forwarded-source");
+        let destination = allocate("resource/forwarded-destination");
+        let source_weak = Arc::downgrade(source.contiguous_allocation());
+        let destination_weak = Arc::downgrade(destination.contiguous_allocation());
+        let values = [0x1234abcd_u32, 0x87654321];
+        let bytes = values
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let upload = runtime
+            .encode_upload(
+                &bytes,
+                HostTransferLayout::new(ElementType::U32, 2).unwrap(),
+                &source,
+                0,
+            )
+            .unwrap();
+        let copy = runtime
+            .encode_copy(&source, &destination, CopyRegion::new(0, 0, 8).unwrap())
+            .unwrap();
+        // From this point only the encoded runtime commands own the physical
+        // allocations. No original buffer or separately retained region remains.
+        drop(source);
+        drop(destination);
+        assert!(source_weak.upgrade().is_some());
+        assert!(destination_weak.upgrade().is_some());
+        let mut stream = runtime.create_stream().unwrap();
+        let parent = runtime
+            .submit_commands(
+                &mut stream,
+                vec![(DeviceCommandPhase::DynamicBinding, None, upload)],
+                DeviceTimingMode::Off,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .unwrap();
+
+        // A queue gate deterministically holds later work without sleeping or
+        // timing thresholds. The actual child copy uses the product runtime API.
+        let gate = runtime.device.new_shared_event();
+        let barrier = stream.queue.new_command_buffer().to_owned();
+        barrier.encode_wait_for_event(&gate, 1);
+        barrier.commit();
+        struct ReleaseQueue {
+            gate: metal::SharedEvent,
+            tail: metal::CommandBuffer,
+        }
+        impl Drop for ReleaseQueue {
+            fn drop(&mut self) {
+                self.gate.set_signaled_value(1);
+                self.tail.wait_until_completed();
+            }
+        }
+        let mut release = ReleaseQueue {
+            gate,
+            tail: barrier,
+        };
+        let child = runtime
+            .submit_commands(
+                &mut stream,
+                vec![(DeviceCommandPhase::DynamicBinding, None, copy)],
+                DeviceTimingMode::Off,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .unwrap();
+        release.tail = child.command_buffer.clone();
+        assert!(runtime
+            .wait_fence(&parent)
+            .unwrap()
+            .terminal()
+            .is_succeeded());
+        assert_eq!(release.gate.signaled_value(), 0);
+        assert_ne!(
+            child.command_buffer.status(),
+            MTLCommandBufferStatus::Completed
+        );
+        assert_ne!(child.command_buffer.status(), MTLCommandBufferStatus::Error);
+        let parent_bytes = read_completed_region(&parent.commands[0].regions[0], 8, 0..8).unwrap();
+        assert_eq!(parent_bytes, bytes);
+        drop(release);
+        assert!(runtime
+            .wait_fence(&child)
+            .unwrap()
+            .terminal()
+            .is_succeeded());
+        let child_bytes = read_completed_region(&child.commands[0].regions[1], 8, 0..8).unwrap();
+        assert_eq!(child_bytes, parent_bytes);
+        for (row, expected) in child_bytes.chunks_exact(4).zip(values) {
+            assert_eq!(u32::from_le_bytes(row.try_into().unwrap()), expected);
+        }
+        drop(parent);
+        drop(child);
+        assert!(source_weak.upgrade().is_none());
+        assert!(destination_weak.upgrade().is_none());
+    }
+
+    #[test]
     fn staging_lease_covers_the_host_layout_including_destination_offset() {
         let layout = HostTransferLayout::new(ElementType::U32, 4).unwrap();
         let region = CopyRegion::new(4, 4, 8).unwrap();

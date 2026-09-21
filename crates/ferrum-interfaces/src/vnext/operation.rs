@@ -10,6 +10,7 @@ mod determinism;
 mod determinism_artifact;
 mod dispatch;
 mod dispatch_contract;
+mod forwarded_input;
 mod foundation;
 mod identity;
 mod invocation;

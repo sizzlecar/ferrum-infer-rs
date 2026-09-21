@@ -26,6 +26,7 @@ use super::dispatch_contract::{
     SubmissionWaveDispatchStage, SubmissionWaveDispatchStageTimer,
     SubmissionWaveDispatchTimingSink, SubmissionWaveInputUpload,
 };
+use super::forwarded_input::encode_submission_wave_forwarded_inputs;
 use super::foundation::invalid_operation;
 use super::invocation::OperationInvocationResources;
 use super::workspace_encoding::{
@@ -1335,6 +1336,7 @@ impl OperationDispatch {
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
             if !input_uploads.is_empty()
+                || !wave.forwarded_inputs().is_empty()
                 || usize::try_from(restore.participant_count()).ok()
                     != Some(active_participant_count)
                 || execution_policy.compute_path() == DeviceComputePathRequirement::Adaptive
@@ -1524,6 +1526,14 @@ impl OperationDispatch {
                 )));
             }
         }
+        encode_submission_wave_forwarded_inputs(
+            runtime,
+            resolved,
+            batch_identity,
+            &completion,
+            input_uploads,
+            &mut commands,
+        )?;
         encode_submission_wave_inputs(
             runtime,
             resolved,

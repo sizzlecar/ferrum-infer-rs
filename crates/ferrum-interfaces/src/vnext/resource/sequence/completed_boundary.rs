@@ -381,8 +381,18 @@ fn validate_completed_wave<R: DeviceRuntime>(
         validate_active_frame(active, &participant.frame)?;
         if active.phase == SequenceSessionPhase::Poisoned
             || active.state_transfer.is_reserved()
-            || active.submission_wave_flight != Some(ParticipantFlightPhase::InFlight)
-            || !active.participant_flights.is_empty()
+            || active
+                .frames
+                .get(ActiveSequenceFrame {
+                    frame_id: participant.frame.frame_id,
+                    batch_step_id: participant.frame.batch_step_id,
+                })
+                .and_then(|record| record.submission_wave_flight)
+                != Some(ParticipantFlightPhase::InFlight)
+            || active.frame_has_node_flights(ActiveSequenceFrame {
+                frame_id: participant.frame.frame_id,
+                batch_step_id: participant.frame.batch_step_id,
+            })
         {
             return Err(invalid_resource(
                 "completed wave sequence state is unavailable",
@@ -461,11 +471,13 @@ fn validate_active_frame(
 ) -> Result<(), VNextError> {
     if active.epoch != hold.epoch
         || active.fingerprint != hold.fingerprint
-        || active.active_frame
-            != Some(ActiveSequenceFrame {
+        || active
+            .frames
+            .get(ActiveSequenceFrame {
                 frame_id: hold.frame_id,
                 batch_step_id: hold.batch_step_id,
             })
+            .is_none()
     {
         return Err(invalid_resource("completed wave session frame is stale"));
     }
@@ -614,7 +626,7 @@ impl<R: DeviceRuntime> PreparedSequenceStateTransfer<R> {
         };
         self.ensure_active_reservation(active)?;
         if active.phase != SequenceSessionPhase::Open
-            || active.active_frame.is_some()
+            || !active.frames.is_empty()
             || active.has_participant_flights()
         {
             return Err(invalid_resource("state transfer frontier is unavailable"));

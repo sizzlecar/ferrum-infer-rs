@@ -131,6 +131,8 @@ pub(crate) struct TestConfig {
     pub(crate) token_scaled_state: bool,
     #[serde(default)]
     pub(crate) recurrent_state: bool,
+    #[serde(default)]
+    pub(crate) token_io: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -138,6 +140,7 @@ pub(crate) struct TestStateProfile {
     pub(crate) zero_state: bool,
     pub(crate) token_scaled_state: bool,
     pub(crate) recurrent_state: bool,
+    pub(crate) token_io: bool,
 }
 
 impl TestStateProfile {
@@ -146,6 +149,14 @@ impl TestStateProfile {
             zero_state: false,
             token_scaled_state: false,
             recurrent_state: false,
+            token_io: false,
+        }
+    }
+
+    pub(crate) const fn tokens() -> Self {
+        Self {
+            token_io: true,
+            ..Self::none()
         }
     }
 
@@ -154,6 +165,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: false,
             recurrent_state: false,
+            token_io: false,
         }
     }
 
@@ -162,6 +174,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: false,
+            token_io: false,
         }
     }
 
@@ -170,6 +183,7 @@ impl TestStateProfile {
             zero_state: true,
             token_scaled_state: true,
             recurrent_state: true,
+            token_io: false,
         }
     }
 
@@ -339,6 +353,32 @@ impl ModelFamilyProvider for TestFamily {
                 checkpoint: StateCheckpointCapability::Unsupported,
             });
         }
+        if config.token_io {
+            let profile_id = NumericalProfileId::new("fixture.f32").unwrap();
+            return FamilyNumericalProfiles::new(
+                self.family_id(),
+                ContractVersion::new(1, 0),
+                vec![NumericalExecutionProfile {
+                    id: profile_id.clone(),
+                    family_id: self.family_id().clone(),
+                    version: ContractVersion::new(1, 0),
+                    kv_storage: Vec::new(),
+                    primary_activation: id("value.intermediate"),
+                    boundaries: BTreeMap::from([
+                        (id("value.intermediate"), ElementType::F32),
+                        (id("value.output"), ElementType::U32),
+                    ]),
+                    states,
+                    operations: vec![NumericalOperationContract {
+                        operation_id: id("operation.main"),
+                        version: ContractVersion::new(1, 0),
+                        multiplication_type: None,
+                        accumulation_type: None,
+                    }],
+                }],
+                vec![profile_id],
+            );
+        }
         fixture_f32_profiles(
             self.family_id(),
             &["value.intermediate", "value.output"],
@@ -462,6 +502,17 @@ fn token_tensor_contract(access: TensorAccess) -> TensorContract {
     .unwrap()
 }
 
+fn token_io_contract(access: TensorAccess, dimension: &str) -> TensorContract {
+    TensorContract::new(
+        vec![DimensionConstraint::Symbol(dimension.to_owned())],
+        BTreeSet::from([ElementType::F32, ElementType::U32]),
+        vec![LayoutConstraint::Contiguous],
+        access,
+        AliasPolicy::NoAlias,
+    )
+    .unwrap()
+}
+
 pub(crate) fn operation() -> OperationDescriptor {
     operation_with_zero_state(false)
 }
@@ -487,6 +538,7 @@ fn operation_with_resource_options_and_work(
             zero_state,
             token_scaled_state,
             recurrent_state: false,
+            token_io: false,
         },
         scratch,
     )
@@ -497,7 +549,9 @@ fn operation_with_resource_profile(
     scratch: ResourcePresenceRequirement,
 ) -> OperationDescriptor {
     let mut inputs = vec![
-        if state_profile.token_scaled_state {
+        if state_profile.token_io {
+            token_io_contract(TensorAccess::Read, "input_width")
+        } else if state_profile.token_scaled_state {
             token_tensor_contract(TensorAccess::Read)
         } else {
             tensor_contract(TensorAccess::Read)
@@ -520,7 +574,9 @@ fn operation_with_resource_profile(
         id: id("operation.main"),
         version: ContractVersion::new(1, 0),
         inputs,
-        outputs: vec![if state_profile.token_scaled_state {
+        outputs: vec![if state_profile.token_io {
+            token_io_contract(TensorAccess::Write, "output_width")
+        } else if state_profile.token_scaled_state {
             token_tensor_contract(TensorAccess::Write)
         } else {
             tensor_contract(TensorAccess::Write)
@@ -667,6 +723,7 @@ impl OperationContract for TestOperationContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderBehavior {
     Success,
+    TokenTransform,
     SplitPhases,
     ProgramBinding,
     ProgramBindingFirstNodeEagerBoundary,
@@ -919,6 +976,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
         let token_count = invocation.work_shape().immediate_tokens();
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::Success => Ok(EncodedDeviceOperation::compute(TestCommand::Provider)),
+            ProviderBehavior::TokenTransform => Ok(EncodedDeviceOperation::compute(
+                memory_fixture::encode_token_transform(&invocation),
+            )),
             ProviderBehavior::SplitPhases => {
                 Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
                     .with_dynamic_binding(TestCommand::DynamicBinding)
@@ -1228,6 +1288,36 @@ pub(crate) fn node_values_with_state_profile_for(
     state_profile: TestStateProfile,
 ) -> Vec<ResolvedValueBinding> {
     let mut values = node_values_for(input_value, input_resource, output_value, output_resource);
+    if state_profile.token_io {
+        for (index, value, resource, role) in [
+            (0, input_value, input_resource, ResolvedValueRole::Input),
+            (2, output_value, output_resource, ResolvedValueRole::Output),
+        ] {
+            if value == "value.input" || value == "value.output" {
+                values[index] = ResolvedValueBinding::new(
+                    id(value),
+                    role,
+                    0,
+                    ResolvedTensorSpec::new(
+                        vec![1],
+                        ElementType::U32,
+                        ResolvedTensorLayout::Contiguous,
+                    )
+                    .unwrap(),
+                    if role == ResolvedValueRole::Input {
+                        TensorAccess::Read
+                    } else {
+                        TensorAccess::Write
+                    },
+                    AliasPolicy::NoAlias,
+                    BufferUsage::Activations,
+                    None,
+                    ResolvedValueStorage::single(id(resource), 0, 4, ElementType::U32).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
     if state_profile.zero_state {
         values.insert(
             2,
@@ -1287,6 +1377,7 @@ pub(crate) fn tail_node_values() -> Vec<ResolvedValueBinding> {
 #[derive(Debug)]
 pub(crate) struct TestBuffer {
     pub(crate) descriptor: BufferDescriptor,
+    pub(crate) memory: Option<memory_fixture::TestMemoryBuffer>,
 }
 
 #[derive(Debug, Default)]
@@ -1295,6 +1386,7 @@ pub(crate) struct TestStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
+    Memory(u64, bool),
     ScratchProvider,
     ScratchProviderWork(u32, u64),
     ReusableExecution,
@@ -1398,6 +1490,7 @@ pub(crate) enum FenceBehavior {
 
 #[derive(Default)]
 pub(crate) struct RuntimeTrace {
+    pub(crate) memory: Option<Arc<Mutex<memory_fixture::TestMemoryRegistry>>>,
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
@@ -1496,6 +1589,12 @@ fn test_submission_attribution(
         let (native_op_id, execution_path, compute_dispatch_count, transfer_command_count) =
             match entry.command() {
                 TestCommand::Provider => ("test_provider", DeviceExecutionPath::Eager, 1, 0),
+                TestCommand::Memory(_, compute) => (
+                    "test_memory",
+                    DeviceExecutionPath::Eager,
+                    u64::from(*compute),
+                    u64::from(!*compute),
+                ),
                 TestCommand::ScratchProvider | TestCommand::ScratchProviderWork(_, _) => {
                     ("test_scratch_provider", DeviceExecutionPath::Eager, 1, 0)
                 }
@@ -1714,6 +1813,9 @@ impl DeviceRuntime for TestRuntime {
                 usage: request.usage(),
                 element_type: request.element_type(),
             },
+            memory: self.trace.lock().unwrap().memory.clone().map(|registry| {
+                memory_fixture::TestMemoryBuffer::new(request.size_bytes(), registry)
+            }),
         })
     }
 
@@ -1772,10 +1874,13 @@ impl DeviceRuntime for TestRuntime {
 
     fn encode_copy(
         &self,
-        _source: &Self::Buffer,
-        _destination: &Self::Buffer,
-        _region: CopyRegion,
+        source: &Self::Buffer,
+        destination: &Self::Buffer,
+        region: CopyRegion,
     ) -> Result<Self::Command, Self::Error> {
+        if source.memory.is_some() {
+            return Ok(memory_fixture::encode_copy(source, destination, region));
+        }
         Ok(TestCommand::Copy)
     }
 
@@ -1784,8 +1889,15 @@ impl DeviceRuntime for TestRuntime {
         source: &[u8],
         _source_layout: HostTransferLayout,
         destination: &Self::Buffer,
-        _destination_offset_bytes: u64,
+        destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        if destination.memory.is_some() {
+            return Ok(memory_fixture::encode_upload(
+                source,
+                destination,
+                destination_offset_bytes,
+            ));
+        }
         self.trace
             .lock()
             .unwrap()
@@ -1940,6 +2052,7 @@ impl DeviceRuntime for TestRuntime {
             .map(|(_, _, _, command)| command)
             .collect::<Vec<_>>();
         let command_count = commands.len();
+        let memory_commands = commands.clone();
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
@@ -1980,6 +2093,9 @@ impl DeviceRuntime for TestRuntime {
             }
             SubmitBehavior::Panic => panic!("injected submit panic"),
             SubmitBehavior::Success => {}
+        }
+        if let Some(memory) = self.trace.lock().unwrap().memory.clone() {
+            memory_fixture::execute(&memory, &memory_commands);
         }
         if drift {
             self.use_alternate_descriptor.store(true, Ordering::Release);
@@ -2079,6 +2195,7 @@ impl DeviceRuntime for TestRuntime {
             trace.submission_readback_ranges.push((region, layout));
             trace.submission_readback_live += 1;
         }
+        let source_memory = source.memory.clone();
         let ownership = TestSubmissionReadbackOwnership {
             _retention: retention,
             _staging: staging,
@@ -2092,6 +2209,9 @@ impl DeviceRuntime for TestRuntime {
                 if trace.submission_readback_fails {
                     return Err(TestRuntimeError("submission-readback-failed"));
                 }
+            }
+            if let Some(memory) = &source_memory {
+                return Ok(memory_fixture::readback(memory, region, layout));
             }
             // The byte-address pattern makes physical row/offset translation
             // observable without adding a second allocator to this fixture.
@@ -2110,13 +2230,16 @@ impl DeviceRuntime for TestRuntime {
     fn readback(
         &self,
         _stream: &mut Self::Stream,
-        _source: &Self::Buffer,
+        source: &Self::Buffer,
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error> {
         let mut trace = self.trace.lock().unwrap();
         trace.readback_calls += 1;
         trace.readback_lengths.push(region.length_bytes());
+        if let Some(memory) = &source.memory {
+            return Ok(memory_fixture::readback(memory, region, output_layout));
+        }
         let fill_byte = if trace.readback_fill_pattern.is_empty() {
             0
         } else {
@@ -2140,3 +2263,5 @@ mod driver;
 pub(crate) use driver::*;
 mod planning;
 pub(crate) use planning::*;
+
+mod memory_fixture;

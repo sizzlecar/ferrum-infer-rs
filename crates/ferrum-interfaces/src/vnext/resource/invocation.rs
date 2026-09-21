@@ -186,7 +186,8 @@ where
             }
         }
         Ok(Self {
-            claimed_backing,
+            claimed_backing: Arc::new(claimed_backing),
+            predecessor: None,
             participants,
             invocation_registry: Arc::new(InvocationRegistry::default()),
             execution_lane,
@@ -203,6 +204,10 @@ where
 
     pub fn execution_lane(&self) -> &Arc<ExecutionLane<R>> {
         &self.execution_lane
+    }
+
+    pub(crate) fn predecessor(&self) -> Option<&Arc<super::SubmittedWavePredecessor<R>>> {
+        self.predecessor.as_ref()
     }
 
     pub fn reusable_execution_bucket(&self) -> Option<&ReusableExecutionBucketSpec> {
@@ -561,6 +566,11 @@ where
         self: &Arc<Self>,
         request: InvocationResourceAdmissionRequest,
     ) -> Result<InvocationResourceAdmissionDecision<R>, VNextError> {
+        if self.predecessor.is_some() {
+            return Err(invalid_resource(
+                "device-token successor work requires a full-plan wave with forwarded inputs",
+            ));
+        }
         let _lifecycle = self.participants[0]
             .session
             .resources()
@@ -790,6 +800,14 @@ where
         node_indices: &[usize],
         purpose: SubmissionWavePurpose,
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        if self.predecessor.is_some()
+            && (purpose != SubmissionWavePurpose::FullPlan
+                || work_shape.as_ref() != self.work_shape())
+        {
+            return Err(invalid_resource(
+                "successor wave must execute the exact admitted full-plan token work",
+            ));
+        }
         let _lifecycle = self.participants[0]
             .session
             .resources()
@@ -980,7 +998,7 @@ where
         )?;
         Ok(StepSubmissionWaveAdmissionDecision::Prepared(
             PreparedStepSubmissionWave {
-                claimed_backing,
+                claimed_backing: Arc::new(claimed_backing),
                 initializations: None,
                 request_state_hazards,
                 nodes: prepared_nodes,
@@ -992,6 +1010,9 @@ where
                 fingerprint: wave_fingerprint,
                 purpose,
                 submission_readbacks: None,
+                submission_fence_installed: false,
+                successor_authority_taken: false,
+                forwarded_inputs: None,
             },
         ))
     }
@@ -1165,6 +1186,16 @@ where
         work_shape: Arc<BatchWorkShape>,
         fit_policy: AdmissionFitPolicy,
     ) -> Result<PreparedParticipantAuthority<R>, VNextError> {
+        if self.predecessor.is_none()
+            && work_shape
+                .participant_work()
+                .iter()
+                .any(|work| work.token_span().submitted_token_source().is_some())
+        {
+            return Err(invalid_resource(
+                "invocation cannot introduce a device-token dependency absent from Step admission",
+            ));
+        }
         let immediate_shape = work_shape.immediate_shape();
         let fit_shape = match fit_policy {
             AdmissionFitPolicy::ImmediateOnly => immediate_shape,
@@ -1219,7 +1250,7 @@ where
                 };
                 if active.epoch != participant.epoch
                     || active.fingerprint != participant.fingerprint
-                    || active.active_frame != Some(frame)
+                    || active.frames.get(frame).is_none()
                 {
                     return Err(invalid_resource("invocation lost its exact Step frame"));
                 }
@@ -1680,7 +1711,7 @@ where
     R: DeviceRuntime,
 {
     // Drop wave backing and participant flights before releasing the Step.
-    claimed_backing: ClaimedSubmissionWaveBacking,
+    claimed_backing: Arc<ClaimedSubmissionWaveBacking>,
     initializations: Option<PreparedBackingInitializations>,
     request_state_hazards: Option<RequestStateHazardPermit<Arc<AdmittedRequestResources<R>>>>,
     nodes: Vec<PreparedStepSubmissionNode<R>>,
@@ -1692,6 +1723,9 @@ where
     fingerprint: String,
     purpose: SubmissionWavePurpose,
     submission_readbacks: Option<crate::vnext::CompletionReadbackBatchRequest>,
+    submission_fence_installed: bool,
+    successor_authority_taken: bool,
+    forwarded_inputs: Option<Vec<super::SubmissionWaveInputForward<R>>>,
 }
 
 impl<R> PreparedStepSubmissionWave<R>
@@ -1718,6 +1752,26 @@ where
         &self,
     ) -> Option<&crate::vnext::CompletionReadbackBatchRequest> {
         self.submission_readbacks.as_ref()
+    }
+
+    pub fn with_forwarded_inputs(
+        mut self,
+        inputs: Vec<super::SubmissionWaveInputForward<R>>,
+    ) -> Result<Self, VNextError> {
+        if self.purpose != SubmissionWavePurpose::FullPlan
+            || self.forwarded_inputs.is_some()
+            || inputs.is_empty()
+        {
+            return Err(invalid_resource(
+                "forwarded inputs require one nonempty binding on a full-plan wave",
+            ));
+        }
+        self.forwarded_inputs = Some(inputs);
+        Ok(self)
+    }
+
+    pub(crate) fn forwarded_inputs(&self) -> &[super::SubmissionWaveInputForward<R>] {
+        self.forwarded_inputs.as_deref().unwrap_or_default()
     }
 
     pub fn batch_step_id(&self) -> BatchStepId {
@@ -1753,6 +1807,27 @@ where
 
     pub fn claimed_backing(&self) -> &ClaimedSubmissionWaveBacking {
         &self.claimed_backing
+    }
+
+    pub(super) fn shared_backing_claim(&self) -> Arc<ClaimedSubmissionWaveBacking> {
+        Arc::clone(&self.claimed_backing)
+    }
+
+    pub(crate) fn take_submitted_predecessor(
+        &mut self,
+        receipt: crate::vnext::SubmittedOperationReceipt,
+    ) -> Result<super::SubmittedWavePredecessor<R>, VNextError> {
+        if !self.submission_fence_installed
+            || self.successor_authority_taken
+            || self.request_state_hazards.is_some()
+        {
+            return Err(invalid_resource(
+                "successor requires one unused submitted wave without Request-state hazards",
+            ));
+        }
+        let predecessor = super::SubmittedWavePredecessor::capture(self, receipt)?;
+        self.successor_authority_taken = true;
+        Ok(predecessor)
     }
 
     pub fn node_count(&self) -> usize {
@@ -1855,10 +1930,12 @@ where
         if let Some(hazards) = &mut self.request_state_hazards {
             hazards.mark_submission_fence_installed()?;
         }
+        self.submission_fence_installed = true;
         Ok(())
     }
 
     pub(crate) fn mark_submission_indeterminate(&mut self) {
+        self.submission_fence_installed = false;
         if let Some(initializations) = &mut self.initializations {
             initializations.mark_indeterminate();
         }

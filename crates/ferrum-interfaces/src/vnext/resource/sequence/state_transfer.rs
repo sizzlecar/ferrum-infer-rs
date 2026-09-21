@@ -203,7 +203,7 @@ fn ensure_transfer_candidate(active: &ActiveSequenceSessionState) -> Result<bool
             "state transfer requires an open sequence session",
         ));
     }
-    Ok(active.active_frame.is_none()
+    Ok(active.frames.is_empty()
         && !active.has_participant_flights()
         && !active.state_transfer.is_reserved())
 }

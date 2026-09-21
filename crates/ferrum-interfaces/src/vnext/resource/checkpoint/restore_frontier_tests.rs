@@ -154,7 +154,7 @@ fn imported_empty_step_cannot_erase_continuation_and_can_rollback_then_execute()
             panic!("target must remain active")
         };
         assert_eq!(active.phase, SequenceSessionPhase::Open);
-        assert_eq!(active.active_frame.unwrap().batch_step_id, id);
+        assert_eq!(active.frames.head().unwrap().batch_step_id, id);
         assert!(
             matches!(&active.completed_boundary, SequenceCompletedFrontier::Proven(current)
             if Arc::ptr_eq(current, &imported))
@@ -256,7 +256,7 @@ fn imported_individual_completion_without_full_plan_cannot_clear_the_contract() 
             panic!("target must remain active")
         };
         assert_eq!(active.phase, SequenceSessionPhase::Open);
-        assert!(active.active_frame.is_some());
+        assert!(active.frames.head().is_some());
         assert!(
             matches!(&active.completed_boundary, SequenceCompletedFrontier::Proven(current)
             if Arc::ptr_eq(current, &imported))
@@ -337,7 +337,7 @@ fn imported_batch_last_invalid_member_cannot_partially_acquire_frames() {
                 };
                 (
                     active.next_frame,
-                    active.active_frame,
+                    active.frames.head(),
                     active.retired_frames,
                     Arc::as_ptr(boundary),
                 )
@@ -645,7 +645,7 @@ fn assert_continuation_rejected_before_frame(
             panic!("rejection must retain the exact active session")
         };
         assert_eq!(active.phase, SequenceSessionPhase::Open);
-        assert!(active.active_frame.is_none());
+        assert!(active.frames.head().is_none());
         assert!(!active.has_participant_flights());
         (
             active.epoch,

@@ -192,7 +192,7 @@ fn node_resolution_with_state_profile(
         runtime_policy,
         registry,
         "node.main",
-        if state_profile.zero_state {
+        if state_profile.zero_state || state_profile.token_io {
             node_values_with_state_profile_for(
                 "value.input",
                 "resource.input",
@@ -244,7 +244,7 @@ fn tail_node_resolution_with_state_profile(
         runtime_policy,
         registry,
         "node.tail",
-        if state_profile.zero_state {
+        if state_profile.zero_state || state_profile.token_io {
             node_values_with_state_profile_for(
                 "value.intermediate",
                 "resource.intermediate",
@@ -280,34 +280,18 @@ pub(crate) fn resolved_model_plan_with_zero_state(
 }
 
 fn test_raw_config(state_profile: TestStateProfile) -> Value {
-    match state_profile {
-        TestStateProfile {
-            zero_state: false,
-            token_scaled_state: false,
-            recurrent_state: false,
-        } => json!({"width": 4}),
-        TestStateProfile {
-            zero_state: true,
-            token_scaled_state: false,
-            recurrent_state: false,
-        } => json!({"width": 4, "zero_state": true}),
-        TestStateProfile {
-            zero_state: true,
-            token_scaled_state: true,
-            recurrent_state: false,
-        } => json!({"width": 4, "zero_state": true, "token_scaled_state": true}),
-        TestStateProfile {
-            zero_state: true,
-            token_scaled_state: true,
-            recurrent_state: true,
-        } => json!({
-            "width": 4,
-            "zero_state": true,
-            "token_scaled_state": true,
-            "recurrent_state": true,
-        }),
-        _ => unreachable!("invalid device-operation state profile"),
+    let mut config = json!({"width": 4});
+    for (name, enabled) in [
+        ("zero_state", state_profile.zero_state),
+        ("token_scaled_state", state_profile.token_scaled_state),
+        ("recurrent_state", state_profile.recurrent_state),
+        ("token_io", state_profile.token_io),
+    ] {
+        if enabled {
+            config[name] = json!(true);
+        }
     }
+    config
 }
 
 fn resolved_model_plan_with_zero_state_and_policy(
@@ -896,6 +880,17 @@ pub(crate) fn fixture() -> Fixture {
     fixture_with_zero_state(false)
 }
 
+pub(crate) fn fixture_tokens() -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_storage_and_operation_version(
+        TestStateProfile::tokens(),
+        ProviderBehavior::TokenTransform,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+    )
+}
+
 pub(crate) fn fixture_with_zero_state(zero_state: bool) -> Fixture {
     fixture_with_provider_behavior(zero_state, ProviderBehavior::Success)
 }
@@ -1099,6 +1094,11 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
     .plan_hash()
     .clone();
     let (runtime, runtime_trace) = runtime(&catalog);
+    if state_profile.token_io {
+        runtime_trace.lock().unwrap().memory = Some(Arc::new(Mutex::new(
+            memory_fixture::TestMemoryRegistry::default(),
+        )));
+    }
     let plan_resources = plan_runtime_resources(&plan, Arc::clone(&runtime));
     Fixture {
         registry,
