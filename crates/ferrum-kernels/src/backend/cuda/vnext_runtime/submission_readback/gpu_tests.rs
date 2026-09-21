@@ -4,6 +4,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod upload_gate_tests;
+
 type TestSnapshot = PinnedReadbackSnapshot<Arc<PinnedHostStorage>>;
 
 struct CallbackGate {
