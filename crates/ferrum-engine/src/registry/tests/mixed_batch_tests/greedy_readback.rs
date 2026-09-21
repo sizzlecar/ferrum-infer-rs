@@ -4,7 +4,7 @@ use ferrum_interfaces::model_executor::{
 };
 
 /// Independent host oracle over the split executor's unprocessed logits.
-fn expected_token(logits: &[f32], policy: &LogitsReturnPolicy) -> TokenId {
+pub(super) fn expected_token(logits: &[f32], policy: &LogitsReturnPolicy) -> TokenId {
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask,
         repetition_penalty,

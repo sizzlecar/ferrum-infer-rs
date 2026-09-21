@@ -600,6 +600,172 @@ fn commit_validates_all_frames_before_publishing_any_completed_frontier() {
 }
 
 #[test]
+fn retained_step_backing_deferral_reclaims_idle_slot_after_parent_retirement() {
+    // The declared resource consumes 64 bytes per token. Keep a two-token
+    // parent at [0, 128), a cached one-token slot at [128, 192), and 128 free
+    // bytes after it. A three-token Step fits the budget only after reclaiming
+    // the smaller cached slot; a live parent fence must prevent that trim.
+    let bytes_per_token = 64;
+    let budget = (2 + 3) * bytes_per_token;
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'a',
+        1,
+        budget,
+        TestDemand::Tokens,
+    );
+    let buckets = [1, 2, 3]
+        .into_iter()
+        .map(|tokens| {
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("test.deferred-step").unwrap(),
+                ReusableExecutionCapacity::new(1, tokens, 1).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let memory_plan = ReusableExecutionMemoryPlan::new(
+        1,
+        buckets.len() as u64,
+        buckets
+            .iter()
+            .map(|bucket| {
+                ResolvedReusableExecutionBucket::new(
+                    bucket.clone(),
+                    vec![ReusablePoolWorkspaceBudget::new(
+                        catalog.pool_id.clone(),
+                        bucket.capacity().maximum_tokens() * bytes_per_token,
+                        0,
+                    )
+                    .unwrap()],
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let runtime = new_runtime(&catalog, budget);
+    let harness = harness_with_nodes_and_reusable(
+        Arc::clone(&runtime),
+        catalog,
+        budget,
+        false,
+        Arc::from(vec![PlanNode::resource_test_node(
+            NodeId::new("node/output").unwrap(),
+        )]),
+        Some(memory_plan),
+    );
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], budget)
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let sessions = ["deferred-parent", "cached-small", "deferred-large"]
+        .into_iter()
+        .map(|name| {
+            admitted_sequence_with_ceiling(&harness.root, name, 4)
+                .open_session()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let batches = sessions
+        .iter()
+        .map(|session| ExecutionBatchParticipants::new(vec![Arc::clone(session)]).unwrap())
+        .collect::<Vec<_>>();
+    let request = |batch: &ExecutionBatchParticipants<TestRuntime>, tokens: usize| {
+        StepResourceAdmissionRequest::new(
+            batch.bind_work_shape(vec![token_span(tokens)]).unwrap(),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap()
+        .with_reusable_execution_bucket(buckets[tokens - 1].bucket_id().clone())
+    };
+    let StepResourceAdmissionDecision::Admitted(parent) = batches[0]
+        .try_begin_step(request(&batches[0], 2), &lane)
+        .unwrap()
+    else {
+        panic!("resident parent must admit");
+    };
+    let StepResourceAdmissionDecision::Admitted(small) = batches[1]
+        .try_begin_step(request(&batches[1], 1), &lane)
+        .unwrap()
+    else {
+        panic!("resident small slot must admit");
+    };
+    small.try_rollback_unsubmitted().unwrap();
+    sessions[1].try_abort_if_quiescent().unwrap();
+    runtime.set_reusable_catalog_lifetime(ReusableExecutionCatalogLifetime::OnDemandBounded);
+    runtime.set_reusable_resident_executables(1);
+    runtime.set_fence_behavior(TestFenceBehavior::Pending);
+    let epoch_before = lane.reusable_execution_epoch();
+    let reaper = CompletionReaper::new();
+    let handle = submit_fixture_wave_through_reaper(
+        &harness.root,
+        std::slice::from_ref(&sessions[0]),
+        &lane,
+        prepared_wave(&parent),
+        &reaper,
+    );
+    let large_request = request(&batches[2], 3);
+    let StepResourceAdmissionDecision::BackingDeferred(deferred) = batches[2]
+        .try_begin_step(large_request.clone(), &lane)
+        .unwrap()
+    else {
+        panic!("small cached slot must produce a real owned backing deferral");
+    };
+    assert!(matches!(
+        handle.poll().unwrap(),
+        CompletionObservation::Pending
+    ));
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    assert_eq!(runtime.reusable_trim_calls(), 0);
+    assert_eq!(lane.reusable_execution_epoch(), epoch_before);
+
+    runtime.set_fence_behavior(TestFenceBehavior::Succeeded);
+    let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+        panic!("parent must reach a real terminal completion");
+    };
+    assert!(matches!(
+        receipt.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    drop(receipt);
+    parent.try_retire_normal().unwrap();
+    assert_eq!(lane.in_flight_count(), 0);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+    assert_eq!(runtime.reusable_trim_calls(), 1);
+    assert_eq!(lane.reusable_execution_epoch(), epoch_before + 1);
+    let StepResourceAdmissionDecision::Admitted(large) =
+        batches[2].try_begin_step(large_request, &lane).unwrap()
+    else {
+        panic!("the same deferred Step must admit after one post-retirement maintenance");
+    };
+    assert_eq!(
+        large.backing_slices()[0].capacity_size_bytes(),
+        3 * bytes_per_token
+    );
+    large.try_rollback_unsubmitted().unwrap();
+    sessions[0].try_complete().unwrap();
+    sessions[2].try_abort_if_quiescent().unwrap();
+    drop(deferred);
+    drop(handle);
+    drop(reaper);
+    drop(batches);
+    drop(sessions);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn on_demand_reusable_trim_waits_for_tracked_fence_terminal() {
     let harness = BoundaryHarness::new(1);
     harness

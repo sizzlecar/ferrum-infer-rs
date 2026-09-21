@@ -8,10 +8,20 @@ pub(super) struct PreparedDecodeSuccessor<R: DeviceRuntime> {
     pub(super) spans: Vec<TokenSpanWork>,
 }
 
+pub(super) enum DecodeSuccessorPreparation<R: DeviceRuntime> {
+    Prepared(PreparedDecodeSuccessor<R>),
+    /// Retain only this optional Step's plan/session maintenance authority,
+    /// never its submitted parent Step or a future execution grant.
+    BackingDeferred(StepAdmissionBackingDeferral<R>),
+    Unavailable,
+}
+
 pub(super) struct DispatchedDecodeSuccessor<R: DeviceRuntime> {
     pub(super) step: Arc<StepResourceLease<R>>,
     pub(super) outcome: DispatchOutcome<R>,
     pub(super) readbacks: CompletionReadbackBatchRequest,
+    pub(super) token_mask_upload_participants: u64,
+    pub(super) token_mask_cache_hit_participants: u64,
 }
 
 pub(super) enum DecodePairParent<R: DeviceRuntime> {
@@ -309,11 +319,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             masks.plans(),
             false,
         );
+        let token_mask_upload_participants = masks
+            .plans()
+            .iter()
+            .filter(|plan| plan.upload_required)
+            .count() as u64;
+        let token_mask_cache_hit_participants =
+            masks.plans().len() as u64 - token_mask_upload_participants;
         masks.invalidate_targets_before_slot_release();
         Ok(DispatchedDecodeSuccessor {
             step,
             outcome,
             readbacks,
+            token_mask_upload_participants,
+            token_mask_cache_hit_participants,
         })
     }
 
@@ -325,7 +344,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         completion: &CompletionHandle<R>,
         sources: &CompletionReadbackBatchRequest,
         parent_step: &StepResourceLease<R>,
-    ) -> Result<Option<PreparedDecodeSuccessor<R>>> {
+    ) -> Result<DecodeSuccessorPreparation<R>> {
         let predecessor = Arc::new(
             completion
                 .take_submitted_predecessor()
@@ -373,13 +392,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         DynamicDeferredMaintenanceOutcome::Maintained(_)
                         | DynamicDeferredMaintenanceOutcome::RetryAdmission { .. } => {}
                         DynamicDeferredMaintenanceOutcome::WaitForRelease { .. } => {
-                            return Ok(None)
+                            return Ok(DecodeSuccessorPreparation::BackingDeferred(deferred));
                         }
                     }
                 }
+                StepResourceAdmissionDecision::BackingDeferred(deferred) => {
+                    return Ok(DecodeSuccessorPreparation::BackingDeferred(deferred));
+                }
                 StepResourceAdmissionDecision::Deferred(_)
-                | StepResourceAdmissionDecision::BackingDeferred(_)
-                | StepResourceAdmissionDecision::PermanentRejected(_) => return Ok(None),
+                | StepResourceAdmissionDecision::PermanentRejected(_) => {
+                    return Ok(DecodeSuccessorPreparation::Unavailable);
+                }
             }
         };
         let sequences = participants
@@ -422,10 +445,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))
         })();
         match prepared {
-            Ok(Some(wave)) => Ok(Some(PreparedDecodeSuccessor { step, wave, spans })),
+            Ok(Some(wave)) => Ok(DecodeSuccessorPreparation::Prepared(
+                PreparedDecodeSuccessor { step, wave, spans },
+            )),
             other => {
                 self.rollback_unsubmitted_step(step, "unused decode successor")?;
-                other.map(|_| None)
+                other.map(|_| DecodeSuccessorPreparation::Unavailable)
             }
         }
     }

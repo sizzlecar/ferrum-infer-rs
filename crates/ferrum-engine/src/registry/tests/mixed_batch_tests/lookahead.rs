@@ -1,5 +1,6 @@
 //! Real model continuation checks: an already executed child must preserve
 //! its row and frontier while the next host batch changes order and policy.
+use super::greedy_readback::expected_token;
 use super::*;
 use ferrum_interfaces::model_executor::{
     GreedyRepetitionPenalty, LogitsReturnPolicy, OneStepDecodeGrant, TokenSelectionMask,
@@ -147,6 +148,140 @@ async fn real_cpu_lookahead_pending_subset_and_fresh_rows_match_serial_after_pol
     }
     release(&paired, &outputs);
     release(&serial, &reference);
+}
+
+#[tokio::test]
+async fn real_cpu_lookahead_pending_and_authorized_fresh_rows_rejoin_before_next_child() {
+    let paired = CpuFixture::new(8).await;
+    let serial = CpuFixture::new(8).await;
+    let mut parent = paired.seed_decode(&[0, 1]).await;
+    let serial_parent = serial.seed_decode(&[0, 1]).await;
+    let mut fresh = paired.seed_decode(&[1, 2]).await;
+    let serial_fresh = serial.seed_decode(&[1, 2]).await;
+    authorize(&mut parent, 0);
+    let before = paired.submissions();
+    let parent_out = split_decode(&paired, std::slice::from_ref(&parent)).await;
+    let serial_parent_out = split_decode(&serial, std::slice::from_ref(&serial_parent)).await;
+    assert_eq!(paired.submissions() - before, 2);
+    assert_eq!(
+        parent_out[0].sampling_output,
+        ExecutorSamplingOutput::GreedyToken(TokenId::new(0))
+    );
+
+    let mut pending = continuation(&parent, &parent_out[0], 0);
+    pending.logits_policy = selected_policy(1);
+    let serial_pending = continuation(&serial_parent, &serial_parent_out[0], 0);
+    authorize(&mut fresh, 2);
+    let inputs = [fresh, pending];
+    let serial_inputs = [serial_fresh, serial_pending];
+    let before = paired.submissions();
+    let outputs = split_decode(&paired, &inputs).await;
+    let reference = split_decode(&serial, &serial_inputs).await;
+    assert_eq!(
+        paired.submissions() - before,
+        1,
+        "the authorized fresh subset must not perpetuate the pending/fresh split"
+    );
+    assert_eq!(
+        outputs[0].sampling_output,
+        ExecutorSamplingOutput::GreedyToken(TokenId::new(2))
+    );
+    let ExecutorSamplingOutput::FullLogits(reference_logits) = &reference[0].sampling_output else {
+        panic!("the serial reference must retain unprocessed logits")
+    };
+    assert_eq!(
+        outputs[0].sampling_output,
+        ExecutorSamplingOutput::GreedyToken(expected_token(
+            reference_logits,
+            &inputs[0].logits_policy,
+        ))
+    );
+    assert_decode_matches(&outputs[1], &reference[1]);
+    let ExecutorSamplingOutput::FullLogits(pending_logits) = &outputs[1].sampling_output else {
+        panic!("the pending row must retain logits for its changed host policy")
+    };
+    assert_eq!(
+        expected_token(pending_logits, &inputs[1].logits_policy),
+        TokenId::new(1)
+    );
+    for (input, output) in inputs.iter().zip(&outputs) {
+        assert_eq!(output.kv_cache.cache_id(), input.kv_cache.cache_id());
+        assert_eq!(
+            output.kv_cache.num_tokens(),
+            input.kv_cache.num_tokens() + 1
+        );
+        output
+            .sampling_output
+            .validate_for_policy(&input.logits_policy, 3)
+            .unwrap();
+    }
+
+    // Both rows are now fresh. Reorder them, change their masks, and prove that
+    // coordination did not disable the next legal two-row parent/child pair.
+    let mut next = [
+        continuation(&inputs[1], &outputs[1], 1),
+        continuation(&inputs[0], &outputs[0], 2),
+    ];
+    let serial_next = [
+        continuation(&serial_inputs[1], &reference[1], 1),
+        continuation(&serial_inputs[0], &reference[0], 2),
+    ];
+    authorize(&mut next[0], 2);
+    authorize(&mut next[1], 0);
+    let before = paired.submissions();
+    let next_out = split_decode(&paired, &next).await;
+    let serial_next_out = split_decode(&serial, &serial_next).await;
+    assert_eq!(paired.submissions() - before, 2);
+    for (row, token) in [2, 0].into_iter().enumerate() {
+        assert_eq!(
+            next_out[row].sampling_output,
+            ExecutorSamplingOutput::GreedyToken(TokenId::new(token))
+        );
+        let ExecutorSamplingOutput::FullLogits(reference_logits) =
+            &serial_next_out[row].sampling_output
+        else {
+            panic!("the serial reference must retain unprocessed logits")
+        };
+        assert_eq!(
+            expected_token(reference_logits, &next[row].logits_policy),
+            TokenId::new(token)
+        );
+    }
+
+    let consume = [
+        continuation(&next[0], &next_out[0], 2),
+        continuation(&next[1], &next_out[1], 0),
+    ];
+    let serial_consume = [
+        continuation(&serial_next[0], &serial_next_out[0], 2),
+        continuation(&serial_next[1], &serial_next_out[1], 0),
+    ];
+    let before = paired.submissions();
+    let final_out = split_decode(&paired, &consume).await;
+    let serial_final = split_decode(&serial, &serial_consume).await;
+    assert_eq!(paired.submissions(), before);
+    for (actual, expected) in final_out.iter().zip(&serial_final) {
+        assert_decode_matches(actual, expected);
+    }
+    release(&paired, &final_out);
+    release(&serial, &serial_final);
+    for fixture in [&paired, &serial] {
+        let health = fixture.executor.cache_metrics_snapshot().unwrap();
+        assert_eq!(health["active_sequences"], 0);
+        assert_eq!(health["counters"]["failed_waves"], 0);
+        assert_eq!(
+            health["counters"]["submitted_waves"],
+            health["counters"]["completed_waves"]
+        );
+        for pool in health["dynamic_pools"]["pools"].as_array().unwrap() {
+            assert_eq!(pool["poisoned"], false);
+            assert_eq!(pool["quarantined_chunks"], 0);
+            assert_eq!(
+                pool["live_occupancy"]["transient"]["total"]["physical_bytes"],
+                0
+            );
+        }
+    }
 }
 
 #[tokio::test]

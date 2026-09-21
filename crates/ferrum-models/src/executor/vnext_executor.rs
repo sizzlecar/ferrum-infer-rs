@@ -8378,6 +8378,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
+        let mut successor_maintenance = None;
         let successor = if allow_lookahead
             && kind == VNextExecutionWaveKind::Decode
             && output_mode == VNextProductOutputMode::GreedyToken
@@ -8396,7 +8397,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )),
             };
             match prepared {
-                Ok(successor) => successor,
+                Ok(decode_lookahead::DecodeSuccessorPreparation::Prepared(successor)) => {
+                    Some(successor)
+                }
+                Ok(decode_lookahead::DecodeSuccessorPreparation::BackingDeferred(deferred)) => {
+                    successor_maintenance = Some(deferred);
+                    None
+                }
+                Ok(decode_lookahead::DecodeSuccessorPreparation::Unavailable) => None,
                 Err(error) => {
                     // The parent is already accepted. Settle it through the
                     // reserved owner even if child preparation failed closed.
@@ -8502,6 +8510,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     step: child_step,
                     outcome,
                     readbacks: child_readbacks,
+                    token_mask_upload_participants,
+                    token_mask_cache_hit_participants,
                 } = child;
                 let (child_completion, child_attribution) = match outcome {
                     DispatchOutcome::Submitted {
@@ -8535,7 +8545,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .lookahead_submitted_waves
                     .fetch_add(1, Ordering::Relaxed);
                 let sink = self.event_sink.read().clone();
-                let participant_count = participants.len() as u64;
                 let (pending, cohort) = parent.submit_pair(
                     completion_reservation,
                     pending_decode::SubmittedPairWave::new(
@@ -8552,7 +8561,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 .fetch_add(1, Ordering::Relaxed);
                             metrics
                                 .token_mask_upload_participants
-                                .fetch_add(participant_count, Ordering::Relaxed);
+                                .fetch_add(token_mask_upload_participants, Ordering::Relaxed);
+                            metrics
+                                .token_mask_cache_hit_participants
+                                .fetch_add(token_mask_cache_hit_participants, Ordering::Relaxed);
                             let bytes = receipt
                                 .dispositions()
                                 .iter()
@@ -8934,6 +8946,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         match step.retire_normal() {
             Ok(_) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
+                if let Some(deferred) = successor_maintenance.filter(|_| {
+                    participants
+                        .iter()
+                        .all(|participant| participant.sequence.active.load(Ordering::Acquire))
+                }) {
+                    // The optional second frame must not force a wait while
+                    // its parent occupies the lane. One evidenced maintenance
+                    // attempt here can reclaim idle graph slots for a later
+                    // grant, after the accepted parent has fully retired.
+                    let epoch_before = self.lane.reusable_execution_epoch();
+                    let maintained = deferred
+                        .maintain()
+                        .map_err(|error| FerrumError::backend(error.to_string()));
+                    if self.lane.reusable_execution_epoch() != epoch_before {
+                        self.reusable_execution_catalog_refresh_needed
+                            .store(true, Ordering::Release);
+                    }
+                    let maintained = maintained
+                        .and_then(|_| self.refresh_on_demand_reusable_execution_catalog());
+                    if let Err(error) = maintained {
+                        // This result is already committed. Preserve it while
+                        // reporting repair failure; core fail-closed state,
+                        // if any, still governs subsequent normal admission.
+                        self.metrics.record_failure(format!(
+                            "vNext post-retirement lookahead backing maintenance failed: {error}"
+                        ));
+                    }
+                }
                 if let Some(error) = execution_event_error {
                     let message = format!("vNext execution event emission failed: {error}");
                     self.metrics.record_failure(message.clone());
@@ -9281,7 +9321,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|&index| Arc::clone(&canonical_candidates[index].sequence))
             .collect::<Vec<_>>();
-        let mut allow_lookahead = self.decode_lookahead_eligible(&sequences)
+        // Consume an existing child and advance fresh rows by one token before
+        // creating another cohort. Otherwise the fresh subset can leave a new
+        // child while the old pending subset becomes fresh, perpetuating split
+        // physical batches on each host turn.
+        let mut allow_lookahead = pending_rows.iter().all(Option::is_none)
+            && self.decode_lookahead_eligible(&sequences)
             && fresh_indices.iter().all(|&index| {
                 let candidate = &canonical_candidates[index];
                 let input = &inputs[candidate.original_index];
@@ -12356,7 +12401,10 @@ mod tests {
         let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
         for (slot, contents) in [
             (7, vec![selection.clone(), selection.clone()]),
-            (8, vec![neutral.clone(), selection.clone(), selection.clone()]),
+            (
+                8,
+                vec![neutral.clone(), selection.clone(), selection.clone()],
+            ),
         ] {
             let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
                 &residency,
@@ -12432,22 +12480,20 @@ mod tests {
         let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
         for explicitly_failed in [false, true] {
             for slot in [7, 8] {
-                let mut transaction =
-                    VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-                        &residency,
-                        Some(slot),
-                        [neutral.clone()],
-                    );
+                let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                    &residency,
+                    Some(slot),
+                    [neutral.clone()],
+                );
                 transaction.publish();
                 transaction.settle_success();
             }
             {
-                let mut transaction =
-                    VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-                        &residency,
-                        Some(8),
-                        [neutral.clone()],
-                    );
+                let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                    &residency,
+                    Some(8),
+                    [neutral.clone()],
+                );
                 assert!(!transaction.plans()[0].upload_required);
                 if explicitly_failed {
                     transaction.invalidate_before_slot_release();
