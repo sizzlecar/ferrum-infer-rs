@@ -8,6 +8,7 @@ use half::f16;
 
 mod prefill_gemm;
 mod q4k;
+mod q4k_q8;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
     if format == GgufBlockFormat::Pq2_0 {

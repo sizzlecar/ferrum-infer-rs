@@ -1,0 +1,555 @@
+//! Ignored tests for an explicitly approximate, test-only Q4_K × Q8 prototype.
+//! No production selector or numerical profile uses these entry points.
+
+use super::*;
+use crate::gguf_blocks::q4k_q8_reference::{dot_reference, fixture_block, pack_rows, Q4Block};
+use cudarc::driver::{
+    sys::{CUdevice_attribute, CUevent_flags},
+    CudaSlice,
+};
+
+const INPUT_PREFIX: usize = 3;
+const WEIGHT_PREFIX: usize = 5;
+const SCALE_PREFIX: usize = 2;
+const WORD_PREFIX: usize = 3;
+const OUTPUT_PREFIX: usize = 4;
+const COLUMN_OFFSET: usize = 2;
+
+struct Prototype {
+    pack: CudaFunction,
+    lane_scalar: CudaFunction,
+    lane_tiled: CudaFunction,
+    mma: CudaFunction,
+}
+
+impl Prototype {
+    fn load(context: &Arc<CudaContext>) -> Self {
+        let major = context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .expect("Q4K Q8 prototypes require a readable CUDA compute capability");
+        assert!(
+            major >= 8,
+            "Q4K Q8 MMA prototype requires compute capability >= 8.0; device major={major}"
+        );
+        let module = context
+            .load_module(Ptx::from_src(crate::ptx::VNEXT_GGUF.to_owned()))
+            .unwrap();
+        Self {
+            pack: module
+                .load_function("vnext_gguf_q8_f32scale_pack_f16_prototype")
+                .unwrap(),
+            lane_scalar: module
+                .load_function("vnext_gguf_q4k_q8_f32scale_dp4a_lane_f16_prototype")
+                .unwrap(),
+            lane_tiled: module
+                .load_function("vnext_gguf_q4k_q8_f32scale_dp4a_lane_tiled_f16_prototype")
+                .unwrap(),
+            mma: module
+                .load_function("vnext_gguf_q4k_q8_f32scale_mma_f16_prototype")
+                .unwrap(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mapping {
+    Strict,
+    Lane,
+    Mma,
+}
+
+struct Case {
+    rows: usize,
+    inputs: usize,
+    outputs: usize,
+    stride: usize,
+    input: Vec<f16>,
+    weights: Vec<u8>,
+    input_gpu: CudaSlice<f16>,
+    weights_gpu: CudaSlice<u8>,
+    scales_gpu: CudaSlice<f32>,
+    words_gpu: CudaSlice<u32>,
+    output_gpu: CudaSlice<f16>,
+    block_override: Option<Q4Block>,
+}
+
+impl Case {
+    fn new(stream: &Arc<CudaStream>, rows: usize, inputs: usize, outputs: usize) -> Self {
+        let mut input = vec![f16::from_f32(-12345.0); INPUT_PREFIX + rows * inputs + 5];
+        for row in 0..rows {
+            for col in 0..inputs {
+                // Distinct rows and group magnitudes; exact zero groups exercise
+                // the d=0 branch without relying on preinitialized device data.
+                let x = if (col / 32 + row) % 7 == 0 {
+                    0.0
+                } else {
+                    ((col * 13 + row * 17) % 67) as f32 / 127.0 - 0.25
+                };
+                input[INPUT_PREFIX + row * inputs + col] = f16::from_f32(x);
+            }
+        }
+        let mut weights = vec![0xcc; WEIGHT_PREFIX];
+        for col in 0..outputs {
+            for block in 0..inputs / 256 {
+                weights.extend(fixture_block(col, block).encode());
+            }
+        }
+        weights.extend([0xcc; 7]);
+        let groups = rows * inputs / 32;
+        let stride = outputs + 5;
+        Self {
+            rows,
+            inputs,
+            outputs,
+            stride,
+            input_gpu: stream.clone_htod(&input).unwrap(),
+            weights_gpu: stream.clone_htod(&weights).unwrap(),
+            scales_gpu: stream
+                .clone_htod(&vec![-8765.25_f32; SCALE_PREFIX + groups + 5])
+                .unwrap(),
+            words_gpu: stream
+                .clone_htod(&vec![0xaabbccdd_u32; WORD_PREFIX + groups * 8 + 5])
+                .unwrap(),
+            output_gpu: stream
+                .clone_htod(&vec![
+                    f16::from_f32(-12345.0);
+                    OUTPUT_PREFIX + rows * stride + 5
+                ])
+                .unwrap(),
+            input,
+            weights,
+            block_override: None,
+        }
+    }
+
+    fn reset_destinations(&mut self, stream: &Arc<CudaStream>, output_poison: f16) {
+        let groups = self.rows * self.inputs / 32;
+        let mut output = vec![f16::from_f32(-12345.0); OUTPUT_PREFIX + self.rows * self.stride + 5];
+        for row in 0..self.rows {
+            let start = OUTPUT_PREFIX + row * self.stride + COLUMN_OFFSET;
+            output[start..start + self.outputs].fill(output_poison);
+        }
+        stream.memcpy_htod(&output, &mut self.output_gpu).unwrap();
+        stream
+            .memcpy_htod(
+                &vec![-8765.25_f32; SCALE_PREFIX + groups + 5],
+                &mut self.scales_gpu,
+            )
+            .unwrap();
+        stream
+            .memcpy_htod(
+                &vec![0xaabbccdd_u32; WORD_PREFIX + groups * 8 + 5],
+                &mut self.words_gpu,
+            )
+            .unwrap();
+    }
+
+    fn pack(&mut self, stream: &Arc<CudaStream>, prototype: &Prototype) {
+        let groups = self.rows * self.inputs / 32;
+        let input = self
+            .input_gpu
+            .slice(INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs);
+        let mut scales = self
+            .scales_gpu
+            .slice_mut(SCALE_PREFIX..SCALE_PREFIX + groups);
+        let mut words = self
+            .words_gpu
+            .slice_mut(WORD_PREFIX..WORD_PREFIX + groups * 8);
+        let mut launch = stream.launch_builder(&prototype.pack);
+        let (rows, inputs) = (self.rows as u32, self.inputs as u32);
+        launch
+            .arg(&input)
+            .arg(&mut scales)
+            .arg(&mut words)
+            .arg(&rows)
+            .arg(&inputs);
+        // SAFETY: one warp per complete group; typed views retain all source
+        // and staging bytes. Partial final blocks still contain complete warps.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: ((groups as u32).div_ceil(4), 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+    }
+
+    fn multiply(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        prototype: &Prototype,
+        retained: &CudaNativeBlockKernels,
+        mapping: Mapping,
+    ) {
+        let approximate = mapping != Mapping::Strict;
+        let groups = self.rows * self.inputs / 32;
+        let tile = match mapping {
+            Mapping::Mma => 32,
+            _ if self.rows == 1 => 1,
+            _ => 8,
+        };
+        let column_tile = match mapping {
+            Mapping::Mma => 16,
+            _ => 4,
+        };
+        let kernel = match (mapping, tile) {
+            (Mapping::Lane, 1) => &prototype.lane_scalar,
+            (Mapping::Lane, _) => &prototype.lane_tiled,
+            (Mapping::Mma, _) => &prototype.mma,
+            (Mapping::Strict, 1) => &retained.linear_q4k_f16,
+            (Mapping::Strict, _) => &retained.linear_q4k_tiled_f16,
+        };
+        let input = self
+            .input_gpu
+            .slice(INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs);
+        let weights = self
+            .weights_gpu
+            .slice(WEIGHT_PREFIX..self.weights.len() - 7);
+        let scales = self.scales_gpu.slice(SCALE_PREFIX..SCALE_PREFIX + groups);
+        let words = self.words_gpu.slice(WORD_PREFIX..WORD_PREFIX + groups * 8);
+        let mut output = self
+            .output_gpu
+            .slice_mut(OUTPUT_PREFIX..OUTPUT_PREFIX + self.rows * self.stride);
+        let params = [
+            self.rows as u32,
+            self.inputs as u32,
+            self.outputs as u32,
+            self.stride as u32,
+            COLUMN_OFFSET as u32,
+            12,
+            256,
+            144,
+        ];
+        let mut launch = stream.launch_builder(kernel);
+        if approximate {
+            launch.arg(&scales).arg(&words);
+        } else {
+            launch.arg(&input);
+        }
+        launch.arg(&weights).arg(&mut output);
+        for p in &params[..if approximate { 5 } else { 8 }] {
+            launch.arg(p);
+        }
+        // SAFETY: the complete 144-byte Q4_K blocks may be byte-unaligned;
+        // kernels use byte loads. Output interval is inside every row stride.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (
+                    (self.outputs as u32).div_ceil(column_tile),
+                    (self.rows as u32).div_ceil(tile),
+                    1,
+                ),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+    }
+
+    fn validate_pack(&self, stream: &Arc<CudaStream>) {
+        let source = &self.input[INPUT_PREFIX..INPUT_PREFIX + self.rows * self.inputs];
+        let expected = pack_rows(source, self.rows, self.inputs);
+        let scales = stream.clone_dtoh(&self.scales_gpu).unwrap();
+        for (i, &d) in scales.iter().enumerate() {
+            if let Some(local) = i
+                .checked_sub(SCALE_PREFIX)
+                .filter(|&j| j < expected.scales.len())
+            {
+                let want = expected.scales[local];
+                assert!(
+                    if want.is_nan() {
+                        d.is_nan()
+                    } else {
+                        d.to_bits() == want.to_bits()
+                    },
+                    "scale[{local}] {d} != {want}"
+                );
+            } else {
+                assert_eq!(d.to_bits(), (-8765.25_f32).to_bits());
+            }
+        }
+        let words = stream.clone_dtoh(&self.words_gpu).unwrap();
+        for (i, &word) in words.iter().enumerate() {
+            if let Some(local) = i
+                .checked_sub(WORD_PREFIX)
+                .filter(|&j| j < expected.quants.len() / 4)
+            {
+                let q = &expected.quants[local * 4..][..4];
+                assert_eq!(
+                    word,
+                    u32::from_le_bytes([q[0] as u8, q[1] as u8, q[2] as u8, q[3] as u8]),
+                    "qword[{local}]"
+                );
+            } else {
+                assert_eq!(word, 0xaabbccdd);
+            }
+        }
+    }
+
+    fn validate_output(
+        &self,
+        stream: &Arc<CudaStream>,
+        approximate: bool,
+        all: bool,
+    ) -> (f64, f64, f64) {
+        let actual = stream.clone_dtoh(&self.output_gpu).unwrap();
+        let mut errors = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (i, &value) in actual.iter().enumerate() {
+            let position = i.checked_sub(OUTPUT_PREFIX).filter(|&j| {
+                j < self.rows * self.stride
+                    && (COLUMN_OFFSET..COLUMN_OFFSET + self.outputs).contains(&(j % self.stride))
+            });
+            let Some(position) = position else {
+                assert_eq!(
+                    value.to_bits(),
+                    f16::from_f32(-12345.0).to_bits(),
+                    "output guard[{i}]"
+                );
+                continue;
+            };
+            let row = position / self.stride;
+            let col = position % self.stride - COLUMN_OFFSET;
+            if !all
+                && (![0, self.rows / 2, self.rows - 1].contains(&row)
+                    || ![0, self.outputs / 2, self.outputs - 1].contains(&col))
+            {
+                continue;
+            }
+            let blocks: Vec<_> = (0..self.inputs / 256)
+                .map(|b| {
+                    self.block_override
+                        .clone()
+                        .unwrap_or_else(|| fixture_block(col, b))
+                })
+                .collect();
+            let reference = dot_reference(
+                &self.input[INPUT_PREFIX + row * self.inputs..][..self.inputs],
+                &blocks,
+            );
+            let half_subnormal_rounding = f64::from(f16::from_bits(1).to_f32()) / 2.0;
+            let (expected, bound) = if approximate {
+                // Four rescale/subtraction operations, at most groups/4
+                // serial sums per active lane, then five warp-shuffle sums.
+                // a/b are exact: finite F16 × u6 needs at most 17 bits.
+                let nu = ((self.inputs / 32).div_ceil(4) + 9) as f64 * f64::from(f32::EPSILON);
+                let accumulation_bound = nu / (1.0 - nu) * reference.expanded_abs_terms;
+                (
+                    reference.policy,
+                    accumulation_bound
+                        + <f16 as Scalar>::ROUNDING * (reference.policy.abs() + accumulation_bound)
+                        + half_subnormal_rounding,
+                )
+            } else {
+                (
+                    reference.strict_original,
+                    (self.inputs as f64 * f64::from(f32::EPSILON) + <f16 as Scalar>::ROUNDING)
+                        * reference.strict_abs_terms
+                        + half_subnormal_rounding,
+                )
+            };
+            let error = (f64::from(value.to_f32()) - expected).abs();
+            assert!(value.is_finite() && error <= bound,
+                "approx={approximate} row={row} col={col} actual={} expected={expected} error={error} bound={bound}", value.to_f32());
+            errors.0 = errors.0.max(error);
+            errors.1 = errors
+                .1
+                .max((reference.strict_quantized - reference.strict_original).abs());
+            errors.2 = errors
+                .2
+                .max((reference.policy - reference.strict_quantized).abs());
+        }
+        assert_eq!(stream.clone_dtoh(&self.weights_gpu).unwrap(), self.weights);
+        assert!(stream
+            .clone_dtoh(&self.input_gpu)
+            .unwrap()
+            .iter()
+            .zip(&self.input)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        errors
+    }
+}
+
+#[test]
+#[ignore = "requires an actual SM80+ CUDA device; approximate policy prototype only"]
+fn q4k_q8_prototype_pack_and_matmul_match_policy_oracle_on_cuda() {
+    let context = CudaContext::new(0).expect("Q4K Q8 prototype requires CUDA");
+    let stream = context.default_stream();
+    let prototype = Prototype::load(&context);
+    let retained = CudaNativeBlockKernels::load(&context).unwrap();
+    for (rows, inputs, outputs) in [
+        (1, 256, 7),
+        (3, 768, 9),
+        (7, 256, 15),
+        (8, 512, 33),
+        (9, 256, 5),
+        (15, 512, 16),
+        (16, 256, 31),
+        (31, 512, 32),
+        (32, 768, 17),
+        (33, 256, 33),
+    ] {
+        let mut case = Case::new(&stream, rows, inputs, outputs);
+        for mapping in [Mapping::Lane, Mapping::Mma] {
+            for _ in 0..2 {
+                case.reset_destinations(&stream, f16::NAN);
+                case.pack(&stream, &prototype);
+                case.multiply(&stream, &prototype, &retained, mapping);
+                case.validate_pack(&stream);
+                case.validate_output(&stream, true, true);
+            }
+        }
+        case.reset_destinations(&stream, f16::NAN);
+        case.multiply(&stream, &prototype, &retained, Mapping::Strict);
+        case.validate_output(&stream, false, true);
+    }
+    // The pack ABI permits a final partial block of complete 32-value groups.
+    let mut tail_pack = Case::new(&stream, 3, 32, 1);
+    tail_pack.reset_destinations(&stream, f16::NAN);
+    tail_pack.pack(&stream, &prototype);
+    tail_pack.validate_pack(&stream);
+    // Min-only policy separation and an exactly cancelling affine weight are
+    // not covered by a generic positive-magnitude tolerance fixture.
+    for (q, minimum) in [(0, 1), (15, 15)] {
+        let mut special = Case::new(&stream, 1, 256, 7);
+        let block = Q4Block {
+            d: f16::ONE,
+            dmin: f16::ONE,
+            scales: [1; 8],
+            minima: [minimum; 8],
+            quants: [q; 256],
+        };
+        special.input[INPUT_PREFIX..INPUT_PREFIX + 256].fill(f16::ZERO);
+        special.input[INPUT_PREFIX] = f16::ONE;
+        special.input[INPUT_PREFIX + 1] = f16::from_f32(1.0 / 256.0);
+        for col in 0..7 {
+            special.weights[WEIGHT_PREFIX + col * 144..][..144].copy_from_slice(&block.encode());
+        }
+        special.block_override = Some(block);
+        stream
+            .memcpy_htod(&special.input, &mut special.input_gpu)
+            .unwrap();
+        stream
+            .memcpy_htod(&special.weights, &mut special.weights_gpu)
+            .unwrap();
+        for mapping in [Mapping::Lane, Mapping::Mma] {
+            special.reset_destinations(&stream, f16::NAN);
+            special.pack(&stream, &prototype);
+            special.validate_pack(&stream);
+            special.multiply(&stream, &prototype, &retained, mapping);
+            special.validate_output(&stream, true, true);
+            if q == 15 && minimum == 15 {
+                let output = stream.clone_dtoh(&special.output_gpu).unwrap();
+                for value in &output[OUTPUT_PREFIX + COLUMN_OFFSET..][..special.outputs] {
+                    assert_eq!(
+                        value.to_f32(),
+                        0.0,
+                        "exact affine cancellation for {mapping:?}"
+                    );
+                }
+            }
+        }
+    }
+    let mut exceptional = Case::new(&stream, 1, 256, 7);
+    for (i, x) in [127.0, -127.0, 0.5, -0.5, 1.5, -1.5, 126.5, -126.5]
+        .into_iter()
+        .enumerate()
+    {
+        exceptional.input[INPUT_PREFIX + i] = f16::from_f32(x);
+    }
+    exceptional.input[INPUT_PREFIX + 32..INPUT_PREFIX + 64].fill(f16::NEG_ZERO);
+    exceptional.input[INPUT_PREFIX + 64..INPUT_PREFIX + 96].fill(f16::from_bits(1));
+    exceptional.input[INPUT_PREFIX + 96] = f16::MAX;
+    exceptional.input[INPUT_PREFIX + 97] = f16::MIN;
+    exceptional.input[INPUT_PREFIX + 128] = f16::NAN;
+    exceptional.input[INPUT_PREFIX + 160] = f16::INFINITY;
+    exceptional.input[INPUT_PREFIX + 192] = f16::NEG_INFINITY;
+    stream
+        .memcpy_htod(&exceptional.input, &mut exceptional.input_gpu)
+        .unwrap();
+    for mapping in [Mapping::Lane, Mapping::Mma] {
+        // Expected outputs are NaN here, so a finite poison is necessary to
+        // distinguish a real nonfinite write from a skipped output store.
+        exceptional.reset_destinations(&stream, f16::ZERO);
+        exceptional.pack(&stream, &prototype);
+        exceptional.validate_pack(&stream);
+        exceptional.multiply(&stream, &prototype, &retained, mapping);
+        let output = stream.clone_dtoh(&exceptional.output_gpu).unwrap();
+        assert!(
+            output[OUTPUT_PREFIX + COLUMN_OFFSET..][..exceptional.outputs]
+                .iter()
+                .all(|x| x.is_nan())
+        );
+        let valid =
+            OUTPUT_PREFIX + COLUMN_OFFSET..OUTPUT_PREFIX + COLUMN_OFFSET + exceptional.outputs;
+        for (index, value) in output.iter().enumerate() {
+            if !valid.contains(&index) {
+                assert_eq!(value.to_bits(), f16::from_f32(-12345.0).to_bits());
+            }
+        }
+        assert_eq!(
+            stream.clone_dtoh(&exceptional.weights_gpu).unwrap(),
+            exceptional.weights
+        );
+        assert!(stream
+            .clone_dtoh(&exceptional.input_gpu)
+            .unwrap()
+            .iter()
+            .zip(&exceptional.input)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+    }
+}
+
+#[test]
+#[ignore = "paired GPU timing including activation pack; exclusive SM80+ CUDA access"]
+fn q4k_q8_prototype_pack_plus_matmul_microbench() {
+    // Hot reuse of each compressed matrix, identical cache treatment for both
+    // paths. This screens arithmetic/pack cost, not 9B cross-layer throughput.
+    let context = CudaContext::new(0).expect("Q4K Q8 timing requires CUDA");
+    let stream = context.default_stream();
+    let prototype = Prototype::load(&context);
+    let retained = CudaNativeBlockKernels::load(&context).unwrap();
+    const REPEATS: u32 = 8;
+    for rows in [1, 8, 32] {
+        for outputs in [4096, 12288] {
+            let mut case = Case::new(&stream, rows, 4096, outputs);
+            for round in 0..6 {
+                for mapping in if round % 2 == 0 {
+                    [Mapping::Strict, Mapping::Lane, Mapping::Mma]
+                } else {
+                    [Mapping::Mma, Mapping::Lane, Mapping::Strict]
+                } {
+                    let approximate = mapping != Mapping::Strict;
+                    // Reset outside both GPU and wall timing; REPEATS itself
+                    // contains only the actual pack (when needed) and GEMV.
+                    case.reset_destinations(&stream, f16::NAN);
+                    stream.synchronize().unwrap();
+                    let wall = std::time::Instant::now();
+                    let start = stream
+                        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+                        .unwrap();
+                    for _ in 0..REPEATS {
+                        if approximate {
+                            case.pack(&stream, &prototype);
+                        }
+                        case.multiply(&stream, &prototype, &retained, mapping);
+                    }
+                    let end = stream
+                        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+                        .unwrap();
+                    end.synchronize().unwrap();
+                    let wall_us = wall.elapsed().as_secs_f64() * 1e6 / f64::from(REPEATS);
+                    let gpu_us =
+                        f64::from(start.elapsed_ms(&end).unwrap()) * 1000.0 / f64::from(REPEATS);
+                    if approximate {
+                        case.validate_pack(&stream);
+                    }
+                    let errors = case.validate_output(&stream, approximate, false);
+                    if round > 0 {
+                        println!("q4k_q8_prototype rows={rows} inputs=4096 outputs={outputs} round={round} mapping={mapping:?} includes_pack={approximate} gpu_us={gpu_us:.3} wall_us={wall_us:.3} oracle_max_abs={} activation_max_abs={} reconstruction_max_abs={}",errors.0,errors.1,errors.2);
+                    }
+                }
+            }
+        }
+    }
+}
