@@ -141,6 +141,21 @@ fn names(backend: Backend) -> Vec<String> {
             ]),
         ],
         Backend::Cuda => &[
+            // Register CUDA-only boundaries and ignored device oracles explicitly;
+            // paired timing microbenchmarks remain opt-in.
+            ("last_token_linear_tests", &[
+                "packed_last_token_rows_requires_unit_ranges_and_exact_matrix_coverage",
+                "packed_last_token_rows_rejects_pointer_width_and_launch_overflow",
+                "packed_f16_last_token_projection_matches_scalar_and_f64_on_cuda",
+                "f16_last_token_projection_fallback_preserves_gaps_order_and_final_rows_on_cuda",
+            ]),
+            ("last_token_linear_tests::gather_tests", &[
+                "last_token_gather_workspace_tracks_sequences_not_prefill_tokens",
+                "last_token_gather_rejects_alias_without_rejecting_safe_fallback_layouts",
+                "last_token_gather_does_not_hide_invalid_scalar_access",
+                "last_token_gather_replay_binds_mode_copy_mapping_and_scratch_address",
+                "gathered_f16_last_token_projection_matches_f64_and_preserves_fallback_on_cuda",
+            ]),
             ("native_blocks::hadamard::tests", &[
                 "hadamard_forward_and_inverse_match_independent_walsh_on_cuda",
                 "hadamard_pq2_embedding_preserves_f32_until_inverse_on_cuda",
@@ -152,14 +167,23 @@ fn names(backend: Backend) -> Vec<String> {
                 "native_block_linears_preserve_f16_and_f32_activations_on_cuda",
                 "native_matrix_launcher_preserves_mixed_dense_and_block_partitions",
             ]),
+            ("native_blocks::tests::q4k", &[
+                "q4k_specialization_preserves_generic_bits_and_f64_oracle_on_cuda",
+            ]),
             ("native_io::tests", &[
                 "token_lookup_launcher_preserves_exact_decode_offsets_and_invalid_ids_on_cuda",
                 "final_row_projection_launcher_preserves_f32_input_and_guarded_logits_on_cuda",
                 "token_io_bounds_preserve_nonzero_spans_and_native_launch_capacity",
             ]),
             ("selection::tests", &["masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda"]),
+            ("selection::tests::partitioned", &[
+                "partitioned_argmax_dispatch_threshold_preserves_small_rows",
+                "partitioned_argmax_matches_scalar_and_old_kernel_with_guarded_windows_on_cuda",
+            ]),
             ("transformer::native_swiglu::tests", &[
+                "native_swiglu_packed_rows_preserve_larger_participant_batches",
                 "native_swiglu_mixed_matrices_match_stage_oracles_on_cuda",
+                "native_swiglu_packed_rows_match_independent_source_slices_on_cuda",
                 "native_swiglu_scratch_accounts_only_for_bounded_activations",
             ]),
             ("transformer::precision::tests", &[
@@ -184,6 +208,7 @@ fn names(backend: Backend) -> Vec<String> {
             ]),
             ("transformer::attention::recurrent_tests", &[
                 "recurrent_cuda_semantics_preserve_f64_oracle_state_carry_and_isolated_slots",
+                "recurrent_cuda_mixed_chunk_boundaries_preserve_f32_state_and_slot_isolation",
                 "recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on_cuda",
             ]),
             ("transformer::causal_attention::numerical_tests", &[
