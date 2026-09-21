@@ -181,7 +181,7 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
-// Diagnostic-only Q4_K x Q8 activation prototype. No production provider loads
+// Diagnostic-only Q4_K/Q5_K/Q6_K x Q8 activation prototypes. No production provider loads
 // these exports. Quantizing activations changes the numeric policy: this is not
 // a strict-equivalent implementation of native_linear or llama's Q8_1 format.
 //
@@ -242,15 +242,72 @@ __device__ __forceinline__ int prototype_signed_dot4(unsigned a, unsigned b) {
 #endif
 }
 
-// Matmul ABI: packed buffers above, native Q4_K weights[outputs][inputs/256]
-// with 144-byte blocks, and y[rows][stride] F16 written at offset..offset+outputs.
+template<unsigned Format>
+__device__ __forceinline__ unsigned prototype_qk_block_bytes() {
+    static_assert(Format == 12 || Format == 13 || Format == 14, "prototype K format");
+    return Format == 12 ? 144 : Format == 13 ? 176 : 210;
+}
+
+// Read four coefficients without requiring any alignment of the native block.
+// Q4/Q5 codes are nonnegative; Q6 codes are signed bytes in [-32,31].
+template<unsigned Format>
+__device__ __forceinline__ unsigned prototype_qk_word(
+    const byte* block, unsigned group, unsigned word) {
+    unsigned packed = 0;
+    #pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const unsigned within = word * 4 + j;
+        unsigned code;
+        if constexpr (Format == 14) {
+            const unsigned i = group * 32 + within;
+            const unsigned local_group = (i % 128) / 32;
+            const unsigned lo = (block[(i / 128) * 64 + (local_group % 2) * 32 + within]
+                >> (4 * (local_group / 2))) & 15;
+            const unsigned hi = (block[128 + (i / 128) * 32 + within]
+                >> (2 * local_group)) & 3;
+            code = unsigned(int(lo | (hi << 4)) - 32) & 255;
+        } else {
+            constexpr unsigned start = Format == 13 ? 48 : 16;
+            code = (block[start + (group / 2) * 32 + within]
+                >> (4 * (group % 2))) & 15;
+            if constexpr (Format == 13) {
+                if (block[16 + within] & (1u << group)) code += 16;
+            }
+        }
+        packed |= code << (j * 8);
+    }
+    return packed;
+}
+
+// Q4/Q5: positive scale and minimum, each rounded once to F32.
+// Q6: the two independent K16 scales within one K32 activation scale group.
+template<unsigned Format>
+__device__ __forceinline__ void prototype_qk_coefficients(
+    const byte* block, unsigned group, float& first, float& second) {
+    if constexpr (Format == 14) {
+        const float d = native_half(block, 208);
+        first = d * float(static_cast<signed char>(block[192 + 2 * group]));
+        second = d * float(static_cast<signed char>(block[193 + 2 * group]));
+    } else {
+        const byte* s = block + 4;
+        const unsigned scale6 = group < 4 ? s[group] & 63
+            : (s[group + 4] & 15) | ((s[group - 4] >> 6) << 4);
+        const unsigned min6 = group < 4 ? s[group + 4] & 63
+            : (s[group + 4] >> 4) | ((s[group] >> 6) << 4);
+        first = native_half(block, 0) * float(scale6);
+        second = native_half(block, 2) * float(min6);
+    }
+}
+
+// Matmul ABI: packed buffers above, native K weights[outputs][inputs/256]
+// (Q4:144, Q5:176, Q6:210 bytes/block), and y[rows][stride] F16 at offset.
 // Launch (ceil(outputs/4), ceil(rows/RowTile), 1) blocks of (128,1,1).
 // A warp owns one output column; its four 8-lane subgroups process four K32
-// groups. Each lane loads four byte-safe Q4 coefficients and one packed Q8 word.
+// groups. Each lane loads four byte-safe coefficients and one packed Q8 word.
 // Each lane applies F32 scaling before the final warp reduction. Weights are
 // shared across RowTile activation rows, without per-group integer shuffles.
-template<unsigned RowTile>
-__device__ void prototype_q4k_q8_linear(const float* scales, const unsigned* qwords,
+template<unsigned Format, unsigned RowTile>
+__device__ void prototype_qk_q8_linear(const float* scales, const unsigned* qwords,
     const byte* w, half* y, unsigned rows, unsigned inputs, unsigned outputs,
     unsigned stride, unsigned offset) {
     const size_t first_row = size_t(blockIdx.y) * RowTile;
@@ -260,38 +317,32 @@ __device__ void prototype_q4k_q8_linear(const float* scales, const unsigned* qwo
     const unsigned word = lane % 8;
     if (first_row >= rows || column >= outputs) return; // Whole-warp exit.
     const unsigned groups = inputs / 32;
-    const byte* weights = w + column * size_t(inputs / 256) * 144;
+    const byte* weights = w + column * size_t(inputs / 256) * prototype_qk_block_bytes<Format>();
     float sums[RowTile] = {};
     for (unsigned base = 0; base < groups; base += 4) {
         const unsigned group = base + subgroup; // inputs%256: no partial group.
         const unsigned local_group = group % 8;
-        const byte* block = weights + size_t(group / 8) * 144;
-        unsigned packed_weight = 0;
-        #pragma unroll
-        for (unsigned j = 0; j < 4; ++j) {
-            const unsigned code = (block[16 + (local_group / 2) * 32 + word * 4 + j]
-                >> (4 * (local_group % 2))) & 15;
-            packed_weight |= code << (j * 8);
-        }
-        const byte* s = block + 4;
-        const unsigned scale6 = local_group < 4 ? s[local_group] & 63
-            : (s[local_group + 4] & 15) | ((s[local_group - 4] >> 6) << 4);
-        const unsigned min6 = local_group < 4 ? s[local_group + 4] & 63
-            : (s[local_group + 4] >> 4) | ((s[local_group] >> 6) << 4);
-        const float a = native_half(block, 0) * float(scale6);
-        const float b = native_half(block, 2) * float(min6);
+        const byte* block = weights + size_t(group / 8) * prototype_qk_block_bytes<Format>();
+        const unsigned packed_weight = prototype_qk_word<Format>(block, local_group, word);
+        float a, b;
+        prototype_qk_coefficients<Format>(block, local_group, a, b);
         #pragma unroll
         for (unsigned r = 0; r < RowTile; ++r) {
             if (first_row + r < rows) { // Uniform condition within each warp.
                 const size_t packed_group = (first_row + r) * groups + group;
                 const unsigned packed_x = qwords[packed_group * 8 + word];
                 const int dot = prototype_signed_dot4(packed_weight, packed_x);
-                const int sum = prototype_signed_dot4(0x01010101u, packed_x);
-                // Four signed activations: |dot|<=4*15*127; |sum|<=4*127.
+                // Four activations: |dot|<=4*32*127 for all three formats.
                 const float d = scales[packed_group];
                 // Independent approximate policy, no unquantized sum
                 // correction. The source is built with --fmad=false.
-                sums[r] += d * (a * float(dot) - b * float(sum));
+                if constexpr (Format == 14) {
+                    // Each word stays entirely within one K16 weight scale.
+                    sums[r] += d * ((word < 4 ? a : b) * float(dot));
+                } else {
+                    const int sum = prototype_signed_dot4(0x01010101u, packed_x);
+                    sums[r] += d * (a * float(dot) - b * float(sum));
+                }
             }
         }
     }
@@ -304,23 +355,28 @@ __device__ void prototype_q4k_q8_linear(const float* scales, const unsigned* qwo
     }
 }
 
-#define PROTOTYPE_Q4K_Q8_LINEAR(suffix, tile) \
-extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_dp4a_##suffix##_prototype( \
+#define PROTOTYPE_QK_Q8_LINEAR(name, format, suffix, tile) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_dp4a_##suffix##_prototype( \
     const float* scales, const unsigned* qwords, const byte* w, half* y, \
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
         || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
-    prototype_q4k_q8_linear<tile>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+    prototype_qk_q8_linear<format, tile>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
 }
-PROTOTYPE_Q4K_Q8_LINEAR(lane_f16, 1)
-PROTOTYPE_Q4K_Q8_LINEAR(lane_tiled_f16, 8)
+PROTOTYPE_QK_Q8_LINEAR(q4k, 12, lane_f16, 1)
+PROTOTYPE_QK_Q8_LINEAR(q4k, 12, lane_tiled_f16, 8)
+PROTOTYPE_QK_Q8_LINEAR(q5k, 13, lane_f16, 1)
+PROTOTYPE_QK_Q8_LINEAR(q5k, 13, lane_tiled_f16, 8)
+PROTOTYPE_QK_Q8_LINEAR(q6k, 14, lane_f16, 1)
+PROTOTYPE_QK_Q8_LINEAR(q6k, 14, lane_tiled_f16, 8)
 
 // Same diagnostic arithmetic policy, now a 16-output x 32-token CTA. Four
 // warps share a K256 decoded weight tile, each computing 16 outputs x 8 tokens.
 // Integer MMA is restricted to a single K32 scale group; its C registers are
 // reset before every instruction, then rescaled in F32. This export is not
 // loaded by a production provider and requires SM80+ to execute.
-extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_mma_f16_prototype(
+template<unsigned Format>
+__device__ void prototype_qk_q8_mma(
     const float* scales, const unsigned* qwords, const byte* w, half* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -331,7 +387,8 @@ extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_mma_f16_prototype(
     // Codes: 6144 bytes; affine metadata: 1024 bytes; total: 7168 bytes/CTA.
     __shared__ unsigned codes[8][16][12];
     __shared__ float coefficients[8][16];
-    __shared__ float minima[8][16];
+    // Q4/Q5 store the minimum; Q6 stores the second K16 coefficient.
+    __shared__ float second_coefficients[8][16];
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid % 32;
     const unsigned warp = tid / 32;
@@ -349,32 +406,19 @@ extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_mma_f16_prototype(
     for (unsigned block_index = 0; block_index < blocks; ++block_index) {
         const bool valid_column = first_column + load_column < outputs;
         const byte* block = valid_column
-            ? w + ((first_column + load_column) * blocks + block_index) * 144 : w;
+            ? w + ((first_column + load_column) * blocks + block_index)
+                * prototype_qk_block_bytes<Format>() : w;
         #pragma unroll
         for (unsigned group = 0; group < 8; ++group) {
             unsigned packed_weight = 0;
-            if (valid_column) {
-                #pragma unroll
-                for (unsigned j = 0; j < 4; ++j) {
-                    const unsigned code = (block[16 + (group / 2) * 32 + load_word * 4 + j]
-                        >> (4 * (group % 2))) & 15;
-                    packed_weight |= code << (j * 8);
-                }
-            }
+            if (valid_column)
+                packed_weight = prototype_qk_word<Format>(block, group, load_word);
             codes[group][load_column][load_word] = packed_weight;
             if (load_word == 0) {
                 float a = 0.0f, b = 0.0f;
-                if (valid_column) {
-                    const byte* s = block + 4;
-                    const unsigned scale6 = group < 4 ? s[group] & 63
-                        : (s[group + 4] & 15) | ((s[group - 4] >> 6) << 4);
-                    const unsigned min6 = group < 4 ? s[group + 4] & 63
-                        : (s[group + 4] >> 4) | ((s[group] >> 6) << 4);
-                    a = native_half(block, 0) * float(scale6);
-                    b = native_half(block, 2) * float(min6);
-                }
+                if (valid_column) prototype_qk_coefficients<Format>(block, group, a, b);
                 coefficients[group][load_column] = a;
-                minima[group][load_column] = b;
+                second_coefficients[group][load_column] = b;
             }
         }
         __syncthreads();
@@ -394,28 +438,52 @@ extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_mma_f16_prototype(
                 b1 = qwords[packed_group * 8 + t + 4];
                 activation_scale = scales[packed_group];
             }
-            int activation_sum = prototype_signed_dot4(0x01010101u, b0)
-                + prototype_signed_dot4(0x01010101u, b1);
-            activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 1, 4);
-            activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 2, 4);
-            const int sum0 = __shfl_sync(0xffffffff, activation_sum, 8 * t);
-            const int sum1 = __shfl_sync(0xffffffff, activation_sum, 8 * t + 4);
             const float d0 = __shfl_sync(0xffffffff, activation_scale, 8 * t);
             const float d1 = __shfl_sync(0xffffffff, activation_scale, 8 * t + 4);
             int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
-            asm volatile(
-                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-                : "+r"(dot0), "+r"(dot1), "+r"(dot2), "+r"(dot3)
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
             const float a_lower = coefficients[group][g];
             const float a_upper = coefficients[group][g + 8];
-            const float b_lower = minima[group][g];
-            const float b_upper = minima[group][g + 8];
-            partial[group % 4][0] += d0 * (a_lower * float(dot0) - b_lower * float(sum0));
-            partial[group % 4][1] += d1 * (a_lower * float(dot1) - b_lower * float(sum1));
-            partial[group % 4][2] += d0 * (a_upper * float(dot2) - b_upper * float(sum0));
-            partial[group % 4][3] += d1 * (a_upper * float(dot3) - b_upper * float(sum1));
+            const float b_lower = second_coefficients[group][g];
+            const float b_upper = second_coefficients[group][g + 8];
+            if constexpr (Format == 14) {
+                // Q6 has two weight scales per K32 activation group. A/B
+                // lower words form K16, with the same C ownership as K32;
+                // upper words form the second K16. Each |dot|<=16*32*127.
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+                    : "+r"(dot0), "+r"(dot1), "+r"(dot2), "+r"(dot3)
+                    : "r"(a0), "r"(a1), "r"(b0));
+                int upper0 = 0, upper1 = 0, upper2 = 0, upper3 = 0;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+                    : "+r"(upper0), "+r"(upper1), "+r"(upper2), "+r"(upper3)
+                    : "r"(a2), "r"(a3), "r"(b1));
+                // Coefficients were rounded to F32 before the integer dot.
+                // Both K16 halves share delta; combine once per K32, then
+                // accumulate with the same four partial chains as Q4/Q5.
+                partial[group % 4][0] += d0 * (a_lower * float(dot0) + b_lower * float(upper0));
+                partial[group % 4][1] += d1 * (a_lower * float(dot1) + b_lower * float(upper1));
+                partial[group % 4][2] += d0 * (a_upper * float(dot2) + b_upper * float(upper2));
+                partial[group % 4][3] += d1 * (a_upper * float(dot3) + b_upper * float(upper3));
+            } else {
+                int activation_sum = prototype_signed_dot4(0x01010101u, b0)
+                    + prototype_signed_dot4(0x01010101u, b1);
+                activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 1, 4);
+                activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 2, 4);
+                const int sum0 = __shfl_sync(0xffffffff, activation_sum, 8 * t);
+                const int sum1 = __shfl_sync(0xffffffff, activation_sum, 8 * t + 4);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                    : "+r"(dot0), "+r"(dot1), "+r"(dot2), "+r"(dot3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                partial[group % 4][0] += d0 * (a_lower * float(dot0) - b_lower * float(sum0));
+                partial[group % 4][1] += d1 * (a_lower * float(dot1) - b_lower * float(sum1));
+                partial[group % 4][2] += d0 * (a_upper * float(dot2) - b_upper * float(sum0));
+                partial[group % 4][3] += d1 * (a_upper * float(dot3) - b_upper * float(sum1));
+            }
         }
         // Invalid token/output tails still participate in both barriers and
         // every warp instruction; only their final stores are suppressed.
@@ -431,6 +499,16 @@ extern "C" __global__ void vnext_gguf_q4k_q8_f32scale_mma_f16_prototype(
     }
 #endif
 }
+
+#define PROTOTYPE_QK_Q8_MMA(name, format) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_mma_f16_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) { \
+    prototype_qk_q8_mma<format>(scales, qwords, w, y, rows, inputs, outputs, stride, offset); \
+}
+PROTOTYPE_QK_Q8_MMA(q4k, 12)
+PROTOTYPE_QK_Q8_MMA(q5k, 13)
+PROTOTYPE_QK_Q8_MMA(q6k, 14)
 
 // A prefill tile reuses activations across output columns as well as decoded
 // weights across token rows. Decode directly into bounded shared F32 storage;
