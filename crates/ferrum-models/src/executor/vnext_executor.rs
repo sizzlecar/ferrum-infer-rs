@@ -69,6 +69,7 @@ mod decode_lookahead;
 mod determinism;
 mod mixed_batch;
 mod pending_decode;
+mod readback_logits;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 use decode_lookahead::{ObservedVNextStep, PendingDecodeRow};
 mod prefix_cache;
@@ -9014,12 +9015,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn decode_logits(bytes: &[u8], element_type: ElementType) -> Result<Vec<f32>> {
         match element_type {
-            ElementType::F16 => Ok(bytes
-                .chunks_exact(2)
-                .map(|chunk| {
-                    half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32()
-                })
-                .collect()),
+            ElementType::F16 => Ok(readback_logits::decode_f16(bytes)),
             ElementType::Bf16 => Ok(bytes
                 .chunks_exact(2)
                 .map(|chunk| {
