@@ -6,6 +6,7 @@ use crate::gguf_blocks::{
 use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 use half::f16;
 
+mod prefill_gemm;
 mod q4k;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {

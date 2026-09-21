@@ -24,6 +24,9 @@ pub(super) struct CudaNativeBlockKernels {
     linear_tiled_f32_f16: CudaFunction,
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
+    gemm_q4k_f16: CudaFunction,
+    gemm_q5k_f16: CudaFunction,
+    gemm_q6k_f16: CudaFunction,
     hadamard: hadamard::CudaHadamardKernels,
     pub embedding_f16: CudaFunction,
     pub embedding_f32: CudaFunction,
@@ -146,6 +149,9 @@ impl CudaNativeBlockKernels {
             linear_tiled_f32_f16: load("vnext_gguf_linear_tiled_f32_f16")?,
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
+            gemm_q4k_f16: load("vnext_gguf_gemm_q4k_f16")?,
+            gemm_q5k_f16: load("vnext_gguf_gemm_q5k_f16")?,
+            gemm_q6k_f16: load("vnext_gguf_gemm_q6k_f16")?,
             hadamard: hadamard::CudaHadamardKernels::load(&module)?,
             embedding_f16: load("vnext_gguf_embedding_f16")?,
             embedding_f32: load("vnext_gguf_embedding_f32")?,
@@ -241,7 +247,32 @@ impl CudaNativeBlockKernels {
         let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
         let q4k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
+        // The shared-memory matrix tile pays off for substantial batches.
+        // Keep short decode and small output matrices on the original warp
+        // path. Only the F16 activation interface is performance-qualified;
+        // its coefficients, products and accumulators still remain F32.
+        let shared_gemm = if rows >= 128
+            && part.rows >= 128
+            && input_type == ElementType::F16
+            && output_type == ElementType::F16
+        {
+            match part.format {
+                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K) => {
+                    Some(&self.gemm_q4k_f16)
+                }
+                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q5K) => {
+                    Some(&self.gemm_q5k_f16)
+                }
+                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q6K) => {
+                    Some(&self.gemm_q6k_f16)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let kernel = match (input_type, output_type, row_tile > 1) {
+            _ if shared_gemm.is_some() => shared_gemm.unwrap(),
             (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
             (ElementType::F16, ElementType::F16, true) if q4k => &self.linear_q4k_tiled_f16,
             (ElementType::F16, ElementType::F16, false) => &self.linear_f16,
@@ -273,12 +304,21 @@ impl CudaNativeBlockKernels {
             launch.arg(parameter);
         }
         // SAFETY: The provider retains exact row-complete matrix and activation
-        // regions. One complete warp writes each guarded output column for
-        // every row in its tile; the final partial tile guards all row accesses.
+        // regions. Both launch geometries guard partial row/column tiles. The
+        // shared kernel's fixed 16x16 block cooperatively initializes all of
+        // its bounded shared storage before any thread consumes it.
         unsafe {
             launch.launch(LaunchConfig {
-                grid_dim: (part.rows.div_ceil(4), rows.div_ceil(row_tile), 1),
-                block_dim: (128, 1, 1),
+                grid_dim: if shared_gemm.is_some() {
+                    (part.rows.div_ceil(64), rows.div_ceil(64), 1)
+                } else {
+                    (part.rows.div_ceil(4), rows.div_ceil(row_tile), 1)
+                },
+                block_dim: if shared_gemm.is_some() {
+                    (16, 16, 1)
+                } else {
+                    (128, 1, 1)
+                },
                 shared_mem_bytes: 0,
             })
         }

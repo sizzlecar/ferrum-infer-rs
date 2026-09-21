@@ -181,6 +181,87 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
+// A prefill tile reuses activations across output columns as well as decoded
+// weights across token rows. Decode directly into bounded shared F32 storage;
+// no expanded persistent weights, F16 weight rounding, or tensor math mode.
+// The sum now follows input-column order instead of a warp reduction, while
+// multiplication and accumulation remain F32 (this source uses --fmad=false).
+template<typename Input, typename Output, unsigned Format, unsigned Values, unsigned Bytes>
+__device__ void native_block_gemm(const Input* x, const byte* w, Output* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset,
+    float (&activations)[64][33], float (&weights)[32][65]) {
+    const unsigned tx = threadIdx.x;
+    const unsigned ty = threadIdx.y;
+    const unsigned tid = ty * 16 + tx;
+    const unsigned first_row = blockIdx.y * 64;
+    const unsigned first_column = blockIdx.x * 64;
+    const size_t row_bytes = size_t(inputs / Values) * Bytes;
+    float sums[4][4] = {};
+    for (unsigned base = 0; base < inputs; base += 32) {
+        // Consecutive lanes read consecutive coefficients. Padding avoids
+        // shared-memory bank conflicts when transposing the weight tile.
+        for (unsigned element = tid; element < 64 * 32; element += 256) {
+            const unsigned local = element / 32;
+            const unsigned k = element % 32;
+            const unsigned input_column = base + k;
+            activations[local][k] = first_row + local < rows && input_column < inputs
+                ? float(x[size_t(first_row + local) * inputs + input_column]) : 0.0f;
+            float weight = 0.0f;
+            if (first_column + local < outputs && input_column < inputs) {
+                const byte* block = w + size_t(first_column + local) * row_bytes
+                    + size_t(input_column / Values) * Bytes;
+                weight = native_block_value(block, input_column % Values, Format);
+            }
+            weights[k][local] = weight;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned k = 0; k < 32; ++k) {
+            float a[4], b[4];
+            #pragma unroll
+            for (unsigned r = 0; r < 4; ++r) a[r] = activations[ty + r * 16][k];
+            #pragma unroll
+            for (unsigned c = 0; c < 4; ++c) b[c] = weights[k][tx + c * 16];
+            #pragma unroll
+            for (unsigned r = 0; r < 4; ++r) {
+                #pragma unroll
+                for (unsigned c = 0; c < 4; ++c) sums[r][c] += a[r] * b[c];
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < 4; ++r) {
+        const unsigned row = first_row + ty + r * 16;
+        #pragma unroll
+        for (unsigned c = 0; c < 4; ++c) {
+            const unsigned column = first_column + tx + c * 16;
+            if (row < rows && column < outputs)
+                y[size_t(row) * stride + offset + column] = Output(sums[r][c]);
+        }
+    }
+}
+
+#define NATIVE_BLOCK_GEMM(Input, Output, suffix, Format, Values, Bytes) \
+extern "C" __global__ void vnext_gguf_gemm_##suffix(const Input* x, const byte* w, Output* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    unsigned format, unsigned values, unsigned bytes) { \
+    if (format != Format || values != Values || bytes != Bytes || inputs % Values != 0) return; \
+    __shared__ float activations[64][33]; \
+    __shared__ float weights[32][65]; \
+    native_block_gemm<Input, Output, Format, Values, Bytes>(x, w, y, rows, inputs, outputs, \
+        stride, offset, activations, weights); \
+}
+NATIVE_BLOCK_GEMM(half, half, q4k_f16, 12, 256, 144)
+NATIVE_BLOCK_GEMM(float, float, q4k_f32, 12, 256, 144)
+NATIVE_BLOCK_GEMM(float, half, q4k_f32_f16, 12, 256, 144)
+NATIVE_BLOCK_GEMM(half, half, q5k_f16, 13, 256, 176)
+NATIVE_BLOCK_GEMM(float, float, q5k_f32, 13, 256, 176)
+NATIVE_BLOCK_GEMM(float, half, q5k_f32_f16, 13, 256, 176)
+NATIVE_BLOCK_GEMM(half, half, q6k_f16, 14, 256, 210)
+NATIVE_BLOCK_GEMM(float, float, q6k_f32, 14, 256, 210)
+NATIVE_BLOCK_GEMM(float, half, q6k_f32_f16, 14, 256, 210)
+
 #define NATIVE_EMBEDDING(T, suffix) \
 extern "C" __global__ void vnext_gguf_embedding_##suffix(const unsigned* tokens, const byte* w, T* y, \
     unsigned count, unsigned width, unsigned vocabulary, unsigned format, unsigned values, unsigned bytes) { \
