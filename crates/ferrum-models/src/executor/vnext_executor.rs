@@ -1438,6 +1438,7 @@ struct VNextExecutorMetrics {
     lookahead_submitted_waves: AtomicU64,
     lookahead_serial_warmups: AtomicU64,
     lookahead_consumed_rows: AtomicU64,
+    lookahead_maintenance_failures: AtomicU64,
     greedy_policy_fallback_waves: AtomicU64,
     token_mask_upload_participants: AtomicU64,
     token_mask_cache_hit_participants: AtomicU64,
@@ -2776,6 +2777,12 @@ impl VNextExecutorMetrics {
         *self.last_failure.lock() = Some(message.into());
     }
 
+    fn record_lookahead_maintenance_failure(&self, message: impl Into<String>) {
+        self.lookahead_maintenance_failures
+            .fetch_add(1, Ordering::Relaxed);
+        *self.last_failure.lock() = Some(message.into());
+    }
+
     fn record_reusable_catalog_miss(&self, key: VNextReusableExecutionCatalogMissKey) {
         if key.reason.is_epoch_mismatch() {
             self.reusable_catalog_epoch_misses
@@ -2828,6 +2835,7 @@ impl VNextExecutorMetrics {
             &self.lookahead_submitted_waves,
             &self.lookahead_serial_warmups,
             &self.lookahead_consumed_rows,
+            &self.lookahead_maintenance_failures,
             &self.greedy_policy_fallback_waves,
             &self.token_mask_upload_participants,
             &self.token_mask_cache_hit_participants,
@@ -8969,7 +8977,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         // This result is already committed. Preserve it while
                         // reporting repair failure; core fail-closed state,
                         // if any, still governs subsequent normal admission.
-                        self.metrics.record_failure(format!(
+                        self.metrics.record_lookahead_maintenance_failure(format!(
                             "vNext post-retirement lookahead backing maintenance failed: {error}"
                         ));
                     }
@@ -10378,6 +10386,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "lookahead_submitted_waves": self.metrics.lookahead_submitted_waves.load(Ordering::Relaxed),
             "lookahead_serial_warmups": self.metrics.lookahead_serial_warmups.load(Ordering::Relaxed),
             "lookahead_consumed_rows": self.metrics.lookahead_consumed_rows.load(Ordering::Relaxed),
+            "lookahead_maintenance_failures": self.metrics.lookahead_maintenance_failures.load(Ordering::Relaxed),
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
             "token_mask_residency_eligible": self.io.token_mask_residency_eligible,
             "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
@@ -11242,6 +11251,49 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
+
+    #[test]
+    fn lookahead_maintenance_failure_preserves_completed_wave_accounting() {
+        use std::sync::atomic::Ordering;
+
+        let metrics = super::VNextExecutorMetrics::default();
+        metrics.submitted_waves.store(1, Ordering::Relaxed);
+        metrics.completed_waves.store(1, Ordering::Relaxed);
+        metrics.record_lookahead_maintenance_failure("retired parent: optional trim failed");
+
+        assert_eq!(metrics.submitted_waves.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.completed_waves.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .lookahead_maintenance_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.last_failure.lock().as_deref(),
+            Some("retired parent: optional trim failed")
+        );
+
+        metrics.reset_after_startup();
+        assert_eq!(
+            metrics
+                .lookahead_maintenance_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.completed_waves.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 0);
+        assert!(metrics.last_failure.lock().is_none());
+        metrics.record_failure("actual wave failure");
+        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .lookahead_maintenance_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
 
     use super::{
         apply_teacher_forced_decision, bounded_wall_anchor, budget_reusable_decode_seed_prefill,
