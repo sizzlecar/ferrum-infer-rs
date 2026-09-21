@@ -126,6 +126,7 @@ pub fn metal_vnext_runtime_config(
             include_str!("gated_delta_attention.rs").as_bytes(),
             include_str!("gated_delta_attention.metal").as_bytes(),
             include_str!("causal_attention.rs").as_bytes(),
+            include_str!("causal_attention/head_dim_specialization.rs").as_bytes(),
             include_str!("causal_attention.metal").as_bytes(),
             include_str!("causal_attention_int8.metal").as_bytes(),
         ]),

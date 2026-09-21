@@ -65,6 +65,23 @@ fn run_packed_projected(
     pipelines: &MetalCausalAttentionPipelines,
     participants: &[(&Inputs, usize, &PagedKv)],
 ) -> Vec<Output> {
+    run_packed_projected_mode(device, queue, pipelines, participants, CoreMode::General)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoreMode {
+    General,
+    GroupedSerial,
+    GroupedBatched,
+}
+
+fn run_packed_projected_mode(
+    device: &Device,
+    queue: &CommandQueueRef,
+    pipelines: &MetalCausalAttentionPipelines,
+    participants: &[(&Inputs, usize, &PagedKv)],
+    mode: CoreMode,
+) -> Vec<Output> {
     let first = participants[0].0;
     let shape = CausalAttentionShape {
         hidden_size: 8,
@@ -76,7 +93,12 @@ fn run_packed_projected(
             as u64,
         kv_features: (first.kv_heads * first.dim) as u64,
         rope_dim: (first.dim / 4 * 2) as u64,
-        maximum_context_tokens: 64,
+        maximum_context_tokens: participants
+            .iter()
+            .map(|(inputs, start, _)| (start + inputs.tokens) as u64)
+            .max()
+            .unwrap()
+            .max(64),
         epsilon: 1e-6,
         rope_theta: 10_000.0,
         rope_interleaved: true,
@@ -89,7 +111,12 @@ fn run_packed_projected(
     let layout =
         ScratchLayout::new_with_storage(shape, total_tokens, participants.len(), pipelines.kv_type)
             .unwrap();
-    let mut scratch_values = vec![f16::ZERO; layout.required_bytes as usize / 2];
+    let poison = if mode == CoreMode::General {
+        f16::ZERO
+    } else {
+        f16::NAN
+    };
+    let mut scratch_values = vec![poison; layout.required_bytes as usize / 2];
     let mut packed_start = 0;
     for &(inputs, _, _) in participants {
         for (base, width, values) in [
@@ -156,6 +183,7 @@ fn run_packed_projected(
     let encoder = command.new_compute_command_encoder();
     packed_start = 0;
     let mut readback = Vec::new();
+    let mut grouped_rows = Vec::new();
     for (participant, &(inputs, start, state)) in participants.iter().enumerate() {
         assert_eq!(
             (inputs.heads, inputs.kv_heads, inputs.dim, inputs.gate),
@@ -218,14 +246,58 @@ fn run_packed_projected(
             ),
             MTLSize::new(SIMD_THREADS, 1, 1),
         );
-        encoder.set_buffer(0, Some(&scratch), query);
-        encoder.set_buffer(1, Some(&scratch), q_raw);
-        encoder.set_buffer(2, Some(&scratch), context);
-        encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&arguments), binding_offset);
-        set_raw_params(encoder, 4, &params);
         let plan = pipelines.dispatch_plan(&params);
-        assert_eq!(plan.kind, AttentionDispatchKind::General);
-        encode_attention_dispatch(pipelines, encoder, plan, &params);
+        let partials = layout.split_decode_offset(participant).unwrap();
+        assert_eq!(
+            plan.kind,
+            if mode == CoreMode::General {
+                AttentionDispatchKind::General
+            } else {
+                AttentionDispatchKind::GroupedDecode
+            }
+        );
+        if mode != CoreMode::General {
+            grouped_rows.push(GroupedDecodeRow {
+                params,
+                query,
+                query_raw: q_raw,
+                partials,
+                output: context,
+                binding: binding_offset,
+            });
+        }
+        if mode != CoreMode::GroupedBatched {
+            encoder.set_buffer(0, Some(&scratch), query);
+            encoder.set_buffer(1, Some(&scratch), q_raw);
+            encoder.set_buffer(
+                2,
+                Some(&scratch),
+                if mode == CoreMode::GroupedSerial {
+                    partials
+                } else {
+                    context
+                },
+            );
+            encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(&arguments), binding_offset);
+            set_raw_params(encoder, 4, &params);
+            encode_attention_dispatch(pipelines, encoder, plan, &params);
+            if mode == CoreMode::GroupedSerial {
+                encoder.set_compute_pipeline_state(pipelines.grouped_reduce_pipeline(&params));
+                encoder.set_buffer(0, Some(&scratch), partials);
+                encoder.set_buffer(1, Some(&scratch), q_raw);
+                encoder.set_buffer(2, Some(&scratch), context);
+                encoder.set_threadgroup_memory_length(
+                    0,
+                    grouped_decode_reduce_threadgroup_memory_bytes(),
+                );
+                encoder.set_threadgroup_memory_length(1, 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(u64::from(params.query_heads), 1, 1),
+                    MTLSize::new(SIMD_THREADS, 1, 1),
+                );
+                encoder.set_threadgroup_memory_length(0, 0);
+            }
+        }
         // The packed output projection consumes contiguous context rows too.
         readback.push((
             query,
@@ -234,11 +306,45 @@ fn run_packed_projected(
         ));
         packed_start += inputs.tokens as u64;
     }
+    if mode == CoreMode::GroupedBatched {
+        for rows in grouped_rows.chunks(GROUPED_BATCH_ROWS) {
+            dispatch_batched_grouped_decode(pipelines, encoder, &scratch, 0, &arguments, 0, rows);
+        }
+    }
     encoder.end_encoding();
     command.commit();
     command.wait_until_completed();
     assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
     let values = read::<f16>(&scratch, scratch.length() as usize / 2);
+    if mode != CoreMode::General {
+        let mut writable = vec![false; values.len()];
+        for row in &grouped_rows {
+            let elements = (row.params.query_heads * row.params.head_dim) as usize;
+            for (offset, count) in [
+                (row.query, elements),
+                (row.output, elements),
+                (
+                    row.partials,
+                    grouped_decode_partitions(&row.params) as usize
+                        * row.params.query_heads as usize
+                        * (row.params.head_dim as usize + 2)
+                        * 2,
+                ),
+            ] {
+                let start = offset as usize / 2;
+                writable[start..start + count].fill(true);
+            }
+        }
+        for (index, (&value, &initial)) in values.iter().zip(&scratch_values).enumerate() {
+            if !writable[index] {
+                assert_eq!(
+                    value.to_bits(),
+                    initial.to_bits(),
+                    "projected input/unused scratch guard {index}"
+                );
+            }
+        }
+    }
     participants
         .iter()
         .zip(readback)
@@ -408,4 +514,142 @@ fn packed_partial_head_f16_preserves_contiguous_rows_and_independent_histories()
 #[test]
 fn packed_partial_head_int8_preserves_contiguous_rows_and_independent_histories() {
     packed_partial_head_case(ElementType::I8);
+}
+
+#[test]
+fn packed_grouped_prepare_reordering_preserves_bits_kv_and_guards() {
+    metal::objc::rc::autoreleasepool(|| {
+        let device = Device::system_default().expect("prepare ordering requires Metal");
+        let queue = device.new_command_queue();
+        let pipelines = MetalCausalAttentionPipelines::new(&device).unwrap();
+        for starts in [&[256_usize, 528][..], &[256_usize, 528, 512][..]] {
+            let inputs = starts
+                .iter()
+                .enumerate()
+                .map(|(row, _)| {
+                    let mut input = Inputs::new(1, 16, 4, 256, true);
+                    for values in [&mut input.query, &mut input.key, &mut input.value] {
+                        for value in values {
+                            *value = f16::from_f32(value.to_f32() + row as f32 / 32.0);
+                        }
+                    }
+                    input
+                })
+                .collect::<Vec<_>>();
+            let make_states = || {
+                starts
+                    .iter()
+                    .zip(&inputs)
+                    .enumerate()
+                    .map(|(row, (&start, input))| {
+                        let state = PagedKv::new(&device, start + 1, input, ElementType::F16);
+                        let prefix_elements = start * 2 * input.kv_heads * input.dim;
+                        let page_elements = VNEXT_KV_PAGE_BYTES as usize / 2;
+                        for (page_index, page) in state.payload.iter().enumerate() {
+                            let count = prefix_elements
+                                .saturating_sub(page_index * page_elements)
+                                .min(page_elements);
+                            // Each page is shared CPU memory; no submission owns it yet.
+                            // Fill only retained history, leaving the new token and page
+                            // slack poisoned until the real prepare kernel writes them.
+                            let values = unsafe {
+                                std::slice::from_raw_parts_mut(page.contents().cast::<f16>(), count)
+                            };
+                            for (index, value) in values.iter_mut().enumerate() {
+                                *value = f16::from_f32(
+                                    ((page_index * page_elements + index + row * 31) as f32
+                                        * 0.0091)
+                                        .sin()
+                                        * 0.2,
+                                );
+                            }
+                        }
+                        state
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let old_states = make_states();
+            let new_states = make_states();
+            let before = old_states.iter().map(PagedKv::snapshot).collect::<Vec<_>>();
+            let old_participants = inputs
+                .iter()
+                .zip(starts)
+                .zip(&old_states)
+                .map(|((input, &start), state)| (input, start, state))
+                .collect::<Vec<_>>();
+            let new_participants = inputs
+                .iter()
+                .zip(starts)
+                .zip(&new_states)
+                .map(|((input, &start), state)| (input, start, state))
+                .collect::<Vec<_>>();
+            let old = run_packed_projected_mode(
+                &device,
+                &queue,
+                &pipelines,
+                &old_participants,
+                CoreMode::GroupedSerial,
+            );
+            let new = run_packed_projected_mode(
+                &device,
+                &queue,
+                &pipelines,
+                &new_participants,
+                CoreMode::GroupedBatched,
+            );
+            for row in 0..starts.len() {
+                assert_eq!(old[row].error, 0);
+                assert_eq!(new[row].error, 0);
+                assert_eq!(
+                    old[row]
+                        .query
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>(),
+                    new[row]
+                        .query
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>(),
+                    "prepared query row {row}"
+                );
+                assert_eq!(
+                    old[row]
+                        .attention
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>(),
+                    new[row]
+                        .attention
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>(),
+                    "attention row {row}"
+                );
+                let old_state = old_states[row].snapshot();
+                assert_eq!(
+                    old_state,
+                    new_states[row].snapshot(),
+                    "all KV bytes row {row}"
+                );
+                let token_bytes = 2 * inputs[row].kv_heads * inputs[row].dim * 2;
+                let written = starts[row] * token_bytes..(starts[row] + 1) * token_bytes;
+                for (index, (&value, &initial)) in old_state.iter().zip(&before[row]).enumerate() {
+                    if !written.contains(&index) {
+                        assert_eq!(
+                            value, initial,
+                            "retained history/page slack row {row} byte {index}"
+                        );
+                    }
+                }
+                check_reference(
+                    &inputs[row],
+                    starts[row],
+                    &old_states[row],
+                    &old[row].query,
+                    &new[row],
+                );
+            }
+        }
+    });
 }

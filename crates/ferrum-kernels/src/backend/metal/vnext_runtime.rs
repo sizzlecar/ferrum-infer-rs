@@ -628,6 +628,26 @@ impl MetalBufferRegion {
             && self.length_bytes == other.length_bytes
             && self.element_type == other.element_type
     }
+
+    /// Compare retained allocation ranges, including overlapping subviews.
+    /// An invalid extent conservatively aliases rather than authorizing reorder.
+    pub(crate) fn overlaps_physical_region(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
+            && match (
+                self.offset_bytes.checked_add(self.length_bytes),
+                other.offset_bytes.checked_add(other.length_bytes),
+            ) {
+                (Some(end), Some(other_end)) => {
+                    self.offset_bytes < other_end && other.offset_bytes < end
+                }
+                _ => true,
+            }
+    }
+
+    /// Local ordering of live owned allocations; never persisted as authority.
+    pub(crate) fn compare_physical_allocation(&self, other: &Self) -> std::cmp::Ordering {
+        Arc::as_ptr(&self.allocation).cmp(&Arc::as_ptr(&other.allocation))
+    }
 }
 
 // Profile-only, lazily allocated, and still bounded. Keep the existing page

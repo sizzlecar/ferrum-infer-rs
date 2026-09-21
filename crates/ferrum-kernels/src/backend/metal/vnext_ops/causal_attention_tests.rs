@@ -15,6 +15,9 @@ mod timing;
 #[path = "causal_attention_int8_tests.rs"]
 mod int8;
 
+#[path = "causal_attention_batched_tests.rs"]
+mod batched_grouped;
+
 const TOKENS: usize = 2;
 const QUERY_HEADS: usize = 2;
 const KV_HEADS: usize = 1;

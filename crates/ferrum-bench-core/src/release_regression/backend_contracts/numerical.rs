@@ -120,6 +120,10 @@ fn names(backend: Backend) -> Vec<String> {
                 "grouped_decode_head256_with_gate_matches_direct_and_cpu_across_page_boundary_on_real_metal",
                 "gqa_tiled_prefill_head256_with_gate_matches_general_and_cpu_across_prefix_page_and_tail_on_real_metal",
             ]),
+            ("causal_attention::conformance_tests::batched_grouped", &[
+                "batched_grouped_decode_matches_serial_bits_cpu_and_guards",
+                "batched_grouped_decode_production_gate_accepts_n32_and_rejects_physical_aliases",
+            ]),
             ("causal_attention::conformance_tests::int8", &[
                 "int8_prepare_matches_reference_rounding_zero_and_subnormal_scales",
                 "int8_prepare_crosses_payload_and_independent_scale_page_frontiers",
@@ -135,6 +139,7 @@ fn names(backend: Backend) -> Vec<String> {
             ("causal_attention::conformance_tests::int8::packed", &[
                 "packed_partial_head_f16_preserves_contiguous_rows_and_independent_histories",
                 "packed_partial_head_int8_preserves_contiguous_rows_and_independent_histories",
+                "packed_grouped_prepare_reordering_preserves_bits_kv_and_guards",
             ]),
             ("causal_attention::shape_tests", &[
                 "int8_state_geometry_counts_independent_pages_and_omits_unused_split_decode_scratch",

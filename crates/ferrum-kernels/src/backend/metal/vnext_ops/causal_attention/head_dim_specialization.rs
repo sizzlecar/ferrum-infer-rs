@@ -34,6 +34,7 @@ impl AttentionHeadDim {
 #[derive(Default)]
 pub(super) struct SpecializedAttentionPipelines {
     pub(super) grouped: Option<(ComputePipelineState, ComputePipelineState)>,
+    pub(super) batched_grouped: Option<(ComputePipelineState, ComputePipelineState)>,
     pub(super) tiled: Option<ComputePipelineState>,
     pub(super) gqa: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -118,6 +119,18 @@ impl SpecializedAttentionPipelines {
             grouped_decode_reduce_threadgroup_memory_bytes(),
             false,
         );
+        let batched_partial = pipeline(
+            "vnext_causal_attention_decode_batched_partial_f16",
+            SIMD_THREADS * TILED_PREFILL_SIMDGROUPS,
+            tile_bytes(1, TILED_PREFILL_KEY_TILE),
+            true,
+        );
+        let batched_reduce = pipeline(
+            "vnext_causal_attention_decode_batched_reduce_f16",
+            SIMD_THREADS,
+            grouped_decode_reduce_threadgroup_memory_bytes(),
+            false,
+        );
         let tiled = pipeline(
             TILED_PREFILL_ATTENTION_KERNEL,
             SIMD_THREADS * TILED_PREFILL_SIMDGROUPS,
@@ -141,6 +154,7 @@ impl SpecializedAttentionPipelines {
             // Keep the two stages paired: unsupported partial or reduction
             // falls back to the original complete dynamic route.
             grouped: partial.zip(reduce),
+            batched_grouped: batched_partial.zip(batched_reduce),
             tiled,
             gqa,
             #[cfg(test)]
@@ -150,7 +164,7 @@ impl SpecializedAttentionPipelines {
 }
 
 impl MetalCausalAttentionPipelines {
-    fn specialization(
+    pub(super) fn specialization(
         &self,
         params: &CausalAttentionParams,
     ) -> Option<&SpecializedAttentionPipelines> {

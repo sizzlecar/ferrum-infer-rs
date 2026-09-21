@@ -1032,6 +1032,36 @@ struct CausalAttentionParams {
     rope_theta: f32,
 }
 
+/// Constant-address-space descriptor shared with VNextGroupedDecodeRow in MSL.
+/// No implicit padding or host/device addresses are copied by set_bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupedDecodeRow {
+    params: CausalAttentionParams,
+    query: u64,
+    query_raw: u64,
+    partials: u64,
+    output: u64,
+    binding: u64,
+}
+const _: () = assert!(std::mem::size_of::<CausalAttentionParams>() == 64);
+const _: () = assert!(std::mem::size_of::<GroupedDecodeRow>() == 104);
+const _: () = assert!(std::mem::align_of::<GroupedDecodeRow>() == 8);
+const GROUPED_BATCH_ROWS: usize = 4096 / std::mem::size_of::<GroupedDecodeRow>();
+
+impl From<&ParticipantLaunch> for GroupedDecodeRow {
+    fn from(launch: &ParticipantLaunch) -> Self {
+        Self {
+            params: launch.params,
+            query: launch.query,
+            query_raw: launch.query_raw,
+            partials: launch.split_decode,
+            output: launch.context,
+            binding: launch.binding_offset,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
@@ -1669,6 +1699,18 @@ fn encode_attention(
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
+    let batched_grouped = packed_enabled
+        && can_batch_grouped_decode(
+            &attention,
+            launches.iter().map(|launch| {
+                (
+                    &launch.params,
+                    &regions
+                        [launch.first_page_region..launch.first_page_region + launch.page_count],
+                    launch.scale_page_count,
+                )
+            }),
+        );
     let grouped_decode_reductions = launches
         .iter()
         .filter(|launch| {
@@ -1705,6 +1747,11 @@ fn encode_attention(
     };
     let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
         .saturating_add(grouped_decode_reductions)
+        .saturating_sub(if batched_grouped {
+            2 * launches.len() as u64 - 2 * launches.len().div_ceil(GROUPED_BATCH_ROWS) as u64
+        } else {
+            0
+        })
         .saturating_add(extra_projection_dispatches);
     let operation_label = if kv_type == ElementType::I8 {
         if hidden_type == ElementType::F32 {
@@ -1761,6 +1808,7 @@ fn encode_attention(
                     shared,
                     packed,
                     &launches,
+                    batched_grouped,
                 );
             } else {
                 for launch in &launches {
@@ -2068,6 +2116,7 @@ fn enqueue_packed_attention(
     shared: SharedRegions,
     packed: &PackedLaunch,
     participants: &[ParticipantLaunch],
+    batched_grouped: bool,
 ) {
     let scratch = &regions[shared.scratch];
     dispatch_input_rms_norm(
@@ -2103,13 +2152,36 @@ fn enqueue_packed_attention(
             shared,
             participant,
         );
-        dispatch_attention(
-            attention,
-            compute_subwork(encoder, "causal_attention.core"),
-            regions,
-            shared,
-            participant,
-        );
+        if !batched_grouped {
+            dispatch_attention(
+                attention,
+                compute_subwork(encoder, "causal_attention.core"),
+                regions,
+                shared,
+                participant,
+            );
+        }
+    }
+    if batched_grouped {
+        for chunk in participants.chunks(GROUPED_BATCH_ROWS) {
+            let mut rows = [GroupedDecodeRow::from(&chunk[0]); GROUPED_BATCH_ROWS];
+            for (row, participant) in rows.iter_mut().zip(chunk) {
+                *row = GroupedDecodeRow::from(participant);
+            }
+            let core = compute_subwork(encoder, "causal_attention.core");
+            for participant in chunk {
+                use_pages(core, regions, participant);
+            }
+            dispatch_batched_grouped_decode(
+                attention,
+                core,
+                regions[shared.scratch].buffer(),
+                regions[shared.scratch].offset_bytes(),
+                regions[shared.binding].buffer(),
+                regions[shared.binding].offset_bytes(),
+                &rows[..chunk.len()],
+            );
+        }
     }
     dispatch_linear(
         linear,
@@ -2137,6 +2209,93 @@ fn compute_subwork<'a>(
 ) -> &'a ComputeCommandEncoderRef {
     encoder.begin_compute_subwork(subwork_id);
     encoder.compute_encoder()
+}
+
+fn can_batch_grouped_decode<'a>(
+    pipelines: &MetalCausalAttentionPipelines,
+    mut participants: impl ExactSizeIterator<
+        Item = (&'a CausalAttentionParams, &'a [MetalBufferRegion], usize),
+    >,
+) -> bool {
+    if participants.len() < 2 {
+        return false;
+    }
+    let first = participants.next().expect("nonempty participants");
+    if !pipelines
+        .specialization(first.0)
+        .is_some_and(|p| p.grouped.is_some() && p.batched_grouped.is_some())
+    {
+        return false;
+    }
+    let mut pages = Vec::new();
+    for (params, participant_pages, scale_page_count) in std::iter::once(first).chain(participants)
+    {
+        if scale_page_count != 0
+            || pipelines.dispatch_plan(params).kind != AttentionDispatchKind::GroupedDecode
+            || params.head_dim != first.0.head_dim
+            || params.query_heads != first.0.query_heads
+            || params.key_value_heads != first.0.key_value_heads
+        {
+            return false;
+        }
+        pages.extend(participant_pages);
+    }
+    // The retained allocation's identity is used only for this local sort.
+    // Reject even same-row overlap: independent pages need no alias exception.
+    // Whole-page exclusion conservatively keeps shared read-only prefixes on
+    // the original route and proves all peer KV read/write ranges disjoint.
+    pages.sort_unstable_by(|left: &&MetalBufferRegion, right| {
+        left.compare_physical_allocation(right)
+            .then_with(|| left.offset_bytes().cmp(&right.offset_bytes()))
+    });
+    !pages
+        .windows(2)
+        .any(|pair| pair[0].overlaps_physical_region(pair[1]))
+}
+#[allow(clippy::too_many_arguments)]
+fn dispatch_batched_grouped_decode(
+    pipelines: &MetalCausalAttentionPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    scratch: &metal::BufferRef,
+    scratch_offset: u64,
+    bindings: &metal::BufferRef,
+    binding_offset: u64,
+    rows: &[GroupedDecodeRow],
+) {
+    assert!(!rows.is_empty() && rows.len() <= GROUPED_BATCH_ROWS);
+    let params = &rows[0].params;
+    let (partial, reduce) = pipelines
+        .specialization(params)
+        .and_then(|p| p.batched_grouped.as_ref())
+        .expect("validated batched grouped pipelines");
+    let plan = grouped_decode_attention_dispatch_plan(params);
+    encoder.set_buffer(0, Some(scratch), scratch_offset);
+    encoder.set_buffer(ATTENTION_PAGE_TABLE_INDEX, Some(bindings), binding_offset);
+    // set_bytes copies this <=4096-byte slice into command-owned storage before
+    // returning, so neither the stack array nor the next chunk can alias it.
+    encoder.set_bytes(4, std::mem::size_of_val(rows) as u64, rows.as_ptr().cast());
+    encoder.set_compute_pipeline_state(partial);
+    encoder.set_threadgroup_memory_length(0, plan.threadgroup_memory_bytes[0]);
+    encoder.set_threadgroup_memory_length(1, plan.threadgroup_memory_bytes[1]);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            rows.iter()
+                .map(|r| grouped_decode_partitions(&r.params))
+                .max()
+                .unwrap(),
+            u64::from(params.key_value_heads),
+            rows.len() as u64,
+        ),
+        MTLSize::new(SIMD_THREADS, TILED_PREFILL_SIMDGROUPS, 1),
+    );
+    encoder.set_compute_pipeline_state(reduce);
+    encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
+    encoder.set_threadgroup_memory_length(1, 0);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(u64::from(params.query_heads), 1, rows.len() as u64),
+        MTLSize::new(SIMD_THREADS, 1, 1),
+    );
+    encoder.set_threadgroup_memory_length(0, 0);
 }
 
 fn dispatch_prepare(

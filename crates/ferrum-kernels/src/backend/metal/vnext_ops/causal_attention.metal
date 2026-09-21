@@ -35,6 +35,19 @@ struct VNextCausalAttentionParams {
     float rope_theta;
 };
 
+// Copied inline by setBytes. These byte offsets address retained scratch and
+// argument-buffer views, never host addresses. Rust asserts the same ABI.
+struct VNextGroupedDecodeRow {
+    VNextCausalAttentionParams params;
+    ulong query;
+    ulong query_raw;
+    ulong partials;
+    ulong output;
+    ulong binding;
+};
+static_assert(sizeof(VNextGroupedDecodeRow) == 104, "grouped row ABI size");
+static_assert(alignof(VNextGroupedDecodeRow) == 8, "grouped row ABI alignment");
+
 // Unbound functions retain the dynamic ABI. Only typed 128/256 pipelines bind
 // this constant; all arithmetic, page addressing and reduction order is shared.
 constant uint VNEXT_ATTENTION_HEAD_DIM [[function_constant(0)]];
@@ -599,18 +612,18 @@ inline uint vnext_grouped_decode_partitions(
 // reduction lane. More partitions expose parallelism in long contexts without
 // launching empty groups for short contexts. The reduction kernel below merges
 // their independent online-softmax states.
-kernel void vnext_causal_attention_decode_grouped_partial_f16(
-    const device half *query [[buffer(0)]],
-    const device half *query_raw [[buffer(1)]],
-    device float *partials [[buffer(2)]],
-    device VNextKvPageTable& page_table [[buffer(3)]],
-    constant VNextCausalAttentionParams& params [[buffer(4)]],
-    threadgroup half *shared_half [[threadgroup(0)]],
-    threadgroup float *shared_float [[threadgroup(1)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simdgroup [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
+inline void vnext_causal_attention_decode_grouped_partial_body(
+    const device half *query,
+    const device half *query_raw,
+    device float *partials,
+    device VNextKvPageTable& page_table,
+    constant VNextCausalAttentionParams& params,
+    threadgroup half *shared_half,
+    threadgroup float *shared_float,
+    uint2 group,
+    uint thread_index,
+    uint simdgroup,
+    uint lane) {
     const uint partition = group.x;
     const uint partitions = vnext_grouped_decode_partitions(params);
     const uint kv_head = group.y;
@@ -919,14 +932,14 @@ kernel void vnext_causal_attention_decode_grouped_partial_f16(
     }
 }
 
-kernel void vnext_causal_attention_decode_grouped_reduce_f16(
-    const device float *partials [[buffer(0)]],
-    const device half *query_raw [[buffer(1)]],
-    device half *output [[buffer(2)]],
-    constant VNextCausalAttentionParams& params [[buffer(4)]],
-    threadgroup float *shared [[threadgroup(0)]],
-    uint query_head [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]) {
+inline void vnext_causal_attention_decode_grouped_reduce_body(
+    const device float *partials,
+    const device half *query_raw,
+    device half *output,
+    constant VNextCausalAttentionParams& params,
+    threadgroup float *shared,
+    uint query_head,
+    uint lane) {
     if (params.tokens != 1u || query_head >= params.query_heads ||
         lane >= VNEXT_SIMD_WIDTH) {
         return;
@@ -980,6 +993,68 @@ kernel void vnext_causal_attention_decode_grouped_reduce_f16(
         output[(ulong)query_head * (ulong)vnext_attention_head_dim(params) +
                (ulong)dim] = half(value);
     }
+}
+
+kernel void vnext_causal_attention_decode_grouped_partial_f16(
+    const device half *query [[buffer(0)]],
+    const device half *query_raw [[buffer(1)]],
+    device float *partials [[buffer(2)]],
+    device VNextKvPageTable& page_table [[buffer(3)]],
+    constant VNextCausalAttentionParams& params [[buffer(4)]],
+    threadgroup half *shared_half [[threadgroup(0)]],
+    threadgroup float *shared_float [[threadgroup(1)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    vnext_causal_attention_decode_grouped_partial_body(query, query_raw, partials,
+        page_table, params, shared_half, shared_float, group, thread_index, simdgroup, lane);
+}
+
+kernel void vnext_causal_attention_decode_grouped_reduce_f16(
+    const device float *partials [[buffer(0)]],
+    const device half *query_raw [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant VNextCausalAttentionParams& params [[buffer(4)]],
+    threadgroup float *shared [[threadgroup(0)]],
+    uint query_head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    vnext_causal_attention_decode_grouped_reduce_body(partials, query_raw, output,
+        params, shared, query_head, lane);
+}
+
+kernel void vnext_causal_attention_decode_batched_partial_f16(
+    device uchar *scratch [[buffer(0)]],
+    device VNextKvPageTable& page_tables [[buffer(3)]],
+    constant VNextGroupedDecodeRow *rows [[buffer(4)]],
+    threadgroup half *shared_half [[threadgroup(0)]],
+    threadgroup float *shared_float [[threadgroup(1)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constant VNextGroupedDecodeRow& row = rows[group.z];
+    device VNextKvPageTable& table = *reinterpret_cast<device VNextKvPageTable *>(
+        reinterpret_cast<device uchar *>(&page_tables) + row.binding);
+    vnext_causal_attention_decode_grouped_partial_body(
+        reinterpret_cast<const device half *>(scratch + row.query),
+        reinterpret_cast<const device half *>(scratch + row.query_raw),
+        reinterpret_cast<device float *>(scratch + row.partials), table, row.params,
+        shared_half, shared_float, group.xy, thread_index, simdgroup, lane);
+}
+
+kernel void vnext_causal_attention_decode_batched_reduce_f16(
+    device uchar *scratch [[buffer(0)]],
+    constant VNextGroupedDecodeRow *rows [[buffer(4)]],
+    threadgroup float *shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constant VNextGroupedDecodeRow& row = rows[group.z];
+    vnext_causal_attention_decode_grouped_reduce_body(
+        reinterpret_cast<const device float *>(scratch + row.partials),
+        reinterpret_cast<const device half *>(scratch + row.query_raw),
+        reinterpret_cast<device half *>(scratch + row.output), row.params,
+        shared, group.x, lane);
 }
 
 // Full-attention prefill hot path for the head_dim=128 and head_dim=256 shapes
