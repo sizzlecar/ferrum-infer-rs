@@ -127,6 +127,133 @@ fn admit_batch_invocation(
 }
 
 #[test]
+fn participant_buffer_validation_rejects_same_fingerprint_capacity_drift_before_encode() {
+    dispatch_with_descriptor_switch_during_first_participant(
+        BufferDescriptorRuntimeSwitch::DifferentCapacity,
+    );
+}
+
+#[test]
+fn participant_buffer_validation_accepts_equal_descriptor_at_a_different_address() {
+    dispatch_with_descriptor_switch_during_first_participant(
+        BufferDescriptorRuntimeSwitch::EqualCopy,
+    );
+}
+
+fn dispatch_with_descriptor_switch_during_first_participant(switch: BufferDescriptorRuntimeSwitch) {
+    let Fixture {
+        registry,
+        resolved,
+        plan,
+        runtime,
+        runtime_trace,
+        provider_trace,
+        plan_resources,
+        ..
+    } = fixture();
+    let resources = (0..2)
+        .map(|index| {
+            logical_resources(
+                &plan_resources,
+                &format!("run.device-operation.descriptor-switch.{index}"),
+                &format!("request.device-operation.descriptor-switch.{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = resources
+        .iter()
+        .map(|resources| resources.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = plan_resources.create_execution_lane().unwrap();
+    let active_bindings = batch
+        .sessions()
+        .iter()
+        .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+        .collect::<Vec<_>>();
+    let step = admit_batch_step(&batch, &lane);
+    let node = &plan.payload().nodes()[0];
+    let invocation = admit_batch_invocation(&plan_resources, &step, node.id());
+    let identities = step
+        .participant_frames()
+        .zip(&active_bindings)
+        .enumerate()
+        .map(|(index, (frame, active))| {
+            operation_identity(
+                &plan,
+                active,
+                frame.frame_id(),
+                NodeInvocationId::try_from(index as u64 + 1).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let provider = registry.bind(&resolved, node.id()).unwrap();
+    let identity = OperationDispatch::bind_batch_identity(
+        &resolved,
+        identities,
+        &active_bindings,
+        &invocation,
+        &lane,
+    )
+    .unwrap();
+    let reaper = CompletionReaper::new();
+
+    // Arm only after admission and identity binding. This fixture has no state
+    // initialization, so the resource event occurs while building the first
+    // participant's views, after invocation-wide descriptor validation. The
+    // second participant must inspect the runtime's newly returned object.
+    runtime_trace.lock().unwrap().switch_descriptor_on_buffer = Some(switch);
+    let outcome = OperationDispatch::encode_and_submit(
+        &provider,
+        &resolved,
+        &identity,
+        &active_bindings,
+        invocation,
+        &lane,
+        &reaper,
+    );
+    assert_eq!(
+        runtime_trace.lock().unwrap().switched_descriptor_on_buffer,
+        Some(switch)
+    );
+    assert!(!std::ptr::eq(runtime.descriptor(), &runtime.descriptor));
+    assert_eq!(
+        runtime.descriptor().runtime_implementation_fingerprint,
+        runtime.descriptor.runtime_implementation_fingerprint
+    );
+    match switch {
+        BufferDescriptorRuntimeSwitch::DifferentCapacity => {
+            assert_ne!(
+                runtime.descriptor().total_memory_bytes,
+                runtime.descriptor.total_memory_bytes
+            );
+            assert!(matches!(outcome, Err(OperationDispatchError::Contract(_))));
+            assert_eq!(provider_trace.lock().unwrap().encode_calls, 0);
+            assert_eq!(runtime_trace.lock().unwrap().submit_calls, 0);
+        }
+        BufferDescriptorRuntimeSwitch::EqualCopy => {
+            assert_eq!(runtime.descriptor(), &runtime.descriptor);
+            let handle = outcome.unwrap();
+            assert_eq!(provider_trace.lock().unwrap().encode_calls, 1);
+            assert_eq!(provider_trace.lock().unwrap().last_participant_count, 2);
+            assert_eq!(runtime_trace.lock().unwrap().submit_calls, 1);
+            assert!(matches!(
+                handle.wait().unwrap(),
+                CompletionObservation::Terminal(_)
+            ));
+        }
+    }
+    runtime
+        .use_different_capacity_descriptor
+        .store(false, Ordering::Release);
+    runtime
+        .use_equal_descriptor_copy
+        .store(false, Ordering::Release);
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+}
+
+#[test]
 fn thirty_two_participant_dispatch_is_one_physical_submission() {
     let Fixture {
         registry,

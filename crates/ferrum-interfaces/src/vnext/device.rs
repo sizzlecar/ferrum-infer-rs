@@ -17,6 +17,12 @@ use super::{
     VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
+mod submission_readback;
+pub(crate) use submission_readback::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget};
+pub use submission_readback::{
+    DeviceReadbackStagingLease, DeviceSubmissionReadbackRequest, PreparedDeviceSubmissionReadback,
+};
+
 /// Backend-neutral device capability for an explicit cold-path reusable
 /// executable preparation lifecycle.
 pub const DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID: &str = "capability.device.reusable_execution.v1";
@@ -3603,6 +3609,19 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// Prepares an optional submission-scoped snapshot. The command is appended
+    /// after compute and before the submission fence; its reader is called only
+    /// at that exact successful terminal, while core still owns all source slots.
+    /// Both command and reader must retain the staging lease through any DMA.
+    /// Returning `None` preserves the ordinary synchronous readback path.
+    fn prepare_submission_readback(
+        &self,
+        _request: DeviceSubmissionReadbackRequest<'_, Self::Buffer>,
+    ) -> Option<Result<PreparedDeviceSubmissionReadback<Self::Command, Self::Error>, Self::Error>>
+    {
+        None
+    }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError>;
 }

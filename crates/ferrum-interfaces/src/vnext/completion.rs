@@ -25,6 +25,10 @@ use super::{
     ReusableExecutionCatalogLifetime, StreamState, VNextError,
 };
 
+use super::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget, DeviceSubmissionReadbackRequest};
+mod submission_readback;
+use submission_readback::PreparedCompletionReadbacks;
+
 mod readback_collection;
 pub use readback_collection::*;
 mod completed_wave;
@@ -119,6 +123,7 @@ pub struct ExecutionLane<R: DeviceRuntime> {
     fail_closed: AtomicBool,
     reusable_execution_epoch: AtomicU64,
     state: Mutex<ExecutionLaneState<R::Stream>>,
+    readback_staging: DeviceReadbackStagingBudget,
 }
 
 impl<R: DeviceRuntime> fmt::Debug for ExecutionLane<R> {
@@ -163,11 +168,36 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 in_flight: 0,
                 fail_closed: false,
             }),
+            readback_staging: DeviceReadbackStagingBudget::default(),
         }))
     }
 
     pub fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    /// Sets an explicit host staging payload limit before work starts on this lane.
+    /// Zero selects synchronous readback. Outstanding DMA/snapshot leases must
+    /// be released before the budget can change, even if their fence completed.
+    pub fn configure_submission_readback_staging(
+        &self,
+        maximum_bytes: u64,
+    ) -> Result<(), VNextError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("execution lane state is poisoned"))?;
+        if state.in_flight != 0
+            || state.fail_closed
+            || self.fail_closed.load(Ordering::Acquire)
+            || !self.current_descriptor_matches_snapshot()
+            || self.runtime.stream_state(&state.stream) != StreamState::Ready
+        {
+            return Err(invalid_completion(
+                "staging configuration requires a quiescent reusable lane",
+            ));
+        }
+        self.readback_staging.configure(maximum_bytes)
     }
 
     pub const fn id(&self) -> ExecutionLaneId {
@@ -1969,6 +1999,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             record_receipt: Some(record_receipt),
             submission_may_have_happened: false,
             finished: false,
+            readbacks: None,
         })
     }
 
@@ -3481,6 +3512,7 @@ impl<R: DeviceRuntime> IndeterminateSubmissionHandle<R> {
 pub struct CompletionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     receipt: SubmittedOperationReceipt,
+    readbacks: Option<Arc<PreparedCompletionReadbacks<R::Error>>>,
 }
 
 impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
@@ -3488,6 +3520,7 @@ impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
         Self {
             reaper: Weak::clone(&self.reaper),
             receipt: self.receipt.clone(),
+            readbacks: self.readbacks.clone(),
         }
     }
 }
@@ -3542,10 +3575,14 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
         &self,
         request: CompletionReadbackBatchRequest,
     ) -> Result<CompletionReadbackBatchObservation, VNextError> {
-        self.reaper
+        let reaper = self
+            .reaper
             .upgrade()
-            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
-            .wait_bound_with_readbacks(self.slot_id(), request)
+            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?;
+        if let Some(readbacks) = &self.readbacks {
+            return reaper.wait_bound_with_submission_readbacks(self.slot_id(), request, readbacks);
+        }
+        reaper.wait_bound_with_readbacks(self.slot_id(), request)
     }
 
     pub fn wait_with_readback_collection(
@@ -3570,6 +3607,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     record_receipt: Option<SubmittedOperationReceipt>,
     submission_may_have_happened: bool,
     finished: bool,
+    readbacks: Option<Arc<PreparedCompletionReadbacks<R::Error>>>,
 }
 
 impl<R: DeviceRuntime> CompletionReservation<R> {
@@ -3719,6 +3757,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         let handle = CompletionHandle {
             reaper: Arc::downgrade(&self.reaper),
             receipt,
+            readbacks: self.readbacks.take(),
         };
         match transition {
             Ok(()) => Ok(handle),

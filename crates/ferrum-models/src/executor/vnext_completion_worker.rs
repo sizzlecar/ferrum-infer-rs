@@ -3,7 +3,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -117,6 +117,76 @@ impl fmt::Display for VNextCompletionWorkerError {
 
 impl std::error::Error for VNextCompletionWorkerError {}
 
+/// Reserved queue capacity. Holding this before device submission lets the
+/// caller hand cleanup to the worker synchronously after submission succeeds.
+/// The permit borrows its worker, so dropping an idle worker cannot join a
+/// thread whose channel is still kept open by an escaped reservation.
+#[must_use = "a reservation must be submitted or dropped to release queue capacity"]
+pub(super) struct VNextCompletionReservation<'a> {
+    permit: mpsc::Permit<'a, VNextCompletionTask>,
+    counters: Arc<VNextCompletionWorkerCounters>,
+    reservation_wait: Duration,
+}
+
+/// Owns result observation, not the worker task. Dropping this ticket leaves
+/// the accepted task and its device-resource retention on the worker.
+#[must_use = "dropping a completion ticket abandons its result, not device cleanup"]
+pub(super) struct VNextCompletionTicket<T> {
+    receiver: oneshot::Receiver<Result<T, VNextCompletionWorkerError>>,
+}
+
+impl<T> VNextCompletionTicket<T> {
+    pub(super) async fn wait(self) -> Result<T, VNextCompletionWorkerError> {
+        self.receiver
+            .await
+            .map_err(|_| VNextCompletionWorkerError::ResultChannelClosed)?
+    }
+}
+
+impl VNextCompletionReservation<'_> {
+    pub(super) fn submit<T, F>(
+        self,
+        kind: VNextCompletionTaskKind,
+        task: F,
+    ) -> VNextCompletionTicket<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let Self {
+            permit,
+            counters,
+            reservation_wait,
+        } = self;
+        let class = counters.task_class(kind);
+        class.reservation_wait.record(reservation_wait);
+        class.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
+        counters.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
+        counters.pending_tasks.fetch_add(1, Ordering::AcqRel);
+        let guard = VNextCompletionTaskGuard {
+            counters: Arc::clone(&counters),
+        };
+        let (result_sender, receiver) = oneshot::channel();
+        let queued_at = Instant::now();
+        let job = Box::new(move || {
+            let class = counters.task_class(kind);
+            class.queued_wait.record(queued_at.elapsed());
+            let task_started = Instant::now();
+            let result = catch_unwind(AssertUnwindSafe(task)).map_err(|_| {
+                counters.panicked_tasks.fetch_add(1, Ordering::Relaxed);
+                VNextCompletionWorkerError::TaskPanicked
+            });
+            class.task_run.record(task_started.elapsed());
+            class.completed_tasks.fetch_add(1, Ordering::Relaxed);
+            counters.completed_tasks.fetch_add(1, Ordering::Relaxed);
+            drop(guard);
+            let _ = result_sender.send(result);
+        }) as VNextCompletionTask;
+        permit.send(job);
+        VNextCompletionTicket { receiver }
+    }
+}
+
 /// One executor-owned blocking boundary for device fences and readbacks.
 /// Requests enqueue through a bounded async channel; no request or token creates
 /// an OS thread, and dropping an awaiting request does not cancel device cleanup.
@@ -159,15 +229,9 @@ impl VNextCompletionWorker {
         })
     }
 
-    pub(super) async fn execute<T, F>(
+    pub(super) async fn reserve(
         &self,
-        kind: VNextCompletionTaskKind,
-        task: F,
-    ) -> Result<T, VNextCompletionWorkerError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
+    ) -> Result<VNextCompletionReservation<'_>, VNextCompletionWorkerError> {
         let sender = self
             .sender
             .as_ref()
@@ -177,37 +241,23 @@ impl VNextCompletionWorker {
             .reserve()
             .await
             .map_err(|_| VNextCompletionWorkerError::QueueClosed)?;
-        let class = self.counters.task_class(kind);
-        class.reservation_wait.record(reservation_started.elapsed());
-        class.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .scheduled_tasks
-            .fetch_add(1, Ordering::Relaxed);
-        self.counters.pending_tasks.fetch_add(1, Ordering::AcqRel);
-        let guard = VNextCompletionTaskGuard {
+        Ok(VNextCompletionReservation {
+            permit,
             counters: Arc::clone(&self.counters),
-        };
-        let counters = Arc::clone(&self.counters);
-        let (result_sender, result_receiver) = oneshot::channel();
-        let queued_at = Instant::now();
-        let job = Box::new(move || {
-            let class = counters.task_class(kind);
-            class.queued_wait.record(queued_at.elapsed());
-            let task_started = Instant::now();
-            let result = catch_unwind(AssertUnwindSafe(task)).map_err(|_| {
-                counters.panicked_tasks.fetch_add(1, Ordering::Relaxed);
-                VNextCompletionWorkerError::TaskPanicked
-            });
-            class.task_run.record(task_started.elapsed());
-            class.completed_tasks.fetch_add(1, Ordering::Relaxed);
-            counters.completed_tasks.fetch_add(1, Ordering::Relaxed);
-            drop(guard);
-            let _ = result_sender.send(result);
-        }) as VNextCompletionTask;
-        permit.send(job);
-        result_receiver
-            .await
-            .map_err(|_| VNextCompletionWorkerError::ResultChannelClosed)?
+            reservation_wait: reservation_started.elapsed(),
+        })
+    }
+
+    pub(super) async fn execute<T, F>(
+        &self,
+        kind: VNextCompletionTaskKind,
+        task: F,
+    ) -> Result<T, VNextCompletionWorkerError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.reserve().await?.submit(kind, task).wait().await
     }
 
     fn pending_tasks(&self) -> usize {
@@ -265,11 +315,118 @@ impl Drop for VNextCompletionWorker {
 }
 
 #[cfg(test)]
+#[path = "vnext_completion_worker/retained_step_tests.rs"]
+mod retained_step_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{VNextCompletionTaskKind, VNextCompletionWorker};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{VNextCompletionTaskKind, VNextCompletionWorker, VNextCompletionWorkerError};
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::Poll;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn reservation_is_bounded_and_drop_releases_capacity_without_a_task() {
+        let worker = VNextCompletionWorker::new().unwrap();
+        let reservation = worker.reserve().await.unwrap();
+        let mut blocked = Box::pin(worker.reserve());
+        let polled = std::future::poll_fn(|cx| Poll::Ready(blocked.as_mut().poll(cx))).await;
+        assert!(polled.is_pending());
+        assert_eq!(worker.pending_tasks(), 0);
+        assert_eq!(worker.metrics_snapshot()["scheduled_tasks"], 0);
+        drop(reservation);
+
+        let reservation = blocked.await.unwrap();
+        // Classification happens at synchronous submission, so an already
+        // reserved wave can schedule its recovery without reserving again.
+        let ticket = reservation.submit(VNextCompletionTaskKind::IndeterminateRecovery, || 17);
+        assert_eq!(ticket.wait().await.unwrap(), 17);
+        let metrics = worker.metrics_snapshot();
+        assert_eq!(metrics["scheduled_tasks"], 1);
+        assert_eq!(
+            metrics["task_classes"]["wave_readback"]["scheduled_tasks"],
+            0
+        );
+        assert_eq!(
+            metrics["task_classes"]["indeterminate_recovery"]["scheduled_tasks"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_ticket_and_worker_keep_task_ownership_until_terminal_event() {
+        struct RetainedStep {
+            terminal: Arc<AtomicBool>,
+            released: Option<tokio::sync::oneshot::Sender<bool>>,
+        }
+        impl Drop for RetainedStep {
+            fn drop(&mut self) {
+                let _ = self
+                    .released
+                    .take()
+                    .unwrap()
+                    .send(self.terminal.load(Ordering::Acquire));
+            }
+        }
+
+        let worker = VNextCompletionWorker::new().unwrap();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let (released_sender, mut released_receiver) = tokio::sync::oneshot::channel();
+        let retained = RetainedStep {
+            terminal: Arc::clone(&terminal),
+            released: Some(released_sender),
+        };
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (finish_sender, finish_receiver) = std::sync::mpsc::channel();
+        let ticket = worker.reserve().await.unwrap().submit(
+            VNextCompletionTaskKind::WaveReadback,
+            move || {
+                let _ = started_sender.send(());
+                finish_receiver.recv().unwrap();
+                terminal.store(true, Ordering::Release);
+                retained
+            },
+        );
+        started_receiver.await.unwrap();
+        drop(ticket);
+        drop(worker);
+        assert!(matches!(
+            released_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        finish_sender.send(()).unwrap();
+        assert!(released_receiver.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ticket_reports_task_panic_and_worker_accepts_the_next_task() {
+        let worker = VNextCompletionWorker::new().unwrap();
+        let ticket =
+            worker
+                .reserve()
+                .await
+                .unwrap()
+                .submit(VNextCompletionTaskKind::WaveReadback, || {
+                    panic!("injected completion task panic");
+                });
+        assert_eq!(
+            ticket.wait().await,
+            Err(VNextCompletionWorkerError::TaskPanicked)
+        );
+        assert_eq!(
+            worker
+                .execute(VNextCompletionTaskKind::PostSubmitDrain, || 23)
+                .await
+                .unwrap(),
+            23
+        );
+        let metrics = worker.metrics_snapshot();
+        assert_eq!(metrics["pending_tasks"], 0);
+        assert_eq!(metrics["completed_tasks"], 2);
+        assert_eq!(metrics["panicked_tasks"], 1);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_is_single_threaded_bounded_and_cancellation_safe() {

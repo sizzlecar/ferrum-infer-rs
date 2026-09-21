@@ -34,18 +34,22 @@ use ferrum_interfaces::vnext::{
     DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGapReason,
     DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, RetainedHostMemoryRegion, StaticWeightTransformPlan,
-    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionReadbackRequest, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    PreparedDeviceSubmissionReadback, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
+    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
+    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::AttentionExecutionPolicy;
 
 use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 use super::vnext_tool_correlation;
+
+mod submission_readback;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -4279,6 +4283,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 ))
             }
         }
+    }
+
+    fn prepare_submission_readback(
+        &self,
+        request: DeviceSubmissionReadbackRequest<'_, Self::Buffer>,
+    ) -> Option<Result<PreparedDeviceSubmissionReadback<Self::Command, Self::Error>, Self::Error>>
+    {
+        Some(submission_readback::prepare(self, request))
     }
 
     fn readback(

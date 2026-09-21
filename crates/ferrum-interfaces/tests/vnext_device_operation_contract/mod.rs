@@ -1419,7 +1419,15 @@ pub(crate) struct RuntimeTrace {
     pub(crate) readback_fill_index: usize,
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
+    pub(crate) waited_fences: Vec<u64>,
+    pub(crate) submission_readback_enabled: bool,
+    pub(crate) submission_readback_fails: bool,
+    pub(crate) submission_readback_ranges: Vec<(CopyRegion, HostTransferLayout)>,
+    pub(crate) submission_readback_reads: u64,
+    pub(crate) submission_readback_live: u64,
     pub(crate) tamper_buffer_descriptor: bool,
+    pub(crate) switch_descriptor_on_buffer: Option<BufferDescriptorRuntimeSwitch>,
+    pub(crate) switched_descriptor_on_buffer: Option<BufferDescriptorRuntimeSwitch>,
     pub(crate) drift_on_submit: bool,
     pub(crate) next_fence: u64,
     pub(crate) submit_behavior: SubmitBehavior,
@@ -1437,10 +1445,32 @@ pub(crate) struct RuntimeTrace {
     pub(crate) imported_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferDescriptorRuntimeSwitch {
+    DifferentCapacity,
+    EqualCopy,
+}
+
+struct TestSubmissionReadbackOwnership {
+    _retention: DeviceBufferRetention,
+    _staging: DeviceReadbackStagingLease,
+    trace: Arc<Mutex<RuntimeTrace>>,
+}
+
+impl Drop for TestSubmissionReadbackOwnership {
+    fn drop(&mut self) {
+        self.trace.lock().unwrap().submission_readback_live -= 1;
+    }
+}
+
 pub(crate) struct TestRuntime {
     pub(crate) descriptor: DeviceDescriptor,
     pub(crate) alternate_descriptor: DeviceDescriptor,
+    pub(crate) different_capacity_descriptor: DeviceDescriptor,
+    pub(crate) equal_descriptor_copy: DeviceDescriptor,
     pub(crate) use_alternate_descriptor: AtomicBool,
+    pub(crate) use_different_capacity_descriptor: AtomicBool,
+    pub(crate) use_equal_descriptor_copy: AtomicBool,
     pub(crate) descriptor_reads_until_drift: AtomicU64,
     pub(crate) trace: Arc<Mutex<RuntimeTrace>>,
 }
@@ -1657,6 +1687,13 @@ impl DeviceRuntime for TestRuntime {
         }
         if self.use_alternate_descriptor.load(Ordering::Acquire) {
             &self.alternate_descriptor
+        } else if self
+            .use_different_capacity_descriptor
+            .load(Ordering::Acquire)
+        {
+            &self.different_capacity_descriptor
+        } else if self.use_equal_descriptor_copy.load(Ordering::Acquire) {
+            &self.equal_descriptor_copy
         } else {
             &self.descriptor
         }
@@ -1682,7 +1719,19 @@ impl DeviceRuntime for TestRuntime {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
         let mut descriptor = buffer.descriptor.clone();
-        if self.trace.lock().unwrap().tamper_buffer_descriptor {
+        let mut trace = self.trace.lock().unwrap();
+        if let Some(switch) = trace.switch_descriptor_on_buffer.take() {
+            match switch {
+                BufferDescriptorRuntimeSwitch::DifferentCapacity => self
+                    .use_different_capacity_descriptor
+                    .store(true, Ordering::Release),
+                BufferDescriptorRuntimeSwitch::EqualCopy => self
+                    .use_equal_descriptor_copy
+                    .store(true, Ordering::Release),
+            }
+            trace.switched_descriptor_on_buffer = Some(switch);
+        }
+        if trace.tamper_buffer_descriptor {
             descriptor.size_bytes += 1;
         }
         descriptor
@@ -1974,6 +2023,7 @@ impl DeviceRuntime for TestRuntime {
         let (behavior, block) = {
             let mut trace = self.trace.lock().unwrap();
             trace.wait_fence_calls += 1;
+            trace.waited_fences.push(fence.0);
             let behavior = trace
                 .fence_behaviors
                 .get(&fence.0)
@@ -2005,6 +2055,56 @@ impl DeviceRuntime for TestRuntime {
         } else {
             Ok(())
         }
+    }
+
+    fn prepare_submission_readback(
+        &self,
+        request: DeviceSubmissionReadbackRequest<'_, Self::Buffer>,
+    ) -> Option<Result<PreparedDeviceSubmissionReadback<Self::Command, Self::Error>, Self::Error>>
+    {
+        if !self.trace.lock().unwrap().submission_readback_enabled {
+            return None;
+        }
+        let (source, region, layout, retention, staging) = request.into_parts();
+        assert_eq!(source.descriptor.element_type, layout.element_type());
+        assert!(
+            region.source_offset_bytes() + region.length_bytes() <= source.descriptor.size_bytes
+        );
+        assert!(
+            region.destination_offset_bytes() + region.length_bytes() <= layout.byte_len().unwrap()
+        );
+        assert!(layout.byte_len().unwrap() <= staging.bytes());
+        {
+            let mut trace = self.trace.lock().unwrap();
+            trace.submission_readback_ranges.push((region, layout));
+            trace.submission_readback_live += 1;
+        }
+        let ownership = TestSubmissionReadbackOwnership {
+            _retention: retention,
+            _staging: staging,
+            trace: Arc::clone(&self.trace),
+        };
+        Some(Ok(PreparedDeviceSubmissionReadback::new(None, move || {
+            let _ownership = &ownership;
+            {
+                let mut trace = ownership.trace.lock().unwrap();
+                trace.submission_readback_reads += 1;
+                if trace.submission_readback_fails {
+                    return Err(TestRuntimeError("submission-readback-failed"));
+                }
+            }
+            // The byte-address pattern makes physical row/offset translation
+            // observable without adding a second allocator to this fixture.
+            let mut output = vec![0; layout.byte_len().unwrap() as usize];
+            let start = region.destination_offset_bytes() as usize;
+            for (index, byte) in output[start..start + region.length_bytes() as usize]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = (region.source_offset_bytes() + index as u64) as u8;
+            }
+            Ok(output)
+        })))
     }
 
     fn readback(

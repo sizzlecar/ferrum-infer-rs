@@ -1966,6 +1966,12 @@ impl OperationDispatch {
         }
         drop(provider_stage);
 
+        // These copies belong to this submission and must remain outside any
+        // cached compute executable. The exact parent fence covers their DMA.
+        completion
+            .prepare_submission_readbacks(&mut commands)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+
         let lane_stage = SubmissionWaveDispatchStageTimer::start(
             timing_sink,
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,

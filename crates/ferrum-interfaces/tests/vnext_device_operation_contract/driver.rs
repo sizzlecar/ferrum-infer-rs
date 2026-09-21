@@ -136,11 +136,18 @@ pub(crate) fn runtime(catalog: &CapabilityCatalog) -> (Arc<TestRuntime>, Arc<Mut
     let descriptor = catalog.device().clone();
     let mut alternate_descriptor = descriptor.clone();
     alternate_descriptor.runtime_implementation_fingerprint = sha('f');
+    let mut different_capacity_descriptor = descriptor.clone();
+    different_capacity_descriptor.total_memory_bytes += 1;
+    let equal_descriptor_copy = descriptor.clone();
     (
         Arc::new(TestRuntime {
             descriptor,
             alternate_descriptor,
+            different_capacity_descriptor,
+            equal_descriptor_copy,
             use_alternate_descriptor: AtomicBool::new(false),
+            use_different_capacity_descriptor: AtomicBool::new(false),
+            use_equal_descriptor_copy: AtomicBool::new(false),
             descriptor_reads_until_drift: AtomicU64::new(0),
             trace: Arc::clone(&trace),
         }),

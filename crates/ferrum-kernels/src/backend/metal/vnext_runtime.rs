@@ -26,13 +26,14 @@ use ferrum_interfaces::vnext::{
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
     DeviceNativeWorkAttribution, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
-    WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
-    HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionReadbackRequest, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    PreparedDeviceSubmissionReadback, RetainedHostMemoryRegion, StaticWeightImportSession,
+    StreamState, VNextError, WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
@@ -49,6 +50,7 @@ use super::st;
 
 mod counter_readback;
 use counter_readback::CounterReadbackStats;
+mod submission_readback;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -2623,6 +2625,14 @@ impl DeviceRuntime for MetalDeviceRuntime {
             return Err(failure);
         }
         Ok(())
+    }
+
+    fn prepare_submission_readback(
+        &self,
+        request: DeviceSubmissionReadbackRequest<'_, Self::Buffer>,
+    ) -> Option<Result<PreparedDeviceSubmissionReadback<Self::Command, Self::Error>, Self::Error>>
+    {
+        Some(submission_readback::prepare(self, request))
     }
 
     fn readback(

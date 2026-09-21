@@ -991,6 +991,7 @@ where
                 batch_invocation_id,
                 fingerprint: wave_fingerprint,
                 purpose,
+                submission_readbacks: None,
             },
         ))
     }
@@ -1690,12 +1691,35 @@ where
     batch_invocation_id: BatchInvocationId,
     fingerprint: String,
     purpose: SubmissionWavePurpose,
+    submission_readbacks: Option<crate::vnext::CompletionReadbackBatchRequest>,
 }
 
 impl<R> PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
+    /// Requests a bounded snapshot at this wave's own completion boundary.
+    /// Unsupported backends or exhausted staging capacity retain ordinary
+    /// terminal readback. This does not grant an additional resource lifetime.
+    pub fn with_submission_readbacks(
+        mut self,
+        request: crate::vnext::CompletionReadbackBatchRequest,
+    ) -> Result<Self, VNextError> {
+        if self.purpose != SubmissionWavePurpose::FullPlan || self.submission_readbacks.is_some() {
+            return Err(invalid_resource(
+                "submission readbacks require an unbound full-plan wave",
+            ));
+        }
+        self.submission_readbacks = Some(request);
+        Ok(self)
+    }
+
+    pub(crate) fn submission_readbacks(
+        &self,
+    ) -> Option<&crate::vnext::CompletionReadbackBatchRequest> {
+        self.submission_readbacks.as_ref()
+    }
+
     pub fn batch_step_id(&self) -> BatchStepId {
         self.step.batch_step_id()
     }

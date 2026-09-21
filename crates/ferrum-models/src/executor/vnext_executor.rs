@@ -56,7 +56,10 @@ use super::{
         VNextCheckpointProductOutputMode, VNextCheckpointProductOutputRecord,
         VNextCheckpointSelection, VNextTeacherForcedDecision,
     },
-    vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
+    vnext_completion_worker::{
+        VNextCompletionReservation, VNextCompletionTaskKind, VNextCompletionTicket,
+        VNextCompletionWorker, VNextCompletionWorkerError,
+    },
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
 };
 
@@ -2261,7 +2264,7 @@ impl VNextWaveTimingMetrics {
                 "binding_validate_coalesce includes per-node binding validation and the final exact-layout coverage and backend coalescing pass; child timers include elapsed work before an error but skip unwinding",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
-                "completion_round_trip includes async queue wait, device fence wait, and readback",
+                "completion_round_trip includes post-submit worker queue wait, device fence wait, and readback; pre-submit queue reservation wait is recorded separately by completion_worker task_classes.reservation_wait",
                 "these host intervals are not kernel or device-busy time"
             ],
         })
@@ -3536,6 +3539,46 @@ struct VNextSequence<R: DeviceRuntime> {
 struct PreparedVNextPrefill<R: DeviceRuntime> {
     step: Arc<StepResourceLease<R>>,
     wave: PreparedStepSubmissionWave<R>,
+}
+
+type VNextWaveReadbackResult<R> = (
+    std::result::Result<CompletionReadbackBatchObservation, VNextError>,
+    Arc<StepResourceLease<R>>,
+);
+
+/// The accepted worker task retains the exact Step and reaper until its fence
+/// observation finishes. Abandoning this result never retires the Step early.
+#[must_use = "pending readback owns observation; its worker continues cleanup if dropped"]
+struct PendingVNextWaveReadback<R: DeviceRuntime> {
+    ticket: VNextCompletionTicket<VNextWaveReadbackResult<R>>,
+}
+
+impl<R: DeviceRuntime> PendingVNextWaveReadback<R> {
+    fn submit(
+        reservation: VNextCompletionReservation<'_>,
+        completion: CompletionHandle<R>,
+        readbacks: VNextTerminalReadbacks,
+        step: Arc<StepResourceLease<R>>,
+        reaper: Arc<CompletionReaper<R>>,
+    ) -> Self {
+        let ticket = reservation.submit(VNextCompletionTaskKind::WaveReadback, move || {
+            let observation = match readbacks {
+                VNextTerminalReadbacks::Batch(request) => completion.wait_with_readbacks(request),
+                VNextTerminalReadbacks::Collection(request) => {
+                    completion.wait_with_readback_collection(request)
+                }
+            };
+            drop(reaper);
+            (observation, step)
+        });
+        Self { ticket }
+    }
+
+    async fn wait(
+        self,
+    ) -> std::result::Result<VNextWaveReadbackResult<R>, VNextCompletionWorkerError> {
+        self.ticket.wait().await
+    }
 }
 
 struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
@@ -4990,6 +5033,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let lane = ExecutionLane::create(Arc::clone(&runtime)).map_err(|error| {
             FerrumError::device(format!("vNext execution lane creation failed: {error:?}"))
         })?;
+        let readback_staging_bytes =
+            u64::from(config.runtime_policy.memory().maximum_active_sequences)
+                .checked_mul(2)
+                .and_then(|rows| rows.checked_mul(ElementType::U32.size_bytes()))
+                .ok_or_else(|| {
+                    FerrumError::config("vNext selected-token readback staging capacity overflows")
+                })?;
+        lane.configure_submission_readback_staging(readback_staging_bytes)
+            .map_err(|error| {
+                FerrumError::device(format!(
+                    "vNext selected-token readback staging configuration failed: {error}"
+                ))
+            })?;
         let submission_wave_identity =
             OperationDispatch::compile_submission_wave_identity(&resolved_plan, &lane).map_err(
                 |error| {
@@ -8026,6 +8082,37 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
+        let wave = match (&readbacks, output_mode) {
+            (VNextTerminalReadbacks::Batch(request), VNextProductOutputMode::GreedyToken) => {
+                match wave.with_submission_readbacks(request.clone()) {
+                    Ok(wave) => wave,
+                    Err(error) => {
+                        return Err(self.abort_unsubmitted_step(
+                            step,
+                            FerrumError::backend(format!(
+                                "vNext selected-token submission readback binding failed: {error}"
+                            )),
+                        ));
+                    }
+                }
+            }
+            _ => wave,
+        };
+        // Reserve the bounded cleanup queue before device submission. Once
+        // dispatch accepts work, handing its ownership to that worker is
+        // synchronous and introduces no intervening cancellation point.
+        let completion_reservation = match self.completion_worker.reserve().await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(wave);
+                return Err(self.abort_unsubmitted_step(
+                    step,
+                    FerrumError::backend(format!(
+                        "vNext completion queue reservation failed: {error}"
+                    )),
+                ));
+            }
+        };
         let (mut token_mask_residency, dispatch) = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
@@ -8070,18 +8157,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 attribution,
             } => (completion, attribution),
             DispatchOutcome::QuiescentFailure(message) => {
+                drop(completion_reservation);
                 token_mask_residency.invalidate_before_slot_release();
                 return Err(self.abort_step(step, message).await);
             }
             DispatchOutcome::SubmissionIndeterminate { message, recovery } => {
                 let reaper = Arc::clone(&self.reaper);
-                let recovered = self
-                    .completion_worker
-                    .execute(VNextCompletionTaskKind::IndeterminateRecovery, move || {
+                let (recovered, step) = completion_reservation
+                    .submit(VNextCompletionTaskKind::IndeterminateRecovery, move || {
                         let recovered = recovery.recover_by_draining_lane();
                         drop(reaper);
-                        recovered
+                        (recovered, step)
                     })
+                    .wait()
                     .await
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match recovered {
@@ -8104,13 +8192,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 completion,
             } => {
                 let reaper = Arc::clone(&self.reaper);
-                let observed = self
-                    .completion_worker
-                    .execute(VNextCompletionTaskKind::PostSubmitDrain, move || {
+                let (observed, step) = completion_reservation
+                    .submit(VNextCompletionTaskKind::PostSubmitDrain, move || {
                         let observed = completion.wait();
                         drop(reaper);
-                        observed
+                        (observed, step)
                     })
+                    .wait()
                     .await
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match observed {
@@ -8184,29 +8272,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
-        let reaper = Arc::clone(&self.reaper);
-        let observation = {
+        let (observation, step) = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
             let _phase_timing = phase_timing.completion_round_trip.start();
-            self.completion_worker
-                .execute(VNextCompletionTaskKind::WaveReadback, move || {
-                    let observation = match readbacks {
-                        VNextTerminalReadbacks::Batch(request) => {
-                            completion.wait_with_readbacks(request)
-                        }
-                        VNextTerminalReadbacks::Collection(request) => {
-                            completion.wait_with_readback_collection(request)
-                        }
-                    };
-                    drop(reaper);
-                    observation
-                })
-                .await
-                .map_err(|error| {
-                    FerrumError::backend(format!("vNext completion task failed: {error}"))
-                })?
-                .map_err(|error| FerrumError::backend(error.to_string()))?
+            let pending = PendingVNextWaveReadback::submit(
+                completion_reservation,
+                completion,
+                readbacks,
+                step,
+                Arc::clone(&self.reaper),
+            );
+            pending.wait().await.map_err(|error| {
+                FerrumError::backend(format!("vNext completion task failed: {error}"))
+            })?
         };
+        let observation = observation.map_err(|error| FerrumError::backend(error.to_string()))?;
         let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
         let _phase_postprocess_timing = phase_timing.host_postprocess.start();
         let receipt = match observation {

@@ -227,7 +227,7 @@ fn names(backend: Backend) -> Vec<String> {
             ]),
         ],
     };
-    modules
+    let mut tests: Vec<_> = modules
         .iter()
         .flat_map(|(module, names)| {
             names.iter().map(move |name| {
@@ -237,7 +237,19 @@ fn names(backend: Backend) -> Vec<String> {
                 )
             })
         })
-        .collect()
+        .collect();
+    if backend == Backend::Cuda {
+        // Runtime snapshot tests live outside vnext_ops. Select both range
+        // boundaries and the ignored real-device parent/child fence oracle.
+        tests.extend([
+            "tests::staging_lease_covers_the_host_layout_including_destination_offset",
+            "tests::readback_requires_whole_elements_and_bounded_source_and_destination",
+            "gpu_tests::staged_u32_snapshot_reads_parent_while_same_lane_child_is_pending_on_cuda",
+        ].into_iter().map(|name| {
+            format!("backend::cuda::vnext_runtime::submission_readback::{name}")
+        }));
+    }
+    tests
 }
 
 pub(super) fn groups(backend: Backend) -> Vec<ContractGroup> {

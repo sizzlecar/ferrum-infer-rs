@@ -4,6 +4,9 @@ mod vnext_device_operation_wave_contract;
 #[path = "vnext_device_operation_wave_contract/reusable_binding_projection.rs"]
 mod reusable_binding_projection;
 
+#[path = "vnext_device_operation_wave_contract/submission_readback.rs"]
+mod submission_readback;
+
 use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 
