@@ -74,6 +74,9 @@ use ferrum_interfaces::vnext::{
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
+use ferrum_interfaces::vnext::{
+    dense_swiglu_q8_f32scale_contract, DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+};
 use native_io::TokenPrecision;
 use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
 
@@ -118,6 +121,8 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/q8_swiglu.rs").as_bytes(),
+        include_str!("vnext_ops/native_blocks/q8_f32scale.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/hadamard.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
@@ -209,6 +214,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RMS_NORM_F32_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
+        DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
         DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
         CONSTANT_SCALE_F16_CAPABILITY_ID,
         LOGIT_SOFTCAP_F16_CAPABILITY_ID,
@@ -435,7 +441,7 @@ fn cuda_operation_contracts(
 pub fn cuda_vnext_operation_registry(
     runtime: &CudaDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
-    let contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
+    let mut contracts = cuda_operation_contracts(runtime.attention_execution_policy())?;
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaTokenEmbeddingProvider::new_f32(runtime)?),
@@ -523,6 +529,18 @@ pub fn cuda_vnext_operation_registry(
         ));
         providers
     };
+    let mut providers = providers;
+    if runtime
+        .descriptor()
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID)
+    {
+        contracts.push(Box::new(
+            dense_swiglu_q8_f32scale_contract().map_err(contract_error)?,
+        ));
+        providers.push(Box::new(transformer::CudaQ8SwiGluProvider::new(runtime)?));
+    }
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
 

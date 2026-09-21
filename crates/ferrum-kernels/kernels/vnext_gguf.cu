@@ -181,8 +181,9 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
-// Diagnostic-only Q4_K/Q5_K/Q6_K x Q8 activation prototypes. No production provider loads
-// these exports. Quantizing activations changes the numeric policy: this is not
+// Q4_K/Q5_K/Q6_K x Q8 projections for the explicit Q8/F32scale policy.
+// The strict native provider does not select these exports. Quantizing activations
+// changes the numeric policy: this is not
 // a strict-equivalent implementation of native_linear or llama's Q8_1 format.
 //
 // Pack ABI: x[rows][inputs] F16; scales[rows][inputs/32] F32;
@@ -374,7 +375,7 @@ PROTOTYPE_QK_Q8_LINEAR(q6k, 14, lane_tiled_f16, 8)
 // warps share a K256 decoded weight tile, each computing 16 outputs x 8 tokens.
 // Integer MMA is restricted to a single K32 scale group; its C registers are
 // reset before every instruction, then rescaled in F32. This export is not
-// loaded by a production provider and requires SM80+ to execute.
+// selected by the strict provider and requires SM80+ to execute.
 template<unsigned Format>
 __device__ void prototype_qk_q8_mma(
     const float* scales, const unsigned* qwords, const byte* w, half* y,

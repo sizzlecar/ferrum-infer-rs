@@ -1,6 +1,6 @@
 # 数值执行策略
 
-本文说明下一版开发接口；v0.8.9 发布资产尚不提供 `--numerical-profile`。
+本文说明开发分支的数值执行接口；具体 profile 的可用性由构建及设备能力决定。
 
 数值 profile 规定模型中间结果、运算和状态的精度合同。例如，Q4 GGUF
 描述权重的物理编码，推理过程仍可使用 FP16、FP32 或混合精度。选择 profile
@@ -38,6 +38,25 @@ Qwen3.5 声明 `qwen3_5.f16` 和 `qwen3_5.f32-master`。F32-master 保持混合�
 `Auto` 保留既有、已验证的编码与 recurrent 参数 ABI 组合。声明两个 profile
 不意味着所有 GGUF、SafeTensors、Metal 和 CUDA 组合都可用；新增 GGUF + F16
 组合在独立数值验收前不会进入默认候选。其他已迁移 family 先保留原有的单一方案。
+
+CUDA SM80 及以上设备可显式选择 `qwen3_5.f32-master.q8-swiglu`。
+它仅对 FFN 中原生 GGUF Q4_K、Q5_K、Q6_K 权重的矩阵乘法量化激活：
+每 32 个 FP16 输入使用一个 FP32 scale，转换为有符号 INT8，整数点积后以
+FP32 缩放和累加。gate/up、SiLU 结果及 FFN 输出仍有 FP16 舍入边界；
+其他权重格式和 attention、输出层沿用原运算，主干保持 FP32。
+激活量化会改变数值结果，独立算子正确性不等于模型质量或服务性能提升。
+
+此 profile 不进入 `Auto`。它要求原生权重、negative-rate recurrent ABI、
+至少一个满足 K256 分组的 FFN Q4_K/Q5_K/Q6_K 权重，并仅支持非 MoE、
+无 Hadamard 旋转和 FP16 KV 的组合。`run` 和 `serve` 使用同一选择：
+
+```bash
+ferrum run qwen3.5:4b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.q8-swiglu
+ferrum serve qwen3.5:4b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.q8-swiglu
+```
+
+激活打包临时空间进入正常显存规划，gate/up 共用一次打包，down 复用空间后
+重新打包。无对应设备实现或容量不足时，显式选择按既有规划规则拒绝执行。
 
 ## 来源、计划和缓存
 

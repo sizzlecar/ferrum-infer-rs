@@ -170,6 +170,10 @@ fn names(backend: Backend) -> Vec<String> {
             ("native_blocks::tests::q4k", &[
                 "q4k_specialization_preserves_generic_bits_and_f64_oracle_on_cuda",
             ]),
+            ("native_blocks::tests::q4k_q8", &[
+                "q4k_q8_prototype_pack_and_matmul_match_policy_oracle_on_cuda",
+                "q56k_q8_prototype_pack_and_matmul_match_policy_oracle_on_cuda",
+            ]),
             ("native_blocks::tests::prefill_gemm", &[
                 "shared_prefill_gemm_preserves_f32_math_and_buffer_extents_on_cuda",
                 "shared_prefill_gemm_production_dispatch_preserves_partition_offsets_on_cuda",
@@ -194,6 +198,9 @@ fn names(backend: Backend) -> Vec<String> {
                 "native_swiglu_mixed_matrices_match_stage_oracles_on_cuda",
                 "native_swiglu_packed_rows_match_independent_source_slices_on_cuda",
                 "native_swiglu_scratch_accounts_only_for_bounded_activations",
+            ]),
+            ("transformer::native_swiglu::tests::q8_tests", &[
+                "native_q8_swiglu_stages_and_replay_preserve_f16_policy_on_cuda",
             ]),
             ("transformer::precision::tests", &[
                 "master_rms_norm_matches_f64_with_half_weights_on_cuda",

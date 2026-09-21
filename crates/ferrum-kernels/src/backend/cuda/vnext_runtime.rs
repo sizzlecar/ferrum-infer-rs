@@ -2116,7 +2116,7 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
-    pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+    pub fn new(mut config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime requires a resolved attention execution policy",
@@ -2124,6 +2124,20 @@ impl CudaDeviceRuntime {
         }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
+        // The installed bundle can contain SM80 MMA exports even on an older
+        // device. Its runtime descriptor must advertise only executable ops.
+        if config.capabilities.iter().any(|capability| {
+            capability.as_str() == ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
+        }) {
+            let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
+            if major < 8 {
+                config.capabilities.retain(|capability| {
+                    capability.as_str()
+                        != ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
+                });
+            }
+        }
         // vNext owns all cross-stream ordering through explicit commands and
         // fences. Per-slice implicit events would create a second authority.
         unsafe {

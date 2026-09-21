@@ -423,3 +423,90 @@ fn wire_rebuilds_selected_profile_and_rejects_forged_arithmetic_or_old_semantics
     )
     .is_err());
 }
+
+fn arithmetic_profile() -> NumericalExecutionProfile {
+    Family {
+        family_id: id("family.numerical-fixture"),
+        program_calls: Arc::default(),
+        corrupt_physical_identity: false,
+    }
+    .profile("fixture.f16", ElementType::F16)
+}
+
+#[test]
+fn numerical_arithmetic_accepts_i8_f32_without_other_integer_combinations() {
+    let mut profile = arithmetic_profile();
+    let prior_types = [
+        None,
+        Some(ElementType::F16),
+        Some(ElementType::Bf16),
+        Some(ElementType::F32),
+    ];
+    // Copy/index and mixed floating operations retain every previously valid
+    // combination, including operations with only one arithmetic stage.
+    for multiplication in prior_types {
+        for accumulation in prior_types {
+            profile.operations[0].multiplication_type = multiplication;
+            profile.operations[0].accumulation_type = accumulation;
+            profile.validate().unwrap();
+        }
+    }
+    profile.operations[0].operation_id = id(DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID);
+    profile.operations[0].multiplication_type = Some(ElementType::I8);
+    profile.operations[0].accumulation_type = Some(ElementType::F32);
+    profile.validate().unwrap();
+    assert_eq!(profile.activation_type().unwrap(), ElementType::F16);
+    let mixed_fingerprint = profile.fingerprint().unwrap();
+    let decoded: NumericalExecutionProfile =
+        serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+    assert_eq!(decoded, profile);
+    assert_eq!(decoded.fingerprint().unwrap(), mixed_fingerprint);
+    profile.operations[0].multiplication_type = Some(ElementType::F32);
+    assert_ne!(profile.fingerprint().unwrap(), mixed_fingerprint);
+
+    for (multiplication, accumulation) in [
+        (Some(ElementType::I8), None),
+        (Some(ElementType::I8), Some(ElementType::F16)),
+        (Some(ElementType::I8), Some(ElementType::Bf16)),
+        (Some(ElementType::I8), Some(ElementType::I8)),
+        (Some(ElementType::I8), Some(ElementType::I32)),
+        (Some(ElementType::U8), Some(ElementType::F32)),
+        (Some(ElementType::U32), Some(ElementType::F32)),
+        (Some(ElementType::I32), Some(ElementType::F32)),
+        (Some(ElementType::Bool), Some(ElementType::F32)),
+        (Some(ElementType::F32), Some(ElementType::I32)),
+        (None, Some(ElementType::I8)),
+    ] {
+        profile.operations[0].multiplication_type = multiplication;
+        profile.operations[0].accumulation_type = accumulation;
+        assert!(
+            profile.validate().is_err(),
+            "{multiplication:?}/{accumulation:?}"
+        );
+    }
+    profile.operations[0].multiplication_type = Some(ElementType::I8);
+    profile.operations[0].accumulation_type = Some(ElementType::F32);
+    profile
+        .boundaries
+        .insert(profile.primary_activation.clone(), ElementType::I8);
+    assert!(
+        profile.validate().is_err(),
+        "quantized dots do not change the primary storage boundary"
+    );
+}
+
+#[test]
+fn floating_profile_wire_and_fingerprint_remain_compatible() {
+    let mut profile = arithmetic_profile();
+    profile.states.clear();
+    // A pre-existing floating profile's canonical wire, deliberately without
+    // new fields. This checks serialized ABI and its fingerprint together.
+    const LEGACY_WIRE: &[u8] = br#"{"id":"fixture.f16","version":{"major":1,"minor":0},"family_id":"family.numerical-fixture","primary_activation":"value.output","boundaries":{"value.output":"f16"},"states":[],"kv_storage":[],"operations":[{"operation_id":"operation.fixture.f16","version":{"major":1,"minor":0},"multiplication_type":"f32","accumulation_type":"f32"}]}"#;
+    let decoded: NumericalExecutionProfile = serde_json::from_slice(LEGACY_WIRE).unwrap();
+    assert_eq!(decoded, profile);
+    assert_eq!(serde_json::to_vec(&profile).unwrap(), LEGACY_WIRE);
+    assert_eq!(
+        profile.fingerprint().unwrap(),
+        format!("{:x}", Sha256::digest(LEGACY_WIRE))
+    );
+}

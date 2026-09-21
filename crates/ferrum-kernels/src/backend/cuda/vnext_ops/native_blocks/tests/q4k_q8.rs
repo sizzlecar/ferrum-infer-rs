@@ -1,5 +1,5 @@
-//! Ignored tests for explicitly approximate, test-only Q4_K/Q5_K/Q6_K × Q8 prototypes.
-//! No production selector or numerical profile uses these entry points.
+//! Ignored primitive tests for the explicitly approximate Q4_K/Q5_K/Q6_K × Q8 policy.
+//! Model composition, output quality and service performance are separate checks.
 
 use super::*;
 use crate::gguf_blocks::q4k_q8_reference::{

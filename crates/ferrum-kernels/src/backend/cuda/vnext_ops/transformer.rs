@@ -88,6 +88,7 @@ mod native_linear;
 mod native_matrix;
 mod native_swiglu;
 mod precision;
+mod q8_swiglu;
 #[cfg(test)]
 mod test_support;
 
@@ -107,6 +108,7 @@ pub(super) use moe_weights::{
     COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID,
     GPTQ_MARLIN_CAPABILITY_ID,
 };
+pub(super) use q8_swiglu::CudaQ8SwiGluProvider;
 
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_linear.f16.cublas";

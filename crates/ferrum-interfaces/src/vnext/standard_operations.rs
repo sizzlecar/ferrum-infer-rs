@@ -37,6 +37,9 @@ pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
+pub const DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID: &str = "operation.dense_swiglu.q8-f32scale";
+pub const DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID: &str =
+    "capability.operation.dense_swiglu.q8-f32scale";
 pub const DENSE_GEGLU_TANH_OPERATION_ID: &str = "operation.dense_geglu_tanh";
 pub const DENSE_GEGLU_TANH_F16_CAPABILITY_ID: &str = "capability.operation.dense_geglu_tanh.f16";
 pub const CONSTANT_SCALE_OPERATION_ID: &str = "operation.constant_scale";
@@ -682,6 +685,59 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
         provider: provider_requirement(DENSE_SWIGLU_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Dense SwiGLU with an independent F32-scale Q8 activation policy, version 1.0.
+///
+/// Each projection leaf backed by native GGUF Q4_K, Q5_K or Q6_K blocks uses
+/// the following arithmetic; other physical weight formats retain the strict
+/// arithmetic of [`dense_swiglu_contract`]. Logical tensor signatures and
+/// resource requirements stay unchanged. Providers must estimate and retain
+/// the bounded scratch for quantized activations as well as the usual SwiGLU
+/// intermediates.
+///
+/// For each consecutive group of 32 F16 projection inputs, convert to F32 and
+/// compute `delta = RN_F32(max(abs(x)) / 127)`. Quantize
+/// `q = clamp(round_away(RN_F32(x / delta)), -127, 127)` into signed I8.
+/// An all-zero group has positive-zero delta and all-zero q. If any input in
+/// the group is nonfinite, its delta is NaN and all q are zero. This grouping
+/// applies again to the F16 SwiGLU intermediate consumed by the down projection.
+///
+/// Integer dots are transient I32 and are converted to F32 before rescaling.
+/// The following formulas define the independent mathematical policy reference.
+/// Q4_K/Q5_K first form F32 coefficients
+/// `a = RN_F32(weight_delta * group_scale)` and
+/// `b = RN_F32(weight_min_delta * group_min)`, then contribute
+/// `delta * (a * sum(qw*q) - b * sum(q))`; the minimum correction uses the
+/// quantized integer sum, never the original floating input sum. Q6_K forms
+/// two F32 coefficients from its signed K16 scales and contributes
+/// `delta * (a0 * sum_0(qw*q) + a1 * sum_1(qw*q))`. Both K16 halves share the
+/// same K32 activation delta. These rescale expressions have separate F32
+/// multiplication and addition/subtraction rounding points.
+/// Implementations may rescale I32 dot4 partials before a floating reduction,
+/// or rescale complete K32 dots (two K16 dots for Q6_K). Their F32 reduction
+/// order can differ; its rounding error is checked against this same policy
+/// reference, without changing the strict operation or its tolerance.
+///
+/// Across-group accumulation and SiLU arithmetic remain F32. Gate/up
+/// projection results, the SiLU-times-up intermediate, and final output keep
+/// the existing F16 storage/rounding boundaries. These internal stages define
+/// the mixed arithmetic denoted by I8 multiplication with F32 accumulation.
+///
+/// The oracle is this independent Q8 policy, not equivalence to the strict
+/// operation. The existing F16 reference tolerance is retained against that
+/// policy for normal finite cases; it is not a universal error bound, a model
+/// quality guarantee, or permission to relax the strict operation's tolerance.
+pub fn dense_swiglu_q8_f32scale_contract() -> Result<StandardOperationContract, VNextError> {
+    let mut descriptor = dense_swiglu_contract()?.descriptor;
+    descriptor.id = OperationId::new(DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID)?;
+    descriptor.version = ContractVersion::new(1, 0);
+    descriptor.provider = provider_requirement(
+        DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
     descriptor.validate()?;
     Ok(StandardOperationContract { descriptor })
 }
@@ -2149,6 +2205,56 @@ mod tests {
         assert_eq!(
             contracts[3].descriptor().outputs[0].alias(),
             &AliasPolicy::MayAlias { tensor_index: 0 }
+        );
+    }
+
+    #[test]
+    fn dense_swiglu_q8_policy_has_independent_identity_and_preserves_f16_boundaries() {
+        let strict = dense_swiglu_contract().unwrap();
+        let strict_descriptor = strict.descriptor();
+        let strict_fingerprint = strict_descriptor.fingerprint().unwrap();
+        let quantized = dense_swiglu_q8_f32scale_contract().unwrap();
+        let descriptor = quantized.descriptor();
+        assert_eq!(
+            descriptor.id.as_str(),
+            DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_ne!(descriptor.id, strict_descriptor.id);
+        assert_ne!(descriptor.fingerprint().unwrap(), strict_fingerprint);
+        assert_eq!(
+            descriptor.provider.required_capabilities,
+            BTreeSet::from([CapabilityId::new(DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID).unwrap()])
+        );
+        assert!(descriptor
+            .provider
+            .required_capabilities
+            .is_disjoint(&strict_descriptor.provider.required_capabilities));
+        assert_eq!(descriptor.inputs, strict_descriptor.inputs);
+        assert_eq!(descriptor.outputs, strict_descriptor.outputs);
+        assert_eq!(descriptor.attributes, strict_descriptor.attributes);
+        assert_eq!(descriptor.resources, strict_descriptor.resources);
+        // A tolerance against the new policy does not refer to the old strict
+        // operation or loosen the tolerance of either descriptor.
+        assert_eq!(descriptor.oracle, f16_reference_tolerance().unwrap());
+        assert_eq!(descriptor.oracle, strict_descriptor.oracle);
+        quantized
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+        let decoded: OperationDescriptor =
+            serde_json::from_slice(&serde_json::to_vec(descriptor).unwrap()).unwrap();
+        assert_eq!(decoded, *descriptor);
+        assert_eq!(
+            decoded.fingerprint().unwrap(),
+            descriptor.fingerprint().unwrap()
+        );
+        assert_eq!(
+            dense_swiglu_contract()
+                .unwrap()
+                .descriptor()
+                .fingerprint()
+                .unwrap(),
+            strict_fingerprint
         );
     }
 

@@ -18,6 +18,13 @@ pub use kv_storage::KvStateStorage;
 /// points. Arithmetic types are explicit here; copying/indexing operations have
 /// no multiplication or accumulation. A fused operation's internal conversions
 /// remain part of its versioned operation contract.
+///
+/// `I8` multiplication with `F32` accumulation denotes quantized dot-product
+/// operands and persistent accumulation after rescaling. The operation version
+/// must define transient I32 group dots, F32 scales/rescaling, any fused floating
+/// operations such as SiLU, and storage rounding boundaries. It does not imply
+/// that every internal arithmetic instruction uses I8, or permit I8 storage for
+/// the profile's primary activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NumericalOperationContract {
@@ -86,16 +93,16 @@ impl NumericalExecutionProfile {
         }
         let mut operation_ids = BTreeSet::new();
         for operation in &self.operations {
+            let arithmetic_valid = matches!(
+                (operation.multiplication_type, operation.accumulation_type),
+                (Some(ElementType::I8), Some(ElementType::F32))
+            ) || (operation.multiplication_type.is_none_or(floating)
+                && operation.accumulation_type.is_none_or(floating));
             if operation.version.major == 0
                 || !operation_ids.insert(&operation.operation_id)
-                || operation
-                    .multiplication_type
-                    .is_some_and(|dtype| !floating(dtype))
-                || operation
-                    .accumulation_type
-                    .is_some_and(|dtype| !floating(dtype))
+                || !arithmetic_valid
             {
-                return Err(invalid(&self.family_id, "operation contracts need unique identities, valid versions and floating-point arithmetic types"));
+                return Err(invalid(&self.family_id, "operation contracts need unique identities, valid versions and floating-point/absent arithmetic types or I8 multiplication with F32 accumulation"));
             }
         }
         let mut state_ids = BTreeSet::new();

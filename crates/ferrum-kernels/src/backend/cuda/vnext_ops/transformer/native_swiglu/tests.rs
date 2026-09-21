@@ -5,6 +5,9 @@ use ferrum_interfaces::vnext::WeightId;
 use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 
+#[path = "q8_tests.rs"]
+mod q8_tests;
+
 #[test]
 fn native_swiglu_scratch_accounts_only_for_bounded_activations() {
     let layout = ScratchLayout::new(3, 257).unwrap();
