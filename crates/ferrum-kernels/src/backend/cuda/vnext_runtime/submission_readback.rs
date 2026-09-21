@@ -1,41 +1,73 @@
 use super::*;
-use ferrum_interfaces::vnext::DeviceReadbackStagingLease;
+use ferrum_interfaces::vnext::{
+    DeviceReadbackStagingLease, DeviceReadbackStagingStorage, DeviceReadbackStagingStorageError,
+};
+use std::ops::Deref;
+
+type PinnedHostStorage = Mutex<PinnedHostSlice<u8>>;
 
 /// Both the submission command and its terminal reader retain this snapshot.
-/// Drop pinned storage first: its own event guard must finish any outstanding
-/// DMA before the source retention and staging-budget lease can be released.
+/// Source retention is submission-local; the cached host allocation contains no
+/// source/Step ownership. All command/reader owners must release their leases
+/// before a later submission can reuse the host slot.
 struct SubmissionReadback {
-    snapshot: PinnedReadbackSnapshot,
+    snapshot: PinnedReadbackSnapshot<DeviceReadbackStagingStorage<PinnedHostStorage>>,
     _staging: DeviceReadbackStagingLease,
 }
 
 /// The CUDA snapshot mechanism is independent of core's staging-budget lease.
 /// Production retains both together in `SubmissionReadback` until terminal read.
-struct PinnedReadbackSnapshot {
-    host: Mutex<PinnedHostSlice<u8>>,
+struct PinnedReadbackSnapshot<H> {
+    host: H,
     source: CudaBufferRegion,
+    output_bytes: usize,
 }
 
-impl PinnedReadbackSnapshot {
-    fn new(source: CudaBufferRegion, output_bytes: usize) -> Result<Self, CudaDeviceRuntimeError> {
-        let mut host = unsafe {
-            source
-                ._allocation
-                ._base
-                .context()
-                .alloc_pinned::<u8>(output_bytes)
+fn allocate_host_storage(
+    source: &CudaBufferRegion,
+    capacity_bytes: usize,
+) -> Result<PinnedHostStorage, CudaDeviceRuntimeError> {
+    let host = unsafe {
+        source
+            ._allocation
+            ._base
+            .context()
+            .alloc_pinned::<u8>(capacity_bytes)
+    }
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver("submission readback host allocation", error)
+    })?;
+    Ok(Mutex::new(host))
+}
+
+impl<H: Deref<Target = PinnedHostStorage>> PinnedReadbackSnapshot<H> {
+    fn new(
+        source: CudaBufferRegion,
+        host: H,
+        output_bytes: usize,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        {
+            let mut allocation = host
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if allocation.len() < output_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "cached submission readback storage is smaller than its output layout",
+                ));
+            }
+            // A cached slot is exclusively leased. Clear all prior payload and
+            // padding, observing only this allocation's earlier DMA event.
+            allocation
+                .as_mut_slice()
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("submission readback host initialization", error)
+                })?
+                .fill(0);
         }
-        .map_err(|error| {
-            CudaDeviceRuntimeError::driver("submission readback host allocation", error)
-        })?;
-        host.as_mut_slice()
-            .map_err(|error| {
-                CudaDeviceRuntimeError::driver("submission readback host initialization", error)
-            })?
-            .fill(0);
         Ok(Self {
-            host: Mutex::new(host),
+            host,
             source,
+            output_bytes,
         })
     }
 
@@ -68,9 +100,11 @@ impl PinnedReadbackSnapshot {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Core invokes this only for the successful exact parent terminal.
         // Observe this allocation's earlier event, never the whole stream.
-        host.as_slice().map(<[u8]>::to_vec).map_err(|error| {
-            CudaDeviceRuntimeError::driver("submission readback host observation", error)
-        })
+        host.as_slice()
+            .map(|bytes| bytes[..self.output_bytes].to_vec())
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("submission readback host observation", error)
+            })
     }
 }
 
@@ -89,8 +123,15 @@ pub(super) fn prepare(
         .checked_add(region.length_bytes())
         .ok_or_else(|| CudaDeviceRuntimeError::contract("submission readback source overflow"))?;
     let source = source.retained_region(region.source_offset_bytes()..source_end, retention)?;
+    let capacity_bytes = checked_usize(staging.bytes(), "submission readback staging capacity")?;
+    let host = staging
+        .get_or_try_init_storage(|| allocate_host_storage(&source, capacity_bytes))
+        .map_err(|error| match error {
+            DeviceReadbackStagingStorageError::Initialization(error) => error,
+            error => CudaDeviceRuntimeError::contract(error.to_string()),
+        })?;
     let snapshot = Arc::new(SubmissionReadback {
-        snapshot: PinnedReadbackSnapshot::new(source, output_bytes)?,
+        snapshot: PinnedReadbackSnapshot::new(source, host, output_bytes)?,
         _staging: staging,
     });
     let destination_start = checked_usize(

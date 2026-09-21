@@ -20,7 +20,8 @@ use super::{
 mod submission_readback;
 pub(crate) use submission_readback::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget};
 pub use submission_readback::{
-    DeviceReadbackStagingLease, DeviceSubmissionReadbackRequest, PreparedDeviceSubmissionReadback,
+    DeviceReadbackStagingLease, DeviceReadbackStagingStorage, DeviceReadbackStagingStorageError,
+    DeviceSubmissionReadbackRequest, PreparedDeviceSubmissionReadback,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable

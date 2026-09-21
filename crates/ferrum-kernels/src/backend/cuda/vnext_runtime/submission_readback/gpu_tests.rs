@@ -4,6 +4,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+type TestSnapshot = PinnedReadbackSnapshot<Arc<PinnedHostStorage>>;
+
 struct CallbackGate {
     entered: Sender<()>,
     release: Receiver<()>,
@@ -26,7 +28,7 @@ struct DrainGate {
     stream: Arc<CudaStream>,
     reader: Option<JoinHandle<()>>,
     // Keep the exact DMA source and pinned destination alive through cleanup.
-    _snapshot: Arc<PinnedReadbackSnapshot>,
+    _snapshot: Arc<TestSnapshot>,
 }
 
 impl DrainGate {
@@ -120,7 +122,10 @@ fn staged_u32_snapshot_reads_parent_while_same_lane_child_is_pending_on_cuda() {
     // Core's typed request/budget/terminal tests cover authority. This test uses
     // the exact private DMA/read helper called by production prepare(), with a
     // real retained allocation and nonzero source/destination offsets.
-    let snapshot = Arc::new(PinnedReadbackSnapshot::new(region.clone(), 16).unwrap());
+    let host_storage = Arc::new(allocate_host_storage(&region, 16).unwrap());
+    let snapshot = Arc::new(
+        PinnedReadbackSnapshot::new(region.clone(), Arc::clone(&host_storage), 16).unwrap(),
+    );
     let parent_write = write_words(region.clone(), 0x12, 0x34);
     stream.state.begin_submission().unwrap();
     parent_write.enqueue(&stream.stream, &stream.blas).unwrap();
@@ -192,5 +197,19 @@ fn staged_u32_snapshot_reads_parent_while_same_lane_child_is_pending_on_cuda() {
     assert_eq!(
         device,
         [0, 0, 0, 0, 0x56, 0x56, 0x56, 0x56, 0x78, 0x78, 0x78, 0x78, 0, 0, 0, 0]
+    );
+    // Reuse the exact pinned allocation after every prior snapshot/DMA owner
+    // is released. Core separately proves the lease-holding typed handle cannot
+    // make a slot idle early; this exercises the same reset/copy/read helper.
+    drop(cleanup);
+    drop(snapshot);
+    let reused = PinnedReadbackSnapshot::new(region.clone(), host_storage, 16).unwrap();
+    stream.state.begin_submission().unwrap();
+    reused.enqueue(&stream.stream, 8..16).unwrap();
+    let next = record_fence(&stream, Vec::new());
+    assert!(runtime.wait_fence(&next).unwrap().terminal().is_succeeded());
+    assert_eq!(
+        reused.read().unwrap(),
+        [0, 0, 0, 0, 0, 0, 0, 0, 0x56, 0x56, 0x56, 0x56, 0x78, 0x78, 0x78, 0x78]
     );
 }
