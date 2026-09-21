@@ -1482,6 +1482,20 @@ where
     pub(in crate::vnext::resource) fn try_reclaim_one_idle_lane_slot(
         &self,
     ) -> Result<bool, VNextError> {
+        self.try_reclaim_idle_lane_slot(None)
+    }
+
+    pub(in crate::vnext::resource) fn try_reclaim_one_idle_lane_slot_in_pool(
+        &self,
+        pool_id: &DynamicBackingPoolId,
+    ) -> Result<bool, VNextError> {
+        self.try_reclaim_idle_lane_slot(Some(pool_id))
+    }
+
+    fn try_reclaim_idle_lane_slot(
+        &self,
+        required_pool: Option<&DynamicBackingPoolId>,
+    ) -> Result<bool, VNextError> {
         if self.try_reclaim_expired_lane_slots()? {
             return Ok(true);
         }
@@ -1503,7 +1517,14 @@ where
                     entry
                         .slots
                         .values()
-                        .filter(|slot| !slot.in_use)
+                        .filter(|slot| {
+                            !slot.in_use
+                                && required_pool.is_none_or(|pool_id| {
+                                    slot.authorities
+                                        .iter()
+                                        .any(|authority| authority.evidence.pool_id() == pool_id)
+                                })
+                        })
                         .map(move |slot| LaneStableArenaEvictionCandidate {
                             key: key.clone(),
                             slot_id: slot.slot_id,

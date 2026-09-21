@@ -30,6 +30,9 @@ mod pool_resident_reclaim_tests;
 #[path = "reusable_pressure_tests.rs"]
 mod reusable_pressure_tests;
 
+#[path = "backing_scope_regression_tests.rs"]
+mod backing_scope_regression_tests;
+
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
 
@@ -511,6 +514,7 @@ impl DeviceRuntime for TestRuntime {
 enum TestDemand {
     Fixed,
     Tokens,
+    ActualSequences(u32),
 }
 
 #[derive(Clone)]
@@ -587,13 +591,18 @@ fn pool_catalog_with_options(
     let pool_id: DynamicBackingPoolId = serde_json::from_value(json!(pool_id_text)).unwrap();
     let mut descriptors = Vec::new();
     let mut resource_ids = Vec::new();
+    let maximum_instances = match demand {
+        TestDemand::ActualSequences(maximum_sequences) => maximum_sequences,
+        TestDemand::Fixed | TestDemand::Tokens => 64,
+    };
     for index in 0..resource_count {
         let resource_id = format!("resource/dynamic-{layout_digit}-{index:02}");
         resource_ids.push(ResourceId::new(resource_id.clone()).unwrap());
         let demand = match demand {
-            TestDemand::Fixed => json!({"fixed": {"bytes": 64}}),
-            TestDemand::Tokens => {
-                json!({"tokens": {"bytes_per_token": 64, "maximum_tokens": 4}})
+            TestDemand::Fixed => DynamicResourceDemand::fixed(64).unwrap(),
+            TestDemand::Tokens => DynamicResourceDemand::tokens(64, 4).unwrap(),
+            TestDemand::ActualSequences(maximum_sequences) => {
+                DynamicResourceDemand::actual_sequences(64, maximum_sequences).unwrap()
             }
         };
         descriptors.push(
@@ -616,7 +625,7 @@ fn pool_catalog_with_options(
                 },
                 "pool_id": pool_id_text,
                 "initialization": initialization,
-                "theoretical_maximum_instances": 64
+                "theoretical_maximum_instances": maximum_instances
             }))
             .unwrap(),
         );
@@ -633,9 +642,11 @@ fn pool_catalog_with_options(
     let theoretical_per_descriptor = match demand {
         TestDemand::Fixed => 64_u128,
         TestDemand::Tokens => 256_u128,
+        TestDemand::ActualSequences(_) => 64_u128,
     };
-    let theoretical_ceiling =
-        theoretical_per_descriptor * 64 * u128::try_from(resource_count).unwrap();
+    let theoretical_ceiling = theoretical_per_descriptor
+        * u128::from(maximum_instances)
+        * u128::try_from(resource_count).unwrap();
     let step_resource_slots = if lifetime == AllocationLifetime::Step {
         if share_step_slot {
             vec![serde_json::json!({

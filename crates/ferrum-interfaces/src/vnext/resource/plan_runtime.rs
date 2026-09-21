@@ -417,15 +417,23 @@ where
             .resources
             .maintenance_controller
             .maintain_for_live_deferred(&self.evidence)?;
-        if matches!(
-            &outcome,
-            DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
-        ) && self
-            .resources
-            .dynamic_pools
-            .try_reclaim_one_idle_lane_slot()?
-        {
-            return self.retry_admission();
+        if let DynamicDeferredMaintenanceOutcome::WaitForRelease { pressure, .. } = &outcome {
+            // Releasing another pool cannot make room beneath this pool's ceiling.
+            // Preserve the bounded retry for an idle slot that owns backing in
+            // the blocking pool. Device-wide pressure can still reclaim any pool.
+            let reclaimed = match pressure.pool_resident() {
+                Some(pressure) => self
+                    .resources
+                    .dynamic_pools
+                    .try_reclaim_one_idle_lane_slot_in_pool(pressure.pool_id())?,
+                None => self
+                    .resources
+                    .dynamic_pools
+                    .try_reclaim_one_idle_lane_slot()?,
+            };
+            if reclaimed {
+                return self.retry_admission();
+            }
         }
         Ok(outcome)
     }
