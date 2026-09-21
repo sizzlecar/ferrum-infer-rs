@@ -222,3 +222,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
+
+#[cfg(test)]
+pub(crate) mod q4k_q8_reference;
