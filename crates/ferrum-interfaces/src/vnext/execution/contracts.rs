@@ -354,26 +354,6 @@ impl PlanNode {
     }
 
     #[cfg(test)]
-    pub(crate) fn resource_test_node_with_binding_and_values(
-        id: NodeId,
-        binding_resource: ResourceId,
-        values: Vec<ResolvedValueBinding>,
-    ) -> Self {
-        let mut node = Self::resource_test_node_with_binding(id, binding_resource);
-        node.resources.extend(values.iter().flat_map(|value| {
-            value
-                .storage()
-                .components()
-                .iter()
-                .map(|component| component.resource_id().clone())
-        }));
-        node.resources.sort();
-        node.resources.dedup();
-        node.values = values;
-        node
-    }
-
-    #[cfg(test)]
     pub(crate) fn resource_test_node_with_state_effect(
         id: NodeId,
         state_id: StateId,

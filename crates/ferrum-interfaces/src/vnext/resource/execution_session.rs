@@ -193,7 +193,6 @@ where
                         deferred,
                         self.sessions.clone(),
                         work_fingerprint,
-                        predecessor,
                     )?,
                 ));
             }

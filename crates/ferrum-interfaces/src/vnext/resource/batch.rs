@@ -1552,20 +1552,11 @@ where
 
 /// Non-cloneable physical-backing authority for one exact batch participant
 /// set and immutable step work shape.
-///
-/// A successor deferral also retains its submitted predecessor's physical
-/// slots through maintenance, including after normal parent retirement. This
-/// keeps maintenance from treating the predecessor's capacity as space for
-/// the additional frame. The hold grants neither execution nor successful
-/// completion authority.
 #[must_use = "step backing deferral retains its exact participant parents"]
 pub struct StepAdmissionBackingDeferral<R>
 where
     R: DeviceRuntime,
 {
-    // Release physical-slot holds before the plan and participant owners.
-    // The predecessor owns backing claims, never the parent Step itself.
-    _predecessor: Option<Arc<super::SubmittedWavePredecessor<R>>>,
     backing: PlanBackingDeferral<R>,
     participants: Vec<Arc<SequenceSession<R>>>,
     work_fingerprint: String,
@@ -1579,7 +1570,6 @@ where
         evidence: DynamicBackingDeferred,
         participants: Vec<Arc<SequenceSession<R>>>,
         work_fingerprint: String,
-        predecessor: Option<Arc<super::SubmittedWavePredecessor<R>>>,
     ) -> Result<Self, VNextError> {
         let first = participants
             .first()
@@ -1593,7 +1583,6 @@ where
             ));
         }
         Ok(Self {
-            _predecessor: predecessor,
             backing: PlanBackingDeferral::new(resources, evidence)?,
             participants,
             work_fingerprint,

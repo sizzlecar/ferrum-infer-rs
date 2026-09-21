@@ -26,9 +26,6 @@ fn lazy_readback_receipts_keep_the_full_terminal_chain_cold_without_evidence_con
     harness.close();
 }
 
-#[path = "successor_backing_hold_tests.rs"]
-mod successor_backing_hold_tests;
-
 struct BoundaryHarness {
     harness: Harness,
     lane: Arc<ExecutionLane<TestRuntime>>,
