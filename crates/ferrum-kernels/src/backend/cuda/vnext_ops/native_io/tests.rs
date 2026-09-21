@@ -8,6 +8,8 @@ use ferrum_interfaces::vnext::WeightId;
 use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 
+mod packed_projection;
+
 fn part(format: MatrixFormat, rows: u32, columns: u32) -> MatrixPart {
     MatrixPart {
         transform: None,
