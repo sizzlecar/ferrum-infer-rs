@@ -170,10 +170,19 @@ fn names(backend: Backend) -> Vec<String> {
             ("native_blocks::tests::q4k", &[
                 "q4k_specialization_preserves_generic_bits_and_f64_oracle_on_cuda",
             ]),
+            ("native_blocks::tests::prefill_gemm", &[
+                "shared_prefill_gemm_preserves_f32_math_and_buffer_extents_on_cuda",
+                "shared_prefill_gemm_production_dispatch_preserves_partition_offsets_on_cuda",
+            ]),
             ("native_io::tests", &[
                 "token_lookup_launcher_preserves_exact_decode_offsets_and_invalid_ids_on_cuda",
                 "final_row_projection_launcher_preserves_f32_input_and_guarded_logits_on_cuda",
                 "token_io_bounds_preserve_nonzero_spans_and_native_launch_capacity",
+            ]),
+            ("native_io::tests::packed_projection", &[
+                "native_projection_packing_requires_exact_physical_rows_and_nonaliasing",
+                "native_projection_packing_preserves_capacity_and_transform_fallback",
+                "packed_native_projection_matches_f64_and_scalar_with_guarded_fallback_on_cuda",
             ]),
             ("selection::tests", &["masked_selection_matches_scalar_semantics_and_preserves_logits_on_cuda"]),
             ("selection::tests::partitioned", &[
