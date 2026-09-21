@@ -3032,24 +3032,63 @@ impl CompletionReadbackBatchRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone)]
 #[must_use = "successful completion output bytes are exact readback evidence"]
 pub struct CompletionReadbackOutput {
     request: CompletionReadbackRequest,
     bytes: Vec<u8>,
-    sha256: String,
-    #[serde(skip)]
+    sha256: OnceLock<String>,
     timing: DeviceTimingMeasurement<CompletionReadbackTiming>,
+}
+
+impl PartialEq for CompletionReadbackOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request && self.bytes == other.bytes && self.timing == other.timing
+    }
+}
+
+impl Eq for CompletionReadbackOutput {}
+
+impl fmt::Debug for CompletionReadbackOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionReadbackOutput")
+            .field("request", &self.request)
+            .field("bytes", &self.bytes)
+            .field("sha256", &self.sha256())
+            .field("timing", &self.timing)
+            .finish()
+    }
+}
+
+impl Serialize for CompletionReadbackOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename = "CompletionReadbackOutput")]
+        struct Wire<'a> {
+            request: &'a CompletionReadbackRequest,
+            bytes: &'a [u8],
+            sha256: &'a str,
+        }
+        Wire {
+            request: &self.request,
+            bytes: &self.bytes,
+            sha256: self.sha256(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl CompletionReadbackOutput {
     fn new(request: CompletionReadbackRequest, readback: LaneReadback) -> Result<Self, VNextError> {
         request.output_layout.validate_bytes(readback.bytes.len())?;
-        let sha256 = format!("{:x}", Sha256::digest(&readback.bytes));
         Ok(Self {
             request,
             bytes: readback.bytes,
-            sha256,
+            sha256: OnceLock::new(),
             timing: readback.timing,
         })
     }
@@ -3063,7 +3102,8 @@ impl CompletionReadbackOutput {
     }
 
     pub fn sha256(&self) -> &str {
-        &self.sha256
+        self.sha256
+            .get_or_init(|| format!("{:x}", Sha256::digest(&self.bytes)))
     }
 
     pub const fn timing(&self) -> DeviceTimingMeasurement<CompletionReadbackTiming> {
@@ -3164,13 +3204,58 @@ fn completion_readback_batch_fingerprint(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone)]
 #[must_use = "a terminal readback receipt couples output evidence to its exact completion"]
 pub struct CompletionReadbackReceipt {
     completion: OperationCompletionReceipt,
     disposition: CompletionReadbackDisposition,
     readback_timing: Option<DeviceTimingMeasurement<CompletionReadbackTiming>>,
-    fingerprint: String,
+    fingerprint: OnceLock<String>,
+}
+
+impl PartialEq for CompletionReadbackReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.completion == other.completion
+            && self.disposition == other.disposition
+            && self.readback_timing == other.readback_timing
+    }
+}
+
+impl Eq for CompletionReadbackReceipt {}
+
+impl fmt::Debug for CompletionReadbackReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionReadbackReceipt")
+            .field("completion", &self.completion)
+            .field("disposition", &self.disposition)
+            .field("readback_timing", &self.readback_timing)
+            .field("fingerprint", &self.fingerprint())
+            .finish()
+    }
+}
+
+impl Serialize for CompletionReadbackReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename = "CompletionReadbackReceipt")]
+        struct Wire<'a> {
+            completion: &'a OperationCompletionReceipt,
+            disposition: &'a CompletionReadbackDisposition,
+            readback_timing: &'a Option<DeviceTimingMeasurement<CompletionReadbackTiming>>,
+            fingerprint: &'a str,
+        }
+        Wire {
+            completion: &self.completion,
+            disposition: &self.disposition,
+            readback_timing: &self.readback_timing,
+            fingerprint: self.fingerprint(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl CompletionReadbackReceipt {
@@ -3183,40 +3268,12 @@ impl CompletionReadbackReceipt {
             .timing_mode()
             .completion_enabled()
             .then(|| readback_timing_for_disposition(&disposition));
-        #[derive(Serialize)]
-        struct FingerprintInput<'a> {
-            domain: &'static str,
-            completion_fingerprint: &'a str,
-            request: &'a CompletionReadbackRequest,
-            output_sha256: Option<&'a str>,
-            failures: Option<&'a [IdentifiedFailure]>,
-            contract_failure: Option<&'a str>,
-        }
-        let (request, output_sha256, failures, contract_failure) = match &disposition {
-            CompletionReadbackDisposition::Succeeded(output) => {
-                (output.request(), Some(output.sha256()), None, None)
-            }
-            CompletionReadbackDisposition::NotAttempted(request) => (request, None, None, None),
-            CompletionReadbackDisposition::FailedButQuiescent { request, failures } => {
-                (request, None, Some(failures.as_slice()), None)
-            }
-            CompletionReadbackDisposition::ContractFailedButQuiescent { request, failure } => {
-                (request, None, None, Some(failure.reason()))
-            }
-        };
-        let fingerprint = canonical_completion_fingerprint(&FingerprintInput {
-            domain: "ferrum.runtime-vnext.completion-readback.v1",
-            completion_fingerprint: completion.fingerprint(),
-            request,
-            output_sha256,
-            failures,
-            contract_failure,
-        });
+
         Self {
             completion,
             disposition,
             readback_timing,
-            fingerprint,
+            fingerprint: OnceLock::new(),
         }
     }
 
@@ -3235,17 +3292,92 @@ impl CompletionReadbackReceipt {
     }
 
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        self.fingerprint.get_or_init(|| {
+            #[derive(Serialize)]
+            struct FingerprintInput<'a> {
+                domain: &'static str,
+                completion_fingerprint: &'a str,
+                request: &'a CompletionReadbackRequest,
+                output_sha256: Option<&'a str>,
+                failures: Option<&'a [IdentifiedFailure]>,
+                contract_failure: Option<&'a str>,
+            }
+            let (request, output_sha256, failures, contract_failure) = match &self.disposition {
+                CompletionReadbackDisposition::Succeeded(output) => {
+                    (output.request(), Some(output.sha256()), None, None)
+                }
+                CompletionReadbackDisposition::NotAttempted(request) => (request, None, None, None),
+                CompletionReadbackDisposition::FailedButQuiescent { request, failures } => {
+                    (request, None, Some(failures.as_slice()), None)
+                }
+                CompletionReadbackDisposition::ContractFailedButQuiescent { request, failure } => {
+                    (request, None, None, Some(failure.reason()))
+                }
+            };
+            canonical_completion_fingerprint(&FingerprintInput {
+                domain: "ferrum.runtime-vnext.completion-readback.v1",
+                completion_fingerprint: self.completion.fingerprint(),
+                request,
+                output_sha256,
+                failures,
+                contract_failure,
+            })
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone)]
 #[must_use = "a terminal batch readback receipt owns all participant output evidence"]
 pub struct CompletionReadbackBatchReceipt {
     completion: OperationCompletionReceipt,
     dispositions: Vec<CompletionReadbackDisposition>,
     readback_timings: Option<Vec<DeviceTimingMeasurement<CompletionReadbackTiming>>>,
-    fingerprint: String,
+    fingerprint: OnceLock<String>,
+}
+
+impl PartialEq for CompletionReadbackBatchReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        self.completion == other.completion
+            && self.dispositions == other.dispositions
+            && self.readback_timings == other.readback_timings
+    }
+}
+
+impl Eq for CompletionReadbackBatchReceipt {}
+
+impl fmt::Debug for CompletionReadbackBatchReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionReadbackBatchReceipt")
+            .field("completion", &self.completion)
+            .field("dispositions", &self.dispositions)
+            .field("readback_timings", &self.readback_timings)
+            .field("fingerprint", &self.fingerprint())
+            .finish()
+    }
+}
+
+impl Serialize for CompletionReadbackBatchReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename = "CompletionReadbackBatchReceipt")]
+        struct Wire<'a> {
+            completion: &'a OperationCompletionReceipt,
+            dispositions: &'a [CompletionReadbackDisposition],
+            readback_timings: &'a Option<Vec<DeviceTimingMeasurement<CompletionReadbackTiming>>>,
+            fingerprint: &'a str,
+        }
+        Wire {
+            completion: &self.completion,
+            dispositions: &self.dispositions,
+            readback_timings: &self.readback_timings,
+            fingerprint: self.fingerprint(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl CompletionReadbackBatchReceipt {
@@ -3263,13 +3395,11 @@ impl CompletionReadbackBatchReceipt {
                     .map(readback_timing_for_disposition)
                     .collect()
             });
-        let fingerprint =
-            completion_readback_batch_fingerprint(completion.fingerprint(), &dispositions);
         Self {
             completion,
             dispositions,
             readback_timings,
-            fingerprint,
+            fingerprint: OnceLock::new(),
         }
     }
 
@@ -3286,7 +3416,9 @@ impl CompletionReadbackBatchReceipt {
     }
 
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        self.fingerprint.get_or_init(|| {
+            completion_readback_batch_fingerprint(self.completion.fingerprint(), &self.dispositions)
+        })
     }
 }
 
@@ -3897,6 +4029,9 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
 }
 
 #[cfg(test)]
+pub(crate) mod lazy_readback_tests;
+
+#[cfg(test)]
 mod fingerprint_tests {
     use super::*;
     use crate::vnext::ElementType;
@@ -3920,7 +4055,7 @@ mod fingerprint_tests {
         CompletionReadbackOutput {
             request: request(),
             bytes,
-            sha256,
+            sha256: OnceLock::from(sha256),
             timing: DeviceTimingMeasurement::NotRequested,
         }
     }

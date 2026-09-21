@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "submission_readback/lazy_receipt_tests.rs"]
+mod lazy_receipt_tests;
+
 struct SubmittedCohort {
     handle: CompletionHandle<TestRuntime>,
     fence: u64,

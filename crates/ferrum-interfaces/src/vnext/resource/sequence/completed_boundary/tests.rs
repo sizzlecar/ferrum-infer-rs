@@ -6,6 +6,26 @@ use crate::vnext::{
 };
 use std::ops::Range;
 
+#[test]
+fn lazy_readback_receipts_keep_the_full_terminal_chain_cold_without_evidence_consumers() {
+    let harness = BoundaryHarness::new(1);
+    let step = harness.step(vec![span(&[53], 0..1)]);
+    let reaper = CompletionReaper::new();
+    let handle = submit_through_reaper(&harness, prepared_wave(&step), &reaper);
+    let CompletionObservation::Terminal(receipt) = handle.wait().unwrap() else {
+        panic!("resource fixture must reach its actual terminal fence");
+    };
+    assert!(matches!(
+        receipt.disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    crate::vnext::completion::lazy_readback_tests::assert_cold_receipt_chain(receipt);
+    drop(handle);
+    step.try_retire_normal().unwrap();
+    assert_eq!(reaper.retained_count(), 0);
+    harness.close();
+}
+
 #[path = "successor_backing_hold_tests.rs"]
 mod successor_backing_hold_tests;
 
