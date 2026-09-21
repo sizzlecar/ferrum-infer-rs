@@ -143,8 +143,15 @@ impl Prototype {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mapping {
     Strict,
+    StrictShared,
     Lane,
     Mma,
+}
+
+impl Mapping {
+    fn approximate(self) -> bool {
+        matches!(self, Self::Lane | Self::Mma)
+    }
 }
 
 struct Case {
@@ -296,18 +303,25 @@ impl Case {
         retained: &CudaNativeBlockKernels,
         mapping: Mapping,
     ) {
-        let approximate = mapping != Mapping::Strict;
+        let approximate = mapping.approximate();
         let groups = self.rows * self.inputs / 32;
         let tile = match mapping {
+            Mapping::StrictShared => 64,
             Mapping::Mma => 32,
             _ if self.rows == 1 => 1,
             _ => 8,
         };
         let column_tile = match mapping {
+            Mapping::StrictShared => 64,
             Mapping::Mma => 16,
             _ => 4,
         };
         let kernel = match (mapping, tile) {
+            (Mapping::StrictShared, _) => match self.format {
+                Format::Q4 => &retained.gemm_q4k_f16,
+                Format::Q5 => &retained.gemm_q5k_f16,
+                Format::Q6 => &retained.gemm_q6k_f16,
+            },
             (Mapping::Lane, 1) => &prototype.lane_scalar,
             (Mapping::Lane, _) => &prototype.lane_tiled,
             (Mapping::Mma, _) => &prototype.mma,
@@ -356,7 +370,11 @@ impl Case {
                     (self.rows as u32).div_ceil(tile),
                     1,
                 ),
-                block_dim: (128, 1, 1),
+                block_dim: if mapping == Mapping::StrictShared {
+                    (16, 16, 1)
+                } else {
+                    (128, 1, 1)
+                },
                 shared_mem_bytes: 0,
             })
         }
@@ -624,7 +642,7 @@ fn check_case(
     for mapping in [Mapping::Strict, Mapping::Lane, Mapping::Mma] {
         for _ in 0..2 {
             case.reset_destinations(stream, f16::NAN);
-            let approximate = mapping != Mapping::Strict;
+            let approximate = mapping.approximate();
             if approximate {
                 case.pack(stream, prototype);
             }
@@ -811,20 +829,62 @@ fn q56k_q8_prototype_pack_plus_matmul_microbench() {
     }
 }
 
+#[test]
+#[ignore = "paired prefill GPU timing including activation pack; exclusive SM80+ CUDA access"]
+fn q8_prefill_pack_plus_shared_matmul_microbench() {
+    // The strict product uses shared F32 GEMM for these large F16 batches.
+    // Decode's original tiled control is not the relevant prefill baseline.
+    // These two FFN geometries screen the 9B gate/up and down projections;
+    // hot matrix reuse and sampled output oracles do not prove service gains.
+    let context = CudaContext::new(0).expect("Q8 prefill timing requires CUDA");
+    let stream = context.default_stream();
+    let retained = CudaNativeBlockKernels::load(&context).unwrap();
+    for (format, inputs, outputs) in [(Format::Q4, 4096, 12288), (Format::Q6, 12288, 4096)] {
+        let prototype = Prototype::load(&context, format);
+        for rows in [128, 512] {
+            let mut case = Case::with_format(&stream, format, rows, inputs, outputs);
+            run_microbench_mappings(
+                &mut case,
+                &stream,
+                &prototype,
+                &retained,
+                &[Mapping::StrictShared, Mapping::Mma],
+            );
+        }
+    }
+}
+
 fn run_microbench(
     case: &mut Case,
     stream: &Arc<CudaStream>,
     prototype: &Prototype,
     retained: &CudaNativeBlockKernels,
 ) {
+    run_microbench_mappings(
+        case,
+        stream,
+        prototype,
+        retained,
+        &[Mapping::Strict, Mapping::Lane, Mapping::Mma],
+    );
+}
+
+fn run_microbench_mappings(
+    case: &mut Case,
+    stream: &Arc<CudaStream>,
+    prototype: &Prototype,
+    retained: &CudaNativeBlockKernels,
+    mappings: &[Mapping],
+) {
     const REPEATS: u32 = 8;
     for round in 0..6 {
-        for mapping in if round % 2 == 0 {
-            [Mapping::Strict, Mapping::Lane, Mapping::Mma]
-        } else {
-            [Mapping::Mma, Mapping::Lane, Mapping::Strict]
-        } {
-            let approximate = mapping != Mapping::Strict;
+        for index in 0..mappings.len() {
+            let mapping = mappings[if round % 2 == 0 {
+                index
+            } else {
+                mappings.len() - 1 - index
+            }];
+            let approximate = mapping.approximate();
             // Reset outside both GPU and wall timing; REPEATS itself
             // contains only the actual pack (when needed) and GEMV.
             case.reset_destinations(stream, f16::NAN);
