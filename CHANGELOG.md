@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added an optional total prefill-token budget while decodes are runnable, plus opt-in mixed prefill/decode execution, to both `run` and `serve`. Split execution remains the default; the budget limits scheduled work rather than promising a fixed latency.
+- Added a Rust decode-isolation benchmark and stricter fixed-output usage checks. Streaming lifecycle coverage includes disconnects, surviving concurrent requests and subsequent resource reuse.
+
+### Changed
+
+- Batched eligible CUDA linear, SwiGLU and FP16 last-token projections, including budgeted gathering of noncontiguous last-token rows. Optimized supported CUDA Q4K/GDN, Metal quantized tail/eight-row dispatch and large-vocabulary argmax paths while retaining numerical and resource-boundary checks.
+- Reduced host preparation work with provider-declared binding projections, lazy canonical fingerprints, shared immutable identifiers and invocation-scoped coverage proofs. Basic metrics collection no longer requires per-node JSON trace construction.
+- Updated resource-maintenance events to schema version 2, distinguishing device-capacity pressure from pool-resident fragmentation. Consumers of these diagnostic events must handle the new schema.
+
+### Fixed
+
+- Reclaimed idle pool fragments without removing space needed by other pending claims, and released idle on-demand execution pins under capacity pressure. Live work and startup-sealed programs remain protected; maintenance retries require real progress.
+- Kept mixed execution fallback limited to proven zero-submission outcomes, validated both output groups before publication, and terminated all affected participants after potentially submitted failures.
+
 ## [0.12.2] - 2026-09-20
 
 ### Changed

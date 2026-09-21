@@ -48,6 +48,12 @@ D + Σ Pᵢ ≤ B
 
 该参数限制 token 工作量，**不承诺固定毫秒延迟**。它提供一个可解释、可复现的控制量，也为后续时间控制器提供独立接口。
 
+### 调度分块与 GDN 算子分块
+
+调度器把一个长 prompt 分多轮推进，与 Gated Delta 算子如何计算本轮 token，是两个独立选择。CUDA 已支持前者；当前 GDN provider 选择 `RecurrentScan`，并未安装 `ChunkedScan` 执行路径。因此，调小 prefill chunk 可以缩短一次占用，却不会自动把块内的顺序递推变成并行算法。
+
+Metal 已有 recurrent 与 chunked 两种实际实现，但安装了 kernel 不等于运行时会选中它。当前 cost model 对受支持的 SIMD recurrent 形状优先使用 recurrent，即使输入较长。后续优化需要按实际 token 数、head 维度、状态精度和设备能力比较两条路径，并验证状态衔接与数值误差；不能仅凭“已有 chunked”推断长 prefill 已充分并行。
+
 ## 公平性与过载
 
 decode 保持已有轮转；prefill 保持已有队列顺序，不在同一个改动里引入新的 aging 或优先级规则。只要有可运行 prefill、正预算和可用资源，调度必须允许它推进。较小的总预算可能延长队首长 prompt 后面请求的 TTFT，需要在长短请求混排测试中展示。
@@ -80,6 +86,12 @@ PlanRuntime mixed API 保留两组输入和各自顺序，共享物理执行并�
 6. 取消和提交后错误依靠资源 guard 清理准确参与者；设备 fence 继续持有实际资源，直到设备执行结束。
 
 当前 mixed 路径仍等待整轮 forward 和必要的 prefill 边界保存。`BatchConfig.prefill_decode_execution` 使用 typed `Split` / `Mixed` 策略，默认保留 `Split`；`run` 和 `serve` 可通过 `--prefill-decode-execution mixed` 显式选择。Mixed 使用 packed-token 执行，仍可能失去纯 decode 的部分专用执行优势。因此，默认启用范围必须由相同调度工作量下的对照结果支持；不能把调小预算带来的改善归因于混合执行。对诊断 checkpoint 等不兼容执行契约，使用明确的 Unsupported 回退。
+
+### CPU 准备与 GPU 执行的重叠边界
+
+CUDA 的整轮 graph replay 已存在；它减少设备提交开销，但当前 engine 仍在本轮完成、回读和状态提交之后，准备下一轮。优化方向之一是减少重复的 host 绑定工作，再评估有界的批次流水，避免 GPU 等待下一轮 CPU 准备。Mixed 本身不建立这种跨轮重叠。
+
+异步流水尚未实现，不能通过删除 fence wait 获得。它需要区分已预留、已提交和已完成的请求进度，声明设备端 token 反馈及 KV/GDN 的前置依赖，并按序处理 EOS、取消和提交后错误。资源槽必须保留到所有引用它的设备工作结束；未知采样结果不能当作真实 token 推进。该设计同时影响 `run`、`serve` 和共享资源协议，需要独立的正确性与端到端性能验证。
 
 ### Mixed 的小回传边界
 
