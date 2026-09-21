@@ -6,6 +6,9 @@ use crate::vnext::{
 };
 use std::ops::Range;
 
+#[path = "successor_backing_hold_tests.rs"]
+mod successor_backing_hold_tests;
+
 struct BoundaryHarness {
     harness: Harness,
     lane: Arc<ExecutionLane<TestRuntime>>,
