@@ -43,6 +43,8 @@ sha2 = "0.10"
 [features]
 default = []
 cuda = ["dep:cudarc", "marlin", "native-op-artifact"]
+# Explicit opt-in for ignored diagnostic tests; no production Lt dispatch.
+cuda-cublaslt-bench = ["cuda", "cudarc/cublaslt"]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
 metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
 marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).

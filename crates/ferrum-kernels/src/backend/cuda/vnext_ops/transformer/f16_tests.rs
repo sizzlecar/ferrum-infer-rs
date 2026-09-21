@@ -4,6 +4,13 @@ use super::*;
 use cudarc::driver::CudaContext;
 use half::f16;
 
+#[path = "f16_tests/gemm_compute_microbench.rs"]
+mod gemm_compute_microbench;
+
+#[cfg(feature = "cuda-cublaslt-bench")]
+#[path = "f16_tests/cublaslt_microbench.rs"]
+mod cublaslt_microbench;
+
 fn values(count: usize, salt: usize) -> Vec<f16> {
     (0..count)
         .map(|i| f16::from_f32(((i * 13 + salt * 7) % 41) as f32 / 32.0 - 0.625))
