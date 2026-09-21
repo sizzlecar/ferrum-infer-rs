@@ -154,8 +154,8 @@ fn q4k_plain_tail_plan_preserves_shape_abi_and_staged_dispatch_count() {
 }
 
 #[test]
-fn q6_f32_eight_row_plan_preserves_parts_strides_and_partial_group_fallbacks() {
-    for rows in [1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 33, 65] {
+fn q6_f32_grouped_plan_preserves_parts_strides_and_bounded_fallbacks() {
+    for rows in [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 16, 31, 32, 33, 65] {
         for outputs in [1023, 1024, 1025] {
             let launch = linear_launch_typed(
                 PreparedLinearPart {
@@ -175,26 +175,63 @@ fn q6_f32_eight_row_plan_preserves_parts_strides_and_partial_group_fallbacks() {
                 ElementType::F32,
             )
             .unwrap();
-            let selected = rows == 8 && outputs >= 1024;
-            assert_eq!(launch.dispatch_count(), if selected { 2 } else { 1 });
-            assert_eq!(launch.plain_plan.parts(launch).is_some(), selected);
-            if let Some([first, second]) = launch.plain_plan.parts(launch) {
-                for part in [first, second] {
-                    assert_eq!(part.params.rows, 4);
+            let selected = (8..=32).contains(&rows) && outputs >= 1024;
+            assert_eq!(
+                launch.dispatch_count(),
+                if selected { rows.div_ceil(4) } else { 1 }
+            );
+            assert_eq!(launch.plain_plan.grouped_parts(launch).is_some(), selected);
+            if let Some(parts) = launch.plain_plan.grouped_parts(launch) {
+                let mut covered = 0;
+                let mut dispatches = 0;
+                for part in parts {
+                    assert_eq!(u64::from(part.params.rows), (rows - covered).min(4));
                     assert_eq!(part.params.output_stride, outputs + 12);
                     assert_eq!(part.params.output_column_offset, 3);
                     assert_eq!(part.weight_region, 7);
                     assert_eq!(part.input_region, 2);
                     assert_eq!(part.output_region, 5);
                     assert_eq!(part.dispatch_count(), 1);
+                    assert_eq!(part.input_offset_bytes, 32 + covered * 768 * 4);
+                    assert_eq!(
+                        part.output_offset_bytes,
+                        48 + covered * u64::from(outputs + 12) * 4
+                    );
+                    covered += u64::from(part.params.rows);
+                    dispatches += part.dispatch_count();
                 }
-                assert_eq!(first.input_offset_bytes, 32);
-                assert_eq!(first.output_offset_bytes, 48);
-                assert_eq!(second.input_offset_bytes, 32 + 4 * 768 * 4);
-                assert_eq!(
-                    second.output_offset_bytes,
-                    48 + 4 * u64::from(outputs + 12) * 4
-                );
+                assert_eq!(covered, rows);
+                assert_eq!(dispatches, launch.dispatch_count());
+            }
+            if selected {
+                for changed in [
+                    LinearLaunch {
+                        input_offset_bytes: u64::MAX,
+                        ..launch
+                    },
+                    LinearLaunch {
+                        output_offset_bytes: u64::MAX,
+                        ..launch
+                    },
+                    LinearLaunch {
+                        format: LinearPhysicalFormat::Q4K,
+                        ..launch
+                    },
+                    LinearLaunch {
+                        transform: Some(HadamardTransform {
+                            block_size: 128,
+                            signs_region: None,
+                            inverse: false,
+                            permutation: None,
+                        }),
+                        ..launch
+                    },
+                ] {
+                    assert!(matches!(
+                        PlainLinearPlan::for_launch(changed),
+                        PlainLinearPlan::Single
+                    ));
+                }
             }
         }
     }

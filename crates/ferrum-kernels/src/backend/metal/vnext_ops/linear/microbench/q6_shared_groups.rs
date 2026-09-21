@@ -4,6 +4,8 @@ use super::*;
 use crate::backend::metal::vnext_ops::MetalVNextComposition;
 use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 
+mod f32_groups;
+
 const INPUT_PREFIX: usize = 4;
 const OUTPUT_PREFIX: usize = 8;
 const WEIGHT_PREFIX: usize = 16;
@@ -81,6 +83,26 @@ impl Fixture {
         format: GgufBlockFormat,
         activation_type: ElementType,
     ) -> Self {
+        Self::with_dense_input(
+            runtime,
+            rows,
+            width,
+            outputs,
+            format,
+            activation_type,
+            false,
+        )
+    }
+
+    fn with_dense_input(
+        runtime: &MetalDeviceRuntime,
+        rows: u32,
+        width: u32,
+        outputs: u32,
+        format: GgufBlockFormat,
+        activation_type: ElementType,
+        dense_input: bool,
+    ) -> Self {
         let shape = Shape {
             name: "four_row_groups",
             input: width,
@@ -89,6 +111,24 @@ impl Fixture {
         };
         let encoded = weights(shape);
         let (_, mut entries) = inputs(rows as usize, width as usize);
+        if dense_input {
+            assert_eq!(activation_type, ElementType::F32);
+            entries = (0..rows)
+                .map(|row| {
+                    (0..width)
+                        .map(|column| {
+                            // Opposite signs and F32-only mantissas exercise dense
+                            // cancellation without changing the existing tolerance.
+                            let value = ((column * 17 + row * 11) % 127) as f32 / 1024.0;
+                            (
+                                column as usize,
+                                if column % 2 == 0 { value } else { -value },
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+        }
         let mut input_values =
             vec![OUTPUT_GUARD; INPUT_PREFIX + rows as usize * width as usize + 8];
         input_values[INPUT_PREFIX..INPUT_PREFIX + rows as usize * width as usize].fill(0.0);
@@ -347,7 +387,7 @@ fn q6_f32_head_four_row_groups_match_cpu_on_metal() {
     let runtime = composition.runtime();
     let pipelines = MetalLinearPipelines::new(runtime.device()).unwrap();
     let queue = runtime.device().new_command_queue();
-    for rows in [4, 5, 7, 8, 9] {
+    for rows in [4, 5, 7, 8, 9, 10, 11, 31, 32, 33] {
         let fixture = Fixture::new(
             runtime,
             rows,
@@ -358,7 +398,11 @@ fn q6_f32_head_four_row_groups_match_cpu_on_metal() {
         );
         assert_eq!(
             fixture.launch.dispatch_count(),
-            if rows == 8 { 2 } else { 1 }
+            if (8..=32).contains(&rows) {
+                u64::from(rows.div_ceil(4))
+            } else {
+                1
+            }
         );
         fixture.run(&pipelines, &queue, false, 1);
         let baseline_bits = fixture.validate();

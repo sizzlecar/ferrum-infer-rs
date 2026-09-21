@@ -2020,7 +2020,11 @@ pub(super) fn dispatch_linear(
         dispatch_transformed_linear(pipelines, encoder, regions, launch);
         return;
     }
-    if let Some([head, tail]) = launch.plain_plan.parts(launch) {
+    if let Some(parts) = launch.plain_plan.grouped_parts(launch) {
+        for part in parts {
+            dispatch_single_plain_linear(pipelines, encoder, regions, part);
+        }
+    } else if let Some([head, tail]) = launch.plain_plan.parts(launch) {
         dispatch_single_plain_linear(pipelines, encoder, regions, head);
         dispatch_single_plain_linear(pipelines, encoder, regions, tail);
     } else {
