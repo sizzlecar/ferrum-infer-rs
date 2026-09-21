@@ -17,8 +17,9 @@ fn candidate() -> SequenceFrameCandidate {
                     fingerprint: fingerprint.clone(),
                     phase: SequenceSessionPhase::Open,
                     next_frame: Some(ExecutionFrameId::try_from(1_u64).unwrap()),
-                    frames: super::super::SequenceFrameSlots::default(),
+                    active_frame: None,
                     participant_flights: BTreeMap::new(),
+                    submission_wave_flight: None,
                     state_transfer: SequenceStateTransferSlot::default(),
                     completed_boundary: super::super::SequenceCompletedFrontier::default(),
                     retired_frames: 0,
@@ -92,7 +93,7 @@ fn checkpoint_transfer_rejects_mixed_batch_without_advancing_other_participants(
     let SequenceSessionSlotState::Active(active) = &*state else {
         panic!()
     };
-    assert!(active.frames.is_empty());
+    assert!(active.active_frame.is_none());
     assert_eq!(active.next_frame.unwrap().get(), 1);
     assert_eq!(active.retired_frames, 0);
     drop(state);
@@ -106,49 +107,17 @@ fn checkpoint_transfer_reservation_respects_frames_flights_and_cancel() {
     let SequenceSessionSlotState::Active(active) = &mut *state else {
         panic!()
     };
-    let frame = ActiveSequenceFrame {
+    active.active_frame = Some(ActiveSequenceFrame {
         frame_id: ExecutionFrameId::try_from(1_u64).unwrap(),
         batch_step_id: BatchStepId::try_from(1_u64).unwrap(),
-    };
-    active.frames.insert_serial(frame);
+    });
     assert!(!ensure_transfer_candidate(active).unwrap());
-    active.frames.get_mut(frame).unwrap().submission_wave_flight =
-        Some(super::super::ParticipantFlightPhase::InFlight);
+    active.active_frame = None;
+    active.submission_wave_flight = Some(super::super::ParticipantFlightPhase::InFlight);
     assert!(!ensure_transfer_candidate(active).unwrap());
-    active.frames.get_mut(frame).unwrap().submission_wave_flight = None;
-    active.frames.remove(frame);
-    assert!(ensure_transfer_candidate(active).unwrap());
+    active.submission_wave_flight = None;
     active.phase = SequenceSessionPhase::CancelRequested;
     assert!(ensure_transfer_candidate(active).is_err());
-}
-
-#[test]
-fn checkpoint_transfer_stays_blocked_after_parent_retirement_with_live_successor() {
-    let candidate = candidate();
-    let mut state = candidate.slot.state.lock().unwrap();
-    let SequenceSessionSlotState::Active(active) = &mut *state else {
-        panic!()
-    };
-    let parent = ActiveSequenceFrame {
-        frame_id: ExecutionFrameId::try_from(1_u64).unwrap(),
-        batch_step_id: BatchStepId::try_from(1_u64).unwrap(),
-    };
-    let child = ActiveSequenceFrame {
-        frame_id: ExecutionFrameId::try_from(2_u64).unwrap(),
-        batch_step_id: BatchStepId::try_from(2_u64).unwrap(),
-    };
-    // Exercise reservation bookkeeping after an already-authorized successor,
-    // without constructing any submitted-fence or token authority.
-    active.frames.insert_serial(parent);
-    active.frames.insert_successor(child);
-    active.frames.get_mut(child).unwrap().submission_wave_flight =
-        Some(super::super::ParticipantFlightPhase::InFlight);
-    active.frames.remove(parent);
-    assert!(!ensure_transfer_candidate(active).unwrap());
-    active.frames.get_mut(child).unwrap().submission_wave_flight = None;
-    assert!(!ensure_transfer_candidate(active).unwrap());
-    active.frames.remove(child);
-    assert!(ensure_transfer_candidate(active).unwrap());
 }
 
 #[test]

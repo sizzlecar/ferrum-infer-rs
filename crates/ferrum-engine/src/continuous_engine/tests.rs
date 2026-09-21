@@ -13768,6 +13768,3 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
 }
 
 mod auto_tools_json;
-
-#[path = "lookahead_tests.rs"]
-mod lookahead_tests;

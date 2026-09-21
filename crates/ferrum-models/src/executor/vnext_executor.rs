@@ -65,13 +65,10 @@ use super::{
 
 mod backing_maintenance;
 mod composition;
-mod decode_lookahead;
 mod determinism;
 mod mixed_batch;
-mod pending_decode;
 mod readback_logits;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
-use decode_lookahead::{ObservedVNextStep, PendingDecodeRow};
 mod prefix_cache;
 mod request;
 mod reusable_catalog;
@@ -1435,10 +1432,6 @@ struct VNextExecutorMetrics {
     readback_bytes: AtomicU64,
     full_logits_readback_waves: AtomicU64,
     greedy_token_readback_waves: AtomicU64,
-    lookahead_submitted_waves: AtomicU64,
-    lookahead_serial_warmups: AtomicU64,
-    lookahead_consumed_rows: AtomicU64,
-    lookahead_maintenance_failures: AtomicU64,
     greedy_policy_fallback_waves: AtomicU64,
     token_mask_upload_participants: AtomicU64,
     token_mask_cache_hit_participants: AtomicU64,
@@ -1857,25 +1850,6 @@ impl<'a> VNextProductTokenMaskResidencyTransaction<'a> {
     fn invalidate_before_slot_release(&mut self) {
         debug_assert!(!self.published);
         self.residency.lock().clear();
-        self.settled = true;
-    }
-
-    fn invalidate_targets_before_slot_release(&mut self) {
-        debug_assert!(!self.published);
-        let mut ledger = self.residency.lock();
-        if self.plans.iter().any(|plan| plan.target.is_none()) {
-            // Without an exact Step slot, the potentially overwritten ranges
-            // cannot be distinguished from other cached product inputs.
-            ledger.clear();
-        } else {
-            for plan in &self.plans {
-                if let Some(target) = &plan.target {
-                    // Remove even a cache hit: an asynchronous child does not
-                    // publish terminal-success proof back into this ledger.
-                    ledger.entries.remove(&target.cache_key());
-                }
-            }
-        }
         self.settled = true;
     }
 }
@@ -2777,12 +2751,6 @@ impl VNextExecutorMetrics {
         *self.last_failure.lock() = Some(message.into());
     }
 
-    fn record_lookahead_maintenance_failure(&self, message: impl Into<String>) {
-        self.lookahead_maintenance_failures
-            .fetch_add(1, Ordering::Relaxed);
-        *self.last_failure.lock() = Some(message.into());
-    }
-
     fn record_reusable_catalog_miss(&self, key: VNextReusableExecutionCatalogMissKey) {
         if key.reason.is_epoch_mismatch() {
             self.reusable_catalog_epoch_misses
@@ -2832,10 +2800,6 @@ impl VNextExecutorMetrics {
             &self.readback_bytes,
             &self.full_logits_readback_waves,
             &self.greedy_token_readback_waves,
-            &self.lookahead_submitted_waves,
-            &self.lookahead_serial_warmups,
-            &self.lookahead_consumed_rows,
-            &self.lookahead_maintenance_failures,
             &self.greedy_policy_fallback_waves,
             &self.token_mask_upload_participants,
             &self.token_mask_cache_hit_participants,
@@ -3564,7 +3528,6 @@ struct VNextSequence<R: DeviceRuntime> {
     active_binding: Arc<TrustedActiveSequenceBinding>,
     request_origin: ExecutorRequestOrigin,
     tokens: Mutex<Vec<u32>>,
-    pending_decode: Mutex<Option<PendingDecodeRow>>,
     maximum_tokens: usize,
     active: AtomicBool,
     operation: AsyncMutex<()>,
@@ -3708,7 +3671,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         Ok(())
     }
 
-    async fn complete(&self, completion: &ExecutorSequenceCompletion) -> Result<()> {
+    fn complete(&self, completion: &ExecutorSequenceCompletion) -> Result<()> {
         if let Err(error) = validate_sequence_completion_accounting(
             self.request_id(),
             self.product_prompt_tokens,
@@ -3717,37 +3680,6 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         ) {
             self.abort();
             return Err(error);
-        }
-        let pending = self.pending_decode.lock().clone();
-        if let Some(pending) = pending {
-            // Device state may already include an unpublished successor. A
-            // product stop remains a normal completion, but that native state
-            // must be discarded instead of exported as the parent frontier.
-            if self.events.is_some() {
-                return Err(FerrumError::internal(
-                    "lookahead completion cannot publish a diagnostic completion seal",
-                ));
-            }
-            self.session.request_cancel().map_err(|error| {
-                FerrumError::backend(format!("vNext lookahead completion cancellation: {error}"))
-            })?;
-            // The accepted worker owns the child Step and never takes the
-            // operation lock held by complete_cache. Keep the row installed
-            // while awaiting it so an abandoned future can still discard it.
-            let observed = pending.cohort.wait().await;
-            pending.cohort.discard_row(pending.row)?;
-            observed?;
-            if !self.active.swap(false, Ordering::AcqRel) {
-                return Err(FerrumError::already_exists(format!(
-                    "vNext request `{}` is already terminal",
-                    self.request_id()
-                )));
-            }
-            self.session.try_abort().map_err(|error| {
-                FerrumError::backend(format!("vNext lookahead completion abort: {error}"))
-            })?;
-            self.pending_decode.lock().take();
-            return Ok(());
         }
         self.complete_with_counts(completion.input_tokens(), completion.output_tokens())
     }
@@ -3781,11 +3713,6 @@ impl<R: DeviceRuntime> VNextSequence<R> {
 
     fn abort(&self) {
         self.active.store(false, Ordering::Release);
-        if let Some(pending) = self.pending_decode.lock().take() {
-            // No blocking or detached waiter: the accepted pair worker owns
-            // both submitted Steps and drains them independently of this row.
-            let _ = pending.cohort.discard_row(pending.row);
-        }
         let _ = self.session.request_cancel();
         let _ = self.session.try_abort();
     }
@@ -3821,7 +3748,9 @@ impl<R: DeviceRuntime> VNextSequence<R> {
 
 impl<R: DeviceRuntime> Drop for VNextSequence<R> {
     fn drop(&mut self) {
-        self.abort();
+        self.active.store(false, Ordering::Release);
+        let _ = self.session.request_cancel();
+        let _ = self.session.try_abort();
     }
 }
 
@@ -4653,7 +4582,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     device_timing_mode: AtomicU8,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
-    metrics: Arc<VNextExecutorMetrics>,
+    metrics: VNextExecutorMetrics,
 }
 
 impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
@@ -5221,7 +5150,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
-            metrics: Arc::new(VNextExecutorMetrics::default()),
+            metrics: VNextExecutorMetrics::default(),
         })
     }
 
@@ -6365,7 +6294,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             active_binding,
             request_origin,
             tokens: Mutex::new(tokens),
-            pending_decode: Mutex::new(None),
             maximum_tokens,
             active: AtomicBool::new(true),
             operation: AsyncMutex::new(()),
@@ -7352,7 +7280,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
-        upload_input_tokens: bool,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7376,7 +7303,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let _phase_timing = phase_timing.token_upload_prepare.start_if(timing_enabled);
             participants
                 .iter()
-                .filter(|_| upload_input_tokens)
                 .enumerate()
                 .map(|(participant_index, participant)| {
                     let range = participant.span.immediate_token_range();
@@ -7978,28 +7904,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
-        self.execute_batch_step_with_lookahead(
-            batch,
-            sequences,
-            token_batches,
-            spans,
-            kind,
-            output_roles,
-            false,
-        )
-        .await
-    }
-
-    async fn execute_batch_step_with_lookahead(
-        &self,
-        batch: &ExecutionBatchParticipants<R>,
-        sequences: &[Arc<VNextSequence<R>>],
-        token_batches: &[Vec<u32>],
-        spans: &[TokenSpanWork],
-        kind: VNextExecutionWaveKind,
-        output_roles: &[VNextParticipantOutputRole],
-        allow_lookahead: bool,
-    ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -8102,14 +8006,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
-        self.execute_prepared_participants_with_lookahead(
-            &participants,
-            prepared,
-            kind,
-            allow_lookahead,
-        )
-        .await
-        .map(VNextExecutionCapacityDecision::Ready)
+        self.execute_prepared_participants(&participants, prepared, kind)
+            .await
+            .map(VNextExecutionCapacityDecision::Ready)
     }
 
     async fn execute_prepared_step(
@@ -8140,17 +8039,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
-    ) -> Result<Vec<ExecutorSamplingOutput>> {
-        self.execute_prepared_participants_with_lookahead(participants, prepared, kind, false)
-            .await
-    }
-
-    async fn execute_prepared_participants_with_lookahead(
-        &self,
-        participants: &[VNextExecutionParticipant<'_, R>],
-        prepared: PreparedVNextPrefill<R>,
-        kind: VNextExecutionWaveKind,
-        allow_lookahead: bool,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
@@ -8260,7 +8148,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
-                true,
             );
             (token_mask_residency, dispatch)
         };
@@ -8386,255 +8273,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
-        let mut successor_maintenance = None;
-        let successor = if allow_lookahead
-            && kind == VNextExecutionWaveKind::Decode
-            && output_mode == VNextProductOutputMode::GreedyToken
-            && self.decode_lookahead_eligible(
-                &participants
-                    .iter()
-                    .map(|p| Arc::clone(p.sequence))
-                    .collect::<Vec<_>>(),
-            ) {
-            let prepared = match &readbacks {
-                VNextTerminalReadbacks::Batch(sources) => {
-                    self.prepare_decode_successor(participants, &completion, sources, &step)
-                }
-                _ => Err(FerrumError::internal(
-                    "lookahead parent requires one selected-token batch",
-                )),
-            };
-            match prepared {
-                Ok(decode_lookahead::DecodeSuccessorPreparation::Prepared(successor)) => {
-                    Some(successor)
-                }
-                Ok(decode_lookahead::DecodeSuccessorPreparation::BackingDeferred(deferred)) => {
-                    successor_maintenance = Some(deferred);
-                    None
-                }
-                Ok(decode_lookahead::DecodeSuccessorPreparation::Unavailable) => None,
-                Err(error) => {
-                    // The parent is already accepted. Settle it through the
-                    // reserved owner even if child preparation failed closed.
-                    execution_event_error.get_or_insert_with(|| error.to_string());
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let (observation, step, successor_cohort) = {
+        let (observation, step) = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
             let _phase_timing = phase_timing.completion_round_trip.start();
-            if let Some(child) = successor {
-                let VNextTerminalReadbacks::Batch(parent_readbacks) = readbacks else {
-                    unreachable!("lookahead preparation checked its parent readback form")
-                };
-                let needs_warmup = self.successor_needs_serial_warmup(&child.wave);
-                let mut parent = decode_lookahead::DecodePairParent::Submitted {
-                    completion,
-                    readbacks: parent_readbacks,
-                    step,
-                };
-                let completion_reservation = match needs_warmup {
-                    Ok(true) => {
-                        let decode_lookahead::DecodePairParent::Submitted {
-                            completion,
-                            readbacks,
-                            step,
-                        } = parent
-                        else {
-                            unreachable!("parent has not yet been observed")
-                        };
-                        let observed = pending_decode::observe_parent(
-                            completion_reservation,
-                            pending_decode::SubmittedPairWave::new(completion, readbacks, step),
-                            Arc::clone(&self.reaper),
-                        )
-                        .wait()
-                        .await
-                        .map_err(|error| FerrumError::backend(error.to_string()))??;
-                        if !matches!(
-                            observed.receipt().completion().disposition(),
-                            OperationCompletionDisposition::Succeeded
-                        ) || observed
-                            .receipt()
-                            .dispositions()
-                            .iter()
-                            .any(|row| !matches!(row, CompletionReadbackDisposition::Succeeded(_)))
-                        {
-                            drop(child.wave);
-                            let rollback = self
-                                .rollback_unsubmitted_step(child.step, "failed parent successor");
-                            let abort = observed.abort();
-                            return Err(FerrumError::backend(format!("lookahead parent failed before warmup; child rollback: {rollback:?}; parent abort: {abort:?}")));
-                        }
-                        // Keep the prepared child (both actual arena slots)
-                        // across the wait. Its first adaptive dispatch can now
-                        // warm/capture at a real quiescent device boundary.
-                        self.refresh_on_demand_reusable_execution_catalog()?;
-                        self.metrics
-                            .lookahead_serial_warmups
-                            .fetch_add(1, Ordering::Relaxed);
-                        parent = decode_lookahead::DecodePairParent::Observed(observed);
-                        self.completion_worker
-                            .reserve()
-                            .await
-                            .map_err(|error| FerrumError::backend(error.to_string()))?
-                    }
-                    Ok(false) => completion_reservation,
-                    Err(error) => {
-                        drop(child.wave);
-                        let rollback =
-                            self.rollback_unsubmitted_step(child.step, "successor warmup query");
-                        let message = match rollback {
-                            Ok(()) => error.to_string(),
-                            Err(cleanup) => format!("{error}; {cleanup}"),
-                        };
-                        return Err(parent
-                            .fail(
-                                completion_reservation,
-                                None,
-                                Arc::clone(&self.reaper),
-                                message,
-                            )
-                            .await);
-                    }
-                };
-                let child = match self.dispatch_decode_successor(participants, child) {
-                    Ok(child) => child,
-                    Err(error) => {
-                        return Err(parent
-                            .fail(
-                                completion_reservation,
-                                None,
-                                Arc::clone(&self.reaper),
-                                error.to_string(),
-                            )
-                            .await)
-                    }
-                };
-                let decode_lookahead::DispatchedDecodeSuccessor {
-                    step: child_step,
-                    outcome,
-                    readbacks: child_readbacks,
-                    token_mask_upload_participants,
-                    token_mask_cache_hit_participants,
-                } = child;
-                let (child_completion, child_attribution) = match outcome {
-                    DispatchOutcome::Submitted {
-                        completion,
-                        attribution,
-                    } => (completion, attribution),
-                    failed => {
-                        token_mask_residency.invalidate_before_slot_release();
-                        let message = match &failed {
-                            DispatchOutcome::QuiescentFailure(message)
-                            | DispatchOutcome::SubmissionIndeterminate { message, .. }
-                            | DispatchOutcome::PostSubmitContract { message, .. } => {
-                                message.clone()
-                            }
-                            DispatchOutcome::Submitted { .. } => unreachable!(),
-                        };
-                        let error = parent
-                            .fail(
-                                completion_reservation,
-                                Some((failed, child_step)),
-                                Arc::clone(&self.reaper),
-                                message,
-                            )
-                            .await;
-                        self.metrics.record_failure(error.to_string());
-                        return Err(error);
-                    }
-                };
-                let metrics = Arc::clone(&self.metrics);
-                metrics
-                    .lookahead_submitted_waves
-                    .fetch_add(1, Ordering::Relaxed);
-                let sink = self.event_sink.read().clone();
-                let (pending, cohort) = parent.submit_pair(
-                    completion_reservation,
-                    pending_decode::SubmittedPairWave::new(
-                        child_completion,
-                        child_readbacks,
-                        child_step,
-                    ),
-                    Arc::clone(&self.reaper),
-                    move |result| match result {
-                        Ok(receipt) => {
-                            metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
-                            metrics
-                                .full_logits_readback_waves
-                                .fetch_add(1, Ordering::Relaxed);
-                            metrics
-                                .token_mask_upload_participants
-                                .fetch_add(token_mask_upload_participants, Ordering::Relaxed);
-                            metrics
-                                .token_mask_cache_hit_participants
-                                .fetch_add(token_mask_cache_hit_participants, Ordering::Relaxed);
-                            let bytes = receipt
-                                .dispositions()
-                                .iter()
-                                .filter_map(|disposition| {
-                                    if let CompletionReadbackDisposition::Succeeded(output) =
-                                        disposition
-                                    {
-                                        output.request().output_layout().byte_len().ok()
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .fold(0_u64, u64::saturating_add);
-                            metrics.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
-                            metrics.device_timing.record(receipt);
-                            metrics
-                                .device_timing_for(VNextExecutionWaveKind::Decode)
-                                .record(receipt);
-                            if let Some(sink) = sink {
-                                let recorded = match child_attribution {
-                                    Some(attribution) => attribution
-                                        .bind_terminal_timing(
-                                            receipt.completion().submission_timing().clone(),
-                                        )
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|attribution| {
-                                            sink.record_device_submission_attribution(&attribution)
-                                                .map_err(|error| error.to_string())
-                                        }),
-                                    None => sink
-                                        .record_physical_device_submission_timing(
-                                            receipt.completion(),
-                                        )
-                                        .map_err(|error| error.to_string()),
-                                };
-                                if let Err(error) = recorded {
-                                    metrics.record_failure(error.to_string());
-                                }
-                            }
-                        }
-                        Err(error) => metrics.record_failure(error.to_string()),
-                    },
-                );
-                let (receipt, guard) = pending.wait().await?;
-                (
-                    Ok(CompletionReadbackBatchObservation::Terminal(receipt)),
-                    ObservedVNextStep::Paired(guard),
-                    Some(cohort),
-                )
-            } else {
-                let pending = PendingVNextWaveReadback::submit(
-                    completion_reservation,
-                    completion,
-                    readbacks,
-                    step,
-                    Arc::clone(&self.reaper),
-                );
-                let (observation, step) = pending.wait().await.map_err(|error| {
-                    FerrumError::backend(format!("vNext completion task failed: {error}"))
-                })?;
-                (observation, ObservedVNextStep::Ordinary(step), None)
-            }
+            let pending = PendingVNextWaveReadback::submit(
+                completion_reservation,
+                completion,
+                readbacks,
+                step,
+                Arc::clone(&self.reaper),
+            );
+            pending.wait().await.map_err(|error| {
+                FerrumError::backend(format!("vNext completion task failed: {error}"))
+            })?
         };
         let observation = observation.map_err(|error| FerrumError::backend(error.to_string()))?;
         let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
@@ -8699,7 +8350,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             );
             token_mask_residency.invalidate_before_slot_release();
             drop(receipt);
-            return Err(self.abort_observed_step(step, message));
+            return Err(self.abort_step(step, message).await);
         }
         // A terminally successful command batch proves every encoded mask
         // upload reached this still-owned Step slot. Host output processing and
@@ -8720,9 +8371,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
             drop(receipt);
-            if let Err(failure) = step.retire_normal() {
+            if let Err(failure) = step.try_retire_normal() {
                 execution_event_error.get_or_insert_with(|| {
-                    format!("vNext diagnostic step retirement failed: {}", failure)
+                    format!(
+                        "vNext diagnostic step retirement failed: {}",
+                        failure.error()
+                    )
                 });
             }
             if let Some(error) = execution_event_error {
@@ -8865,7 +8519,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(processed) => processed,
                 Err(error) => {
                     drop(receipt);
-                    return Err(self.abort_observed_step(step, error.to_string()));
+                    return Err(self.abort_step(step, error.to_string()).await);
                 }
             };
         if let (Some(capture_claim), Some(capture)) =
@@ -8880,13 +8534,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 product_output_records,
             ) {
                 drop(receipt);
-                return Err(self.abort_observed_step(step, error.to_string()));
+                return Err(self.abort_step(step, error.to_string()).await);
             }
         }
         if let Some(decision) = teacher_forced_decision {
             if let Err(error) = apply_teacher_forced_decision(&mut logits, decision) {
                 drop(receipt);
-                return Err(self.abort_observed_step(step, error.to_string()));
+                return Err(self.abort_step(step, error.to_string()).await);
             }
         }
         self.metrics
@@ -8951,50 +8605,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
         drop(receipt);
-        match step.retire_normal() {
+        match step.try_retire_normal() {
             Ok(_) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
-                if let Some(deferred) = successor_maintenance.filter(|_| {
-                    participants
-                        .iter()
-                        .all(|participant| participant.sequence.active.load(Ordering::Acquire))
-                }) {
-                    // The optional second frame must not force a wait while
-                    // its parent occupies the lane. One evidenced maintenance
-                    // attempt here can reclaim idle graph slots for a later
-                    // grant, after the accepted parent has fully retired.
-                    let epoch_before = self.lane.reusable_execution_epoch();
-                    let maintained = deferred
-                        .maintain()
-                        .map_err(|error| FerrumError::backend(error.to_string()));
-                    if self.lane.reusable_execution_epoch() != epoch_before {
-                        self.reusable_execution_catalog_refresh_needed
-                            .store(true, Ordering::Release);
-                    }
-                    let maintained = maintained
-                        .and_then(|_| self.refresh_on_demand_reusable_execution_catalog());
-                    if let Err(error) = maintained {
-                        // This result is already committed. Preserve it while
-                        // reporting repair failure; core fail-closed state,
-                        // if any, still governs subsequent normal admission.
-                        self.metrics.record_lookahead_maintenance_failure(format!(
-                            "vNext post-retirement lookahead backing maintenance failed: {error}"
-                        ));
-                    }
-                }
                 if let Some(error) = execution_event_error {
                     let message = format!("vNext execution event emission failed: {error}");
                     self.metrics.record_failure(message.clone());
                     Err(FerrumError::backend(message))
                 } else {
-                    if let Some(cohort) = successor_cohort {
-                        self.retain_successor_rows(participants, &logits, cohort)?;
-                    }
                     Ok(logits)
                 }
             }
             Err(failure) => {
-                let message = format!("vNext step retirement failed: {}", failure);
+                let message = format!("vNext step retirement failed: {}", failure.error());
                 self.metrics.record_failure(message.clone());
                 Err(FerrumError::backend(message))
             }
@@ -9248,12 +8871,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         let mut token_batches = Vec::with_capacity(canonical_candidates.len());
         let mut previous_lengths = Vec::with_capacity(canonical_candidates.len());
-        let mut pending_rows = Vec::with_capacity(canonical_candidates.len());
-        let mut sampling_outputs = (0..canonical_candidates.len())
-            .map(|_| None)
-            .collect::<Vec<_>>();
-        let mut fresh_indices = Vec::new();
-        for (index, candidate) in canonical_candidates.iter().enumerate() {
+        let mut spans = Vec::with_capacity(canonical_candidates.len());
+        for candidate in &canonical_candidates {
             if !candidate.sequence.active.load(Ordering::Acquire) {
                 return Err(FerrumError::cancelled(format!(
                     "vNext cache `{}` is no longer active",
@@ -9263,11 +8882,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let (tokens, previous_len) = {
                 let current = candidate.sequence.tokens.lock();
                 let previous_len = current.len();
-                if inputs[candidate.original_index].kv_cache.num_tokens() != previous_len {
-                    return Err(FerrumError::request_validation(
-                        "vNext decode cache frontier differs from its model history",
-                    ));
-                }
                 if previous_len >= candidate.sequence.maximum_tokens {
                     return Err(FerrumError::request_validation(format!(
                         "vNext sequence reached its {} token ceiling",
@@ -9278,74 +8892,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 tokens.push(candidate.next_token);
                 (tokens, previous_len)
             };
-            let pending = candidate.sequence.pending_decode.lock().clone();
-            if let Some(pending) = &pending {
-                if pending.expected_cache_tokens != previous_len
-                    || pending.expected_input_token != candidate.next_token
-                {
-                    return Err(FerrumError::request_validation(
-                        "vNext pending decode input differs from its submitted token/frontier",
-                    ));
-                }
-                let buffered = async {
-                    let row = pending.cohort.read_submitted_row(pending.row).await?;
-                    self.refresh_on_demand_reusable_execution_catalog()?;
-                    let CompletionReadbackDisposition::Succeeded(output) = row.disposition() else {
-                        return Err(FerrumError::backend("vNext pending decode readback failed"));
-                    };
-                    let request = output.request();
-                    if request.participant_index() as usize != pending.row
-                        || request.node_id() != &self.io.output_node_id
-                        || request.resource_id() != &self.io.output_resource_id
-                        || request.logical_offset_bytes() != self.io.output_offset_bytes
-                        || request.output_layout() != self.io.output_layout
-                    {
-                        return Err(FerrumError::internal(
-                            "vNext pending decode returned a different product output",
-                        ));
-                    }
-                    self.decode_product_output(output.bytes(), VNextProductOutputMode::FullLogits)
-                }
-                .await;
-                match buffered {
-                    Ok(output) => sampling_outputs[index] = Some(output),
-                    Err(error) => {
-                        self.abort_decode_candidates(&canonical_candidates);
-                        return Err(error);
-                    }
-                }
-            } else {
-                fresh_indices.push(index);
-            }
-            token_batches.push(tokens);
-            previous_lengths.push(previous_len);
-            pending_rows.push(pending);
-        }
-
-        // A cached row belongs to its earlier submitted cohort. Only fresh
-        // participants enter a new canonical batch, and cached rows remain
-        // available if any fresh participant must defer admission.
-        let sequences = fresh_indices
-            .iter()
-            .map(|&index| Arc::clone(&canonical_candidates[index].sequence))
-            .collect::<Vec<_>>();
-        // Consume an existing child and advance fresh rows by one token before
-        // creating another cohort. Otherwise the fresh subset can leave a new
-        // child while the old pending subset becomes fresh, perpetuating split
-        // physical batches on each host turn.
-        let mut allow_lookahead = pending_rows.iter().all(Option::is_none)
-            && self.decode_lookahead_eligible(&sequences)
-            && fresh_indices.iter().all(|&index| {
-                let candidate = &canonical_candidates[index];
-                let input = &inputs[candidate.original_index];
-                input.lookahead.as_ref().is_some_and(|grant| {
-                    grant.matches_input(input)
-                        && grant.successor_input_tokens() <= candidate.sequence.maximum_tokens
-                })
-            });
-        for &index in &fresh_indices {
-            let candidate = &canonical_candidates[index];
-            let tokens = &token_batches[index];
             let extension_span = TokenSpanWork::from_token_ids(&tokens, 0..tokens.len())
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let extension = ResourceWorkShape::single(extension_span)
@@ -9369,168 +8915,62 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     return Err(error);
                 }
             }
-        }
-        if allow_lookahead {
-            for &index in &fresh_indices {
-                let candidate = &canonical_candidates[index];
-                let tokens = &token_batches[index];
-                let grant = inputs[candidate.original_index]
-                    .lookahead
-                    .as_ref()
-                    .expect("validated lookahead grant");
-                let span = TokenSpanWork::from_token_ids_with_fit(
-                    tokens,
-                    0..tokens.len(),
-                    grant.successor_input_tokens(),
-                )
+            let span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-                let target = ResourceWorkShape::single(span)
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-                let request = SequenceResourceExtensionRequest::new(
-                    target,
-                    AdmissionPressureAction::WaitForRelease,
-                )
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-                match candidate
-                    .sequence
-                    .session
-                    .try_ensure_backing_covers(request)
-                {
-                    Ok(SequenceResourceExtensionDecision::Current(_))
-                    | Ok(SequenceResourceExtensionDecision::Extended(_)) => {}
-                    Ok(_) => {
-                        // The optional extra frame never adds a wait or a
-                        // capacity failure to the ordinary current step.
-                        allow_lookahead = false;
-                        break;
-                    }
-                    Err(error) => return Err(FerrumError::backend(error.to_string())),
-                }
-            }
+            token_batches.push(tokens);
+            previous_lengths.push(previous_len);
+            spans.push(span);
         }
-        if !fresh_indices.is_empty() {
-            let fresh_batch = ExecutionBatchParticipants::new(
-                sequences
-                    .iter()
-                    .map(|sequence| Arc::clone(&sequence.session))
-                    .collect(),
+
+        let sequences = canonical_candidates
+            .iter()
+            .map(|candidate| Arc::clone(&candidate.sequence))
+            .collect::<Vec<_>>();
+        let output_roles = canonical_candidates
+            .iter()
+            .map(|candidate| VNextParticipantOutputRole::Decode(candidate.logits_policy.clone()))
+            .collect::<Vec<_>>();
+        let logits = match self
+            .execute_batch_step(
+                &batch,
+                &sequences,
+                &token_batches,
+                &spans,
+                VNextExecutionWaveKind::Decode,
+                &output_roles,
             )
-            .map_err(|error| FerrumError::request_validation(error.to_string()))?;
-            let fresh_tokens = fresh_indices
-                .iter()
-                .map(|&index| token_batches[index].clone())
-                .collect::<Vec<_>>();
-            let spans = fresh_indices
-                .iter()
-                .map(|&index| {
-                    let tokens = &token_batches[index];
-                    let fit = if allow_lookahead {
-                        inputs[canonical_candidates[index].original_index]
-                            .lookahead
-                            .as_ref()
-                            .expect("validated lookahead grant")
-                            .successor_input_tokens()
-                    } else {
-                        tokens.len()
-                    };
-                    TokenSpanWork::from_token_ids_with_fit(
-                        tokens,
-                        previous_lengths[index]..tokens.len(),
-                        fit,
-                    )
-                    .map_err(|error| FerrumError::backend(error.to_string()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let output_roles = fresh_indices
-                .iter()
-                .map(|&index| {
-                    VNextParticipantOutputRole::Decode(
-                        canonical_candidates[index].logits_policy.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let logits = match self
-                .execute_batch_step_with_lookahead(
-                    &fresh_batch,
-                    &sequences,
-                    &fresh_tokens,
-                    &spans,
-                    VNextExecutionWaveKind::Decode,
-                    &output_roles,
-                    allow_lookahead,
-                )
-                .await
-            {
-                Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
-                Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
-                }
-                Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
-                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
-                }
-                Err(error) => {
-                    if DecodeFailureDisposition::from_error(&error)
-                        == DecodeFailureDisposition::AbortSequence
-                    {
-                        self.abort_decode_candidates(&canonical_candidates);
-                    }
-                    return Err(error);
-                }
-            };
-            if logits.len() != fresh_indices.len() {
-                self.abort_decode_candidates(&canonical_candidates);
-                return Err(FerrumError::internal(format!(
-                    "vNext batch decode returned {} logits rows for {} fresh participants",
-                    logits.len(),
-                    fresh_indices.len(),
-                )));
+            .await
+        {
+            Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
+            Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
+                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
             }
-            for (&index, output) in fresh_indices.iter().zip(logits) {
-                sampling_outputs[index] = Some(output);
+            Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
+                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
             }
+            Err(error) => {
+                if DecodeFailureDisposition::from_error(&error)
+                    == DecodeFailureDisposition::AbortSequence
+                {
+                    self.abort_decode_candidates(&canonical_candidates);
+                }
+                return Err(error);
+            }
+        };
+        if logits.len() != canonical_candidates.len() {
+            self.abort_decode_candidates(&canonical_candidates);
+            return Err(FerrumError::internal(format!(
+                "vNext batch decode returned {} logits rows for {} participants",
+                logits.len(),
+                canonical_candidates.len()
+            )));
         }
-        let logits = sampling_outputs
-            .into_iter()
-            .map(|output| {
-                output.ok_or_else(|| {
-                    FerrumError::internal("vNext batch decode lost a pending or fresh output")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         for (sampling_output, candidate) in logits.iter().zip(&canonical_candidates) {
             if let Err(error) = sampling_output
                 .validate_for_policy(&candidate.logits_policy, self.io.output_elements)
             {
                 self.abort_decode_candidates(&canonical_candidates);
                 return Err(error);
-            }
-        }
-        // Commit buffered-row consumption only after every fresh result and
-        // the current host-selected output policy have been validated.
-        for (candidate, pending) in canonical_candidates.iter().zip(pending_rows) {
-            if let Some(pending) = pending {
-                let mut slot = candidate.sequence.pending_decode.lock();
-                if !candidate.sequence.active.load(Ordering::Acquire) {
-                    continue;
-                }
-                if !slot.as_ref().is_some_and(|current| {
-                    Arc::ptr_eq(&current.cohort, &pending.cohort) && current.row == pending.row
-                }) {
-                    drop(slot);
-                    self.abort_decode_candidates(&canonical_candidates);
-                    return Err(FerrumError::internal(
-                        "vNext pending decode changed before consumption",
-                    ));
-                }
-                if let Err(error) = pending.cohort.take_row(pending.row) {
-                    drop(slot);
-                    self.abort_decode_candidates(&canonical_candidates);
-                    return Err(error);
-                }
-                *slot = None;
-                self.metrics
-                    .lookahead_consumed_rows
-                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -10383,10 +9823,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let product_readback = serde_json::json!({
             "full_logits_waves": self.metrics.full_logits_readback_waves.load(Ordering::Relaxed),
             "greedy_token_waves": self.metrics.greedy_token_readback_waves.load(Ordering::Relaxed),
-            "lookahead_submitted_waves": self.metrics.lookahead_submitted_waves.load(Ordering::Relaxed),
-            "lookahead_serial_warmups": self.metrics.lookahead_serial_warmups.load(Ordering::Relaxed),
-            "lookahead_consumed_rows": self.metrics.lookahead_consumed_rows.load(Ordering::Relaxed),
-            "lookahead_maintenance_failures": self.metrics.lookahead_maintenance_failures.load(Ordering::Relaxed),
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
             "token_mask_residency_eligible": self.io.token_mask_residency_eligible,
             "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
@@ -11145,11 +10581,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             sequence.replayed_output_tokens,
             &completion,
         )?;
-        let has_pending_decode = sequence.pending_decode.lock().is_some();
-        if !has_pending_decode {
-            self.retain_completed_sequence_boundary(&sequence).await?;
-        }
-        sequence.complete(&completion).await?;
+        self.retain_completed_sequence_boundary(&sequence).await?;
+        sequence.complete(&completion)?;
         pending.completed = true;
         Ok(())
     }
@@ -11251,49 +10684,6 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
-
-    #[test]
-    fn lookahead_maintenance_failure_preserves_completed_wave_accounting() {
-        use std::sync::atomic::Ordering;
-
-        let metrics = super::VNextExecutorMetrics::default();
-        metrics.submitted_waves.store(1, Ordering::Relaxed);
-        metrics.completed_waves.store(1, Ordering::Relaxed);
-        metrics.record_lookahead_maintenance_failure("retired parent: optional trim failed");
-
-        assert_eq!(metrics.submitted_waves.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.completed_waves.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            metrics
-                .lookahead_maintenance_failures
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            metrics.last_failure.lock().as_deref(),
-            Some("retired parent: optional trim failed")
-        );
-
-        metrics.reset_after_startup();
-        assert_eq!(
-            metrics
-                .lookahead_maintenance_failures
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(metrics.completed_waves.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 0);
-        assert!(metrics.last_failure.lock().is_none());
-        metrics.record_failure("actual wave failure");
-        assert_eq!(metrics.failed_waves.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            metrics
-                .lookahead_maintenance_failures
-                .load(Ordering::Relaxed),
-            0
-        );
-    }
 
     use super::{
         apply_teacher_forced_decision, bounded_wall_anchor, budget_reusable_decode_seed_prefill,
@@ -12443,87 +11833,6 @@ mod tests {
             [first],
         );
         assert!(transaction.plans()[0].upload_required);
-    }
-
-    #[test]
-    fn product_token_mask_residency_child_invalidation_preserves_other_slot_and_rows() {
-        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
-        let mask = TokenSelectionMask::new(vec![1, 0, 1]);
-        let selection = test_selection_content(&mask);
-        let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
-        for (slot, contents) in [
-            (7, vec![selection.clone(), selection.clone()]),
-            (
-                8,
-                vec![neutral.clone(), selection.clone(), selection.clone()],
-            ),
-        ] {
-            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-                &residency,
-                Some(slot),
-                contents,
-            );
-            transaction.publish();
-            transaction.settle_success();
-        }
-
-        {
-            let mut child = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-                &residency,
-                Some(8),
-                [neutral.clone(), neutral.clone()],
-            );
-            assert!(!child.plans()[0].upload_required);
-            assert!(child.plans()[1].upload_required);
-            // Covers both an unchanged mask and an overwritten old selection.
-            // Neither child range is published ahead of terminal success.
-            child.invalidate_targets_before_slot_release();
-        }
-
-        let mut ledger = residency.lock();
-        for row in 0..2 {
-            assert!(
-                !ledger
-                    .prepare(Some(test_token_mask_target(7, row)), selection.clone())
-                    .upload_required,
-                "child invalidation must preserve the parent's successful slot"
-            );
-            assert!(
-                ledger
-                    .prepare(Some(test_token_mask_target(8, row)), neutral.clone())
-                    .upload_required,
-                "the child must not leave or publish residency proof"
-            );
-        }
-        assert!(
-            !ledger
-                .prepare(Some(test_token_mask_target(8, 2)), selection)
-                .upload_required,
-            "a participant range untouched by the child retains its proof"
-        );
-    }
-
-    #[test]
-    fn product_token_mask_residency_child_unknown_slot_invalidates_all() {
-        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
-        let neutral = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
-        for slot in [7, 8] {
-            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-                &residency,
-                Some(slot),
-                [neutral.clone()],
-            );
-            transaction.publish();
-            transaction.settle_success();
-        }
-        let mut child = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
-            &residency,
-            None,
-            [neutral],
-        );
-        assert!(child.plans()[0].upload_required);
-        child.invalidate_targets_before_slot_release();
-        assert!(residency.lock().entries.is_empty());
     }
 
     #[test]

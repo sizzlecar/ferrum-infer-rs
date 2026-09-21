@@ -236,10 +236,6 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub prefill_decode_execution: Option<ferrum_types::PrefillDecodeExecution>,
 
-    /// Permit one eligible pure-decode successor; absent means disabled.
-    #[serde(default)]
-    pub decode_lookahead: Option<bool>,
-
     /// Prefer prefilling until this many requests are active, equivalent to
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
@@ -473,11 +469,6 @@ impl RuntimeCliConfig {
             "FERRUM_PREFILL_DECODE_EXECUTION",
             self.prefill_decode_execution
                 .map(ferrum_types::PrefillDecodeExecution::as_runtime_value),
-        );
-        push_bool_entry(
-            &mut entries,
-            "FERRUM_DECODE_LOOKAHEAD",
-            self.decode_lookahead,
         );
         push_usize_entry(
             &mut entries,
@@ -879,23 +870,6 @@ impl Default for DevConfig {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn decode_lookahead_runtime_file_override_reaches_typed_engine_policy() {
-        for enabled in [false, true] {
-            let runtime = super::RuntimeCliConfig {
-                decode_lookahead: Some(enabled),
-                ..Default::default()
-            };
-            let snapshot =
-                ferrum_types::RuntimeConfigSnapshot::from_entries(runtime.runtime_config_entries());
-            let mut config = ferrum_types::EngineConfig::default();
-            config.apply_runtime_config_snapshot(&snapshot).unwrap();
-            assert_eq!(config.batching.decode_lookahead, enabled);
-        }
-        let runtime: super::RuntimeCliConfig = serde_json::from_str("{}").unwrap();
-        assert!(runtime.decode_lookahead.is_none());
-    }
-
     use super::*;
     use clap::{Parser, Subcommand};
 

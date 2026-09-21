@@ -14,7 +14,6 @@ use ferrum_models::VNextModelExecutor;
 use ferrum_types::{RequestId, TokenId};
 
 mod greedy_readback;
-mod lookahead;
 
 struct CpuFixture {
     executor: VNextModelExecutor<CpuDeviceRuntime>,

@@ -197,25 +197,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         }
-        if sequences
-            .iter()
-            .any(|sequence| sequence.pending_decode.lock().is_some())
-        {
-            // Pure decode owns consumption of the already submitted child.
-            // Restore prefill admission before returning Unsupported; dropping
-            // its armed guards would otherwise cancel unrelated ready work.
-            let authority = prefill_candidates
-                .iter()
-                .map(|candidate| (&candidate.slot, &candidate.sequence))
-                .collect::<Vec<_>>();
-            self.sequences
-                .lock()
-                .restore_prefill_batch_ready(&authority)?;
-            for guard in &mut prefill_guards {
-                guard.disarm();
-            }
-            return Ok(PlanRuntimeMixedBatchOutcome::Unsupported);
-        }
         let mut token_batches = Vec::with_capacity(sequences.len());
         let mut spans = Vec::with_capacity(sequences.len());
         let mut output_roles = Vec::with_capacity(sequences.len());

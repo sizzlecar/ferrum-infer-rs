@@ -7,9 +7,6 @@ mod reusable_binding_projection;
 #[path = "vnext_device_operation_wave_contract/submission_readback.rs"]
 mod submission_readback;
 
-#[path = "vnext_device_operation_wave_contract/forwarded_input_tests.rs"]
-mod forwarded_input_tests;
-
 use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 

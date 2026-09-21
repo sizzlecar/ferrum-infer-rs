@@ -34,7 +34,7 @@ impl EngineInner {
                 prefills.push(input);
             }
         }
-        let decodes = self.prepare_plan_runtime_decodes(decode_ids, false);
+        let decodes = self.prepare_plan_runtime_decodes(decode_ids);
         let prefill_ids = prefills
             .iter()
             .map(|input| input.request_id.clone())

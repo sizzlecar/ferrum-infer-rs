@@ -844,109 +844,14 @@ pub(super) enum ParticipantFlightPhase {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SequenceFrameRecord {
-    pub(super) frame: ActiveSequenceFrame,
-    pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
-}
-
-/// At most one submitted predecessor and its immediate successor. Frame
-/// ownership is independent of host completion order; retiring the head must
-/// never clear the successor's flight or make the session appear quiescent.
-#[derive(Debug, Clone, Default)]
-pub(super) struct SequenceFrameSlots {
-    head: Option<SequenceFrameRecord>,
-    successor: Option<SequenceFrameRecord>,
-}
-
-impl SequenceFrameSlots {
-    pub(super) fn is_empty(&self) -> bool {
-        self.head.is_none() && self.successor.is_none()
-    }
-
-    pub(super) fn head(&self) -> Option<ActiveSequenceFrame> {
-        self.head.as_ref().map(|record| record.frame)
-    }
-
-    pub(super) fn successor(&self) -> Option<ActiveSequenceFrame> {
-        self.successor.as_ref().map(|record| record.frame)
-    }
-
-    pub(super) fn tail(&self) -> Option<ActiveSequenceFrame> {
-        self.successor().or_else(|| self.head())
-    }
-
-    pub(super) fn get(&self, frame: ActiveSequenceFrame) -> Option<&SequenceFrameRecord> {
-        self.head
-            .iter()
-            .chain(self.successor.iter())
-            .find(|record| record.frame == frame)
-    }
-
-    pub(super) fn get_mut(
-        &mut self,
-        frame: ActiveSequenceFrame,
-    ) -> Option<&mut SequenceFrameRecord> {
-        self.head
-            .iter_mut()
-            .chain(self.successor.iter_mut())
-            .find(|record| record.frame == frame)
-    }
-
-    pub(super) fn insert_serial(&mut self, frame: ActiveSequenceFrame) {
-        assert!(
-            self.is_empty(),
-            "serial frame admission was validated while locked"
-        );
-        self.head = Some(SequenceFrameRecord {
-            frame,
-            submission_wave_flight: None,
-        });
-    }
-
-    /// The caller must first validate the sealed submitted predecessor and the
-    /// entire cohort while holding all session locks. This only mutates its
-    /// already-validated bounded bookkeeping.
-    pub(super) fn insert_successor(&mut self, frame: ActiveSequenceFrame) {
-        assert!(
-            self.head.is_some() && self.successor.is_none(),
-            "successor frame admission was validated while locked"
-        );
-        self.successor = Some(SequenceFrameRecord {
-            frame,
-            submission_wave_flight: None,
-        });
-    }
-
-    pub(super) fn remove(&mut self, frame: ActiveSequenceFrame) {
-        if self.head() == Some(frame) {
-            self.head = self.successor.take();
-        } else {
-            assert_eq!(
-                self.successor(),
-                Some(frame),
-                "exact frame retirement was validated while locked"
-            );
-            self.successor = None;
-        }
-    }
-
-    fn flight_count(&self) -> usize {
-        self.head
-            .iter()
-            .chain(self.successor.iter())
-            .filter(|record| record.submission_wave_flight.is_some())
-            .count()
-    }
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct ActiveSequenceSessionState {
     pub(super) epoch: SequenceSessionEpoch,
     pub(super) fingerprint: SequenceSessionFingerprint,
     pub(super) phase: SequenceSessionPhase,
     pub(super) next_frame: Option<ExecutionFrameId>,
-    pub(super) frames: SequenceFrameSlots,
+    pub(super) active_frame: Option<ActiveSequenceFrame>,
     pub(super) participant_flights: BTreeMap<ParticipantNodeKey, ParticipantFlightPhase>,
+    pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
     pub(super) state_transfer: SequenceStateTransferSlot,
     pub(super) completed_boundary: SequenceCompletedFrontier,
     pub(super) retired_frames: u64,
@@ -954,25 +859,11 @@ pub(super) struct ActiveSequenceSessionState {
 
 impl ActiveSequenceSessionState {
     pub(super) fn has_participant_flights(&self) -> bool {
-        !self.participant_flights.is_empty() || self.frames.flight_count() != 0
+        !self.participant_flights.is_empty() || self.submission_wave_flight.is_some()
     }
 
     pub(super) fn participant_flight_count(&self) -> usize {
-        self.participant_flights.len() + self.frames.flight_count()
-    }
-
-    pub(super) fn frame_has_node_flights(&self, frame: ActiveSequenceFrame) -> bool {
-        self.participant_flights
-            .keys()
-            .any(|key| key.frame_id() == frame.frame_id)
-    }
-
-    pub(super) fn frame_has_participant_flights(&self, frame: ActiveSequenceFrame) -> bool {
-        self.frame_has_node_flights(frame)
-            || self
-                .frames
-                .get(frame)
-                .is_some_and(|record| record.submission_wave_flight.is_some())
+        self.participant_flights.len() + usize::from(self.submission_wave_flight.is_some())
     }
 }
 
@@ -1251,7 +1142,7 @@ where
                     "sequence backing coverage target is incomparable with committed work",
                 ));
             }
-            if !active.frames.is_empty()
+            if active.active_frame.is_some()
                 || active.has_participant_flights()
                 || active.state_transfer.is_reserved()
             {
@@ -1359,7 +1250,7 @@ where
             }
             return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
         }
-        if !active.frames.is_empty()
+        if active.active_frame.is_some()
             || active.has_participant_flights()
             || active.state_transfer.is_reserved()
         {
@@ -1411,8 +1302,7 @@ where
             }
         }
         Ok(SequenceSessionCancelSnapshot {
-            active_frame: active.frames.head().map(|frame| frame.frame_id),
-            successor_frame: active.frames.successor().map(|frame| frame.frame_id),
+            active_frame: active.active_frame.map(|frame| frame.frame_id),
             participant_flights: u64::try_from(active.participant_flight_count())
                 .map_err(|_| invalid_resource("participant flight count exceeds u64"))?,
             state_transfer_pending: active.state_transfer.is_reserved(),
@@ -1461,7 +1351,7 @@ where
             }
         };
         if active.phase == SequenceSessionPhase::Poisoned
-            || !active.frames.is_empty()
+            || active.active_frame.is_some()
             || active.has_participant_flights()
             || active.state_transfer.is_reserved()
         {
@@ -1517,7 +1407,7 @@ where
             ),
         };
         if !phase_matches
-            || !active.frames.is_empty()
+            || active.active_frame.is_some()
             || active.has_participant_flights()
             || active.state_transfer.is_reserved()
         {
@@ -1539,7 +1429,6 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequenceSessionCancelSnapshot {
     active_frame: Option<ExecutionFrameId>,
-    successor_frame: Option<ExecutionFrameId>,
     participant_flights: u64,
     state_transfer_pending: bool,
 }
@@ -1547,10 +1436,6 @@ pub struct SequenceSessionCancelSnapshot {
 impl SequenceSessionCancelSnapshot {
     pub const fn active_frame(self) -> Option<ExecutionFrameId> {
         self.active_frame
-    }
-
-    pub const fn successor_frame(self) -> Option<ExecutionFrameId> {
-        self.successor_frame
     }
 
     pub const fn participant_flights(self) -> u64 {
@@ -2205,8 +2090,9 @@ where
                 ExecutionFrameId::try_from(1_u64)
                     .expect("the first execution frame id is non-zero"),
             ),
-            frames: SequenceFrameSlots::default(),
+            active_frame: None,
             participant_flights: BTreeMap::new(),
+            submission_wave_flight: None,
             state_transfer: SequenceStateTransferSlot::default(),
             completed_boundary: SequenceCompletedFrontier::default(),
             retired_frames: 0,

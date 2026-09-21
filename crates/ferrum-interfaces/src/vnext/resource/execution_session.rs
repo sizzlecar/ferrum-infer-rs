@@ -1,22 +1,22 @@
 //! Step admission and bound execution-stream lifecycle.
 
 use super::{
-    acquire_session_frames_with_backing, acquire_successor_session_frames_with_backing,
-    enter_sequence_dispatch, fmt, invalid_resource, issue_batch_step_id,
-    record_step_admission_profile, sequence_dispatch_is_poisoned, sequence_slot_active,
-    sequence_slot_is_poisoned, sequence_slot_poisoned_drained, sequence_slot_poisoned_undrained,
-    session_frame_capture_candidates, step_admission_profile_start, AbandonedSequenceMetadata,
-    AbandonedSequenceRecoveryError, ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt,
-    AdmissionFitPolicy, AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime,
-    Arc, AtomicU64, BatchCapacityClaimDecision, BatchParticipantAuthority, BoundExecutionStream,
+    acquire_session_frames_with_backing, enter_sequence_dispatch, fmt, invalid_resource,
+    issue_batch_step_id, record_step_admission_profile, sequence_dispatch_is_poisoned,
+    sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
+    sequence_slot_poisoned_undrained, session_frame_capture_candidates,
+    step_admission_profile_start, AbandonedSequenceMetadata, AbandonedSequenceRecoveryError,
+    ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, AdmissionFitPolicy,
+    AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64,
+    BatchCapacityClaimDecision, BatchParticipantAuthority, BoundExecutionStream,
     BoundExecutionStreamState, ClaimedBackingTransaction, DeviceRuntime,
     ExecutionBatchParticipants, ExecutionLane, ExecutionStreamCreationError,
     LaneBackingPrepareDecision, LogicalAdmissionCoordinatorId, LogicalBackingSliceAuthority,
     Ordering, RequestIdentity, RunId, SequenceAuthorityId, SequenceBackingSnapshot,
     SequenceExecutionAuthoritySource, Serialize, StepAdmissionBackingDeferral,
     StepResourceAdmissionDecision, StepResourceAdmissionProfilePhase, StepResourceAdmissionRequest,
-    StepResourceLease, StreamState, SubmittedWavePredecessor, TrustedPlanRuntimeEvidence,
-    VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
+    StepResourceLease, StreamState, TrustedPlanRuntimeEvidence, VNextError,
+    SEQUENCE_DISPATCH_POISONED_BIT,
 };
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ where
         request: StepResourceAdmissionRequest,
         lane: &Arc<ExecutionLane<R>>,
     ) -> Result<StepResourceAdmissionDecision<R>, VNextError> {
-        self.try_begin_step_inner::<false, _>(request, lane, None, |_, _| {})
+        self.try_begin_step_inner::<false, _>(request, lane, |_, _| {})
     }
 
     pub fn try_begin_step_profiled<F>(
@@ -41,39 +41,13 @@ where
     where
         F: FnMut(StepResourceAdmissionProfilePhase, Duration),
     {
-        self.try_begin_step_inner::<true, _>(request, lane, None, observer)
-    }
-
-    /// Admits one immediate same-cohort successor behind a submitted parent.
-    /// The predecessor retains its physical claims independently of the parent
-    /// Step, and the request must carry its sealed dependent-token binding.
-    pub fn try_begin_successor_step(
-        &self,
-        request: StepResourceAdmissionRequest,
-        lane: &Arc<ExecutionLane<R>>,
-        predecessor: Arc<SubmittedWavePredecessor<R>>,
-    ) -> Result<StepResourceAdmissionDecision<R>, VNextError> {
-        self.try_begin_step_inner::<false, _>(request, lane, Some(predecessor), |_, _| {})
-    }
-
-    pub fn try_begin_successor_step_profiled<F>(
-        &self,
-        request: StepResourceAdmissionRequest,
-        lane: &Arc<ExecutionLane<R>>,
-        predecessor: Arc<SubmittedWavePredecessor<R>>,
-        observer: F,
-    ) -> Result<StepResourceAdmissionDecision<R>, VNextError>
-    where
-        F: FnMut(StepResourceAdmissionProfilePhase, Duration),
-    {
-        self.try_begin_step_inner::<true, _>(request, lane, Some(predecessor), observer)
+        self.try_begin_step_inner::<true, _>(request, lane, observer)
     }
 
     fn try_begin_step_inner<const PROFILE: bool, F>(
         &self,
         request: StepResourceAdmissionRequest,
         lane: &Arc<ExecutionLane<R>>,
-        predecessor: Option<Arc<SubmittedWavePredecessor<R>>>,
         mut observer: F,
     ) -> Result<StepResourceAdmissionDecision<R>, VNextError>
     where
@@ -120,21 +94,6 @@ where
         {
             return Err(invalid_resource(
                 "step admission requires the reusable execution lane bound to its plan runtime",
-            ));
-        }
-        if let Some(predecessor) = predecessor.as_deref() {
-            predecessor.validate_successor_candidates(
-                &session_frame_capture_candidates(&self.sessions),
-                lane.id(),
-            )?;
-            predecessor.validate_successor_work(&work_shape)?;
-        } else if work_shape
-            .participant_work()
-            .iter()
-            .any(|work| work.token_span().submitted_token_source().is_some())
-        {
-            return Err(invalid_resource(
-                "submitted token input requires the matching successor admission authority",
             ));
         }
         let reusable_execution_bucket = reusable_execution_bucket_id
@@ -276,20 +235,11 @@ where
         let phase_started = step_admission_profile_start::<PROFILE>();
         let batch_step_id = issue_batch_step_id()?;
         let candidates = session_frame_capture_candidates(&self.sessions);
-        let captured_frames = match predecessor.as_deref() {
-            Some(predecessor) => acquire_successor_session_frames_with_backing(
-                &candidates,
-                batch_step_id,
-                claimed_backing.work_shape(),
-                lane.id(),
-                predecessor,
-            )?,
-            None => acquire_session_frames_with_backing(
-                &candidates,
-                batch_step_id,
-                claimed_backing.work_shape(),
-            )?,
-        };
+        let captured_frames = acquire_session_frames_with_backing(
+            &candidates,
+            batch_step_id,
+            claimed_backing.work_shape(),
+        )?;
         let participants = self
             .sessions
             .iter()
@@ -301,15 +251,13 @@ where
                 session,
             })
             .collect();
-        let mut step = StepResourceLease::new(
+        let decision = StepResourceAdmissionDecision::Admitted(Arc::new(StepResourceLease::new(
             participants,
             Arc::clone(lane),
             reusable_execution_bucket,
             batch_step_id,
             claimed_backing,
-        )?;
-        step.predecessor = predecessor;
-        let decision = StepResourceAdmissionDecision::Admitted(Arc::new(step));
+        )?));
         record_step_admission_profile::<PROFILE, _>(
             &mut observer,
             StepResourceAdmissionProfilePhase::FrameCaptureAndLease,

@@ -1355,12 +1355,6 @@ impl SequenceState {
         }
     }
 
-    pub(super) fn remaining_output_tokens(&self) -> usize {
-        self.sampling_params
-            .max_tokens
-            .saturating_sub(self.generated_tokens.len())
-    }
-
     pub(super) fn can_use_model_greedy_argmax(&self) -> bool {
         use ferrum_types::ResponseFormat;
 

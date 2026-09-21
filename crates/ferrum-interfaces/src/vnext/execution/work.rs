@@ -1,31 +1,7 @@
 use super::{
     invalid_plan, Deserialize, Deserializer, Digest, Range, Serialize, Sha256, VNextError,
 };
-use crate::vnext::{CompletionReadbackRequest, SubmittedOperationReceipt};
 use std::sync::Arc;
-
-/// Process-local source evidence for an input whose value is still on device.
-/// It identifies an exact submitted output; it does not invent a host token.
-#[derive(Debug, Clone)]
-pub(crate) struct SubmittedTokenSpanSource {
-    submission_fingerprint: String,
-    parent_work_fingerprint: String,
-    source: CompletionReadbackRequest,
-}
-
-impl SubmittedTokenSpanSource {
-    pub(crate) fn source(&self) -> &CompletionReadbackRequest {
-        &self.source
-    }
-
-    pub(crate) fn submission_fingerprint(&self) -> &str {
-        &self.submission_fingerprint
-    }
-
-    pub(crate) fn parent_work_fingerprint(&self) -> &str {
-        &self.parent_work_fingerprint
-    }
-}
 
 pub const MAX_PROVIDER_WORKSPACE_SHAPE_BUCKETS: usize = 64;
 
@@ -88,8 +64,6 @@ pub struct TokenSpanWork {
     // identity, serialized plans, or resource admission fingerprints.
     #[serde(skip)]
     checkpoint_tokens: Option<Arc<[u32]>>,
-    #[serde(skip)]
-    submitted_token: Option<Arc<SubmittedTokenSpanSource>>,
 }
 
 impl std::fmt::Debug for TokenSpanWork {
@@ -171,54 +145,7 @@ impl TokenSpanWork {
             immediate_end_token,
             fingerprint: format!("{:x}", digest.finalize()),
             checkpoint_tokens: None,
-            submitted_token: None,
         })
-    }
-
-    pub(crate) fn from_submitted_token(
-        parent: &Self,
-        submission: &SubmittedOperationReceipt,
-        source: CompletionReadbackRequest,
-    ) -> Result<Self, VNextError> {
-        let end = parent.full_input_tokens.checked_add(1).ok_or_else(|| {
-            invalid_plan("submitted token continuation exceeds the token address space")
-        })?;
-        if parent.immediate_end_token != parent.full_input_tokens
-            || parent.checkpoint_tokens.is_some()
-            || end > parent.fit_input_tokens
-            || source.output_layout().element_type() != crate::vnext::ElementType::U32
-            || source.output_layout().element_count() != 1
-        {
-            return Err(invalid_plan(
-                "submitted token continuation requires one U32 output and admitted context headroom without checkpoint token evidence",
-            ));
-        }
-        let identity =
-            serde_json::to_vec(&(parent.fingerprint(), submission.fingerprint(), &source))
-                .map_err(|error| {
-                    invalid_plan(format!("submitted token identity encode failed: {error}"))
-                })?;
-        let mut digest = Sha256::new();
-        digest.update(b"ferrum.runtime-vnext.submitted-token-span-work.v1\0");
-        digest.update(identity);
-        Ok(Self {
-            immediate_tokens: 1,
-            full_input_tokens: end,
-            fit_input_tokens: parent.fit_input_tokens,
-            immediate_start_token: parent.full_input_tokens,
-            immediate_end_token: end,
-            fingerprint: format!("{:x}", digest.finalize()),
-            checkpoint_tokens: None,
-            submitted_token: Some(Arc::new(SubmittedTokenSpanSource {
-                submission_fingerprint: submission.fingerprint().to_owned(),
-                parent_work_fingerprint: parent.fingerprint().to_owned(),
-                source,
-            })),
-        })
-    }
-
-    pub(crate) fn submitted_token_source(&self) -> Option<&SubmittedTokenSpanSource> {
-        self.submitted_token.as_deref()
     }
 
     /// Retains the exact input for completed-state prefix validation. The

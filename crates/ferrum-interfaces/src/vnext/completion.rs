@@ -2282,7 +2282,6 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let mut guard = record
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
-        let mut predecessor_failure = None;
         let observation = match &*guard {
             CompletionRecord::StateTransfer(_) => {
                 return Err(invalid_completion(
@@ -2304,27 +2303,12 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 return Err(invalid_completion("completion slot is already reaped"));
             }
             CompletionRecord::InFlight {
-                resources,
                 lane,
                 fence,
                 batch_identity,
                 timing_mode,
                 ..
             } => {
-                if let CompletionResourceLease::Wave(wave) = resources {
-                    match wave.step_resources().predecessor_is_retired() {
-                        Ok(true) => {}
-                        Ok(false) if lane.is_reusable() => {
-                            return Ok(BoundCompletionObservation::Pending);
-                        }
-                        Ok(false) => {
-                            predecessor_failure = Some(invalid_completion(
-                                "dependent completion lane failed before its predecessor retired",
-                            ));
-                        }
-                        Err(error) => predecessor_failure = Some(error),
-                    }
-                }
                 let (observed, wait_timing) =
                     observe_device_fence(lane, fence, blocking, *timing_mode);
                 match observed {
@@ -2386,11 +2370,6 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         if let FenceObservation::Terminal(mut disposition, fence_timing, submission_timing) =
             observation
         {
-            if let Some(error) = predecessor_failure {
-                disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
-                    QuiescentCompletionContractFailure::new(error.to_string()),
-                );
-            }
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
             let CompletionRecord::InFlight {
                 resources,
@@ -3006,10 +2985,7 @@ impl CompletionReadbackBatchRequest {
         self.requests.is_empty()
     }
 
-    pub(crate) fn validate_for(
-        &self,
-        batch_identity: &BatchOperationIdentity,
-    ) -> Result<(), VNextError> {
+    fn validate_for(&self, batch_identity: &BatchOperationIdentity) -> Result<(), VNextError> {
         let node_id = self.requests[0].node_id();
         let node_index = batch_identity.node_index(node_id).ok_or_else(|| {
             invalid_completion("completion readback batch node is absent from its submission")
@@ -3701,33 +3677,6 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
 
     pub fn slot_id(&self) -> CompletionSlotId {
         self.receipt.slot_id()
-    }
-
-    /// Captures one predecessor before handing this completion to a waiting
-    /// worker. A concurrent observer makes this fail immediately rather than
-    /// blocking behind a device-fence wait while holding scheduler authority.
-    pub fn take_submitted_predecessor(
-        &self,
-    ) -> Result<super::SubmittedWavePredecessor<R>, VNextError> {
-        let reaper = self
-            .reaper
-            .upgrade()
-            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?;
-        let record = reaper.lookup(self.slot_id())?;
-        let mut record = record.try_lock().map_err(|_| {
-            invalid_completion("predecessor capture requires an unobserved completion slot")
-        })?;
-        match &mut *record {
-            CompletionRecord::InFlight {
-                resources: CompletionResourceLease::Wave(wave),
-                receipt,
-                recovery_state: CompletionRecoveryState::Unobserved,
-                ..
-            } if receipt == &self.receipt => wave.take_submitted_predecessor(self.receipt.clone()),
-            _ => Err(invalid_completion(
-                "predecessor requires this exact submitted full-plan completion",
-            )),
-        }
     }
 
     pub fn poll(&self) -> Result<CompletionObservation, VNextError> {

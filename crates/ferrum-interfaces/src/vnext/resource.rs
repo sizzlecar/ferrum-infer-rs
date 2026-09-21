@@ -93,8 +93,6 @@ pub(crate) use backing_initialization::{
 };
 mod invocation;
 pub use invocation::*;
-mod submission_dependency;
-pub use submission_dependency::{SubmissionWaveInputForward, SubmittedWavePredecessor};
 mod execution_session;
 pub use execution_session::*;
 mod transaction;

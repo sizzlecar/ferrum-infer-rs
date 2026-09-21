@@ -16,9 +16,6 @@ use super::{
 use crate::vnext::DeviceReusableExecutionProgramId;
 use crate::vnext::{ReusableExecutionBucketId, ReusableExecutionBucketSpec};
 
-mod successor_frames;
-pub(super) use successor_frames::acquire_successor_session_frames_with_backing;
-
 /// Resources whose lifetime is one exact continuous-batch execution frame.
 /// Child invocation leases retain this scope through `Arc`, so shared frame
 /// capacity and every participant authority outlive asynchronous device work.
@@ -29,8 +26,7 @@ where
 {
     // The transaction releases physical extents before its logical claim,
     // then per-sequence frame guards release before their parent sessions.
-    pub(super) claimed_backing: Arc<ClaimedBackingTransaction>,
-    pub(super) predecessor: Option<Arc<super::SubmittedWavePredecessor<R>>>,
+    pub(super) claimed_backing: ClaimedBackingTransaction,
     pub(super) participants: Vec<AdmittedStepParticipant<R>>,
     pub(super) invocation_registry: Arc<InvocationRegistry>,
     pub(super) execution_lane: Arc<ExecutionLane<R>>,
@@ -168,8 +164,8 @@ pub(super) struct SequenceFrameCaptureCandidate<R>
 where
     R: DeviceRuntime,
 {
-    pub(super) frame: SequenceFrameCandidate,
-    pub(super) resources: Arc<AdmittedSequenceResources<R>>,
+    frame: SequenceFrameCandidate,
+    resources: Arc<AdmittedSequenceResources<R>>,
 }
 
 pub(super) struct SessionFrameHold {
@@ -340,11 +336,8 @@ fn prepare_participant_node_flights(
                 if active.epoch == candidate.epoch
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
-                    && active.frames.successor().is_none()
-                    && active
-                        .frames
-                        .get(candidate.frame)
-                        .is_some_and(|record| record.submission_wave_flight.is_none())
+                    && active.active_frame == Some(candidate.frame)
+                    && active.submission_wave_flight.is_none()
                     && !active.participant_flights.contains_key(key) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.epoch
@@ -449,12 +442,7 @@ impl Drop for PreparedSubmissionWaveParticipantFlightHold {
             SequenceSessionSlotState::Active(active)
                 if active.epoch == self.epoch && active.fingerprint == self.fingerprint =>
             {
-                if active
-                    .frames
-                    .get_mut(self.frame)
-                    .and_then(|record| record.submission_wave_flight.take())
-                    != Some(self.phase)
-                {
+                if active.submission_wave_flight.take() != Some(self.phase) {
                     active.phase = SequenceSessionPhase::Poisoned;
                 }
             }
@@ -537,11 +525,9 @@ pub(super) fn prepare_submission_wave_participant_flights(
                 if active.epoch == candidate.epoch
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
+                    && active.active_frame == Some(candidate.frame)
                     && active.participant_flights.is_empty()
-                    && active
-                        .frames
-                        .get(candidate.frame)
-                        .is_some_and(|record| record.submission_wave_flight.is_none()) => {}
+                    && active.submission_wave_flight.is_none() => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.epoch
                     || active.fingerprint != candidate.fingerprint =>
@@ -563,41 +549,32 @@ pub(super) fn prepare_submission_wave_participant_flights(
         }
     }
 
-    let mut inserted_slots = Vec::<(usize, ActiveSequenceFrame)>::with_capacity(candidates.len());
-    for ((candidate, _), &slot_index) in candidates.iter().zip(&slot_indices) {
+    let mut inserted_slots = Vec::<usize>::with_capacity(candidates.len());
+    for &slot_index in &slot_indices {
         let previous = {
             let SequenceSessionSlotState::Active(active) = &mut *states[slot_index] else {
                 unreachable!("all submission wave participants were validated");
             };
             active
-                .frames
-                .get_mut(candidate.frame)
-                .expect("validated exact submission frame remains present while locked")
                 .submission_wave_flight
                 .replace(ParticipantFlightPhase::Prepared)
         };
         if previous.is_some() {
-            for (rollback_slot, rollback_frame) in inserted_slots.into_iter().rev() {
+            for rollback_slot in inserted_slots.into_iter().rev() {
                 if let SequenceSessionSlotState::Active(rollback) = &mut *states[rollback_slot] {
-                    if let Some(record) = rollback.frames.get_mut(rollback_frame) {
-                        record.submission_wave_flight = None;
-                    }
+                    rollback.submission_wave_flight = None;
                     rollback.phase = SequenceSessionPhase::Poisoned;
                 }
             }
             if let SequenceSessionSlotState::Active(active) = &mut *states[slot_index] {
-                active
-                    .frames
-                    .get_mut(candidate.frame)
-                    .expect("validated exact submission frame remains present while locked")
-                    .submission_wave_flight = previous;
+                active.submission_wave_flight = previous;
                 active.phase = SequenceSessionPhase::Poisoned;
             }
             return Err(invalid_resource(
                 "submission wave participant flights changed during atomic insertion",
             ));
         }
-        inserted_slots.push((slot_index, candidate.frame));
+        inserted_slots.push(slot_index);
     }
     drop(states);
 
@@ -673,11 +650,9 @@ fn transition_submission_wave_participant_flights(
                 if active.epoch == hold.epoch
                     && active.fingerprint == hold.fingerprint
                     && active.phase == SequenceSessionPhase::Open
+                    && active.active_frame == Some(hold.frame)
                     && active.participant_flights.is_empty()
-                    && active
-                        .frames
-                        .get(hold.frame)
-                        .is_some_and(|record| record.submission_wave_flight == Some(expected)) => {}
+                    && active.submission_wave_flight == Some(expected) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != hold.epoch || active.fingerprint != hold.fingerprint =>
             {
@@ -697,15 +672,11 @@ fn transition_submission_wave_participant_flights(
             }
         }
     }
-    for (hold, state) in holds.iter().zip(&mut states) {
+    for state in &mut states {
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all submission wave participants were validated while locked");
         };
-        active
-            .frames
-            .get_mut(hold.frame)
-            .expect("validated exact submission frame remains present while locked")
-            .submission_wave_flight = Some(next);
+        active.submission_wave_flight = Some(next);
     }
     drop(states);
     for hold in holds {
@@ -779,14 +750,12 @@ fn transition_participant_flights(
                 if active.epoch == hold.epoch
                     && active.fingerprint == hold.fingerprint
                     && active.phase == SequenceSessionPhase::Open
-                    && active.frames.successor().is_none()
-                    && active
-                        .frames
-                        .get(ActiveSequenceFrame {
+                    && active.active_frame
+                        == Some(ActiveSequenceFrame {
                             frame_id: hold.key.frame_id(),
                             batch_step_id: hold.batch_step_id,
                         })
-                        .is_some_and(|record| record.submission_wave_flight.is_none())
+                    && active.submission_wave_flight.is_none()
                     && active.participant_flights.get(&hold.key) == Some(&expected) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != hold.epoch || active.fingerprint != hold.fingerprint =>
@@ -835,13 +804,11 @@ impl Drop for SessionFrameHold {
         if let SequenceSessionSlotState::Active(active) = &mut *state {
             if active.epoch == self.epoch
                 && active.fingerprint == self.fingerprint
-                && active
-                    .frames
-                    .get(ActiveSequenceFrame {
+                && active.active_frame
+                    == Some(ActiveSequenceFrame {
                         frame_id: self.frame_id,
                         batch_step_id: self.batch_step_id,
                     })
-                    .is_some()
             {
                 active.phase = SequenceSessionPhase::Poisoned;
             }
@@ -899,7 +866,7 @@ pub(super) fn acquire_session_frames(
                 if active.epoch == candidate.epoch
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
-                    && active.frames.is_empty()
+                    && active.active_frame.is_none()
                     && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
@@ -929,7 +896,7 @@ pub(super) fn acquire_session_frames(
             .take()
             .expect("validated session has a next execution frame");
         active.next_frame = execution_frame_successor(frame_id);
-        active.frames.insert_serial(ActiveSequenceFrame {
+        active.active_frame = Some(ActiveSequenceFrame {
             frame_id,
             batch_step_id,
         });
@@ -995,7 +962,7 @@ where
                 if active.epoch == candidate.frame.epoch
                     && active.fingerprint == candidate.frame.fingerprint
                     && active.phase == SequenceSessionPhase::Open
-                    && active.frames.is_empty()
+                    && active.active_frame.is_none()
                     && !active.state_transfer.is_reserved()
                     && active.next_frame.is_some() => {}
             SequenceSessionSlotState::Active(active)
@@ -1047,7 +1014,7 @@ where
             .take()
             .expect("validated session has a next execution frame");
         active.next_frame = execution_frame_successor(frame_id);
-        active.frames.insert_serial(ActiveSequenceFrame {
+        active.active_frame = Some(ActiveSequenceFrame {
             frame_id,
             batch_step_id,
         });
@@ -1090,13 +1057,11 @@ pub(super) fn poison_session_frame(hold: &SessionFrameHold) {
     if let SequenceSessionSlotState::Active(active) = &mut *state {
         if active.epoch == hold.epoch
             && active.fingerprint == hold.fingerprint
-            && active
-                .frames
-                .get(ActiveSequenceFrame {
+            && active.active_frame
+                == Some(ActiveSequenceFrame {
                     frame_id: hold.frame_id,
                     batch_step_id: hold.batch_step_id,
                 })
-                .is_some()
         {
             active.phase = SequenceSessionPhase::Poisoned;
         }
@@ -1142,28 +1107,20 @@ pub(super) fn finalize_session_frames_with_boundary(
                 "step participant session is no longer active",
             ));
         };
-        let frame = ActiveSequenceFrame {
-            frame_id: hold.frame_id,
-            batch_step_id: hold.batch_step_id,
-        };
         if active.epoch != hold.epoch
             || active.fingerprint != hold.fingerprint
-            || active.frames.get(frame).is_none()
-            || (finalization != StepFrameFinalization::Abort
-                && active.next_frame
-                    != active
-                        .frames
-                        .tail()
-                        .and_then(|tail| execution_frame_successor(tail.frame_id)))
-            || active.frame_has_participant_flights(frame)
-            || (finalization == StepFrameFinalization::Commit
-                && active.frames.head() != Some(frame))
+            || active.active_frame
+                != Some(ActiveSequenceFrame {
+                    frame_id: hold.frame_id,
+                    batch_step_id: hold.batch_step_id,
+                })
+            || active.next_frame != execution_frame_successor(hold.frame_id)
+            || active.has_participant_flights()
             || (finalization == StepFrameFinalization::Commit
                 && active.phase == SequenceSessionPhase::Poisoned)
             || (finalization == StepFrameFinalization::Commit && active.retired_frames == u64::MAX)
             || (finalization == StepFrameFinalization::RollbackUnsubmitted
-                && (active.phase != SequenceSessionPhase::Open
-                    || active.frames.tail() != Some(frame)))
+                && active.phase != SequenceSessionPhase::Open)
         {
             return Err(invalid_resource(
                 "step finalization differs from its exact session frame or has live participant work",
@@ -1190,13 +1147,7 @@ pub(super) fn finalize_session_frames_with_boundary(
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all step participant sessions were validated");
         };
-        // A completed head may retire while its submitted successor still owns
-        // its flight. Remove only this frame; the successor keeps the session
-        // non-quiescent and becomes the next frame eligible to commit.
-        active.frames.remove(ActiveSequenceFrame {
-            frame_id: hold.frame_id,
-            batch_step_id: hold.batch_step_id,
-        });
+        active.active_frame = None;
         if let Some(frontier) = frontier {
             active.completed_boundary = frontier;
         }

@@ -333,48 +333,6 @@ fn mock_kv(cache_id: &str) -> Arc<dyn KvCacheHandle> {
     Arc::new(TestKvCacheHandle::new(cache_id))
 }
 
-#[test]
-fn one_step_decode_grant_binds_request_cache_and_frontier_without_dummy_tokens() {
-    use ferrum_interfaces::{
-        model_executor::LogitsReturnPolicy, OneStepDecodeGrant, PlanRuntimeDecodeInput,
-    };
-    let cache = |id: &str, frontier| {
-        let mut cache = TestKvCacheHandle::new(id);
-        cache.block_table.sequence_length = frontier;
-        Arc::new(cache) as Arc<dyn KvCacheHandle>
-    };
-    let mut input = PlanRuntimeDecodeInput::new(
-        RequestId::new(),
-        ferrum_types::TokenId::new(53),
-        cache("cache-a", 12),
-    );
-    assert!(input.lookahead.is_none());
-    assert!(OneStepDecodeGrant::for_input(&input, 2).is_none());
-    input.logits_policy = LogitsReturnPolicy::GreedyArgmax {
-        token_mask: None,
-        repetition_penalty: None,
-    };
-    for remaining in [0, 1] {
-        assert!(OneStepDecodeGrant::for_input(&input, remaining).is_none());
-    }
-    let grant = OneStepDecodeGrant::for_input(&input, 2).unwrap();
-    assert_eq!(grant.successor_input_tokens(), 14);
-    assert!(grant.matches_input(&input));
-    let mut changed = input.clone();
-    changed.request_id = RequestId::new();
-    assert!(!grant.matches_input(&changed));
-    changed = input.clone();
-    changed.kv_cache = cache("cache-b", 12);
-    assert!(!grant.matches_input(&changed));
-    changed.kv_cache = cache("cache-a", 13);
-    assert!(!grant.matches_input(&changed));
-    changed = input.clone();
-    changed.logits_policy = LogitsReturnPolicy::FullLogits;
-    assert!(!grant.matches_input(&changed));
-    input.kv_cache = cache("cache-a", usize::MAX - 1);
-    assert!(OneStepDecodeGrant::for_input(&input, 2).is_none());
-}
-
 fn recurrent_spec(request_id: RequestId) -> RecurrentStateSpec {
     RecurrentStateSpec {
         request_id,
