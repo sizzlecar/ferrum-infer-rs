@@ -276,16 +276,73 @@ pub fn detect_rust_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Snapshot all `FERRUM_*` env vars in the current process, sorted.
+/// Snapshot UTF-8 `FERRUM_*` env vars in the current process, sorted.
+/// Entries whose name or value is not UTF-8 are omitted rather than lossily
+/// replacing bytes and reporting a value that was never configured.
 pub fn capture_ferrum_env() -> BTreeMap<String, String> {
-    std::env::vars()
-        .filter(|(k, _)| k.starts_with("FERRUM_"))
+    std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            if !key.starts_with("FERRUM_") {
+                return None;
+            }
+            Some((key, value.into_string().ok()?))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_ferrum_env_skips_non_unicode_in_subprocess() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt, process::Command};
+
+        const CHILD: &str = "BENCH_ENV_CAPTURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(
+                capture_ferrum_env(),
+                BTreeMap::from([
+                    ("FERRUM_TEST_EMPTY".into(), String::new()),
+                    ("FERRUM_TEST_VALID".into(), "保留=original".into()),
+                ])
+            );
+            return;
+        }
+
+        // Mutate only the child's environment, preserving the test process and
+        // any loader configuration needed to launch this exact test binary.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        for (key, _) in std::env::vars_os() {
+            if key.as_encoded_bytes().starts_with(b"FERRUM_") {
+                command.env_remove(key);
+            }
+        }
+        let result = command
+            .args([
+                "--exact",
+                "env::tests::capture_ferrum_env_skips_non_unicode_in_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", OsString::from_vec(b"/invalid/\xff".to_vec()))
+            .env(OsString::from_vec(b"OTHER_\xff".to_vec()), "ignored")
+            .env(OsString::from_vec(b"FERRUM_\xff".to_vec()), "ignored")
+            .env("FERRUM_TEST_INVALID", OsString::from_vec(vec![0xff]))
+            .env("FERRUM_TEST_EMPTY", "")
+            .env("FERRUM_TEST_VALID", "保留=original")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated environment capture failed: {}\n{}\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     fn fixture_env() -> Env {
         let mut ferrum_env = BTreeMap::new();
