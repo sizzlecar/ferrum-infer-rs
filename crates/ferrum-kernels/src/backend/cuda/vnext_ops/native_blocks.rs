@@ -248,15 +248,11 @@ impl CudaNativeBlockKernels {
         let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
         let q4k =
             part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
-        // The shared-memory matrix tile pays off for substantial batches.
-        // Keep short decode and small output matrices on the original warp
-        // path. Only the F16 activation interface is performance-qualified;
-        // its coefficients, products and accumulators still remain F32.
-        let shared_gemm = if rows >= 128
-            && part.rows >= 128
-            && input_type == ElementType::F16
-            && output_type == ElementType::F16
-        {
+        // Select using this physical matrix part, not the combined logical
+        // output width. The medium-row range is qualified only for substantial
+        // Q5K/Q6K matrices; Q4K and small matrices keep their existing crossover.
+        // The F16 interface still reconstructs and accumulates in F32.
+        let shared_gemm = if use_shared_gemm(part, rows, input_type, output_type) {
             match part.format {
                 weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K) => {
                     Some(&self.gemm_q4k_f16)
@@ -325,6 +321,37 @@ impl CudaNativeBlockKernels {
         }
         .map(|_| ())
         .map_err(|error| CudaDeviceRuntimeError::driver("native matrix linear launch", error))
+    }
+}
+
+fn use_shared_gemm(
+    part: &weights::MatrixPart,
+    rows: u32,
+    input_type: ferrum_interfaces::vnext::ElementType,
+    output_type: ferrum_interfaces::vnext::ElementType,
+) -> bool {
+    use crate::gguf_blocks::GgufBlockFormat;
+    use ferrum_interfaces::vnext::ElementType;
+    if input_type != ElementType::F16 || output_type != ElementType::F16 {
+        return false;
+    }
+    // Preserve the previously qualified large-row path, including its small-K
+    // and partitioned-output cases. The format match at launch remains final.
+    if rows >= 128 && part.rows >= 128 {
+        return true;
+    }
+    if rows < 32 || part.transform.is_some() {
+        return false;
+    }
+    match part.format {
+        weights::MatrixFormat::Block(GgufBlockFormat::Q5K) => {
+            (part.columns >= 4096 && part.rows >= 2560)
+                || (part.columns >= 2560 && part.rows >= 8192)
+        }
+        weights::MatrixFormat::Block(GgufBlockFormat::Q6K) => {
+            part.columns >= 4096 && part.rows >= 4096
+        }
+        _ => false,
     }
 }
 

@@ -884,6 +884,25 @@ fn native_gdn_projection_mappings_microbench() {
     }
 }
 
+#[test]
+#[ignore = "paired Q5K projection timing; coordinate exclusive CUDA access"]
+fn native_q5k_midrow_dispatch_microbench() {
+    let context = CudaContext::new(0).expect("Q5K projection timing requires CUDA");
+    let stream = context.default_stream();
+    let retained = CudaNativeBlockKernels::load(&context).unwrap();
+    let prototype = Prototype::load(&context, Format::Q5);
+    for rows in [32, 64] {
+        let mut case = Case::with_format(&stream, Format::Q5, rows, 4096, 8192);
+        run_microbench_mappings(
+            &mut case,
+            &stream,
+            &prototype,
+            &retained,
+            &[Mapping::Strict, Mapping::StrictShared],
+        );
+    }
+}
+
 fn run_microbench(
     case: &mut Case,
     stream: &Arc<CudaStream>,

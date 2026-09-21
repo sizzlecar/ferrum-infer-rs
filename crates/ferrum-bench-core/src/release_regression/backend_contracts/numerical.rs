@@ -178,6 +178,9 @@ fn names(backend: Backend) -> Vec<String> {
                 "shared_prefill_gemm_preserves_f32_math_and_buffer_extents_on_cuda",
                 "shared_prefill_gemm_production_dispatch_preserves_partition_offsets_on_cuda",
             ]),
+            ("native_blocks::tests::shared_dispatch", &[
+                "shared_gemm_midrow_production_dispatch_preserves_numeric_and_graph_boundaries_on_cuda",
+            ]),
             ("native_io::tests", &[
                 "token_lookup_launcher_preserves_exact_decode_offsets_and_invalid_ids_on_cuda",
                 "final_row_projection_launcher_preserves_f32_input_and_guarded_logits_on_cuda",
