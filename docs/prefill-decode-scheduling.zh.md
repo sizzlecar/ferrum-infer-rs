@@ -1,6 +1,6 @@
 # Prefill / decode 调度设计
 
-状态：调度预算、mixed 路径、CUDA 合批/算子优化、Metal linear 分派和大词表 argmax 已实现，正在进行组合回归与跨引擎对照；Mixed 仍为显式 opt-in。缓冲区碎片修复后，三个测试设备均已观察到实际八路 decode，但端到端性能目标尚未达成。本文记录当前设计、验证范围与待验证项。机器相关测量结果、日志、profile 与二进制存放在仓库之外。
+状态：调度预算、mixed 路径、CUDA 合批与严格中行矩阵分派、显式 Q8 SwiGLU profile、Metal linear 分派与 grouped attention 合批、大词表 argmax 已实现；Mixed 和 Q8 profile 仍需各自显式选择。本文记录当前设计、验证范围与待验证项，不据实现完成宣称达到跨引擎性能目标。机器相关测量结果、日志、profile 与二进制存放在仓库之外。
 
 ## 目标与边界
 
@@ -10,7 +10,7 @@
 
 [vLLM 的配置文档](https://docs.vllm.ai/en/latest/configuration/optimization/#chunked-prefill)把 decode 优先、剩余 token 预算分配和分块结合，并明确 ITL、TTFT 与吞吐之间的取舍。[Sarathi-Serve](https://www.usenix.org/conference/osdi24/presentation/agrawal)研究了分块与混合批次的结合。这些提供架构参考，不意味着论文或其他引擎的最佳参数适用于 Ferrum。
 
-本轮参考 vLLM V1 scheduler 的 token budget 与统一 token 工作集合，以及 model runner/provider 对合并矩阵的实际执行。这里的并发指多个请求参与同一调度轮和设备批次；没有引入操作系统线程级的 prefill/decode 抢占，也不要求把两类 kernel 放进独立 CUDA stream 同时执行。llama.cpp 的 GGUF block 解码、批处理和矩阵 kernel 是另一组实现参照。Ferrum 保留原始压缩权重、声明的激活精度与资源权威，先改善已有 kernel 的合批和数据复用，暂未移植会改变权重布局、激活量化或累加精度的 Marlin/MMQ/Tensor Core 路径。
+本轮参考 vLLM V1 scheduler 的 token budget 与统一 token 工作集合，以及 model runner/provider 对合并矩阵的实际执行。这里的并发指多个请求参与同一调度轮和设备批次；没有引入操作系统线程级的 prefill/decode 抢占，也不要求把两类 kernel 放进独立 CUDA stream 同时执行。llama.cpp 的 GGUF block 解码、批处理和矩阵 kernel 是另一组实现参照。Ferrum 保留原始压缩权重和资源权威，按选定的数值契约执行。严格 CUDA 路径改善已有 kernel 的合批与数据复用；另外已通过显式 `qwen3_5.f32-master.q8-swiglu` profile 接入 FFN 激活量化和整数点积/MMA，不改变 `Auto` 的原有选择。两者需要分别验证和报告，不能将 Q8 profile 的收益归为相同数值契约下的优化。
 
 ## 三类约束各司其职
 
@@ -108,35 +108,50 @@ CUDA native dense linear / SwiGLU 使用现有多行 kernel：所有请求维度
 ### CUDA 算子与 LM head
 
 - **Dense FP16 LM head**：多参与者各有一个 token、token range 从零连续覆盖，且实际输入、输出 row region 的地址与字节数分别组成连续矩阵时，使用一次零拷贝多行 cuBLAS GEMM。mixed/prefill 的最后行不连续时，若输出行确实连续，则先在同一 stream 上收集最后行，再使用一次 GEMM。收集区由 typed workspace 按实际 sequence 数分配，每行 `hidden_size × 2` 字节，纳入原 admission 预算，没有临时设备分配。所有输入、输出、权重和 scratch 都保留到 fence 完成；实际访问范围、溢出和读写别名先校验。合法但不满足连续输出或 scratch 隔离条件的布局沿用逐行路径；非法输入输出别名返回错误。replay key 包含执行模式、复制映射和 scratch，runtime 同时绑定实际地址与范围。CPU 边界测试及真实 CUDA 的零拷贝、收集、逐行/F64 oracle 已通过；完整服务 mixed 路径的提交归因与吞吐仍单独验证。F32 和量化权重路径保持原实现。
-- **Q4K 格式特化**：F16 输入/输出使用专用 RowTile 1/8 kernel，将 Q4K 的 256-value、144-byte block 格式变成编译期常量，保留原始 GGUF bytes、lane 内 F32 累加顺序和 warp reduction。旧 generic 出口保留作为数值与性能对照；F32、其他量化格式和精度组合继续走原路径。实际 CUDA 已完成 generic 逐 bit 与独立 F64 对照。这是减少格式解码开销，没有引入 Tensor Core 或新 scratch。
+- **Q4K 格式特化**：未选中 shared GEMM 的 F16 输入/输出使用专用 RowTile 1/8 kernel，将 Q4K 的 256-value、144-byte block 格式变成编译期常量，保留原始 GGUF bytes、lane 内 F32 累加顺序和 warp reduction。旧 generic 出口保留作为数值与性能对照；本项不改变 F32 或其他格式的 kernel。实际 CUDA 已完成 generic 逐 bit 与独立 F64 对照。这是减少格式解码开销，没有引入 Tensor Core 或新 scratch。
+- **严格 Q5K/Q6K 中行分派**：F16 输入/输出、rows ≥ 32 且无 transform 时，按每个物理权重 part 的输入宽度 K 和输出宽度 N 选择现有 shared GEMM。Q5K 要求 `K ≥ 4096 且 N ≥ 2560`，或 `K ≥ 2560 且 N ≥ 8192`；Q6K 要求 `K ≥ 4096 且 N ≥ 4096`。原有 rows ≥ 128、N ≥ 128 的大行路径保留，Q4K 不新增中行资格。kernel 仍按 F32 重建权重、相乘与累加，输出写回 F16；没有新增激活量化或 Tensor Core 运算。不满足条件的 part 沿用原分派，不能用拼接后的逻辑输出宽度替代单个 part 的 N。选择器边界、非零偏移、尾行和独立 F64 oracle 分别验证；不同归约次序不承诺逐 bit 相同。
 - **Gated Delta recurrent scan**：仅 F32 state、key dimension 128、value tile 16、256-thread launch 进入 warp/register 专用路径。在同一 sequence chunk 内将 state 留在寄存器，只读初始 state、写最终 state，保留原 128-key 归约树、slot/head 映射和 launch/scratch 布局。F16 state 的逐步存储舍入和其他形状保持旧实现。真实 CUDA oracle 覆盖 chunk carry、空 sequence、分离 state slot，以及 grouped/interleaved head 布局；这些不构成所有 GDN 形状的性能保证。
 
-Q4K 和 GDN 修改属于仓库核心 CUDA 源码，会使对应 PTX 内容缓存失效；不需要为此替换外部 native operator-set lock。CUDA 构建仍使用项目要求的锁和 feature 组合。kernel 微基准的加速不能直接当作整模型收益，混合格式 profile 也不能把所有 tiled GGUF 时间都归到 Q4K。
+Q4K 和 GDN kernel 修改属于仓库核心 CUDA 源码，会使对应 PTX 内容缓存失效；严格中行分派复用已安装的 shared GEMM。这些修改不需要替换外部 native operator-set lock，CUDA 构建仍使用项目要求的锁和 feature 组合。kernel 微基准的加速不能直接当作整模型收益，混合格式 profile 也不能把所有 tiled GGUF 时间都归到 Q4K。
+
+### 显式 Q8 SwiGLU 数值契约
+
+`run` 与 `serve` 可通过 `--numerical-profile qwen3_5.f32-master.q8-swiglu` 选择 CUDA SM80 及以上设备的 Q8 FFN 路径。它只量化原生 GGUF Q4K/Q5K/Q6K SwiGLU 投影的激活：每 32 个 F16 输入使用一个 F32 scale，打包为有符号 I8，整数点积后以 F32 缩放与累加。rows ≥ 8 使用整数 MMA，较少行使用 DP4A 映射。原始压缩权重不重排，gate/up、SiLU 结果和 FFN 输出保留原 F16 舍入边界；attention、GDN 投影与递推、LM head 以及其他权重格式不因该 profile 改用 Q8。
+
+该 profile 要求非 MoE、无 Hadamard 旋转、negative-rate recurrent ABI、F16 KV，以及至少一个满足完整 K256 分组的 FFN Q4K/Q5K/Q6K 权重。它不进入 `Auto`，不是原 F32-master 契约下的隐式 kernel 替换。激活打包 workspace 纳入原有资源规划，gate/up 共用打包，down 复用空间后重新打包；显式选择在缺少对应 provider 或资源不可满足时按既有规划规则拒绝执行。数值误差、模型输出有效性和含打包成本的服务性能需要分别验证，详见[数值执行契约](numerical-execution.zh.md)。
 
 kernel 的分块边界也是工作量的一部分。Metal Q4K 的 tiled GEMM 以 32 行为一个 token tile，64 个 prefill token 加一个 decode token 会跨越第三块。验证时应同时比较相邻预算的 split / mixed，固定模型、客户端与输入输出长度，区分合批收益与分块效率；不能把某个测试最好的 token 数写成通用默认值。对来源不同的结果，分别标明已观察现象、源码确认的行为与尚未完成的性能归因。
 
-### Metal 尾行与八行分组（已实现）
+### Metal 尾行与四行分组（已实现）
 
 普通 quantized linear 使用准备期 `PlainLinearPlan` 统一决定分派与计数，复用现有 kernel：
 
 | 条件 | 物理执行 | 作用范围 |
 |---|---|---|
 | Q4K、F16、rows > 32 且 rows % 32 = 1、输出宽度 ≥ 1024 | 完整 32 行 tiles + 单行 GEMV，如 65 → 64 + 1 | 避免一个尾 token 多执行整块 GEMM |
-| Q6K、F32、rows = 8、输出宽度 ≥ 1024 | 两次已有 B4 shared-weight GEMV | 复用四行间的权重解码，包括满足条件的 vocabulary head |
+| Q6K、F32、8 ≤ rows ≤ 32、输出宽度 ≥ 1024 | 按四行分组，共 ceil(rows / 4) 次 dispatch；不足四行的尾组使用原 B1/B2/B3 | 复用组内权重解码，包括满足条件的 vocabulary head |
 | Q4K/Q6K、F16、rows = 8、输入和输出宽度均 ≥ 1024 | 两次已有 B4 shared-weight GEMV | 避免八行只占 32 行 GEMM tile 的四分之一 |
 | Q5K、F16、rows = 8、输入和输出宽度均 ≥ 1024、输出宽度小于输入宽度 | 两次已有 B4 shared-weight GEMV | 实测收缩投影获益；扩张投影的同一改法退化，因此保留原 GEMM |
 
-其他尾宽、batch 宽度、短 K、窄输出和未覆盖格式保持已有分派；Hadamard 路径也保持原策略。八行分组的 K 下界让 Q4K B4 reduction 的四个 256-value block lane 都有工作，不按模型名称或某一型号的精确维度选择。`group.y` 在现有 B4 shader 中不参与行寻址，因此这里实际编码两次带正确偏移的 B4 dispatch，不能只把同一 kernel 的 grid.y 改成 2。
+未列入表格的形状保持已有分派；Hadamard 路径也保持原策略。F16 八行分组的 K 下界让 Q4K B4 reduction 的四个 256-value block lane 都有工作，不按模型名称或某一型号的精确维度选择。F32 Q6 的四行分组限制到 rows = 32，更大 prefill 不拆成无界的小 dispatch 序列。`group.y` 在现有 B4 shader 中不参与行寻址，因此必须实际编码各组带正确偏移的 dispatch，不能只扩大同一 kernel 的 grid.y。
 
 已经落实的约束包括：
 
 - 按完整输入宽度和输出行跨度计算尾部地址，保留每个权重 part 的列偏移；验证非零 region/token offset、拼接输出、保留区间和越界保护。
 - 用同一 prepared plan 决定实际编码与 dispatch 计数。已选 staging 的投影绕过普通 linear 分派，仍计为 dequantization + GEMM 两次 dispatch。物理投影拆分仍属于同一个 packed batch，不改变逻辑 batch 或同轮完成屏障。
 - GEMV 与 MMA 的反量化和累加次序不同，使用独立数值 oracle 和原有误差标准验证，不假设逐位相等。provider fingerprint 包含分派计划源码，测试检查相同准备期计划的重复执行；Metal 当前声明 `bitwise_eager_only`，不能据此声称支持 replay。
-- 真实 Metal 测试覆盖非零 retained/local offset、输出 stride/part 列偏移、truncated view 拒绝、相邻 tile 边界与部分四行组回退。尾行 fixture 还包含 dense 输入、强消减和大动态范围，参考值由独立源 block 解码后以 F64 累加。
+- 真实 Metal 测试覆盖非零 retained/local offset、输出 stride/part 列偏移、truncated view 拒绝、相邻 tile 边界、F32 Q6 的不完整尾组与范围外回退。尾行 fixture 还包含 dense 输入、强消减和大动态范围，参考值由独立源 block 解码后以 F64 累加。
 - 配对微基准在一个 command 内连续编码多个逻辑 projection，按实际 projection 次数归一，CPU oracle 和 guards 校验放在计时外；C4 或未改形状作为同路径控制，AB/BA 交替。尾行、Q6 F32 head 以及 F16 down/gate-up/square 已做这一局部测量；新的组合仍需固定预算下的端到端吞吐、TTFT 与 decode 间隔复测。
 
-F32 Q6 分组在已测输入上与旧逐行 GEMV 逐 bit 一致；F16 Q6 的 GEMM/B4 可能因反量化或累加次序产生差异，沿用既有误差标准，不能宣传为跨算法逐 bit 等价。这些 provider 改动同样影响纯 decode、纯 prefill 和 Split，Mixed 的 opt-in 不能替代它们的回归检查。调度器继续管理 token 预算，不把某个最佳相邻预算固化为默认值。
+F32 Q6 分组的部分 fixture（包括稀疏输入微基准）与旧逐行 GEMV 逐 bit 一致，但生产分派的 dense 输入对照已观察到旧/新 pipeline 的舍入差异，并通过原有误差标准；不能将局部逐 bit 结果推广为跨 pipeline 保证。F16 Q6 的 GEMM/B4 同样按既有误差标准验证。同一 prepared eager 路径的重复性与不同算法之间的数值容差是两项检查。这些 provider 改动同样影响纯 decode、纯 prefill 和 Split，Mixed 的 opt-in 不能替代它们的回归检查。调度器继续管理 token 预算，不把某个最佳相邻预算固化为默认值。
+
+### Metal grouped attention 的独立请求合批
+
+packed causal attention 中至少两个参与者都选中原 `GroupedDecode`，且具有相同 head dimension、query/KV head 数、可用的特化 pipeline 和 F16 KV 时，可合并 attention core dispatch。原 grouped 资格仍要求每个参与者仅推进一个 token、上下文至少 256、head dimension 为 128 或 256、每个 KV head 对应 4 或 8 个 query heads（D = 256 还支持 6），以及兼容八 token 矩阵读取的分页布局。各请求的上下文长度和页偏移可以不同；INT8 KV、mixed 中的多 token prefill 或不满足资格的参与者沿用原路径。
+
+合批前按保留的物理 allocation 身份及页偏移排序，拒绝任何页范围重叠，包括同一请求的重叠页和不同请求共享的只读 prefix。相邻但不重叠的同 allocation 子视图可以通过；无法证明独立时保留逐参与者 prepare → core 顺序。通过后才改为先完成所有 prepare，再以 grid.z 表示参与者，执行合并的 partial 与 reduce。两种入口复用相同 shader body、每行分区和归约规则；不改变请求状态、注意力数学或原数值契约。scratch、页表和 KV 仍由原 command 保留到完成，使用现有资源依赖保证 prepare 的写入先于 core 的读取。
+
+每个 104 字节的行描述符由 command 复制，单批最多 39 行；更多参与者分批提交。attention core 从每个参与者两次 dispatch 改为每 39 行两次，prepare 仍逐参与者执行，投影的额外物理拆分仍计数。资格、共享/嵌套页拒绝、相邻页通过、非零 scratch/page-table 偏移、异长上下文、跨描述符批次，以及 prepare 重排前后的输出、query 和完整 KV/guard 对照都有测试入口。减少 dispatch 的局部收益仍需服务吞吐和尾延迟对照，不能直接推广到不满足资格的 attention 或 GDN。
 
 ### 大词表 masked argmax
 
@@ -194,8 +209,8 @@ Metal 的词表宽度至少为 8192、CUDA 至少为 65536 时，无有效 repet
 |---|---|
 | Scheduler / engine | 整轮 Q、纯 prefill、轮转与 fill-first 退出；mixed 的零提交回退、提交后错误不重放、清理失败仍终止同轮 peers、发布 token 前校验两组输出 |
 | 真实 CPU 模型 | mixed/split 的 logits、KV/frontier 进位、中间/最终 prefill，以及 mask/repetition/host-logits 回退；超出编译期 token 上限的永久失败和参与者释放 |
-| CUDA | packed Linear/SwiGLU 的真实设备执行与归因；dense LM-head 连续布局、GDN state carry、Q4K generic 对照和独立数值 oracle；组合 `serve`/`run` 冒烟与局部性能测量 |
-| Metal | 尾行与八行分组的形状/区域校验、独立数值 oracle、同路径重复和配对微基准；仍需当前组合的无 profile 服务对照 |
+| CUDA | packed Linear/SwiGLU 的真实设备执行与归因；dense LM-head 连续布局、GDN state carry、Q4K generic 对照；严格中行分派的物理 part 边界与 oracle；显式 Q8 的打包、数值契约和独立 oracle；组合 `serve`/`run` 与端到端性能分别验证 |
+| Metal | 尾行与四行分组的形状/区域校验、独立数值 oracle、同路径重复和配对微基准；grouped attention 的资格、别名回退、prepare 排序和异长上下文对照；无 profile 服务吞吐与尾延迟单独验证 |
 
 现有真实 CPU 超限测试验证的是不可重试的编译期容量错误，不能把它写成 GPU 内存 pressure 后恢复成功。mock 的 `NotSubmitted` 也不等于实际设备已经覆盖 admission 压力、maintenance 完成后的再次推进。此次物理池实验已观察到真实维护、恢复和完整八路执行，但没有覆盖所有设备容量耗尽与竞争方式。
 
@@ -203,7 +218,7 @@ Rust HTTP 生命周期测试已在 Metal、4050 和 4090 通过：两个请求�
 
 跨引擎客户端必须显式设置相同的 `temperature=0`、`top_p=1`、`repetition_penalty=1` 和 sampling seed；省略参数会受到不同服务默认值影响。相同模型还须核对实际 prompt/output usage、原始 tokenizer 和 chat template，不能只比较请求中的目标长度。历史上遗漏 repetition penalty 或 tokenizer 重建导致 usage 不一致的初筛不进入公平对照表。
 
-并发八路的正式稳态测试统一预热至少 16 个请求，再开始测量，并单独保留冷启动结果。仅预热四个请求不能覆盖八路按需 graph capture。性能测量关闭 profile 与 scheduler trace；观察执行路径的诊断运行单独记录，不能把带逐节点 JSON trace 的 CPU 空隙归因于正常服务开销。单轮参数探索与 kernel 微基准不构成达到端到端目标的证据，正式结果需要配对重复、正确性检查和不确定性说明。
+正式稳态测试先预热到覆盖待测实际批宽及按需 graph capture，再开始测量，并单独保留冷启动结果。较小并发的预热不能自动覆盖扩大后的批次。性能测量关闭 profile 与 scheduler trace；观察执行路径的诊断运行单独记录，不能把带逐节点 JSON trace 的 CPU 空隙归因于正常服务开销。单轮参数探索与 kernel 微基准不构成达到端到端目标的证据，正式结果需要配对重复、正确性检查和不确定性说明。
 
 性能对照使用同一硬件、模型精度、客户端和负载，分开比较：
 
@@ -216,11 +231,11 @@ Rust HTTP 生命周期测试已在 Metal、4050 和 4090 通过：两个请求�
 
 设备归因单独进行：Metal `--profile-detail kernel` 使用 encoder/subwork 边界的设备 timestamp counter，`device_intervals` 可以定位算子区间，但 `formal_device_busy_time_eligible=false`，不能把区间求和叫作整机 GPU busy。按 measured request ID、实际 participant 宽度和纯 decode token 数筛选，剔除 warmup、首 token 和不完整批次，同一 submission/event 只计一次。该模式增加 encoder 边界与 counter readback；发布用吞吐、TTFT、TPOT/ITL 对照关闭诊断 profile。CUDA 的 nsight 定位和无 profiler 复测也分开记录。
 
-跨引擎对照分别记录 Ferrum 0.12.2、保留的优化前候选、当前候选、llama.cpp 和 vLLM 的版本/构建参数。Metal 使用本机同卡；CUDA 的引擎对照使用同一台租用 GPU，4050 的局部优化证据不直接和另一张卡的引擎结果比较。模型、checkpoint/量化和实际采样策略需一致；若受支持格式限制而有精度差异，应拆开报告，不能只凭模型名称相同认定公平。记录数据集、模板后的逐请求实际输入/输出 token、KV/cache 配置、并发/到达方式、warmup、重复与运行顺序，同时保留错误和输出有效性。
+本轮跨引擎目标已收敛为 Ferrum 与 llama.cpp 的并发性能对照，分别记录 Ferrum 0.12.2、保留的优化前候选、当前候选和 llama.cpp 的版本/构建参数。Metal 使用本机同卡；CUDA 的每组引擎对照也必须使用同一台 GPU，4050 的局部优化证据不直接和另一张卡的引擎结果比较。模型、checkpoint/量化、实际采样策略和 Ferrum 数值 profile 需明确；若激活算术、支持格式或精度有差异，应拆开报告，不能只凭模型名称相同认定公平。记录数据集、模板后的逐请求实际输入/输出 token、KV/cache 配置、并发/到达方式、warmup、重复与运行顺序，同时保留错误和输出有效性。
 
-初筛发现了两项比较口径问题，旧记录全部保留但不进入最终跨引擎表格。其一，省略 repetition penalty 时 Ferrum 使用产品默认 1.1，其他引擎默认 1；后续客户端显式统一 temperature、top_p、repetition penalty 与 seed，不修改产品默认。其二，云端 Transformers 自动 tokenizer 类重建了不同于原 tokenizer.json 的分词规则；vLLM 使用标准 generic fast tokenizer 的 metadata 配置保留原始规则，并核对逐请求实际 token 数。vLLM FP16 与默认 BF16 参考分别记录，缺失扩展导致的 Triton fallback 也要披露，不能将预期 provider 当成实测 provider。
+历史初筛发现了两项比较口径问题，旧记录保留但不进入最终跨引擎表格。其一，省略 repetition penalty 时 Ferrum 使用产品默认 1.1，其他引擎默认 1；后续客户端显式统一 temperature、top_p、repetition penalty 与 seed，不修改产品默认。其二，早期 vLLM 对照中，云端 Transformers 自动 tokenizer 类重建了不同于原 tokenizer.json 的分词规则；修正 metadata 后仍须核对逐请求实际 token 数。历史 vLLM 的 FP16/BF16 和 fallback 差异保留在原始证据中；vLLM 继续作为架构参考，不再是本轮性能验收对象。
 
-当前仍未达到“Ferrum 并发性能更强、接近 vLLM”的完整证据门槛。CUDA 局部和组合改善不能替代 llama.cpp/vLLM 同硬件对照。达到 vLLM 同条件性能 85% 是工程目标，不是已确认结果；完成必要回归与可复现对照之前，不据此发布达标表格。
+本轮要用受支持的热门模型和有代表性的并发档位，证明明确负载下 Ferrum 的并发性能强于 llama.cpp，同时保留低并发、错误率及尾延迟边界。CUDA 或 Metal 的局部加速不能替代同硬件、完整服务的配对对照；不再以达到 vLLM 的某个比例作为本轮门槛。必要回归和可复现对照完成前，不发布达标表格，也不把一个模型或后端的结果推广到全部配置。
 
 真实 agent 验证复用仓库的 Rust `agent_regression` 与 Orchestral。各变体使用相同初始任务、模型、采样和工具权限，在独立会话里实际读文件、编辑、回读并继续模型调用。记录工具结果是否完整进入后续 HTTP 请求，通过服务端 request ID 将 prefill frame 和 token commit 对齐；只启动多个进程或观察 HTTP 重叠不算复现 decode 干扰。外部 Rust contract 独立校验编译和语义，必须将正常交付、工具闭环和任务正确分别报告。输出截断、编译失败或错误答案都保留，失败任务的响应提速不能表述为任务完成率提升。
 
@@ -229,5 +244,7 @@ Rust HTTP 生命周期测试已在 Metal、4050 和 4090 通过：两个请求�
 - [Engine mixed 提交与回退](../crates/ferrum-engine/src/continuous_engine/inner/mixed.rs)、[engine 契约测试](../crates/ferrum-engine/src/continuous_engine/mixed_batch_tests.rs)、[真实 CPU 模型测试](../crates/ferrum-engine/src/registry/tests/mixed_batch_tests.rs)和[小回传测试](../crates/ferrum-engine/src/registry/tests/mixed_batch_tests/greedy_readback.rs)。
 - [Executor mixed 生命周期](../crates/ferrum-models/src/executor/vnext_executor/mixed_batch.rs)与[输出角色测试](../crates/ferrum-models/src/executor/vnext_executor/mixed_batch/tests.rs)。
 - [CUDA native Linear](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/transformer/native_linear.rs)、[SwiGLU](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/transformer/native_swiglu.rs)、[LM-head 连续布局测试](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/last_token_linear_tests.rs)、[Q4K 对照测试](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/native_blocks/tests/q4k.rs)。
-- [Metal plain 分派计划](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill.rs)、[尾行正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill_tests.rs)和[八行分组正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/microbench/q6_shared_groups.rs)。
+- [CUDA 严格分派](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/native_blocks.rs)与[中行分派 oracle](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/native_blocks/tests/shared_dispatch.rs)、[Qwen3.5 数值声明](../crates/ferrum-models/src/vnext/qwen35/numerical.rs)与[Q8 打包和投影](../crates/ferrum-kernels/src/backend/cuda/vnext_ops/native_blocks/q8_f32scale.rs)。
+- [Metal plain 分派计划](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill.rs)、[尾行正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/plain_prefill_tests.rs)和[四行分组正确性与微基准](../crates/ferrum-kernels/src/backend/metal/vnext_ops/linear/microbench/q6_shared_groups.rs)。
+- [Metal causal attention 合批与资格](../crates/ferrum-kernels/src/backend/metal/vnext_ops/causal_attention.rs)、[共用 shader 算术](../crates/ferrum-kernels/src/backend/metal/vnext_ops/causal_attention.metal)、[合批边界与 oracle](../crates/ferrum-kernels/src/backend/metal/vnext_ops/causal_attention_batched_tests.rs)及[prepare 排序回归](../crates/ferrum-kernels/src/backend/metal/vnext_ops/causal_attention_packed_tests.rs)。
 - [池内连续空间回收](../crates/ferrum-interfaces/src/vnext/resource/pool_resident_reclaim.rs)、[资源与事件回归](../crates/ferrum-interfaces/src/vnext/resource/pool_resident_reclaim_tests.rs)及[真实服务断流与资源恢复回归](../crates/ferrum-cli/tests/server_stream_lifecycle.rs)。后者是需要专用服务的 ignored 测试；编译通过不代表实际设备执行通过。
