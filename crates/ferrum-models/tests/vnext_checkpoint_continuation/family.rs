@@ -15,6 +15,7 @@ pub enum AttentionKind {
     Causal,
     CausalInt8,
     GatedDelta,
+    GatedDeltaQ8Projections,
     GatedDeltaHadamardF16,
     GatedDeltaHadamardF32,
 }
@@ -54,6 +55,7 @@ impl Family {
                 AttentionKind::Causal => "family.fixture.causal-checkpoint",
                 AttentionKind::CausalInt8 => "family.fixture.causal-int8-checkpoint",
                 AttentionKind::GatedDelta => "family.fixture.gdn-checkpoint",
+                AttentionKind::GatedDeltaQ8Projections => "family.fixture.gdn-q8-checkpoint",
                 AttentionKind::GatedDeltaHadamardF16 => {
                     "family.fixture.gdn-hadamard-f16-checkpoint"
                 }
@@ -69,6 +71,7 @@ impl Family {
         match self.kind {
             AttentionKind::CausalInt8 => "fixture.attention.f32-master.int8-kv",
             AttentionKind::GatedDeltaHadamardF16 => "fixture.attention.f16",
+            AttentionKind::GatedDeltaQ8Projections => "fixture.attention.f32-master.q8-projections",
             _ => PROFILE,
         }
     }
@@ -86,6 +89,9 @@ impl Family {
             AttentionKind::Causal => CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
             AttentionKind::CausalInt8 => CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
             AttentionKind::GatedDelta => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            AttentionKind::GatedDeltaQ8Projections => {
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID
+            }
             AttentionKind::GatedDeltaHadamardF16 => GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             AttentionKind::GatedDeltaHadamardF32 => {
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
@@ -101,6 +107,7 @@ impl Family {
                 ("kv_scale", vec![2, 2], ElementType::F32, true),
             ],
             AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaQ8Projections
             | AttentionKind::GatedDeltaHadamardF16
             | AttentionKind::GatedDeltaHadamardF32 => vec![
                 ("conv", vec![512, 3], ElementType::F16, false),
@@ -159,6 +166,7 @@ impl Family {
                 Weight::dense("k_norm", vec![128], ElementType::F16),
             ],
             AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaQ8Projections
             | AttentionKind::GatedDeltaHadamardF16
             | AttentionKind::GatedDeltaHadamardF32 => vec![
                 Weight::quantized("qkvzba", vec![776, HIDDEN]),
@@ -186,6 +194,7 @@ impl Family {
                 ("maximum_context_tokens", MAX_TOKENS),
             ],
             AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaQ8Projections
             | AttentionKind::GatedDeltaHadamardF16
             | AttentionKind::GatedDeltaHadamardF32 => vec![
                 ("key_heads", 2),
@@ -222,6 +231,7 @@ impl Family {
                 }
             }
             AttentionKind::GatedDelta
+            | AttentionKind::GatedDeltaQ8Projections
             | AttentionKind::GatedDeltaHadamardF16
             | AttentionKind::GatedDeltaHadamardF32 => {
                 attributes.insert(
@@ -310,6 +320,7 @@ impl ModelFamilyProvider for Family {
                         scale_state: id("state.kv_scale"),
                     }],
                     AttentionKind::GatedDelta
+                    | AttentionKind::GatedDeltaQ8Projections
                     | AttentionKind::GatedDeltaHadamardF16
                     | AttentionKind::GatedDeltaHadamardF32 => Vec::new(),
                 },
@@ -332,7 +343,13 @@ impl ModelFamilyProvider for Family {
                     NumericalOperationContract {
                         operation_id: id(self.operation()),
                         version: self.attention_version(),
-                        multiplication_type: Some(ElementType::F32),
+                        multiplication_type: Some(
+                            if self.kind == AttentionKind::GatedDeltaQ8Projections {
+                                ElementType::I8
+                            } else {
+                                ElementType::F32
+                            },
+                        ),
                         accumulation_type: Some(ElementType::F32),
                     },
                 ],

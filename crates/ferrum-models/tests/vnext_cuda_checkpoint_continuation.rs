@@ -122,6 +122,81 @@ fn causal_int8_kv_eager_failure_does_not_poison_the_execution_lane() {
 }
 
 #[test]
+fn gated_delta_q8_provider_charges_pack_and_replays_changed_inputs_with_isolated_state() {
+    for rows in [1, 8] {
+        verify_gated_delta_q8_provider_replay(rows);
+    }
+}
+
+fn verify_gated_delta_q8_provider_replay(rows: usize) {
+    let eager = Fixture::new(AttentionKind::GatedDeltaQ8Projections);
+    let replay =
+        Fixture::with_replay_token_capacity(AttentionKind::GatedDeltaQ8Projections, rows as u64);
+    {
+        // The real compiler invokes both selected estimators. This comparison
+        // checks the additional pack allocation without inventing an invocation
+        // or substituting a provider descriptor in the test.
+        let strict = Fixture::new(AttentionKind::GatedDelta);
+        eager.assert_q8_projection_workspace(&strict);
+        replay.assert_q8_projection_workspace(&strict);
+    }
+    // Each mapping has its own same-width eager oracle. Lane and MMA may use
+    // different permitted accumulation orders; this is not a cross-width
+    // equality assertion. Inputs vary within and between all four windows.
+    let tokens_a: Arc<[u32]> = (0..4 * rows)
+        .map(|index| 3 + ((index + index / rows) % 8) as u32)
+        .collect();
+    let tokens_b: Arc<[u32]> = (0..4 * rows)
+        .map(|index| 11 + ((index + index / rows) % 8) as u32)
+        .collect();
+    let window = |index| index * rows..(index + 1) * rows;
+    let baseline = |name, tokens: &Arc<[u32]>| {
+        let session = eager.admit(name, Arc::clone(tokens));
+        let observations = (0..4)
+            .map(|index| eager.execute(&session, Arc::clone(tokens), window(index)))
+            .collect::<Vec<_>>();
+        session.try_complete().unwrap();
+        observations
+    };
+    let expected_a = baseline("q8-eager-a", &tokens_a);
+    let expected_b = baseline("q8-eager-b", &tokens_b);
+    expected_a[0].assert_different_output(&expected_b[0]);
+
+    let session_a = replay.admit("q8-replay-a", Arc::clone(&tokens_a));
+    // First execution warms native libraries; the second captures the actual
+    // provider command. Explicit replay below must find the published program
+    // and its typed binding nodes: the helper rejects an eager fallback.
+    for index in 0..2 {
+        expected_a[index].assert_same(
+            &replay.execute(&session_a, Arc::clone(&tokens_a), window(index)),
+            "Q8 provider warm/capture",
+        );
+    }
+    expected_a[2].assert_same(
+        &replay.execute_replayed(&session_a, Arc::clone(&tokens_a), window(2)),
+        "Q8 provider changed-token replay",
+    );
+    let session_b = replay.admit("q8-replay-b", Arc::clone(&tokens_b));
+    for index in 0..3 {
+        let actual = replay.execute_replayed(&session_b, Arc::clone(&tokens_b), window(index));
+        actual.assert_state_nonzero();
+        expected_b[index].assert_same(&actual, "Q8 provider rebound sequence");
+    }
+    // A remains live while B overwrites the shared invocation scratch. Returning
+    // to A must preserve its separate F16 convolution and F32 delta state.
+    expected_a[3].assert_same(
+        &replay.execute_replayed(&session_a, Arc::clone(&tokens_a), window(3)),
+        "Q8 provider parked peer state",
+    );
+    expected_b[3].assert_same(
+        &replay.execute_replayed(&session_b, Arc::clone(&tokens_b), window(3)),
+        "Q8 provider second peer state",
+    );
+    session_a.try_complete().unwrap();
+    session_b.try_complete().unwrap();
+}
+
+#[test]
 fn gated_delta_hadamard_pq2_shared_signs_and_mixed_projections_resume_public_checkpoint() {
     for kind in [
         AttentionKind::GatedDeltaHadamardF16,

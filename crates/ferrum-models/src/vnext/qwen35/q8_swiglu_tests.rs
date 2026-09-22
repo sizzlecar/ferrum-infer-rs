@@ -5,7 +5,7 @@ fn q8_id() -> NumericalProfileId {
     NumericalProfileId::new(F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID).unwrap()
 }
 
-fn native_config(intermediate: u64) -> Qwen35FamilyConfig {
+pub(super) fn native_config(intermediate: u64) -> Qwen35FamilyConfig {
     let mut config = tests::test_dense_gguf_config();
     config.hf_config["text_config"]["hidden_size"] = 256.into();
     config.hf_config["text_config"]["intermediate_size"] = intermediate.into();
@@ -18,7 +18,7 @@ fn native_config(intermediate: u64) -> Qwen35FamilyConfig {
     config
 }
 
-fn quantize(config: &mut Qwen35FamilyConfig, role: &str, dtype: GgmlDType, bytes: u32) {
+pub(super) fn quantize(config: &mut Qwen35FamilyConfig, role: &str, dtype: GgmlDType, bytes: u32) {
     let weight = config
         .weights
         .iter_mut()

@@ -58,6 +58,31 @@ ferrum serve qwen3.5:4b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-ma
 激活打包临时空间进入正常显存规划，gate/up 共用一次打包，down 复用空间后
 重新打包。无对应设备实现或容量不足时，显式选择按既有规划规则拒绝执行。
 
+同一 CUDA 设备范围还可显式选择
+`qwen3_5.f32-master.q8-swiglu-gdn-projections`。它在 Q8 SwiGLU 的基础上，
+仅将 Gated DeltaNet 输入投影（逻辑 Q/K/V/Z/b/a 的物理叶子）和输出投影中
+符合条件的 Q4_K/Q5_K/Q6_K 矩阵改用同一 INT8 激活、FP32 scale 策略；
+其他原生权重叶子保留严格运算。投影输入和结果仍有原 FP16 舍入边界，
+主干与残差保持 FP32，卷积状态保持 FP16，递推核心与 delta 状态保持 FP32。
+这不量化完整 recurrent state，也不改变 causal attention 或 LM head 的运算。
+
+新 profile 除满足 Q8 SwiGLU 的资格外，实际 GDN 层还必须至少有一个满足
+K256 分组及真实 block metadata 的输入或输出投影叶子。只有名字相同的
+权重、FFN 中的量化权重或其他格式不构成 GDN 资格。非 MoE、无 Hadamard、
+negative-rate ABI 和 FP16 KV 限制继续适用；它只接受显式 Require，不进入
+`Auto`，原有 profile 的内容和自动顺序不变。两个产品入口使用同一 ID：
+
+```bash
+ferrum run qwen3.5:4b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.q8-swiglu-gdn-projections
+ferrum serve qwen3.5:4b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.q8-swiglu-gdn-projections
+```
+
+GDN 输入投影的合格叶子共用一次打包；输出投影复用规划空间后重新打包。
+独立 Q8 投影近似和不同 batch 映射的 FP32 归约可能产生数值差异；固定已量化
+投影输入上的分块递推测试，不等于完整 GDN 在任意 batch 或分块下逐位一致。
+已有的同形状 eager/replay 能力语义不因此扩展。小规模算子与状态延续 oracle
+不构成模型质量或服务性能结论，仍需按选定 profile 验证实际模型输出与负载。
+
 ## 来源、计划和缓存
 
 准备阶段先解析 typed 配置、源 schema、模板与 profile 声明，再用选定 profile

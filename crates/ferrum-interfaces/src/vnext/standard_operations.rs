@@ -63,6 +63,10 @@ pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID: &str =
     "operation.gated_delta_recurrent_attention.f32-master";
 pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
     "capability.operation.gated_delta_recurrent_attention.f32-master";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID: &str =
+    "operation.gated_delta_recurrent_attention.f32-master.q8-projections";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID: &str =
+    "capability.operation.gated_delta_recurrent_attention.f32-master.q8-projections";
 pub const GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION: &str =
     "gated-delta-execution-form-selector-v1";
 pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
@@ -1180,6 +1184,47 @@ pub fn gated_delta_recurrent_attention_f32_master_contract(
     )
 }
 
+/// F32-master Gated DeltaNet with an independent Q8 projection policy, v1.0.
+///
+/// Only native GGUF Q4_K/Q5_K/Q6_K physical leaves of input ordinal 2 (packed
+/// Q/K/V/Z/b/a projection) and ordinal 7 (output projection) use the K32 signed
+/// I8 activation packing, F32 scales, transient I32 dots and F32 rescaling
+/// defined by [`dense_swiglu_q8_f32scale_contract`]. Each eligible leaf has
+/// complete K256 blocks. Other physical leaves retain their strict arithmetic.
+/// The packed input is shared across eligible leaves of one projection; the
+/// output projection repacks its own F16 input into bounded planned scratch.
+/// Source weight bytes are unchanged; transformed weights are not qualified.
+///
+/// Input RMS normalization still reads the F32 hidden stream and stores F16
+/// projection inputs. Both projections keep their existing F16 result boundary.
+/// Convolution weights and history state retain F16 storage; convolution
+/// accumulation and the prepared Q/K/V values remain F32. Normalization, decay,
+/// recurrent Delta updates/state, output gating and residual arithmetic retain
+/// the F32-master contract. Hidden input/output remain F32. In particular, I8
+/// multiplication in the numerical profile describes these eligible projection
+/// leaves, not the recurrent core or every arithmetic stage of this fused op.
+///
+/// Logical tensor ordinals, attributes, state/resource requirements and oracle
+/// tolerance match the strict F32-master ABI. The oracle reference substitutes
+/// the declared Q8 policy only at the two projection boundaries, then carries
+/// the original convolution and recurrent states through the remaining stages.
+/// Its tolerance is not an equivalence guarantee against strict activations or
+/// a model-quality bound. Providers must account for and retain activation-pack
+/// workspace in addition to the existing GDN intermediates.
+pub fn gated_delta_recurrent_attention_f32_master_q8_projections_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    let mut descriptor = gated_delta_recurrent_attention_f32_master_contract()?.descriptor;
+    descriptor.id =
+        OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID)?;
+    descriptor.version = ContractVersion::new(1, 0);
+    descriptor.provider = provider_requirement(
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 fn gated_delta_recurrent_attention_contract_with_hidden(
     operation_id: &str,
     version: ContractVersion,
@@ -2255,6 +2300,65 @@ mod tests {
                 .fingerprint()
                 .unwrap(),
             strict_fingerprint
+        );
+    }
+
+    #[test]
+    fn gated_delta_q8_projections_preserve_master_abi_with_independent_identity() {
+        let strict = gated_delta_recurrent_attention_f32_master_contract().unwrap();
+        let quantized =
+            gated_delta_recurrent_attention_f32_master_q8_projections_contract().unwrap();
+        let old = strict.descriptor();
+        let new = quantized.descriptor();
+        assert_eq!(new.version, ContractVersion::new(1, 0));
+        assert_eq!(
+            new.id.as_str(),
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID
+        );
+        assert_ne!(old.fingerprint().unwrap(), new.fingerprint().unwrap());
+        assert_eq!(
+            new.provider.required_capabilities,
+            BTreeSet::from([CapabilityId::new(
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID
+            )
+            .unwrap(),])
+        );
+        assert!(new
+            .provider
+            .required_capabilities
+            .is_disjoint(&old.provider.required_capabilities));
+        let mut expected = old.clone();
+        expected.id = new.id.clone();
+        expected.provider = new.provider.clone();
+        assert_eq!(&expected, new);
+        for ordinal in [0, 9] {
+            assert_eq!(
+                new.inputs[ordinal].element_types(),
+                &BTreeSet::from([ElementType::F32])
+            );
+        }
+        for ordinal in [2, 7, 8] {
+            assert_eq!(
+                new.inputs[ordinal].element_types(),
+                &BTreeSet::from([ElementType::F16])
+            );
+        }
+        assert_eq!(
+            new.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        quantized
+            .validate_signature(&old.inputs, &old.outputs)
+            .unwrap();
+        let decoded: OperationDescriptor =
+            serde_json::from_slice(&serde_json::to_vec(new).unwrap()).unwrap();
+        assert_eq!(&decoded, new);
+        assert_eq!(decoded.fingerprint().unwrap(), new.fingerprint().unwrap());
+        assert_eq!(
+            gated_delta_recurrent_attention_f32_master_contract()
+                .unwrap()
+                .descriptor(),
+            old
         );
     }
 

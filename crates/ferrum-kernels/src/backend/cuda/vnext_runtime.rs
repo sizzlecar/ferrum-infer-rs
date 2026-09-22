@@ -2126,16 +2126,18 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
         // The installed bundle can contain SM80 MMA exports even on an older
         // device. Its runtime descriptor must advertise only executable ops.
-        if config.capabilities.iter().any(|capability| {
-            capability.as_str() == ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
-        }) {
+        let requires_sm80 = |capability: &CapabilityId| {
+            matches!(capability.as_str(),
+                ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
+                | ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID)
+        };
+        if config.capabilities.iter().any(requires_sm80) {
             let major = context.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
                 .map_err(|error| CudaDeviceRuntimeError::driver("MMA compute capability", error))?;
             if major < 8 {
-                config.capabilities.retain(|capability| {
-                    capability.as_str()
-                        != ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
-                });
+                config
+                    .capabilities
+                    .retain(|capability| !requires_sm80(capability));
             }
         }
         // vNext owns all cross-stream ordering through explicit commands and

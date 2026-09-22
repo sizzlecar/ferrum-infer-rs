@@ -12,6 +12,8 @@ use ferrum_interfaces::vnext::{
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
 pub const F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.q8-swiglu";
+pub const F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.q8-swiglu-gdn-projections";
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
 pub const F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.int8-kv";
 
@@ -25,6 +27,11 @@ pub(super) fn profiles(
     let f32 = profile(family_id, &text, &states, &kv_storage, true, false)?;
     let q8_swiglu = q8_swiglu_eligible(config, &text)
         .then(|| q8_swiglu_profile(&f32))
+        .transpose()?;
+    let q8_gdn_projections = q8_swiglu
+        .as_ref()
+        .filter(|_| q8_gdn_projections_eligible(config, &text))
+        .map(q8_gdn_projections_profile)
         .transpose()?;
     // Qualification covers both physical encoding and recurrent parameter ABI.
     // In particular, an unquantized negative-rate source must not silently
@@ -65,32 +72,69 @@ pub(super) fn profiles(
     // This arithmetic policy is opt-in. In particular, keep both existing Auto
     // preference lists unchanged when suitable K-block leaves are present.
     profiles.extend(q8_swiglu);
-    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 2), profiles, automatic)
+    profiles.extend(q8_gdn_projections);
+    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 3), profiles, automatic)
 }
 
 pub(super) fn q8_swiglu_eligible(config: &Qwen35FamilyConfig, text: &Qwen35TextConfig) -> bool {
     text.moe.is_none()
         && config.gguf_hadamard.is_none()
         && config.recurrent_weight_abi == RecurrentWeightAbi::NegativeRateInterleaved
-        && config.weights.iter().all(|weight| matches!(weight.source_encoding,
-            FamilyWeightSourceEncoding::Dense { .. } | FamilyWeightSourceEncoding::BlockQuantized(_)))
+        && config.weights.iter().all(|weight| {
+            matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::Dense { .. }
+                    | FamilyWeightSourceEncoding::BlockQuantized(_)
+            )
+        })
         && config.weights.iter().any(|weight| {
             if weight.layer_index.is_none()
                 || !matches!(weight.role.as_str(), "mlp_gate" | "mlp_up" | "mlp_down")
             {
                 return false;
             }
-            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
-                return false;
-            };
             // Qualify physical leaves, not a checkpoint/container name. Other
             // native leaves keep their original arithmetic, including a dense
             // projection whose input width is not a multiple of 256.
-            matches!((spec.format_id.as_str(), spec.logical_values_per_block, spec.bytes_per_block),
-                ("quantization.gguf.q4-k", 256, 144)
-                | ("quantization.gguf.q5-k", 256, 176)
-                | ("quantization.gguf.q6-k", 256, 210))
-                && matches!(weight.dimensions.as_slice(), [rows, columns] if *rows > 0 && *columns > 0 && *columns % 256 == 0)
+            q8_k_leaf(weight)
+        })
+}
+
+fn q8_k_leaf(weight: &FamilyWeight) -> bool {
+    let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+        return false;
+    };
+    matches!(
+        (
+            spec.format_id.as_str(),
+            spec.logical_values_per_block,
+            spec.bytes_per_block
+        ),
+        ("quantization.gguf.q4-k", 256, 144)
+            | ("quantization.gguf.q5-k", 256, 176)
+            | ("quantization.gguf.q6-k", 256, 210)
+    ) && matches!(weight.dimensions.as_slice(), [rows, columns] if *rows > 0 && *columns > 0 && *columns % 256 == 0)
+}
+
+pub(super) fn q8_gdn_projections_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    q8_swiglu_eligible(config, text)
+        && config.weights.iter().any(|weight| {
+            // Input ordinal 2 is the logical stack of these four physical
+            // leaves; ordinal 7 is the output projection. A matching role on
+            // an absent/full-attention layer does not qualify a GDN operation.
+            weight.layer_index.is_some_and(|layer| {
+                text.layer_types.get(layer as usize) == Some(&Qwen35LayerType::LinearAttention)
+            }) && matches!(
+                weight.role.as_str(),
+                "linear_attn_qkv"
+                    | "linear_attn_z"
+                    | "linear_attn_b"
+                    | "linear_attn_a"
+                    | "linear_attn_out"
+            ) && q8_k_leaf(weight)
         })
 }
 
@@ -114,6 +158,31 @@ fn q8_swiglu_profile(
     dense.version = ContractVersion::new(1, 0);
     dense.multiplication_type = Some(ElementType::I8);
     dense.accumulation_type = Some(ElementType::F32);
+    profile
+        .operations
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(profile)
+}
+
+fn q8_gdn_projections_profile(
+    swiglu: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = swiglu.clone();
+    profile.id = NumericalProfileId::new(F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let gdn = profile
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.operation_id.as_str()
+                == GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
+        })
+        .ok_or_else(|| invalid_config("numerical_profile.operations", "GDN contract is missing"))?;
+    gdn.operation_id =
+        operation_id(GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID)?;
+    gdn.version = ContractVersion::new(1, 0);
+    gdn.multiplication_type = Some(ElementType::I8);
+    gdn.accumulation_type = Some(ElementType::F32);
     profile
         .operations
         .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));

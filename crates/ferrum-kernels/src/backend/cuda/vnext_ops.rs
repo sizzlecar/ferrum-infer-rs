@@ -75,7 +75,10 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use ferrum_interfaces::vnext::{
-    dense_swiglu_q8_f32scale_contract, DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+    dense_swiglu_q8_f32scale_contract,
+    gated_delta_recurrent_attention_f32_master_q8_projections_contract,
+    DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
 use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
@@ -222,6 +225,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID,
@@ -540,6 +544,20 @@ pub fn cuda_vnext_operation_registry(
             dense_swiglu_q8_f32scale_contract().map_err(contract_error)?,
         ));
         providers.push(Box::new(transformer::CudaQ8SwiGluProvider::new(runtime)?));
+    }
+    if runtime.descriptor().capabilities.iter().any(|capability| {
+        capability.as_str()
+            == GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID
+    }) {
+        contracts.push(Box::new(
+            gated_delta_recurrent_attention_f32_master_q8_projections_contract()
+                .map_err(contract_error)?,
+        ));
+        providers.push(Box::new(
+            transformer::CudaGatedDeltaRecurrentAttentionProvider::new_f32_master_q8_projections(
+                runtime,
+            )?,
+        ));
     }
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }

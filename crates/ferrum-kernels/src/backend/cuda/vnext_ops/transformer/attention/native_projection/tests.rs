@@ -7,6 +7,150 @@ use half::f16;
 use weights::{MatrixFormat, MatrixPart};
 
 #[test]
+fn q8_attention_workspace_and_dispatch_account_for_mixed_parts_and_row_chunks() {
+    let part = |format, columns, output_offset| MatrixPart {
+        component_id: WeightId::new(format!("weight.q8-attention.{output_offset}")).unwrap(),
+        format,
+        columns,
+        rows: 3,
+        output_offset,
+        transform: None,
+        signs_region: None,
+    };
+    let parts = [
+        part(MatrixFormat::Block(GgufBlockFormat::Q5K), 256, 0),
+        part(MatrixFormat::Block(GgufBlockFormat::Q4K), 256, 3),
+        part(MatrixFormat::Block(GgufBlockFormat::Q8_0), 256, 6),
+    ];
+    let packed = q8_part_workspace_per_token(&parts).unwrap();
+    assert_eq!(packed, 256 + 8 * 4);
+    assert_eq!(q8_dispatch_count(&parts, 7).unwrap(), 4);
+    assert_eq!(q8_dispatch_count(&parts, MAX_ROWS + 1).unwrap(), 8);
+    assert_eq!(q8_part_workspace_per_token(&parts[2..]).unwrap(), 0);
+    assert_eq!(q8_dispatch_count(&parts[2..], MAX_ROWS + 1).unwrap(), 2);
+    assert!(q8_part_workspace_per_token(&[]).is_err());
+    assert!(q8_dispatch_count(&parts, 0).is_err());
+    let mut rotated = parts[0].clone();
+    rotated.signs_region = Some(1);
+    assert!(q8_part_workspace_per_token(&[rotated]).is_err());
+    assert!(q8_part_workspace_per_token(&[part(
+        MatrixFormat::Block(GgufBlockFormat::Q5K),
+        255,
+        0
+    )])
+    .is_err());
+    let shape = super::super::tests::test_shape();
+    for tokens in [1, 7, 8, 33, MAX_ROWS + 1] {
+        let strict = ScratchLayout::new(
+            shape,
+            tokens,
+            3,
+            AttentionProjection::Native {
+                transform_bytes_per_token: 0,
+            },
+        )
+        .unwrap();
+        let q8 = ScratchLayout::new(
+            shape,
+            tokens,
+            3,
+            AttentionProjection::NativeQ8 {
+                pack_bytes_per_token: packed,
+            },
+        )
+        .unwrap();
+        assert_eq!(q8.required_bytes - strict.required_bytes, tokens * packed);
+        assert_eq!(
+            q8.z_or_activation - q8.projection_staging.unwrap(),
+            tokens * packed
+        );
+        assert_eq!(q8.projection_staging.unwrap() % SCRATCH_ALIGNMENT, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires an actual SM80+ CUDA device"]
+fn q8_attention_projection_preserves_pack_and_output_across_row_chunk_on_cuda() {
+    use crate::gguf_blocks::q4k_q8_reference::{dot_reference, fixture_block};
+    let context = CudaContext::new(0).unwrap();
+    let stream = context.default_stream();
+    let native = CudaNativeBlockKernels::load(&context).unwrap();
+    let q8 = Q8F32ScaleKernels::load(&context).unwrap();
+    let tokens = MAX_ROWS as usize + 1;
+    let columns = 256;
+    let block = fixture_block(1, 0);
+    let matrix = Guarded::new(&stream, &block.encode(), 0xab);
+    let part = MatrixPart {
+        component_id: WeightId::new("weight.q8-chunk").unwrap(),
+        format: MatrixFormat::Block(GgufBlockFormat::Q4K),
+        rows: 1,
+        columns,
+        output_offset: 1,
+        transform: None,
+        signs_region: None,
+    };
+    let input = (0..tokens)
+        .flat_map(|row| vec![f16::from_f32((row as i32 % 7 - 3) as f32 / 128.0); columns as usize])
+        .collect::<Vec<_>>();
+    let input_gpu = Guarded::new(&stream, &input, f16::from_f32(71.0));
+    let sentinel = f16::from_f32(79.0);
+    let output = Guarded::new(&stream, &vec![sentinel; tokens * 3], sentinel);
+    let bytes = PackLayout::new(MAX_ROWS, u64::from(columns))
+        .unwrap()
+        .total_bytes;
+    let scratch = Guarded::new(&stream, &vec![0xa5_u8; bytes as usize], 0xcd);
+    let run = |size| {
+        launch_q8_parts(
+            &stream,
+            &native,
+            &q8,
+            std::slice::from_ref(&part),
+            &[matrix.pointer(&stream)],
+            input_gpu.pointer(&stream),
+            output.pointer(&stream),
+            tokens as i32,
+            3,
+            columns as i32,
+            scratch.pointer(&stream),
+            size,
+        )
+    };
+    assert!(run(bytes - 1).is_err());
+    run(bytes).unwrap();
+    stream.synchronize().unwrap();
+    let actual = output.read(&stream);
+    let expected = (0..7)
+        .map(|row| {
+            let dot = dot_reference(
+                &input[row * columns as usize..(row + 1) * columns as usize],
+                std::slice::from_ref(&block),
+            );
+            let nu = 11.0 * f64::from(f32::EPSILON);
+            let accumulation = nu / (1.0 - nu) * dot.expanded_abs_terms;
+            (
+                f16::from_f64(dot.policy),
+                accumulation
+                    + 0.0009765625 * (dot.policy.abs() + accumulation)
+                    + f16::from_bits(1).to_f64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (row, values) in actual.chunks_exact(3).enumerate() {
+        assert_eq!(values[0], sentinel);
+        assert_eq!(values[2], sentinel);
+        let (reference, bound) = expected[row % 7];
+        assert!(
+            values[1].is_finite() && (values[1].to_f64() - reference.to_f64()).abs() <= bound,
+            "row {row}: {} vs {reference}",
+            values[1]
+        );
+    }
+    input_gpu.assert_unchanged(&stream);
+    matrix.assert_unchanged(&stream);
+    scratch.read(&stream);
+}
+
+#[test]
 fn native_attention_projection_accounts_for_partitions_and_cuda_row_capacity() {
     assert_eq!(dispatch_count(7, 3).unwrap(), 7);
     assert_eq!(dispatch_count(7, MAX_ROWS + 1).unwrap(), 14);

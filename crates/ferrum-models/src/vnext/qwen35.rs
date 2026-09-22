@@ -26,6 +26,7 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F32_F16_OPERATION_ID,
@@ -67,11 +68,15 @@ pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditi
 mod hadamard;
 mod numerical;
 #[cfg(test)]
+#[path = "qwen35/q8_gdn_projections_tests.rs"]
+mod q8_gdn_projections_tests;
+#[cfg(test)]
 #[path = "qwen35/q8_swiglu_tests.rs"]
 mod q8_swiglu_tests;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
     F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID,
+    F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID,
     F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID,
 };
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
@@ -315,6 +320,15 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER
     };
 
+    const F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS: Self = Self {
+        linear_attention: OperationSelection::new(
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER_Q8_SWIGLU
+    };
+
     const F16_INT8_KV: Self = Self {
         causal_attention: OperationSelection::new(
             CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
@@ -337,6 +351,9 @@ impl Qwen35OperationProfile {
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
             F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_Q8_SWIGLU),
+            F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS)
+            }
             F16_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F16_INT8_KV),
             F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_INT8_KV),
             _ => Err(invalid_config(
@@ -801,6 +818,15 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     .any(|state| state.format() != KvStorageFormat::F16))
         {
             return Err(invalid_config("numerical_profile", "Q8 SwiGLU requires native non-Hadamard dense FFN K-block weights, negative-rate recurrent ABI, and F16 KV"));
+        }
+        if profile.id.as_str() == F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID
+            && (!numerical::q8_gdn_projections_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16))
+        {
+            return Err(invalid_config("numerical_profile", "Q8 SwiGLU/GDN projections require native non-Hadamard FFN and GDN K-block leaves, negative-rate recurrent ABI, non-MoE layers, and F16 KV"));
         }
         let operations = Qwen35OperationProfile::for_profile(profile)?;
         let mut weight_refs = Vec::with_capacity(config.weights.len());

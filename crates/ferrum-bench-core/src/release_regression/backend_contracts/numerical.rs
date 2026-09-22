@@ -235,6 +235,12 @@ fn names(backend: Backend) -> Vec<String> {
                 "recurrent_cuda_mixed_chunk_boundaries_preserve_f32_state_and_slot_isolation",
                 "recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on_cuda",
             ]),
+            // Quantized projection policies are checked at their actual F16
+            // boundaries; the recurrent state remains F32. Fixed-QKV carry is
+            // distinct from strict/Q8 equivalence or model-quality evidence.
+            ("transformer::attention::recurrent_tests::q8_projection", &[
+                "recurrent_q8_projections_match_policy_and_preserve_fixed_qkv_state_carry_on_cuda",
+            ]),
             ("transformer::causal_attention::numerical_tests", &[
                 "causal_kv_carry_crosses_physical_pages_and_matches_f64_attention_on_cuda",
                 "causal_master_preserves_f32_hidden_and_both_residual_alias_modes_on_cuda",
@@ -279,7 +285,7 @@ fn names(backend: Backend) -> Vec<String> {
 pub(super) fn groups(backend: Backend) -> Vec<ContractGroup> {
     // The same small execution verifies arithmetic and guarded state/output
     // boundaries. The harness deduplicates shared assertions across groups.
-    let tests: Vec<_> = names(backend)
+    let mut tests: Vec<_> = names(backend)
         .into_iter()
         .map(|name| ContractTest {
             package: "ferrum-kernels".into(),
@@ -288,6 +294,14 @@ pub(super) fn groups(backend: Backend) -> Vec<ContractGroup> {
             name,
         })
         .collect();
+    if backend == Backend::Cuda {
+        tests.push(ContractTest {
+            package: "ferrum-models".into(),
+            target: "vnext_cuda_checkpoint_continuation".into(),
+            kind: "test".into(),
+            name: "gated_delta_q8_provider_charges_pack_and_replays_changed_inputs_with_isolated_state".into(),
+        });
+    }
     [Behavior::KernelNumerics, Behavior::KernelBoundaries]
         .into_iter()
         .map(|behavior| ContractGroup {

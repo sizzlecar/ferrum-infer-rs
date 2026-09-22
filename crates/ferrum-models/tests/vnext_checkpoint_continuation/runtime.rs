@@ -32,6 +32,20 @@ impl Fixture {
         reusable: bool,
         nonfinite_token: Option<u32>,
     ) -> Self {
+        Self::with_execution_capacity(kind, reusable, nonfinite_token, 1)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn with_replay_token_capacity(kind: AttentionKind, maximum_tokens: u64) -> Self {
+        Self::with_execution_capacity(kind, true, None, maximum_tokens)
+    }
+
+    fn with_execution_capacity(
+        kind: AttentionKind,
+        reusable: bool,
+        nonfinite_token: Option<u32>,
+        maximum_tokens: u64,
+    ) -> Self {
         let definition = Family::new(kind);
         let states = definition.states();
         let profile_id = definition.profile_id();
@@ -42,7 +56,7 @@ impl Fixture {
         let bucket = reusable.then(|| {
             ReusableExecutionBucketSpec::new(
                 ReusableExecutionClassId::new("fixture.checkpoint.decode").unwrap(),
-                ReusableExecutionCapacity::new(1, 1, 16).unwrap(),
+                ReusableExecutionCapacity::new(1, maximum_tokens, 16).unwrap(),
             )
             .unwrap()
         });
@@ -198,6 +212,71 @@ impl Fixture {
     pub fn with_checkpoint_timing(mut self, mode: DeviceTimingMode) -> Self {
         self.checkpoint_timing_mode = mode;
         self
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn assert_q8_projection_workspace(&self, strict: &Self) {
+        fn attention(fixture: &Fixture) -> &PlanNode {
+            fixture
+                .compilation
+                .executable()
+                .execution_plan()
+                .payload()
+                .nodes()
+                .iter()
+                .find(|node| node.id().as_str() == "node.attention")
+                .unwrap()
+        }
+        let node = attention(self);
+        assert_eq!(
+            node.operation_id().as_str(),
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID
+        );
+        assert_eq!(node.operation_version(), ContractVersion::new(1, 0));
+        assert_eq!(
+            node.selection().selected_provider().as_str(),
+            "provider.cuda.gated_delta_recurrent_attention.f32-master.q8-projections"
+        );
+        // The semantic node's additional requirements are distinct from the
+        // capabilities of the actual registry-bound provider.
+        let provider = self
+            .providers
+            .providers()
+            .iter()
+            .map(|provider| provider.descriptor())
+            .find(|provider| provider.provider_id() == node.selection().selected_provider())
+            .unwrap();
+        assert!(provider.capabilities().contains(&id::<CapabilityId>(
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID
+        )));
+        let scratch = node.provider_resources().scratch().unwrap();
+        let old = attention(strict).provider_resources().scratch().unwrap();
+        let (
+            ProviderWorkspaceSizeFormula::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            },
+            ProviderWorkspaceSizeFormula::Affine {
+                fixed_bytes: old_fixed,
+                bytes_per_sequence: old_sequence,
+                bytes_per_token: old_token,
+            },
+        ) = (scratch.size_formula(), old.size_formula())
+        else {
+            panic!("attention must charge its actual affine workspace");
+        };
+        assert_eq!(fixed_bytes, old_fixed);
+        assert_eq!(bytes_per_sequence, old_sequence);
+        // Both native matrices have K=256. One I8 value per input and one
+        // F32 scale per K32 group, reused by the two sequential projections.
+        assert_eq!(bytes_per_token - old_token, HIDDEN + HIDDEN / 32 * 4);
+        assert_eq!(scratch.scope(), ProviderWorkspaceScope::Invocation);
+        assert_eq!(
+            scratch.reuse_policy(),
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead
+        );
+        assert!(node.scratch_resource().is_some() && node.binding_resource().is_some());
     }
 
     fn assert_checkpoint_timing(&self, operation: CheckpointOperationTimings, bytes: u64) {
@@ -965,6 +1044,14 @@ pub struct Observation {
     state_types: BTreeMap<String, ElementType>,
 }
 impl Observation {
+    #[cfg(feature = "cuda")]
+    pub fn assert_different_output(&self, other: &Self) {
+        assert_ne!(
+            self.values["output"], other.values["output"],
+            "changed token input must produce different output, not stale graph data"
+        );
+    }
+
     pub fn assert_state_nonzero(&self) {
         for (name, bytes) in &self.values {
             if name == "output" {

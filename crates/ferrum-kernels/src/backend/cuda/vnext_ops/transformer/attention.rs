@@ -65,6 +65,7 @@ use crate::marlin_fp8_materializer::{
 
 mod native_projection;
 mod precision;
+use crate::backend::cuda::vnext_ops::native_blocks::q8_f32scale::Q8F32ScaleKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use precision::AttentionPrecision;
 const PREPARE_FUNCTION: &str =
@@ -100,6 +101,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 #[derive(Clone)]
 struct AttentionFunctions {
     native: CudaNativeBlockKernels,
+    q8: Option<Q8F32ScaleKernels>,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     prepare_negative_rate: CudaFunction,
@@ -129,6 +131,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F32Master)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_q8_projections(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterQ8Projections)
+    }
+
     fn with_precision(
         runtime: &CudaDeviceRuntime,
         precision: AttentionPrecision,
@@ -152,6 +160,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
+            include_bytes!("../native_blocks/q8_f32scale.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::LINEAR_ATTENTION.as_bytes(),
@@ -177,6 +186,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
+            include_bytes!("../native_blocks/q8_f32scale.rs"),
             precision.estimator().as_bytes(),
         ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
@@ -190,7 +200,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
         );
         #[cfg(feature = "vllm-marlin")]
-        {
+        if !precision.quantizes_projections() {
             let marlin_capability =
                 CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).map_err(contract_error)?;
             if !runtime
@@ -315,6 +325,10 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .map_err(|error| CudaDeviceRuntimeError::driver("attention residual module", error))?;
         let functions = AttentionFunctions {
             native: CudaNativeBlockKernels::load(runtime.context())?,
+            q8: precision
+                .quantizes_projections()
+                .then(|| Q8F32ScaleKernels::load(runtime.context()))
+                .transpose()?,
             rms_norm: load_function(&rms_module, precision.norm(), "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
             prepare_negative_rate: load_function(
@@ -392,6 +406,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let projection = AttentionProjection::from_values(
             request.values(),
+            self.precision,
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
         )
@@ -804,6 +819,9 @@ enum AttentionProjection {
     Native {
         transform_bytes_per_token: u64,
     },
+    NativeQ8 {
+        pack_bytes_per_token: u64,
+    },
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
@@ -818,8 +836,14 @@ enum AttentionProjection {
 impl AttentionProjection {
     fn from_values(
         values: &[ResolvedValueBinding],
+        precision: AttentionPrecision,
         #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
+        if precision.quantizes_projections() {
+            return Ok(Self::NativeQ8 {
+                pack_bytes_per_token: native_projection::q8_workspace_per_token(values)?,
+            });
+        }
         if native_projection::uses_native(values)? {
             return Ok(Self::Native {
                 transform_bytes_per_token:
@@ -892,7 +916,7 @@ impl AttentionProjection {
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 | Self::Native { .. } => Ok(0),
+            Self::F16 | Self::Native { .. } | Self::NativeQ8 { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime, .. } => runtime.workspace_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -919,6 +943,9 @@ impl AttentionProjection {
             Self::Native {
                 transform_bytes_per_token,
             } => Ok(transform_bytes_per_token),
+            Self::NativeQ8 {
+                pack_bytes_per_token,
+            } => Ok(pack_bytes_per_token),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -930,6 +957,7 @@ impl AttentionProjection {
         match self {
             Self::F16 => "f16-cublas",
             Self::Native { .. } => "native-compressed",
+            Self::NativeQ8 { .. } => "native-q8-f32scale-projections",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -1358,9 +1386,22 @@ fn attention_dispatches_per_launch(
     qkvzba: &SharedProjectionWeight,
     output: &SharedProjectionWeight,
     rows: u64,
+    quantized: bool,
 ) -> Result<u64, String> {
-    let qkvzba = qkvzba.dispatch_count(rows)?;
-    let output = output.dispatch_count(rows)?;
+    let count = |weight: &SharedProjectionWeight| {
+        if quantized {
+            match weight {
+                SharedProjectionWeight::Native { parts, .. } => {
+                    native_projection::q8_dispatch_count(parts, rows)
+                }
+                _ => Err("Q8 attention requires native projection matrices".to_owned()),
+            }
+        } else {
+            weight.dispatch_count(rows)
+        }
+    };
+    let qkvzba = count(qkvzba)?;
+    let output = count(output)?;
     8_u64
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
@@ -1396,6 +1437,7 @@ fn encode_attention(
     let shape = AttentionShape::from_attributes(first.attributes())?;
     let projection = AttentionProjection::from_values(
         first.bindings(),
+        precision,
         #[cfg(feature = "vllm-marlin")]
         projection_runtime,
     )?;
@@ -1637,6 +1679,7 @@ fn encode_attention(
         "vnext_gated_delta_recurrent_attention",
     )
     .bytes(projection.replay_tag().as_bytes())
+    .bytes(precision.operation().as_bytes())
     .u64(shape.hidden_size)
     .u64(shape.key_heads)
     .u64(shape.value_heads)
@@ -1690,7 +1733,12 @@ fn encode_attention(
         return Err("CUDA recurrent attention launch attribution is inconsistent".to_owned());
     }
     let logical_compute_dispatches = launches.iter().try_fold(0_u64, |total, launch| {
-        let count = attention_dispatches_per_launch(&shared.qkvzba, &shared.output, launch.tokens)?;
+        let count = attention_dispatches_per_launch(
+            &shared.qkvzba,
+            &shared.output,
+            launch.tokens,
+            precision.quantizes_projections(),
+        )?;
         total
             .checked_add(count)
             .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())
@@ -2054,6 +2102,7 @@ fn enqueue_attention(
         projection,
         &shared.qkvzba,
         &functions.native,
+        functions.q8.as_ref(),
         #[cfg(feature = "vllm-marlin")]
         &functions.projection_stitch,
         normalized,
@@ -2161,6 +2210,7 @@ fn enqueue_attention(
         projection,
         &shared.output,
         &functions.native,
+        functions.q8.as_ref(),
         #[cfg(feature = "vllm-marlin")]
         &functions.projection_stitch,
         z,
@@ -2193,6 +2243,7 @@ fn launch_attention_projection(
     projection: AttentionProjection,
     weight: &SharedProjectionWeight,
     native: &CudaNativeBlockKernels,
+    q8: Option<&Q8F32ScaleKernels>,
     #[cfg(feature = "vllm-marlin")] projection_stitch: &CudaFunction,
     input: u64,
     output: u64,
@@ -2208,22 +2259,57 @@ fn launch_attention_projection(
         SharedProjectionWeight::Native {
             first_region,
             ref parts,
-        } => native_projection::launch(
-            stream,
-            native,
-            parts,
-            &regions[first_region..first_region + weights::region_count(parts)],
-            input,
-            output,
-            rows,
-            output_features,
-            input_features,
-            layout
-                .projection_staging
-                .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
-                .transpose()?
-                .unwrap_or(0),
-        ),
+        } => {
+            if let Some(q8) = q8 {
+                let AttentionProjection::NativeQ8 {
+                    pack_bytes_per_token,
+                } = projection
+                else {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "Q8 attention lacks its admitted pack layout",
+                    ));
+                };
+                native_projection::launch_q8(
+                    stream,
+                    native,
+                    q8,
+                    parts,
+                    &regions[first_region..first_region + weights::region_count(parts)],
+                    input,
+                    output,
+                    rows,
+                    output_features,
+                    input_features,
+                    layout
+                        .projection_staging
+                        .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                        .transpose()?
+                        .unwrap_or(0),
+                    pack_bytes_per_token
+                        .checked_mul(rows as u64)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract("Q8 attention pack extent overflows")
+                        })?,
+                )
+            } else {
+                native_projection::launch(
+                    stream,
+                    native,
+                    parts,
+                    &regions[first_region..first_region + weights::region_count(parts)],
+                    input,
+                    output,
+                    rows,
+                    output_features,
+                    input_features,
+                    layout
+                        .projection_staging
+                        .map(|offset| scratch_pointer(scratch.device_ptr(), offset))
+                        .transpose()?
+                        .unwrap_or(0),
+                )
+            }
+        }
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
             blas,
             input,
@@ -3434,7 +3520,10 @@ fn push_shared_projection_weight(
             "attention projection input {ordinal} must have two logical dimensions"
         ));
     };
-    if native_projection::uses_native(invocation.participants()[0].bindings())? {
+    if invocation.operation().id.as_str()
+        == precision::AttentionPrecision::F32MasterQ8Projections.operation()
+        || native_projection::uses_native(invocation.participants()[0].bindings())?
+    {
         return native_projection::resolve_shared(regions, invocation, ordinal, logical_dimensions);
     }
     #[cfg(feature = "vllm-marlin")]
@@ -4032,7 +4121,7 @@ mod tests {
         };
         assert_eq!(qkvzba.dispatch_count(3).unwrap(), 8);
         assert_eq!(
-            attention_dispatches_per_launch(&qkvzba, &output, 3).unwrap(),
+            attention_dispatches_per_launch(&qkvzba, &output, 3, false).unwrap(),
             17
         );
         assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);
