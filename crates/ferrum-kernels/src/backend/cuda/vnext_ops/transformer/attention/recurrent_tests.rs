@@ -5,6 +5,9 @@ use crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config;
 use ferrum_interfaces::vnext::DeviceId;
 use ferrum_types::AttentionExecutionPolicy;
 use half::f16;
+
+#[path = "recurrent_tests/q8_projection.rs"]
+mod q8_projection;
 fn assert_close(actual: &[f32], expected: &[f64], stage: &str) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -141,6 +144,23 @@ fn exercise(
     shape: AttentionShape,
     batches: &[[usize; 3]],
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    exercise_with_raw(stream, functions, shape, batches, None, |_, _, _, _| {})
+}
+
+// A composed projection fixture can retain its actual GPU QKV allocation and
+// consume the actual core/z buffers without a host upload between operators.
+// The original standalone recurrence tests keep their original input generator.
+fn exercise_with_raw(
+    stream: &Arc<CudaStream>,
+    functions: &AttentionFunctions,
+    shape: AttentionShape,
+    batches: &[[usize; 3]],
+    raw_batches: Option<&[&Guarded<f16>]>,
+    mut after_core: impl FnMut(usize, &[usize; 3], &Guarded<f32>, &Guarded<f16>),
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    if let Some(raw_batches) = raw_batches {
+        assert_eq!(raw_batches.len(), batches.len());
+    }
     let channels = shape.qkv_features as usize;
     let width = shape.qkvzba_features as usize;
     let qk = (shape.key_heads * shape.key_head_dim) as usize;
@@ -202,7 +222,7 @@ fn exercise(
     };
     let mut positions = [0; 3];
     let mut outputs = vec![Vec::new(); 3];
-    for counts in batches {
+    for (batch_index, counts) in batches.iter().enumerate() {
         let tokens: usize = counts.iter().sum();
         let mut raw = Vec::new();
         let mut lengths = vec![0_u32];
@@ -221,8 +241,16 @@ fn exercise(
             positions[sequence] += count;
             lengths.push(lengths.last().unwrap() + count as u32);
         }
+        let generated;
+        let raw_gpu = if let Some(raw_batches) = raw_batches {
+            raw = raw_batches[batch_index].read(stream);
+            assert_eq!(raw.len(), tokens * width);
+            raw_batches[batch_index]
+        } else {
+            generated = Guarded::new(stream, &raw, f16::from_f32(41.0));
+            &generated
+        };
         let expected = reference.forward(shape, counts, &raw, &conv_weight, &decay, &bias);
-        let raw_gpu = Guarded::new(stream, &raw, f16::from_f32(41.0));
         let lengths_gpu = Guarded::new(stream, &lengths, u32::MAX);
         let sequence_gpu = Guarded::new(stream, &token_sequences, u32::MAX);
         let f32_buffer = |length| Guarded::new(stream, &vec![0.0_f32; length], 101.0);
@@ -334,7 +362,7 @@ fn exercise(
         final_conv.read(stream);
         query.read(stream);
         key.read(stream);
-        raw_gpu.assert_unchanged(stream);
+        assert_eq!(raw_gpu.read(stream), raw, "recurrence modified QKV input");
         lengths_gpu.assert_unchanged(stream);
         sequence_gpu.assert_unchanged(stream);
         bindings.assert_unchanged(stream);
@@ -343,6 +371,7 @@ fn exercise(
         bias_gpu.assert_unchanged(stream);
         conv[1].assert_unchanged(stream);
         states[1].assert_unchanged(stream);
+        after_core(batch_index, counts, &output, &z);
     }
     (outputs, states.iter().map(|s| s.read(stream)).collect())
 }
