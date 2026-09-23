@@ -9,6 +9,7 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+pub mod cost_model;
 pub mod planning_state;
 mod prefill_output;
 pub use prefill_output::{PrefillOutputPublication, PrefillOutputPublicationOutcome};

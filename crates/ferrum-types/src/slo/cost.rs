@@ -86,6 +86,12 @@ pub enum SloCostFeatureModel {
     EmpiricalHostContentV1 {
         host_history_bucket_tokens: NonZeroU32,
     },
+    /// Empirical host-settled costs with joint work/numeric/static row tuples
+    /// pooled within unchanged physical role segments. This does not reorder
+    /// execution or make a deterministic latency guarantee.
+    EmpiricalRowMultisetV2 {
+        host_history_bucket_tokens: NonZeroU32,
+    },
 }
 
 impl Default for SloCostFeatureModel {
