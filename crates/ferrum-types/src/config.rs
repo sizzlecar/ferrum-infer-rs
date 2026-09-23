@@ -185,6 +185,9 @@ pub struct RuntimeKnobs {
     pub profile_jsonl: Option<PathBuf>,
     pub scheduler_trace_jsonl: Option<PathBuf>,
     pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
+    /// Opt-in device allocation sampling; independent of product profiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_memory_sampling: Option<crate::DeviceMemorySamplingConfig>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub profile_detail: ObservabilityProfileDetail,
     pub unified_post_prof: bool,

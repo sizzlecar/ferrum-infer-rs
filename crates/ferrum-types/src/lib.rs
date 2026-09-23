@@ -6,6 +6,7 @@
 
 pub mod auto_config;
 pub mod config;
+pub mod device_memory;
 pub mod devices;
 pub mod errors;
 pub mod execution_policy;
@@ -28,6 +29,7 @@ pub mod startup_memory;
 // Re-export commonly used types
 pub use auto_config::*;
 pub use config::*;
+pub use device_memory::*;
 pub use devices::*;
 pub use errors::*;
 pub use execution_policy::*;
