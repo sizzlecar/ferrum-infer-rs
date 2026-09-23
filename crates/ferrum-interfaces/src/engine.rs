@@ -6,6 +6,7 @@
 //! engine impl now implements exactly the trait its modality needs;
 //! no more inert "unsupported" stubs.
 
+use crate::InferenceRequestContext;
 use async_trait::async_trait;
 use ferrum_types::{
     EngineConfig, ExecutionResourceAuthority, ExecutorAdmissionSnapshot, InferenceRequest,
@@ -93,6 +94,35 @@ pub trait LlmInferenceEngine: InferenceEngine {
         &self,
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
+
+    /// Trusted ingress context captured before product-side preprocessing.
+    /// Engines without SLO support retain Off compatibility; active modes must
+    /// explicitly implement the context boundary rather than silently ignore it.
+    async fn infer_with_context(
+        &self,
+        request: InferenceRequest,
+        _context: InferenceRequestContext,
+    ) -> Result<InferenceResponse> {
+        if self.config().scheduler.slo.mode != ferrum_types::SloMode::Off {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "this engine does not support the SLO request context",
+            ));
+        }
+        self.infer(request).await
+    }
+
+    async fn infer_stream_with_context(
+        &self,
+        request: InferenceRequest,
+        _context: InferenceRequestContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        if self.config().scheduler.slo.mode != ferrum_types::SloMode::Off {
+            return Err(ferrum_types::FerrumError::unsupported(
+                "this engine does not support the SLO request context",
+            ));
+        }
+        self.infer_stream(request).await
+    }
 }
 
 /// Embedding engine (CLIP, BERT, etc.).

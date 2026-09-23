@@ -19,6 +19,7 @@ pub mod model_executor;
 pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
+pub mod slo;
 pub mod tensor;
 pub mod tokenizer;
 #[allow(
@@ -54,6 +55,10 @@ pub use sampler::{
     SAMPLING_RNG_ALGORITHM_ID,
 };
 pub use scheduler::{BatchHint, BatchPlan, Scheduler as SchedulerInterface};
+pub use slo::{
+    InferenceRequestContext, RequestSloState, SloTimingBoundary, SloTimingViolations,
+    SloViolationWake,
+};
 pub use tensor::{TensorFactory, TensorLike, TensorOps, TensorRef};
 pub use tokenizer::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo};
 
