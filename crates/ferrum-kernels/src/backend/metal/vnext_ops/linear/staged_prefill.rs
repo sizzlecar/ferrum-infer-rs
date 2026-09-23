@@ -31,7 +31,14 @@ impl StagingPolicy {
             }
             (Self::SwiGlu, LinearPhysicalFormat::Q4K) => Some(768),
             (Self::SwiGlu, LinearPhysicalFormat::Q6K) => Some(256),
-            // Candidate large-prefill policy; the recurrent core is unchanged.
+            // Wide input projections amortize fresh staging before the prior
+            // large-prefill threshold. Keep narrower matrices on their prior
+            // route; recurrence and output projections are unchanged.
+            (Self::GatedDelta, LinearPhysicalFormat::Q4K | LinearPhysicalFormat::Q5K)
+                if input_features >= 4096 =>
+            {
+                Some(512)
+            }
             (Self::GatedDelta, LinearPhysicalFormat::Q4K | LinearPhysicalFormat::Q5K) => Some(768),
             _ => None,
         }

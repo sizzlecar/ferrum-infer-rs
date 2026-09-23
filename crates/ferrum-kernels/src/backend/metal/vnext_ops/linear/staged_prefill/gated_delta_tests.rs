@@ -8,18 +8,38 @@ use metal::MTLCommandBufferStatus;
 
 #[test]
 fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse() {
+    check_shared_projection_scratch(1024, 768);
+    check_shared_projection_scratch(4096, 512);
+}
+
+fn check_shared_projection_scratch(hidden: u64, first_staged_rows: u64) {
     let composition =
         MetalVNextComposition::create(DeviceId::new("device.gated-delta.staging").unwrap())
             .unwrap();
     let runtime = composition.runtime();
     let pipelines = MetalLinearPipelines::new(runtime.device()).unwrap();
     let queue = runtime.device().new_command_queue();
-    let hidden = 1024_u64;
     let leaves = [
-        (2048_u32, GgufBlockFormat::Q5K, LinearPhysicalFormat::Q5K),
-        (1024, GgufBlockFormat::Q4K, LinearPhysicalFormat::Q4K),
-        (8, GgufBlockFormat::Q8_0, LinearPhysicalFormat::Q8_0),
-        (8, GgufBlockFormat::Q8_0, LinearPhysicalFormat::Q8_0),
+        (
+            2 * hidden as u32,
+            GgufBlockFormat::Q5K,
+            LinearPhysicalFormat::Q5K,
+        ),
+        (
+            hidden as u32,
+            GgufBlockFormat::Q4K,
+            LinearPhysicalFormat::Q4K,
+        ),
+        (
+            (hidden / 128) as u32,
+            GgufBlockFormat::Q8_0,
+            LinearPhysicalFormat::Q8_0,
+        ),
+        (
+            (hidden / 128) as u32,
+            GgufBlockFormat::Q8_0,
+            LinearPhysicalFormat::Q8_0,
+        ),
     ];
     let output_width = leaves
         .iter()
@@ -27,9 +47,9 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
         .sum::<u64>();
     let guard = f16::from_f32(123.0);
     let staging_bytes = hidden * u64::from(leaves[0].0) * 2;
-    // 767/768 straddle the staging policy; three decode rows share Q5/Q4
-    // weights without using the staging workspace.
-    for rows in [1_u64, 3, 767, 768] {
+    // Exercise both sides of each input-width policy and small decode rows
+    // that share Q5/Q4 weights without using the staging workspace.
+    for rows in [1_u64, 3, first_staged_rows - 1, first_staged_rows] {
         let normalized_offset = 64_u64;
         let output_offset = normalized_offset + rows * hidden * 2;
         let staging_offset = output_offset + rows * output_width * 2;
@@ -122,7 +142,7 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
                 );
             }
         }
-        if rows == 768 {
+        if rows == first_staged_rows {
             for (offset, size) in [
                 (staging_offset, staging_bytes - 2),
                 (staging_offset - 2, staging_bytes),
@@ -148,7 +168,11 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
                 projection_steps(&launches, &regions)
                     .map(|step| step.dispatch_count(active))
                     .sum::<u64>(),
-                4 + if candidate && rows >= 768 { 2 } else { 0 }
+                4 + if candidate && rows >= first_staged_rows {
+                    2
+                } else {
+                    0
+                }
             );
             let command = queue.new_command_buffer();
             let encoder = command.new_compute_command_encoder();
@@ -184,7 +208,7 @@ fn staged_gated_delta_projections_preserve_offsets_fallback_and_workspace_reuse(
                 &actual[staging_offset as usize..(staging_offset + staging_bytes) as usize];
             assert!(staged.chunks_exact(2).all(|pair| {
                 let value = f16::from_le_bytes(pair.try_into().unwrap());
-                if candidate && rows >= 768 {
+                if candidate && rows >= first_staged_rows {
                     value.is_finite()
                 } else {
                     value.is_nan()
@@ -228,6 +252,23 @@ fn gated_delta_staging_keeps_its_own_width_format_and_f32_boundaries() {
         },
     };
     assert!(selected_for(launch, StagingPolicy::GatedDelta));
+    for (rows, in_features, expected) in [(511, 4096, false), (512, 4096, true), (512, 1024, false)]
+    {
+        assert_eq!(
+            selected_for(
+                LinearLaunch {
+                    params: LinearParams {
+                        rows,
+                        in_features,
+                        ..launch.params
+                    },
+                    ..launch
+                },
+                StagingPolicy::GatedDelta
+            ),
+            expected
+        );
+    }
     let shorter = LinearLaunch {
         params: LinearParams {
             rows: 256,
