@@ -26,6 +26,7 @@ pub mod runtime_config;
 pub mod sampling;
 pub mod slo;
 pub mod startup_memory;
+pub mod teacher_capture;
 
 // Re-export commonly used types
 pub use auto_config::*;
