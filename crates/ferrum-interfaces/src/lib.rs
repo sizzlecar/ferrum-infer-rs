@@ -13,6 +13,7 @@
 extern crate self as ferrum_interfaces;
 
 pub mod engine;
+pub mod execution_cost;
 pub mod kv_cache;
 pub mod kv_dtype;
 pub mod model_executor;
