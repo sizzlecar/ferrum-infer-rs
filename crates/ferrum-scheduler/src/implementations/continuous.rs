@@ -13,6 +13,7 @@ mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
+mod waiting_capacity;
 
 #[cfg(test)]
 mod historical_replay_tests;
@@ -4090,20 +4091,13 @@ impl Scheduler for ContinuousBatchScheduler {
             request_id
         );
 
-        // Check queue capacity
-        let waiting_count = self.waiting_count();
-        if waiting_count >= self.config.max_waiting_requests {
-            warn!("Queue is full, rejecting request {}", request_id);
-            return Err(FerrumError::scheduler(
-                "Queue is full, cannot accept more requests",
-            ));
-        }
-
         // Create continuous batch request
         let cb_request = ContinuousBatchRequest::new(request);
 
-        // Add to waiting queue
+        // Validate against the same queue state that receives the request.
+        // Concurrent offered requests cannot both spend the last capacity.
         let mut waiting_queue = self.waiting_queue.write();
+        waiting_capacity::check(&self.config, &waiting_queue, &cb_request.inner.request)?;
         let mut request_index = self.request_index.write();
         if request_index.contains_key(&request_id) {
             return Err(FerrumError::scheduler(format!(
@@ -4146,6 +4140,28 @@ impl Scheduler for ContinuousBatchScheduler {
 
     async fn complete(&self, request_id: RequestId, response: &InferenceResponse) -> Result<()> {
         debug!("Completing request {}", request_id);
+
+        // Shutdown/output failure can terminate an owner before admission.
+        // Resolve that lifecycle while it is still Waiting, without granting
+        // active capacity or claiming that unexecuted work generated output.
+        // Release the waiting lock before the existing active-queue path.
+        if !matches!(
+            response.finish_reason,
+            ferrum_types::FinishReason::EOS
+                | ferrum_types::FinishReason::Stop
+                | ferrum_types::FinishReason::Length
+        ) {
+            let mut waiting = self.waiting_queue.write();
+            if let Some(position) =
+                waiting.position(|request| request.inner.request.id == request_id)
+            {
+                waiting.remove(position);
+                self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
+                self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
 
         // Remove from decode queue
         let mut decode_queue = self.decode_queue.write();
