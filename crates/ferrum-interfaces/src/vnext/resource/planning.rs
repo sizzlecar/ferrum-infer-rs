@@ -13,6 +13,7 @@ use crate::vnext::{
 };
 
 mod capture;
+mod cost_route;
 mod physical_ranges;
 mod project;
 mod workspace;

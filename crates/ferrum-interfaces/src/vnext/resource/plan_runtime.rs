@@ -757,6 +757,10 @@ where
         }
     }
 
+    pub(crate) fn planning_runtime_matches(&self, runtime: &R) -> bool {
+        std::ptr::eq(self.runtime.as_ref(), runtime)
+    }
+
     fn evidence(&self) -> TrustedPlanRuntimeEvidence {
         let (binding, identity) = match &self.static_resources {
             PlanRuntimeStatic::NoStatic { binding } => (binding, None),

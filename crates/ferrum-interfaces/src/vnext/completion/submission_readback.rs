@@ -127,6 +127,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         let Some(request) = self.wave().submission_readbacks().cloned() else {
             return Ok(());
         };
+        self.readback_staging_attempted = true;
         let identity = self.batch_identity.as_ref().expect("reserved identity");
         request.validate_for(identity)?;
         let resources = self.resources.as_ref().expect("reserved resources");

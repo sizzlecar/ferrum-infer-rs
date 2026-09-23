@@ -35,6 +35,11 @@ struct CachedStagingStorage {
 pub(crate) struct DeviceReadbackStagingBudget(Arc<Mutex<StagingState>>);
 
 impl DeviceReadbackStagingBudget {
+    pub(crate) fn available_for_cost_planning(&self) -> Option<u64> {
+        let state = self.0.try_lock().ok()?;
+        state.limit.checked_sub(state.used)
+    }
+
     pub(crate) fn configure(&self, limit: u64) -> Result<(), VNextError> {
         let evicted = {
             let mut state = self

@@ -12,6 +12,7 @@ mod determinism_artifact;
 mod dispatch;
 mod dispatch_contract;
 mod foundation;
+mod future_cost_route;
 mod identity;
 mod invocation;
 #[cfg(test)]
@@ -75,6 +76,14 @@ pub use dispatch_contract::{
     ProfiledSubmissionHandle, SubmissionExecutionPolicy, SubmissionScratchInitialization,
     SubmissionWaveDispatchError, SubmissionWaveDispatchStage, SubmissionWaveDispatchTimingSink,
     SubmissionWaveInputUpload,
+};
+pub use future_cost_route::{
+    append_complete_eager_cost_route, selection_mask_bytes_match, DeviceCoreCostCapabilities,
+    EagerCoreInputUpload, EagerCoreReadback, EagerCoreTokenMaskInput, EagerCoreWaveCostQuery,
+    ExecutionCostRouteAvailability, ExecutionCostRouteProjection, ExecutionCostRouteState,
+    ExecutionCostRouteUnknown, ExecutionCostRouteView, FutureCostOutput, FutureWaveCostQuery,
+    FutureWaveCostRow, ProductTokenMaskContent, ProductTokenMaskResidencyEntry,
+    ProductTokenMaskResidencySnapshot, ProductTokenMaskSelection,
 };
 pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,

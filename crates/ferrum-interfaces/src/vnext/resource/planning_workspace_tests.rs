@@ -1,6 +1,10 @@
 //! Pure forecasts versus real retained Step slots, with no GPU or fake leases.
 use super::*;
 
+use crate::vnext::{
+    ExecutionCostRouteUnknown, ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot,
+};
+
 fn lane_view(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     session: &SequenceSession<TestRuntime>,
@@ -186,8 +190,150 @@ fn real_mask_step_identity() -> LaneStableArenaSlotIdentity {
     identity // a copied identity must not pin the now-closed resource root
 }
 
+#[path = "planning_workspace_tests/selection_masks.rs"]
+mod selection_masks;
+
 #[path = "planning_workspace_tests/shared_capture.rs"]
 mod shared_capture;
+
+#[test]
+fn planning_token_masks_roll_forward_per_slot_and_per_candidate() {
+    let slot = real_mask_step_identity();
+    let initial = ProductTokenMaskResidencySnapshot::new(true, 4, vec![], &mut || true).unwrap();
+    let mut candidate = initial.clone();
+    assert_eq!(
+        candidate
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [true, true]
+    );
+    assert_eq!(
+        candidate
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [false, false]
+    );
+    let mut sibling = initial;
+    assert_eq!(
+        sibling
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [true, true]
+    );
+    assert_eq!(
+        candidate
+            .project_uploads(None, 17, 2, &mut || true)
+            .unwrap(),
+        [true, true]
+    );
+    assert_eq!(
+        candidate
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [false, false]
+    );
+    // A wider batch cannot reuse a neighboring row's cached mask.
+    assert_eq!(
+        candidate
+            .project_uploads(Some(&slot), 17, 3, &mut || true)
+            .unwrap(),
+        [false, false, true]
+    );
+}
+
+#[test]
+fn planning_token_masks_preserve_nonmatching_entries_and_exact_eviction() {
+    let slot = real_mask_step_identity();
+    let mut snapshot = ProductTokenMaskResidencySnapshot::new(
+        true,
+        2,
+        vec![
+            ProductTokenMaskResidencyEntry::new(slot.clone(), 0, Some(17)),
+            ProductTokenMaskResidencyEntry::new(slot.clone(), 2, None),
+        ],
+        &mut || true,
+    )
+    .unwrap();
+    // The unrelated selection-mask entry counts towards capacity. Actual
+    // publish clears the ledger, then publishes only this wave's uploads;
+    // the row-zero hit is deliberately NOT republished after that clear.
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [false, true]
+    );
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [true, false]
+    );
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 17, 2, &mut || true)
+            .unwrap(),
+        [false, false]
+    );
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 19, 2, &mut || true)
+            .unwrap(),
+        [true, true]
+    );
+    // More uploads than the ledger can hold clear it without publishing any.
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 23, 3, &mut || true)
+            .unwrap(),
+        [true, true, true]
+    );
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&slot), 23, 1, &mut || true)
+            .unwrap(),
+        [true]
+    );
+}
+
+#[test]
+fn planning_token_masks_validate_full_identity_limits_and_budget() {
+    let slot = real_mask_step_identity();
+    let other = real_mask_step_identity();
+    assert_eq!(slot.slot_id(), other.slot_id());
+    assert_ne!(slot, other);
+    let entry = ProductTokenMaskResidencyEntry::new(slot.clone(), 0, Some(17));
+    assert!(ProductTokenMaskResidencySnapshot::new(
+        true,
+        2,
+        vec![entry.clone(), entry.clone()],
+        &mut || true
+    )
+    .is_err());
+    assert!(ProductTokenMaskResidencySnapshot::new(true, 0, vec![], &mut || true).is_err());
+    let mut snapshot =
+        ProductTokenMaskResidencySnapshot::new(true, 2, vec![entry.clone()], &mut || true).unwrap();
+    let before = snapshot.clone();
+    assert_eq!(
+        snapshot.project_uploads(Some(&slot), 17, 1, &mut || false),
+        Err(ExecutionCostRouteUnknown::BudgetExhausted)
+    );
+    assert_eq!(snapshot, before);
+    assert_eq!(
+        snapshot
+            .project_uploads(Some(&other), 17, 1, &mut || true)
+            .unwrap(),
+        [true]
+    );
+    let mut ineligible =
+        ProductTokenMaskResidencySnapshot::new(false, 2, vec![entry], &mut || true).unwrap();
+    assert_eq!(
+        ineligible
+            .project_uploads(Some(&slot), 17, 1, &mut || true)
+            .unwrap(),
+        [true]
+    );
+}
 
 #[test]
 fn planning_workspace_cold_capacity_requires_real_resident_backing() {

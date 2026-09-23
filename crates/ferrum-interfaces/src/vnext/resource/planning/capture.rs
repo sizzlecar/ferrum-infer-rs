@@ -26,15 +26,32 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         limits: ResourcePlanningLimits,
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ResourcePlanningAvailability<ResourcePlanningView> {
-        if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
-            return ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::StaleIdentity);
-        }
-        match lane.try_with_resource_planning_lane(|epoch| {
-            self.capture_resource_planning_view(sessions, Some((lane.id(), epoch)), limits, budget)
-        }) {
-            Ok(view) => ResourcePlanningAvailability::Known(view),
+        match self.resource_planning_view_with_graph_on_lane(sessions, lane, limits, budget) {
+            Ok((view, _)) => ResourcePlanningAvailability::Known(view),
             Err(reason) => ResourcePlanningAvailability::Unknown(reason),
         }
+    }
+
+    pub(super) fn resource_planning_view_with_graph_on_lane(
+        self: &Arc<Self>,
+        sessions: &[&SequenceSession<R>],
+        lane: &ExecutionLane<R>,
+        limits: ResourcePlanningLimits,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<
+        (
+            ResourcePlanningView,
+            Option<crate::vnext::DeviceCostGraphStreamState>,
+        ),
+        ResourcePlanningUnknown,
+    > {
+        if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
+            return Err(ResourcePlanningUnknown::StaleIdentity);
+        }
+        lane.try_with_resource_planning_lane(|epoch, graph| {
+            self.capture_resource_planning_view(sessions, Some((lane.id(), epoch)), limits, budget)
+                .map(|view| (view, graph))
+        })
     }
 
     fn capture_resource_planning_view(

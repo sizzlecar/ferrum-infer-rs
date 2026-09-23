@@ -177,6 +177,21 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         &self.descriptor
     }
 
+    /// Numeric evidence only. A busy or non-quiescent lane is not a promise
+    /// that a later readback can reuse its staging capacity.
+    pub fn cost_readback_available_bytes(&self) -> Option<u64> {
+        let state = self.state.try_lock().ok()?;
+        if state.in_flight != 0
+            || state.fail_closed
+            || self.fail_closed.load(Ordering::Acquire)
+            || !self.current_descriptor_matches_snapshot()
+            || self.runtime.stream_state(&state.stream) != StreamState::Ready
+        {
+            return None;
+        }
+        self.readback_staging.available_for_cost_planning()
+    }
+
     /// Sets an explicit host staging payload limit before work starts on this lane.
     /// Zero selects synchronous readback. Outstanding DMA/snapshot leases must
     /// be released before the budget can change, even if their fence completed.
@@ -2001,6 +2016,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             submission_may_have_happened: false,
             finished: false,
             readbacks: None,
+            readback_staging_attempted: false,
         })
     }
 
@@ -3646,6 +3662,7 @@ pub struct CompletionHandle<R: DeviceRuntime> {
     reaper: Weak<CompletionReaper<R>>,
     receipt: SubmittedOperationReceipt,
     readbacks: Option<Arc<PreparedCompletionReadbacks<R::Error>>>,
+    readback_staging_attempted: bool,
 }
 
 impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
@@ -3654,6 +3671,7 @@ impl<R: DeviceRuntime> Clone for CompletionHandle<R> {
             reaper: Weak::clone(&self.reaper),
             receipt: self.receipt.clone(),
             readbacks: self.readbacks.clone(),
+            readback_staging_attempted: self.readback_staging_attempted,
         }
     }
 }
@@ -3667,7 +3685,40 @@ impl<R: DeviceRuntime> fmt::Debug for CompletionHandle<R> {
     }
 }
 
+fn core_readback_route<R: DeviceRuntime>(
+    runtime: &R,
+    staged: bool,
+    attempted: bool,
+) -> crate::execution_cost::CoreReadbackRoute {
+    use crate::execution_cost::CoreReadbackRoute;
+    if staged {
+        CoreReadbackRoute::SubmissionStaged
+    } else {
+        let fallback = runtime
+            .cost_core_execution_capabilities()
+            .map_or(CoreReadbackRoute::Unknown, |capability| {
+                capability.fallback_readback
+            });
+        if attempted && fallback == CoreReadbackRoute::HostSynchronized {
+            CoreReadbackRoute::SubmissionFallbackSynchronized
+        } else {
+            fallback
+        }
+    }
+}
+
 impl<R: DeviceRuntime> CompletionHandle<R> {
+    /// The actual submission chose staging before returning this handle. For
+    /// ordinary batch readback, absence means the runtime fallback will run;
+    /// collection/diagnostic readers must not use this batch-only declaration.
+    pub fn core_readback_route(&self, runtime: &R) -> crate::execution_cost::CoreReadbackRoute {
+        core_readback_route(
+            runtime,
+            self.readbacks.is_some(),
+            self.readback_staging_attempted,
+        )
+    }
+
     pub fn receipt(&self) -> &SubmittedOperationReceipt {
         &self.receipt
     }
@@ -3741,6 +3792,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     submission_may_have_happened: bool,
     finished: bool,
     readbacks: Option<Arc<PreparedCompletionReadbacks<R::Error>>>,
+    readback_staging_attempted: bool,
 }
 
 impl<R: DeviceRuntime> CompletionReservation<R> {
@@ -3791,6 +3843,17 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .as_ref()
             .expect("live completion reservation owns submission resources")
             .encode_backing_initializations(runtime, commands)
+    }
+
+    pub(crate) fn core_readback_route(
+        &self,
+        runtime: &R,
+    ) -> crate::execution_cost::CoreReadbackRoute {
+        core_readback_route(
+            runtime,
+            self.readbacks.is_some(),
+            self.readback_staging_attempted,
+        )
     }
 
     pub(crate) fn mark_submission_started(&mut self) {
@@ -3891,6 +3954,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             reaper: Arc::downgrade(&self.reaper),
             receipt,
             readbacks: self.readbacks.take(),
+            readback_staging_attempted: self.readback_staging_attempted,
         };
         match transition {
             Ok(()) => Ok(handle),

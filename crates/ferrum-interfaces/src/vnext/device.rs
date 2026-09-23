@@ -17,6 +17,10 @@ use super::{
     VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
+mod cost_identity;
+pub use cost_identity::*;
+mod cost_graph;
+pub use cost_graph::*;
 mod cost_range;
 pub use cost_range::*;
 mod submission_readback;
@@ -2855,6 +2859,8 @@ impl DeviceReplayedSegmentAttribution {
 pub struct DeviceSubmissionAttribution {
     commands: Box<[DeviceNativeWorkAttribution]>,
     replayed_segments: Box<[DeviceReplayedSegmentAttribution]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph_evidence: Option<DeviceSubmissionGraphEvidence>,
 }
 
 impl DeviceSubmissionAttribution {
@@ -2909,7 +2915,27 @@ impl DeviceSubmissionAttribution {
         Some(Self {
             commands: commands.into_boxed_slice(),
             replayed_segments: replayed_segments.into_boxed_slice(),
+            graph_evidence: None,
         })
+    }
+
+    /// Attaches actual stream/preparation evidence without altering any native
+    /// command. A replay-free declaration must agree with the command ledger.
+    pub fn with_graph_evidence(mut self, evidence: DeviceSubmissionGraphEvidence) -> Option<Self> {
+        let replayed = self
+            .commands
+            .iter()
+            .any(|command| command.execution_path() == DeviceExecutionPath::Replayed)
+            || !self.replayed_segments.is_empty();
+        if replayed != (evidence.replayed_segments() != 0) {
+            return None;
+        }
+        self.graph_evidence = Some(evidence);
+        Some(self)
+    }
+
+    pub const fn graph_evidence(&self) -> Option<DeviceSubmissionGraphEvidence> {
+        self.graph_evidence
     }
 
     pub fn commands(&self) -> &[DeviceNativeWorkAttribution] {
@@ -3443,6 +3469,41 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn descriptor(&self) -> &DeviceDescriptor;
+
+    /// A nonblocking actual backend declaration, never inferred from a device
+    /// name or a requested Auto/Eager policy. Unknown requires per-dispatch
+    /// graph-capture evidence before assigning a complete cost shape.
+    fn cost_graph_capture_capability(&self) -> DeviceCostGraphCaptureCapability {
+        DeviceCostGraphCaptureCapability::Unknown
+    }
+
+    /// Nonblocking numeric state of this exact stream's graph preparation and
+    /// resident cache. Callers must hold the owning lane's quiescent bracket.
+    /// Missing evidence remains unknown even when no replay was observed.
+    fn cost_graph_stream_state(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Option<DeviceCostGraphStreamState> {
+        None
+    }
+
+    /// Describes the actual eager core encoder without encoding or submitting
+    /// anything. It grants neither buffer nor readback-staging permission.
+    fn cost_core_execution_capabilities(&self) -> Option<super::DeviceCoreCostCapabilities> {
+        None
+    }
+
+    /// Pure declaration of this runtime's actual whole-wave binding merge.
+    /// Missing layout/write evidence stays unavailable; no default may borrow
+    /// another backend's command cardinality or transfer-count convention.
+    fn cost_coalesced_program_binding(
+        &self,
+        _layout: &super::ProgramBindingLayout,
+        _patches: &[super::ProgramBindingCostPatch<'_>],
+        _poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<super::OperationCostCommand, Self::Error>> {
+        None
+    }
 
     /// Resolved attention provider-family policy installed by this runtime
     /// composition. `Auto` is never valid after composition.

@@ -46,7 +46,7 @@ fn validate_program_binding_patch(
     encoded_program_binding_count: usize,
     program_binding_resources: &mut BTreeSet<ResourceId>,
 ) -> Result<(), VNextError> {
-    if program_binding.is_some() != (encoded_program_binding_count == 1) {
+    if encoded_program_binding_count != usize::from(program_binding.is_some()) {
         return Err(invalid_operation(
             "compiled program binding slot and provider patch cardinality differ",
         ));
@@ -938,6 +938,7 @@ impl OperationDispatch {
             SubmissionExecutionPolicy::adaptive(),
             None,
             None,
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -973,6 +974,7 @@ impl OperationDispatch {
             execution_policy,
             None,
             None,
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1013,6 +1015,7 @@ impl OperationDispatch {
             execution_policy,
             None,
             None,
+            false,
             timing_sink,
             wave,
             lane,
@@ -1063,6 +1066,7 @@ impl OperationDispatch {
             SubmissionExecutionPolicy::determinism_eager(scratch_fill),
             Some(restore),
             None,
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1148,6 +1152,7 @@ impl OperationDispatch {
             SubmissionExecutionPolicy::determinism_replayed(scratch_fill),
             Some(restore),
             Some(reusable_program),
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1191,6 +1196,7 @@ impl OperationDispatch {
             SubmissionExecutionPolicy::adaptive(),
             None,
             Some(reusable_program),
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1227,6 +1233,7 @@ impl OperationDispatch {
             execution_policy,
             None,
             Some(reusable_program),
+            false,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1265,6 +1272,47 @@ impl OperationDispatch {
             execution_policy,
             None,
             Some(reusable_program),
+            false,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Retains actual logical execution evidence independently of device/host
+    /// timing. The compute policy, inputs and reusable program are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_cost_observation<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        execution_policy: SubmissionExecutionPolicy,
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<ProfiledSubmissionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            execution_policy,
+            None,
+            reusable_program,
+            true,
             timing_sink,
             wave,
             lane,
@@ -1283,6 +1331,7 @@ impl OperationDispatch {
         execution_policy: SubmissionExecutionPolicy,
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
+        cost_attribution: bool,
         timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -1477,7 +1526,7 @@ impl OperationDispatch {
                 .set_declared_eager_compute_node_indices(declared_eager_compute_node_indices)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
         }
-        if determinism_restore.is_some() {
+        if determinism_restore.is_some() || cost_attribution {
             commands.require_logical_execution_path_attribution();
         }
         let backing_initialization_command_count = completion
@@ -2413,15 +2462,12 @@ where
 
         let mut validated_cursor = 0_usize;
         while validated_cursor < validated.len() {
-            let mut contiguous_end = validated_cursor + 1;
-            if participant_packed {
-                while contiguous_end < validated.len()
-                    && validated[contiguous_end - 1].destination.end
-                        == validated[contiguous_end].destination.start
-                {
-                    contiguous_end += 1;
-                }
-            }
+            let contiguous_end = super::backing_upload::contiguous_upload_run_end(
+                validated.len(),
+                validated_cursor,
+                participant_packed,
+                |index| validated[index].destination.clone(),
+            );
             let first = &validated[validated_cursor];
             let backing = completion
                 .backing_view(

@@ -6,6 +6,23 @@ use super::dispatch_contract::SubmissionWaveDispatchError;
 use super::foundation::invalid_operation;
 use super::storage_profile::ElementType;
 
+/// Actual uploads and numerical planning share the adjacent-range rule. The
+/// caller has already validated every range against its exact input binding.
+pub(super) fn contiguous_upload_run_end(
+    length: usize,
+    start: usize,
+    packed: bool,
+    range: impl Fn(usize) -> std::ops::Range<u64>,
+) -> usize {
+    let mut end = start + 1;
+    if packed {
+        while end < length && range(end - 1).end == range(end).start {
+            end += 1;
+        }
+    }
+    end
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_submission_wave_backing_upload<R>(
     runtime: &R,
