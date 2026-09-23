@@ -9,6 +9,14 @@ use ferrum_types::{Result, SpecialTokens, TokenId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod bounded_decode;
+mod output_bound;
+pub use bounded_decode::{
+    BoundedDecodeBound, BoundedDecodeError, BoundedDecodeRequirements,
+    BoundedIncrementalDecodePolicy,
+};
+pub use output_bound::DecodedTextBound;
+
 /// Core tokenizer trait for encoding/decoding operations
 pub trait Tokenizer: Send + Sync {
     /// Encode text to token IDs
@@ -33,6 +41,26 @@ pub trait Tokenizer: Send + Sync {
     /// Get text for a specific token ID
     fn token_text(&self, token_id: TokenId) -> Option<&str>;
 
+    /// Immutable, allocation-free lookup of a protocol marker compiled during
+    /// tokenizer construction. It must exactly match token_id(text) as one
+    /// token when present, otherwise encode(text,false). Unknown strings return
+    /// None; never lazily encode or grow a request-driven cache. Borrowed IDs
+    /// remain unchanged for this tokenizer's lifetime. Cold table storage and
+    /// compilation workspace are separate from per-request output grants.
+    fn prepared_completion_tokens(&self, _text: &str) -> Option<&[TokenId]> {
+        None
+    }
+
+    /// Cached identity of the actual host decode/token-surface implementation,
+    /// immutable vocabulary/configuration and resolved special-token policy.
+    /// Implementations compute this once at construction; the query must not
+    /// serialize vocabulary, inspect mutable caches, or include paths or model
+    /// labels. Bounds and algorithm names alone cannot establish this identity.
+    /// None disables cost-model training for this host policy.
+    fn host_output_policy_identity(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Return the context-free byte surface represented by one vocabulary token.
     ///
     /// This is distinct from decoding a one-token sequence: byte-level BPE
@@ -48,6 +76,67 @@ pub trait Tokenizer: Send + Sync {
                 self.token_text(token_id)
                     .map(|text| text.as_bytes().to_vec())
             })
+    }
+
+    /// Proven maximum raw byte surface of any known token for
+    /// `token_bytes_bounded_into`. This is independent of decoded text:
+    /// fragments may be invalid UTF-8, and special-token surfaces are neither
+    /// skipped nor replaced with canonical semantic markers.
+    fn bounded_token_bytes_bound(&self) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+
+    /// Write a known token's raw surface into the supplied prefix without
+    /// allocating, growing caches, or falling back to ordinary decode.
+    /// Unknown IDs return None without writing. Some(length) may be zero for
+    /// a known empty token. Capacity errors leave the entire buffer unchanged;
+    /// success leaves bytes after length unchanged. Callers retain the actual
+    /// byte fragments for their existing UTF-8 validity checks.
+    fn token_bytes_bounded_into(
+        &self,
+        _token_id: TokenId,
+        _output: &mut [u8],
+    ) -> std::result::Result<Option<usize>, BoundedDecodeError> {
+        Err(BoundedDecodeError::Unsupported)
+    }
+
+    /// A proven bound for the complete UTF-8 text returned by `decode`, including
+    /// semantic marker substitutions. A one-token measurement or vocabulary
+    /// spelling length is not sufficient for a contextual decoder. The default
+    /// is unsupported; output-credit enforcement must not guess a bound.
+    fn decoded_text_bound(&self) -> Option<DecodedTextBound> {
+        None
+    }
+
+    /// Proven text and working-storage bounds for `decode_bounded_into`.
+    /// Ordinary `decode` and a text-only bound do not establish this capability.
+    fn bounded_decode_bound(&self) -> Option<BoundedDecodeBound> {
+        None
+    }
+
+    /// Proven equivalence of decode_incremental to the declared bounded full
+    /// decode policy. Unknown implementations must not inherit a guess based
+    /// on tokenizer type, decoded-length bounds, or raw token bytes.
+    fn bounded_incremental_decode_policy(&self) -> Option<BoundedIncrementalDecodePolicy> {
+        None
+    }
+
+    /// Decode the complete borrowed token slice without allocating. The caller
+    /// preauthorizes and supplies the capacities returned by `requirements`.
+    /// Implementations validate both capacities before changing either buffer;
+    /// on success they replace `output` and may overwrite `scratch`.
+    ///
+    /// Output capacity (not current spare capacity) is used because old output
+    /// is cleared after validation. No cache or token-history copy is permitted.
+    /// Unsupported decoders must not silently fall back to ordinary `decode`.
+    fn decode_bounded_into(
+        &self,
+        _tokens: &[TokenId],
+        _skip_special: bool,
+        _scratch: &mut [u8],
+        _output: &mut String,
+    ) -> std::result::Result<(), BoundedDecodeError> {
+        Err(BoundedDecodeError::Unsupported)
     }
 
     /// Check if token is a special token
