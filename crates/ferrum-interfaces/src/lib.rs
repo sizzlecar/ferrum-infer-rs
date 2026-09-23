@@ -16,6 +16,7 @@ pub mod engine;
 pub mod kv_cache;
 pub mod kv_dtype;
 pub mod model_executor;
+pub mod output_credit;
 pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
@@ -44,6 +45,12 @@ pub use model_executor::{
     PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
     PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
     PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PrefillInput, PrefillOutput,
+};
+pub use output_credit::{
+    LeasedOutput, OutputAccountLimits, OutputAccountSnapshot, OutputCreditAccount,
+    OutputCreditAmount, OutputCreditAttempt, OutputCreditClock, OutputCreditError,
+    OutputCreditLane, OutputCreditPool, OutputCreditWake, OutputPoolLimits, OutputPoolSnapshot,
+    OutputReservation,
 };
 pub use recurrent_state::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
