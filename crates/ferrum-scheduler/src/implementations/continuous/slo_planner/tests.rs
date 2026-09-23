@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+mod admission;
 mod boundaries;
 mod budget_phases;
 mod host_domain;

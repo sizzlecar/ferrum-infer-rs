@@ -42,6 +42,92 @@ pub struct PlanningTimeOrigin {
 }
 
 impl PlanningTimeOrigin {
+    /// Assess an already accepted or prospective request using the caller's
+    /// existing transaction deadline. Policy checks, search and final replay
+    /// all consume that same wall-clock allowance; no nested full budget is
+    /// created. The evaluator itself preserves the acceptance boundary.
+    pub fn assess_admission_with_deadline(
+        &self,
+        evaluator: &super::time_admission::TimeAdmissionEvaluator<'_>,
+        query: super::time_admission::TimeAdmissionQuery<'_>,
+        deadline: Instant,
+        read: impl FnMut() -> Instant,
+    ) -> Result<super::time_admission::TimeAdmissionDecision, PlanningTimeError> {
+        self.assess_admission_with_budget_window(
+            evaluator,
+            query,
+            PlanningBudgetWindow {
+                started_at_ns: self.observed_at_ns,
+                deadline_ns: self.at_ns(deadline)?,
+            },
+            read,
+        )
+    }
+
+    /// Preserve the actual outer transaction start, including pre-snapshot work.
+    pub fn assess_admission_with_budget_window(
+        &self,
+        evaluator: &super::time_admission::TimeAdmissionEvaluator<'_>,
+        query: super::time_admission::TimeAdmissionQuery<'_>,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+    ) -> Result<super::time_admission::TimeAdmissionDecision, PlanningTimeError> {
+        use super::time_admission::*;
+        if query.snapshot.observed_at_ns != self.observed_at_ns {
+            return Err(PlanningTimeError::SnapshotOriginMismatch);
+        }
+        let exhausted = || TimeAdmissionDecision::Unknown {
+            reason: TimeAdmissionUnknown::Planning(PlanningUnknownReason::ComputeBudgetExhausted),
+            continuation: TimeAdmissionContinuation::WaitForEvidence,
+            wait: TimeAdmissionWait {
+                review_at_ns: None,
+                strict_expiry_at_ns: None,
+                snapshot_generation: query.snapshot.generation,
+                cost_model_version: query.snapshot.cost_model_version,
+            },
+        };
+        let window = self.checked_budget_window(window, &evaluator.planner.settings.search)?;
+        let (_, planner_deadline_ns) =
+            match window.phase_deadlines(&evaluator.planner.settings.search) {
+                Ok(value) => value,
+                Err(reason) => {
+                    return Ok(TimeAdmissionDecision::Unknown {
+                        reason: TimeAdmissionUnknown::Planning(reason),
+                        continuation: TimeAdmissionContinuation::WaitForEvidence,
+                        wait: TimeAdmissionWait {
+                            review_at_ns: None,
+                            strict_expiry_at_ns: None,
+                            snapshot_generation: query.snapshot.generation,
+                            cost_model_version: query.snapshot.cost_model_version,
+                        },
+                    })
+                }
+            };
+        let mut clock = CheckedPlanningClock {
+            origin: *self,
+            read,
+            last_ns: self.observed_at_ns,
+            error: None,
+            budget: Some(window),
+        };
+        let initial_ns = clock.now_ns();
+        if let Some(error) = clock.error {
+            return Err(error);
+        }
+        if initial_ns >= planner_deadline_ns {
+            return Ok(exhausted());
+        }
+        let decision = evaluator.assess(query, &mut clock);
+        let final_ns = clock.now_ns();
+        if let Some(error) = clock.error {
+            return Err(error);
+        }
+        if final_ns >= planner_deadline_ns {
+            return Ok(exhausted());
+        }
+        Ok(decision)
+    }
+
     /// `maximum_requests` must come from the same bounded snapshot policy as
     /// the planner. Iteration consumes at most that bound plus one; overflow
     /// returns an error instead of omitting an outstanding obligation.

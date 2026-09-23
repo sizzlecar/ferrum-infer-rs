@@ -13,6 +13,7 @@ mod resources;
 mod search;
 mod shape;
 mod simulation;
+pub mod time_admission;
 mod types;
 mod validation;
 
