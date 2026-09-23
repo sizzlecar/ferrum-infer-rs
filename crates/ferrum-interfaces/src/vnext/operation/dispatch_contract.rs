@@ -69,6 +69,19 @@ impl BoundDeviceSubmissionAttribution {
         submission_fingerprint: String,
         device: DeviceSubmissionAttribution,
     ) -> Result<Self, VNextError> {
+        Self::validate_device(&batch_identity, &device)?;
+        Ok(Self {
+            batch_identity,
+            submission_fingerprint,
+            device,
+            terminal_timing: DeviceTimingMeasurement::NotRequested,
+        })
+    }
+
+    pub(super) fn validate_device(
+        batch_identity: &BatchOperationIdentity,
+        device: &DeviceSubmissionAttribution,
+    ) -> Result<(), VNextError> {
         for command in device.commands() {
             let Some(node_index) = command.node_index() else {
                 continue;
@@ -143,12 +156,7 @@ impl BoundDeviceSubmissionAttribution {
                 ));
             }
         }
-        Ok(Self {
-            batch_identity,
-            submission_fingerprint,
-            device,
-            terminal_timing: DeviceTimingMeasurement::NotRequested,
-        })
+        Ok(())
     }
 
     pub fn bind_terminal_timing(

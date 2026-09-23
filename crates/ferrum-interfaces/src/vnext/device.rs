@@ -23,6 +23,8 @@ mod cost_graph;
 pub use cost_graph::*;
 mod cost_range;
 pub use cost_range::*;
+mod submission_guard;
+pub use submission_guard::*;
 mod submission_readback;
 pub(crate) use submission_readback::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget};
 pub use submission_readback::{
@@ -3667,6 +3669,25 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         stream: &mut Self::Stream,
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>;
+
+    /// True only when `submit_guarded` implements a gate at the actual native
+    /// commit boundary. A declaration of eager execution alone is insufficient.
+    fn supports_guarded_submission(&self) -> bool {
+        false
+    }
+
+    /// The default executes no commands. Implementations must not fall back to
+    /// ordinary submission when the guard or attribution cannot be evaluated.
+    fn submit_guarded(
+        &self,
+        _stream: &mut Self::Stream,
+        _commands: DeviceCommandBatch<Self::Command>,
+        _guard: &dyn DeviceSubmissionGuard,
+    ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>> {
+        Err(GuardedDeviceSubmissionError::Rejected(
+            crate::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
+        ))
+    }
 
     /// Profile-attached submission entrypoint. Backends override this only
     /// when they can expose typed internal boundaries without changing

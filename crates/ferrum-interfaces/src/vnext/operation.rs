@@ -22,6 +22,7 @@ mod registry;
 mod resolved_value;
 mod semantic;
 mod storage_profile;
+mod submission_guard;
 mod tensor_contract;
 mod weight_contract;
 mod workspace_encoding;
@@ -114,6 +115,9 @@ pub use semantic::{AttributeId, AttributeValueKind, CanonicalRational, SemanticV
 pub use storage_profile::{
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
     ElementType,
+};
+pub use submission_guard::{
+    GuardedWaveSubmissionOutcome, PendingGuardedWaveRejection, PreparedWaveSubmissionGuard,
 };
 pub use tensor_contract::{
     AliasPolicy, BlockedTensorPadding, DimensionConstraint, LayoutConstraint, ResolvedTensorLayout,

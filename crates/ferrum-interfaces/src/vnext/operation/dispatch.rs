@@ -38,6 +38,24 @@ use super::{
     ReusableExecutionTopologyRequest, TensorAccess,
 };
 
+struct NativeWaveGuard<'a> {
+    guard: &'a dyn super::PreparedWaveSubmissionGuard,
+    identity: &'a BatchOperationIdentity,
+    readback: crate::execution_cost::CoreReadbackRoute,
+}
+impl super::super::DeviceSubmissionGuard for NativeWaveGuard<'_> {
+    fn check(
+        &self,
+        attribution: Option<&super::super::DeviceSubmissionAttribution>,
+    ) -> Result<(), crate::execution_cost::GuardedNotSubmittedReason> {
+        use crate::execution_cost::GuardedNotSubmittedReason;
+        let attribution = attribution.ok_or(GuardedNotSubmittedReason::AttributionUnavailable)?;
+        BoundDeviceSubmissionAttribution::validate_device(self.identity, attribution)
+            .map_err(|_| GuardedNotSubmittedReason::ResourceClaimMismatch)?;
+        self.guard.check(attribution, self.readback)
+    }
+}
+
 /// The only public path from a resolved plan to an operation kernel.
 fn validate_program_binding_patch(
     resolved: &dyn ExecutablePlanView,
@@ -841,6 +859,17 @@ impl OperationDispatch {
             .map_err(OperationDispatchError::Contract)?;
         completion.mark_submission_started();
         match lane_reservation.submit(commands) {
+            LaneSubmitOutcome::GuardRejected(_) => {
+                drop(lane_reservation);
+                drop(
+                    completion
+                        .definitely_not_submitted()
+                        .map_err(OperationDispatchError::Contract)?,
+                );
+                Err(OperationDispatchError::Contract(invalid_operation(
+                    "unguarded operation returned a guarded rejection",
+                )))
+            }
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 drop(lane_reservation);
                 let retry = completion
@@ -939,6 +968,7 @@ impl OperationDispatch {
             None,
             None,
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -975,6 +1005,7 @@ impl OperationDispatch {
             None,
             None,
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1016,6 +1047,7 @@ impl OperationDispatch {
             None,
             None,
             false,
+            None,
             timing_sink,
             wave,
             lane,
@@ -1067,6 +1099,7 @@ impl OperationDispatch {
             Some(restore),
             None,
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1153,6 +1186,7 @@ impl OperationDispatch {
             Some(restore),
             Some(reusable_program),
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1197,6 +1231,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1234,6 +1269,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            None,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
             lane,
@@ -1273,6 +1309,7 @@ impl OperationDispatch {
             None,
             Some(reusable_program),
             false,
+            None,
             timing_sink,
             wave,
             lane,
@@ -1313,11 +1350,54 @@ impl OperationDispatch {
             None,
             reusable_program,
             true,
+            None,
             timing_sink,
             wave,
             lane,
             reaper,
         )
+    }
+
+    /// The runtime invokes the guard after native encoding, immediately before
+    /// commit. This path never retries a rejected route through ordinary submit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave<'binding, R, I>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        input_uploads: &[SubmissionWaveInputUpload],
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        let mut rejection = None;
+        let result = Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            DeviceTimingMode::Off,
+            input_uploads,
+            SubmissionExecutionPolicy::adaptive(),
+            None,
+            None,
+            true,
+            Some((guard, &mut rejection)),
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        );
+        match rejection {
+            Some(rejection) => super::GuardedWaveSubmissionOutcome::NotSubmitted(rejection),
+            None => super::GuardedWaveSubmissionOutcome::Dispatch(result),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1332,6 +1412,10 @@ impl OperationDispatch {
         determinism_restore: Option<&SubmissionWaveDeterminismRestore>,
         reusable_program: Option<&DeviceReusableExecutionProgram>,
         cost_attribution: bool,
+        mut submission_guard: Option<(
+            &dyn super::PreparedWaveSubmissionGuard,
+            &mut Option<super::PendingGuardedWaveRejection>,
+        )>,
         timing_sink: &S,
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -2039,11 +2123,39 @@ impl OperationDispatch {
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
         );
         completion.mark_submission_started();
-        let submit_outcome = lane_reservation.submit_with_timing(commands, timing_sink);
+        let submit_outcome = match submission_guard.as_ref() {
+            Some((guard, _)) => {
+                let device_guard = NativeWaveGuard {
+                    guard: *guard,
+                    identity: batch_identity,
+                    readback: completion.core_readback_route(runtime),
+                };
+                lane_reservation.submit_guarded(commands, &device_guard)
+            }
+            None => lane_reservation.submit_with_timing(commands, timing_sink),
+        };
         drop(lane_reservation);
         drop(device_submit_stage);
 
         let outcome = match submit_outcome {
+            LaneSubmitOutcome::GuardRejected(reason) => {
+                // This drops all prepared wave/initialization/readback owners;
+                // it deliberately does not exercise the returned retry power.
+                completion
+                    .definitely_not_submitted_wave()
+                    .map_err(SubmissionWaveDispatchError::Contract)?
+                    .withdraw_for_step_rollback()
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                if let Some((_, rejection)) = submission_guard.as_mut() {
+                    **rejection = Some(super::PendingGuardedWaveRejection::new(
+                        reason,
+                        batch_identity.batch_step_id(),
+                    ));
+                }
+                Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "native submission guard rejected prepared wave",
+                )))
+            }
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 let retry = completion
                     .definitely_not_submitted_wave()

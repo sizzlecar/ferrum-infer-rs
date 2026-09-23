@@ -1,6 +1,8 @@
 //! Pure forecasts versus real retained Step slots, with no GPU or fake leases.
 use super::*;
 
+#[path = "planning_expected_work_tests.rs"]
+mod expected_work;
 use crate::vnext::{
     ExecutionCostRouteUnknown, ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot,
 };

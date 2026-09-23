@@ -196,6 +196,45 @@ impl LogitsReturnPolicy {
     pub fn requires_full_logits(&self) -> bool {
         matches!(self, Self::FullLogits)
     }
+
+    /// Constant-time identity check for a frozen policy and its cloned input.
+    /// Immutable mask/history allocations must be the captured allocations;
+    /// even equal replacement contents require a fresh capture. No vocabulary
+    /// scan or history hashing belongs in the final native submission gate.
+    pub fn same_captured_input(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::FullLogits, Self::FullLogits) => true,
+            (
+                Self::GreedyArgmax {
+                    token_mask: a_mask,
+                    repetition_penalty: a_penalty,
+                },
+                Self::GreedyArgmax {
+                    token_mask: b_mask,
+                    repetition_penalty: b_penalty,
+                },
+            ) => {
+                let mask_matches = match (a_mask, b_mask) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => {
+                        a.fingerprint == b.fingerprint
+                            && Arc::ptr_eq(&a.valid_token_mask, &b.valid_token_mask)
+                    }
+                    _ => false,
+                };
+                let penalty_matches = match (a_penalty, b_penalty) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => {
+                        a.penalty.to_bits() == b.penalty.to_bits()
+                            && Arc::ptr_eq(&a.token_ids, &b.token_ids)
+                    }
+                    _ => false,
+                };
+                mask_matches && penalty_matches
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Typed product output returned by a plan-runtime execution wave.

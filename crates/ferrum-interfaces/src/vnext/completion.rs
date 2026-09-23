@@ -780,6 +780,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
 pub(crate) enum LaneSubmitOutcome<F, E> {
     Submitted(F),
     DefinitelyNotSubmitted(E),
+    GuardRejected(crate::execution_cost::GuardedNotSubmittedReason),
     PossiblySubmittedPanic,
 }
 
@@ -836,6 +837,40 @@ impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
         S: DeviceSubmissionTimingSink,
     {
         self.submit_via(|runtime, stream| runtime.submit_with_timing(stream, commands, timing_sink))
+    }
+
+    pub(crate) fn submit_guarded(
+        &mut self,
+        commands: DeviceCommandBatch<R::Command>,
+        guard: &dyn super::DeviceSubmissionGuard,
+    ) -> LaneSubmitOutcome<R::Fence, R::Error> {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.lane
+                .runtime
+                .submit_guarded(&mut self.state.stream, commands, guard)
+        }));
+        match result {
+            Ok(Ok(fence)) => {
+                if let Some(next) = self.state.in_flight.checked_add(1) {
+                    self.state.in_flight = next;
+                } else {
+                    self.state.fail_closed = true;
+                    self.lane.fail_closed.store(true, Ordering::Release);
+                }
+                LaneSubmitOutcome::Submitted(fence)
+            }
+            Ok(Err(super::GuardedDeviceSubmissionError::Device(error))) => {
+                LaneSubmitOutcome::DefinitelyNotSubmitted(error.into_error())
+            }
+            Ok(Err(super::GuardedDeviceSubmissionError::Rejected(reason))) => {
+                LaneSubmitOutcome::GuardRejected(reason)
+            }
+            Err(_) => {
+                self.state.fail_closed = true;
+                self.lane.fail_closed.store(true, Ordering::Release);
+                LaneSubmitOutcome::PossiblySubmittedPanic
+            }
+        }
     }
 }
 

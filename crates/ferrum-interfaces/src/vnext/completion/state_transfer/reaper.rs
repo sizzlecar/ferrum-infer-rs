@@ -519,6 +519,17 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     "native state transfer was not submitted: {error}"
                 )))
             }
+            LaneSubmitOutcome::GuardRejected(reason) => {
+                reservation.submission_started = false;
+                reservation
+                    .resources
+                    .take()
+                    .expect("unsubmitted transfer owns resources")
+                    .definitely_not_submitted()?;
+                Err(invalid_completion(format!(
+                    "unguarded state transfer returned a guard rejection: {reason:?}"
+                )))
+            }
             LaneSubmitOutcome::PossiblySubmittedPanic => {
                 self.checkpoint_timings.record_copies(kind, geometry, true);
                 reservation.install(TransferPhase::SubmissionIndeterminate)?;

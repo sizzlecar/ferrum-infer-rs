@@ -3,6 +3,8 @@
 //! This is observation, not resource or execution authority. All timestamps in
 //! one recorder use the caller's single monotonic clock; no epoch is persisted.
 //! Recorders never perform I/O, serialize, or change an execution decision.
+//! The separate submission-guard contract validates this evidence at an actual
+//! commit boundary; the evidence itself still grants no resource authority.
 
 use std::{num::NonZeroU64, sync::Arc};
 
@@ -16,6 +18,10 @@ mod canonical;
 pub use canonical::*;
 mod features;
 pub use features::*;
+mod submission_guard;
+pub use submission_guard::*;
+mod expected_work;
+pub use expected_work::*;
 #[cfg(test)]
 mod tests;
 
