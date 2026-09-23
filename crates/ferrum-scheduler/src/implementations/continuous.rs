@@ -16,6 +16,7 @@ mod prefill_output;
 pub use prefill_output::{PrefillOutputPublication, PrefillOutputPublicationOutcome};
 mod prefix_rendezvous;
 mod prefix_restore;
+pub mod slo_planner;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
 mod pressure;
 mod waiting_capacity;
