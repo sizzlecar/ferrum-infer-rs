@@ -1,5 +1,6 @@
 use super::super::super::cost_model::*;
 use super::*;
+use ferrum_interfaces::execution_cost::CanonicalWaveCostShape;
 use ferrum_types::SloLatencyBudgets;
 use std::{cell::Cell, sync::Arc};
 
@@ -323,4 +324,208 @@ fn cost_clock_overflow_cannot_turn_into_fresh_or_zero_cost_prediction() {
     assert!(AnchoredPlanningCostModel::new(model.as_ref(), anchor)
         .predict(&fingerprint(), &shape(), 6)
         .is_none());
+}
+
+struct Resolver;
+impl PlanningShapeResolver for Resolver {
+    fn resolve(
+        &self,
+        _: &PlanningShapeQuery<'_>,
+        _: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Option<CanonicalWaveCostShape>, PlanningUnknownReason> {
+        panic!("empty clock harness must not resolve physical work")
+    }
+}
+fn snapshot(observed_at_ns: u64) -> SchedulerSnapshot {
+    SchedulerSnapshot {
+        observed_at_ns,
+        generation: 1,
+        cost_model_version: 1,
+        fingerprint: fingerprint(),
+        requests: vec![],
+        capabilities: BackendPlanningCapabilities {
+            path: WaveExecutionPath::PlanRuntime,
+            graph_state: WaveGraphState::Disabled,
+            order: BatchOrderSemantics::Ordered,
+            decode_batch_sizes: vec![nz(1)],
+            prefill_batch_sizes: vec![nz(1)],
+            prefill_chunk_sizes: vec![n32(1)],
+            prefill_alignment: n32(1),
+            allow_final_short_chunk: true,
+            native_mixed: false,
+            max_wave_rows: nz(1),
+            max_prefill_tokens_per_wave: n64(1),
+            workspace_bytes_upper_bound: 0,
+        },
+        capacity: CapacityReadView {
+            evidence_known: true,
+            available_kv_tokens: 10,
+            maximum_context_tokens: n32(128),
+            available_workspace_bytes: 1,
+            available_output_bytes: 1,
+        },
+        scope: PlanningScope {
+            horizon_end_ns: observed_at_ns + 1_000_000,
+            reference_decode_token_ns: n64(1),
+            reference_work_version: 1,
+        },
+        has_unmodeled_maintenance: false,
+    }
+}
+
+#[test]
+fn realtime_wrapper_rejects_clock_failure_even_after_an_otherwise_valid_decision() {
+    let at = Instant::now();
+    let origin = PlanningTimeOrigin::from_origin(at, at + ns(100)).unwrap();
+    let model = model();
+    let mut reads = [at + ns(100), at + ns(100), at + ns(100), at + ns(100)].into_iter();
+    let good = origin
+        .propose_with_clock(
+            &BoundedSloPlanner::default(),
+            &snapshot(100),
+            model.as_ref(),
+            &Resolver,
+            || reads.next().unwrap_or(at + ns(100)),
+        )
+        .unwrap();
+    assert!(matches!(
+        good,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::NoWork,
+            ..
+        }
+    ));
+    let calls = Cell::new(0);
+    let result = origin.propose_with_clock(
+        &BoundedSloPlanner::default(),
+        &snapshot(100),
+        model.as_ref(),
+        &Resolver,
+        || {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                at + ns(100)
+            } else {
+                at + ns(99)
+            }
+        },
+    );
+    assert_eq!(result, Err(PlanningTimeError::ClockMovedBackwards));
+    assert_eq!(
+        origin.propose_with_clock(
+            &BoundedSloPlanner::default(),
+            &snapshot(99),
+            model.as_ref(),
+            &Resolver,
+            || at + ns(100)
+        ),
+        Err(PlanningTimeError::SnapshotOriginMismatch)
+    );
+}
+
+#[test]
+fn elapsed_snapshot_construction_uses_up_the_same_planning_budget() {
+    let at = Instant::now();
+    let origin = PlanningTimeOrigin::from_origin(at, at).unwrap();
+    let mut planner = BoundedSloPlanner::default();
+    planner.settings.search.max_planning_us = n64(10);
+    let model = model();
+    for elapsed in [10_000, 20_000] {
+        assert!(matches!(
+            origin
+                .propose_with_clock(&planner, &snapshot(0), model.as_ref(), &Resolver, || at
+                    + ns(elapsed))
+                .unwrap(),
+            PlanningDecision::Unknown {
+                reason: PlanningUnknownReason::ComputeBudgetExhausted,
+                ..
+            }
+        ));
+    }
+    let calls = Cell::new(0);
+    let result = origin
+        .propose_with_clock(&planner, &snapshot(0), model.as_ref(), &Resolver, || {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                at + ns(9_000)
+            } else {
+                at + ns(10_000)
+            }
+        })
+        .unwrap();
+    assert!(matches!(
+        result,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::ComputeBudgetExhausted,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn caller_deadline_charges_reads_before_snapshot_observation_and_cannot_extend_config() {
+    let at = Instant::now();
+    let origin = PlanningTimeOrigin::from_origin(at, at + ns(9_000)).unwrap();
+    let mut planner = BoundedSloPlanner::default();
+    planner.settings.search.max_planning_us = n64(10);
+    let model = model();
+    // Nine microseconds of queue/capacity capture occurred before observed_at.
+    // The old observation-relative budget would permit this query until 19us.
+    let exhausted = origin
+        .propose_with_deadline_and_resources(
+            &planner,
+            &snapshot(9_000),
+            model.as_ref(),
+            &Resolver,
+            None,
+            at + ns(10_000),
+            || at + ns(10_000),
+        )
+        .unwrap();
+    assert!(matches!(
+        exhausted,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::ComputeBudgetExhausted,
+            ..
+        }
+    ));
+    // A caller may only shorten the existing configured budget.
+    let exhausted = origin
+        .propose_with_deadline_and_resources(
+            &planner,
+            &snapshot(9_000),
+            model.as_ref(),
+            &Resolver,
+            None,
+            at + ms(100),
+            || at + ns(19_000),
+        )
+        .unwrap();
+    assert!(matches!(
+        exhausted,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::ComputeBudgetExhausted,
+            ..
+        }
+    ));
+    let live = origin
+        .propose_with_deadline_and_resources(
+            &planner,
+            &snapshot(9_000),
+            model.as_ref(),
+            &Resolver,
+            None,
+            at + ns(10_000),
+            || at + ns(9_000),
+        )
+        .unwrap();
+    assert!(matches!(
+        live,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::NoWork,
+            ..
+        }
+    ));
 }

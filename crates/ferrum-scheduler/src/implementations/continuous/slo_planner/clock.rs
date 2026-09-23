@@ -1,7 +1,7 @@
 //! Checked bridges between request Instants, one planning origin and the
 //! independent engine cost clock. No clock conversion refreshes observations.
 use super::super::cost_model::{ExecutionFingerprint, WaveExecutionShape};
-use super::types::*;
+use super::{types::*, BoundedSloPlanner};
 use ferrum_interfaces::slo::RequestSloState;
 use std::{
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -156,6 +156,201 @@ impl PlanningTimeOrigin {
         }
         Ok(timing)
     }
+
+    /// The existing PlanningClock trait cannot express a failed checked read.
+    /// Keep that implementation private and override *every* decision on a
+    /// sticky clock error, including an otherwise returned impossibility.
+    pub fn propose_realtime(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_with_clock(planner, snapshot, model, resolver, Instant::now)
+    }
+
+    pub fn propose_realtime_with_resources(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        resources: &dyn PlanningResourceResolver,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_with_clock_and_resources(
+            planner,
+            snapshot,
+            model,
+            resolver,
+            Some(resources),
+            Instant::now,
+        )
+    }
+
+    fn propose_with_clock(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_with_clock_and_resources(planner, snapshot, model, resolver, None, read)
+    }
+
+    /// Uses one explicit request-clock source through snapshot construction,
+    /// planning and final replay (including Tokio's paused test clock).
+    pub fn propose_with_clock_and_resources(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        resources: Option<&dyn PlanningResourceResolver>,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        let deadline = self
+            .observed_at
+            .checked_add(planner.settings.search.planning_budget())
+            .ok_or(PlanningTimeError::TimeOverflow)?;
+        self.propose_with_deadline_and_resources(
+            planner, snapshot, model, resolver, resources, deadline, read,
+        )
+    }
+
+    /// Consume a caller-owned synchronous planning deadline, including work
+    /// before this snapshot's observation. The request time origin is unchanged.
+    /// The supplied deadline can shorten, never extend, the configured budget.
+    pub fn propose_with_deadline_and_resources(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        resources: Option<&dyn PlanningResourceResolver>,
+        deadline: Instant,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_scoped_with_deadline(
+            planner, snapshot, model, resolver, resources, None, deadline, read,
+        )
+    }
+
+    pub fn propose_scoped_with_deadline(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        resources: Option<&dyn PlanningResourceResolver>,
+        protection: Option<std::sync::Arc<super::PlanningObligationSet>>,
+        deadline: Instant,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_scoped_with_budget_window(
+            planner,
+            snapshot,
+            model,
+            resolver,
+            resources,
+            protection,
+            PlanningBudgetWindow {
+                started_at_ns: self.observed_at_ns,
+                deadline_ns: self.at_ns(deadline)?,
+            },
+            read,
+        )
+    }
+
+    pub fn propose_scoped_with_budget_window(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        resolver: &dyn PlanningShapeResolver,
+        resources: Option<&dyn PlanningResourceResolver>,
+        protection: Option<std::sync::Arc<super::PlanningObligationSet>>,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        if snapshot.observed_at_ns != self.observed_at_ns {
+            return Err(PlanningTimeError::SnapshotOriginMismatch);
+        }
+        let window = self.checked_budget_window(window, &planner.settings.search)?;
+        let (_, planner_deadline_ns) = match window.phase_deadlines(&planner.settings.search) {
+            Ok(value) => value,
+            Err(reason) => {
+                return Ok(PlanningDecision::Unknown {
+                    reason,
+                    search: Default::default(),
+                })
+            }
+        };
+        let mut clock = CheckedPlanningClock {
+            origin: *self,
+            read,
+            last_ns: self.observed_at_ns,
+            error: None,
+            budget: Some(window),
+        };
+        let start_ns = clock.now_ns();
+        if let Some(error) = clock.error {
+            return Err(error);
+        }
+        if start_ns >= planner_deadline_ns {
+            return Ok(budget_exhausted(Default::default()));
+        }
+        let decision = if let Some(protection) = protection {
+            planner.propose_recovery(snapshot, protection, model, resolver, resources, &mut clock)
+        } else {
+            match resources {
+                Some(resources) => {
+                    planner.propose_with_resources(snapshot, model, resolver, resources, &mut clock)
+                }
+                None => planner.propose(snapshot, model, resolver, &mut clock),
+            }
+        };
+        let final_ns = clock.now_ns();
+        if let Some(error) = clock.error {
+            return Err(error);
+        }
+        if final_ns >= planner_deadline_ns {
+            let search = match decision {
+                PlanningDecision::FeasibleWithinHorizon { search, .. }
+                | PlanningDecision::ProtectedWithinHorizon { search, .. }
+                | PlanningDecision::Unknown { search, .. } => search,
+                PlanningDecision::ProvenImpossibleUnderModel { .. } => Default::default(),
+            };
+            return Ok(budget_exhausted(search));
+        }
+        Ok(decision)
+    }
+
+    fn checked_budget_window(
+        &self,
+        mut window: PlanningBudgetWindow,
+        settings: &ferrum_types::SloPlannerConfig,
+    ) -> Result<PlanningBudgetWindow, PlanningTimeError> {
+        if window.started_at_ns > self.observed_at_ns {
+            return Err(PlanningTimeError::SnapshotOriginMismatch);
+        }
+        let configured_end = settings
+            .max_planning_us
+            .get()
+            .checked_mul(1000)
+            .and_then(|span| window.started_at_ns.checked_add(span))
+            .ok_or(PlanningTimeError::TimeOverflow)?;
+        window.deadline_ns = window.deadline_ns.min(configured_end);
+        Ok(window)
+    }
+}
+
+fn budget_exhausted(search: super::PlanningSearchStats) -> PlanningDecision {
+    PlanningDecision::Unknown {
+        reason: PlanningUnknownReason::ComputeBudgetExhausted,
+        search,
+    }
 }
 
 fn elapsed_ns(origin: Instant, at: Instant) -> Result<u64, PlanningTimeError> {
@@ -170,6 +365,31 @@ fn duration_ns(duration: Duration) -> Result<NonZeroU64, PlanningTimeError> {
         .ok()
         .and_then(NonZeroU64::new)
         .ok_or(PlanningTimeError::TimeOverflow)
+}
+
+struct CheckedPlanningClock<F> {
+    origin: PlanningTimeOrigin,
+    read: F,
+    last_ns: u64,
+    error: Option<PlanningTimeError>,
+    budget: Option<PlanningBudgetWindow>,
+}
+impl<F: FnMut() -> Instant> PlanningClock for CheckedPlanningClock<F> {
+    fn planning_budget_window(&self) -> Option<PlanningBudgetWindow> {
+        self.budget
+    }
+    fn now_ns(&mut self) -> u64 {
+        if self.error.is_none() {
+            match self.origin.at_ns((self.read)()) {
+                Ok(now) if now >= self.last_ns => self.last_ns = now,
+                Ok(_) => self.error = Some(PlanningTimeError::ClockMovedBackwards),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        // No synthetic future time can manufacture an expired-deadline proof.
+        // The private wrapper returns Err regardless of the planner's result.
+        self.last_ns
+    }
 }
 
 /// Explicit conversion to an independent monotonic cost clock. The cost value
