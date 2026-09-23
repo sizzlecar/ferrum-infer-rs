@@ -510,3 +510,20 @@ fn output_budget_preserves_terminal_capacity_and_isolated_active_request_shares(
     config.admission.max_active_requests = NonZeroUsize::new(1).unwrap();
     config.validate().unwrap();
 }
+
+#[test]
+fn planner_phase_shares_default_in_old_config_and_reject_empty_replay_share() {
+    let config: SloPlannerConfig = serde_json::from_str(r#"{"max_planning_us":1}"#).unwrap();
+    assert_eq!(config.search_budget_percent, 60);
+    assert_eq!(config.publication_reserve_percent, 20);
+    config.validate().unwrap();
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert_eq!(serialized["search_budget_percent"], 60);
+    assert_eq!(serialized["publication_reserve_percent"], 20);
+    for (search, publication) in [(0, 20), (60, 0), (80, 20), (100, 1), (255, 255)] {
+        let mut invalid = config.clone();
+        invalid.search_budget_percent = search;
+        invalid.publication_reserve_percent = publication;
+        assert!(invalid.validate().is_err(), "{search}/{publication}");
+    }
+}

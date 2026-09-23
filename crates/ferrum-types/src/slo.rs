@@ -204,6 +204,12 @@ pub struct SloPlannerConfig {
     /// Complete whole-wave cost alternatives. Independent of candidate count.
     pub max_shape_alternatives: NonZeroUsize,
     pub max_planning_us: NonZeroU64,
+    /// Optional exploration stops at this percentage of the original planning
+    /// transaction once a complete shared witness exists. Never a fresh budget.
+    pub search_budget_percent: u8,
+    /// Reserve the final part of that same transaction for engine resource,
+    /// route and output revalidation/publication, after the planner's replay.
+    pub publication_reserve_percent: u8,
     pub max_replan_attempts: NonZeroUsize,
     /// A new snapshot after transient lock contention or an exhausted compute
     /// slice. This timer never grants physical capacity or resets request time.
@@ -223,6 +229,8 @@ impl Default for SloPlannerConfig {
             max_route_states: NonZeroUsize::new(16).unwrap(),
             max_shape_alternatives: NonZeroUsize::new(32).unwrap(),
             max_planning_us: NonZeroU64::new(2_000).unwrap(),
+            search_budget_percent: 60,
+            publication_reserve_percent: 20,
             max_replan_attempts: NonZeroUsize::new(2).unwrap(),
             retry_backoff_ms: NonZeroU64::new(1).unwrap(),
             prefill_credit_beta: 1.0,
@@ -238,6 +246,16 @@ impl SloPlannerConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.search_budget_percent == 0
+            || self.publication_reserve_percent == 0
+            || u16::from(self.search_budget_percent) + u16::from(self.publication_reserve_percent)
+                >= 100
+        {
+            return Err(
+                "planner search/publication percentages must be positive and sum to less than 100"
+                    .to_owned(),
+            );
+        }
         validate_milliseconds("planner retry_backoff_ms", self.retry_backoff_ms)?;
         if self.max_route_states.get() > 256 || self.max_shape_alternatives.get() > 256 {
             return Err(
