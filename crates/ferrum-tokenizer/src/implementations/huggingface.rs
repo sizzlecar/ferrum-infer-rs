@@ -2,6 +2,9 @@
 
 use crate::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo, TokenizerType};
 use async_trait::async_trait;
+use ferrum_interfaces::tokenizer::{
+    BoundedDecodeBound, BoundedDecodeError, BoundedIncrementalDecodePolicy, DecodedTextBound,
+};
 use ferrum_types::{ModelOutputProtocol, Result, SpecialTokens, TokenId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -10,6 +13,13 @@ use tokenizers::decoders::DecoderWrapper;
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::debug;
 
+mod bounded_decode;
+mod host_output_identity;
+mod output_bound;
+#[cfg(test)]
+mod output_bound_tests;
+mod prepared_completion;
+
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
     tokenizer: Arc<HfTokenizer>,
@@ -17,6 +27,11 @@ pub struct HuggingFaceTokenizer {
     info: TokenizerInfo,
     id_to_token: Vec<Option<String>>,
     byte_level_decoder: bool,
+    decoded_text_bound: Option<DecodedTextBound>,
+    bounded_decoder: Option<bounded_decode::ByteLevelBoundedDecoder>,
+    prepared_completion: prepared_completion::PreparedCompletionTable,
+    host_output_content_identity: Option<[u8; 32]>,
+    host_output_policy_identity: Option<[u8; 32]>,
     /// Semantic-marker token ids mapped to the canonical text emitted in
     /// their place. Some vocabs mark protocol controls `special: true`
     /// (Magistral's `[THINK]`/`[/THINK]`), so a skip-special decode would
@@ -138,6 +153,33 @@ impl HuggingFaceTokenizer {
 
         let semantic_markers = probe_semantic_markers(&tokenizer);
         let byte_level_decoder = tokenizer.get_decoder().is_some_and(decoder_uses_byte_level);
+        let decoded_text_bound = output_bound::byte_level_decoded_text_bound(
+            &tokenizer,
+            &id_to_token,
+            &semantic_markers,
+        );
+        let bounded_decoder = bounded_decode::ByteLevelBoundedDecoder::new(
+            &tokenizer,
+            &id_to_token,
+            &semantic_markers,
+        );
+
+        let identity_started = std::time::Instant::now();
+        let prepared_completion = prepared_completion::PreparedCompletionTable::new(&tokenizer);
+        let host_output_content_identity = host_output_identity::content(
+            &tokenizer,
+            &id_to_token,
+            &semantic_markers,
+            byte_level_decoder,
+            bounded_decoder.is_some(),
+        );
+        let host_output_policy_identity =
+            host_output_identity::resolved(host_output_content_identity, &special_tokens);
+        debug!(
+            elapsed_us = identity_started.elapsed().as_micros() as u64,
+            identity_available = host_output_policy_identity.is_some(),
+            "Computed tokenizer host output policy identity"
+        );
 
         Ok(Self {
             tokenizer: Arc::new(tokenizer),
@@ -145,6 +187,11 @@ impl HuggingFaceTokenizer {
             info,
             id_to_token,
             byte_level_decoder,
+            decoded_text_bound,
+            bounded_decoder,
+            prepared_completion,
+            host_output_content_identity,
+            host_output_policy_identity,
             semantic_markers,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
@@ -202,6 +249,10 @@ impl HuggingFaceTokenizer {
             self.special_tokens.extra_eos_tokens = overrides.extra_eos;
         }
         self.info.special_tokens = self.special_tokens.clone();
+        // Source overrides are applied before publication. Reuse the cached
+        // large immutable content digest rather than serializing vocab again.
+        self.host_output_policy_identity =
+            host_output_identity::resolved(self.host_output_content_identity, &self.special_tokens);
     }
 
     /// Create from HuggingFace Hub
@@ -342,6 +393,14 @@ impl Tokenizer for HuggingFaceTokenizer {
             .and_then(|value| value.as_deref())
     }
 
+    fn prepared_completion_tokens(&self, text: &str) -> Option<&[TokenId]> {
+        self.prepared_completion.get(text)
+    }
+
+    fn host_output_policy_identity(&self) -> Option<[u8; 32]> {
+        self.host_output_policy_identity
+    }
+
     fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
         if self.byte_level_decoder {
             return self.token_text(token_id).map(byte_level_token_bytes);
@@ -353,6 +412,44 @@ impl Tokenizer for HuggingFaceTokenizer {
                 self.token_text(token_id)
                     .map(|text| text.as_bytes().to_vec())
             })
+    }
+
+    fn decoded_text_bound(&self) -> Option<DecodedTextBound> {
+        self.decoded_text_bound
+    }
+
+    fn bounded_token_bytes_bound(&self) -> Option<std::num::NonZeroUsize> {
+        self.bounded_decoder
+            .as_ref()
+            .and_then(|decoder| decoder.token_bytes_bound())
+    }
+
+    fn token_bytes_bounded_into(
+        &self,
+        token_id: TokenId,
+        output: &mut [u8],
+    ) -> std::result::Result<Option<usize>, BoundedDecodeError> {
+        bounded_decode::token_bytes_into(self, token_id, output)
+    }
+
+    fn bounded_decode_bound(&self) -> Option<BoundedDecodeBound> {
+        self.bounded_decoder.as_ref().map(|decoder| decoder.bound())
+    }
+
+    fn bounded_incremental_decode_policy(&self) -> Option<BoundedIncrementalDecodePolicy> {
+        self.bounded_decoder
+            .as_ref()
+            .map(|_| BoundedIncrementalDecodePolicy::StrictDecodedPrefix)
+    }
+
+    fn decode_bounded_into(
+        &self,
+        tokens: &[TokenId],
+        skip_special: bool,
+        scratch: &mut [u8],
+        output: &mut String,
+    ) -> std::result::Result<(), BoundedDecodeError> {
+        bounded_decode::decode_into(self, tokens, skip_special, scratch, output)
     }
 
     fn apply_chat_template(
