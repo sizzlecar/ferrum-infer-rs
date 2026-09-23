@@ -9,6 +9,9 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+pub mod planning_state;
+mod prefill_output;
+pub use prefill_output::{PrefillOutputPublication, PrefillOutputPublicationOutcome};
 mod prefix_rendezvous;
 mod prefix_restore;
 pub use prefix_rendezvous::{PrefixRendezvousCandidate, PrefixRendezvousHold, PrefixRequestKey};
@@ -741,6 +744,8 @@ pub struct ContinuousSchedulerAdmissionCounts {
 /// This scheduler manages requests through their lifecycle in a continuous
 /// batching system, allowing for iteration-level scheduling decisions.
 pub struct ContinuousBatchScheduler {
+    /// Cold owner fence for planning read views; never executor authority.
+    planning_owner: Arc<()>,
     /// Configuration
     config: SchedulerConfig,
 
@@ -912,6 +917,7 @@ impl ContinuousBatchScheduler {
         let runtime_config = ContinuousBatchRuntimeConfig::from_scheduler_config(&config);
 
         Self {
+            planning_owner: Arc::new(()),
             config,
             waiting_queue: RwLock::new(DynamicAdmissionQueue::new(
                 DynamicAdmissionQueuePolicy::default(),
@@ -1986,6 +1992,18 @@ impl ContinuousBatchScheduler {
     /// Route active decode failures through the same logical work frontier as
     /// prefill/recompute failures.
     pub fn defer_decode_for_execution_capacity(
+        &self,
+        request_ids: &[RequestId],
+        deferral: AdmissionDeferral,
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Result<ExecutionCapacityAction> {
+        self.plan_execution_capacity_pressure(request_ids, deferral, release_snapshot)
+    }
+
+    /// One exact prefill/decode/mixed wave enters the phase-independent
+    /// pressure coordinator atomically, without issuing several competing
+    /// yield transactions from the same capacity observation.
+    pub fn defer_wave_for_execution_capacity(
         &self,
         request_ids: &[RequestId],
         deferral: AdmissionDeferral,

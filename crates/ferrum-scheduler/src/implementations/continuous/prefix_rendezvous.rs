@@ -91,6 +91,22 @@ impl Default for PrefixRendezvousRequestState {
 }
 
 impl PrefixRendezvousRequestState {
+    /// Unlike `cap`, this never releases a dependency when a span cannot fit.
+    pub(super) fn planning_state(&self) -> (bool, Option<(usize, u64, u64)>) {
+        (
+            self.held(),
+            self.source
+                .upgrade()
+                .filter(|dependency| dependency.pending.load(Ordering::Acquire))
+                .map(|dependency| {
+                    (
+                        dependency.boundary,
+                        dependency.span.alignment().get(),
+                        dependency.span.minimum_tokens().get(),
+                    )
+                }),
+        )
+    }
     pub(super) fn held(&self) -> bool {
         self.follower
             .upgrade()

@@ -62,6 +62,7 @@ pub(crate) struct LogicalWorkFrontier {
     resident_tokens: usize,
     scheduled_tokens: usize,
     committed_output_tokens: usize,
+    prefill_output_pending: bool,
     progress_generation: LogicalWorkGeneration,
     recompute_origin: Option<LogicalWorkGeneration>,
     recompute_target_tokens: Option<usize>,
@@ -75,6 +76,7 @@ impl Default for LogicalWorkFrontier {
             resident_tokens: 0,
             scheduled_tokens: 0,
             committed_output_tokens: 0,
+            prefill_output_pending: false,
             progress_generation: LogicalWorkGeneration::ZERO,
             recompute_origin: None,
             recompute_target_tokens: None,
@@ -83,6 +85,16 @@ impl Default for LogicalWorkFrontier {
 }
 
 impl LogicalWorkFrontier {
+    /// Numeric planning evidence only; no resident-resource authority.
+    pub(super) fn planning_counters(&self) -> (usize, usize, usize, usize, Option<usize>) {
+        (
+            self.computed_tokens,
+            self.resident_tokens,
+            self.scheduled_tokens,
+            self.committed_output_tokens,
+            self.recompute_target_tokens,
+        )
+    }
     pub(crate) const fn work_kind(&self) -> LogicalWorkKind {
         self.work_kind
     }
@@ -96,6 +108,7 @@ impl LogicalWorkFrontier {
     }
 
     pub(crate) fn begin_prefill(&mut self, recompute: bool) {
+        self.prefill_output_pending = false;
         self.work_kind = if recompute {
             LogicalWorkKind::Recompute
         } else {
@@ -111,6 +124,7 @@ impl LogicalWorkFrontier {
     }
 
     pub(crate) fn begin_decode(&mut self) {
+        self.prefill_output_pending = true;
         self.work_kind = LogicalWorkKind::Decode;
         self.recompute_origin = None;
         self.recompute_target_tokens = None;
@@ -151,7 +165,21 @@ impl LogicalWorkFrontier {
         }
     }
 
+    pub(super) fn prefill_output_pending(&self) -> bool {
+        self.prefill_output_pending
+    }
+
+    pub(super) fn commit_prefill_output(&mut self, committed_output_tokens: usize) {
+        self.prefill_output_pending = false;
+        let delta = committed_output_tokens.saturating_sub(self.committed_output_tokens);
+        self.committed_output_tokens = committed_output_tokens;
+        if delta > 0 {
+            self.progress_generation = self.progress_generation.advance(delta);
+        }
+    }
+
     pub(crate) fn commit_decode(&mut self, committed_output_tokens: usize) {
+        self.prefill_output_pending = false;
         let delta = committed_output_tokens.saturating_sub(self.committed_output_tokens);
         self.committed_output_tokens = committed_output_tokens;
         self.computed_tokens = self.computed_tokens.saturating_add(delta);
@@ -163,6 +191,7 @@ impl LogicalWorkFrontier {
     }
 
     pub(crate) fn yield_for_recompute(&mut self) {
+        self.prefill_output_pending = false;
         self.work_kind = LogicalWorkKind::Waiting;
         self.recompute_origin = Some(self.progress_generation);
         self.recompute_target_tokens = Some(self.computed_tokens);
@@ -172,6 +201,7 @@ impl LogicalWorkFrontier {
     }
 
     pub(crate) fn finish(&mut self) {
+        self.prefill_output_pending = false;
         self.work_kind = LogicalWorkKind::Terminal;
         self.scheduled_tokens = self.computed_tokens;
     }
@@ -1482,6 +1512,28 @@ impl PressureCoordinator {
             };
         }
         PressureHoldStatus::None
+    }
+
+    /// Allocation-free projection of the same hold predicate used by admission.
+    pub(super) fn planning_is_held(&self, request_id: &RequestId) -> bool {
+        if self.released_holds.contains_key(request_id) {
+            return false;
+        }
+        self.request_index
+            .get(request_id)
+            .and_then(|id| self.episodes.get(id))
+            .and_then(|episode| episode.participants.get(request_id).map(|p| (episode, p)))
+            .is_some_and(|(episode, participant)| {
+                matches!(
+                    participant.state,
+                    ParticipantState::YieldPlanned | ParticipantState::Held
+                ) || (participant.state == ParticipantState::PendingResume
+                    && episode.state != PressureEpisodeState::Resumable)
+            })
+    }
+
+    pub(super) fn planning_revision(&self) -> u64 {
+        self.next_transition_ordinal
     }
 
     pub(crate) fn consume_released_hold(

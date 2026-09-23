@@ -26,6 +26,14 @@ pub(super) struct PrefixRestoreState {
 }
 
 impl PrefixRestoreState {
+    pub(super) fn planning_state(&self) -> (bool, usize, bool, bool) {
+        (
+            self.is_pending(),
+            self.restored_tokens,
+            self.capacity_hold,
+            self.abandoned,
+        )
+    }
     pub(super) fn begin_admission(&mut self) {
         *self = Self::default();
     }
