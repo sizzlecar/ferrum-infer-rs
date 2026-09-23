@@ -9,11 +9,15 @@ use std::ffi::OsString;
 use std::sync::RwLock;
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// Typed diagnostic entry, deliberately not an environment-variable name.
+pub const PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY: &str = "profile_max_frames_per_request";
+
 /// Product settings carried through the runtime snapshot without an env bridge.
 pub fn is_typed_only_runtime_config_key(key: &str) -> bool {
     matches!(
         key,
-        crate::SLO_CONFIG_RUNTIME_KEY
+        PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY
+            | crate::SLO_CONFIG_RUNTIME_KEY
             | crate::SLO_CONFIG_PATH_RUNTIME_KEY
             | crate::SLO_CONFIG_DIGEST_RUNTIME_KEY
             | crate::SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY
@@ -242,6 +246,9 @@ pub fn parse_tri_state_env_value(raw: Option<&str>) -> Result<EnvTriState, Strin
 }
 
 fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
+    if key == PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY {
+        return vec![RuntimeConfigEffect::Diagnostics];
+    }
     if matches!(
         key,
         crate::SLO_CONFIG_RUNTIME_KEY

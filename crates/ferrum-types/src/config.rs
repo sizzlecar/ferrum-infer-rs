@@ -190,6 +190,10 @@ pub struct RuntimeKnobs {
     pub device_memory_sampling: Option<crate::DeviceMemorySamplingConfig>,
     pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub profile_detail: ObservabilityProfileDetail,
+    /// Limit diagnostic execution frames per request without changing inference.
+    /// Only modes that already capture all frames support this opt-in bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_max_frames_per_request: Option<std::num::NonZeroU32>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
     /// Retain independent vNext sequence-state checkpoints across requests.
@@ -214,6 +218,38 @@ pub struct RuntimeKnobs {
     pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
     #[serde(default)]
     pub vnext_diagnostic_fault: Option<VNextDiagnosticFault>,
+}
+
+impl RuntimeKnobs {
+    pub fn validate_profile_frame_limit(&self) -> std::result::Result<(), String> {
+        if self.profile_max_frames_per_request.is_none() {
+            return Ok(());
+        }
+        if !matches!(
+            self.profile_detail,
+            ObservabilityProfileDetail::Resource
+                | ObservabilityProfileDetail::Kernel
+                | ObservabilityProfileDetail::Replay
+                | ObservabilityProfileDetail::Verify
+                | ObservabilityProfileDetail::Full
+        ) {
+            return Err("profile-max-frames-per-request requires an existing all-frame profile detail: resource, kernel, replay, verify or full".to_owned());
+        }
+        if self.profile_jsonl.is_none() && self.scheduler_trace_jsonl.is_none() {
+            return Err("profile-max-frames-per-request requires a profile-jsonl or scheduler-trace-jsonl execution event sink".to_owned());
+        }
+        if self
+            .profile_jsonl
+            .iter()
+            .chain(self.scheduler_trace_jsonl.iter())
+            .any(|path| path.as_os_str().is_empty())
+        {
+            return Err(
+                "profile frame limit requires nonempty execution event sink paths".to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Engine configuration
@@ -365,6 +401,13 @@ impl EngineConfig {
                     "FERRUM_PROFILE_DETAIL: expected one of off, basic, resource, latency, kernel, debug, replay, verify, full; got {value:?}"
                     )
                 })?;
+        }
+        if let Some(value) =
+            runtime_config_value(snapshot, crate::PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY)
+        {
+            self.runtime.profile_max_frames_per_request = Some(value.parse().map_err(|_| {
+                "profile_max_frames_per_request must be a positive 32-bit integer".to_owned()
+            })?);
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_VNEXT_DIAGNOSTIC_FAULT") {
             self.runtime.vnext_diagnostic_fault = Some(
@@ -1555,6 +1598,62 @@ mod tests {
             config.runtime.profile_detail,
             ObservabilityProfileDetail::Full
         );
+    }
+
+    #[test]
+    fn engine_config_profile_frame_limit_is_positive_and_does_not_enable_capture() {
+        for value in ["1", "4294967295"] {
+            let snapshot = RuntimeConfigSnapshot::from_entries([crate::RuntimeConfigEntry::new(
+                crate::PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY,
+                value,
+                crate::RuntimeConfigSource::Cli,
+            )]);
+            let mut config = EngineConfig::default();
+            config.apply_runtime_config_snapshot(&snapshot).unwrap();
+            assert_eq!(
+                config.runtime.profile_max_frames_per_request.unwrap().get(),
+                value.parse::<u32>().unwrap()
+            );
+            assert_eq!(
+                config.runtime.profile_detail,
+                ObservabilityProfileDetail::Off
+            );
+            assert!(config.runtime.validate_profile_frame_limit().is_err());
+        }
+        for value in ["0", "-1", "4294967296", "unlimited"] {
+            let snapshot = RuntimeConfigSnapshot::from_entries([crate::RuntimeConfigEntry::new(
+                crate::PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY,
+                value,
+                crate::RuntimeConfigSource::ConfigFile,
+            )]);
+            assert!(EngineConfig::default()
+                .apply_runtime_config_snapshot(&snapshot)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn profile_frame_limit_preserves_unbounded_serialized_runtime_defaults() {
+        let runtime = RuntimeKnobs::default();
+        let serialized = serde_json::to_value(&runtime).unwrap();
+        assert!(serialized.get("profile_max_frames_per_request").is_none());
+        let restored: RuntimeKnobs = serde_json::from_value(serialized).unwrap();
+        assert!(restored.profile_max_frames_per_request.is_none());
+        assert!(restored.validate_profile_frame_limit().is_ok());
+
+        let runtime = RuntimeKnobs {
+            profile_detail: ObservabilityProfileDetail::Full,
+            profile_jsonl: Some(PathBuf::from("profile.jsonl")),
+            profile_max_frames_per_request: std::num::NonZeroU32::new(2),
+            ..Default::default()
+        };
+        let restored: RuntimeKnobs =
+            serde_json::from_value(serde_json::to_value(&runtime).unwrap()).unwrap();
+        assert_eq!(
+            restored.profile_max_frames_per_request,
+            runtime.profile_max_frames_per_request
+        );
+        assert!(restored.validate_profile_frame_limit().is_ok());
     }
 
     #[test]
