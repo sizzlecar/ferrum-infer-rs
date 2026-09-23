@@ -1,6 +1,6 @@
 //! Direct HTTP measurements reuse the agent proxy's exact SSE observer.
 use super::{
-    proxy::{RequestRecord, SseObserver},
+    proxy::{RequestRecord, SseObserver, VisibleTextRecord},
     write_json,
 };
 use anyhow::{ensure, Context, Result};
@@ -20,6 +20,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Barrier;
+
+#[path = "http_replay/text_timing.rs"]
+mod text_timing;
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -48,6 +51,7 @@ struct FrozenBody {
     source: PathBuf,
     bytes: Bytes,
     sha256: String,
+    single_choice_requested: bool,
 }
 
 pub(crate) async fn run(args: &Args) -> Result<i32> {
@@ -94,6 +98,7 @@ pub(crate) async fn run(args: &Args) -> Result<i32> {
                 source,
                 bytes,
                 sha256,
+                single_choice_requested: parsed.get("n").is_none_or(|n| n.as_u64() == Some(1)),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -143,6 +148,7 @@ pub(crate) async fn run(args: &Args) -> Result<i32> {
             &endpoint,
             &run_id,
             bodies[index].bytes.clone(),
+            bodies[index].single_choice_requested,
             index as u32,
             raw,
             clock,
@@ -179,6 +185,13 @@ pub(crate) async fn run(args: &Args) -> Result<i32> {
             })
             .sum::<u64>()
     });
+    let successful: Vec<_> = records
+        .iter()
+        .filter(|r| r.http_status == Some(200) && r.saw_done && r.error.is_none())
+        .collect();
+    let successful_output = successful.iter().try_fold(0_u64, |total, r| {
+        total.checked_add(r.usage.as_ref()?["completion_tokens"].as_u64()?)
+    });
     let summary: Vec<_> = records.iter().map(|r| json!({
         "request_index": r.request_index, "request_id": r.server_request_id,
         "body_sha256": bodies[r.request_index as usize].sha256,
@@ -187,6 +200,7 @@ pub(crate) async fn run(args: &Args) -> Result<i32> {
         "ttft_ns": r.progress_ns.first().map(|first| first.saturating_sub(r.submitted_ns)),
         "first_sse_latency_ns": r.first_sse_ns.map(|first| first.saturating_sub(r.submitted_ns)),
         "progress_events": r.progress_ns.len(), "usage": r.usage,
+        "visible_text": text_timing::measure(r),
         "http_status": r.http_status, "saw_done": r.saw_done,
         "finish_reasons": r.finish_reasons, "error": r.error
     })).collect();
@@ -195,10 +209,17 @@ pub(crate) async fn run(args: &Args) -> Result<i32> {
         "transport_complete": transport_complete, "usage_complete": usage_complete,
         "elapsed_ns": end.saturating_sub(start), "total_output_tokens": total_output,
         "output_tokens_per_second_including_prefill": total_output.filter(|_| end > start).map(|n| n as f64 * 1e9 / (end - start) as f64),
+        "successful_request_count": successful.len(),
+        "successful_output_tokens": successful_output,
+        "successful_output_tokens_per_second_including_prefill": successful_output.filter(|_| end > start).map(|n| n as f64 * 1e9 / (end - start) as f64),
         "requests": summary,
+        "visible_text": text_timing::summarize(&records),
         "measurement_notes": [
             "TTFT is first nonempty content, reasoning or tool name/argument progress; a role-only SSE frame is not progress.",
+            "visible_text reports separate first-choice content/reasoning text TTFT, last-visible TPOT using usage tokens, and pooled SSE text-event ITL. Tool-only, role-only, empty and finish-only events are excluded.",
+            "Visible text gaps retain stalls, transport-coalesced events and usage/event mismatches. Strict single-token timing is not established by this replay.",
             "SSE progress events are not tokens. Output counts come only from server usage; missing usage remains unavailable.",
+            "The original throughput field includes all reported usage. Successful throughput includes only completed error-free responses, over the same full-wave wall interval.",
             "Client latency includes transport, queueing and inference. Concurrent HTTP streams do not prove simultaneous GPU execution.",
             "Prefix-cache state and server configuration are controlled externally; this command does not warm, clear or reset caches.",
             "Finish reasons, including length, are retained. Transport completion is not semantic task validation."
@@ -219,6 +240,7 @@ async fn capture(
     endpoint: &str,
     run_id: &str,
     body: Bytes,
+    single_choice_requested: bool,
     index: u32,
     mut raw: BufWriter<File>,
     clock: Instant,
@@ -229,6 +251,10 @@ async fn capture(
         task_id: "raw-body".into(),
         request_index: index,
         submitted_ns: at(clock),
+        visible_text: Some(VisibleTextRecord {
+            single_choice_requested: Some(single_choice_requested),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let mut observer = SseObserver::default();

@@ -44,6 +44,9 @@ pub(crate) struct RequestRecord {
     pub first_sse_ns: Option<u64>,
     /// Nonempty content, reasoning or tool-argument/name fragments, not role frames.
     pub progress_ns: Vec<u64>,
+    /// Separate first-choice text timing; absent in older evidence records.
+    #[serde(default)]
+    pub visible_text: Option<VisibleTextRecord>,
     pub ended_ns: Option<u64>,
     pub server_request_id: Option<String>,
     pub http_status: Option<u16>,
@@ -56,6 +59,16 @@ pub(crate) struct RequestRecord {
     /// to prove which assistant turn each returned tool result belongs to.
     #[serde(skip)]
     pub messages: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct VisibleTextRecord {
+    pub timestamps_ns: Vec<u64>,
+    pub transport_coalesced_chunks: u64,
+    #[serde(default)]
+    pub single_choice_requested: Option<bool>,
+    #[serde(default)]
+    pub multi_choice_observed: bool,
 }
 
 pub(crate) struct Proxy {
@@ -403,6 +416,11 @@ impl SseObserver {
         at: u64,
         record: &mut RequestRecord,
     ) -> std::io::Result<()> {
+        let before = record
+            .visible_text
+            .get_or_insert_default()
+            .timestamps_ns
+            .len();
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() > 32 * 1024 * 1024 {
             return Err(std::io::Error::other("unterminated oversized SSE record"));
@@ -422,6 +440,13 @@ impl SseObserver {
                 self.data
                     .extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
             }
+        }
+        let text = record
+            .visible_text
+            .as_mut()
+            .expect("text observer initialized");
+        if text.timestamps_ns.len() - before > 1 {
+            text.transport_coalesced_chunks += 1;
         }
         Ok(())
     }
@@ -453,6 +478,40 @@ impl SseObserver {
         }
         if event["usage"].is_object() {
             record.usage = Some(event["usage"].clone());
+        }
+        if event["choices"].as_array().is_some_and(|choices| {
+            choices.len() > 1
+                || choices.iter().any(|choice| {
+                    choice
+                        .get("index")
+                        .is_some_and(|index| index.as_u64() != Some(0))
+                })
+        }) {
+            record
+                .visible_text
+                .get_or_insert_default()
+                .multi_choice_observed = true;
+        }
+        // Match bench_serve's first_non_empty_delta_text contract. Tool
+        // fragments remain agent progress, but are not visible text events.
+        let visible = event["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| {
+                ["content", "reasoning", "reasoning_content"]
+                    .iter()
+                    .any(|key| {
+                        choice["delta"][key]
+                            .as_str()
+                            .is_some_and(|text| !text.is_empty())
+                    })
+            });
+        if visible {
+            record
+                .visible_text
+                .get_or_insert_default()
+                .timestamps_ns
+                .push(at);
         }
         let mut progress = false;
         for choice in event["choices"].as_array().into_iter().flatten() {
