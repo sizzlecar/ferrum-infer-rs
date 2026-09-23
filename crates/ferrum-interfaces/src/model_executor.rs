@@ -3064,6 +3064,75 @@ pub enum ExecutorPrefillAdmissionDecision {
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Explicit passive observation is separate from resource and submission authority.
+    /// Unavailable observed calls do no work; Executed errors may have submitted.
+    fn execution_cost_observation_capability(
+        &self,
+    ) -> crate::execution_cost::ExecutorCostObservationCapability {
+        crate::execution_cost::ExecutorCostObservationCapability::Unavailable
+    }
+
+    async fn plan_runtime_prefill_with_capacity_observed(
+        &self,
+        _input: &PlanRuntimePrefillInput,
+        _observation: &mut crate::execution_cost::PlanRuntimeCostObservationContext<'_>,
+    ) -> crate::execution_cost::ObservedDispatch<PlanRuntimePrefillOutcome> {
+        crate::execution_cost::ObservedDispatch::Unavailable
+    }
+
+    async fn plan_runtime_batch_prefill_with_capacity_observed(
+        &self,
+        _inputs: &[PlanRuntimePrefillInput],
+        _observation: &mut crate::execution_cost::PlanRuntimeCostObservationContext<'_>,
+    ) -> crate::execution_cost::ObservedDispatch<PlanRuntimeBatchPrefillOutcome> {
+        crate::execution_cost::ObservedDispatch::Unavailable
+    }
+
+    async fn plan_runtime_mixed_batch_with_capacity_observed(
+        &self,
+        _prefills: &[PlanRuntimePrefillInput],
+        _decodes: &[PlanRuntimeDecodeInput],
+        _observation: &mut crate::execution_cost::PlanRuntimeCostObservationContext<'_>,
+    ) -> crate::execution_cost::ObservedDispatch<PlanRuntimeMixedBatchOutcome> {
+        crate::execution_cost::ObservedDispatch::Unavailable
+    }
+
+    async fn plan_runtime_batch_decode_with_capacity_observed(
+        &self,
+        _inputs: &[PlanRuntimeDecodeInput],
+        _observation: &mut crate::execution_cost::PlanRuntimeCostObservationContext<'_>,
+    ) -> crate::execution_cost::ObservedDispatch<PlanRuntimeBatchDecodeOutcome> {
+        crate::execution_cost::ObservedDispatch::Unavailable
+    }
+
+    /// Capture bounded read-only evidence for complete future eager waves.
+    /// Does not prepare work or alter execution policy.
+    fn execution_cost_route_view(
+        &self,
+        _requests: &[ExecutorResourcePlanningRequest<'_>],
+        _limits: crate::vnext::ResourcePlanningLimits,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::ExecutionCostRouteView> {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    /// Replay a whole wave in private numeric state, including transfers,
+    /// selected providers and readback. A projected route grants no authority.
+    fn project_execution_cost_wave(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _state: &crate::vnext::ExecutionCostRouteState,
+        _query: &crate::vnext::FutureWaveCostQuery<'_>,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::ExecutionCostRouteProjection>
+    {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
     /// Plan an optional prompt-tail checkpoint before a prefill chunk is
     /// dispatched. The boundary must lie after this chunk's start and no later
     /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning

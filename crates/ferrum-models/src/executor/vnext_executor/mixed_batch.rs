@@ -51,6 +51,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         prefills: &[PlanRuntimePrefillInput],
         decodes: &[PlanRuntimeDecodeInput],
+        cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<PlanRuntimeMixedBatchOutcome> {
         // Diagnostic checkpoint capture assigns separate phase counters and
         // teacher-forced ownership. Preserve its existing execution contract.
@@ -297,6 +298,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &spans,
                 VNextExecutionWaveKind::Mixed,
                 &output_roles,
+                cost_observation,
             )
             .await?
         {

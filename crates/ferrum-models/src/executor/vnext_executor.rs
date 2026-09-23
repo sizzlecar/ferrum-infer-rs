@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ferrum_interfaces::execution_cost::{
+    ActualWaveEvidenceUnknown, ActualWaveOutcome, ExecutorCostObservationCapability,
+    ObservedCallOutcome, ObservedDispatch, PlanRuntimeCostObservationContext,
+};
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
@@ -65,8 +69,10 @@ use super::{
 
 mod backing_maintenance;
 mod composition;
+mod cost_observation;
 mod determinism;
 mod mixed_batch;
+mod planning_cost_route;
 mod readback_logits;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
@@ -1637,8 +1643,8 @@ impl VNextResidentProductTokenMaskContent {
                     return false;
                 }
                 resident_mask.upgrade().is_some_and(|resident_mask| {
-                    Arc::ptr_eq(&resident_mask, requested_mask)
-                        || resident_mask.as_ref() == requested_mask.as_ref()
+                    selection_mask_bytes_match(&resident_mask, requested_mask, None)
+                        .expect("unbudgeted mask comparison is infallible")
                 })
             }
             _ => false,
@@ -5280,6 +5286,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .execute_plan_runtime_prefill_with_capacity_policy(
                 &input,
                 VNextPrefillFrontierPolicy::ExactStartup,
+                None,
             )
             .await?
         {
@@ -5392,7 +5399,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             })
             .collect::<Vec<_>>();
-        match self.execute_plan_runtime_decode_batch(&inputs).await? {
+        match self
+            .execute_plan_runtime_decode_batch(&inputs, None)
+            .await?
+        {
             PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
                 if outputs.len() != width {
                     return Err(FerrumError::internal(format!(
@@ -7280,6 +7290,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7329,14 +7340,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .iter()
                         .flat_map(|token| token.to_le_bytes())
                         .collect::<Vec<_>>();
-                    let logical_offset_bytes = range
-                        .start
-                        .checked_mul(ElementType::U32.size_bytes())
-                        .ok_or_else(|| {
-                            FerrumError::backend("vNext token upload offset overflows u64")
-                        })?;
-                    let source_layout = HostTransferLayout::new(
-                        ElementType::U32,
+                    let (logical_offset_bytes, source_layout) = planning_cost_route::product_token_upload_layout(
+                        range.start,
                         participant.span.immediate_tokens(),
                     )
                     .map_err(|error| FerrumError::backend(error.to_string()))?;
@@ -7358,19 +7363,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
-        let token_mask_elements = match u64::try_from(self.io.output_elements) {
-            Ok(elements) => elements,
-            Err(_) => {
-                return DispatchOutcome::QuiescentFailure(
-                    "vNext token-mask length exceeds u64".to_owned(),
-                )
-            }
-        };
-        let token_mask_layout = match HostTransferLayout::new(ElementType::U8, token_mask_elements)
-        {
-            Ok(layout) => layout,
+        let upload_layouts = match planning_cost_route::product_upload_layouts(&self.io) {
+            Ok(layouts) => layouts,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
+        let token_mask_layout = upload_layouts.mask;
         let token_mask_uploads = participants
             .iter()
             .zip(token_mask_plans)
@@ -7400,15 +7397,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         }
         let repetition_uploads = (|| -> Result<_> {
-            let repetition_capacity = u64::try_from(self.io.repetition_capacity)
-                .map_err(|_| FerrumError::backend("vNext repetition capacity exceeds u64"))?;
-            let repetition_token_id_layout =
-                HostTransferLayout::new(ElementType::U32, repetition_capacity)
-                    .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let repetition_offset_layout = HostTransferLayout::new(ElementType::U32, 2)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let repetition_penalty_layout = HostTransferLayout::new(ElementType::F32, 1)
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let repetition_token_id_layout = upload_layouts.repetition_ids;
+            let repetition_offset_layout = upload_layouts.offsets;
+            let repetition_penalty_layout = upload_layouts.penalty;
             let mut token_id_uploads = Vec::with_capacity(participants.len());
             let mut offset_uploads = Vec::with_capacity(participants.len());
             let mut penalty_uploads = Vec::with_capacity(participants.len());
@@ -7626,6 +7617,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     program.per_wave_binding_node_indices().len() as u64,
                 )
             });
+            let cost_submit_started = cost_observation
+                .as_ref()
+                .and_then(|observation| observation.now_ns());
             let submission = {
                 let _timing = self
                     .metrics
@@ -7633,7 +7627,41 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .provider_encode_submit
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                if let Some(reusable_program) = reusable_program {
+                if cost_observation.is_some() {
+                    if timing_enabled {
+                        OperationDispatch::encode_and_submit_wave_with_cost_observation(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            device_timing_mode,
+                            &uploads,
+                            execution_policy,
+                            reusable_program,
+                            &timing_sink,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                        .map(ProfiledSubmissionHandle::into_parts)
+                    } else {
+                        OperationDispatch::encode_and_submit_wave_with_cost_observation(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            device_timing_mode,
+                            &uploads,
+                            execution_policy,
+                            reusable_program,
+                            &cost_observation::dispatch::NoTiming,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                        .map(ProfiledSubmissionHandle::into_parts)
+                    }
+                } else if let Some(reusable_program) = reusable_program {
                     if timing_enabled {
                         OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
                             self.providers.providers(),
@@ -7697,6 +7725,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             match submission {
                 Ok((completion, attribution)) => {
+                    if let Some(observation) = cost_observation.as_deref_mut() {
+                        let shape = cost_observation::dispatch::actual_shape(
+                            self,
+                            observation,
+                            participants,
+                            kind,
+                            output_mode,
+                            token_mask_plans,
+                            attribution.as_ref(),
+                            retries,
+                            completion.core_readback_route(self.runtime.as_ref()),
+                        );
+                        observation.physical_wave(shape, cost_submit_started);
+                    }
                     let identity_materialization = identity.materialization_snapshot();
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
                     self.metrics.identity_waves.fetch_add(1, Ordering::Relaxed);
@@ -7766,16 +7808,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     return DispatchOutcome::QuiescentFailure(error.to_string())
                 }
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery }) => {
+                    if let Some(observation) = cost_observation.as_deref_mut() {
+                        observation.physical_wave(
+                            Err(ActualWaveEvidenceUnknown::GraphPath),
+                            cost_submit_started,
+                        );
+                    }
                     return DispatchOutcome::SubmissionIndeterminate {
                         message: "vNext wave submission is indeterminate".to_owned(),
                         recovery,
-                    }
+                    };
                 }
                 Err(SubmissionWaveDispatchError::PostSubmitContract { error, completion }) => {
+                    if let Some(observation) = cost_observation.as_deref_mut() {
+                        observation.physical_wave(
+                            Err(ActualWaveEvidenceUnknown::GraphPath),
+                            cost_submit_started,
+                        );
+                    }
                     return DispatchOutcome::PostSubmitContract {
                         message: error.to_string(),
                         completion,
-                    }
+                    };
                 }
             }
         }
@@ -7903,6 +7957,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
+        cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
@@ -8006,7 +8061,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, prepared, kind)
+        self.execute_prepared_participants(&participants, prepared, kind, cost_observation)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
     }
@@ -8027,7 +8082,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             output_role: &output_role,
         };
         let mut logits = self
-            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
+            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind, None)
             .await?;
         logits
             .pop()
@@ -8039,6 +8094,36 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+    ) -> Result<Vec<ExecutorSamplingOutput>> {
+        let mut terminal_observed = false;
+        let result = self
+            .execute_prepared_participants_inner(
+                participants,
+                prepared,
+                kind,
+                cost_observation.as_deref_mut(),
+                &mut terminal_observed,
+            )
+            .await;
+        if let Some(observation) = cost_observation {
+            let outcome = match (&result, terminal_observed) {
+                (Ok(_), true) => ActualWaveOutcome::Completed,
+                (Err(_), true) => ActualWaveOutcome::FailedAfterSubmit,
+                _ => ActualWaveOutcome::SubmissionIndeterminate,
+            };
+            observation.terminal(outcome, None);
+        }
+        result
+    }
+
+    async fn execute_prepared_participants_inner(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        prepared: PreparedVNextPrefill<R>,
+        kind: VNextExecutionWaveKind,
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        terminal_observed: &mut bool,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
@@ -8148,6 +8233,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 output_mode,
                 token_mask_residency.plans(),
+                cost_observation.as_deref_mut(),
             );
             (token_mask_residency, dispatch)
         };
@@ -8175,6 +8261,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match recovered {
                     Ok(_) => {
+                        *terminal_observed = true;
                         token_mask_residency.invalidate_before_slot_release();
                         return Err(self.abort_step(step, message).await);
                     }
@@ -8204,6 +8291,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match observed {
                     Ok(CompletionObservation::Terminal(_)) => {
+                        *terminal_observed = true;
                         token_mask_residency.invalidate_before_slot_release();
                         return Err(self.abort_step(step, message).await);
                     }
@@ -8299,6 +8387,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(FerrumError::backend(message));
             }
         };
+        *terminal_observed = true;
         self.refresh_on_demand_reusable_execution_catalog()?;
         self.metrics.device_timing.record(&receipt);
         self.metrics.device_timing_for(kind).record(&receipt);
@@ -8634,20 +8723,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         output_mode: VNextProductOutputMode,
     ) -> Result<VNextTerminalReadbacks> {
         let (output_node_id, output_resource_id, output_offset_bytes, output_layout) =
-            match output_mode {
-                VNextProductOutputMode::FullLogits => (
-                    &self.io.output_node_id,
-                    &self.io.output_resource_id,
-                    self.io.output_offset_bytes,
-                    self.io.output_layout,
-                ),
-                VNextProductOutputMode::GreedyToken => (
-                    &self.io.greedy_token_output_node_id,
-                    &self.io.greedy_token_output_resource_id,
-                    self.io.greedy_token_output_offset_bytes,
-                    self.io.greedy_token_output_layout,
-                ),
-            };
+            planning_cost_route::product_readback_binding(&self.io, output_mode);
         let product_readbacks = participants
             .iter()
             .enumerate()
@@ -8805,6 +8881,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     async fn execute_plan_runtime_decode_batch(
         &self,
         inputs: &[PlanRuntimeDecodeInput],
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         let started = Instant::now();
         if inputs.is_empty() {
@@ -8941,6 +9018,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &spans,
                 VNextExecutionWaveKind::Decode,
                 &output_roles,
+                cost_observation.as_deref_mut(),
             )
             .await
         {
@@ -9046,7 +9124,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
 
         match self
-            .execute_plan_runtime_decode_batch(&typed_inputs)
+            .execute_plan_runtime_decode_batch(&typed_inputs, None)
             .await?
         {
             PlanRuntimeBatchDecodeOutcome::Completed(outputs) => {
@@ -9078,6 +9156,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.execute_plan_runtime_prefill_with_capacity_policy(
             input,
             VNextPrefillFrontierPolicy::Adaptive,
+            None,
         )
         .await
     }
@@ -9086,6 +9165,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         input: &PlanRuntimePrefillInput,
         frontier_policy: VNextPrefillFrontierPolicy,
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<PlanRuntimePrefillOutcome> {
         let started = Instant::now();
         let request_id = input.request_id.clone();
@@ -9191,6 +9271,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::slice::from_ref(&span),
                     VNextExecutionWaveKind::Prefill,
                     &[VNextParticipantOutputRole::prefill(completed_chunk)],
+                    cost_observation.as_deref_mut(),
                 )
                 .await?
             {
@@ -9275,6 +9356,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     async fn execute_plan_runtime_prefill_batch_with_capacity(
         &self,
         inputs: &[PlanRuntimePrefillInput],
+        mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<PlanRuntimeBatchPrefillOutcome> {
         if inputs.is_empty() {
             return Ok(PlanRuntimeBatchPrefillOutcome::Completed(Vec::new()));
@@ -9496,6 +9578,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &spans,
                     VNextExecutionWaveKind::Prefill,
                     &output_roles,
+                    cost_observation.as_deref_mut(),
                 )
                 .await?
             {
@@ -9764,7 +9847,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|input| self.plan_runtime_prefill_input_from_legacy(input))
             .collect::<Result<Vec<_>>>()?;
         match self
-            .execute_plan_runtime_prefill_batch_with_capacity(&inputs)
+            .execute_plan_runtime_prefill_batch_with_capacity(&inputs, None)
             .await?
         {
             PlanRuntimeBatchPrefillOutcome::Completed(completions) => {
@@ -9946,6 +10029,102 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn execution_cost_observation_capability(&self) -> ExecutorCostObservationCapability {
+        ExecutorCostObservationCapability::SinglePhysicalWave
+    }
+
+    async fn plan_runtime_prefill_with_capacity_observed(
+        &self,
+        input: &PlanRuntimePrefillInput,
+        observation: &mut PlanRuntimeCostObservationContext<'_>,
+    ) -> ObservedDispatch<PlanRuntimePrefillOutcome> {
+        let result = self
+            .execute_plan_runtime_prefill_with_capacity_policy(
+                input,
+                VNextPrefillFrontierPolicy::Adaptive,
+                Some(observation),
+            )
+            .await;
+        observation.finish_call(match &result {
+            Ok(PlanRuntimePrefillOutcome::Completed(_)) => ObservedCallOutcome::Completed,
+            Ok(PlanRuntimePrefillOutcome::Deferred(_)) => ObservedCallOutcome::Deferred,
+            Err(_) => ObservedCallOutcome::Failed,
+        });
+        ObservedDispatch::Executed(result)
+    }
+
+    async fn plan_runtime_batch_prefill_with_capacity_observed(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+        observation: &mut PlanRuntimeCostObservationContext<'_>,
+    ) -> ObservedDispatch<PlanRuntimeBatchPrefillOutcome> {
+        let result = self
+            .execute_plan_runtime_prefill_batch_with_capacity(inputs, Some(observation))
+            .await;
+        observation.finish_call(match &result {
+            Ok(PlanRuntimeBatchPrefillOutcome::Completed(_)) => ObservedCallOutcome::Completed,
+            Ok(PlanRuntimeBatchPrefillOutcome::Unsupported) => ObservedCallOutcome::Unsupported,
+            Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(_)) => {
+                ObservedCallOutcome::NotSubmitted
+            }
+            Err(_) => ObservedCallOutcome::Failed,
+        });
+        ObservedDispatch::Executed(result)
+    }
+
+    async fn plan_runtime_mixed_batch_with_capacity_observed(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+        observation: &mut PlanRuntimeCostObservationContext<'_>,
+    ) -> ObservedDispatch<PlanRuntimeMixedBatchOutcome> {
+        let result = self
+            .execute_plan_runtime_mixed_batch(prefills, decodes, Some(observation))
+            .await;
+        observation.finish_call(match &result {
+            Ok(PlanRuntimeMixedBatchOutcome::Completed { .. }) => ObservedCallOutcome::Completed,
+            Ok(PlanRuntimeMixedBatchOutcome::Unsupported) => ObservedCallOutcome::Unsupported,
+            Ok(PlanRuntimeMixedBatchOutcome::NotSubmitted(_)) => ObservedCallOutcome::NotSubmitted,
+            Err(_) => ObservedCallOutcome::Failed,
+        });
+        ObservedDispatch::Executed(result)
+    }
+
+    async fn plan_runtime_batch_decode_with_capacity_observed(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        observation: &mut PlanRuntimeCostObservationContext<'_>,
+    ) -> ObservedDispatch<PlanRuntimeBatchDecodeOutcome> {
+        let result = self
+            .execute_plan_runtime_decode_batch(inputs, Some(observation))
+            .await;
+        observation.finish_call(match &result {
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(_)) => ObservedCallOutcome::Completed,
+            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(_)) => ObservedCallOutcome::Deferred,
+            Err(_) => ObservedCallOutcome::Failed,
+        });
+        ObservedDispatch::Executed(result)
+    }
+
+    fn execution_cost_route_view(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        limits: ResourcePlanningLimits,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteView> {
+        self.capture_future_cost_route(requests, limits, budget)
+    }
+
+    fn project_execution_cost_wave(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        query: &FutureWaveCostQuery<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteProjection> {
+        self.project_future_cost_route(view, state, query, budget)
+    }
+
     fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
         self.prompt_tail_boundary(chunk)
     }
@@ -10453,7 +10632,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         inputs: &[PlanRuntimePrefillInput],
     ) -> Result<PlanRuntimeBatchPrefillOutcome> {
-        self.execute_plan_runtime_prefill_batch_with_capacity(inputs)
+        self.execute_plan_runtime_prefill_batch_with_capacity(inputs, None)
             .await
     }
 
@@ -10462,7 +10641,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         prefills: &[PlanRuntimePrefillInput],
         decodes: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeMixedBatchOutcome> {
-        self.execute_plan_runtime_mixed_batch(prefills, decodes)
+        self.execute_plan_runtime_mixed_batch(prefills, decodes, None)
             .await
     }
 
@@ -10577,7 +10756,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         inputs: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        self.execute_plan_runtime_decode_batch(inputs).await
+        self.execute_plan_runtime_decode_batch(inputs, None).await
     }
 
     fn discard_plan_runtime_prefill(&self, authority: PlanRuntimePrefillAuthority) -> Result<()> {
