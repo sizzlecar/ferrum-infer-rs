@@ -219,6 +219,10 @@ pub struct RuntimeKnobs {
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
+    /// Filled only after actual cost-profile loading. Serialized diagnostics
+    /// cannot supply a receipt when deserialized as a new engine request.
+    #[serde(default, skip_deserializing)]
+    pub slo_cost_profile_receipt: Option<crate::SloCostProfileReceipt>,
     /// Numerical policy is resolved against family contracts and the actual
     /// runtime catalog before any model weight allocation.
     #[serde(default)]
@@ -440,6 +444,9 @@ impl Default for EngineModelConfig {
 /// Scheduler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
+    /// Optional time policy. Existing configurations retain the Off behavior.
+    #[serde(default)]
+    pub slo: crate::SloConfig,
     /// Scheduling policy
     pub policy: SchedulingPolicy,
     /// Maximum waiting queue size
@@ -488,6 +495,7 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            slo: crate::SloConfig::default(),
             policy: SchedulingPolicy::Priority,
             max_waiting_requests: 1000,
             max_running_requests: 32,
@@ -516,6 +524,22 @@ impl SchedulerConfig {
         &mut self,
         snapshot: &RuntimeConfigSnapshot,
     ) -> std::result::Result<(), String> {
+        if let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == crate::SLO_CONFIG_RUNTIME_KEY)
+        {
+            if entry.source == crate::RuntimeConfigSource::Env {
+                return Err(
+                    "slo_config has no environment override; use typed CLI/config input".to_owned(),
+                );
+            }
+            let slo: crate::SloConfig = serde_json::from_str(&entry.effective_value)
+                .map_err(|error| format!("slo_config: {error}"))?;
+            slo.validate()
+                .map_err(|reason| format!("slo_config: {reason}"))?;
+            self.slo = slo;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS")
         {
             self.prefix_rendezvous_max_wait_ms = Some(

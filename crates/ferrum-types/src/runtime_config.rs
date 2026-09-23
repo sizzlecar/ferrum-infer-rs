@@ -9,6 +9,17 @@ use std::ffi::OsString;
 use std::sync::RwLock;
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// Product settings carried through the runtime snapshot without an env bridge.
+pub fn is_typed_only_runtime_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        crate::SLO_CONFIG_RUNTIME_KEY
+            | crate::SLO_CONFIG_PATH_RUNTIME_KEY
+            | crate::SLO_CONFIG_DIGEST_RUNTIME_KEY
+            | crate::SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY
+    )
+}
+
 /// Process-wide runtime snapshot, installed once at the composition root.
 ///
 /// This is the single env-bridge seam the test-architecture goal asks for:
@@ -231,6 +242,19 @@ pub fn parse_tri_state_env_value(raw: Option<&str>) -> Result<EnvTriState, Strin
 }
 
 fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
+    if matches!(
+        key,
+        crate::SLO_CONFIG_RUNTIME_KEY
+            | crate::SLO_CONFIG_PATH_RUNTIME_KEY
+            | crate::SLO_CONFIG_DIGEST_RUNTIME_KEY
+    ) {
+        return vec![
+            RuntimeConfigEffect::Correctness,
+            RuntimeConfigEffect::Performance,
+            RuntimeConfigEffect::Memory,
+            RuntimeConfigEffect::Diagnostics,
+        ];
+    }
     let mut effects = Vec::new();
 
     if key.contains("DIAG")
