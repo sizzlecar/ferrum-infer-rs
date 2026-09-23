@@ -82,7 +82,7 @@ pub(super) fn validate_value_binding_physical_coverage(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StepParticipantRangeCoordinates {
+pub(super) enum StepParticipantRangeCoordinates {
     SourceToken,
     ParticipantLocal,
 }
@@ -177,12 +177,40 @@ fn translate_step_participant_range(
     semantic_range: Range<u64>,
     coordinates: StepParticipantRangeCoordinates,
 ) -> Result<Range<u64>, VNextError> {
+    let token_range = work_shape
+        .participant_token_ranges()
+        .get(participant_index)
+        .ok_or_else(|| invalid_operation("participant resource projection is out of range"))?;
+    translate_step_participant_numeric_range(
+        demand,
+        work_shape.immediate_sequences(),
+        work_shape.immediate_tokens(),
+        participant_index,
+        token_range.source_token_range(),
+        token_range.immediate_token_range().start,
+        semantic_range,
+        coordinates,
+    )
+}
+
+/// The actual encoder and future query share this coordinate calculation.
+/// Numeric ranges convey layout facts only, never physical buffer authority.
+pub(super) fn translate_step_participant_numeric_range(
+    demand: &DynamicResourceDemand,
+    immediate_sequences: u32,
+    immediate_tokens: u64,
+    participant_index: usize,
+    source: Range<u64>,
+    packed_start_token: u64,
+    semantic_range: Range<u64>,
+    coordinates: StepParticipantRangeCoordinates,
+) -> Result<Range<u64>, VNextError> {
     if semantic_range.start >= semantic_range.end {
         return Err(invalid_operation(
             "participant resource projection has an empty semantic range",
         ));
     }
-    if participant_index >= work_shape.participant_token_ranges().len() {
+    if participant_index >= immediate_sequences as usize || source.start >= source.end {
         return Err(invalid_operation(
             "participant resource projection is out of range",
         ));
@@ -192,8 +220,7 @@ fn translate_step_participant_range(
             bytes_per_sequence,
             maximum_sequences,
         } => {
-            if work_shape.immediate_sequences() > *maximum_sequences
-                || semantic_range.end > *bytes_per_sequence
+            if immediate_sequences > *maximum_sequences || semantic_range.end > *bytes_per_sequence
             {
                 return Err(invalid_operation(
                     "participant fixed resource projection exceeds its planned stride",
@@ -218,14 +245,11 @@ fn translate_step_participant_range(
             bytes_per_token,
             maximum_tokens,
         } => {
-            if work_shape.immediate_tokens() > *maximum_tokens {
+            if immediate_tokens > *maximum_tokens {
                 return Err(invalid_operation(
                     "participant token resource projection exceeds its planned ceiling",
                 ));
             }
-            let token_range = &work_shape.participant_token_ranges()[participant_index];
-            let source = token_range.source_token_range();
-            let packed = token_range.immediate_token_range();
             let source_start = source
                 .start
                 .checked_mul(*bytes_per_token)
@@ -234,8 +258,7 @@ fn translate_step_participant_range(
                 .end
                 .checked_mul(*bytes_per_token)
                 .ok_or_else(|| invalid_operation("source token byte range overflows u64"))?;
-            let packed_start = packed
-                .start
+            let packed_start = packed_start_token
                 .checked_mul(*bytes_per_token)
                 .ok_or_else(|| invalid_operation("packed token byte offset overflows u64"))?;
             let relative_range = match coordinates {

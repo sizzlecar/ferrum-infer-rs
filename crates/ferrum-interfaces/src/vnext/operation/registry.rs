@@ -14,8 +14,9 @@ use super::invocation::PreparedOperationDispatchBinding;
 use super::resolved_value::resource_uses_packed_batch_coordinates;
 use super::{
     AttributeId, BatchedOperationInvocation, CapabilityCatalog, EngineProviderDescriptor,
-    OperationContract, OperationDescriptor, OperationFailure, OperationProviderDescriptor,
-    ResolvedValueBinding, ResolvedValueRole,
+    OperationContract, OperationCostRoute, OperationCostRouteRequest, OperationCostWorkRow,
+    OperationDescriptor, OperationFailure, OperationProviderDescriptor, ResolvedValueBinding,
+    ResolvedValueRole,
 };
 
 /// Exact semantic input presented to a selected provider's resource estimator.
@@ -590,6 +591,17 @@ pub enum ReusableBindingResources {
 /// A compile-time provider contract for one concrete runtime buffer type. The
 /// kernel method consumes only a dispatch-created invocation.
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
+    /// Declares one eager route from immutable plan semantics and numerical
+    /// work only. Unknown is the default; historical observations are not a
+    /// future route proof. The caller still has to establish that eager is the
+    /// selected execution path and revalidate live resources before submission.
+    fn eager_cost_route(
+        &self,
+        _request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        Ok(None)
+    }
+
     /// Opts a binding-only encoder into a smaller physical view projection.
     /// The default preserves the full invocation, including for providers
     /// whose binding encoder delegates to `encode_selected`.
@@ -944,6 +956,37 @@ where
 
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
         self.provider().descriptor()
+    }
+
+    /// Query the exact provider already bound to this plan, without creating
+    /// invocation resources or acquiring submission authority.
+    pub fn eager_cost_route(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        rows: &[OperationCostWorkRow],
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        self.eager_cost_route_with_ranges(resolved, rows, None)
+    }
+
+    pub(crate) fn eager_cost_route_with_ranges(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        rows: &[OperationCostWorkRow],
+        physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        self.validate_binding(resolved, &self.node_id)?;
+        let node = self.dispatch.node(resolved, &self.node_id)?;
+        let request = OperationCostRouteRequest::new(
+            node,
+            resolved.execution_plan().payload().memory(),
+            rows,
+        )?
+        .with_physical_ranges(physical_ranges);
+        let route = self.provider().eager_cost_route(request)?;
+        if let Some(route) = &route {
+            route.validate_participants(rows.len())?;
+        }
+        Ok(route)
     }
 }
 

@@ -5,6 +5,7 @@ mod catalog;
 mod checkpoint;
 mod compiled_identity;
 mod compiled_submission_wave;
+mod cost_route;
 mod descriptor;
 mod determinism;
 mod determinism_artifact;
@@ -44,6 +45,11 @@ pub use checkpoint::{
     PROVIDER_CHECKPOINT_CONTRACT_VERSION,
 };
 pub use compiled_identity::CompiledSubmissionWaveIdentity;
+pub use cost_route::{
+    coalesce_sorted_program_binding_writes, OperationCostCommand, OperationCostRoute,
+    OperationCostRouteRequest, OperationCostWorkRow, ProgramBindingCostPatch,
+    ProgramBindingCostWrite, ProgramBindingTransferLayout, SelectedEagerCostRoute,
+};
 pub use descriptor::{
     OperationContract, OperationDescriptor, OracleSpec, ProfilePhase, ProviderRequirement,
     ResourcePresenceRequirement, ResourceRequirements,

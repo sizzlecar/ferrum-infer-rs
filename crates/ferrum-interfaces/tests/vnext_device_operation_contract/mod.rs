@@ -747,6 +747,10 @@ impl ProviderBehavior {
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) cost_route_supported: bool,
+    pub(crate) cost_route_extra_participants: u32,
+    pub(crate) cost_route_queries: Vec<Vec<OperationCostWorkRow>>,
+    pub(crate) cost_route_input_alignment: Vec<Option<u64>>,
     pub(crate) reusable_binding_resources: ReusableBindingResources,
     pub(crate) reusable_views: Vec<(NodeId, BTreeSet<ResourceId>, BTreeSet<ProgramValueId>)>,
     pub(crate) reusable_topology_calls: u64,
@@ -833,6 +837,33 @@ impl OperationResourceEstimator for TestProvider {
 }
 
 impl OperationProvider<TestRuntime> for TestProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.cost_route_queries.push(request.rows().to_vec());
+        trace.cost_route_input_alignment.push(
+            request
+                .binding_contiguous_base_alignment(ResolvedValueRole::Input, 0)?
+                .map(|alignment| alignment.get()),
+        );
+        if !trace.cost_route_supported {
+            return Ok(None);
+        }
+        OperationCostRoute::new(vec![OperationCostCommand::new(
+            "fixture.cost-route",
+            DeviceCommandPhase::Compute,
+            DeviceBatchingForm::ParticipantLoop,
+            0,
+            request.rows().len() as u32 + trace.cost_route_extra_participants,
+            request.immediate_tokens(),
+            request.rows().len() as u64,
+            0,
+        )?])
+        .map(Some)
+    }
+
     fn reusable_binding_resources(&self) -> ReusableBindingResources {
         self.trace.lock().unwrap().reusable_binding_resources
     }
