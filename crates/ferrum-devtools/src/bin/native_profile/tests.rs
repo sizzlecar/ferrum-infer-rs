@@ -235,3 +235,166 @@ fn absent_identity_is_reported_and_incomplete_json_is_an_error() {
     let error = summarize(Cursor::new("{\"phase\":")).unwrap_err();
     assert!(error.to_string().contains("invalid JSON on line 1"));
 }
+
+fn with_participants(mut event: Event, start: u64, count: u64) -> Event {
+    event.shape.participant_count = Some(count);
+    event.shape.participant_start = Some(start);
+    event.shape.participant_end = Some(start + count);
+    event.attributes.participant_request_ids = Some(
+        (start..start + count)
+            .map(|id| format!("request-{id}"))
+            .collect(),
+    );
+    event
+}
+
+#[test]
+fn compute_participants_are_verified_independently_of_housekeeping_and_tokens() {
+    let mut a = with_participants(command("wave", 0, 32, 100), 3, 32);
+    a.attributes.wave_phase = Some("decode".into());
+    let mut b = a.clone();
+    b.shape.command_index = Some(1);
+    let mut housekeeping = command("wave", 2, 1, 20);
+    housekeeping.attributes.command_phase = Some("readback".into());
+    housekeeping.shape.participant_count = Some(0);
+    housekeeping.attributes.participant_request_ids = a.attributes.participant_request_ids.clone();
+    let result = report(&[a, b, housekeeping]);
+    let wave = &result.submissions[0];
+    assert_eq!(wave.phase.as_deref(), Some("decode"));
+    assert_eq!(wave.uniform_verified_compute_participant_count, Some(32));
+    assert_eq!(wave.observed_compute_participant_counts, [32]);
+    assert_eq!(wave.compute_command_shapes.len(), 2);
+    assert_eq!(wave.compute_commands_missing_participant_evidence, 0);
+    assert_eq!(wave.compute_commands_invalid_participant_evidence, 0);
+    let shape = &wave.compute_command_shapes[0];
+    assert_eq!(shape.command_index, 0);
+    assert_eq!(shape.participant_start, Some(3));
+    assert_eq!(shape.participant_end, Some(35));
+    assert_eq!(shape.participant_request_id_count, Some(32));
+    assert_eq!(shape.unique_participant_request_id_count, Some(32));
+
+    let mut prefill = with_participants(command("prefill", 0, 512, 100), 0, 4);
+    prefill.attributes.wave_phase = Some("prefill".into());
+    let result = report(&[prefill]);
+    assert_eq!(result.submissions[0].phase.as_deref(), Some("prefill"));
+    assert_eq!(
+        result.submissions[0].uniform_verified_compute_participant_count,
+        Some(4)
+    );
+    assert_eq!(
+        result.submissions[0].compute_command_shapes[0].token_count,
+        Some(512)
+    );
+}
+
+#[test]
+fn missing_or_heterogeneous_participant_evidence_never_proves_uniform_n32() {
+    let valid = with_participants(command("wave", 0, 32, 100), 0, 32);
+    let legacy = command("wave", 1, 32, 100);
+    let mut partial = with_participants(command("wave", 2, 32, 100), 0, 32);
+    partial.shape.participant_end = None;
+    let result = report(&[valid.clone(), legacy, partial]);
+    let wave = &result.submissions[0];
+    assert_eq!(wave.maximum_command_token_count, Some(32));
+    assert_eq!(wave.uniform_verified_compute_participant_count, None);
+    assert_eq!(wave.compute_commands_missing_participant_evidence, 2);
+    assert_eq!(wave.compute_commands_invalid_participant_evidence, 0);
+
+    let narrow = with_participants(command("wave", 1, 8, 100), 0, 8);
+    let result = report(&[valid, narrow]);
+    assert_eq!(
+        result.submissions[0].observed_compute_participant_counts,
+        [8, 32]
+    );
+    assert_eq!(
+        result.submissions[0].uniform_verified_compute_participant_count,
+        None
+    );
+    let mut readback = command("empty", 0, 32, 100);
+    readback.attributes.command_phase = Some("readback".into());
+    assert_eq!(
+        report(&[readback]).submissions[0].uniform_verified_compute_participant_count,
+        None
+    );
+}
+
+#[test]
+fn invalid_participant_evidence_is_reported_without_invalidating_device_time() {
+    let valid = with_participants(command("wave", 0, 2, 100), 0, 2);
+    let mut range = valid.clone();
+    range.shape.participant_end = Some(3);
+    let mut reversed = valid.clone();
+    reversed.shape.participant_start = Some(u64::MAX);
+    let mut missing_id = valid.clone();
+    missing_id
+        .attributes
+        .participant_request_ids
+        .as_mut()
+        .unwrap()
+        .pop();
+    let mut duplicate_id = valid.clone();
+    duplicate_id.attributes.participant_request_ids = Some(vec!["same".into(); 2]);
+    let mut empty_id = valid;
+    empty_id
+        .attributes
+        .participant_request_ids
+        .as_mut()
+        .unwrap()[0]
+        .clear();
+    let mut partial_conflict = range.clone();
+    partial_conflict.shape.participant_count = None;
+    for (event, issue) in [
+        (range, "participant_range_count_mismatch"),
+        (reversed, "reversed_participant_range"),
+        (missing_id, "participant_request_id_count_mismatch"),
+        (duplicate_id, "duplicate_participant_request_ids"),
+        (empty_id, "empty_participant_request_id"),
+        (
+            partial_conflict,
+            "participant_range_request_id_count_mismatch",
+        ),
+    ] {
+        let result = report(&[event]);
+        let wave = &result.submissions[0];
+        assert_eq!(wave.uniform_verified_compute_participant_count, None);
+        assert_eq!(wave.compute_commands_invalid_participant_evidence, 1);
+        assert!(wave.compute_command_shapes[0]
+            .participant_evidence_issues
+            .contains(&issue));
+        assert_eq!(wave.native_work.timing.measured_ns, 100);
+        assert_eq!(wave.native_work.timing.invalid_timing_commands, 0);
+    }
+}
+
+#[test]
+fn malformed_participant_types_and_conflicting_duplicate_shapes_are_errors() {
+    let original =
+        serde_json::to_value(with_participants(command("wave", 0, 2, 100), 0, 2)).unwrap();
+    for (pointer, value) in [
+        ("/shape/participant_count", serde_json::json!(-1)),
+        ("/shape/participant_start", serde_json::json!("0")),
+        ("/shape/participant_end", serde_json::json!(2.5)),
+        (
+            "/attributes/participant_request_ids",
+            serde_json::json!([1, 2]),
+        ),
+    ] {
+        let mut malformed = original.clone();
+        *malformed.pointer_mut(pointer).unwrap() = value;
+        let error = summarize(Cursor::new(malformed.to_string())).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid native schema on line 1"));
+    }
+    let changed =
+        serde_json::to_value(with_participants(command("wave", 0, 2, 100), 0, 1)).unwrap();
+    let mut repeated_id = original.clone();
+    repeated_id["attributes"]["participant_request_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::from("request-0"));
+    for conflict in [changed, repeated_id] {
+        let error = summarize(Cursor::new(format!("{original}\n{conflict}\n"))).unwrap_err();
+        assert!(error.to_string().contains("conflicting physical evidence"));
+    }
+}
