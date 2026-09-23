@@ -10,6 +10,7 @@
 //! - Preemption support for long-running requests
 
 pub mod cost_model;
+pub mod cost_profile;
 pub mod planning_state;
 mod prefill_output;
 pub use prefill_output::{PrefillOutputPublication, PrefillOutputPublicationOutcome};

@@ -24,6 +24,7 @@ priority-queue = "2.1"
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 
 # Error handling
 anyhow = { workspace = true }
