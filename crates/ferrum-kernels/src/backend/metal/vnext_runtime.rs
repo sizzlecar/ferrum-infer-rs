@@ -22,18 +22,19 @@ use std::time::Instant;
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
-    DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionReadbackRequest, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    PreparedDeviceSubmissionReadback, RetainedHostMemoryRegion, StaticWeightImportSession,
-    StreamState, VNextError, WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement,
+    DeviceCostGraphCaptureCapability, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
+    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionSpanKind,
+    DeviceExecutionTiming, DeviceId, DeviceNativeOperationId, DeviceNativeWorkAttribution,
+    DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionGuard, DeviceSubmissionReadbackRequest,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
+    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
+    FenceQuery, GuardedDeviceSubmissionError, HostTransferLayout, PreparedDeviceSubmissionReadback,
+    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
+    WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
@@ -50,6 +51,9 @@ use super::st;
 
 mod counter_readback;
 use counter_readback::CounterReadbackStats;
+mod core_cost_route;
+#[cfg(test)]
+mod submission_guard_tests;
 mod submission_readback;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -1275,6 +1279,9 @@ pub(crate) struct MetalSubmissionEncoder {
     command_buffer: CommandBuffer,
     compute: Option<ComputeCommandEncoder>,
     profile_enabled: bool,
+    /// Host-only counters for native work identity. Keeping these must never
+    /// enable physical profiling's encoder splits, labels or timestamp passes.
+    command_counts_enabled: bool,
     current_command_index: Option<u32>,
     command_label: Option<&'static str>,
     compute_subwork_id: Option<&'static str>,
@@ -1287,12 +1294,14 @@ impl MetalSubmissionEncoder {
     fn new(
         command_buffer: &CommandBufferRef,
         profile_enabled: bool,
+        command_counts_enabled: bool,
         counter_capture: Option<MetalCounterCaptureBuilder>,
     ) -> Self {
         Self {
             command_buffer: command_buffer.to_owned(),
             compute: None,
             profile_enabled,
+            command_counts_enabled,
             current_command_index: None,
             command_label: None,
             compute_subwork_id: None,
@@ -1303,7 +1312,7 @@ impl MetalSubmissionEncoder {
     }
 
     pub(crate) fn record_compute_dispatches(&mut self, count: u64) {
-        if self.profile_enabled {
+        if self.command_counts_enabled {
             self.compute_dispatch_count = self.compute_dispatch_count.saturating_add(count);
         }
     }
@@ -1392,7 +1401,7 @@ impl MetalSubmissionEncoder {
         encode: impl FnOnce(&metal::BlitCommandEncoderRef) -> T,
     ) -> T {
         debug_assert!(command_count > 0);
-        if self.profile_enabled {
+        if self.command_counts_enabled {
             self.transfer_command_count = self.transfer_command_count.saturating_add(command_count);
         }
         self.end_compute();
@@ -2122,11 +2131,26 @@ impl MetalDeviceRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     fn submit_commands<S>(
         &self,
         stream: &mut MetalDeviceStream,
         entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
         timing_mode: DeviceTimingMode,
+        timing_sink: &S,
+    ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        self.submit_commands_with_attribution(stream, entries, timing_mode, false, timing_sink)
+    }
+
+    fn submit_commands_with_attribution<S>(
+        &self,
+        stream: &mut MetalDeviceStream,
+        entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
+        timing_mode: DeviceTimingMode,
+        logical_attribution: bool,
         timing_sink: &S,
     ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
     where
@@ -2138,7 +2162,22 @@ impl MetalDeviceRuntime {
         // The returned fence owns the command buffer, counter pages, and command
         // resources needed until asynchronous device completion.
         metal::objc::rc::autoreleasepool(|| {
-            self.submit_commands_inner(stream, entries, timing_mode, timing_sink)
+            self.submit_commands_inner(
+                stream,
+                entries,
+                timing_mode,
+                logical_attribution,
+                timing_sink,
+                None,
+            )
+            .map_err(|error| match error {
+                GuardedDeviceSubmissionError::Device(error) => error,
+                GuardedDeviceSubmissionError::Rejected(_) => {
+                    DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                        "unguarded Metal submit returned a guard rejection",
+                    ))
+                }
+            })
         })
     }
 
@@ -2147,8 +2186,10 @@ impl MetalDeviceRuntime {
         stream: &mut MetalDeviceStream,
         entries: Vec<(DeviceCommandPhase, Option<u32>, MetalDeviceCommand)>,
         timing_mode: DeviceTimingMode,
+        logical_attribution: bool,
         timing_sink: &S,
-    ) -> Result<MetalDeviceFence, DefinitelyNotSubmitted<MetalDeviceRuntimeError>>
+        guard: Option<&dyn DeviceSubmissionGuard>,
+    ) -> Result<MetalDeviceFence, GuardedDeviceSubmissionError<MetalDeviceRuntimeError>>
     where
         S: DeviceSubmissionTimingSink,
     {
@@ -2157,12 +2198,15 @@ impl MetalDeviceRuntime {
             DeviceSubmissionStage::ValidateAndPrepare,
         );
         if let Err(error) = self.validate_stream(stream) {
-            return Err(DefinitelyNotSubmitted::new(error));
+            return Err(DefinitelyNotSubmitted::new(error).into());
         }
         if entries.is_empty() {
-            return Err(DefinitelyNotSubmitted::new(
-                MetalDeviceRuntimeError::contract("Metal command batch is empty"),
-            ));
+            return Err(
+                DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                    "Metal command batch is empty",
+                ))
+                .into(),
+            );
         }
         let command_count = u32::try_from(entries.len()).map_err(|_| {
             DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
@@ -2173,24 +2217,26 @@ impl MetalDeviceRuntime {
             .iter()
             .any(|(_, _, command)| command.runtime_instance != self.runtime_instance)
         {
-            return Err(DefinitelyNotSubmitted::new(
-                MetalDeviceRuntimeError::contract(
+            return Err(
+                DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
                     "Metal command batch contains work from another runtime instance",
-                ),
-            ));
+                ))
+                .into(),
+            );
         }
         if entries
             .iter()
             .any(|(_, _, command)| DeviceNativeOperationId::new(command.operation).is_none())
         {
-            return Err(DefinitelyNotSubmitted::new(
-                MetalDeviceRuntimeError::contract(
+            return Err(
+                DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
                     "Metal command batch has a non-portable native operation identity",
-                ),
-            ));
+                ))
+                .into(),
+            );
         }
         if let Err(error) = stream.state.begin_submission() {
-            return Err(DefinitelyNotSubmitted::new(error));
+            return Err(DefinitelyNotSubmitted::new(error).into());
         }
         drop(validate_stage);
 
@@ -2227,12 +2273,17 @@ impl MetalDeviceRuntime {
         } else {
             None
         };
+        // Cost evidence is bounded and may be unavailable for oversized waves.
+        // Existing explicitly requested kernel profiling retains its policy.
+        let logical_attribution = logical_attribution && entries.len() <= 8192;
         let mut encoder = MetalSubmissionEncoder::new(
             &command_buffer,
             physical_span_attribution,
+            physical_span_attribution || logical_attribution,
             counter_capture,
         );
-        let mut attribution = kernel_attribution.then(|| Vec::with_capacity(entries.len()));
+        let mut attribution =
+            (kernel_attribution || logical_attribution).then(|| Vec::with_capacity(entries.len()));
         let enqueue_stage =
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         for (command_index, (phase, node_index, command)) in entries.iter().enumerate() {
@@ -2240,7 +2291,7 @@ impl MetalDeviceRuntime {
             encoder.begin_command(command_index, command.operation);
             if let Err(error) = command.encode(&mut encoder) {
                 stream.state.cancel_recording();
-                return Err(DefinitelyNotSubmitted::new(error));
+                return Err(DefinitelyNotSubmitted::new(error).into());
             }
             if let Some(attribution) = attribution.as_mut() {
                 let (compute_dispatch_count, transfer_command_count) = encoder.command_counts();
@@ -2290,17 +2341,46 @@ impl MetalDeviceRuntime {
             Ok(submission_id) => submission_id,
             Err(_) => {
                 stream.state.cancel_recording();
-                return Err(DefinitelyNotSubmitted::new(
-                    MetalDeviceRuntimeError::contract("Metal submission identity exhausted"),
-                ));
+                return Err(
+                    DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                        "Metal submission identity exhausted",
+                    ))
+                    .into(),
+                );
             }
         };
-        if let Err(error) = stream.state.submission_recorded() {
-            stream.state.cancel_recording();
-            return Err(DefinitelyNotSubmitted::new(error));
+        if let Some(guard) = guard {
+            // Acquire/reserve all host bookkeeping before the final callback.
+            // No mutex acquisition or Vec growth follows a successful check.
+            let mut pending = stream.pending.command_buffers();
+            if pending.try_reserve(1).is_err() {
+                stream.state.cancel_recording();
+                return Err(
+                    DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                        "Metal pending submission capacity exhausted",
+                    ))
+                    .into(),
+                );
+            }
+            let retained_command_buffer = command_buffer.clone();
+            if let Err(reason) = guard.check(attribution.as_ref()) {
+                stream.state.cancel_recording();
+                return Err(GuardedDeviceSubmissionError::Rejected(reason));
+            }
+            if let Err(error) = stream.state.submission_recorded() {
+                stream.state.cancel_recording();
+                return Err(DefinitelyNotSubmitted::new(error).into());
+            }
+            pending.push((submission_id, retained_command_buffer));
+            command_buffer.commit();
+        } else {
+            if let Err(error) = stream.state.submission_recorded() {
+                stream.state.cancel_recording();
+                return Err(DefinitelyNotSubmitted::new(error).into());
+            }
+            stream.pending.insert(submission_id, command_buffer.clone());
+            command_buffer.commit();
         }
-        stream.pending.insert(submission_id, command_buffer.clone());
-        command_buffer.commit();
         let fence = MetalDeviceFence {
             submission_id,
             command_buffer,
@@ -2352,8 +2432,20 @@ impl DeviceRuntime for MetalDeviceRuntime {
         &self.descriptor
     }
 
+    fn cost_graph_capture_capability(&self) -> DeviceCostGraphCaptureCapability {
+        // This implementation only encodes eager Metal commands. It has no
+        // graph capture or replay path, regardless of product timing settings.
+        DeviceCostGraphCaptureCapability::Unsupported
+    }
+
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
         ferrum_types::AttentionExecutionPolicy::Portable
+    }
+
+    fn cost_core_execution_capabilities(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceCoreCostCapabilities> {
+        Some(core_cost_route::capabilities())
     }
 
     fn allocate(
@@ -2499,7 +2591,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         );
         Ok(MetalDeviceCommand::transfer(
             self.runtime_instance,
-            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
+            core_cost_route::capabilities().upload_native_operation,
             vec![destination_region],
             vec![staging],
             Box::new(|encoder, regions, staging| {
@@ -2538,7 +2630,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
         Ok(MetalDeviceCommand::transfer(
             self.runtime_instance,
-            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
+            core_cost_route::capabilities().zero_native_operation,
             vec![destination_region],
             Vec::new(),
             Box::new(|encoder, regions, _staging| {
@@ -2572,6 +2664,9 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
+        let logical_attribution = commands
+            .attribution_requirement()
+            .logical_execution_path_required();
         if matches!(
             commands.compute_path_requirement(),
             DeviceComputePathRequirement::ReplayedOnly
@@ -2596,7 +2691,59 @@ impl DeviceRuntime for MetalDeviceRuntime {
             })
             .collect::<Result<Vec<_>, MetalDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
-        self.submit_commands(stream, entries, timing_mode, timing_sink)
+        self.submit_commands_with_attribution(
+            stream,
+            entries,
+            timing_mode,
+            logical_attribution,
+            timing_sink,
+        )
+    }
+
+    fn supports_guarded_submission(&self) -> bool {
+        true
+    }
+
+    fn submit_guarded(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        guard: &dyn DeviceSubmissionGuard,
+    ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>> {
+        if commands.timing_mode() != DeviceTimingMode::Off
+            || matches!(
+                commands.compute_path_requirement(),
+                DeviceComputePathRequirement::ReplayedOnly
+                    | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+            )
+        {
+            return Err(GuardedDeviceSubmissionError::Rejected(
+                ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::ActualRouteMismatch,
+            ));
+        }
+        let entries = commands
+            .into_entries()
+            .into_iter()
+            .map(|entry| {
+                let (phase, node_index, logical_work, command) = entry.into_parts();
+                let command = match logical_work {
+                    Some(work) => command.bind_core_logical_work(work)?,
+                    None => command,
+                };
+                Ok((phase, node_index, command))
+            })
+            .collect::<Result<Vec<_>, MetalDeviceRuntimeError>>()
+            .map_err(DefinitelyNotSubmitted::new)?;
+        metal::objc::rc::autoreleasepool(|| {
+            self.submit_commands_inner(
+                stream,
+                entries,
+                DeviceTimingMode::Off,
+                true,
+                &DisabledDeviceSubmissionTimingSink,
+                Some(guard),
+            )
+        })
     }
 
     fn submission_attribution(&self, fence: &Self::Fence) -> Option<DeviceSubmissionAttribution> {
@@ -3019,6 +3166,205 @@ mod tests {
             )
             .expect("readback");
         assert_eq!(output, [1, 2, 0, 0, 0, 6, 7, 8]);
+    }
+
+    #[test]
+    fn cost_logical_attribution_keeps_timing_off_and_transfer_commands_identical() {
+        let runtime = runtime();
+        assert_eq!(
+            runtime.cost_graph_capture_capability(),
+            DeviceCostGraphCaptureCapability::Unsupported
+        );
+        let mut observations = Vec::new();
+        for retain_evidence in [false, true] {
+            let source = runtime
+                .allocate_request(&buffer_request("resource/cost-source"))
+                .unwrap();
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/cost-destination"))
+                .unwrap();
+            let mut stream = runtime.create_stream().unwrap();
+            let commands = vec![
+                runtime
+                    .encode_upload(
+                        &[1, 2, 3, 4, 5, 6, 7, 8],
+                        HostTransferLayout::new(ElementType::U8, 8).unwrap(),
+                        &source,
+                        0,
+                    )
+                    .unwrap(),
+                runtime
+                    .encode_copy(&source, &destination, CopyRegion::new(0, 0, 8).unwrap())
+                    .unwrap(),
+                runtime.encode_zero(&destination, 2, 3).unwrap(),
+            ];
+            let fence = runtime
+                .submit_commands_with_attribution(
+                    &mut stream,
+                    compute_entries(commands),
+                    DeviceTimingMode::Off,
+                    retain_evidence,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .unwrap();
+            assert_eq!(fence.commands.len(), 3);
+            let attribution = runtime.submission_attribution(&fence);
+            assert_eq!(attribution.is_some(), retain_evidence);
+            if let Some(attribution) = attribution {
+                assert_eq!(attribution.commands().len(), 3);
+                assert!(attribution
+                    .commands()
+                    .iter()
+                    .all(|row| row.execution_path() == DeviceExecutionPath::Eager));
+                assert!(attribution.commands().iter().all(|row| {
+                    row.compute_dispatch_count() == 0 && row.transfer_command_count() == 1
+                }));
+                assert!(attribution.replayed_segments().is_empty());
+            }
+            let terminal = runtime.wait_fence(&fence).unwrap();
+            assert!(terminal.terminal().is_succeeded());
+            assert!(matches!(
+                terminal.execution_timing(),
+                DeviceTimingMeasurement::NotRequested
+            ));
+            assert!(matches!(
+                terminal.submission_timing(),
+                DeviceTimingMeasurement::NotRequested
+            ));
+            assert!(matches!(
+                fence.command_timing,
+                MetalFenceCommandTiming::NotRequested
+            ));
+            observations.push(
+                runtime
+                    .readback(
+                        &mut stream,
+                        &destination,
+                        CopyRegion::new(0, 0, 8).unwrap(),
+                        HostTransferLayout::new(ElementType::U8, 8).unwrap(),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(observations[0], [1, 2, 0, 0, 0, 6, 7, 8]);
+        assert_eq!(observations[0], observations[1]);
+    }
+
+    #[test]
+    fn cost_logical_attribution_counts_compute_without_splitting_off_encoders() {
+        let runtime = runtime();
+        let library = runtime
+            .device
+            .new_library_with_source(
+                "#include <metal_stdlib>\n\
+                 using namespace metal;\n\
+                 kernel void cost_increment(device uchar *out [[buffer(0)]],\n\
+                                            uint i [[thread_position_in_grid]]) {\n\
+                     if (i < 8) out[i] += 1;\n\
+                 }",
+                &metal::CompileOptions::new(),
+            )
+            .unwrap();
+        let function = library.get_function("cost_increment", None).unwrap();
+        let pipeline = runtime
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
+
+        for retain_evidence in [false, true] {
+            let destination = runtime
+                .allocate_request(&buffer_request("resource/cost-compute"))
+                .unwrap();
+            // Retain the actual encoder objects so a split cannot be hidden by
+            // allocator address reuse. Both commands must use one Off encoder.
+            let compute_encoders = Arc::new(Mutex::new(Vec::new()));
+            let mut entries = vec![(
+                DeviceCommandPhase::Initialization,
+                None,
+                runtime.encode_zero(&destination, 0, 8).unwrap(),
+            )];
+            for node_index in 0..2 {
+                let pipeline = pipeline.clone();
+                let compute_encoders = Arc::clone(&compute_encoders);
+                let command = MetalDeviceCommand::operation(
+                    "test.cost_increment",
+                    vec![destination.region(0..8).unwrap()],
+                    move |encoder, regions| {
+                        assert!(!encoder.profile_enabled);
+                        assert!(encoder.counter_capture.is_none());
+                        assert!(encoder.current_command_index.is_none());
+                        assert!(encoder.command_label.is_none());
+                        encoder.record_compute_dispatches(1);
+                        let compute = encoder.compute_encoder();
+                        compute.set_compute_pipeline_state(&pipeline);
+                        compute.set_buffer(0, Some(regions[0].buffer()), regions[0].offset_bytes());
+                        compute.dispatch_threads(
+                            metal::MTLSize::new(8, 1, 1),
+                            metal::MTLSize::new(8, 1, 1),
+                        );
+                        compute_encoders.lock().unwrap().push(compute.to_owned());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                entries.push((DeviceCommandPhase::Compute, Some(node_index), command));
+            }
+            let mut stream = runtime.create_stream().unwrap();
+            let fence = runtime
+                .submit_commands_with_attribution(
+                    &mut stream,
+                    entries,
+                    DeviceTimingMode::Off,
+                    retain_evidence,
+                    &DisabledDeviceSubmissionTimingSink,
+                )
+                .unwrap();
+            let encoders = compute_encoders.lock().unwrap();
+            assert_eq!(encoders.len(), 2);
+            assert_eq!(encoders[0].as_ptr(), encoders[1].as_ptr());
+            drop(encoders);
+
+            let attribution = runtime.submission_attribution(&fence);
+            assert_eq!(attribution.is_some(), retain_evidence);
+            if let Some(attribution) = attribution {
+                let [initialization, first, second] = attribution.commands() else {
+                    panic!("expected initialization plus both actual dispatches")
+                };
+                assert_eq!(initialization.compute_dispatch_count(), 0);
+                assert_eq!(initialization.transfer_command_count(), 1);
+                for (index, command) in [first, second].into_iter().enumerate() {
+                    assert_eq!(command.command_index(), index as u32 + 1);
+                    assert_eq!(command.node_index(), Some(index as u32));
+                    assert_eq!(command.compute_dispatch_count(), 1);
+                    assert_eq!(command.transfer_command_count(), 0);
+                }
+            }
+            let terminal = runtime.wait_fence(&fence).unwrap();
+            assert!(terminal.terminal().is_succeeded());
+            assert!(matches!(
+                terminal.execution_timing(),
+                DeviceTimingMeasurement::NotRequested
+            ));
+            assert!(matches!(
+                terminal.submission_timing(),
+                DeviceTimingMeasurement::NotRequested
+            ));
+            assert!(matches!(
+                fence.command_timing,
+                MetalFenceCommandTiming::NotRequested
+            ));
+            assert_eq!(
+                runtime
+                    .readback(
+                        &mut stream,
+                        &destination,
+                        CopyRegion::new(0, 0, 8).unwrap(),
+                        HostTransferLayout::new(ElementType::U8, 8).unwrap(),
+                    )
+                    .unwrap(),
+                [2; 8]
+            );
+        }
     }
 
     #[test]

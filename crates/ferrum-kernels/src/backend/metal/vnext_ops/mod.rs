@@ -113,6 +113,7 @@ pub fn metal_vnext_runtime_config(
         device_id,
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             include_str!("../vnext_runtime.rs").as_bytes(),
+            include_str!("../vnext_runtime/core_cost_route.rs").as_bytes(),
             include_str!("../vnext_runtime/counter_readback.rs").as_bytes(),
             include_str!("mod.rs").as_bytes(),
             include_str!("weights.rs").as_bytes(),
@@ -308,6 +309,7 @@ impl MetalVNextComposition {
             implementation_fingerprint(&[
                 include_str!("mod.rs").as_bytes(),
                 include_str!("../vnext_runtime.rs").as_bytes(),
+                include_str!("../vnext_runtime/core_cost_route.rs").as_bytes(),
                 include_str!("../vnext_runtime/counter_readback.rs").as_bytes(),
                 METAL_ENGINE_PROVIDER_ID.as_bytes(),
             ]),
