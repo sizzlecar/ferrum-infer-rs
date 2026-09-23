@@ -6,6 +6,9 @@ const RECURRENT_ATTENTION_SOURCE: &str =
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
 const VNEXT_OPS_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops.rs");
 const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs");
+const SUBMISSION_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime/submission.rs");
+const CORE_COST_ROUTE_SOURCE: &str =
+    include_str!("../src/backend/cuda/vnext_runtime/core_cost_route.rs");
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
@@ -253,7 +256,7 @@ fn replay_identity_does_not_enable_full_profile_tool_correlation() {
     assert!(!REPLAY_SOURCE.contains("profile_identity.map_or_else("));
     assert!(!REPLAY_SOURCE.contains("retain_profile_identity: bool"));
     assert!(!REPLAY_SOURCE.contains("tool_correlation: bool"));
-    assert!(RUNTIME_SOURCE.contains(
+    assert!(SUBMISSION_SOURCE.contains(
         "if kernel_attribution {\n            vnext_tool_correlation::prepare();\n        }"
     ));
 }
@@ -302,7 +305,7 @@ fn dynamic_attention_addresses_use_one_hoistable_program_binding_boundary() {
     assert!(TRANSFORMER_SOURCE.contains("has_compiled_program_slot"));
     assert!(TRANSFORMER_SOURCE.contains("operation.with_program_binding(binding_command)"));
     assert!(TRANSFORMER_SOURCE.contains("operation.with_dynamic_binding(binding_command)"));
-    assert!(RUNTIME_SOURCE.contains("vnext_program_binding_prelude"));
+    assert!(CORE_COST_ROUTE_SOURCE.contains("vnext_program_binding_prelude"));
     assert!(RUNTIME_SOURCE.contains("coalesced_program_bindings"));
 }
 

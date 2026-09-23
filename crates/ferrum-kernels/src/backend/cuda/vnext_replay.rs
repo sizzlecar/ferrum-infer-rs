@@ -1110,6 +1110,17 @@ impl CudaExecutablePreparation {
 }
 
 impl CudaExecutableCache {
+    pub(crate) fn cost_graph_stream_state(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceCostGraphStreamState> {
+        ferrum_interfaces::vnext::DeviceCostGraphStreamState::new(
+            self.preparation.cost_graph_configuration(),
+            self.entries.len().try_into().ok()?,
+            self.programs.len().try_into().ok()?,
+            self.rejected.len().try_into().ok()?,
+        )
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),

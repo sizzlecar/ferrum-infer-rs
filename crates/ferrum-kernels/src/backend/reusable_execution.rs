@@ -150,6 +150,22 @@ pub(crate) struct ReusableExecutionPreparationTracker {
 }
 
 impl ReusableExecutionPreparationTracker {
+    pub(crate) const fn cost_graph_configuration(
+        &self,
+    ) -> ferrum_interfaces::vnext::DeviceCostGraphConfiguration {
+        use ferrum_interfaces::vnext::DeviceCostGraphConfiguration as C;
+        match self.lifecycle {
+            ReusableExecutionPreparationLifecycle::Unconfigured => C::Unconfigured,
+            ReusableExecutionPreparationLifecycle::Preparing(_) => C::StartupPreparing,
+            ReusableExecutionPreparationLifecycle::Ready(plan)
+                if plan.catalog_lifetime().is_startup_sealed() =>
+            {
+                C::StartupReady
+            }
+            ReusableExecutionPreparationLifecycle::Ready(_) => C::OnDemand,
+        }
+    }
+
     pub(crate) const fn is_on_demand(&self) -> bool {
         match self.lifecycle {
             ReusableExecutionPreparationLifecycle::Ready(plan) => {

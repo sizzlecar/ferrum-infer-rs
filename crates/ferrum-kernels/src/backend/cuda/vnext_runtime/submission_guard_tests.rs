@@ -1,0 +1,205 @@
+//! Real core-owned resources and CUDA submission. The tiny fixture provider
+//! runs the installed scale kernel and counts actual enqueue calls; it cannot
+//! construct a DeviceCommandBatch or mint completion/rollback receipts.
+use super::*;
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use cudarc::nvrtc::Ptx;
+use ferrum_interfaces::execution_cost::{
+    CoreReadbackRoute, GuardedNotSubmittedReason, HostSubmissionRejection,
+};
+use ferrum_interfaces::vnext::*;
+use half::f16;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+mod family;
+mod fixture;
+use fixture::Fixture;
+
+fn id<T: TryFrom<String>>(value: &str) -> T
+where
+    T::Error: std::fmt::Debug,
+{
+    T::try_from(value.to_owned()).unwrap()
+}
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn invalid(reason: &str) -> VNextError {
+    VNextError::InvalidExecutionPlan {
+        reason: reason.into(),
+    }
+}
+fn span() -> TokenSpanWork {
+    TokenSpanWork::from_token_ids(&[1], 0..1).unwrap()
+}
+
+#[test]
+fn cuda_guard_fixture_family_prepares_through_product_configuration_contract() {
+    let family = TypedFamilyRegistration::new(family::Family::default());
+    family
+        .prepare_with_profile(&serde_json::json!({"width": 4}), &id("fixture.f16"))
+        .unwrap();
+    assert!(family
+        .prepare_with_profile(&serde_json::json!(4), &id("fixture.f16"))
+        .is_err());
+    assert!(family
+        .prepare_with_profile(&serde_json::json!({"width": 5}), &id("fixture.f16"))
+        .is_err());
+}
+
+struct Guard {
+    reject: bool,
+    calls: AtomicU64,
+    enqueues: Arc<AtomicU64>,
+}
+impl Guard {
+    fn new(f: &Fixture, reject: bool) -> Self {
+        Self {
+            reject,
+            calls: AtomicU64::new(0),
+            enqueues: Arc::clone(&f.enqueues),
+        }
+    }
+}
+impl PreparedWaveSubmissionGuard for Guard {
+    fn check(
+        &self,
+        actual: &DeviceSubmissionAttribution,
+        readback: CoreReadbackRoute,
+    ) -> Result<(), GuardedNotSubmittedReason> {
+        assert_eq!(
+            self.enqueues.load(Ordering::Relaxed),
+            0,
+            "actual CUDA compute must not have entered enqueue"
+        );
+        assert!(actual.graph_evidence().unwrap().proves_unconfigured_eager());
+        assert_eq!(readback, CoreReadbackRoute::SubmissionStaged);
+        assert_eq!(
+            actual
+                .commands()
+                .iter()
+                .map(|c| c.compute_dispatch_count())
+                .sum::<u64>(),
+            1
+        );
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.reject {
+            Err(GuardedNotSubmittedReason::HostRejected(
+                HostSubmissionRejection::WitnessExpired,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+fn accepted(
+    value: GuardedWaveSubmissionOutcome<CudaDeviceRuntime>,
+) -> CompletionHandle<CudaDeviceRuntime> {
+    match value {
+        GuardedWaveSubmissionOutcome::Dispatch(Ok(value)) => value.into_parts().0,
+        GuardedWaveSubmissionOutcome::Dispatch(Err(error)) => panic!("CUDA dispatch: {error}"),
+        GuardedWaveSubmissionOutcome::NotSubmitted(_) => panic!("accepting guard rejected"),
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_core_rejection_rolls_back_and_same_lane_submits() {
+    let f = Fixture::new();
+    let lane_id = f.lane.id();
+    let (step, wave) = f.prepare();
+    let guard = Guard::new(&f, true);
+    let pending = match f.dispatch(wave, &guard) {
+        GuardedWaveSubmissionOutcome::NotSubmitted(value) => value,
+        _ => panic!("expected actual backend rejection"),
+    };
+    assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(f.encoded.load(Ordering::Relaxed), 1);
+    assert_eq!(f.enqueues.load(Ordering::Relaxed), 0);
+    assert_eq!(f.lane.in_flight_count(), 0);
+    assert_eq!(f.lane.cost_readback_available_bytes(), Some(8));
+    assert_eq!(f.reaper.retained_count(), 0);
+    let receipt = pending
+        .reconcile_step(step)
+        .unwrap_or_else(|(e, _)| panic!("exact step rollback: {e}"));
+    assert_eq!(
+        receipt.reason(),
+        GuardedNotSubmittedReason::HostRejected(HostSubmissionRejection::WitnessExpired)
+    );
+    let (step, wave) = f.prepare();
+    let guard = Guard::new(&f, false);
+    let handle = accepted(f.dispatch(wave, &guard));
+    assert_eq!(f.lane.id(), lane_id);
+    assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(f.enqueues.load(Ordering::Relaxed), 1);
+    let receipt = match handle.wait_with_readbacks(f.readback()).unwrap() {
+        CompletionReadbackBatchObservation::Terminal(value) => value,
+        _ => panic!("CUDA readback did not terminate"),
+    };
+    let CompletionReadbackDisposition::Succeeded(output) = &receipt.dispositions()[0] else {
+        panic!("scale output failed")
+    };
+    let expected = [2.0_f32, -4.0, 1.0, 8.0]
+        .into_iter()
+        .flat_map(|v| f16::from_f32(v).to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(output.bytes(), expected);
+    drop((receipt, handle));
+    step.try_retire_normal().unwrap();
+    assert_eq!(f.lane.cost_readback_available_bytes(), Some(8));
+    f.close(true);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_core_configured_graph_is_rejected_before_host_gate() {
+    let f = Fixture::new();
+    f.lane
+        .configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(1).unwrap())
+        .unwrap();
+    let (step, wave) = f.prepare();
+    let guard = Guard::new(&f, false);
+    let pending = match f.dispatch(wave, &guard) {
+        GuardedWaveSubmissionOutcome::NotSubmitted(value) => value,
+        _ => panic!("configured graph cannot grant eager guard authority"),
+    };
+    assert_eq!(guard.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(f.encoded.load(Ordering::Relaxed), 1);
+    assert_eq!(f.enqueues.load(Ordering::Relaxed), 0);
+    assert_eq!(f.lane.in_flight_count(), 0);
+    assert_eq!(f.lane.cost_readback_available_bytes(), Some(8));
+    let receipt = pending
+        .reconcile_step(step)
+        .unwrap_or_else(|(e, _)| panic!("graph rejection rollback: {e}"));
+    assert_eq!(
+        receipt.reason(),
+        GuardedNotSubmittedReason::AttributionUnavailable
+    );
+    f.close(false);
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_core_dropped_handle_keeps_flight_until_terminal_reaped() {
+    let f = Fixture::new();
+    let (step, wave) = f.prepare();
+    let handle = accepted(f.dispatch(wave, &Guard::new(&f, false)));
+    assert_eq!(f.enqueues.load(Ordering::Relaxed), 1);
+    let step = step
+        .try_rollback_unsubmitted()
+        .expect_err("submitted work cannot roll back")
+        .into_step();
+    drop(handle);
+    assert_eq!(f.reaper.retained_count(), 1);
+    assert_eq!(f.lane.in_flight_count(), 1);
+    assert!(f.session.try_abort_if_quiescent().is_err());
+    // Device completion alone does not settle core ownership. The reaper must
+    // observe the actual native fence before the Step can retire.
+    f.runtime.context.synchronize().unwrap();
+    f.reaper.poll_bounded(1).unwrap();
+    assert_eq!(f.reaper.retained_count(), 0);
+    assert_eq!(f.lane.in_flight_count(), 0);
+    step.try_retire_normal().unwrap();
+    f.close(true);
+}

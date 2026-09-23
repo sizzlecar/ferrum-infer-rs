@@ -6,6 +6,8 @@ use std::ops::Deref;
 
 type PinnedHostStorage = Mutex<PinnedHostSlice<u8>>;
 
+pub(super) const NATIVE_OPERATION: &str = "host.submission_readback";
+
 /// Both the submission command and its terminal reader retain this snapshot.
 /// Source retention is submission-local; the cached host allocation contains no
 /// source/Step ownership. All command/reader owners must release their leases
@@ -145,7 +147,7 @@ pub(super) fn prepare(
     let command_snapshot = Arc::clone(&snapshot);
     let command = CudaDeviceCommand::transfer(
         runtime.runtime_instance,
-        "host.submission_readback",
+        NATIVE_OPERATION,
         vec![snapshot.snapshot.source.clone()],
         Vec::new(),
         Box::new(move |stream, _blas, _regions, _storage| {

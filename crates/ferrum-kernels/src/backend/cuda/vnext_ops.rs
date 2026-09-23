@@ -114,6 +114,8 @@ pub fn cuda_vnext_runtime_config(
 ) -> Result<CudaDeviceRuntimeConfig, VNextError> {
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
+        include_str!("vnext_runtime/submission.rs").as_bytes(),
+        include_str!("vnext_runtime/core_cost_route.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("../reusable_execution.rs").as_bytes(),
         include_str!("../reusable_execution/warmup.rs").as_bytes(),
@@ -610,6 +612,8 @@ impl CudaVNextComposition {
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
                 include_str!("vnext_runtime.rs").as_bytes(),
+                include_str!("vnext_runtime/submission.rs").as_bytes(),
+                include_str!("vnext_runtime/core_cost_route.rs").as_bytes(),
                 CUDA_ENGINE_PROVIDER_ID.as_bytes(),
             ]),
             runtime.descriptor().id.clone(),
