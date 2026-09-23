@@ -71,6 +71,7 @@ mod readback_logits;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
 mod request;
+mod resource_planning;
 mod reusable_catalog;
 mod state_memory;
 pub use determinism::{
@@ -6768,23 +6769,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map_err(|error| FerrumError::backend(error.to_string()))?,
             );
             let reusable_bucket_id = self
-                .resolved_plan
-                .execution_plan()
-                .payload()
-                .memory()
-                .reusable_execution()
-                .and_then(|plan| {
-                    plan.buckets().iter().find(|resolved| {
-                        let bucket = resolved.bucket();
-                        bucket.class_id().as_str() == kind.reusable_execution_class()
-                            && bucket.capacity().covers(
-                                work_shape.immediate_sequences(),
-                                work_shape.immediate_tokens(),
-                                work_shape.immediate_pages(),
-                            )
-                    })
-                })
-                .map(|resolved| resolved.bucket().bucket_id().clone());
+                .reusable_bucket_for_shape(
+                    kind,
+                    work_shape.immediate_sequences(),
+                    work_shape.immediate_tokens(),
+                    work_shape.immediate_pages(),
+                )
+                .cloned();
             let request = StepResourceAdmissionRequest::new(
                 work_shape,
                 AdmissionFitPolicy::ImmediateOnly,
@@ -10052,6 +10043,65 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {
         Some(&self.resolved_plan)
+    }
+
+    fn execution_resource_planning_view(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        limits: ResourcePlanningLimits,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<ResourcePlanningView> {
+        self.capture_resource_planning_view(requests, limits, budget)
+    }
+
+    fn project_execution_resource_wave(
+        &self,
+        view: &ResourcePlanningView,
+        state: &ResourcePlanningState,
+        rows: &[ResourcePlanningRow],
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<ResourcePlanningProjection> {
+        self.plan_resources
+            .project_resource_wave(view, state, rows, budget)
+    }
+
+    fn project_execution_resource_wave_for_kind(
+        &self,
+        view: &ResourcePlanningView,
+        state: &ResourcePlanningState,
+        rows: &[ResourcePlanningRow],
+        kind: ferrum_interfaces::execution_cost::ActualWaveKind,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ResourcePlanningAvailability<ResourcePlanningProjection> {
+        use ferrum_interfaces::execution_cost::ActualWaveKind;
+        let kind = match kind {
+            ActualWaveKind::Prefill => VNextExecutionWaveKind::Prefill,
+            ActualWaveKind::Decode => VNextExecutionWaveKind::Decode,
+            ActualWaveKind::Mixed => VNextExecutionWaveKind::Mixed,
+            _ => {
+                return ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::InvalidInput)
+            }
+        };
+        if rows.is_empty() || rows.len() > view.limits().maximum_participants {
+            return ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::InvalidInput);
+        }
+        let mut tokens = 0_u64;
+        for row in rows {
+            if !budget.has_budget() {
+                return ResourcePlanningAvailability::Unknown(
+                    ResourcePlanningUnknown::BudgetExhausted,
+                );
+            }
+            let Some(total) = tokens.checked_add(row.token_count) else {
+                return ResourcePlanningAvailability::Unknown(
+                    ResourcePlanningUnknown::InvalidInput,
+                );
+            };
+            tokens = total;
+        }
+        let bucket = self.reusable_bucket_for_shape(kind, rows.len() as u32, tokens, 0);
+        self.plan_resources
+            .project_resource_wave_with_bucket(view, state, rows, bucket, budget)
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {

@@ -34,6 +34,14 @@ pub use prefix_restore::{
     PrefixRestoreObservation, PrefixRestoreSource,
 };
 
+/// Identifies the exact currently admitted model participant. A decode caller
+/// supplies its opaque cache ID; prefills use their admitted request identity.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutorResourcePlanningRequest<'a> {
+    pub request_id: &'a RequestId,
+    pub cache_id: Option<&'a str>,
+}
+
 /// One model-owned KV slot reservation request.
 ///
 /// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
@@ -3116,6 +3124,67 @@ pub trait ModelExecutor: Send + Sync {
     /// return `Some` while they are ready.
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
         Ok(None)
+    }
+
+    /// Bounded, nonblocking numerical read; grants no admission or buffer
+    /// permission and cannot extend resource lifetimes. Participant order in
+    /// the view is the supplied request order, not a newly chosen batch.
+    fn execution_resource_planning_view(
+        &self,
+        _requests: &[ExecutorResourcePlanningRequest<'_>],
+        _limits: crate::vnext::ResourcePlanningLimits,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ResourcePlanningAvailability<crate::vnext::ResourcePlanningView> {
+        crate::vnext::ResourcePlanningAvailability::Unknown(
+            crate::vnext::ResourcePlanningUnknown::Unsupported,
+        )
+    }
+
+    /// Evaluates immutable plan demand against the same captured pools across
+    /// an entire rollout. This method never prepares or allocates live work.
+    fn project_execution_resource_wave(
+        &self,
+        _view: &crate::vnext::ResourcePlanningView,
+        _state: &crate::vnext::ResourcePlanningState,
+        _rows: &[crate::vnext::ResourcePlanningRow],
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ResourcePlanningAvailability<crate::vnext::ResourcePlanningProjection> {
+        crate::vnext::ResourcePlanningAvailability::Unknown(
+            crate::vnext::ResourcePlanningUnknown::Unsupported,
+        )
+    }
+
+    /// Includes the declared execution phase so a workspace-backed executor
+    /// can choose the same capacity bucket as actual Step admission. A
+    /// one-token prefill is not a decode wave. Executors without phase-specific
+    /// workspace policy may retain their ordinary numerical projection.
+    fn project_execution_resource_wave_for_kind(
+        &self,
+        view: &crate::vnext::ResourcePlanningView,
+        state: &crate::vnext::ResourcePlanningState,
+        rows: &[crate::vnext::ResourcePlanningRow],
+        _kind: crate::execution_cost::ActualWaveKind,
+        budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ResourcePlanningAvailability<crate::vnext::ResourcePlanningProjection> {
+        self.project_execution_resource_wave(view, state, rows, budget)
+    }
+
+    /// Re-samples resource evidence; the caller still performs the real Step
+    /// acquisition and validates work/output identities before submission.
+    fn revalidate_execution_resource_planning_view(
+        &self,
+        requests: &[ExecutorResourcePlanningRequest<'_>],
+        view: &crate::vnext::ResourcePlanningView,
+        budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ResourcePlanningAvailability<bool> {
+        match self.execution_resource_planning_view(requests, view.limits(), budget) {
+            crate::vnext::ResourcePlanningAvailability::Known(current) => {
+                crate::vnext::ResourcePlanningAvailability::Known(view.same_live_evidence(&current))
+            }
+            crate::vnext::ResourcePlanningAvailability::Unknown(reason) => {
+                crate::vnext::ResourcePlanningAvailability::Unknown(reason)
+            }
+        }
     }
 
     /// Whether this executor's backend can run the unified mixed prefill+decode
