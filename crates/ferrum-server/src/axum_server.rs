@@ -128,23 +128,46 @@ fn env_usize(key: &str) -> Option<usize> {
     std::env::var(key).ok()?.parse().ok()
 }
 
-/// Shared Prometheus recorder handle for rendering metrics.
-static PROM_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
-    std::sync::OnceLock::new();
+type PrometheusRecorderState =
+    std::result::Result<metrics_exporter_prometheus::PrometheusHandle, String>;
+
+/// The handle belongs to the recorder actually installed in this process.
+/// An embedding application's existing recorder is never replaced or rendered
+/// through an unrelated handle. Retain installation failure for the endpoint.
+static PROM_HANDLE: std::sync::OnceLock<PrometheusRecorderState> = std::sync::OnceLock::new();
 
 /// Initialize the Prometheus metrics recorder.
 ///
 /// Must be called once before any `metrics::counter!()` / `histogram!()` calls.
 /// Safe to call multiple times — subsequent calls are no-ops.
+/// An existing third-party recorder is retained; exporter unavailability is
+/// reported without preventing inference from starting.
 pub fn init_prometheus_recorder() {
-    PROM_HANDLE.get_or_init(|| {
+    install_prometheus_recorder(&PROM_HANDLE);
+}
+
+fn install_prometheus_recorder(state: &std::sync::OnceLock<PrometheusRecorderState>) {
+    state.get_or_init(|| {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let handle = builder
-            .install_recorder()
-            .expect("Failed to install Prometheus recorder");
-        info!("Prometheus metrics recorder installed");
-        handle
+        match builder.install_recorder() {
+            Ok(handle) => {
+                info!("Prometheus metrics recorder installed");
+                Ok(handle)
+            }
+            Err(error) => {
+                warn!(%error, "Prometheus exporter unavailable; retaining the process recorder");
+                Err(error.to_string())
+            }
+        }
     });
+}
+
+fn render_prometheus_recorder(state: Option<&PrometheusRecorderState>) -> String {
+    match state {
+        Some(Ok(handle)) => handle.render(),
+        Some(Err(reason)) => format!("# Prometheus recorder unavailable: {reason}\n"),
+        None => "# Prometheus recorder not initialized\n".to_string(),
+    }
 }
 
 /// Axum-based server implementation.
@@ -380,6 +403,28 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// A shared process recorder is required if any installed engine enables
+    /// metrics. An empty server follows the existing typed monitoring default.
+    fn metrics_enabled(&self) -> bool {
+        let settings = [
+            self.llm
+                .as_ref()
+                .map(|engine| engine.config().monitoring.enable_metrics),
+            self.embed
+                .as_ref()
+                .map(|engine| engine.config().monitoring.enable_metrics),
+            self.transcribe
+                .as_ref()
+                .map(|engine| engine.config().monitoring.enable_metrics),
+            self.tts
+                .as_ref()
+                .map(|engine| engine.config().monitoring.enable_metrics),
+        ];
+        settings.iter().flatten().any(|enabled| *enabled)
+            || (settings.iter().all(Option::is_none)
+                && ferrum_types::MonitoringConfig::default().enable_metrics)
+    }
+
     fn record_prefix_prompt(&self, prompt: &str, policy: &CachePolicy) {
         if self.llm.as_ref().is_some_and(|engine| {
             engine.execution_resource_authority() == ExecutionResourceAuthority::PlanRuntime
@@ -1072,6 +1117,11 @@ impl HttpServer for AxumServer {
             return Err(Error::internal(
                 "cannot start Axum server after shutdown was requested",
             ));
+        }
+        // Install before exposing HTTP or admitting its first request. The
+        // process-wide OnceLock makes concurrent/repeated server starts safe.
+        if self.state.metrics_enabled() {
+            init_prometheus_recorder();
         }
         self.lifecycle
             .running
@@ -5710,10 +5760,17 @@ async fn health_handler(
 async fn metrics_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let mut body = match PROM_HANDLE.get() {
-        Some(handle) => handle.render(),
-        None => "# Prometheus recorder not initialized\n".to_string(),
-    };
+    if !state.metrics_enabled() {
+        return Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            "# Metrics disabled by engine monitoring configuration\n",
+        )
+            .into_response());
+    }
+    let mut body = render_prometheus_recorder(PROM_HANDLE.get());
     if !body.ends_with('\n') {
         body.push('\n');
     }
@@ -5916,6 +5973,7 @@ mod tests {
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
+    mod metrics_startup;
     mod model_reasoning_metadata;
     mod native_tool_stream;
     mod reasoning_controls;
