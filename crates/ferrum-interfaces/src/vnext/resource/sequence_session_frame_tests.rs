@@ -591,6 +591,29 @@ fn physical_invocation_retry_requires_not_submitted_and_a_fresh_attempt() {
 }
 
 #[test]
+fn guarded_withdrawal_requires_exact_not_submitted_ledger() {
+    let registry = Arc::new(InvocationRegistry::default());
+    let mut guard = registry
+        .enter_submission_wave(4, invocation(41), &"a".repeat(64))
+        .unwrap();
+    assert!(guard.withdraw_not_submitted().is_err());
+    guard.mark_not_submitted().unwrap();
+    {
+        let mut state = registry.state.lock().unwrap();
+        state
+            .submission_wave
+            .as_mut()
+            .unwrap()
+            .ledger
+            .batch_invocation_id = invocation(42);
+    }
+    assert!(guard.withdraw_not_submitted().is_err());
+    assert!(registry.state.lock().unwrap().poisoned);
+    drop(guard);
+    assert!(registry.ensure_pristine_for_step_rollback().is_err());
+}
+
+#[test]
 fn full_plan_wave_ledger_is_one_entry_and_preserves_all_node_tombstones() {
     let registry = Arc::new(InvocationRegistry::default());
     let key = participant_node_key(1, 7, "main");

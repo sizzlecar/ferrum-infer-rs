@@ -1955,6 +1955,18 @@ impl<R> DefinitelyNotSubmittedWaveRetryAuthority<R>
 where
     R: DeviceRuntime,
 {
+    /// Retires this exact rejected wave without retrying or changing ordinary
+    /// Drop semantics. The caller still owns and must roll back its parent Step.
+    pub(crate) fn withdraw_for_step_rollback(mut self) -> Result<(), VNextError> {
+        self.wave
+            .as_mut()
+            .ok_or_else(|| invalid_resource("NotSubmitted withdrawal lost its wave"))?
+            .active_wave
+            .withdraw_not_submitted()?;
+        drop(self.wave.take());
+        Ok(())
+    }
+
     pub const fn prior_attempt(&self) -> BatchInvocationId {
         self.prior_attempt
     }

@@ -7,6 +7,51 @@ use crate::vnext::{
 use std::ops::Range;
 
 #[test]
+fn guarded_not_submitted_withdrawal_restores_step_and_preserves_the_live_request() {
+    let harness = BoundaryHarness::new(1);
+    let step = harness.step(vec![span(&[3, 5], 0..2)]);
+    let mut wave = prepared_wave(&step);
+    wave.begin_dispatch().unwrap();
+    let mut encoded = DeviceCommandBatch::with_capacity(1);
+    wave.encode_backing_initializations(wave.runtime(), &mut encoded)
+        .unwrap();
+    // Native encoding has happened; no physical submit took ownership.
+    drop(encoded);
+    wave.definitely_not_submitted()
+        .unwrap()
+        .withdraw_for_step_rollback()
+        .unwrap();
+    step.try_rollback_unsubmitted().unwrap();
+    assert!(matches!(
+        frontier(&harness.sessions[0]),
+        SequenceCompletedFrontier::Fresh
+    ));
+    // The same admitted request can execute the same tokens afterwards. The
+    // rejection must not be implemented as aborting/replacing its session.
+    let next = harness.step(vec![span(&[3, 5], 0..2)]);
+    finish_and_record(&next);
+    next.try_retire_normal().unwrap();
+    assert!(!matches!(
+        frontier(&harness.sessions[0]),
+        SequenceCompletedFrontier::Fresh
+    ));
+    harness.close();
+}
+
+#[test]
+fn ordinary_not_submitted_drop_keeps_step_tombstone() {
+    let harness = BoundaryHarness::new(1);
+    let step = harness.step(vec![span(&[3], 0..1)]);
+    let mut wave = prepared_wave(&step);
+    wave.begin_dispatch().unwrap();
+    drop(wave.definitely_not_submitted().unwrap());
+    let failure = step.try_rollback_unsubmitted().unwrap_err();
+    assert!(failure.error().to_string().contains("pristine"));
+    failure.into_step().try_abort().unwrap();
+    harness.close();
+}
+
+#[test]
 fn lazy_readback_receipts_keep_the_full_terminal_chain_cold_without_evidence_consumers() {
     let harness = BoundaryHarness::new(1);
     let step = harness.step(vec![span(&[53], 0..1)]);

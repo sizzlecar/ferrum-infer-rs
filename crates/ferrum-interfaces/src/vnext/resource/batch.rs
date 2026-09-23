@@ -1403,6 +1403,63 @@ impl ActiveInvocationWaveGuard {
         )
     }
 
+    /// Consume this exact never-submitted wave's ledger authority. Ordinary
+    /// Drop retains tombstones; only a proved NotSubmitted attempt may restore
+    /// a pristine parent Step for logical rollback.
+    pub(super) fn withdraw_not_submitted(&mut self) -> Result<(), VNextError> {
+        if self.phase != PhysicalInvocationPhase::NotSubmitted {
+            return Err(invalid_resource(
+                "only an exact NotSubmitted attempt may withdraw its ledger",
+            ));
+        }
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("invocation registry is poisoned"))?;
+        let expected = ParticipantNodeLedgerEntry {
+            batch_invocation_id: self.batch_invocation_id,
+            work_fingerprint: self.work_fingerprint.clone(),
+            phase: PhysicalInvocationPhase::NotSubmitted,
+        };
+        let matches = match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                state.submission_wave.is_none()
+                    && keys
+                        .iter()
+                        .all(|key| state.entries.get(key) == Some(&expected))
+            }
+            ActiveInvocationLedgerTopology::SubmissionWave {
+                covered_participant_nodes,
+            } => {
+                state.entries.is_empty()
+                    && state.submission_wave
+                        == Some(SubmissionWaveLedgerEntry {
+                            ledger: expected,
+                            covered_participant_nodes: *covered_participant_nodes,
+                        })
+            }
+        };
+        if state.poisoned || !matches {
+            state.poisoned = true;
+            return Err(invalid_resource(
+                "NotSubmitted withdrawal differs from exact attempt/work authority",
+            ));
+        }
+        match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                for key in keys {
+                    state.entries.remove(key);
+                }
+            }
+            ActiveInvocationLedgerTopology::SubmissionWave { .. } => {
+                state.submission_wave = None;
+            }
+        }
+        self.phase = PhysicalInvocationPhase::Retired;
+        Ok(())
+    }
+
     pub(super) fn prepare_retry(
         &mut self,
         fresh_attempt: BatchInvocationId,
