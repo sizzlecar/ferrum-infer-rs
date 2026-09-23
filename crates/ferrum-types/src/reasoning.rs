@@ -3,6 +3,10 @@
 use crate::{FerrumError, ModelOutputProtocol, Result};
 
 mod gemma;
+mod text_view;
+pub use text_view::{
+    parse_text_reasoning_view, TextReasoningView, TEXT_REASONING_MAX_PROJECTION_EPOCHS,
+};
 
 /// Resolved reasoning behavior of the model-owned template and output protocol.
 /// Unknown is not equivalent to a template that explicitly has no reasoning mode.
