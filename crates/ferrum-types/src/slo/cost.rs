@@ -92,6 +92,14 @@ pub enum SloCostFeatureModel {
     EmpiricalRowMultisetV2 {
         host_history_bucket_tokens: NonZeroU32,
     },
+    /// V3 keeps exact executable work and provider identities, but treats the
+    /// actual full prefill context as a jointly observed support coordinate rather
+    /// than a statistical equality key. Chunk count and final/output branches
+    /// remain exact. This is an empirical model, not a latency guarantee.
+    /// Persisted training requires profile schema 5; V4 is not relabeled.
+    EmpiricalPromptRangeV3 {
+        host_history_bucket_tokens: NonZeroU32,
+    },
 }
 
 impl Default for SloCostFeatureModel {

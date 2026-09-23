@@ -50,6 +50,9 @@ pub(super) fn project_bucket(shape: &mut WaveExecutionShape, mode: &CostFeatureM
         }
         | CostFeatureModel::EmpiricalRowMultisetV2 {
             host_history_bucket_tokens,
+        }
+        | CostFeatureModel::EmpiricalPromptRangeV3 {
+            host_history_bucket_tokens,
         } => {
             // validate_mode runs before lookup/training. This normalized shape
             // is only a private grouping key, never executable work evidence.
@@ -74,6 +77,14 @@ pub(super) fn project_bucket(shape: &mut WaveExecutionShape, mode: &CostFeatureM
                 shape.host_content_features = None;
                 features.output_policy_signature
             };
+            if prompt_range(mode) {
+                // Private grouping only. bucket_key captured the checked
+                // final-fragment bits before this sentinel replacement.
+                // Real totals remain in observations and joint support.
+                for chunk in &mut shape.prefill_chunks {
+                    chunk.total_prompt_tokens = NonZeroU32::MIN;
+                }
+            }
             shape.output_policy_signature = signature;
             // This is only the private grouping key. Actual numeric/exact
             // identities remain in retained observations and public evidence.
@@ -95,23 +106,38 @@ pub(super) fn project_bucket(shape: &mut WaveExecutionShape, mode: &CostFeatureM
     }
 }
 
-fn coordinates(shape: &WaveExecutionShape) -> Vec<u64> {
+pub(super) fn prompt_range(mode: &CostFeatureModel) -> bool {
+    matches!(mode, CostFeatureModel::EmpiricalPromptRangeV3 { .. })
+}
+
+fn coordinates(shape: &WaveExecutionShape, include_prompt_total: bool) -> Vec<u64> {
     let features = shape
         .numeric_features
         .as_ref()
         .expect("validated numeric mode");
     let mut values = Vec::with_capacity(
-        shape.decode_kv_tokens.len() + shape.prefill_chunks.len() + 6 * features.rows.len(),
+        shape.decode_kv_tokens.len()
+            + shape.prefill_chunks.len() * if include_prompt_total { 2 } else { 1 }
+            + 6 * features.rows.len(),
     );
     values.extend(shape.decode_kv_tokens.iter().map(|&n| u64::from(n)));
-    // Count/total-prompt/final-fragment and recurrent/maintenance work remain
-    // exact in the grouping key. Only these declared work axes range here.
+    // Count/final-fragment and recurrent/maintenance work remain exact.
+    // Only the explicit V3 model ranges actual prefill total; the complete
+    // row tuple still moves together in statistical_order.
     values.extend(
         shape
             .prefill_chunks
             .iter()
             .map(|chunk| u64::from(chunk.offset)),
     );
+    if include_prompt_total {
+        values.extend(
+            shape
+                .prefill_chunks
+                .iter()
+                .map(|chunk| u64::from(chunk.total_prompt_tokens.get())),
+        );
+    }
     for row in &features.rows {
         values.extend([
             row.generated_tokens_before,
@@ -127,6 +153,7 @@ fn coordinates(shape: &WaveExecutionShape) -> Vec<u64> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NumericSupport {
+    include_prompt_total: bool,
     minima: Box<[u64]>,
     maxima: Box<[u64]>,
     /// Joint support points are bounded by the trainer's samples/rows limits.
@@ -139,9 +166,10 @@ impl NumericSupport {
         if matches!(mode, CostFeatureModel::ExactV1 {}) {
             return None;
         }
+        let include_prompt_total = prompt_range(mode);
         let points: Vec<Box<[u64]>> = samples
             .iter()
-            .map(|sample| coordinates(&sample.shape).into_boxed_slice())
+            .map(|sample| coordinates(&sample.shape, include_prompt_total).into_boxed_slice())
             .collect();
         let mut minima = points.first()?.clone();
         let mut maxima = minima.clone();
@@ -152,6 +180,7 @@ impl NumericSupport {
             }
         }
         Some(Self {
+            include_prompt_total,
             minima,
             maxima,
             points: points.into(),
@@ -159,7 +188,7 @@ impl NumericSupport {
     }
 
     pub(super) fn contains(&self, shape: &WaveExecutionShape) -> bool {
-        let values = coordinates(shape);
+        let values = coordinates(shape, self.include_prompt_total);
         if values.len() != self.minima.len()
             || !values
                 .iter()

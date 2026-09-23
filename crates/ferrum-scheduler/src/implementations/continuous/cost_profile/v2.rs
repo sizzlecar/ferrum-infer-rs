@@ -145,6 +145,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ParsedProfile, CostProfileError> {
                 wire.settings.feature_model,
                 CostFeatureModel::EmpiricalHostContentV1 { .. }
                     | CostFeatureModel::EmpiricalRowMultisetV2 { .. }
+                    | CostFeatureModel::EmpiricalPromptRangeV3 { .. }
             ) {
                 return Err(CostProfileError::Metadata(
                     "host-content model requires profile v3",
@@ -177,6 +178,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ParsedProfile, CostProfileError> {
         }
         v3::COST_PROFILE_SCHEMA_VERSION_V3 => v3::parse(bytes),
         v4::COST_PROFILE_SCHEMA_VERSION_V4 => v4::parse(bytes),
+        v5::COST_PROFILE_SCHEMA_VERSION_V5 => v5::parse(bytes),
         other => Err(CostProfileError::UnsupportedVersion(other)),
     }
 }

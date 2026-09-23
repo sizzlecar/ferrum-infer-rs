@@ -8,7 +8,11 @@ use ferrum_interfaces::execution_cost::{
 };
 
 pub(super) fn enabled(mode: &CostFeatureModel) -> bool {
-    matches!(mode, CostFeatureModel::EmpiricalRowMultisetV2 { .. })
+    matches!(
+        mode,
+        CostFeatureModel::EmpiricalRowMultisetV2 { .. }
+            | CostFeatureModel::EmpiricalPromptRangeV3 { .. }
+    )
 }
 
 pub(super) fn validate(shape: &WaveExecutionShape) -> Result<(), CostUnknownReason> {

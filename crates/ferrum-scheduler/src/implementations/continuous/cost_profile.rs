@@ -23,6 +23,7 @@ pub const COST_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub mod v2;
 pub mod v3;
 pub mod v4;
+pub mod v5;
 const HARD_FILE_BYTES: usize = ferrum_types::SloCostProfileImportConfig::MAX_FILE_BYTES;
 const HARD_SAMPLES: usize = 131_072;
 const HARD_ROWS_PER_VECTOR: usize = 1024;

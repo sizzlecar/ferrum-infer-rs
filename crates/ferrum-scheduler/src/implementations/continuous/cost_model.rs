@@ -27,6 +27,8 @@ mod multiset;
 mod numeric;
 #[cfg(test)]
 mod numeric_tests;
+#[cfg(test)]
+pub(super) mod prompt_range_tests;
 
 #[cfg(test)]
 #[path = "cost_model/expiry_tests.rs"]
@@ -421,6 +423,7 @@ impl CostModelSnapshot {
             self.settings.feature_model,
             CostFeatureModel::EmpiricalHostContentV1 { .. }
                 | CostFeatureModel::EmpiricalRowMultisetV2 { .. }
+                | CostFeatureModel::EmpiricalPromptRangeV3 { .. }
         ) {
             CostBoundary::PreparationToHostSettledV1
         } else {
@@ -817,7 +820,8 @@ impl CostModelTrainer {
                 let empirical_cost = match self.settings.feature_model {
                     CostFeatureModel::ExactV1 {}
                     | CostFeatureModel::EmpiricalHostContentV1 { .. }
-                    | CostFeatureModel::EmpiricalRowMultisetV2 { .. } => {
+                    | CostFeatureModel::EmpiricalRowMultisetV2 { .. }
+                    | CostFeatureModel::EmpiricalPromptRangeV3 { .. } => {
                         typical.checked_add(residual_margin)
                     }
                     CostFeatureModel::BoundedNumericV1 { .. } => costs.last().copied(),
@@ -916,6 +920,7 @@ fn boundary_supported(mode: &CostFeatureModel, boundary: CostBoundary) -> bool {
         mode,
         CostFeatureModel::EmpiricalHostContentV1 { .. }
             | CostFeatureModel::EmpiricalRowMultisetV2 { .. }
+            | CostFeatureModel::EmpiricalPromptRangeV3 { .. }
     ) == (boundary == CostBoundary::PreparationToHostSettledV1)
 }
 
