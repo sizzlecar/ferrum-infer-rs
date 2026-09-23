@@ -1932,6 +1932,18 @@ where
             .map_err(|_| invalid_resource("sequence backing state mutex is poisoned"))
     }
 
+    pub(super) fn try_lock_planning_backing(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, SequenceBackingState<R>>>, VNextError> {
+        match self.backing_state.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(invalid_resource("planning backing read is poisoned"))
+            }
+        }
+    }
+
     pub(crate) fn backing_snapshot(&self) -> Result<Arc<SequenceBackingSnapshot<R>>, VNextError> {
         Ok(Arc::clone(&self.lock_backing_state()?.current))
     }

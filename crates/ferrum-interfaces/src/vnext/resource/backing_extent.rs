@@ -133,6 +133,7 @@ pub(super) fn backing_segment_range(
         segments,
         physical_offset_bytes,
         size_bytes,
+        || true,
         |segment, offset, length| {
             projection.push(BackingSegment::from_chunk(
                 segment.pool_id(),
@@ -155,12 +156,33 @@ pub(super) fn backing_segment_range_matches(
     size_bytes: u64,
     evidence: &[BackingSegment],
 ) -> Result<bool, VNextError> {
-    let mut expected = evidence.iter();
-    let mut matches = true;
-    visit_backing_segment_range(
+    Ok(backing_segment_range_matches_with_poll(
         segments,
         physical_offset_bytes,
         size_bytes,
+        evidence,
+        || true,
+    )?
+    .unwrap_or(false))
+}
+
+/// The same projection check with a nonblocking budget poll for every source
+/// segment, including segments before the requested window. `None` means the
+/// check was interrupted and must not be treated as successful evidence.
+pub(super) fn backing_segment_range_matches_with_poll(
+    segments: &[BackingSegment],
+    physical_offset_bytes: u64,
+    size_bytes: u64,
+    evidence: &[BackingSegment],
+    poll: impl FnMut() -> bool,
+) -> Result<Option<bool>, VNextError> {
+    let mut expected = evidence.iter();
+    let mut matches = true;
+    let completed = visit_backing_segment_range(
+        segments,
+        physical_offset_bytes,
+        size_bytes,
+        poll,
         |segment, offset, length| {
             matches &= expected.next().is_some_and(|actual| {
                 actual.chunk() == segment.chunk()
@@ -170,15 +192,16 @@ pub(super) fn backing_segment_range_matches(
             Ok(())
         },
     )?;
-    Ok(matches && expected.next().is_none())
+    Ok(completed.then(|| matches && expected.next().is_none()))
 }
 
 fn visit_backing_segment_range(
     segments: &[BackingSegment],
     physical_offset_bytes: u64,
     size_bytes: u64,
+    mut poll: impl FnMut() -> bool,
     mut visit: impl FnMut(&BackingSegment, u64, u64) -> Result<(), VNextError>,
-) -> Result<(), VNextError> {
+) -> Result<bool, VNextError> {
     let physical_end = physical_offset_bytes
         .checked_add(size_bytes)
         .ok_or_else(|| invalid_resource("logical backing projection range overflows u64"))?;
@@ -190,6 +213,9 @@ fn visit_backing_segment_range(
     let mut physical_cursor = 0_u64;
     let mut covered = 0_u64;
     for segment in segments {
+        if !poll() {
+            return Ok(false);
+        }
         if physical_cursor >= physical_end {
             break;
         }
@@ -223,13 +249,13 @@ fn visit_backing_segment_range(
             "logical backing projection exceeds its physical extent",
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
 mod projection_tests;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FreeExtent {
     pub(super) chunk_generation: u64,
     pub(super) length_bytes: u64,

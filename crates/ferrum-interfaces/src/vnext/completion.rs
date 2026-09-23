@@ -26,6 +26,7 @@ use super::{
 };
 
 use super::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget, DeviceSubmissionReadbackRequest};
+mod resource_planning;
 mod submission_readback;
 use submission_readback::PreparedCompletionReadbacks;
 

@@ -73,6 +73,8 @@ mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod planning;
+pub use planning::*;
 mod checkpoint;
 pub(crate) use checkpoint::*;
 pub use checkpoint::{

@@ -517,6 +517,9 @@ enum TestDemand {
     ActualSequences(u32),
 }
 
+#[path = "planning_tests.rs"]
+mod planning_tests;
+
 #[derive(Clone)]
 struct PoolCatalog {
     pools: Vec<DynamicBackingPoolSpec>,

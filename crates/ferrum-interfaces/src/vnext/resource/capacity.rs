@@ -94,7 +94,7 @@ pub(super) struct DeviceCapacityState {
     pub(super) next_budget_id: u64,
     pub(super) budgets: BTreeMap<u64, DeviceCapacityBudgetRecord>,
     process_availability_epoch: u64,
-    poisoned: bool,
+    pub(super) poisoned: bool,
 }
 
 fn capacity_fault(kind: DynamicAdmissionFaultKind, reason: impl Into<String>) -> VNextError {

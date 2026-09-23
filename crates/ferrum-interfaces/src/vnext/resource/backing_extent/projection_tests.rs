@@ -1,6 +1,34 @@
 use super::{
-    backing_segment_range, backing_segment_range_matches, BackingSegment, DynamicBackingPoolId,
+    backing_segment_range, backing_segment_range_matches, backing_segment_range_matches_with_poll,
+    BackingSegment, DynamicBackingPoolId,
 };
+
+#[test]
+fn borrowed_projection_budget_polls_segments_before_the_requested_window() {
+    let source = source();
+    let expected = backing_segment_range(&source, 128, 64).unwrap();
+    let mut remaining = 1_usize;
+    let interrupted = backing_segment_range_matches_with_poll(&source, 128, 64, &expected, || {
+        let available = remaining > 0;
+        remaining = remaining.saturating_sub(1);
+        available
+    })
+    .unwrap();
+    assert_eq!(
+        interrupted, None,
+        "skipped leading segments consume the budget too"
+    );
+    assert_eq!(
+        backing_segment_range_matches_with_poll(&source, 128, 64, &expected, || true).unwrap(),
+        Some(true)
+    );
+    let mut wrong = expected;
+    wrong[0] = source[0].clone();
+    assert_eq!(
+        backing_segment_range_matches_with_poll(&source, 128, 64, &wrong, || true).unwrap(),
+        Some(false)
+    );
+}
 
 fn pool(hash_digit: char) -> DynamicBackingPoolId {
     serde_json::from_value(serde_json::json!(format!(

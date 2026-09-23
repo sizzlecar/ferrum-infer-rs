@@ -750,6 +750,13 @@ impl<R> PlanRuntimeResources<R>
 where
     R: DeviceRuntime,
 {
+    pub(crate) fn planning_plan_hash(&self) -> &PlanHash {
+        match &self.static_resources {
+            PlanRuntimeStatic::NoStatic { binding } => binding.plan_hash(),
+            PlanRuntimeStatic::Static(source) => source.admission.plan_hash(),
+        }
+    }
+
     fn evidence(&self) -> TrustedPlanRuntimeEvidence {
         let (binding, identity) = match &self.static_resources {
             PlanRuntimeStatic::NoStatic { binding } => (binding, None),
@@ -795,6 +802,27 @@ where
 
     pub fn deferred_cleanup_status(&self) -> DeferredDeviceCleanupStatus {
         deferred_device_cleanup_status(self.deferred_cleanup_domain)
+    }
+
+    pub(super) fn try_read_planning_lifecycle(
+        &self,
+    ) -> Result<RwLockReadGuard<'_, ()>, super::ResourcePlanningUnknown> {
+        use super::{ResourcePlanningReadStage as Stage, ResourcePlanningUnknown as U};
+        let guard = self
+            .lifecycle
+            .try_read()
+            .map_err(|error| super::planning::read_lock_error(error, Stage::Lifecycle))?;
+        if self.phase.load(Ordering::Acquire) != PLAN_RUNTIME_OPEN {
+            return Err(U::BusyOrUnavailable);
+        }
+        let cleanup =
+            crate::vnext::device::try_deferred_device_cleanup_status(self.deferred_cleanup_domain)
+                .map_err(|_| U::BusyOrUnavailable)?
+                .ok_or(U::ReadUnavailable(Stage::DeferredCleanup))?;
+        if cleanup.is_saturated() {
+            return Err(U::BusyOrUnavailable);
+        }
+        Ok(guard)
     }
 
     pub fn create_execution_lane(

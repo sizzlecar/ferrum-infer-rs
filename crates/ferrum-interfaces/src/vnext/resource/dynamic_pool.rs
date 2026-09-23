@@ -1583,7 +1583,24 @@ pub(super) struct IdleChunkReclaimCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct PhysicalBackingClaimIdentity {
     pool_id: DynamicBackingPoolId,
-    resource_ids: Vec<ResourceId>,
+    // All projections of one physical claim share this immutable list. Value
+    // equality/order remain content based; pointer identity is only a shortcut
+    // for comparisons of clones from the same proved allocation.
+    #[serde(serialize_with = "serialize_claim_resource_ids")]
+    resource_ids: Arc<[ResourceId]>,
+    // Arc's slice dereference is not const. Cache only this constructor-derived
+    // property to preserve the public const query; it is not wire evidence.
+    #[serde(skip)]
+    shared: bool,
+}
+
+fn serialize_claim_resource_ids<S: serde::Serializer>(
+    ids: &Arc<[ResourceId]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Preserve the public array wire format without requiring serde's rc
+    // feature (workspace test feature unification must not be necessary).
+    ids.as_ref().serialize(serializer)
 }
 
 impl PhysicalBackingClaimIdentity {
@@ -1597,9 +1614,11 @@ impl PhysicalBackingClaimIdentity {
                 "physical backing claim identity requires unique logical resources",
             ));
         }
+        let shared = resource_ids.len() > 1;
         Ok(Self {
             pool_id,
-            resource_ids,
+            resource_ids: resource_ids.into(),
+            shared,
         })
     }
 
@@ -1611,8 +1630,12 @@ impl PhysicalBackingClaimIdentity {
         &self.resource_ids
     }
 
+    pub(super) fn shares_resource_id_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.resource_ids, &other.resource_ids)
+    }
+
     pub const fn is_shared(&self) -> bool {
-        self.resource_ids.len() > 1
+        self.shared
     }
 }
 

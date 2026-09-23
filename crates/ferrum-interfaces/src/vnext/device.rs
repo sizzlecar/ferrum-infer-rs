@@ -17,6 +17,8 @@ use super::{
     VNextError, WeightComponentPayload, WeightComponentSegments, WeightComponentSpec,
 };
 
+mod cost_range;
+pub use cost_range::*;
 mod submission_readback;
 pub(crate) use submission_readback::{DeviceReadbackSnapshot, DeviceReadbackStagingBudget};
 pub use submission_readback::{
@@ -273,6 +275,33 @@ pub(crate) fn deferred_device_cleanup_status(
         .get(&domain_id)
         .map(deferred_device_cleanup_domain_status)
         .unwrap_or_else(empty_deferred_device_cleanup_status)
+}
+
+pub(crate) fn try_deferred_device_cleanup_status(
+    domain_id: DeferredDeviceCleanupDomainId,
+) -> Result<Option<DeferredDeviceCleanupStatus>, VNextError> {
+    let lock =
+        DEFERRED_DEVICE_CLEANUP_REGISTRY
+            .get()
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "planning cleanup registry is unavailable".into(),
+            })?;
+    let registry = match lock.try_lock() {
+        Ok(registry) => registry,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "planning cleanup registry is poisoned".into(),
+            })
+        }
+    };
+    Ok(Some(
+        registry
+            .domains
+            .get(&domain_id)
+            .map(deferred_device_cleanup_domain_status)
+            .unwrap_or_else(empty_deferred_device_cleanup_status),
+    ))
 }
 
 pub(crate) fn maintain_deferred_device_cleanups(
@@ -3426,6 +3455,19 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn allocate(&self, permit: DeviceAllocationPermit<'_>) -> Result<Self::Buffer, Self::Error>;
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor;
+
+    /// Opt-in numeric layout evidence for cost prediction. Other runtimes do
+    /// not incur range capture or imply that resource IDs prove non-aliasing.
+    fn supports_cost_buffer_ranges(&self) -> bool {
+        false
+    }
+
+    /// An address/length only, with no ownership, dereference or submit grant.
+    /// Core borrows the live buffer under its existing lifecycle/generation
+    /// guards and retains this value only in a fenced numeric planning view.
+    fn cost_buffer_range(&self, _buffer: &Self::Buffer) -> Option<DeviceCostBufferRange> {
+        None
+    }
 
     /// Begins an optional all-or-nothing static-weight import transaction.
     /// Returning `None` selects the portable zero-and-upload path. The default

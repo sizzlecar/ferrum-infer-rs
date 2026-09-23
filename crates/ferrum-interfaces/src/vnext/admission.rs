@@ -2255,6 +2255,28 @@ impl LogicalAdmissionCoordinator {
         }
     }
 
+    /// Keeps a bounded logical read consistent with resource-layer try-lock
+    /// sampling. The callback must never wait for another lock or mutate claims.
+    pub(crate) fn with_planning_snapshot<T>(
+        &self,
+        maximum_domains: usize,
+        sample: impl FnOnce(CapacitySnapshot) -> T,
+    ) -> Result<Option<T>, VNextError> {
+        let state = match self.inner.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid_admission("planning logical read is poisoned"))
+            }
+        };
+        if state.poisoned || state.domains.len() > maximum_domains {
+            return Err(invalid_admission(
+                "planning logical read is fail-closed or exceeds its bound",
+            ));
+        }
+        Ok(Some(sample(state.snapshot(self.id()))))
+    }
+
     pub fn epochs(&self) -> Result<CapacityEpochs, VNextError> {
         let state = self.inner.lock_state()?;
         if state.poisoned {

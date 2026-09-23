@@ -89,7 +89,7 @@ where
     pub(in crate::vnext::resource) request_state_hazards: Arc<RequestStateHazardCoordinator>,
     pub(in crate::vnext::resource) logical_admission: LogicalAdmissionCoordinator,
     pub(in crate::vnext::resource) budget: Arc<DeviceCapacityBudget>,
-    lane_stable_arenas: Arc<Mutex<LaneStableArenaState>>,
+    pub(in crate::vnext::resource) lane_stable_arenas: Arc<Mutex<LaneStableArenaState>>,
     binding: StaticProvisioningBinding,
     // Backend context must outlive every resident/quarantined buffer above.
     runtime: Arc<R>,
