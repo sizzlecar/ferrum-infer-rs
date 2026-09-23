@@ -30,6 +30,7 @@ pub mod profile;
 pub mod release_regression;
 pub mod report;
 pub mod stats;
+pub mod teacher_metrics;
 pub mod trace;
 
 pub use env::{Env, EnvHash};
