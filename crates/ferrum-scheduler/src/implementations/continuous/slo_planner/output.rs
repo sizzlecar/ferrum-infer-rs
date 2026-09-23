@@ -1,4 +1,29 @@
 use super::types::{OutputByteBacking, OutputCreditView, PlanningUnknownReason};
+use ferrum_interfaces::output_flow::PrepaidOutputCapacityView;
+
+impl TryFrom<PrepaidOutputCapacityView> for OutputCreditView {
+    type Error = PlanningUnknownReason;
+
+    fn try_from(view: PrepaidOutputCapacityView) -> Result<Self, Self::Error> {
+        let overflow = PlanningUnknownReason::ArithmeticOverflow;
+        Ok(Self {
+            available_token_commands: view
+                .no_drain_token_commands()
+                .try_into()
+                .map_err(|_| overflow)?,
+            byte_backing: OutputByteBacking::PrepaidLifetime {
+                remaining_token_commands: view
+                    .remaining_token_commands()
+                    .try_into()
+                    .map_err(|_| overflow)?,
+                remaining_wire_bytes: view
+                    .remaining_wire_bytes()
+                    .try_into()
+                    .map_err(|_| overflow)?,
+            },
+        })
+    }
+}
 
 impl OutputCreditView {
     /// Advance one hypothetical output command, returning only the additional

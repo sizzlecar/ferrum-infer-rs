@@ -95,6 +95,21 @@ pub trait LlmInferenceEngine: InferenceEngine {
         request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>>;
 
+    /// A transport-specific, move-only stream. The engine derives its budget
+    /// from the actual tokenizer and effective request before submitting work.
+    /// Consumers must retain each wire lease through their final byte owner;
+    /// this is not an adapter around the clonable legacy StreamChunk API.
+    async fn infer_credited_stream(
+        &self,
+        _request: InferenceRequest,
+        _context: InferenceRequestContext,
+        _contract: std::sync::Arc<crate::output_flow::OutputProjectionContract>,
+    ) -> Result<crate::output_flow::CreditedOutputSession> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "this engine does not support credited output",
+        ))
+    }
+
     /// Trusted ingress context captured before product-side preprocessing.
     /// Engines without SLO support retain Off compatibility; active modes must
     /// explicitly implement the context boundary rather than silently ignore it.

@@ -18,6 +18,7 @@ pub mod kv_cache;
 pub mod kv_dtype;
 pub mod model_executor;
 pub mod output_credit;
+pub mod output_flow;
 pub mod recurrent_state;
 pub mod sampler;
 pub mod scheduler;
