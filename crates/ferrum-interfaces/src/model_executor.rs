@@ -17,8 +17,13 @@ use std::{
     sync::Arc,
 };
 
+mod execution_completion;
 mod prefix_capture;
 mod prefix_restore;
+pub use execution_completion::{
+    ExecutorAdmissionCancellationObservation, ExecutorCompletionActivities,
+    ExecutorCompletionObservation, ExecutorCompletionWork,
+};
 pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
     PrefixCaptureStatus,
@@ -3157,6 +3162,18 @@ pub trait ModelExecutor: Send + Sync {
         false
     }
 
+    /// Execute cancellation exactly once. The generic result does not prove
+    /// absence of backend work, including when no authority was released.
+    fn cancel_prefill_admission_observed(
+        &self,
+        request_id: &RequestId,
+    ) -> ExecutorAdmissionCancellationObservation {
+        ExecutorAdmissionCancellationObservation {
+            released: self.cancel_prefill_admission(request_id),
+            work: ExecutorCompletionWork::Unknown,
+        }
+    }
+
     /// Whether this exact plan can retain and restore independent prefix state.
     /// This must include resolved model/provider support and product policy.
     fn supports_plan_runtime_prefix_restore(&self) -> bool {
@@ -3526,6 +3543,18 @@ pub trait ModelExecutor: Send + Sync {
     async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
         self.release_cache(completion.cache_id());
         Ok(())
+    }
+
+    /// Observe the same completion once; callers must not replay this operation
+    /// if the work classification is unknown. Outcome and work are independent.
+    async fn complete_cache_observed(
+        &self,
+        completion: ExecutorSequenceCompletion,
+    ) -> ExecutorCompletionObservation {
+        ExecutorCompletionObservation {
+            result: self.complete_cache(completion).await,
+            work: ExecutorCompletionWork::Unknown,
+        }
     }
 
     /// Release KV cache and state without asserting successful completion.
