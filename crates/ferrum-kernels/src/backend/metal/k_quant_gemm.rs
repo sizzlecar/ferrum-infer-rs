@@ -4,12 +4,19 @@
 
 use metal::{CompileOptions, ComputePipelineState, Device};
 
-pub(crate) const SHADER_SOURCE: &str = include_str!("k_quant_gemm.metal");
+pub(crate) const SHADER_SOURCE: &str = concat!(
+    include_str!("k_quant_gemm.metal"),
+    "\n",
+    include_str!("k_quant_gemm_m8.metal"),
+);
 
 pub(crate) struct MetalKQuantGemmPipelines {
     pub(crate) q4_k: ComputePipelineState,
     pub(crate) q5_k: ComputePipelineState,
     pub(crate) q6_k: ComputePipelineState,
+    pub(crate) q4_k_m8: ComputePipelineState,
+    pub(crate) q5_k_m8: ComputePipelineState,
+    pub(crate) q6_k_m8: ComputePipelineState,
     pub(crate) q8_0: ComputePipelineState,
     pub(crate) stage_q4_k: ComputePipelineState,
     pub(crate) stage_q5_k: ComputePipelineState,
@@ -34,6 +41,9 @@ impl MetalKQuantGemmPipelines {
             q4_k: pipeline("gemm_f16a_q4kw_tiled")?,
             q5_k: pipeline("gemm_f16a_q5kw_tiled")?,
             q6_k: pipeline("gemm_f16a_q6kw_tiled")?,
+            q4_k_m8: pipeline("gemm_f16a_q4kw_m8")?,
+            q5_k_m8: pipeline("gemm_f16a_q5kw_m8")?,
+            q6_k_m8: pipeline("gemm_f16a_q6kw_m8")?,
             q8_0: pipeline("gemm_f16a_q8_0w_tiled")?,
             stage_q4_k: pipeline("stage_q4k_f16")?,
             stage_q5_k: pipeline("stage_q5k_f16")?,

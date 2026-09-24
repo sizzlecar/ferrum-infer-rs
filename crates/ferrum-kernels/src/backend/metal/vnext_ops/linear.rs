@@ -1,6 +1,8 @@
 //! Native Metal linear providers over typed physical weight layouts.
 mod cost_route;
 mod head_cost_route;
+#[cfg(test)]
+mod m8_tests;
 mod selected;
 #[cfg(test)]
 pub(crate) use selected::tests::runtime_fixture as selected_runtime_fixture;
@@ -71,6 +73,8 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("../q5_k_gemv.metal"),
     include_str!("../q6_k_gemv.metal"),
     include_str!("../k_quant_gemm.metal"),
+    include_str!("../k_quant_gemm_m8.metal"),
+    include_str!("../k_quant_gemm.rs"),
 );
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.metal.dense_linear.f16.native";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_linear.f16.native";
@@ -180,6 +184,7 @@ enum LinearDispatchKind {
     Pq2CooperativeGemv,
     SharedWeightGemv,
     TiledGemm,
+    TiledGemmM8,
     NativeTiledGemm,
     NativeTiledGemmM64,
 }
@@ -276,6 +281,19 @@ impl MetalLinearPipelines {
                 .and_then(|format| self.native.shared_linear(format, rows, ElementType::F16))
             {
                 return (pipeline, LinearDispatchKind::SharedWeightGemv);
+            }
+        }
+        // An eight-row wave needs only one M8 fragment. Keep the original
+        // half operands and K8 accumulation order while avoiding M32 padding.
+        if rows == 8 {
+            let pipeline = match format {
+                LinearPhysicalFormat::Q4K => Some(&self.k_quant_gemm.q4_k_m8),
+                LinearPhysicalFormat::Q5K => Some(&self.k_quant_gemm.q5_k_m8),
+                LinearPhysicalFormat::Q6K => Some(&self.k_quant_gemm.q6_k_m8),
+                _ => None,
+            };
+            if let Some(pipeline) = pipeline {
+                return (pipeline, LinearDispatchKind::TiledGemmM8);
             }
         }
         let tiled = rows >= QUANTIZED_TILED_GEMM_MIN_ROWS;
@@ -2214,11 +2232,16 @@ fn dispatch_linear_grid(
             MTLSize::new(u64::from(params.out_features).div_ceil(4), 1, 1),
             MTLSize::new(32, 2, 1),
         ),
-        LinearDispatchKind::TiledGemm => {
+        LinearDispatchKind::TiledGemm | LinearDispatchKind::TiledGemmM8 => {
             encoder.set_threadgroup_memory_length(0, 8192);
+            let tile_rows = if dispatch_kind == LinearDispatchKind::TiledGemmM8 {
+                8
+            } else {
+                32
+            };
             encoder.dispatch_thread_groups(
                 MTLSize::new(
-                    u64::from(params.rows).div_ceil(32),
+                    u64::from(params.rows).div_ceil(tile_rows),
                     u64::from(params.out_features).div_ceil(64),
                     1,
                 ),
@@ -3316,7 +3339,7 @@ mod tests {
         let encoder = command.new_compute_command_encoder();
         let (_, dispatch_kind) =
             pipelines.linear_pipeline(LinearPhysicalFormat::Q6K, rows as u32, output_width as u32);
-        assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemm);
+        assert_eq!(dispatch_kind, LinearDispatchKind::TiledGemmM8);
         dispatch_raw_linear(
             &pipelines,
             encoder,

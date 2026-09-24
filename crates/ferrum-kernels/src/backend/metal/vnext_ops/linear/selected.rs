@@ -40,8 +40,12 @@ pub(super) fn grid(params: LinearParams, kind: LinearDispatchKind) -> Option<Gri
             None,
             m.checked_mul(n)?,
         ),
-        LinearDispatchKind::TiledGemm => {
-            let tile = 32;
+        LinearDispatchKind::TiledGemm | LinearDispatchKind::TiledGemmM8 => {
+            let tile = if kind == LinearDispatchKind::TiledGemmM8 {
+                8
+            } else {
+                32
+            };
             (
                 [m.div_ceil(tile), n.div_ceil(64), 1],
                 [128, 1, 1],
@@ -133,6 +137,9 @@ fn entry(pipelines: &MetalLinearPipelines, actual: &ComputePipelineState) -> Opt
     named!(&pipelines.k_quant_gemm.q5_k, "gemm_f16a_q5kw_tiled");
     named!(&pipelines.k_quant_gemm.q6_k, "gemm_f16a_q6kw_tiled");
     named!(&pipelines.k_quant_gemm.q8_0, "gemm_f16a_q8_0w_tiled");
+    named!(&pipelines.k_quant_gemm.q4_k_m8, "gemm_f16a_q4kw_m8");
+    named!(&pipelines.k_quant_gemm.q5_k_m8, "gemm_f16a_q5kw_m8");
+    named!(&pipelines.k_quant_gemm.q6_k_m8, "gemm_f16a_q6kw_m8");
     if let Some(pso) = &pipelines.dense_narrow {
         named!(pso, LINEAR_DENSE_NARROW_KERNEL);
     }

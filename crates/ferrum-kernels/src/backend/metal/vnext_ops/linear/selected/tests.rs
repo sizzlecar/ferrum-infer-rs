@@ -41,7 +41,7 @@ fn numeric_grid_preserves_actual_padding_and_checked_boundaries() {
 }
 
 #[test]
-fn actual_pipeline_catalog_separates_b4_split_m32_and_staged_work() {
+fn actual_pipeline_catalog_separates_b4_split_m8_m32_and_staged_work() {
     let device = Device::system_default().expect("selected algorithm evidence requires Metal");
     let pipelines = MetalLinearPipelines::new(&device).unwrap();
     let m8_split = launch(8, 1024, 1024);
@@ -55,11 +55,7 @@ fn actual_pipeline_catalog_separates_b4_split_m32_and_staged_work() {
     split.validate_command(8, 2, 0).unwrap();
     eight.validate_command(8, 1, 0).unwrap();
     assert_ne!(split.family_signature(), eight.family_signature());
-    assert_eq!(
-        eight.family_signature(),
-        sixteen.family_signature(),
-        "HEAD uses the same actual M32 kernel for unsplit B8 and B16"
-    );
+    assert_ne!(eight.family_signature(), sixteen.family_signature());
     assert_eq!(
         sixteen.family_signature(),
         thirtytwo.family_signature(),
