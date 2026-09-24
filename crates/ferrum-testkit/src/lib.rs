@@ -14,6 +14,7 @@ mod kv_cache;
 pub mod op_diff;
 pub mod paged_executor;
 mod sampler;
+pub mod slo_oracle;
 mod tensor;
 mod tokenizer;
 
