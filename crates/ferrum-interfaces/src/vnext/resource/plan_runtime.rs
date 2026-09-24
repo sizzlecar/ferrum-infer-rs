@@ -399,6 +399,13 @@ where
         &self.evidence
     }
 
+    pub(super) fn protect_additional_retry_claims(
+        &mut self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<(), VNextError> {
+        self.evidence.protect_additional_retry_claims(requests)
+    }
+
     pub(super) fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         let _lifecycle = self
             .resources

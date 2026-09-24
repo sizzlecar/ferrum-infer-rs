@@ -895,6 +895,8 @@ where
                         Arc::clone(self),
                         deferred,
                         deferred_node_work_fingerprints,
+                        purpose == SubmissionWavePurpose::FullPlan
+                            && self.reusable_execution_bucket.is_none(),
                     )?,
                 ));
             }
@@ -1542,6 +1544,7 @@ where
     backing: PlanBackingDeferral<R>,
     step: Arc<StepResourceLease<R>>,
     node_work_fingerprints: Vec<(NodeId, String)>,
+    full_plan_transient_retry_protection: bool,
 }
 
 impl<R> StepSubmissionWaveBackingDeferral<R>
@@ -1552,6 +1555,7 @@ where
         step: Arc<StepResourceLease<R>>,
         evidence: DynamicBackingDeferred,
         node_work_fingerprints: Vec<(NodeId, String)>,
+        full_plan_transient_retry_protection: bool,
     ) -> Result<Self, VNextError> {
         let resources = Arc::clone(
             &step.participants[0]
@@ -1565,6 +1569,7 @@ where
             backing: PlanBackingDeferral::new(resources, evidence)?,
             step,
             node_work_fingerprints,
+            full_plan_transient_retry_protection,
         })
     }
 
@@ -1580,7 +1585,7 @@ where
     /// Step before exporting a maintenance-only continuation. Ordinary retire
     /// receipts cannot substitute for this private rollback check.
     pub fn reconcile_for_maintenance(
-        self,
+        mut self,
         step: Arc<StepResourceLease<R>>,
     ) -> Result<ReconciledSubmissionWaveMaintenance<R>, super::StepFinalizationFailure<R>> {
         if !Arc::ptr_eq(&self.step, &step) {
@@ -1588,6 +1593,30 @@ where
                 step,
                 error: invalid_resource("wave maintenance belongs to another Step"),
             });
+        }
+        if self.full_plan_transient_retry_protection {
+            // The original Step is about to be rolled back. Its backing will
+            // no longer count as occupied, but the exact retry still needs it.
+            // Add only its pure physical claims before dropping the authority;
+            // the enriched deferral is never maintained with the Step live.
+            let result = (|| {
+                let plan = &self.step.participants[0].session.resources().request.plan;
+                let shape = self.step.work_shape().immediate_shape();
+                let (_, retry_step_slices) = plan.scoped_demand(
+                    AllocationLifetime::Step,
+                    None,
+                    shape,
+                    shape,
+                    self.step.reusable_execution_bucket.as_ref(),
+                    AdmissionFitPolicy::ImmediateOnly,
+                    AdmissionPressureAction::WaitForRelease,
+                )?;
+                self.backing
+                    .protect_additional_retry_claims(&retry_step_slices)
+            })();
+            if let Err(error) = result {
+                return Err(super::StepFinalizationFailure { step, error });
+            }
         }
         let participants = self
             .step
@@ -1599,6 +1628,7 @@ where
             backing,
             step: retained_step,
             node_work_fingerprints: _,
+            full_plan_transient_retry_protection: _,
         } = self;
         drop(retained_step);
         step.try_rollback_unsubmitted()?;

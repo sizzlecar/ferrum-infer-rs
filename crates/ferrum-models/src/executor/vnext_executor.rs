@@ -6819,6 +6819,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 AdmissionPressureAction::WaitForRelease,
             )
             .map_err(|error| FerrumError::backend(error.to_string()))?;
+            // This executor submits every immutable-plan node as one wave.
+            let request = request.with_full_plan_transient_retry_protection();
             match reusable_bucket_id {
                 Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
                 None => request,

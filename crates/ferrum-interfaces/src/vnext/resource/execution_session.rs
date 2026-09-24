@@ -65,6 +65,7 @@ where
             fit_policy,
             pressure_action,
             reusable_execution_bucket_id,
+            full_plan_transient_retry_protection,
         } = request;
         let work_fingerprint = work_shape.fingerprint().to_owned();
         let expected_participants = self
@@ -141,7 +142,20 @@ where
         let phase_started = step_admission_profile_start::<PROFILE>();
         let prepared = match plan.prepare_lane_stable_backing_slices(lane, requested_slices)? {
             LaneBackingPrepareDecision::Prepared(prepared) => prepared,
-            LaneBackingPrepareDecision::Deferred(deferred) => {
+            LaneBackingPrepareDecision::Deferred(mut deferred) => {
+                if full_plan_transient_retry_protection && reusable_execution_bucket.is_none() {
+                    // The caller declared the full immutable-plan wave. Reuse
+                    // its exact pure Invocation layout, not an estimated byte
+                    // total or a claim minted from future numerical evidence.
+                    let (_, retry_wave_slices) = plan.submission_wave_demand(
+                        immediate_shape,
+                        fit_shape,
+                        reusable_execution_bucket.as_ref(),
+                        fit_policy,
+                        pressure_action,
+                    )?;
+                    deferred.protect_additional_retry_claims(&retry_wave_slices)?;
+                }
                 record_step_admission_profile::<PROFILE, _>(
                     &mut observer,
                     StepResourceAdmissionProfilePhase::BackingClaim,

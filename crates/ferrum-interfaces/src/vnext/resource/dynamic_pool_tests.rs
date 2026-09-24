@@ -33,6 +33,9 @@ mod reusable_pressure_tests;
 #[path = "backing_scope_regression_tests.rs"]
 mod backing_scope_regression_tests;
 
+#[path = "retry_wave_protection_tests.rs"]
+mod retry_wave_protection_tests;
+
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
 

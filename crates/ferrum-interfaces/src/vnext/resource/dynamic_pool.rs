@@ -1533,6 +1533,89 @@ impl DynamicBackingDeferred {
     pub fn protected_packing_envelopes(&self) -> &[DynamicBackingPackingEnvelope] {
         &self.protected_packing_envelopes
     }
+
+    /// Complete an exact retry's reclaim floor with its other execution stage.
+    /// These requests come only from the same immutable plan's demand evaluator;
+    /// they create neither physical claims nor admission/execution authority.
+    /// The caller must have released any live claim represented here before it
+    /// exports this deferral to maintenance.
+    pub(super) fn protect_additional_retry_claims(
+        &mut self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<(), VNextError> {
+        let additional_lifetime = match self.scope {
+            DynamicBackingClaimScope::Step => AllocationLifetime::Invocation,
+            DynamicBackingClaimScope::Invocation => AllocationLifetime::Step,
+            _ => {
+                return Err(invalid_resource(
+                    "complete-wave retry protection requires Step or Invocation scope",
+                ));
+            }
+        };
+        let mut by_domain = BTreeMap::new();
+        for envelope in &self.protected_packing_envelopes {
+            if by_domain
+                .insert(
+                    envelope.domain_id(),
+                    (
+                        envelope.pool_id().clone(),
+                        envelope.claim_bytes_descending().to_vec(),
+                    ),
+                )
+                .is_some()
+            {
+                return Err(invalid_resource(
+                    "retry protection has duplicate pool domains",
+                ));
+            }
+        }
+        for request in requests {
+            if request.projections.is_empty()
+                || request
+                    .projections
+                    .iter()
+                    .any(|projection| projection.descriptor.lifetime() != additional_lifetime)
+                || request.claim_identity.pool_id() != request.domain.pool_id()
+            {
+                return Err(invalid_resource(
+                    "retry protection differs from its opposite-stage physical claims",
+                ));
+            }
+            let (pool, claims) = by_domain
+                .entry(request.domain.domain_id())
+                .or_insert_with(|| (request.domain.pool_id().clone(), Vec::new()));
+            if pool != request.domain.pool_id() {
+                return Err(invalid_resource(
+                    "retry protection pool/domain binding differs",
+                ));
+            }
+            // A pool may serve both lifetimes. Keep the actual separate claim
+            // sizes: summing them into one contiguous claim changes packing.
+            claims.push(request.capacity_size_bytes);
+        }
+        let envelopes = by_domain
+            .into_iter()
+            .map(|(domain, (pool, claims))| {
+                DynamicBackingPackingEnvelope::new(pool, domain, claims)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let protected = CapacityVector::new(
+            envelopes
+                .iter()
+                .map(|envelope| {
+                    CapacityEntry::new(
+                        envelope.domain_id(),
+                        CapacityUnits::new(envelope.total_bytes()?),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        // Preserve the original failed acquire/epoch. Publish only after every
+        // count and byte sum has been checked; no partial protection on error.
+        self.protected_immediate = protected;
+        self.protected_packing_envelopes = envelopes;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

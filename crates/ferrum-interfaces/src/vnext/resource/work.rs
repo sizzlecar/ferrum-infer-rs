@@ -12,6 +12,7 @@ pub struct StepResourceAdmissionRequest {
     pub(super) fit_policy: AdmissionFitPolicy,
     pub(super) pressure_action: AdmissionPressureAction,
     pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
+    pub(super) full_plan_transient_retry_protection: bool,
 }
 
 impl StepResourceAdmissionRequest {
@@ -25,11 +26,24 @@ impl StepResourceAdmissionRequest {
             fit_policy,
             pressure_action,
             reusable_execution_bucket_id: None,
+            full_plan_transient_retry_protection: false,
         })
     }
 
     pub fn with_reusable_execution_bucket(mut self, bucket_id: ReusableExecutionBucketId) -> Self {
         self.reusable_execution_bucket_id = Some(bucket_id);
+        self
+    }
+
+    /// Declare that retrying this Step is part of one full immutable-plan wave.
+    /// Only maintenance reclaim protection is enlarged: this allocates nothing
+    /// and is not a reservation, an admission grant, or execution permission.
+    /// This protection covers transient backing (no reusable bucket). Retained
+    /// lane slots keep their existing maintenance contract: counting an already
+    /// occupied slot again as uncommitted demand would double its reclaim floor.
+    /// Subset/invocation callers keep the default single-stage semantics.
+    pub fn with_full_plan_transient_retry_protection(mut self) -> Self {
+        self.full_plan_transient_retry_protection = true;
         self
     }
 
