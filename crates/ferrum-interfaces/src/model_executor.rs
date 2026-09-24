@@ -18,11 +18,16 @@ use std::{
 };
 
 mod execution_completion;
+mod execution_maintenance;
 mod prefix_capture;
 mod prefix_restore;
+mod token_policy_residency;
 pub use execution_completion::{
     ExecutorAdmissionCancellationObservation, ExecutorCompletionActivities,
     ExecutorCompletionObservation, ExecutorCompletionWork,
+};
+pub use execution_maintenance::{
+    ExecutorExecutionMaintenanceOutcome, ExecutorExecutionMaintenanceTicket,
 };
 pub use prefix_capture::{
     PrefixCaptureBoundary, PrefixCaptureLease, PrefixCapturePlan, PrefixCaptureRequest,
@@ -32,6 +37,9 @@ pub use prefix_restore::{
     PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PrefixRestoreDecision,
     PrefixRestoreObservation, PrefixRestoreSource,
+};
+pub use token_policy_residency::{
+    TokenPolicyResidencyInvalidation, TokenPolicyResidencyUnavailable,
 };
 
 /// Identifies the exact currently admitted model participant. A decode caller
@@ -3061,9 +3069,197 @@ pub enum ExecutorPrefillAdmissionDecision {
     PermanentRejected(crate::vnext::AdmissionRejected),
 }
 
+/// Products from one submitted mixed wave, preserving each input phase order.
+pub struct PlanRuntimeMixedBatchOutput {
+    pub prefills: Vec<PlanRuntimePrefillCompletion>,
+    pub decodes: Vec<PlanRuntimeDecodeOutput>,
+}
+
+/// Declared support for the controller's guarded execution contract. This is
+/// independent of collecting timing observations or exposing a resource view.
+/// It does not establish cost coverage for any particular request or wave.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutorSloCapability {
+    #[default]
+    Unavailable,
+    /// Prefill, decode and mixed work obey the sealed single-wave bounds,
+    /// revalidate at native submission and reconcile actual completion.
+    /// Unmodeled execution policies are excluded before this is advertised.
+    GuardedEagerWaves,
+}
+
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
+    /// Explicit calibration-only invalidation of token-policy upload residency.
+    /// The exclusive calibration driver must have completed its previous cohort.
+    /// Implementations must independently reject retained requests or execution
+    /// work and return the actual cleared entry count. This must not submit work,
+    /// reset metrics, modify policy, or claim a full device cold start.
+    fn calibration_invalidate_token_policy_residency(&self) -> TokenPolicyResidencyInvalidation {
+        TokenPolicyResidencyInvalidation::Unsupported
+    }
+
+    fn slo_execution_capability(&self) -> ExecutorSloCapability {
+        ExecutorSloCapability::Unavailable
+    }
+
+    /// Smallest logical prefill service quantum supported by the guarded
+    /// executor at a valid prefill frontier. None makes no size declaration.
+    /// This never proves capacity, a provider route, or submission permission;
+    /// exact span/resource/native checks are still mandatory for every wave.
+    fn guarded_prefill_granularity(&self) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+
+    /// Cached actual execution identity; never infer hardware identity from a
+    /// logical device ordinal or its memory capacity. This getter does no I/O.
+    fn execution_cost_identity(&self) -> crate::execution_cost::ExecutorCostIdentityAvailability {
+        crate::execution_cost::ExecutorCostIdentityAvailability::default()
+    }
+
+    /// Whether this executor implements the explicit legacy single-chunk
+    /// contract below. The generic `prefill_with_capacity` wrapper is not
+    /// evidence of incremental execution or an observed model KV frontier.
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        false
+    }
+
+    /// Execute only `input.chunk` from the full prompt tensor, observe terminal
+    /// completion, and validate actual model progress before returning a receipt.
+    /// Implementations may narrow before submission but must never run multiple
+    /// chunks, reset a continuation, or infer completion solely from input sizes.
+    /// Unsupported state combinations must fail before any model execution.
+    async fn bounded_incremental_prefill(
+        &self,
+        _input: &PrefillInput,
+    ) -> Result<ExecutorPrefillOutcome> {
+        Err(FerrumError::unsupported(
+            "executor does not declare bounded incremental prefill",
+        ))
+    }
+
+    /// Consume one real deferred-maintenance continuation on a separate engine
+    /// turn. At most one bounded core maintenance transaction; never submit,
+    /// retry execution, narrow work, or reuse a prior planning witness.
+    fn maintain_execution_capacity_once(
+        &self,
+        _ticket: ExecutorExecutionMaintenanceTicket,
+        _guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+    ) -> Result<ExecutorExecutionMaintenanceOutcome> {
+        Ok(ExecutorExecutionMaintenanceOutcome::Unsupported)
+    }
+
+    /// Execute exactly the selected batch-prefill wave, including one-row batches.
+    /// No inner chunk narrowing, maintenance, retry, or checkpoint copy is allowed.
+    /// Only a reconciled not-submitted outcome preserves all admitted frontiers.
+    async fn plan_runtime_batch_prefill_guarded_observed(
+        &self,
+        _inputs: &[PlanRuntimePrefillInput],
+        _expected: &crate::execution_cost::ExpectedExecutionCostWave,
+        _guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        _observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>> {
+        crate::execution_cost::GuardedDispatchOutcome::Unsupported
+    }
+
+    /// Execute exactly one selected mixed wave under the same final-submit guard.
+    /// Partial prefill products cannot be sampled; final products retain full logits.
+    async fn plan_runtime_mixed_batch_guarded_observed(
+        &self,
+        _prefills: &[PlanRuntimePrefillInput],
+        _decodes: &[PlanRuntimeDecodeInput],
+        _expected: &crate::execution_cost::ExpectedExecutionCostWave,
+        _guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        _observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput> {
+        crate::execution_cost::GuardedDispatchOutcome::Unsupported
+    }
+
+    /// The same exact physical prefill contract, with an explicit choice of
+    /// cost witness or completion-only work. Neither branch may narrow, retry,
+    /// bypass the final native/host guard, or invent capacity. Implementations
+    /// supporting only cost witnesses retain their existing behavior.
+    async fn plan_runtime_batch_prefill_guarded_work_observed(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+        expected: &crate::execution_cost::ExpectedExecutionWave,
+        guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>> {
+        match expected.commitment() {
+            crate::execution_cost::WaveCommitment::CostWitness(witness) => {
+                self.plan_runtime_batch_prefill_guarded_observed(
+                    inputs,
+                    witness,
+                    guard,
+                    observation,
+                )
+                .await
+            }
+            crate::execution_cost::WaveCommitment::CompleteRequests(_) => {
+                crate::execution_cost::GuardedDispatchOutcome::Unsupported
+            }
+        }
+    }
+
+    async fn plan_runtime_mixed_batch_guarded_work_observed(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+        expected: &crate::execution_cost::ExpectedExecutionWave,
+        guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput> {
+        match expected.commitment() {
+            crate::execution_cost::WaveCommitment::CostWitness(witness) => {
+                self.plan_runtime_mixed_batch_guarded_observed(
+                    prefills,
+                    decodes,
+                    witness,
+                    guard,
+                    observation,
+                )
+                .await
+            }
+            crate::execution_cost::WaveCommitment::CompleteRequests(_) => {
+                crate::execution_cost::GuardedDispatchOutcome::Unsupported
+            }
+        }
+    }
+
+    /// One exact guarded decode wave. The final host check must run after all
+    /// real encoding and immediately before device submission, after the actual
+    /// encoded route matches `expected`. Never fall back to the unguarded entry.
+    /// Cancelled futures cannot be assumed to represent unsubmitted work.
+    async fn plan_runtime_batch_decode_guarded_observed(
+        &self,
+        _inputs: &[PlanRuntimeDecodeInput],
+        _expected: &crate::execution_cost::ExpectedExecutionCostWave,
+        _guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        _observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>> {
+        crate::execution_cost::GuardedDispatchOutcome::Unsupported
+    }
+
+    async fn plan_runtime_batch_decode_guarded_work_observed(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        expected: &crate::execution_cost::ExpectedExecutionWave,
+        guard: &dyn crate::execution_cost::NonblockingHostSubmissionGuard,
+        observation: crate::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> crate::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>> {
+        match expected.commitment() {
+            crate::execution_cost::WaveCommitment::CostWitness(witness) => {
+                self.plan_runtime_batch_decode_guarded_observed(inputs, witness, guard, observation)
+                    .await
+            }
+            crate::execution_cost::WaveCommitment::CompleteRequests(_) => {
+                crate::execution_cost::GuardedDispatchOutcome::Unsupported
+            }
+        }
+    }
+
     /// Explicit passive observation is separate from resource and submission authority.
     /// Unavailable observed calls do no work; Executed errors may have submitted.
     fn execution_cost_observation_capability(

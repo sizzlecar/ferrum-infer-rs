@@ -1576,6 +1576,38 @@ where
         &self.node_work_fingerprints
     }
 
+    /// Release the retained Step reference and reconcile that exact unsubmitted
+    /// Step before exporting a maintenance-only continuation. Ordinary retire
+    /// receipts cannot substitute for this private rollback check.
+    pub fn reconcile_for_maintenance(
+        self,
+        step: Arc<StepResourceLease<R>>,
+    ) -> Result<ReconciledSubmissionWaveMaintenance<R>, super::StepFinalizationFailure<R>> {
+        if !Arc::ptr_eq(&self.step, &step) {
+            return Err(super::StepFinalizationFailure {
+                step,
+                error: invalid_resource("wave maintenance belongs to another Step"),
+            });
+        }
+        let participants = self
+            .step
+            .participants
+            .iter()
+            .map(|participant| Arc::clone(&participant.session))
+            .collect();
+        let Self {
+            backing,
+            step: retained_step,
+            node_work_fingerprints: _,
+        } = self;
+        drop(retained_step);
+        step.try_rollback_unsubmitted()?;
+        Ok(ReconciledSubmissionWaveMaintenance {
+            backing,
+            participants,
+        })
+    }
+
     pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         if self.step.finalized {
             return Err(invalid_resource(
@@ -1587,6 +1619,26 @@ where
 
     pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
         self.backing.register_waiter()
+    }
+}
+
+/// A real backing deferral whose original Step was proven unsubmitted and
+/// completely rolled back. It owns no Step, invocation, or execution permit.
+#[must_use]
+pub struct ReconciledSubmissionWaveMaintenance<R: DeviceRuntime> {
+    backing: PlanBackingDeferral<R>,
+    participants: Vec<Arc<super::SequenceSession<R>>>,
+}
+
+impl<R: DeviceRuntime> ReconciledSubmissionWaveMaintenance<R> {
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        self.backing.evidence()
+    }
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        for participant in &self.participants {
+            participant.ensure_open_identity()?;
+        }
+        self.backing.maintain()
     }
 }
 

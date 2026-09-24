@@ -2,9 +2,9 @@
 //! an entered device submission. Expected evidence is never execution authority.
 use super::{
     ActualRowWork, ActualWaveKind, CanonicalWaveCostShape, CostObservationParticipant,
-    MAX_COST_ROWS,
+    PlanRuntimeCostObservationContext, MAX_COST_ROWS,
 };
-use crate::model_executor::PrefillChunk;
+use crate::model_executor::{ExecutorExecutionDeferral, PrefillChunk};
 use crate::vnext::ExecutionCostRouteView;
 use ferrum_types::{FerrumError, RequestId, Result};
 
@@ -164,3 +164,31 @@ impl GuardedNotSubmitted {
         self.reason
     }
 }
+
+/// No outer `Result`: even failure must retain its submission phase.
+pub enum GuardedDispatchOutcome<T> {
+    /// No preparation, encode, or device submission has occurred.
+    Unsupported,
+    /// The selected resource/frame evidence changed before provider encoding
+    /// or device submission. All temporary preparation owners are released.
+    /// A prior row may have extended its logical backing, so the caller must
+    /// capture a fresh resource view instead of reusing the selected witness.
+    ReplanBeforeEncode,
+    /// Ordinary capacity deferral before encode or submission.
+    Deferred(ExecutorExecutionDeferral),
+    /// No submission occurred; any temporary Step was already rolled back.
+    /// The one-use maintenance continuation belongs to a later engine turn.
+    MaintenanceDeferred {
+        deferral: ExecutorExecutionDeferral,
+        ticket: crate::model_executor::ExecutorExecutionMaintenanceTicket,
+    },
+    /// Preparation occurred, no device submission occurred, cleanup completed.
+    NotSubmittedAfterPreparation(GuardedNotSubmitted),
+    /// Submission was entered or cannot be ruled out. Never reopen its logical
+    /// publication on error. The executor owns physical terminal reconciliation.
+    Submitted(Result<T>),
+}
+
+/// Cost observation is optional; safe guarded execution does not depend on
+/// enabling diagnostic instrumentation.
+pub type GuardedCostObservation<'a, 'b> = Option<&'a mut PlanRuntimeCostObservationContext<'b>>;

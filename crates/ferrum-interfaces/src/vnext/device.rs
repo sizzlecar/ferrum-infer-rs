@@ -3519,6 +3519,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     fn descriptor(&self) -> &DeviceDescriptor;
 
+    /// Cached evidence about the actual device and its compatibility scope.
+    /// Unsupported runtimes remain Unknown; a logical descriptor is not proof
+    /// that devices with the same memory capacity share calibrated costs.
+    fn cost_hardware_identity(&self) -> DeviceCostHardwareIdentityAvailability {
+        DeviceCostHardwareIdentityAvailability::default()
+    }
+
     /// A nonblocking actual backend declaration, never inferred from a device
     /// name or a requested Auto/Eager policy. Unknown requires per-dispatch
     /// graph-capture evidence before assigning a complete cost shape.

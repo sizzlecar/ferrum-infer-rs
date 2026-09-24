@@ -52,6 +52,7 @@ use super::st;
 mod counter_readback;
 use counter_readback::CounterReadbackStats;
 mod core_cost_route;
+mod cost_identity;
 #[cfg(test)]
 mod submission_guard_tests;
 mod submission_readback;
@@ -2007,6 +2008,7 @@ impl Drop for MetalDeviceFence {
 /// operation dispatch layers.
 pub struct MetalDeviceRuntime {
     descriptor: DeviceDescriptor,
+    cost_hardware_identity: ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability,
     runtime_instance: u64,
     device: metal::Device,
     timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
@@ -2046,8 +2048,11 @@ impl MetalDeviceRuntime {
             .map_err(|_| MetalDeviceRuntimeError::contract("Metal runtime identity exhausted"))?;
         let counter_readback_stats =
             Arc::new(CounterReadbackStats::new(runtime_instance, device.name()));
+        let cost_hardware_identity =
+            cost_identity::capture(&device, &descriptor.runtime_implementation_fingerprint);
         Ok(Self {
             descriptor,
+            cost_hardware_identity,
             runtime_instance,
             device,
             timestamp_counter_support: OnceLock::new(),
@@ -2475,6 +2480,12 @@ impl DeviceRuntime for MetalDeviceRuntime {
         // This implementation only encodes eager Metal commands. It has no
         // graph capture or replay path, regardless of product timing settings.
         DeviceCostGraphCaptureCapability::Unsupported
+    }
+
+    fn cost_hardware_identity(
+        &self,
+    ) -> ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability {
+        self.cost_hardware_identity.clone()
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {

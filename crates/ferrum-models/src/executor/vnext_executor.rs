@@ -4566,6 +4566,7 @@ impl<R: DeviceRuntime> Drop for VNextPrefillExecutionGuard<'_, R> {
 /// registry. CUDA and Metal factories differ only in composition creation.
 pub struct VNextModelExecutor<R: DeviceRuntime> {
     info: ModelInfo,
+    cost_identity: ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability,
     resolved_plan: ResolvedModelPlan,
     capability_catalog: CapabilityCatalog,
     runtime: Arc<R>,
@@ -4947,6 +4948,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .program()
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
+        let cost_identity = cost_observation::cache_identity(
+            prepared,
+            &resolved_plan,
+            &config,
+            &family_fingerprint,
+            &program_fingerprint,
+            &runtime.cost_hardware_identity(),
+        );
+
         let static_bytes = resolved_plan
             .execution_plan()
             .payload()
@@ -5137,6 +5147,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         Ok(Self {
             info,
+            cost_identity,
             resolved_plan,
             capability_catalog: catalog,
             runtime,
@@ -10039,6 +10050,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn execution_cost_identity(
+        &self,
+    ) -> ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability {
+        self.cost_identity.clone()
+    }
+
     fn execution_cost_observation_capability(&self) -> ExecutorCostObservationCapability {
         ExecutorCostObservationCapability::SinglePhysicalWave
     }
