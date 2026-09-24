@@ -333,7 +333,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .checked_mul(query.rows.len() as u64)
             .ok_or(U::Capacity)?;
         let shape = canonical
-            .finish(
+            .finish_with_statistics(
                 query.kind,
                 ActualWavePath::PlanRuntime,
                 ActualWaveGraphState::Disabled,
@@ -341,6 +341,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 recurrent,
             )
             .map_err(|_| U::InvalidInput)?;
-        Ok(ExecutionCostRouteProjection { shape, state: next })
+        Ok(ExecutionCostRouteProjection {
+            statistical_evidence: shape.statistical.ok(),
+            shape: shape.exact,
+            state: next,
+        })
     }
 }

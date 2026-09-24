@@ -85,6 +85,7 @@ fn production_actual_route_matches_declared_canonical_inputs_losslessly() {
     // side above calls the exact adapter consumed by production actual_shape.
     declared
         .physical_command(CostPhysicalCommand {
+            statistical_evidence: None,
             native_op_id: "fixture.native",
             command_index: 0,
             node_index: Some(0),
@@ -128,6 +129,7 @@ fn actual_attribution_numeric_rows_match_a_full_declared_route() {
     let mut declared = CanonicalWaveCostBuilder::new(0, CostProductOutput::GreedyToken);
     declared
         .physical_command(CostPhysicalCommand {
+            statistical_evidence: None,
             native_op_id: "fixture.native",
             command_index: 0,
             node_index: Some(0),

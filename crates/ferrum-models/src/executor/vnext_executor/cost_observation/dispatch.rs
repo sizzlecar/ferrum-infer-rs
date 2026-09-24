@@ -167,7 +167,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
         ActualWavePath::PlanRuntime
     };
     let canonical = canonical
-        .finish(
+        .finish_with_statistics(
             kind,
             path,
             graph,
@@ -175,7 +175,10 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
             recurrent_state_bytes,
         )
         .map_err(|_| ActualWaveEvidenceUnknown::ProviderPath)?;
+    let statistical_evidence = canonical.statistical.ok();
+    let canonical = canonical.exact;
     let shape = ActualWaveShape {
+        statistical_evidence,
         kind,
         path,
         graph,
