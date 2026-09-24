@@ -19,6 +19,7 @@ use std::time::Duration;
 mod completion;
 pub(in crate::continuous_engine) mod fixture;
 pub(super) mod prefill;
+mod publication_retry;
 mod recompute_boundary;
 mod recovery;
 mod recurrent_state;
