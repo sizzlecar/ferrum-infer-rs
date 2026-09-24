@@ -13,6 +13,7 @@ mod admission;
 mod boundaries;
 mod budget_phases;
 mod host_domain;
+mod joint_execution;
 mod lazy_search;
 mod ordering;
 mod output;
@@ -776,17 +777,25 @@ fn virtual_clock_budget_and_clock_reversal_are_explicit_unknowns() {
 
 #[test]
 fn planning_overhead_is_included_before_returning_a_first_wave() {
+    struct LookupClock<'a>(&'a std::cell::Cell<u64>);
+    impl PlanningClock for LookupClock<'_> {
+        fn now_ns(&mut self) -> u64 {
+            self.0.get()
+        }
+    }
     let mut request = decode(1);
     request.timing.budgets.tpot_ns = n64(14); // deadline 104
     let snapshot = snapshot(vec![request]);
-    let clock = &mut ScriptClock::new(&[100, 100, 100, 100, 105]);
+    let now = std::cell::Cell::new(100);
+    let model = Model(|_: &WaveExecutionShape| {
+        // Search's 100 + 4 fits exactly, but one unit spent in the real lookup
+        // forces fresh replay to 101 + 4 > 104. The actual clock is still before
+        // the deadline, so this is sequence failure, not DeadlineAlreadyMissed.
+        now.set(101);
+        Some(4)
+    });
     assert!(matches!(
-        planner(1).propose(
-            &snapshot,
-            &Model(|_: &WaveExecutionShape| Some(4)),
-            &TestResolver,
-            clock
-        ),
+        planner(1).propose(&snapshot, &model, &TestResolver, &mut LookupClock(&now)),
         PlanningDecision::Unknown { .. }
     ));
 }

@@ -1,4 +1,34 @@
-use super::{obligations::PlanningObligationSet, shape, types::*};
+use super::{
+    execution::{self, PlanningExecutionContext, PlanningExecutionState},
+    obligations::PlanningObligationSet,
+    types::*,
+};
+use std::{ops::Deref, sync::Arc};
+
+#[derive(Clone)]
+pub(super) struct PlanningState<'epoch> {
+    logical: SimulatedSequence,
+    execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
+    depth: usize,
+}
+
+impl Deref for PlanningState<'_> {
+    type Target = SimulatedSequence;
+    fn deref(&self) -> &Self::Target {
+        &self.logical
+    }
+}
+
+pub(super) struct VerifiedTransition<'epoch> {
+    pub wave: WaveCandidate,
+    pub state: PlanningState<'epoch>,
+}
+
+pub(super) struct TransitionFailure {
+    pub cause: SimulationFailure,
+    /// Distinguishes an attempted callback from accepted execution evidence.
+    pub projected: bool,
+}
 
 #[derive(Clone)]
 pub(super) struct SimulatedSequence {
@@ -28,6 +58,120 @@ impl From<PlanningUnknownReason> for SimulationFailure {
     }
 }
 
+pub(super) fn begin<'epoch>(
+    snapshot: &'epoch SchedulerSnapshot,
+    context: &'epoch dyn PlanningExecutionContext,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    started_at_ns: u64,
+) -> Result<PlanningState<'epoch>, SimulationFailure> {
+    let execution = execution::checked(poll, |poll| context.begin(snapshot, poll))?;
+    Ok(PlanningState {
+        execution,
+        depth: 0,
+        logical: SimulatedSequence {
+            requests: snapshot.requests.clone(),
+            now_ns: started_at_ns,
+            started_at_ns,
+            output_tokens: 0,
+            net_prefill_work_ns: 0,
+            remaining_kv_tokens: snapshot.capacity.available_kv_tokens,
+            remaining_output_bytes: snapshot.capacity.available_output_bytes,
+            first_wave_cost_ns: 0,
+            first_fairness_rank: u64::MAX,
+            minimum_start_slack_ns: u64::MAX,
+            minimum_cost_freshness_slack_ns: u64::MAX,
+        },
+    })
+}
+
+/// Expand only this edge. The parent's logical and execution states are never
+/// changed, including when a late cost/output/obligation check fails.
+pub(super) fn advance<'epoch>(
+    snapshot: &SchedulerSnapshot,
+    parent: &PlanningState<'epoch>,
+    work: &[CandidateWork],
+    model: &dyn PlanningCostModel,
+    complete_resources: bool,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    milestones_enabled: bool,
+    protection: Option<&PlanningObligationSet>,
+) -> Result<VerifiedTransition<'epoch>, TransitionFailure> {
+    let projected = execution::project(
+        snapshot,
+        &parent.requests,
+        work,
+        parent.execution.as_ref(),
+        poll,
+    )
+    .map_err(|reason| TransitionFailure {
+        cause: reason.into(),
+        projected: false,
+    })?
+    .ok_or(TransitionFailure {
+        cause: SimulationFailure::SequenceViolation,
+        projected: false,
+    })?;
+    let mut logical = parent.logical.clone();
+    apply(
+        snapshot,
+        &mut logical,
+        &projected.wave,
+        model,
+        complete_resources,
+        poll,
+        milestones_enabled,
+        protection,
+        parent.depth == 0,
+    )
+    .map_err(|cause| TransitionFailure {
+        cause,
+        projected: true,
+    })?;
+    Ok(VerifiedTransition {
+        wave: projected.wave,
+        state: PlanningState {
+            logical,
+            execution: projected.successor,
+            depth: parent.depth + 1,
+        },
+    })
+}
+
+/// Independent replay initializes a fresh backend state and resolves every
+/// selected edge again. Search state is not a publication certificate.
+pub(super) fn replay<'epoch>(
+    snapshot: &'epoch SchedulerSnapshot,
+    waves: &[WaveCandidate],
+    model: &dyn PlanningCostModel,
+    context: &'epoch dyn PlanningExecutionContext,
+    complete_resources: bool,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    started_at_ns: u64,
+    milestones_enabled: bool,
+    protection: Option<&PlanningObligationSet>,
+) -> Result<PlanningState<'epoch>, SimulationFailure> {
+    let mut state = begin(snapshot, context, poll, started_at_ns)?;
+    for wave in waves {
+        let transition = advance(
+            snapshot,
+            &state,
+            &wave.work,
+            model,
+            complete_resources,
+            poll,
+            milestones_enabled,
+            protection,
+        )
+        .map_err(|failure| failure.cause)?;
+        if transition.wave != *wave {
+            return Err(SimulationFailure::SequenceViolation);
+        }
+        state = transition.state;
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
 pub(super) fn simulate(
     snapshot: &SchedulerSnapshot,
     waves: &[WaveCandidate],
@@ -39,40 +183,22 @@ pub(super) fn simulate(
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
 ) -> Result<SimulatedSequence, SimulationFailure> {
-    let mut resource_projection = resources
-        .map(|resolver| super::resources::begin(resolver, snapshot, poll_budget))
-        .transpose()?;
-    let mut state = SimulatedSequence {
-        requests: snapshot.requests.clone(),
-        now_ns: started_at_ns,
-        started_at_ns,
-        output_tokens: 0,
-        net_prefill_work_ns: 0,
-        remaining_kv_tokens: snapshot.capacity.available_kv_tokens,
-        remaining_output_bytes: snapshot.capacity.available_output_bytes,
-        first_wave_cost_ns: 0,
-        first_fairness_rank: u64::MAX,
-        minimum_start_slack_ns: u64::MAX,
-        minimum_cost_freshness_slack_ns: u64::MAX,
+    let context = execution::ReplayContext {
+        resolver,
+        resources,
     };
-    for (index, wave) in waves.iter().enumerate() {
-        apply(
-            snapshot,
-            &mut state,
-            wave,
-            model,
-            &shape::PriorWaveResolver {
-                resolver,
-                prior_waves: &waves[..index],
-            },
-            &mut resource_projection,
-            poll_budget,
-            milestones_enabled,
-            protection,
-            index == 0,
-        )?;
-    }
-    Ok(state)
+    replay(
+        snapshot,
+        waves,
+        model,
+        &context,
+        resources.is_some(),
+        poll_budget,
+        started_at_ns,
+        milestones_enabled,
+        protection,
+    )
+    .map(|state| state.logical)
 }
 
 fn apply(
@@ -80,8 +206,7 @@ fn apply(
     state: &mut SimulatedSequence,
     wave: &WaveCandidate,
     model: &dyn PlanningCostModel,
-    resolver: &dyn PlanningShapeResolver,
-    resource_projection: &mut Option<Box<dyn PlanningResourceProjection + '_>>,
+    complete_resources: bool,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
@@ -101,12 +226,8 @@ fn apply(
             return Err(SimulationFailure::SequenceViolation);
         }
     }
-    let shape = shape::resolve(snapshot, &state.requests, &wave.work, resolver, poll_budget)?
-        .ok_or(SimulationFailure::SequenceViolation)?;
-    if shape != wave.execution_shape {
-        return Err(SimulationFailure::SequenceViolation);
-    }
-    if resource_projection.is_none()
+    let shape = &wave.execution_shape;
+    if !complete_resources
         && snapshot.capabilities.workspace_bytes_upper_bound
             > snapshot.capacity.available_workspace_bytes
     {
@@ -159,26 +280,15 @@ fn apply(
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
         advances.push((index, new_context, emits_token, output_credit));
     }
-    if (resource_projection.is_none() && required_kv > state.remaining_kv_tokens)
+    if (!complete_resources && required_kv > state.remaining_kv_tokens)
         || required_output > state.remaining_output_bytes
     {
         return Err(PlanningUnknownReason::OutputOrResourceBlocked.into());
     }
-    if let Some(projection) = resource_projection {
-        super::resources::apply(
-            projection.as_mut(),
-            &PlanningResourceQuery {
-                snapshot,
-                requests: &state.requests,
-                wave,
-            },
-            poll_budget,
-        )?;
-    }
     if first_wave && shape.exact().is_none() {
         return Err(PlanningUnknownReason::InvalidShapeEvidence.into());
     }
-    let cost = domain_cost(snapshot, model, &shape, state.now_ns, poll_budget)?;
+    let cost = domain_cost(snapshot, model, shape, state.now_ns, poll_budget)?;
     state.minimum_cost_freshness_slack_ns =
         state.minimum_cost_freshness_slack_ns.min(cost.valid_for_ns);
     let end_ns = state
@@ -206,7 +316,7 @@ fn apply(
             check_milestones(snapshot, index, request, end_ns, false, protection)?;
         }
     }
-    if resource_projection.is_none() {
+    if !complete_resources {
         state.remaining_kv_tokens -= required_kv;
     }
     state.remaining_output_bytes -= required_output;

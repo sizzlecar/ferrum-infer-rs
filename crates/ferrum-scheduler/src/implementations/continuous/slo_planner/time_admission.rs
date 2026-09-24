@@ -103,6 +103,35 @@ pub struct TimeAdmissionEvaluator<'a> {
     pub resources: &'a dyn PlanningResourceResolver,
 }
 
+pub struct TimeAdmissionExecutionEvaluator<'a> {
+    pub policy: &'a SloAdmissionConfig,
+    pub planner: &'a BoundedSloPlanner,
+    pub model: &'a dyn PlanningCostModel,
+    pub execution: &'a dyn PlanningExecutionContext,
+}
+
+impl TimeAdmissionEvaluator<'_> {
+    /// Compatibility adapter for existing providers. Admission still executes
+    /// the same transition/search/final replay as the joint production path.
+    pub fn assess(
+        &self,
+        query: TimeAdmissionQuery<'_>,
+        clock: &mut dyn PlanningClock,
+    ) -> TimeAdmissionDecision {
+        let execution = super::execution::ReplayContext {
+            resolver: self.shapes,
+            resources: Some(self.resources),
+        };
+        TimeAdmissionExecutionEvaluator {
+            policy: self.policy,
+            planner: self.planner,
+            model: self.model,
+            execution: &execution,
+        }
+        .assess(query, clock)
+    }
+}
+
 /// Records *every* read, including reads made inside the planner. Comparing
 /// only the wrapper's first and last reads misses a reversal after the search.
 struct TrackingClock<'a> {
@@ -124,7 +153,7 @@ impl PlanningClock for TrackingClock<'_> {
     }
 }
 
-impl TimeAdmissionEvaluator<'_> {
+impl TimeAdmissionExecutionEvaluator<'_> {
     pub fn assess(
         &self,
         query: TimeAdmissionQuery<'_>,
@@ -226,12 +255,11 @@ impl TimeAdmissionEvaluator<'_> {
                 };
             }
         }
-        match self.planner.propose_admission_with_resources(
+        match self.planner.propose_admission_with_execution(
             snapshot,
             query.target,
             self.model,
-            self.shapes,
-            self.resources,
+            self.execution,
             clock,
         ) {
             PlanningDecision::FeasibleWithinHorizon {

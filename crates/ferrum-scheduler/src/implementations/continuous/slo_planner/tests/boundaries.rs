@@ -105,6 +105,55 @@ fn final_lookup_time_must_fit_the_inclusive_cost_freshness_window() {
 
 #[test]
 fn freshness_uses_the_tightest_lookup_across_the_complete_common_sequence() {
+    // Only a new root marks independent final replay. Incremental search may
+    // project any number of siblings without advancing this phase marker.
+    struct MarkFinalReplay<'a> {
+        inner: super::super::execution::ReplayContext<'a>,
+        begun: Cell<bool>,
+        final_replay: Rc<Cell<bool>>,
+    }
+    impl PlanningExecutionContext for MarkFinalReplay<'_> {
+        fn begin<'epoch>(
+            &'epoch self,
+            snapshot: &'epoch SchedulerSnapshot,
+            poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+        ) -> Result<Arc<dyn PlanningExecutionState<'epoch> + 'epoch>, PlanningUnknownReason>
+        {
+            self.final_replay.set(self.begun.replace(true));
+            self.inner.begin(snapshot, poll)
+        }
+    }
+    struct TightestLookup {
+        now: Rc<Cell<u64>>,
+        final_replay: Rc<Cell<bool>>,
+        final_tight_lookup_seen: Cell<bool>,
+    }
+    impl PlanningCostModel for TightestLookup {
+        fn model_version(&self) -> u64 {
+            7
+        }
+        fn predict(
+            &self,
+            _: &ExecutionFingerprint,
+            _: &WaveExecutionShape,
+            at_ns: u64,
+        ) -> Option<PlanningCost> {
+            let valid_for_ns = 1000u64.checked_sub(at_ns)?;
+            // With two sequential 1ns waves, the second final lookup starts
+            // at 1000 and has zero freshness left. One actual ns spent in
+            // that lookup must invalidate the complete saved sequence.
+            if self.final_replay.get() && at_ns == 1000 {
+                self.final_tight_lookup_seen.set(true);
+                self.now.set(1000);
+            }
+            Some(PlanningCost {
+                typical_ns: 1,
+                planning_ns: 1,
+                model_version: 7,
+                valid_for_ns,
+            })
+        }
+    }
     let mut snapshot = loose_snapshot();
     let mut second = snapshot.requests[0].clone();
     second.key = decode(2).key;
@@ -112,22 +161,28 @@ fn freshness_uses_the_tightest_lookup_across_the_complete_common_sequence() {
     second.fairness_rank = 2;
     snapshot.requests.push(second);
     let now = Rc::new(Cell::new(999));
-    // Search queries A; then A,B. Final replay queries A,B again. B is
-    // projected to begin at 1000, so its remaining freshness is exactly zero.
-    let model = ExpiringModel {
+    let final_replay = Rc::new(Cell::new(false));
+    let context = MarkFinalReplay {
+        inner: super::super::execution::ReplayContext {
+            resolver: &TestResolver,
+            resources: None,
+        },
+        begun: Cell::new(false),
+        final_replay: final_replay.clone(),
+    };
+    let model = TightestLookup {
         now: now.clone(),
-        calls: Cell::new(0),
-        advance_on_call: 5,
-        advance_to_ns: 1000,
-        expires_at_ns: 1000,
+        final_replay,
+        final_tight_lookup_seen: Cell::new(false),
     };
     assert!(matches!(
-        planner(2).propose(&snapshot, &model, &TestResolver, &mut SharedClock(now)),
+        planner(2).propose_with_execution(&snapshot, &model, &context, &mut SharedClock(now)),
         PlanningDecision::Unknown {
             reason: PlanningUnknownReason::CostUnavailable,
             ..
         }
     ));
+    assert!(model.final_tight_lookup_seen.get());
 }
 
 #[test]

@@ -1,79 +1,18 @@
 //! Legal logical work is resolved into a canonical physical route explicitly.
 use super::{super::cost_model::*, cost_shape::canonical_cost_shape, types::*};
 use ferrum_interfaces::execution_cost::{ActualRowWork, ActualWaveKind};
+#[cfg(test)]
 use std::cell::Cell;
-
-/// Borrow the exact parent sequence without cloning route or resource state.
-/// Each resolution starts from the same captured evidence and explicitly
-/// replays this prefix, including during the final witness validation.
-pub(super) struct PriorWaveResolver<'a> {
-    pub resolver: &'a dyn PlanningShapeResolver,
-    pub prior_waves: &'a [WaveCandidate],
-}
-impl PlanningShapeResolver for PriorWaveResolver<'_> {
-    fn resolve_domain(
-        &self,
-        query: &PlanningShapeQuery<'_>,
-        poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
-    ) -> Result<
-        Option<PlanningShapeDomain<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>>,
-        PlanningUnknownReason,
-    > {
-        poll_budget()?;
-        if self.prior_waves.len() > 16 || !query.prior_waves.is_empty() {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
-        }
-        self.resolver.resolve_domain(
-            &PlanningShapeQuery {
-                snapshot: query.snapshot,
-                prior_waves: self.prior_waves,
-                kind: query.kind,
-                rows: query.rows,
-                recurrent_state_bytes: query.recurrent_state_bytes,
-            },
-            poll_budget,
-        )
-    }
-    fn order_work(
-        &self,
-        snapshot: &SchedulerSnapshot,
-        work: &mut [CandidateWork],
-        poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
-    ) -> Result<(), PlanningUnknownReason> {
-        self.resolver.order_work(snapshot, work, poll_budget)
-    }
-    fn resolve(
-        &self,
-        query: &PlanningShapeQuery<'_>,
-        poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
-    ) -> Result<
-        Option<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>,
-        PlanningUnknownReason,
-    > {
-        poll_budget()?;
-        if self.prior_waves.len() > 16 || !query.prior_waves.is_empty() {
-            return Err(PlanningUnknownReason::InvalidShapeEvidence);
-        }
-        self.resolver.resolve(
-            &PlanningShapeQuery {
-                snapshot: query.snapshot,
-                prior_waves: self.prior_waves,
-                kind: query.kind,
-                rows: query.rows,
-                recurrent_state_bytes: query.recurrent_state_bytes,
-            },
-            poll_budget,
-        )
-    }
-}
 
 /// Enforced total invocation bound derived from the configured search limits.
 /// It includes raw candidate attempts and all complete-sequence replays.
+#[cfg(test)]
 pub(super) struct ResolutionSession<'a> {
     resolver: &'a dyn PlanningShapeResolver,
     remaining: Cell<usize>,
     max_alternatives: usize,
 }
+#[cfg(test)]
 impl<'a> ResolutionSession<'a> {
     pub fn new(resolver: &'a dyn PlanningShapeResolver, settings: &BoundedPlannerSettings) -> Self {
         let depth = settings.search.lookahead_waves.get();
@@ -91,6 +30,7 @@ impl<'a> ResolutionSession<'a> {
         }
     }
 }
+#[cfg(test)]
 impl PlanningShapeResolver for ResolutionSession<'_> {
     fn resolve_domain(
         &self,
@@ -175,6 +115,17 @@ pub(super) fn order_work(
     }
     after?;
     result?;
+    validate_permutation(&original, work, poll_budget)
+}
+
+pub(super) fn validate_permutation(
+    original: &[CandidateWork],
+    work: &[CandidateWork],
+    poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<(), PlanningUnknownReason> {
+    if work.len() != original.len() {
+        return Err(PlanningUnknownReason::InvalidShapeEvidence);
+    }
     // O(n²), with at most 256 rows. Count full entries rather than just IDs so
     // duplicates, offset changes and substituted generations cannot pass.
     for (index, entry) in work.iter().enumerate() {
@@ -187,6 +138,7 @@ pub(super) fn order_work(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn resolve(
     snapshot: &SchedulerSnapshot,
     requests: &[RequestSchedulingView],
@@ -242,6 +194,25 @@ pub(super) fn resolve(
     }
     after?;
     let domain = result?.ok_or(PlanningUnknownReason::ShapeUnavailable)?;
+    validate_domain(
+        snapshot,
+        kind,
+        &rows,
+        recurrent_state_bytes,
+        domain,
+        poll_budget,
+    )
+    .map(Some)
+}
+
+pub(super) fn validate_domain(
+    snapshot: &SchedulerSnapshot,
+    kind: ActualWaveKind,
+    rows: &[PlanningShapeRow<'_>],
+    recurrent_state_bytes: u64,
+    domain: PlanningShapeDomain<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>,
+    poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<PlanningShapeDomain<WaveExecutionShape>, PlanningUnknownReason> {
     if domain.shapes().is_empty() || domain.shapes().len() > 256 {
         return Err(PlanningUnknownReason::ShapeCapacity);
     }
@@ -257,7 +228,7 @@ pub(super) fn resolve(
             || canonical
                 .rows
                 .iter()
-                .zip(&rows)
+                .zip(rows)
                 .any(|(actual, expected)| *actual != expected.work)
         {
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
@@ -276,15 +247,15 @@ pub(super) fn resolve(
         }
         shapes.push(shape);
     }
-    Ok(Some(match domain {
+    Ok(match domain {
         PlanningShapeDomain::Exact(_) => PlanningShapeDomain::Exact(shapes.pop().unwrap()),
         PlanningShapeDomain::HostContentAlternatives(_) => {
             PlanningShapeDomain::HostContentAlternatives(shapes)
         }
-    }))
+    })
 }
 
-fn legal_rows<'a>(
+pub(super) fn legal_rows<'a>(
     snapshot: &SchedulerSnapshot,
     requests: &'a [RequestSchedulingView],
     work: &[CandidateWork],

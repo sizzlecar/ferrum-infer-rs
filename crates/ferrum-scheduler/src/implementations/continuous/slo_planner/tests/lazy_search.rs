@@ -54,17 +54,40 @@ fn complete_three_wave_witness_precedes_expensive_optional_siblings_and_is_repla
         complete_width: 8,
         widths: RefCell::new(Vec::new()),
     };
-    let predictions = Cell::new(0);
-    let model = Model(|_: &WaveExecutionShape| {
-        let count = predictions.get() + 1;
-        predictions.set(count);
-        // Replays of prefixes of lengths 1, 2, 3 consume six predictions.
-        // Only the third complete wave crosses the optional-search cutoff.
-        if count == 6 {
-            now.set(650);
+    struct CompletingModel<'a> {
+        now: &'a Cell<u64>,
+        queries: RefCell<Vec<(Vec<u32>, u64)>>,
+    }
+    impl PlanningCostModel for CompletingModel<'_> {
+        fn model_version(&self) -> u64 {
+            7
         }
-        Some(5)
-    });
+        fn predict(
+            &self,
+            _: &ExecutionFingerprint,
+            shape: &WaveExecutionShape,
+            at_ns: u64,
+        ) -> Option<PlanningCost> {
+            self.queries
+                .borrow_mut()
+                .push((shape.decode_kv_tokens.clone(), at_ns));
+            // The third full wave uses each original context plus two. Only
+            // this complete common prefix crosses the optional-search cutoff.
+            if shape.decode_kv_tokens == (1..=8).map(|id| id * 10 + 2).collect::<Vec<_>>() {
+                self.now.set(650);
+            }
+            Some(PlanningCost {
+                typical_ns: 5,
+                planning_ns: 5,
+                model_version: 7,
+                valid_for_ns: u64::MAX,
+            })
+        }
+    }
+    let model = CompletingModel {
+        now: &now,
+        queries: RefCell::new(Vec::new()),
+    };
     let (first, witness, search) =
         feasible(planner(3).propose(&s, &model, &resolver, &mut WindowClock(&now)));
     assert_eq!(first.candidate.work.len(), 8);
@@ -73,11 +96,15 @@ fn complete_three_wave_witness_precedes_expensive_optional_siblings_and_is_repla
     assert_eq!(search.generated_candidates, 3);
     assert_eq!(search.expanded_candidates, 3);
     assert_eq!(search.search_soft_stops, 1);
-    assert_eq!(
-        predictions.get(),
-        9,
-        "final replay must query all three waves again"
-    );
+    // Final replay is independently anchored after the actual search delay.
+    // Each complete physical frontier must be predicted at its new start time.
+    for step in 0..3 {
+        let expected = (1..=8).map(|id| id * 10 + step).collect::<Vec<_>>();
+        assert!(model
+            .queries
+            .borrow()
+            .contains(&(expected, 650 + u64::from(step) * 5)));
+    }
     assert!(resolver.widths.borrow().iter().all(|width| *width == 8));
     assert_eq!(
         s, before,

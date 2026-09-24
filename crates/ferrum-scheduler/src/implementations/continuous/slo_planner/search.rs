@@ -1,7 +1,8 @@
 use super::obligations::PlanningObligationSet;
 use super::{
     candidates,
-    simulation::{self, SimulatedSequence, SimulationFailure},
+    execution::{ExecutionSession, PlanningExecutionContext, ReplayContext},
+    simulation::{self, PlanningState, SimulatedSequence, SimulationFailure},
     types::*,
     validation,
 };
@@ -16,21 +17,21 @@ pub struct BoundedSloPlanner {
 }
 
 #[derive(Clone)]
-struct Node {
+struct Node<'epoch> {
     waves: Vec<WaveCandidate>,
-    state: SimulatedSequence,
+    state: PlanningState<'epoch>,
     score: f64,
     debt: u64,
     ordinal: usize,
 }
 
-struct Frame {
-    node: Node,
+struct Frame<'epoch> {
+    node: Node<'epoch>,
     work: Option<std::vec::IntoIter<Vec<CandidateWork>>>,
     resolved: usize,
 }
-impl Frame {
-    fn new(node: Node) -> Self {
+impl<'epoch> Frame<'epoch> {
+    fn new(node: Node<'epoch>) -> Self {
         Self {
             node,
             work: None,
@@ -174,12 +175,77 @@ impl BoundedSloPlanner {
         protection: Option<Arc<PlanningObligationSet>>,
         clock: &mut dyn PlanningClock,
     ) -> PlanningDecision {
+        let context = ReplayContext {
+            resolver,
+            resources,
+        };
+        self.propose_joint(
+            snapshot,
+            model,
+            &context,
+            resources.is_some(),
+            admission_target,
+            protection,
+            clock,
+        )
+    }
+
+    pub fn propose_with_execution(
+        &self,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        context: &dyn PlanningExecutionContext,
+        clock: &mut dyn PlanningClock,
+    ) -> PlanningDecision {
+        self.propose_joint(snapshot, model, context, true, None, None, clock)
+    }
+
+    pub fn propose_admission_with_execution(
+        &self,
+        snapshot: &SchedulerSnapshot,
+        target: &RequestWorkKey,
+        model: &dyn PlanningCostModel,
+        context: &dyn PlanningExecutionContext,
+        clock: &mut dyn PlanningClock,
+    ) -> PlanningDecision {
+        self.propose_joint(snapshot, model, context, true, Some(target), None, clock)
+    }
+
+    pub fn propose_recovery_with_execution(
+        &self,
+        snapshot: &SchedulerSnapshot,
+        protection: Arc<PlanningObligationSet>,
+        model: &dyn PlanningCostModel,
+        context: &dyn PlanningExecutionContext,
+        clock: &mut dyn PlanningClock,
+    ) -> PlanningDecision {
+        self.propose_joint(
+            snapshot,
+            model,
+            context,
+            true,
+            None,
+            Some(protection),
+            clock,
+        )
+    }
+
+    fn propose_joint(
+        &self,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        context: &dyn PlanningExecutionContext,
+        complete_resources: bool,
+        admission_target: Option<&RequestWorkKey>,
+        protection: Option<Arc<PlanningObligationSet>>,
+        clock: &mut dyn PlanningClock,
+    ) -> PlanningDecision {
         let mut stats = PlanningSearchStats::default();
         let start_ns = clock.now_ns();
         if start_ns < snapshot.observed_at_ns {
             return unknown(PlanningUnknownReason::ClockMovedBackwards, stats);
         }
-        if let Err(reason) = validation::validate(&self.settings, snapshot, resources.is_some()) {
+        if let Err(reason) = validation::validate(&self.settings, snapshot, complete_resources) {
             return unknown(reason, stats);
         }
         if admission_target.is_some_and(|key| {
@@ -228,19 +294,14 @@ impl BoundedSloPlanner {
             Ok(value) => value,
             Err(reason) => return unknown(reason, stats),
         };
-        let resolution_session = super::shape::ResolutionSession::new(resolver, &self.settings);
-        let resolver: &dyn PlanningShapeResolver = &resolution_session;
+        let execution_session = ExecutionSession::new(context, &self.settings);
+        let context: &dyn PlanningExecutionContext = &execution_session;
         let milestones = self.settings.search.enable_prefill_milestones;
-        let initial = match simulation::simulate(
+        let initial = match simulation::begin(
             snapshot,
-            &[],
-            model,
-            resolver,
-            resources,
+            context,
             &mut || budget.read(clock).map(|_| ()),
             start_ns,
-            milestones,
-            protection.as_deref(),
         ) {
             Ok(state) => state,
             Err(error) => return unknown(simulation_reason(error), stats),
@@ -316,10 +377,6 @@ impl BoundedSloPlanner {
                     remaining_raw,
                     &mut stats.enumeration_attempts,
                     protection.as_deref(),
-                    &super::shape::PriorWaveResolver {
-                        resolver,
-                        prior_waves: &frame.node.waves,
-                    },
                     &mut || budget.read(clock).map(|_| ()),
                 ) {
                     Ok(generated) => generated,
@@ -334,62 +391,43 @@ impl BoundedSloPlanner {
                 continue;
             }
             let Some(work) = work.next() else { continue };
-            let resolved = super::shape::resolve(
+            // All search nodes use one execution-time origin. CPU time is
+            // charged by the shared real budget and fresh final replay; extending
+            // a node never shifts its ancestors or replays their physical work.
+            let transition = simulation::advance(
                 snapshot,
-                &frame.node.state.requests,
+                &frame.node.state,
                 &work,
-                &super::shape::PriorWaveResolver {
-                    resolver,
-                    prior_waves: &frame.node.waves,
-                },
-                &mut || budget.read(clock).map(|_| ()),
-            );
-            let shape_unknown = matches!(&resolved, Err(PlanningUnknownReason::ShapeUnavailable));
-            let execution_shape = match resolved {
-                Ok(Some(shape)) => shape,
-                Ok(None) | Err(PlanningUnknownReason::ShapeUnavailable) => {
-                    if shape_unknown {
-                        stats.shape_unknown_candidates += 1;
-                    }
-                    pending[depth].insert(0, frame);
-                    continue;
-                }
-                Err(reason) => stop_or_unknown!(reason, 'exploration),
-            };
-            frame.resolved += 1;
-            stats.generated_candidates += 1;
-            saw_candidate = true;
-            let mut waves = frame.node.waves.clone();
-            waves.push(WaveCandidate {
-                work,
-                execution_shape,
-                based_on_generation: snapshot.generation,
-                cost_model_version: snapshot.cost_model_version,
-            });
-            // Keep the exact parent continuation before attempting its child.
-            // Its state/required service are never recaptured from a new scope.
-            pending[depth].insert(0, frame);
-            let now_ns = match budget.read(clock) {
-                Ok(now) => now,
-                Err(reason) => stop_or_unknown!(reason, 'exploration),
-            };
-            stats.expanded_candidates += 1;
-            let state = match simulation::simulate(
-                snapshot,
-                &waves,
                 model,
-                resolver,
-                resources,
+                complete_resources,
                 &mut || budget.read(clock).map(|_| ()),
-                now_ns,
                 milestones,
                 protection.as_deref(),
+            );
+            let projected = transition
+                .as_ref()
+                .map_or_else(|failure| failure.projected, |_| true);
+            let transition = transition.map_err(|failure| failure.cause);
+            if matches!(
+                transition,
+                Err(SimulationFailure::Unknown(
+                    PlanningUnknownReason::ShapeUnavailable
+                ))
             ) {
-                Ok(state) => state,
-                Err(SimulationFailure::Unknown(PlanningUnknownReason::ShapeUnavailable)) => {
-                    stats.shape_unknown_candidates += 1;
-                    continue;
-                }
+                stats.shape_unknown_candidates += 1;
+                pending[depth].insert(0, frame);
+                continue;
+            }
+            if projected {
+                frame.resolved += 1;
+                stats.generated_candidates += 1;
+                stats.expanded_candidates += 1;
+                saw_candidate = true;
+            }
+            let mut waves = frame.node.waves.clone();
+            pending[depth].insert(0, frame);
+            let transition = match transition {
+                Ok(value) => value,
                 Err(SimulationFailure::Unknown(PlanningUnknownReason::CostUnavailable)) => {
                     stats.cost_unknown_candidates += 1;
                     continue;
@@ -405,6 +443,8 @@ impl BoundedSloPlanner {
                 Err(SimulationFailure::SequenceViolation) => continue,
                 Err(SimulationFailure::Unknown(reason)) => stop_or_unknown!(reason, 'exploration),
             };
+            waves.push(transition.wave);
+            let state = transition.state;
             let (score, debt) = match simulation::score(snapshot, &state, &self.settings) {
                 Ok(value) => value,
                 Err(reason) => return unknown(reason, stats),
@@ -453,12 +493,12 @@ impl BoundedSloPlanner {
                     return decision;
                 }
             }
-            let state = match simulation::simulate(
+            let state = match simulation::replay(
                 snapshot,
                 &solution.waves,
                 model,
-                resolver,
-                resources,
+                context,
+                complete_resources,
                 &mut || budget.read(clock).map(|_| ()),
                 now_ns,
                 milestones,

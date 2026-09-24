@@ -1,4 +1,6 @@
-use super::{obligations::PlanningObligationSet, shape, types::*};
+#[cfg(test)]
+use super::shape;
+use super::{obligations::PlanningObligationSet, types::*};
 use std::{cmp::Reverse, num::NonZeroU32};
 
 pub(super) struct LogicalCandidates {
@@ -16,7 +18,6 @@ pub(super) fn logical_candidates(
     raw_limit: usize,
     observed_attempts: &mut usize,
     protection: Option<&PlanningObligationSet>,
-    resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<LogicalCandidates, PlanningUnknownReason> {
     poll_budget()?;
@@ -96,7 +97,6 @@ pub(super) fn logical_candidates(
             &decoders,
             size.get(),
             &mut result,
-            resolver,
             poll_budget,
         )?;
     }
@@ -115,7 +115,6 @@ pub(super) fn logical_candidates(
                 &decoders,
                 size.get(),
                 &mut result,
-                resolver,
                 poll_budget,
             )?;
         }
@@ -125,14 +124,7 @@ pub(super) fn logical_candidates(
                 let prefill_work =
                     prefill_work(requests, &prefills, size.get(), chunk, caps, poll_budget)?;
                 if let Some(work) = &prefill_work {
-                    push(
-                        snapshot,
-                        requests,
-                        work.clone(),
-                        &mut result,
-                        resolver,
-                        poll_budget,
-                    )?;
+                    push(snapshot, requests, work.clone(), &mut result, poll_budget)?;
                 }
                 if caps.native_mixed {
                     for &decode_size in &caps.decode_batch_sizes {
@@ -142,7 +134,7 @@ pub(super) fn logical_candidates(
                             &prefill_work,
                         ) {
                             work.extend(prefill.iter().cloned());
-                            push(snapshot, requests, work, &mut result, resolver, poll_budget)?;
+                            push(snapshot, requests, work, &mut result, poll_budget)?;
                         }
                         if result.truncated {
                             return Ok(result);
@@ -176,7 +168,6 @@ pub(super) fn logical_candidates(
             &decoders,
             size.get(),
             &mut result,
-            resolver,
             poll_budget,
         )?;
         if result.truncated {
@@ -189,7 +180,7 @@ pub(super) fn logical_candidates(
             if let Some(work) =
                 prefill_work(requests, &prefills, size.get(), chunk, caps, poll_budget)?
             {
-                push(snapshot, requests, work, &mut result, resolver, poll_budget)?;
+                push(snapshot, requests, work, &mut result, poll_budget)?;
             }
             if result.truncated {
                 return Ok(result);
@@ -254,11 +245,10 @@ fn push_decode(
     indices: &[usize],
     size: usize,
     output: &mut LogicalCandidates,
-    resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<(), PlanningUnknownReason> {
     if let Some(work) = decode_work(requests, indices, size) {
-        push(snapshot, requests, work, output, resolver, poll_budget)?;
+        push(snapshot, requests, work, output, poll_budget)?;
     }
     Ok(())
 }
@@ -313,9 +303,8 @@ fn prefill_work(
 fn push(
     snapshot: &SchedulerSnapshot,
     _requests: &[RequestSchedulingView],
-    mut work: Vec<CandidateWork>,
+    work: Vec<CandidateWork>,
     output: &mut LogicalCandidates,
-    resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<(), PlanningUnknownReason> {
     poll_budget()?;
@@ -328,8 +317,11 @@ fn push(
     {
         return Ok(());
     }
-    shape::order_work(snapshot, &mut work, resolver, poll_budget)?;
-    if output.work.contains(&work) {
+    if output
+        .work
+        .iter()
+        .any(|old| old.len() == work.len() && work.iter().all(|row| old.contains(row)))
+    {
         return Ok(());
     }
     output.work.push(work);
@@ -362,7 +354,6 @@ pub(super) fn enumerate(
         usize::MAX,
         &mut 0,
         protection,
-        resolver,
         poll_budget,
     )?;
     let mut result = CandidateSet {
@@ -371,7 +362,8 @@ pub(super) fn enumerate(
         attempts: logical.attempts,
         shape_unknown: 0,
     };
-    for work in logical.work {
+    for mut work in logical.work {
+        shape::order_work(snapshot, &mut work, resolver, poll_budget)?;
         let execution_shape = match shape::resolve(snapshot, requests, &work, resolver, poll_budget)
         {
             Err(PlanningUnknownReason::ShapeUnavailable) => {

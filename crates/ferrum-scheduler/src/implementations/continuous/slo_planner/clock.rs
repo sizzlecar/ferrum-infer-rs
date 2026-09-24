@@ -1,7 +1,7 @@
 //! Checked bridges between request Instants, one planning origin and the
 //! independent engine cost clock. No clock conversion refreshes observations.
 use super::super::cost_model::{ExecutionFingerprint, WaveExecutionShape};
-use super::{types::*, BoundedSloPlanner};
+use super::{types::*, BoundedSloPlanner, PlanningExecutionContext};
 use ferrum_interfaces::slo::RequestSloState;
 use std::{
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -72,6 +72,34 @@ impl PlanningTimeOrigin {
         window: PlanningBudgetWindow,
         read: impl FnMut() -> Instant,
     ) -> Result<super::time_admission::TimeAdmissionDecision, PlanningTimeError> {
+        self.assess_admission_transaction(evaluator.planner, query, window, read, |query, clock| {
+            evaluator.assess(query, clock)
+        })
+    }
+
+    pub fn assess_admission_execution_with_budget_window(
+        &self,
+        evaluator: &super::time_admission::TimeAdmissionExecutionEvaluator<'_>,
+        query: super::time_admission::TimeAdmissionQuery<'_>,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+    ) -> Result<super::time_admission::TimeAdmissionDecision, PlanningTimeError> {
+        self.assess_admission_transaction(evaluator.planner, query, window, read, |query, clock| {
+            evaluator.assess(query, clock)
+        })
+    }
+
+    fn assess_admission_transaction<'a>(
+        &self,
+        planner: &BoundedSloPlanner,
+        query: super::time_admission::TimeAdmissionQuery<'a>,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+        assess: impl FnOnce(
+            super::time_admission::TimeAdmissionQuery<'a>,
+            &mut dyn PlanningClock,
+        ) -> super::time_admission::TimeAdmissionDecision,
+    ) -> Result<super::time_admission::TimeAdmissionDecision, PlanningTimeError> {
         use super::time_admission::*;
         if query.snapshot.observed_at_ns != self.observed_at_ns {
             return Err(PlanningTimeError::SnapshotOriginMismatch);
@@ -86,23 +114,22 @@ impl PlanningTimeOrigin {
                 cost_model_version: query.snapshot.cost_model_version,
             },
         };
-        let window = self.checked_budget_window(window, &evaluator.planner.settings.search)?;
-        let (_, planner_deadline_ns) =
-            match window.phase_deadlines(&evaluator.planner.settings.search) {
-                Ok(value) => value,
-                Err(reason) => {
-                    return Ok(TimeAdmissionDecision::Unknown {
-                        reason: TimeAdmissionUnknown::Planning(reason),
-                        continuation: TimeAdmissionContinuation::WaitForEvidence,
-                        wait: TimeAdmissionWait {
-                            review_at_ns: None,
-                            strict_expiry_at_ns: None,
-                            snapshot_generation: query.snapshot.generation,
-                            cost_model_version: query.snapshot.cost_model_version,
-                        },
-                    })
-                }
-            };
+        let window = self.checked_budget_window(window, &planner.settings.search)?;
+        let (_, planner_deadline_ns) = match window.phase_deadlines(&planner.settings.search) {
+            Ok(value) => value,
+            Err(reason) => {
+                return Ok(TimeAdmissionDecision::Unknown {
+                    reason: TimeAdmissionUnknown::Planning(reason),
+                    continuation: TimeAdmissionContinuation::WaitForEvidence,
+                    wait: TimeAdmissionWait {
+                        review_at_ns: None,
+                        strict_expiry_at_ns: None,
+                        snapshot_generation: query.snapshot.generation,
+                        cost_model_version: query.snapshot.cost_model_version,
+                    },
+                })
+            }
+        };
         let mut clock = CheckedPlanningClock {
             origin: *self,
             read,
@@ -117,7 +144,7 @@ impl PlanningTimeOrigin {
         if initial_ns >= planner_deadline_ns {
             return Ok(exhausted());
         }
-        let decision = evaluator.assess(query, &mut clock);
+        let decision = assess(query, &mut clock);
         let final_ns = clock.now_ns();
         if let Some(error) = clock.error {
             return Err(error);
@@ -360,6 +387,48 @@ impl PlanningTimeOrigin {
         window: PlanningBudgetWindow,
         read: impl FnMut() -> Instant,
     ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_transaction(planner, snapshot, window, read, |clock| {
+            if let Some(protection) = protection {
+                planner.propose_recovery(snapshot, protection, model, resolver, resources, clock)
+            } else {
+                match resources {
+                    Some(resources) => {
+                        planner.propose_with_resources(snapshot, model, resolver, resources, clock)
+                    }
+                    None => planner.propose(snapshot, model, resolver, clock),
+                }
+            }
+        })
+    }
+
+    /// Same clock/budget contract, with the executor's joint state transition.
+    pub fn propose_scoped_with_execution_budget_window(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        model: &dyn PlanningCostModel,
+        context: &dyn PlanningExecutionContext,
+        protection: Option<std::sync::Arc<super::PlanningObligationSet>>,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
+        self.propose_transaction(planner, snapshot, window, read, |clock| {
+            if let Some(protection) = protection {
+                planner.propose_recovery_with_execution(snapshot, protection, model, context, clock)
+            } else {
+                planner.propose_with_execution(snapshot, model, context, clock)
+            }
+        })
+    }
+
+    fn propose_transaction(
+        &self,
+        planner: &BoundedSloPlanner,
+        snapshot: &SchedulerSnapshot,
+        window: PlanningBudgetWindow,
+        read: impl FnMut() -> Instant,
+        propose: impl FnOnce(&mut dyn PlanningClock) -> PlanningDecision,
+    ) -> Result<PlanningDecision, PlanningTimeError> {
         if snapshot.observed_at_ns != self.observed_at_ns {
             return Err(PlanningTimeError::SnapshotOriginMismatch);
         }
@@ -387,16 +456,7 @@ impl PlanningTimeOrigin {
         if start_ns >= planner_deadline_ns {
             return Ok(budget_exhausted(Default::default()));
         }
-        let decision = if let Some(protection) = protection {
-            planner.propose_recovery(snapshot, protection, model, resolver, resources, &mut clock)
-        } else {
-            match resources {
-                Some(resources) => {
-                    planner.propose_with_resources(snapshot, model, resolver, resources, &mut clock)
-                }
-                None => planner.propose(snapshot, model, resolver, &mut clock),
-            }
-        };
+        let decision = propose(&mut clock);
         let final_ns = clock.now_ns();
         if let Some(error) = clock.error {
             return Err(error);

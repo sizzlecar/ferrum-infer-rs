@@ -18,7 +18,8 @@ impl PlanningClock for TransactionClock<'_> {
 
 struct ExpensiveOptionalBranch<'a> {
     now: &'a Cell<u64>,
-    full_calls: Cell<usize>,
+    complete_cost_seen: &'a Cell<bool>,
+    final_projection_seen: Cell<bool>,
     optional_calls: Cell<usize>,
     final_read: Option<u64>,
 }
@@ -32,11 +33,11 @@ impl PlanningShapeResolver for ExpensiveOptionalBranch<'_> {
             self.optional_calls.set(self.optional_calls.get() + 1);
             self.now.set(1_200); // optional A -> B exploration would exhaust the transaction
         } else if query.rows.len() == 2 {
-            let calls = self.full_calls.get() + 1;
-            self.full_calls.set(calls);
-            if calls == 2 {
-                self.now.set(650); // first complete shared witness, after the soft cutoff
-            } else if calls == 3 {
+            // The successful full-wave cost lookup moves the clock past the
+            // optional cutoff. A fresh root projection after that event belongs
+            // to final replay, irrespective of callback/clock-poll counts.
+            if self.complete_cost_seen.get() {
+                self.final_projection_seen.set(true);
                 if let Some(at) = self.final_read {
                     self.now.set(at);
                 }
@@ -54,15 +55,17 @@ fn workload() -> SchedulerSnapshot {
     s.scope.horizon_end_ns = 10_000;
     s
 }
-fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, usize, usize) {
+fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, bool, usize) {
     let mut s = workload();
     if recovery {
         s.requests[0].timing.slo_failed = true;
     }
     let now = Cell::new(100);
+    let complete_cost_seen = Cell::new(false);
     let resolver = ExpensiveOptionalBranch {
         now: &now,
-        full_calls: Cell::new(0),
+        complete_cost_seen: &complete_cost_seen,
+        final_projection_seen: Cell::new(false),
         optional_calls: Cell::new(0),
         final_read,
     };
@@ -75,7 +78,14 @@ fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, usize, usi
     };
     let mut planner = planner(2);
     planner.settings.search.max_planning_us = n64(1);
-    let model = Model(|_: &WaveExecutionShape| Some(5));
+    let model = Model(|shape: &WaveExecutionShape| {
+        // Both owners have one remaining token, so this actual whole-wave
+        // lookup discharges the common horizon. No prefix replay count is used.
+        if shape.decode_kv_tokens.len() == 2 && !complete_cost_seen.replace(true) {
+            now.set(650);
+        }
+        Some(5)
+    });
     let decision = if recovery {
         planner.propose_recovery(
             &s,
@@ -90,29 +100,26 @@ fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, usize, usi
     };
     (
         decision,
-        resolver.full_calls.get(),
+        resolver.final_projection_seen.get(),
         resolver.optional_calls.get(),
     )
 }
 
 #[test]
 fn complete_common_witness_stops_optional_branch_and_is_replayed() {
-    let (decision, full_calls, optional_calls) = run(None, false);
+    let (decision, final_projection_seen, optional_calls) = run(None, false);
     let (first, witness, search) = feasible(decision);
     assert_eq!(first.candidate.work.len(), 2);
     assert_eq!(witness.waves, 1);
     assert_eq!(witness.predicted_output_tokens, 2);
     assert_eq!(search.search_soft_stops, 1);
-    assert_eq!(
-        full_calls, 3,
-        "candidate, simulated complete witness, final replay"
-    );
+    assert!(final_projection_seen, "the saved wave must be reprojected");
     assert_eq!(optional_calls, 0);
 }
 
 #[test]
 fn recovery_uses_same_phase_budget_without_reclassifying_scope() {
-    let (decision, full_calls, optional_calls) = run(None, true);
+    let (decision, final_projection_seen, optional_calls) = run(None, true);
     let PlanningDecision::ProtectedWithinHorizon {
         protection, search, ..
     } = decision
@@ -121,14 +128,15 @@ fn recovery_uses_same_phase_budget_without_reclassifying_scope() {
     };
     assert!(protection.rows()[0].historical_violation);
     assert_eq!(search.search_soft_stops, 1);
-    assert_eq!((full_calls, optional_calls), (3, 0));
+    assert!(final_projection_seen);
+    assert_eq!(optional_calls, 0);
 }
 
 #[test]
 fn final_replay_phase_or_hard_timeout_never_returns_saved_witness() {
     for at in [800, 1_000, 1_200] {
-        let (decision, full_calls, _) = run(Some(at), false);
-        assert_eq!(full_calls, 3);
+        let (decision, final_projection_seen, _) = run(Some(at), false);
+        assert!(final_projection_seen);
         assert!(
             matches!(
                 decision,

@@ -7,6 +7,7 @@
 mod candidates;
 mod clock;
 mod cost_shape;
+mod execution;
 mod obligations;
 mod output;
 mod resources;
@@ -21,6 +22,9 @@ pub use clock::{
     AnchoredPlanningCostModel, PlanningCostClockAnchor, PlanningTimeError, PlanningTimeOrigin,
 };
 pub use cost_shape::{actual_cost_shape, canonical_cost_shape};
+pub use execution::{
+    PlanningExecutionContext, PlanningExecutionInput, PlanningExecutionState, ProjectedExecution,
+};
 pub use obligations::{
     historical_violation, ForwardObligation, PlanningObligationSet, RecoveryServiceDebt,
     RequestObligation,
