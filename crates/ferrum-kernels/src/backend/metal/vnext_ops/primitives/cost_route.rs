@@ -1,5 +1,9 @@
 //! Pure branch metadata shared by eager primitive encoding and route queries.
 use super::*;
+use ferrum_interfaces::execution_cost::{
+    SelectedCommandCostBuilderV1, SelectedCommandCostEvidenceV1,
+};
+type SelectedPrimitiveRoute = (PrimitiveRoute, Option<SelectedCommandCostEvidenceV1>);
 use ferrum_interfaces::vnext::{
     DeviceBatchingForm, DeviceCommandPhase, HadamardApplication, HadamardSigns,
     OperationCostCommand, OperationCostRoute, OperationCostRouteRequest, PhysicalStorageLayout,
@@ -81,7 +85,7 @@ pub(super) fn eager_route(
     request: OperationCostRouteRequest<'_>,
     pipelines: &MetalPrimitivePipelines,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
-    let checked = || -> Result<Option<PrimitiveRoute>, String> {
+    let checked = || -> Result<Option<SelectedPrimitiveRoute>, String> {
         let get = |role, ordinal| binding(request.bindings(), role, ordinal);
         let attribute = |name| unsigned_attribute(request.attributes(), name);
         Ok(Some(match request.operation_id().as_str() {
@@ -103,7 +107,7 @@ pub(super) fn eager_route(
                     hidden,
                     output_type,
                 )?;
-                let (_, _, transform) = embedding_weight_metadata(table, vocabulary, hidden)?;
+                let (format, _, transform) = embedding_weight_metadata(table, vocabulary, hidden)?;
                 if let Some(transform) = transform {
                     pipelines.hadamard.validate_dispatch(
                         transform,
@@ -113,19 +117,32 @@ pub(super) fn eager_route(
                     )?;
                 }
                 let mut scratch = 0;
+                let mut stats = SelectedCommandCostBuilderV1::new(request.immediate_tokens());
+                let mut complete = transform.is_none();
                 for row in request.rows() {
-                    embedding_params(row.count.get(), hidden, vocabulary)?;
+                    let params = embedding_params(row.count.get(), hidden, vocabulary)?;
+                    complete &= selected::push_embedding(
+                        &mut stats,
+                        pipelines,
+                        format,
+                        output_type,
+                        params,
+                    )
+                    .is_some();
                     if transform.is_some() {
                         scratch = embedding_scratch_bytes(scratch, row.count.get(), hidden)?;
                     }
                 }
-                PrimitiveRoute::TokenEmbedding {
-                    transformed_participants: if transform.is_some() {
-                        request.rows().len() as u32
-                    } else {
-                        0
+                (
+                    PrimitiveRoute::TokenEmbedding {
+                        transformed_participants: if transform.is_some() {
+                            request.rows().len() as u32
+                        } else {
+                            0
+                        },
                     },
-                }
+                    if complete { stats.finish().ok() } else { None },
+                )
             }
             RMS_NORM_OPERATION_ID
             | RMS_NORM_F32_OPERATION_ID
@@ -146,7 +163,7 @@ pub(super) fn eager_route(
                 ) {
                     return Err("Metal RMSNorm cost query differs from its signature".into());
                 }
-                rms_norm_params(
+                let params = rms_norm_params(
                     request.immediate_tokens(),
                     hidden,
                     rational_attribute(request.attributes(), "epsilon")?,
@@ -161,7 +178,10 @@ pub(super) fn eager_route(
                 {
                     return Ok(None);
                 }
-                PrimitiveRoute::RmsNorm
+                (
+                    PrimitiveRoute::RmsNorm,
+                    selected::rms_evidence(pipelines, params, input_type, output_type),
+                )
             }
             RESIDUAL_ADD_OPERATION_ID | RESIDUAL_ADD_F32_F16_OPERATION_ID => {
                 let (left, output) = if request.operation_id().as_str() == RESIDUAL_ADD_OPERATION_ID
@@ -182,7 +202,7 @@ pub(super) fn eager_route(
                 ) {
                     return Err("Metal residual-add cost query differs from its signature".into());
                 }
-                residual_add_params(request.immediate_tokens(), hidden)?;
+                let params = residual_add_params(request.immediate_tokens(), hidden)?;
                 if request.rows().len() > 1
                     && (!request
                         .binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)
@@ -196,7 +216,17 @@ pub(super) fn eager_route(
                 {
                     return Ok(None);
                 }
-                PrimitiveRoute::ResidualAdd
+                (
+                    PrimitiveRoute::ResidualAdd,
+                    selected::residual_evidence(
+                        pipelines,
+                        params,
+                        left,
+                        ElementType::F16,
+                        output,
+                        request.immediate_tokens(),
+                    ),
+                )
             }
             LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID | LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID => {
                 let logits_type =
@@ -220,25 +250,40 @@ pub(super) fn eager_route(
                     "Metal masked argmax cost query differs from its signature".to_owned()
                 })?;
                 let params = masked_argmax_params(vocabulary, repetition)?;
-                masked_argmax_scratch_stride(vocabulary, logits_type)?
+                let scratch = masked_argmax_scratch_stride(vocabulary, logits_type)?
                     .checked_mul(request.rows().len() as u64)
                     .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
-                PrimitiveRoute::MaskedArgmax {
-                    vocabulary_size: params.vocabulary_size,
+                let mut stats = SelectedCommandCostBuilderV1::new(request.rows().len() as u64);
+                let mut complete = true;
+                for _ in request.rows() {
+                    complete &=
+                        selected::push_argmax(&mut stats, pipelines, params, logits_type, scratch)
+                            .is_some();
                 }
+                (
+                    PrimitiveRoute::MaskedArgmax {
+                        vocabulary_size: params.vocabulary_size,
+                    },
+                    if complete { stats.finish().ok() } else { None },
+                )
             }
             _ => return Ok(None),
         }))
     };
-    let Some(route) = checked().map_err(invalid_plan)? else {
+    let Some((route, statistical)) = checked().map_err(invalid_plan)? else {
         return Ok(None);
     };
-    OperationCostRoute::new(vec![compute_command(
+    let mut command = compute_command(
         route,
         request.rows().len() as u32,
         request.immediate_tokens(),
-    )?])
-    .map(Some)
+    )?;
+    if let Some(evidence) = statistical {
+        if let Ok(checked) = command.clone().with_statistical_evidence(evidence) {
+            command = checked;
+        }
+    }
+    OperationCostRoute::new(vec![command]).map(Some)
 }
 
 fn positive_u32(value: u64, label: &str) -> Result<u32, String> {

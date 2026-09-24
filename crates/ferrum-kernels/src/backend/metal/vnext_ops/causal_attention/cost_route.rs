@@ -209,6 +209,8 @@ pub(super) fn eager_route(
     operation_id: &str,
     hidden_type: ElementType,
     pipelines: &MetalCausalAttentionPipelines,
+    linear: &MetalLinearPipelines,
+    primitives: &MetalPrimitivePipelines,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != operation_id {
         return Ok(None);
@@ -250,7 +252,7 @@ pub(super) fn eager_route(
                 .map_err(|e| e.to_string())?;
         // Size only, no binding buffer or argument encoder acquired.
         BindingLayout::new(pipelines.binding_slot_bytes()?, request.rows().len())?;
-        project(
+        project_selected(
             shape,
             hidden_type,
             request.rows(),
@@ -259,6 +261,7 @@ pub(super) fn eager_route(
             weights,
             caps,
             Some(&request),
+            Some((pipelines, linear, primitives)),
         )
     };
     calculate()
@@ -335,6 +338,34 @@ fn project(
     weights: [PreparedLinearPart; 4],
     caps: Capabilities,
     request: Option<&OperationCostRouteRequest<'_>>,
+) -> Result<Option<[OperationCostCommand; 2]>, String> {
+    project_selected(
+        shape,
+        hidden_type,
+        rows,
+        total,
+        packed,
+        weights,
+        caps,
+        request,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn project_selected(
+    shape: CausalAttentionShape,
+    hidden_type: ElementType,
+    rows: &[OperationCostWorkRow],
+    total: u64,
+    packed: bool,
+    weights: [PreparedLinearPart; 4],
+    caps: Capabilities,
+    request: Option<&OperationCostRouteRequest<'_>>,
+    statistics: Option<(
+        &MetalCausalAttentionPipelines,
+        &MetalLinearPipelines,
+        &MetalPrimitivePipelines,
+    )>,
 ) -> Result<Option<[OperationCostCommand; 2]>, String> {
     let mut params = Vec::new();
     params
@@ -421,7 +452,7 @@ fn project(
         .iter()
         .filter(|p| caps.dispatch_plan(p).kind == AttentionDispatchKind::GroupedDecode)
         .count() as u64;
-    commands(
+    let mut commands = commands(
         hidden_type,
         caps.kv_type,
         rows.len(),
@@ -430,8 +461,55 @@ fn project(
         grouped,
         batched_grouped,
         extra,
-    )
-    .map(Some)
+    )?;
+    if let Some((a, l, p)) = statistics {
+        let evidence = (|| {
+            let mut starts = 0_u64;
+            let mut projected = Vec::new();
+            projected.try_reserve_exact(rows.len()).ok()?;
+            for params in &params {
+                let n = u64::from(params.tokens);
+                projected.push(selected::Row {
+                    params: *params,
+                    projection: selected::Projection {
+                        tokens: params.tokens,
+                        hidden: u32::try_from(shape.hidden_size).ok()?,
+                        epsilon: shape.epsilon,
+                        launches: projected_launches(shape, weights, layout, starts, n).ok()?,
+                    },
+                });
+                starts = starts.checked_add(n)?;
+            }
+            let packed = if packed {
+                Some(selected::Projection {
+                    tokens: u32::try_from(total).ok()?,
+                    hidden: u32::try_from(shape.hidden_size).ok()?,
+                    epsilon: shape.epsilon,
+                    launches: projected_launches(shape, weights, layout, 0, total).ok()?,
+                })
+            } else {
+                None
+            };
+            let binding = BindingLayout::new(a.binding_slot_bytes().ok()?, rows.len()).ok()?;
+            selected::evidence(
+                a,
+                l,
+                p,
+                hidden_type,
+                total,
+                layout.required_bytes.checked_add(binding.required_bytes)?,
+                packed,
+                batched_grouped,
+                &projected,
+            )
+        })();
+        if let Some(evidence) = evidence {
+            if let Ok(decorated) = commands[1].clone().with_statistical_evidence(evidence) {
+                commands[1] = decorated;
+            }
+        }
+    }
+    Ok(Some(commands))
 }
 
 /// Same whole-page exclusion as actual grouped dispatch, including aliases

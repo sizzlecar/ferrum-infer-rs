@@ -94,6 +94,9 @@ pub(super) fn eager_route(
     hidden_type: ElementType,
     capabilities: GatedDeltaExecutionCapabilities,
     cost_model: MetalGatedDeltaExecutionCostModel,
+    attention: &MetalGatedDeltaPipelines,
+    linear: &MetalLinearPipelines,
+    primitives: &MetalPrimitivePipelines,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != operation_id {
         return Ok(None);
@@ -147,7 +150,29 @@ pub(super) fn eager_route(
             capabilities,
             cost_model,
         )?;
-        Ok(Some(route))
+        let statistics = project_statistics(
+            shape,
+            hidden_type,
+            request.rows(),
+            request.immediate_tokens(),
+            packed,
+            &input,
+            *output,
+            layout,
+            staging_bytes,
+            capabilities,
+            cost_model,
+            attention,
+            linear,
+            primitives,
+        );
+        Ok(Some(match statistics {
+            Some(evidence) => route
+                .clone()
+                .with_statistical_evidence(evidence)
+                .unwrap_or(route),
+            None => route,
+        }))
     };
     calculate()
         .map_err(invalid_plan)?
@@ -307,6 +332,26 @@ fn project_dispatches(
     tokens: u64,
     policy: Option<staged_prefill::StagingPolicy>,
 ) -> Result<ProjectionDispatches, String> {
+    let (input, output) = project_launches(shape, input, output, layout, start, tokens)?;
+    let input = input.into_iter().try_fold(0_u64, |count, launch| {
+        count
+            .checked_add(staged_prefill::policy_dispatch_count(launch, policy))
+            .ok_or_else(|| "Metal GDN input dispatch count overflows".to_owned())
+    })?;
+    Ok(ProjectionDispatches {
+        input,
+        output: output.dispatch_count(),
+    })
+}
+
+fn project_launches(
+    shape: AttentionShape,
+    input: &[PreparedLinearPart],
+    output: PreparedLinearPart,
+    layout: ScratchLayout,
+    start: u64,
+    tokens: u64,
+) -> Result<(Vec<LinearLaunch>, LinearLaunch), String> {
     let end_token = start
         .checked_add(tokens)
         .ok_or("Metal GDN projection row range overflows")?;
@@ -353,18 +398,18 @@ fn project_dispatches(
         }
         Ok::<_, String>(launch)
     };
-    let input_dispatches = input.iter().try_fold(0_u64, |count, part| {
-        let launch = checked_launch(
-            *part,
-            shape.hidden_size,
-            shape.qkvzba_features,
-            normalized,
-            qkvzba,
-        )?;
-        count
-            .checked_add(staged_prefill::policy_dispatch_count(launch, policy))
-            .ok_or_else(|| "Metal GDN input dispatch count overflows".to_owned())
-    })?;
+    let input = input
+        .iter()
+        .map(|part| {
+            checked_launch(
+                *part,
+                shape.hidden_size,
+                shape.qkvzba_features,
+                normalized,
+                qkvzba,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let output = checked_launch(
         output,
         shape.value_features,
@@ -372,10 +417,71 @@ fn project_dispatches(
         qkvzba,
         normalized,
     )?;
-    Ok(ProjectionDispatches {
-        input: input_dispatches,
-        output: output.dispatch_count(),
-    })
+    Ok((input, output))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_statistics(
+    shape: AttentionShape,
+    hidden: ElementType,
+    rows: &[OperationCostWorkRow],
+    total: u64,
+    packed: bool,
+    input: &[PreparedLinearPart],
+    output: PreparedLinearPart,
+    layout: ScratchLayout,
+    staging_bytes: u64,
+    capabilities: GatedDeltaExecutionCapabilities,
+    cost_model: MetalGatedDeltaExecutionCostModel,
+    attention: &MetalGatedDeltaPipelines,
+    linear: &MetalLinearPipelines,
+    primitives: &MetalPrimitivePipelines,
+) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+    let mut projections = Vec::new();
+    projections.try_reserve_exact(rows.len()).ok()?;
+    let mut start = 0_u64;
+    for row in rows {
+        let count = row.count.get();
+        let form = shape.execution_form(count, capabilities, cost_model).ok()?;
+        let (input, output) = project_launches(shape, input, output, layout, start, count).ok()?;
+        projections.push((shape.params(count).ok()?, form, input, output));
+        start = start.checked_add(count)?;
+    }
+    let packed_projection = if packed {
+        Some(project_launches(shape, input, output, layout, 0, total).ok()?)
+    } else {
+        None
+    };
+    let packed = if let Some((input, output)) = packed_projection.as_ref() {
+        Some(selected::Projection {
+            params: shape.params(total).ok()?,
+            input,
+            output: *output,
+            staged: staging_bytes != 0,
+        })
+    } else {
+        None
+    };
+    selected::evidence(
+        attention,
+        linear,
+        primitives,
+        hidden,
+        total,
+        layout.required_bytes,
+        packed,
+        projections
+            .iter()
+            .map(|(params, form, input, output)| selected::Row {
+                projection: selected::Projection {
+                    params: *params,
+                    input,
+                    output: *output,
+                    staged: staging_bytes != 0,
+                },
+                form: *form,
+            }),
+    )
 }
 
 #[cfg(test)]

@@ -49,6 +49,7 @@ use super::{
 };
 
 mod cost_route;
+mod selected;
 use cost_route::PrimitiveRoute;
 
 const SHADER_SOURCE: &str = include_str!("primitives.metal");
@@ -215,6 +216,7 @@ impl MetalTokenEmbeddingProvider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 hadamard::FINGERPRINT_SOURCE.as_bytes(),
                 TOKEN_EMBEDDING_PROVIDER_ID.as_bytes(),
@@ -299,6 +301,7 @@ impl MetalRmsNormProvider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RMS_NORM_PROVIDER_ID.as_bytes(),
             ]),
@@ -374,6 +377,7 @@ impl MetalResidualAddProvider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RESIDUAL_ADD_PROVIDER_ID.as_bytes(),
             ]),
@@ -449,6 +453,7 @@ impl MetalLastTokenMaskedArgmaxProvider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID.as_bytes(),
             ]),
@@ -546,6 +551,7 @@ macro_rules! no_workspace_primitive_provider {
                     implementation_fingerprint(&[
                         include_str!("primitives.rs").as_bytes(),
                         include_str!("primitives/cost_route.rs").as_bytes(),
+                        include_str!("primitives/selected.rs").as_bytes(),
                         SHADER_SOURCE.as_bytes(),
                         hadamard::FINGERPRINT_SOURCE.as_bytes(),
                         $provider_id.as_bytes(),
@@ -714,6 +720,7 @@ impl MetalLastTokenMaskedArgmaxF32Provider {
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives/cost_route.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID.as_bytes(),
             ]),
@@ -950,6 +957,7 @@ fn encode_token_embedding_typed(
         token_count,
     )
     .map_err(|error| error.to_string())?;
+    let statistical = selected::embedding_evidence(&pipelines, &launches, output_type, token_count);
     let dispatch_count = route.compute_dispatch_count();
     let batching = route.batching();
     MetalDeviceCommand::operation(
@@ -1004,6 +1012,7 @@ fn encode_token_embedding_typed(
         },
     )
     .map_err(|error| error.to_string())?
+    .with_statistical_evidence(statistical)
     .with_work_shape(batching, participant_count, token_count)
     .map_err(|error| error.to_string())
 }
@@ -1224,6 +1233,7 @@ fn encode_rms_norm_typed(
     )?;
     let route = cost_route::compute_command(PrimitiveRoute::RmsNorm, participant_count, tokens)
         .map_err(|error| error.to_string())?;
+    let statistical = selected::rms_evidence(&pipelines, params, input_type, output_type);
     let batching = route.batching();
     let dispatches = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
@@ -1245,6 +1255,7 @@ fn encode_rms_norm_typed(
         },
     )
     .map_err(|error| error.to_string())?
+    .with_statistical_evidence(statistical)
     .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
@@ -1352,6 +1363,14 @@ fn encode_residual_add_typed(
     )?;
     let route = cost_route::compute_command(PrimitiveRoute::ResidualAdd, participant_count, tokens)
         .map_err(|error| error.to_string())?;
+    let statistical = selected::residual_evidence(
+        &pipelines,
+        params,
+        left_type,
+        right_type,
+        output_type,
+        tokens,
+    );
     let batching = route.batching();
     let dispatches = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
@@ -1374,6 +1393,7 @@ fn encode_residual_add_typed(
         },
     )
     .map_err(|error| error.to_string())?
+    .with_statistical_evidence(statistical)
     .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
@@ -1520,6 +1540,8 @@ fn encode_last_token_masked_argmax_typed(
         invocation.work_shape().immediate_tokens(),
     )
     .map_err(|error| error.to_string())?;
+    let statistical =
+        selected::argmax_evidence(&pipelines, &launches, logits_type, required_scratch_bytes);
     let dispatch_count = route.compute_dispatch_count();
     let batching = route.batching();
     MetalDeviceCommand::operation(
@@ -1547,6 +1569,7 @@ fn encode_last_token_masked_argmax_typed(
         },
     )
     .map_err(|error| error.to_string())?
+    .with_statistical_evidence(statistical)
     .with_work_shape(batching, participant_count, u64::from(participant_count))
     .map_err(|error| error.to_string())
 }
@@ -1626,13 +1649,9 @@ fn dispatch_last_token_masked_argmax(
     logits_type: ElementType,
 ) {
     let parallel = masked_argmax_dispatch_count(params.vocabulary_size) == 2;
-    let pipeline = match (logits_type, parallel) {
-        (ElementType::F16, false) => &pipelines.last_token_masked_argmax,
-        (ElementType::F32, false) => &pipelines.last_token_masked_argmax_f32,
-        (ElementType::F16, true) => &pipelines.parallel_masked_argmax,
-        (ElementType::F32, true) => &pipelines.parallel_masked_argmax_f32,
-        other => panic!("unsupported Metal masked argmax logits type {other:?}"),
-    };
+    let selection = selected::argmax(pipelines, logits_type, parallel)
+        .expect("validated Metal masked argmax type");
+    let pipeline = selection.pipeline;
     encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, logits);
     set_region_offset(encoder, 1, scratch, scratch_offset_bytes);
@@ -1761,19 +1780,9 @@ fn dispatch_embedding_at(
     params: EmbeddingParams,
     output_type: ElementType,
 ) {
-    let pipeline = match (format, output_type) {
-        (EmbeddingPhysicalFormat::DenseF16, ElementType::F16) => &pipelines.embedding_dense,
-        (EmbeddingPhysicalFormat::Q4K, ElementType::F16) => &pipelines.embedding_q4_k,
-        (EmbeddingPhysicalFormat::Q6K, ElementType::F16) => &pipelines.embedding_q6_k,
-        (EmbeddingPhysicalFormat::Q8_0, ElementType::F16) => &pipelines.embedding_q8_0,
-        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F16) => &pipelines.embedding_pq2_0,
-        (EmbeddingPhysicalFormat::DenseF16, ElementType::F32) => &pipelines.embedding_dense_f32,
-        (EmbeddingPhysicalFormat::Q4K, ElementType::F32) => &pipelines.embedding_q4_k_f32,
-        (EmbeddingPhysicalFormat::Q6K, ElementType::F32) => &pipelines.embedding_q6_k_f32,
-        (EmbeddingPhysicalFormat::Q8_0, ElementType::F32) => &pipelines.embedding_q8_0_f32,
-        (EmbeddingPhysicalFormat::Pq2_0, ElementType::F32) => &pipelines.embedding_pq2_0_f32,
-        (_, other) => panic!("unsupported Metal embedding output type {other:?}"),
-    };
+    let selection = selected::embedding(pipelines, format, output_type)
+        .expect("validated Metal embedding type");
+    let pipeline = selection.pipeline;
     encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, table);
     set_region(encoder, 1, token_ids);
@@ -1897,12 +1906,9 @@ fn dispatch_rms_norm_typed_at(
         hidden_size,
         epsilon,
     };
-    let pipeline = match (input_type, output_type) {
-        (ElementType::F16, ElementType::F16) => &pipelines.rms_norm,
-        (ElementType::F32, ElementType::F16) => &pipelines.rms_norm_f32_to_f16,
-        (ElementType::F32, ElementType::F32) => &pipelines.rms_norm_f32,
-        other => panic!("unsupported Metal RMSNorm type pair {other:?}"),
-    };
+    let selection =
+        selected::rms(pipelines, input_type, output_type).expect("validated Metal RMSNorm types");
+    let pipeline = selection.pipeline;
     encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(encoder, 0, input, input_offset_bytes);
     set_region(encoder, 1, weight);
@@ -2019,11 +2025,9 @@ fn dispatch_residual_add_typed_at(
     output_type: ElementType,
 ) {
     let params = ResidualAddParams { elements };
-    let pipeline = match (left_type, right_type, output_type) {
-        (ElementType::F16, ElementType::F16, ElementType::F16) => &pipelines.residual_add,
-        (ElementType::F32, ElementType::F16, ElementType::F32) => &pipelines.residual_add_f32_f16,
-        other => panic!("unsupported Metal residual-add type triple {other:?}"),
-    };
+    let selection = selected::residual(pipelines, left_type, right_type, output_type)
+        .expect("validated Metal residual types");
+    let pipeline = selection.pipeline;
     encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(encoder, 0, left, left_offset_bytes);
     set_region_offset(encoder, 1, right, right_offset_bytes);
@@ -2919,4 +2923,48 @@ mod tests {
         encoder
             .dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS_PER_GROUP, 1, 1));
     }
+}
+
+#[cfg(test)]
+pub(crate) use selected::tests::runtime_fixtures as selected_runtime_fixtures;
+
+pub(super) fn append_selected_rms(
+    builder: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+    p: &MetalPrimitivePipelines,
+    input: ElementType,
+    output: ElementType,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+    scratch: u64,
+) -> Option<()> {
+    selected::push_rms(
+        builder,
+        p,
+        RmsNormParams {
+            rows,
+            hidden_size,
+            epsilon,
+        },
+        input,
+        output,
+        scratch,
+    )
+}
+pub(super) fn append_selected_residual(
+    builder: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+    p: &MetalPrimitivePipelines,
+    hidden: ElementType,
+    elements: u32,
+    scratch: u64,
+) -> Option<()> {
+    selected::push_residual(
+        builder,
+        p,
+        ResidualAddParams { elements },
+        hidden,
+        ElementType::F16,
+        hidden,
+        scratch,
+    )
 }

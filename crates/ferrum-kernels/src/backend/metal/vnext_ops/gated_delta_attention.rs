@@ -1,6 +1,7 @@
 //! Native Metal provider for the standard recurrent gated-delta operation.
 
 mod cost_route;
+mod selected;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -355,10 +356,12 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             implementation_fingerprint(&[
                 include_str!("gated_delta_attention.rs").as_bytes(),
                 include_str!("gated_delta_attention/cost_route.rs").as_bytes(),
+                include_str!("gated_delta_attention/selected.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/selected.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
                 GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
                 provider_id.as_bytes(),
@@ -453,6 +456,9 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
             self.hidden_type,
             self.execution_capabilities,
             self.execution_cost_model,
+            &self.attention,
+            &self.linear,
+            &self.primitives,
         )
     }
 
@@ -1393,6 +1399,29 @@ fn encode_attention(
             })
         }),
     )?;
+    let statistical_evidence = selected::evidence(
+        &attention,
+        &linear,
+        &primitives,
+        hidden_type,
+        total_tokens,
+        layout.required_bytes,
+        packed.as_ref().map(|v| selected::Projection {
+            params: v.params,
+            input: &v.input_projections,
+            output: v.output_projection,
+            staged: v.input_projection_workspace.is_some(),
+        }),
+        launches.iter().map(|v| selected::Row {
+            projection: selected::Projection {
+                params: v.params,
+                input: &v.input_projections,
+                output: v.output_projection,
+                staged: v.input_projection_workspace.is_some(),
+            },
+            form: v.execution_form,
+        }),
+    );
     let dispatch_count = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
         route.native_operation(),
@@ -1436,6 +1465,7 @@ fn encode_attention(
         route.participant_count(),
         route.token_count(),
     )
+    .map(|command| command.with_statistical_evidence(statistical_evidence))
     .map_err(|error| error.to_string())
 }
 
@@ -1858,20 +1888,8 @@ fn dispatch_recurrent_delta(
     state: &MetalBufferRegion,
     launch: &ParticipantLaunch,
 ) {
-    let use_simd_delta = supports_simd_delta(
-        &launch.params,
-        pipelines.simd_delta.thread_execution_width(),
-        pipelines
-            .simd_delta
-            .max_total_threads_per_threadgroup()
-            .try_into()
-            .unwrap_or(0),
-    );
-    encoder.set_compute_pipeline_state(if use_simd_delta {
-        &pipelines.simd_delta
-    } else {
-        &pipelines.delta
-    });
+    let (pipeline, _, rows_per_group, threads) = selected::recurrent(pipelines, &launch.params);
+    encoder.set_compute_pipeline_state(pipeline);
     for (index, offset) in [
         launch.query,
         launch.key,
@@ -1887,25 +1905,14 @@ fn dispatch_recurrent_delta(
     set_region_offset(encoder, 5, state, 0);
     set_region_offset(encoder, 6, scratch, launch.core);
     set_params(encoder, 7, &launch.params);
-    if use_simd_delta {
-        encoder.dispatch_thread_groups(
-            MTLSize::new(
-                u64::from(launch.params.value_dim).div_ceil(SIMD_DELTA_ROWS_PER_GROUP),
-                u64::from(launch.params.value_heads),
-                1,
-            ),
-            MTLSize::new(SIMD_DELTA_THREADS, 1, 1),
-        );
-    } else {
-        encoder.dispatch_thread_groups(
-            MTLSize::new(
-                u64::from(launch.params.value_dim).div_ceil(VALUE_TILE),
-                u64::from(launch.params.value_heads),
-                1,
-            ),
-            MTLSize::new(THREADS_PER_GROUP, 1, 1),
-        );
-    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            u64::from(launch.params.value_dim).div_ceil(rows_per_group),
+            u64::from(launch.params.value_heads),
+            1,
+        ),
+        MTLSize::new(threads, 1, 1),
+    );
 }
 
 fn supports_simd_delta(
