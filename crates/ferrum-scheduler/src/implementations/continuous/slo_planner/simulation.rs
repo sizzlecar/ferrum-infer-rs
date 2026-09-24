@@ -566,13 +566,36 @@ pub(super) fn ready_witness(
     Ok(true)
 }
 
-pub(super) fn score(
+pub(super) fn score_at(
     snapshot: &SchedulerSnapshot,
     state: &SimulatedSequence,
     settings: &BoundedPlannerSettings,
+    transaction_started_at_ns: u64,
+    ranking_now_ns: u64,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<(f64, u64), PlanningUnknownReason> {
+    // Logical simulation remains anchored where it was constructed/replayed.
+    // Ranking projects only its duration onto one common actual CPU instant.
+    if ranking_now_ns < state.started_at_ns {
+        return Err(PlanningUnknownReason::ClockMovedBackwards);
+    }
+    let execution_ns = state
+        .now_ns
+        .checked_sub(state.started_at_ns)
+        .ok_or(PlanningUnknownReason::ClockMovedBackwards)?;
+    let cpu_ns = ranking_now_ns
+        .checked_sub(transaction_started_at_ns)
+        .ok_or(PlanningUnknownReason::ClockMovedBackwards)?;
+    let occupied_ns = cpu_ns
+        .checked_add(execution_ns)
+        .filter(|&value| value > 0)
+        .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
+    let completion_ns = ranking_now_ns
+        .checked_add(execution_ns)
+        .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
     let mut debt = 0_u64;
     for (initial, current) in snapshot.requests.iter().zip(&state.requests) {
+        poll()?;
         let RequestPhaseView::Prefill(progress) = &initial.phase else {
             continue;
         };
@@ -586,7 +609,7 @@ pub(super) fn score(
             .checked_add(initial.timing.budgets.ttft_ns.get())
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
         let required = progress
-            .ideal_reference_work_at(state.now_ns, first_deadline)
+            .ideal_reference_work_at(completion_ns, first_deadline)
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
         debt = debt
             .checked_add(required.saturating_sub(completed))
@@ -596,7 +619,7 @@ pub(super) fn score(
     let value = (state.output_tokens as f64
         + settings.search.prefill_credit_beta * (state.net_prefill_work_ns as f64 / tau)
         - settings.search.prefill_debt_gamma * (debt as f64 / tau))
-        / (state.now_ns - state.started_at_ns) as f64;
+        / occupied_ns as f64;
     if !value.is_finite() {
         return Err(PlanningUnknownReason::ArithmeticOverflow);
     }

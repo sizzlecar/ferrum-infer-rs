@@ -27,7 +27,7 @@ struct Node<'epoch> {
 
 struct Frame<'epoch> {
     node: Node<'epoch>,
-    work: Option<std::vec::IntoIter<Vec<CandidateWork>>>,
+    work: Option<candidates::FrontierCursor>,
     resolved: usize,
 }
 impl<'epoch> Frame<'epoch> {
@@ -38,6 +38,16 @@ impl<'epoch> Frame<'epoch> {
             resolved: 0,
         }
     }
+}
+
+/// A complete common tail, never just a high-scoring prefix. Construction and
+/// improvement share the same transaction, action limits and final replay.
+struct CommonPlan<'epoch>(Node<'epoch>);
+
+#[derive(Clone, Copy)]
+enum SearchPhase {
+    Construct,
+    Improve,
 }
 
 struct ComputeBudget {
@@ -353,44 +363,71 @@ impl BoundedSloPlanner {
             else {
                 break;
             };
-            budget.optional_search = !solutions.is_empty();
+            let phase = if solutions.is_empty() {
+                SearchPhase::Construct
+            } else {
+                SearchPhase::Improve
+            };
+            budget.optional_search = matches!(phase, SearchPhase::Improve);
             if let Err(reason) = budget.read(clock) {
                 stop_or_unknown!(reason, 'exploration);
             }
-            if stats.expanded_candidates == expansion_limit {
+            if stats.expanded_candidates == expansion_limit
+                || stats.enumeration_attempts == raw_limit
+            {
                 stats.candidate_truncations += 1;
                 break;
+            }
+            let ranking_now = match budget.read(clock) {
+                Ok(now) => now,
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
+            if let Err(reason) = rank_frames(
+                &mut pending[depth],
+                snapshot,
+                &self.settings,
+                window.started_at_ns,
+                ranking_now,
+                &mut || budget.read(clock).map(|_| ()),
+            ) {
+                stop_or_unknown!(reason, 'exploration);
             }
             let mut frame = pending[depth].remove(0);
             stats.max_depth_reached = stats.max_depth_reached.max(depth + 1);
             if frame.work.is_none() {
-                let remaining_raw = raw_limit - stats.enumeration_attempts;
-                if remaining_raw == 0 {
-                    stats.candidate_truncations += 1;
-                    continue;
-                }
-                let generated = match candidates::logical_candidates(
-                    snapshot,
-                    &frame.node.state.requests,
-                    frame.node.state.now_ns,
-                    candidate_limit,
-                    remaining_raw,
-                    &mut stats.enumeration_attempts,
-                    protection.as_deref(),
-                    &mut || budget.read(clock).map(|_| ()),
-                ) {
-                    Ok(generated) => generated,
-                    Err(reason) => stop_or_unknown!(reason, 'exploration),
-                };
-                stats.candidate_truncations += usize::from(generated.truncated);
-                frame.work = Some(generated.work.into_iter());
+                frame.work = Some(
+                    match candidates::FrontierCursor::new(
+                        snapshot,
+                        &frame.node.state.requests,
+                        frame.node.state.now_ns,
+                        candidate_limit,
+                        protection.as_deref(),
+                        &mut || budget.read(clock).map(|_| ()),
+                    ) {
+                        Ok(cursor) => cursor,
+                        Err(reason) => stop_or_unknown!(reason, 'exploration),
+                    },
+                );
             }
-            let work = frame.work.as_mut().expect("initialized logical cursor");
+            let cursor = frame.work.as_mut().expect("initialized logical cursor");
             if frame.resolved == candidate_limit {
-                stats.candidate_truncations += usize::from(work.len() != 0);
+                stats.candidate_truncations += usize::from(cursor.may_have_more());
                 continue;
             }
-            let Some(work) = work.next() else { continue };
+            let work = match cursor.next(
+                snapshot,
+                &frame.node.state.requests,
+                &mut stats.enumeration_attempts,
+                raw_limit,
+                &mut || budget.read(clock).map(|_| ()),
+            ) {
+                Ok(Some(work)) => work,
+                Ok(None) => {
+                    stats.candidate_truncations += usize::from(cursor.truncated);
+                    continue;
+                }
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
             // All search nodes use one execution-time origin. CPU time is
             // charged by the shared real budget and fresh final replay; extending
             // a node never shifts its ancestors or replays their physical work.
@@ -445,15 +482,11 @@ impl BoundedSloPlanner {
             };
             waves.push(transition.wave);
             let state = transition.state;
-            let (score, debt) = match simulation::score(snapshot, &state, &self.settings) {
-                Ok(value) => value,
-                Err(reason) => return unknown(reason, stats),
-            };
             let node = Node {
                 waves,
                 state,
-                score,
-                debt,
+                score: 0.0,
+                debt: 0,
                 ordinal: stats.expanded_candidates,
             };
             match simulation::ready_witness(
@@ -463,8 +496,25 @@ impl BoundedSloPlanner {
                 protection.as_deref(),
             ) {
                 Ok(true) if admission_serviced(admission_target, &node.state) => {
-                    solutions.push(node.clone());
-                    retain_best(&mut solutions, width);
+                    solutions.push(CommonPlan(node.clone()));
+                    // Crossing Construct -> Improve does not create a new
+                    // budget or permit an uncertified tail into solutions.
+                    budget.optional_search = true;
+                    let now = match budget.read(clock) {
+                        Ok(now) => now,
+                        Err(reason) => stop_or_unknown!(reason, 'exploration),
+                    };
+                    if let Err(reason) = rank_plans(
+                        &mut solutions,
+                        snapshot,
+                        &self.settings,
+                        window.started_at_ns,
+                        now,
+                        &mut || budget.read(clock).map(|_| ()),
+                    ) {
+                        stop_or_unknown!(reason, 'exploration);
+                    }
+                    solutions.truncate(width);
                 }
                 Ok(_) => {}
                 Err(reason) => return unknown(reason, stats),
@@ -472,7 +522,20 @@ impl BoundedSloPlanner {
             if depth + 1 < horizon {
                 pending[depth + 1].push(Frame::new(node));
                 let nodes = &mut pending[depth + 1];
-                nodes.sort_by(|left, right| compare_nodes(&left.node, &right.node));
+                let now = match budget.read(clock) {
+                    Ok(now) => now,
+                    Err(reason) => stop_or_unknown!(reason, 'exploration),
+                };
+                if let Err(reason) = rank_frames(
+                    nodes,
+                    snapshot,
+                    &self.settings,
+                    window.started_at_ns,
+                    now,
+                    &mut || budget.read(clock).map(|_| ()),
+                ) {
+                    stop_or_unknown!(reason, 'exploration);
+                }
                 let before = nodes.len();
                 nodes.truncate(width);
                 stats.beam_pruned_nodes += before - nodes.len();
@@ -483,7 +546,26 @@ impl BoundedSloPlanner {
         // must still revalidate identity/resources/credits and its real current
         // clock immediately before committing this *first* wave.
         budget.optional_search = false;
-        for solution in solutions {
+        // Re-rank every complete plan at the same end-of-search CPU instant.
+        // A soft stop may interrupt an earlier ranking; cached scores cannot
+        // select a winner at a different time basis from its peers.
+        if !solutions.is_empty() {
+            let now = match budget.read(clock) {
+                Ok(now) => now,
+                Err(reason) => return unknown(reason, stats),
+            };
+            if let Err(reason) = rank_plans(
+                &mut solutions,
+                snapshot,
+                &self.settings,
+                window.started_at_ns,
+                now,
+                &mut || budget.read(clock).map(|_| ()),
+            ) {
+                return unknown(reason, stats);
+            }
+        }
+        for CommonPlan(solution) in solutions {
             let now_ns = match budget.read(clock) {
                 Ok(now) => now,
                 Err(reason) => return unknown(reason, stats),
@@ -525,12 +607,25 @@ impl BoundedSloPlanner {
                 Ok(_) => continue,
                 Err(reason) => return unknown(reason, stats),
             }
-            let (score, debt) = match simulation::score(snapshot, &state, &self.settings) {
+            // Detect time spent inside the cost-model callback too. Crossing the
+            // budget cannot be hidden by the last lookup returning a prediction.
+            let final_now = match budget.read(clock) {
+                Ok(now) => now,
+                Err(reason) => return unknown(reason, stats),
+            };
+            let (score, debt) = match simulation::score_at(
+                snapshot,
+                &state,
+                &self.settings,
+                window.started_at_ns,
+                final_now,
+                &mut || budget.read(clock).map(|_| ()),
+            ) {
                 Ok(value) => value,
                 Err(reason) => return unknown(reason, stats),
             };
-            // Detect time spent inside the cost-model callback too. Crossing the
-            // budget cannot be hidden by the last lookup returning a prediction.
+            // Ranking is bounded but not free: guard the time it consumed too.
+            // The score is only an ordering diagnostic, not a deadline permit.
             let final_now = match budget.read(clock) {
                 Ok(now) => now,
                 Err(reason) => return unknown(reason, stats),
@@ -670,9 +765,59 @@ fn compare_nodes(left: &Node, right: &Node) -> std::cmp::Ordering {
         .then_with(|| left.ordinal.cmp(&right.ordinal))
 }
 
-fn retain_best(nodes: &mut Vec<Node>, limit: usize) {
-    nodes.sort_by(compare_nodes);
-    nodes.truncate(limit);
+fn rank_node(
+    node: &mut Node,
+    snapshot: &SchedulerSnapshot,
+    settings: &BoundedPlannerSettings,
+    origin: u64,
+    now: u64,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<(), PlanningUnknownReason> {
+    // The root has no work and is never compared against a non-root prefix.
+    if node.waves.is_empty() {
+        return poll();
+    }
+    (node.score, node.debt) =
+        simulation::score_at(snapshot, &node.state, settings, origin, now, poll)?;
+    Ok(())
+}
+
+fn rank_frames(
+    nodes: &mut [Frame],
+    snapshot: &SchedulerSnapshot,
+    settings: &BoundedPlannerSettings,
+    origin: u64,
+    now: u64,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<(), PlanningUnknownReason> {
+    // A sole branch needs no ranking; when a peer arrives both are scored
+    // afresh. This avoids an O(N) debt walk merely to pick the only prefix.
+    if nodes.len() < 2 {
+        return poll();
+    }
+    for frame in nodes.iter_mut() {
+        rank_node(&mut frame.node, snapshot, settings, origin, now, poll)?;
+    }
+    nodes.sort_by(|left, right| compare_nodes(&left.node, &right.node));
+    poll()
+}
+
+fn rank_plans(
+    nodes: &mut [CommonPlan],
+    snapshot: &SchedulerSnapshot,
+    settings: &BoundedPlannerSettings,
+    origin: u64,
+    now: u64,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<(), PlanningUnknownReason> {
+    if nodes.len() < 2 {
+        return poll();
+    }
+    for plan in nodes.iter_mut() {
+        rank_node(&mut plan.0, snapshot, settings, origin, now, poll)?;
+    }
+    nodes.sort_by(|left, right| compare_nodes(&left.0, &right.0));
+    poll()
 }
 
 fn unknown(reason: PlanningUnknownReason, search: PlanningSearchStats) -> PlanningDecision {
