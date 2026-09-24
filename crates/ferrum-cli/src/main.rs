@@ -44,6 +44,9 @@ enum Commands {
     #[command(hide = true)]
     BenchServe(bench_serve::BenchServeCommand),
 
+    /// Measure real bounded cohorts and validate against a frozen cost model.
+    CalibrateSlo(calibrate_slo::CalibrateSloCommand),
+
     /// Validate and replay a request replay bundle without starting HTTP.
     #[command(hide = true)]
     ReplayBundle(replay_bundle::ReplayBundleCommand),
@@ -122,6 +125,7 @@ fn command_future(
         Commands::Run(cmd) => Box::pin(run::execute(cmd, config)),
         Commands::Bench(cmd) => Box::pin(bench::execute(cmd, config)),
         Commands::BenchServe(cmd) => Box::pin(bench_serve::execute(cmd, config)),
+        Commands::CalibrateSlo(cmd) => Box::pin(calibrate_slo::execute(cmd, config)),
         Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
         Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
         Commands::Embed(cmd) => Box::pin(embed::execute(cmd, config)),

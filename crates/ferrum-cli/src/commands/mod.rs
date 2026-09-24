@@ -47,6 +47,7 @@ impl VNextDiagnosticFaultArg {
 
 pub mod bench;
 pub mod bench_serve;
+pub mod calibrate_slo;
 pub mod doctor;
 pub mod embed;
 pub mod list;
@@ -168,3 +169,4 @@ mod tests {
         }
     }
 }
+mod chat_request;
