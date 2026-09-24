@@ -223,3 +223,114 @@ fn independent_family_v2_cannot_invent_old_import_evidence_or_change_ordered_fit
         .family_signature_for(SelectedStatisticalFamily::IndependentAttentionV2)
         .is_err());
 }
+
+#[test]
+fn heldout_query_identity_comes_from_the_same_typed_lookup_for_known_and_unknown() {
+    let fit = (1..=8)
+        .map(|n| independent_sample(n, [false, true, false]))
+        .collect::<Vec<_>>();
+    let residual = (9..=16)
+        .map(|n| independent_sample(n, [true, false, false]))
+        .collect::<Vec<_>>();
+    let heldout = independent_sample(17, [false, false, true]);
+    let model = FittedWholeWaveModelV1::fit_independent_attention_v2(
+        fingerprint(),
+        settings(),
+        partition(),
+        &fit,
+        108,
+    )
+    .unwrap()
+    .calibrate(&residual, 116)
+    .unwrap();
+    let known =
+        model.predict_identified(&heldout.fingerprint, &heldout.exact, &heldout.selected, 117);
+    assert_eq!(
+        known.prediction,
+        model.predict(&heldout.fingerprint, &heldout.exact, &heldout.selected, 117)
+    );
+    let identity = known.query_identity.unwrap();
+    assert_eq!(identity.schema_version, 1);
+    assert_eq!(identity.family_schema_version, 2);
+    assert_eq!(
+        identity.model_revision,
+        INDEPENDENT_ATTENTION_MODEL_REVISION
+    );
+    assert_eq!(
+        identity.family_signature,
+        *heldout
+            .selected
+            .independent_attention_v2()
+            .unwrap()
+            .family_signature()
+    );
+    assert_ne!(
+        identity.family_signature,
+        *heldout.selected.family_signature()
+    );
+    let evaluation = model.evaluate_heldout(&heldout, 117).unwrap();
+    assert_eq!(evaluation.query_identity, Some(identity));
+    assert_eq!(evaluation.prediction, known.prediction);
+
+    let expired = known.prediction.unwrap().valid_until_ns + 1;
+    let stale = model.predict_identified(
+        &heldout.fingerprint,
+        &heldout.exact,
+        &heldout.selected,
+        expired,
+    );
+    assert_eq!(stale.prediction, Err(ModelUnknown::Stale));
+    assert_eq!(stale.query_identity, Some(identity));
+    assert_eq!(
+        stale.prediction,
+        model.predict(
+            &heldout.fingerprint,
+            &heldout.exact,
+            &heldout.selected,
+            expired
+        )
+    );
+
+    let same_order_residual = (9..=16)
+        .map(|n| independent_sample(n, [false, true, false]))
+        .collect::<Vec<_>>();
+    let legacy = FittedWholeWaveModelV1::fit(fingerprint(), settings(), partition(), &fit, 108)
+        .unwrap()
+        .calibrate(&same_order_residual, 116)
+        .unwrap();
+    let missing =
+        legacy.predict_identified(&heldout.fingerprint, &heldout.exact, &heldout.selected, 117);
+    assert_eq!(missing.prediction, Err(ModelUnknown::FamilyMissing));
+    let old_identity = missing.query_identity.unwrap();
+    assert_eq!(old_identity.family_schema_version, 1);
+    assert_eq!(old_identity.model_revision, MODEL_REVISION);
+    assert_eq!(
+        old_identity.family_signature,
+        *heldout.selected.family_signature()
+    );
+    assert_eq!(
+        missing.prediction,
+        legacy.predict(&heldout.fingerprint, &heldout.exact, &heldout.selected, 117)
+    );
+
+    let mut wrong_exact = heldout.exact.clone();
+    wrong_exact.provider_signature[0] ^= 1;
+    let invalid =
+        model.predict_identified(&heldout.fingerprint, &wrong_exact, &heldout.selected, 117);
+    assert!(matches!(invalid.prediction, Err(ModelUnknown::Evidence(_))));
+    assert_eq!(invalid.query_identity, None);
+    let mut wrong_fingerprint = heldout.fingerprint.clone();
+    wrong_fingerprint.model_weights[0] ^= 1;
+    let precedence =
+        model.predict_identified(&wrong_fingerprint, &wrong_exact, &heldout.selected, 0);
+    assert_eq!(precedence.prediction, Err(ModelUnknown::WrongFingerprint));
+    assert_eq!(precedence.query_identity, None);
+    assert_eq!(
+        precedence.prediction,
+        model.predict(&wrong_fingerprint, &wrong_exact, &heldout.selected, 0)
+    );
+    assert_eq!(
+        model.evaluate_heldout(&residual[0], 117),
+        Err(ModelUnknown::PhaseLeakage)
+    );
+}

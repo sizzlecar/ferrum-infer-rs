@@ -68,6 +68,20 @@ fn roundtrip_refits_then_calibrates_and_import_clock_preserves_age() {
         imported.predict(&fingerprint(), &q.exact, &q.selected, 99),
         Err(ModelUnknown::Clock)
     );
+    for now in [99, 100, local_expiry, local_expiry + 1] {
+        let identified = imported.predict_identified(&fingerprint(), &q.exact, &q.selected, now);
+        assert_eq!(
+            identified.prediction,
+            imported.predict(&fingerprint(), &q.exact, &q.selected, now)
+        );
+        if now == 99 {
+            assert_eq!(identified.query_identity, None);
+        } else {
+            let identity = identified.query_identity.unwrap();
+            assert_eq!(identity.family_schema_version, 1);
+            assert_eq!(identity.family_signature, *q.selected.family_signature());
+        }
+    }
 }
 #[test]
 fn legacy_versions_settings_and_exact_join_cannot_be_relabelled() {

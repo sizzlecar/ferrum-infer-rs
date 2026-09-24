@@ -4,7 +4,17 @@ use ferrum_scheduler::implementations::continuous::cost_model::statistical::mode
 
 #[test]
 fn selected_heldout_keeps_real_receipt_session_cut_and_model_identity() {
-    let fixture = Fixture::new();
+    for predictor in [
+        ferrum_types::SloCostPredictor::SelectedWholeWaveV1,
+        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2,
+    ] {
+        selected_heldout_query_identity_for(predictor);
+    }
+}
+
+fn selected_heldout_query_identity_for(predictor: ferrum_types::SloCostPredictor) {
+    let mut fixture = Fixture::new();
+    fixture.config.predictor = predictor;
     let mut capture = fixture.begin();
     let mut fit_capture = None;
     for _ in 0..8 {
@@ -40,6 +50,45 @@ fn selected_heldout_keeps_real_receipt_session_cut_and_model_identity() {
         ),
     };
     let result = model.evaluate_selected_evidence(&evidence).unwrap();
+    let identity = result.query_identity.unwrap();
+    let observation = evidence.observation.as_ref().unwrap();
+    let expected = match predictor {
+        ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => {
+            observation.selected.family_signature()
+        }
+        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => observation
+            .selected
+            .independent_attention_v2()
+            .unwrap()
+            .family_signature(),
+        _ => unreachable!(),
+    };
+    assert_eq!(identity.family_signature, *expected);
+    assert_eq!(
+        identity.model_revision,
+        model
+            .import_receipt()
+            .selected_whole_wave
+            .as_ref()
+            .unwrap()
+            .model_revision
+    );
+    assert_eq!(
+        identity.family_schema_version,
+        match predictor {
+            ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => 1,
+            ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => 2,
+            _ => unreachable!(),
+        }
+    );
+    assert_eq!(
+        result.prediction,
+        model.imported.snapshot.predict_selected_wave(
+            &observation.exact,
+            &observation.selected,
+            21
+        )
+    );
     assert_eq!(result.actual_ns, 19);
     let prediction = result.prediction.unwrap();
     assert_eq!(

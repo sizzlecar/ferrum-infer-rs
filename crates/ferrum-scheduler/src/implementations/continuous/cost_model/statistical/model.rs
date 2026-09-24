@@ -190,8 +190,36 @@ pub struct WholeWavePredictionV1 {
     pub fit_samples: usize,
     pub residual_samples: usize,
 }
+/// Identity selected by this exact read-only lookup, never reconstructed from training rows.
+/// Serialized only in diagnostic results; profile/source V1--V7 wires are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SelectedQueryIdentityV1 {
+    pub schema_version: u32,
+    pub model_revision: &'static str,
+    pub family_schema_version: u32,
+    pub family_signature: [u8; 32],
+}
+impl SelectedQueryIdentityV1 {
+    fn new(family: SelectedStatisticalFamily, signature: [u8; 32]) -> Self {
+        Self {
+            schema_version: 1,
+            model_revision: family.model_revision(),
+            family_schema_version: match family {
+                SelectedStatisticalFamily::OrderedV1 => 1,
+                SelectedStatisticalFamily::IndependentAttentionV2 => 2,
+            },
+            family_signature: signature,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifiedPredictionV1 {
+    pub query_identity: Option<SelectedQueryIdentityV1>,
+    pub prediction: Result<WholeWavePredictionV1, ModelUnknown>,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldoutEvaluationV1 {
+    pub query_identity: Option<SelectedQueryIdentityV1>,
     pub prediction: Result<WholeWavePredictionV1, ModelUnknown>,
     pub actual_ns: u64,
     pub underestimate_ns: Option<u64>,
@@ -451,6 +479,33 @@ impl WholeWaveModelV1 {
         let input = StatisticalModelInputV1::from_future(exact, evidence)?;
         self.predict_input(fingerprint, &input, now_ns)
     }
+    /// Same lookup and error precedence as predict. The identity is captured
+    /// only after the validated input selects the model's statistical family.
+    pub fn predict_identified(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        exact: &CanonicalWaveCostShape,
+        evidence: &StatisticalWaveEvidenceV1,
+        now_ns: u64,
+    ) -> IdentifiedPredictionV1 {
+        let mut query_identity = None;
+        let prediction = (|| {
+            if fingerprint != &self.fingerprint {
+                return Err(ModelUnknown::WrongFingerprint);
+            }
+            if now_ns < self.frozen_at_ns {
+                return Err(ModelUnknown::Clock);
+            }
+            let input = StatisticalModelInputV1::from_future(exact, evidence)?;
+            self.predict_input_using(fingerprint, &input, now_ns, |identity| {
+                query_identity = Some(identity);
+            })
+        })();
+        IdentifiedPredictionV1 {
+            query_identity,
+            prediction,
+        }
+    }
     /// For an already validated, immutable execution edge. The planner binds
     /// this input to its exact alternative before construction; this is numeric
     /// cost evidence and never an executable authorization.
@@ -459,6 +514,15 @@ impl WholeWaveModelV1 {
         fingerprint: &ExecutionFingerprint,
         input: &StatisticalModelInputV1,
         now_ns: u64,
+    ) -> Result<WholeWavePredictionV1, ModelUnknown> {
+        self.predict_input_using(fingerprint, input, now_ns, |_| {})
+    }
+    fn predict_input_using(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        input: &StatisticalModelInputV1,
+        now_ns: u64,
+        identify: impl FnOnce(SelectedQueryIdentityV1),
     ) -> Result<WholeWavePredictionV1, ModelUnknown> {
         if fingerprint != &self.fingerprint {
             return Err(ModelUnknown::WrongFingerprint);
@@ -469,6 +533,7 @@ impl WholeWaveModelV1 {
 
         validate_input(input, &self.settings)?;
         let family = input.family_signature_for(self.family)?;
+        identify(SelectedQueryIdentityV1::new(self.family, *family));
         let segment = self.segments.get(family).ok_or_else(|| {
             self.unavailable
                 .get(family)
@@ -515,12 +580,15 @@ impl WholeWaveModelV1 {
             self.partition.source_sha256,
             now_ns,
         )?;
-        let prediction = self.predict(&sample.fingerprint, &sample.exact, &sample.selected, now_ns);
+        let identified =
+            self.predict_identified(&sample.fingerprint, &sample.exact, &sample.selected, now_ns);
+        let prediction = identified.prediction;
         let underestimate_ns = prediction
             .as_ref()
             .ok()
             .map(|p| sample.wall_ns.saturating_sub(p.planning_ns));
         Ok(HeldoutEvaluationV1 {
+            query_identity: identified.query_identity,
             prediction,
             actual_ns: sample.wall_ns,
             underestimate_ns,

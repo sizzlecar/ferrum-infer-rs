@@ -78,6 +78,29 @@ fn profile7_refits_permuted_independent_populations_and_preserves_import_age() {
         ),
         Err(ModelUnknown::Stale)
     ));
+    let local_expiry = 100 + p.valid_until_ns - model.clock.model_anchor_ns;
+    for now in [99, 100, local_expiry, local_expiry + 1] {
+        let identified =
+            model.predict_identified(&fingerprint(), &query.exact, &query.selected, now);
+        assert_eq!(
+            identified.prediction,
+            model.predict(&fingerprint(), &query.exact, &query.selected, now)
+        );
+        if now == 99 {
+            assert_eq!(identified.query_identity, None);
+        } else {
+            let identity = identified.query_identity.unwrap();
+            assert_eq!(identity.family_schema_version, 2);
+            assert_eq!(
+                identity.family_signature,
+                *query
+                    .selected
+                    .independent_attention_v2()
+                    .unwrap()
+                    .family_signature()
+            );
+        }
+    }
 }
 #[test]
 fn profile7_rejects_legacy_relabel_missing_binding_work_or_changed_freeze() {

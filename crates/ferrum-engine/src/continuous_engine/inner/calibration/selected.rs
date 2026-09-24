@@ -217,16 +217,18 @@ impl ImportedCalibrationModel {
             .now_ns()
             .filter(|now| *now >= observation.observed_at_ns)
             .ok_or(ModelUnknown::Clock)?;
-        let prediction = self.imported.snapshot.predict_selected_wave(
+        let identified = self.imported.snapshot.predict_selected_wave_identified(
             &observation.exact,
             &observation.selected,
             now,
         );
+        let prediction = identified.prediction;
         let underestimate_ns = prediction
             .as_ref()
             .ok()
             .map(|value| observation.wall_ns.saturating_sub(value.planning_ns));
         Ok(HeldoutEvaluationV1 {
+            query_identity: identified.query_identity,
             prediction,
             actual_ns: observation.wall_ns,
             underestimate_ns,

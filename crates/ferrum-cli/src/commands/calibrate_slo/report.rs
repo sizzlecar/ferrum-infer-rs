@@ -314,14 +314,14 @@ fn selected_prediction(
     totals: &mut Summary,
 ) -> serde_json::Value {
     totals.selected_validation_offered += 1;
-    let (reason, actual_ns) = match result {
+    let (reason, actual_ns, query_identity) = match result {
         Ok(evaluation) => match evaluation.prediction {
             Ok(prediction) => {
                 totals.selected_validation_known += 1;
                 let underestimate = evaluation.actual_ns.saturating_sub(prediction.planning_ns);
                 totals.selected_validation_underestimates += u64::from(underestimate > 0);
                 return serde_json::json!({
-                    "kind":"known", "boundary":"preparation_to_host_settled_v1",
+                    "kind":"known", "query_identity":evaluation.query_identity, "boundary":"preparation_to_host_settled_v1",
                     "fitted_ns":prediction.fitted_ns, "residual_ns":prediction.residual_ns,
                     "static_margin_ns":prediction.static_margin_ns,
                     "planning_ns":prediction.planning_ns, "valid_until_ns":prediction.valid_until_ns,
@@ -330,9 +330,13 @@ fn selected_prediction(
                     "scope":"independent complete host-settled wave retrospective check; not future-route or serving SLO qualification"
                 });
             }
-            Err(reason) => (reason, Some(evaluation.actual_ns)),
+            Err(reason) => (
+                reason,
+                Some(evaluation.actual_ns),
+                evaluation.query_identity,
+            ),
         },
-        Err(reason) => (reason, None),
+        Err(reason) => (reason, None, None),
     };
     totals.selected_validation_unknown += 1;
     let reason = format!("{reason:?}");
@@ -340,7 +344,7 @@ fn selected_prediction(
         .selected_validation_unknown_reasons
         .entry(reason.clone())
         .or_default() += 1;
-    serde_json::json!({"kind":"unknown", "reason":reason, "actual_ns":actual_ns})
+    serde_json::json!({"kind":"unknown", "reason":reason, "actual_ns":actual_ns, "query_identity":query_identity})
 }
 
 fn host_content_prediction(

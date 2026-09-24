@@ -1,13 +1,16 @@
 use super::*;
 use ferrum_scheduler::implementations::continuous::cost_model::statistical::model::{
-    HeldoutEvaluationV1, ModelUnknown, WholeWavePredictionV1,
+    HeldoutEvaluationV1, ModelUnknown, SelectedQueryIdentityV1, WholeWavePredictionV1,
+    INDEPENDENT_ATTENTION_MODEL_REVISION,
 };
 
 #[test]
 fn selected_heldout_report_counts_actual_underestimates_without_legacy_fallback() {
     let mut totals = Summary::default();
+    let identity = query_identity();
     let evidence = selected_prediction(
         Ok(HeldoutEvaluationV1 {
+            query_identity: Some(identity),
             prediction: Ok(WholeWavePredictionV1 {
                 fitted_ns: 70,
                 residual_ns: 15,
@@ -23,6 +26,10 @@ fn selected_heldout_report_counts_actual_underestimates_without_legacy_fallback(
         &mut totals,
     );
     assert_eq!(evidence["underestimate_ns"], 15);
+    assert_eq!(
+        evidence["query_identity"],
+        serde_json::to_value(identity).unwrap()
+    );
     assert_eq!(totals.selected_validation_offered, 1);
     assert_eq!(totals.selected_validation_known, 1);
     assert_eq!(totals.selected_validation_underestimates, 1);
@@ -33,9 +40,11 @@ fn selected_heldout_report_counts_actual_underestimates_without_legacy_fallback(
 #[test]
 fn selected_heldout_report_retains_missing_receipts_and_unsupported_families() {
     let mut totals = Summary::default();
+    let identity = query_identity();
     let absent = selected_prediction(Err(ModelUnknown::WrongSource), &mut totals);
     let unsupported = selected_prediction(
         Ok(HeldoutEvaluationV1 {
+            query_identity: Some(identity),
             prediction: Err(ModelUnknown::InsufficientResidual),
             actual_ns: 123,
             underestimate_ns: None,
@@ -43,6 +52,11 @@ fn selected_heldout_report_retains_missing_receipts_and_unsupported_families() {
         &mut totals,
     );
     assert!(absent["actual_ns"].is_null());
+    assert!(absent["query_identity"].is_null());
+    assert_eq!(
+        unsupported["query_identity"],
+        serde_json::to_value(identity).unwrap()
+    );
     assert_eq!(unsupported["actual_ns"], 123);
     assert_eq!(totals.selected_validation_offered, 2);
     assert_eq!(totals.selected_validation_unknown, 2);
@@ -58,4 +72,13 @@ fn selected_heldout_report_retains_missing_receipts_and_unsupported_families() {
             .get("InsufficientResidual"),
         Some(&1)
     );
+}
+
+fn query_identity() -> SelectedQueryIdentityV1 {
+    SelectedQueryIdentityV1 {
+        schema_version: 1,
+        model_revision: INDEPENDENT_ATTENTION_MODEL_REVISION,
+        family_schema_version: 2,
+        family_signature: [17; 32],
+    }
 }

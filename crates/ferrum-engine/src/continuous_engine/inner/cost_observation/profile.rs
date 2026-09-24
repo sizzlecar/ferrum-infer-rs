@@ -349,6 +349,36 @@ impl EngineCostSnapshot {
         }
     }
 
+    /// Retrospective calibration diagnostics only. The regular planner path
+    /// remains unchanged; the family is returned by the same model lookup.
+    pub fn predict_selected_wave_identified(
+        &self,
+        exact: &ferrum_interfaces::execution_cost::CanonicalWaveCostShape,
+        evidence: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+        local_now_ns: u64,
+    ) -> model::statistical::model::IdentifiedPredictionV1 {
+        match &self.inner {
+            Snapshot::Selected(snapshot) => {
+                let mut result = snapshot.model.predict_identified(
+                    &self.fingerprint,
+                    exact,
+                    evidence,
+                    local_now_ns,
+                );
+                result.prediction = result
+                    .prediction
+                    .and_then(|value| snapshot.apply(value, snapshot.family_signature(evidence)?));
+                result
+            }
+            _ => model::statistical::model::IdentifiedPredictionV1 {
+                query_identity: None,
+                prediction: Err(model::statistical::model::ModelUnknown::Evidence(
+                    ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,
+                )),
+            },
+        }
+    }
+
     pub fn planning_boundary(&self) -> model::CostBoundary {
         match &self.inner {
             Snapshot::Selected(_) => model::CostBoundary::PreparationToHostSettledV1,

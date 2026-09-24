@@ -1,4 +1,5 @@
 use super::*;
+use crate::implementations::continuous::cost_model::statistical::model::IdentifiedPredictionV1;
 #[derive(Debug, Clone)]
 pub struct ImportedWholeWaveModelV1 {
     pub provenance: WholeWaveImportProvenanceV1,
@@ -46,6 +47,25 @@ impl ImportedWholeWaveModelV1 {
                 .model_now_ns(local_now_ns)
                 .map_err(|_| ModelUnknown::Clock)?,
         )
+    }
+    /// Preserve the imported clock translation and error precedence while
+    /// exposing the family selected by the actual read-only lookup.
+    pub fn predict_identified(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        shape: &CanonicalWaveCostShape,
+        evidence: &StatisticalWaveEvidenceV1,
+        local_now_ns: u64,
+    ) -> IdentifiedPredictionV1 {
+        match self.clock.model_now_ns(local_now_ns) {
+            Ok(now) => self
+                .model
+                .predict_identified(fingerprint, shape, evidence, now),
+            Err(_) => IdentifiedPredictionV1 {
+                query_identity: None,
+                prediction: Err(ModelUnknown::Clock),
+            },
+        }
     }
     pub fn predict_input(
         &self,
