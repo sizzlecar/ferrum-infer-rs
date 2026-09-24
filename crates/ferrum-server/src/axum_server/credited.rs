@@ -9,6 +9,7 @@ use ferrum_interfaces::output_flow::{
 mod chat;
 mod evidence;
 pub(super) use chat::stream as chat_stream;
+pub(super) use evidence::EvidenceObservers;
 use ferrum_types::SloOutputTransport;
 
 pub(super) fn enabled(state: &AppState) -> bool {
@@ -47,7 +48,7 @@ pub(super) async fn completions_stream(
         openai_request.model.clone(),
         "/v1/completions",
         None,
-    );
+    )?;
     let engine = state.llm.ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; completions unavailable".into())
     })?;

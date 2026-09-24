@@ -47,7 +47,7 @@ pub(in crate::axum_server) async fn stream(
         request.model.clone(),
         "/v1/chat/completions",
         correlation,
-    );
+    )?;
     let contract = Arc::new(OutputProjectionContract::chat_sse(
         inference_request.id.to_string(),
         request.model,

@@ -751,7 +751,7 @@ Chat 的工具投影完成前仍明确拒绝 alternate；不会篡改模板状�
 
 显式选择 `credited` 后，非流式 Chat、Responses 和非流式 Completions 当前会在
 推理前返回明确的 Unsupported 请求错误，不会退回旧队列。Chat tools、native/Harmony、结构化输出、
-证据历史等也必须有各自的投影存储证明；引擎会拒绝缺少所需能力的组合。
+未声明边界的证据历史等也必须有各自的投影存储证明；引擎会拒绝缺少所需能力的组合。
 这些是本阶段的未完成项，不缩小最终协议覆盖目标。
 
 CLI 支持 `ferrum run ... --prompt "Hello" --output-format text` 的原样文本输出：
@@ -759,9 +759,29 @@ CLI 支持 `ferrum run ... --prompt "Hello" --output-format text` 的原样文�
 实际写入和 flush 返回。一个请求使用一个阻塞 writer，没有中间输出队列；
 操作系统的阻塞写无法由取消异步等待直接中断，未返回的写仍占用额度。
 `--bench-mode` 消费并释放字节但不输出正文；统计写 stderr，区分 token 和文本事件。
-交互历史、JSONL、保留响应的 product profile/request dump 当前明确拒绝，
-`--device-memory-jsonl` 独立可用。后续这些变体也必须各自持有相应的输出/历史额度，
+单次文本请求支持 `--profile-detail basic|latency|kernel` 及 `--profile-jsonl`，
+终态记录与已编码文本共享原请求的额度合同。交互历史、JSONL 输出、CLI request dump、
+memory/scheduler lifecycle sinks 及 replay/debug/verify/full bundle 当前仍明确拒绝；
+`--device-memory-jsonl` 独立可用。这些变体后续仍需各自的输出/历史额度，
 不能用任意文本复制绕过预算。
+
+HTTP credited 文本端点也可保存上述终态 profile；配置 request dump 时，成功请求的
+prompt token ID 证据同样由原请求额度持有。请求在开始执行前按有效 prompt/output
+上限预留证据空间；commit 时间序列和阶段记录不会另建无界历史。阶段记录额度
+用尽后显式计数遗漏，不减少模型工作量、不截断用户输出，也不把部分记录称为完整。
+序列化直接借用带额度的终态对象，写出结束前不释放其内存额度；这不等于客户端
+已经收包，也不证明磁盘持久化。CLI 单次执行会等待该写出结果后再结束。
+
+profile JSONL 可以同时包含 vNext 执行记录与 `phase = "credited_generation"`
+终态记录，应按 phase 及 `attributes.execution_request_id` 关联，不能假定文件
+只有一行或每行都是请求终态。
+
+服务关闭先等待 HTTP drain，再等待已登记的终态证据写出，之后清理引擎；
+这些步骤及并发关闭的串行等待共用 `HttpServer::stop(timeout)` 的同一个截止时间。
+写出失败或超时会使关闭返回错误，同时仍尝试在原截止时间内清理引擎；
+实际写出错误在再次关闭时仍保留。超时不能中断操作系统的阻塞文件写，
+尚未完成的写仍持有原额度，后续关闭可以继续等待；不得将超时返回解释为内存已经释放。
+这不保证真实引擎清理过程被取消后可以安全重试，也不保证 Tokio runtime 销毁有相同时间上限。
 
 上述额度覆盖已声明的输出、解码工作区和 completion matcher；当前用户
 `stop_sequences` 在引擎构造停止条件时仍调用通用 tokenizer encode。该编码的

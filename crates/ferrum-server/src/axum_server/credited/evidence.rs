@@ -4,6 +4,8 @@ use ferrum_interfaces::{
     output_credit::LeasedOutput,
     output_flow::{CreditedExecutionProfile, CreditedPromptEvidence, OutputCompletion},
 };
+mod drain;
+pub(in crate::axum_server) use drain::EvidenceObservers;
 
 pub(super) struct Observer {
     state: AppState,
@@ -11,6 +13,7 @@ pub(super) struct Observer {
     endpoint: &'static str,
     correlation: Option<BenchmarkRequestCorrelation>,
     started: Instant,
+    ticket: drain::Ticket,
 }
 impl Observer {
     pub(super) fn new(
@@ -18,38 +21,58 @@ impl Observer {
         model: String,
         endpoint: &'static str,
         correlation: Option<BenchmarkRequestCorrelation>,
-    ) -> Option<Self> {
-        (state.profile_jsonl.is_some() || state.request_dump_dir.is_some()).then(|| Self {
+    ) -> std::result::Result<Option<Self>, ServerError> {
+        if state.profile_jsonl.is_none() && state.request_dump_dir.is_none() {
+            return Ok(None);
+        }
+        // Register before the asynchronous engine admission. A startup error
+        // drops an unarmed reservation; an accepted session arms the obligation.
+        let ticket = state
+            .credited_evidence
+            .register()
+            .map_err(|error| ServerError::ServiceUnavailable(error.to_owned()))?;
+        Ok(Some(Self {
             state: state.clone(),
             model,
             endpoint,
             correlation,
             started: Instant::now(),
-        })
+            ticket,
+        }))
     }
     pub(super) fn spawn(
-        self,
+        mut self,
         completion: tokio::sync::oneshot::Receiver<LeasedOutput<OutputCompletion>>,
     ) {
+        self.ticket.arm();
         tokio::spawn(async move {
             match completion.await {
                 Ok(completion) => {
                     let elapsed = elapsed_us_since(self.started);
+                    // The ticket moves into the blocking closure too. Cancelling
+                    // its async waiter cannot claim an in-progress write drained
+                    // or release the completion's lease underneath serialization.
                     if let Err(error) = tokio::task::spawn_blocking(move || {
-                        self.write(Arc::new(completion), elapsed)
+                        let result = self.write(Arc::new(completion), elapsed);
+                        self.ticket.finish(result);
                     })
                     .await
                     {
                         warn!("credited evidence writer task failed: {error}");
                     }
                 }
-                Err(error) => {
-                    warn!("credited completion closed before diagnostic evidence: {error}")
-                }
+                Err(error) => self.ticket.finish(Err(format!(
+                    "credited completion closed before diagnostic evidence: {error}"
+                ))),
             }
         });
     }
-    fn write(self, completion: Arc<LeasedOutput<OutputCompletion>>, elapsed: u64) {
+    fn write(
+        &self,
+        completion: Arc<LeasedOutput<OutputCompletion>>,
+        elapsed: u64,
+    ) -> std::result::Result<(), String> {
+        let mut first_error = None;
         if let Some(path) = self.state.profile_jsonl.as_ref() {
             let mut attributes = BTreeMap::new();
             extend_benchmark_profile_attributes(&mut attributes, self.correlation.as_ref());
@@ -75,6 +98,7 @@ impl Observer {
             });
             if let Err(error) = result {
                 warn!("failed to write credited request profile: {error}");
+                first_error = Some(format!("credited request profile write failed: {error}"));
             }
         }
         if let Some(root) = self
@@ -91,14 +115,18 @@ impl Observer {
                         &dir.join("prompt_token_ids.json"),
                         CreditedPromptEvidence {
                             completion,
-                            model: self.model,
+                            model: self.model.clone(),
                         },
                     )
                     .map_err(|e| e.to_string())
                 });
             if let Err(error) = result {
                 warn!("failed to write credited prompt evidence: {error}");
+                first_error.get_or_insert_with(|| {
+                    format!("credited prompt evidence write failed: {error}")
+                });
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }

@@ -671,3 +671,5 @@ async fn credited_text_latency_and_kernel_profiles_consume_terminal_evidence_and
         }
     }
 }
+
+mod shutdown;

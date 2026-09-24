@@ -406,6 +406,7 @@ pub struct AppState {
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
     pub first_request_memory_recorded: Arc<AtomicBool>,
     cache: Arc<CacheRuntimeState>,
+    credited_evidence: Arc<credited::EvidenceObservers>,
 }
 
 impl AppState {
@@ -1163,13 +1164,20 @@ impl HttpServer for AxumServer {
     }
 
     async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
-        let _stop_guard = self.lifecycle.stop_lock.lock().await;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::invalid_parameter("server shutdown timeout overflow"))?;
+        let _stop_guard = tokio::time::timeout_at(deadline, self.lifecycle.stop_lock.lock())
+            .await
+            .map_err(|_| {
+                Error::internal("server shutdown deadline expired waiting for another stop")
+            })?;
         info!("Stopping Axum server");
         self.lifecycle.request_shutdown();
 
         let mut first_error = None;
         if self.lifecycle.running.load(Ordering::Acquire) {
-            if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
+            if tokio::time::timeout_at(deadline, self.lifecycle.wait_until_stopped())
                 .await
                 .is_err()
             {
@@ -1180,8 +1188,30 @@ impl HttpServer for AxumServer {
             }
         }
 
+        // HTTP drain closes the set of accepted observers. Keep engines alive
+        // while terminal receivers and their same-lease file writes finish.
+        // On HTTP timeout leave registration open for already running handlers;
+        // this call has already failed and cannot certify a drained server.
+        if !self.lifecycle.running.load(Ordering::Acquire) {
+            self.state.credited_evidence.seal();
+        }
+        match tokio::time::timeout_at(deadline, self.state.credited_evidence.drain()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!("credited evidence shutdown failed: {error}");
+                first_error.get_or_insert_with(|| Error::internal(error));
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| {
+                    Error::internal("credited evidence did not drain before server shutdown deadline; writes and leases may remain live")
+                });
+            }
+        }
+
+        // Always attempt engine cleanup, including after HTTP/evidence failure.
+        // Reuse the original absolute deadline; no phase receives a new budget.
         if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
-            match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
+            match tokio::time::timeout_at(deadline, self.shutdown_loaded_engines()).await {
                 Ok(Ok(())) => {
                     self.lifecycle
                         .engines_stopped
