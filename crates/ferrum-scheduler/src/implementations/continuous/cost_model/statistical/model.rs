@@ -15,6 +15,50 @@ pub(crate) mod tests;
 pub const MODEL_REVISION: &str = "whole_wave_piecewise_affine_v1";
 pub const INDEPENDENT_ATTENTION_MODEL_REVISION: &str =
     "whole_wave_piecewise_affine_independent_attention_v2";
+pub const WORK_SUPPORT_MODEL_REVISION: &str =
+    "whole_wave_piecewise_affine_independent_attention_work_support_v1";
+/// Model semantics are separate from the producer's statistical family schema.
+/// WorkSupportV1 still consumes the exact V2 family and original 26-field data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WholeWaveModelRevision {
+    OrderedV1,
+    IndependentAttentionV2,
+    IndependentAttentionWorkSupportV1,
+}
+impl WholeWaveModelRevision {
+    pub fn family(self) -> SelectedStatisticalFamily {
+        match self {
+            Self::OrderedV1 => SelectedStatisticalFamily::OrderedV1,
+            Self::IndependentAttentionV2 | Self::IndependentAttentionWorkSupportV1 => {
+                SelectedStatisticalFamily::IndependentAttentionV2
+            }
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrderedV1 => MODEL_REVISION,
+            Self::IndependentAttentionV2 => INDEPENDENT_ATTENTION_MODEL_REVISION,
+            Self::IndependentAttentionWorkSupportV1 => WORK_SUPPORT_MODEL_REVISION,
+        }
+    }
+    pub fn fit(
+        self,
+        fingerprint: ExecutionFingerprint,
+        settings: WholeWaveSettingsV1,
+        partition: CalibrationPartitionV1,
+        samples: &[WholeWaveObservationV1],
+        now_ns: u64,
+    ) -> Result<FittedWholeWaveModelV1, ModelUnknown> {
+        FittedWholeWaveModelV1::fit_for_revision(
+            fingerprint,
+            settings,
+            partition,
+            samples,
+            now_ns,
+            self,
+        )
+    }
+}
 impl SelectedStatisticalFamily {
     pub fn model_revision(self) -> &'static str {
         match self {
@@ -150,6 +194,7 @@ struct FittedSegment {
 #[derive(Debug, Clone)]
 pub struct FittedWholeWaveModelV1 {
     family: SelectedStatisticalFamily,
+    revision: WholeWaveModelRevision,
     fingerprint: ExecutionFingerprint,
     settings: WholeWaveSettingsV1,
     partition: CalibrationPartitionV1,
@@ -172,6 +217,7 @@ struct CalibratedSegment {
 #[derive(Debug, Clone)]
 pub struct WholeWaveModelV1 {
     family: SelectedStatisticalFamily,
+    revision: WholeWaveModelRevision,
     fingerprint: ExecutionFingerprint,
     settings: WholeWaveSettingsV1,
     partition: CalibrationPartitionV1,
@@ -200,10 +246,11 @@ pub struct SelectedQueryIdentityV1 {
     pub family_signature: [u8; 32],
 }
 impl SelectedQueryIdentityV1 {
-    fn new(family: SelectedStatisticalFamily, signature: [u8; 32]) -> Self {
+    fn new(revision: WholeWaveModelRevision, signature: [u8; 32]) -> Self {
+        let family = revision.family();
         Self {
             schema_version: 1,
-            model_revision: family.model_revision(),
+            model_revision: revision.as_str(),
             family_schema_version: match family {
                 SelectedStatisticalFamily::OrderedV1 => 1,
                 SelectedStatisticalFamily::IndependentAttentionV2 => 2,
@@ -245,7 +292,7 @@ impl FittedWholeWaveModelV1 {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"ferrum.whole-wave.frozen-fit.v1\0");
-        hash.update(self.family.model_revision().as_bytes());
+        hash.update(self.revision.as_str().as_bytes());
         for (family, fitted) in &self.segments {
             hash.update(family);
             hash.update((fitted.samples as u64).to_le_bytes());
@@ -263,13 +310,13 @@ impl FittedWholeWaveModelV1 {
         samples: &[WholeWaveObservationV1],
         now_ns: u64,
     ) -> Result<Self, ModelUnknown> {
-        Self::fit_for_family(
+        Self::fit_for_revision(
             fingerprint,
             settings,
             partition,
             samples,
             now_ns,
-            SelectedStatisticalFamily::OrderedV1,
+            WholeWaveModelRevision::OrderedV1,
         )
     }
     /// New capture only: every sample must carry the independently produced V2
@@ -281,23 +328,39 @@ impl FittedWholeWaveModelV1 {
         samples: &[WholeWaveObservationV1],
         now_ns: u64,
     ) -> Result<Self, ModelUnknown> {
-        Self::fit_for_family(
+        Self::fit_for_revision(
             fingerprint,
             settings,
             partition,
             samples,
             now_ns,
-            SelectedStatisticalFamily::IndependentAttentionV2,
+            WholeWaveModelRevision::IndependentAttentionV2,
         )
     }
-    fn fit_for_family(
+    pub fn fit_work_support_v1(
         fingerprint: ExecutionFingerprint,
         settings: WholeWaveSettingsV1,
         partition: CalibrationPartitionV1,
         samples: &[WholeWaveObservationV1],
         now_ns: u64,
-        family: SelectedStatisticalFamily,
     ) -> Result<Self, ModelUnknown> {
+        WholeWaveModelRevision::IndependentAttentionWorkSupportV1.fit(
+            fingerprint,
+            settings,
+            partition,
+            samples,
+            now_ns,
+        )
+    }
+    fn fit_for_revision(
+        fingerprint: ExecutionFingerprint,
+        settings: WholeWaveSettingsV1,
+        partition: CalibrationPartitionV1,
+        samples: &[WholeWaveObservationV1],
+        now_ns: u64,
+        revision: WholeWaveModelRevision,
+    ) -> Result<Self, ModelUnknown> {
+        let family = revision.family();
         settings_valid(&settings)?;
         partition.validate()?;
         let groups = group_samples(
@@ -317,7 +380,11 @@ impl FittedWholeWaveModelV1 {
                 continue;
             }
             let affine = Affine::fit(&points)?;
-            let support = Support::new(points.iter().map(|(input, _, _)| coordinates(input)))?;
+            let support = Support::new(
+                points
+                    .iter()
+                    .map(|(input, _, _)| coordinates(input, revision)),
+            )?;
             let expires_at_ns = expires(&points, &settings)?;
             segments.insert(
                 family,
@@ -334,6 +401,7 @@ impl FittedWholeWaveModelV1 {
         }
         Ok(Self {
             family,
+            revision,
             fingerprint,
             settings,
             partition,
@@ -416,7 +484,7 @@ impl FittedWholeWaveModelV1 {
             let mut errors = Vec::with_capacity(points.len());
             if points
                 .iter()
-                .any(|(input, _, _)| !fit.support.contains(&coordinates(input)))
+                .any(|(input, _, _)| !fit.support.contains(&coordinates(input, self.revision)))
             {
                 unavailable.insert(family, ModelUnknown::JointSupport);
                 continue;
@@ -428,7 +496,11 @@ impl FittedWholeWaveModelV1 {
             let index = ((errors.len() as f64 * self.settings.residual_quantile).ceil() as usize)
                 .saturating_sub(1)
                 .min(errors.len() - 1);
-            let support = Support::new(points.iter().map(|(input, _, _)| coordinates(input)))?;
+            let support = Support::new(
+                points
+                    .iter()
+                    .map(|(input, _, _)| coordinates(input, self.revision)),
+            )?;
             let expiry = expires(&points, &self.settings)?.min(fit.expires_at_ns);
             unavailable.remove(&family);
             segments.insert(
@@ -449,6 +521,7 @@ impl FittedWholeWaveModelV1 {
         calibration_calls.extend(residual.iter().map(|s| s.call_id));
         Ok(WholeWaveModelV1 {
             family: self.family,
+            revision: self.revision,
             fingerprint: self.fingerprint,
             settings: self.settings,
             partition: self.partition,
@@ -460,6 +533,9 @@ impl FittedWholeWaveModelV1 {
     }
 }
 impl WholeWaveModelV1 {
+    pub fn revision(&self) -> WholeWaveModelRevision {
+        self.revision
+    }
     pub fn selected_family(&self) -> SelectedStatisticalFamily {
         self.family
     }
@@ -533,7 +609,7 @@ impl WholeWaveModelV1 {
 
         validate_input(input, &self.settings)?;
         let family = input.family_signature_for(self.family)?;
-        identify(SelectedQueryIdentityV1::new(self.family, *family));
+        identify(SelectedQueryIdentityV1::new(self.revision, *family));
         let segment = self.segments.get(family).ok_or_else(|| {
             self.unavailable
                 .get(family)
@@ -543,7 +619,7 @@ impl WholeWaveModelV1 {
         if now_ns > segment.expires_at_ns {
             return Err(ModelUnknown::Stale);
         }
-        let values = coordinates(input);
+        let values = coordinates(input, self.revision);
         if !segment.fit.support.contains(&values) || !segment.support.contains(&values) {
             return Err(ModelUnknown::JointSupport);
         }

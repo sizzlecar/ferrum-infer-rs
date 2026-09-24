@@ -330,3 +330,5 @@ fn q99_is_an_empirical_quantile_not_a_maximum_or_heldout_guarantee() {
 }
 
 pub(crate) mod independent_rows;
+
+pub(crate) mod work_support;

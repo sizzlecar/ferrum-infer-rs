@@ -27,6 +27,9 @@ pub struct WholeWaveImportProvenanceV1 {
     pub residual_through_ordinal: u64,
 }
 impl ImportedWholeWaveModelV1 {
+    pub fn model_revision(&self) -> WholeWaveModelRevision {
+        self.model.revision()
+    }
     pub fn selected_family(
         &self,
     ) -> super::super::super::cost_model::statistical::SelectedStatisticalFamily {
@@ -203,7 +206,25 @@ pub(in crate::implementations::continuous::cost_profile) fn import_selected_prof
     clock: ProfileLoadClock,
     family: super::super::super::cost_model::statistical::SelectedStatisticalFamily,
 ) -> Result<ImportedWholeWaveModelV1, CostProfileError> {
-    if file.model_revision != family.model_revision() {
+    let revision = match family {
+        super::super::super::cost_model::statistical::SelectedStatisticalFamily::OrderedV1 => WholeWaveModelRevision::OrderedV1,
+        super::super::super::cost_model::statistical::SelectedStatisticalFamily::IndependentAttentionV2 => WholeWaveModelRevision::IndependentAttentionV2,
+    };
+    import_selected_profile_revision(file, bytes, fingerprint, settings, limits, clock, revision)
+}
+pub(in crate::implementations::continuous::cost_profile) fn import_selected_profile_revision<
+    S: SelectedProfileRecord,
+>(
+    file: WholeWaveProfileFile<S>,
+    bytes: &[u8],
+    fingerprint: &ExecutionFingerprint,
+    settings: &WholeWaveSettingsV1,
+    limits: &CostProfileLoadLimits,
+    clock: ProfileLoadClock,
+    revision: WholeWaveModelRevision,
+) -> Result<ImportedWholeWaveModelV1, CostProfileError> {
+    let family = revision.family();
+    if file.model_revision != revision.as_str() {
         return Err(CostProfileError::Metadata(
             "unsupported whole-wave model revision",
         ));
@@ -340,18 +361,15 @@ pub(in crate::implementations::continuous::cost_profile) fn import_selected_prof
             }
         }
     }
-    let fit_model = match family {
-        super::super::super::cost_model::statistical::SelectedStatisticalFamily::OrderedV1 => FittedWholeWaveModelV1::fit,
-        super::super::super::cost_model::statistical::SelectedStatisticalFamily::IndependentAttentionV2 => FittedWholeWaveModelV1::fit_independent_attention_v2,
-    };
-    let frozen = fit_model(
-        fingerprint.clone(),
-        settings.clone(),
-        partition,
-        &fit,
-        anchor,
-    )
-    .map_err(|_| CostProfileError::Metadata("invalid independent fit calibration"))?;
+    let frozen = revision
+        .fit(
+            fingerprint.clone(),
+            settings.clone(),
+            partition,
+            &fit,
+            anchor,
+        )
+        .map_err(|_| CostProfileError::Metadata("invalid independent fit calibration"))?;
     if frozen.parameter_signature() != file.fit_parameters_sha256 {
         return Err(CostProfileError::Metadata(
             "frozen fit parameter digest mismatch",

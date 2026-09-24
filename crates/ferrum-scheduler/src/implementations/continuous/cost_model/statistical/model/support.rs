@@ -2,7 +2,10 @@ use super::*;
 /// Full observed coordinates, not just the regression axes. Frozen joint
 /// evidence is bounded by the original per-bucket sample limit.
 pub(super) const AXES: usize = 26;
-pub(super) fn coordinates(input: &StatisticalModelInputV1) -> [u64; AXES] {
+pub(super) fn coordinates(
+    input: &StatisticalModelInputV1,
+    revision: WholeWaveModelRevision,
+) -> [u64; AXES] {
     let d = input.device();
     let h = input.host_and_sequence();
     [
@@ -24,7 +27,14 @@ pub(super) fn coordinates(input: &StatisticalModelInputV1) -> [u64; AXES] {
         h.prompt_tokens_sum,
         h.prompt_tokens_max,
         h.generated_tokens_sum,
-        h.output_budget_sum,
+        // Keep the raw metadata and all authority checks intact. Only the
+        // explicitly versioned work-support projection removes this non-work
+        // coordinate; zero is a fixed inactive slot, not fabricated observation.
+        if revision == WholeWaveModelRevision::IndependentAttentionWorkSupportV1 {
+            0
+        } else {
+            h.output_budget_sum
+        },
         h.sampling_history_sum,
         h.sampling_history_max,
         h.repetition_tokens_sum,

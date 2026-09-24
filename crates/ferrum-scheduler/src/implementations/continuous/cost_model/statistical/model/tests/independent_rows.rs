@@ -1,6 +1,15 @@
 use super::*;
 
 pub(crate) fn independent_sample(ordinal: u64, rows: [bool; 3]) -> WholeWaveObservationV1 {
+    independent_sample_with_state(ordinal, rows, 1, 16, 0)
+}
+pub(crate) fn independent_sample_with_state(
+    ordinal: u64,
+    rows: [bool; 3],
+    generated: u64,
+    maximum: u64,
+    extra_kv: u32,
+) -> WholeWaveObservationV1 {
     let mut command = SelectedCommandCostBuilderV1::new(3);
     let emit = |b: &mut SelectedCommandCostBuilderV1, name: &str| {
         b.kernel(
@@ -54,7 +63,7 @@ pub(crate) fn independent_sample(ordinal: u64, rows: [bool; 3]) -> WholeWaveObse
     for grouped in rows {
         b.row(CanonicalCostRow {
             work: ActualRowWork::Decode {
-                kv_tokens: if grouped { 300 } else { 100 },
+                kv_tokens: (if grouped { 300 } else { 100 }) + extra_kv,
             },
             host_policy_signature: [1; 32],
             mask_upload_required: false,
@@ -72,9 +81,9 @@ pub(crate) fn independent_sample(ordinal: u64, rows: [bool; 3]) -> WholeWaveObse
                     raw_token_bytes_bound: 4,
                 },
                 state: HostCostStateV1 {
-                    generated_tokens_before: 1,
-                    maximum_output_tokens: 16,
-                    sampling_history_tokens: 1,
+                    generated_tokens_before: generated,
+                    maximum_output_tokens: maximum,
+                    sampling_history_tokens: generated,
                     sampling_history_scope: CostSamplingHistoryScope::FullGeneration,
                     pending_decoded_utf8: false,
                     completion_state_signature: satisfied_completion_cost_signature(),

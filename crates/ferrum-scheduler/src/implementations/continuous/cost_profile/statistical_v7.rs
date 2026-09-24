@@ -1,10 +1,11 @@
 //! Explicit profile7 for independent-attention empirical families. The fitting,
 //! residual, source/clock, capacity and exact-binding rules are shared with V1;
 //! old profile6 records cannot provide or synthesize the required V2 sidecar.
+#[cfg(test)]
+use super::super::cost_model::statistical::model::FittedWholeWaveModelV1;
 use super::super::cost_model::statistical::{
     model::{
-        CalibrationPartitionV1, FittedWholeWaveModelV1, WholeWaveObservationV1,
-        WholeWaveSettingsV1, INDEPENDENT_ATTENTION_MODEL_REVISION,
+        CalibrationPartitionV1, WholeWaveModelRevision, WholeWaveObservationV1, WholeWaveSettingsV1,
     },
     SelectedStatisticalFamily,
 };
@@ -75,20 +76,64 @@ impl CostProfileFileV7 {
         fit: &[WholeWaveObservationV1],
         residual: &[WholeWaveObservationV1],
     ) -> Result<Self, CostProfileError> {
+        Self::from_capture_for_revision(
+            fingerprint,
+            settings,
+            partition,
+            source,
+            generated_monotonic_ns,
+            generated_unix_ns,
+            source_clock_max_error_ns,
+            frozen_fit_parameters_sha256,
+            fit,
+            residual,
+            WholeWaveModelRevision::IndependentAttentionV2,
+            COST_PROFILE_SCHEMA_VERSION_V7,
+        )
+    }
+    /// Shared record construction; both versions retain identical raw fields.
+    /// The caller must choose the matching explicit model/schema pair.
+    pub(super) fn from_capture_for_revision(
+        fingerprint: &ExecutionFingerprint,
+        settings: &WholeWaveSettingsV1,
+        partition: CalibrationPartitionV1,
+        source: ProfileSource,
+        generated_monotonic_ns: u64,
+        generated_unix_ns: u64,
+        source_clock_max_error_ns: u64,
+        frozen_fit_parameters_sha256: [u8; 32],
+        fit: &[WholeWaveObservationV1],
+        residual: &[WholeWaveObservationV1],
+        revision: WholeWaveModelRevision,
+        schema_version: u32,
+    ) -> Result<Self, CostProfileError> {
+        if !matches!(
+            (revision, schema_version),
+            (
+                WholeWaveModelRevision::IndependentAttentionV2,
+                COST_PROFILE_SCHEMA_VERSION_V7
+            ) | (
+                WholeWaveModelRevision::IndependentAttentionWorkSupportV1,
+                super::statistical_v8::COST_PROFILE_SCHEMA_VERSION_V8
+            )
+        ) {
+            return Err(CostProfileError::Metadata("model/schema revision mismatch"));
+        }
         if source.observation_artifact_sha256 == [0; 32] || frozen_fit_parameters_sha256 == [0; 32]
         {
             return Err(CostProfileError::Metadata(
                 "unsealed source or missing frozen fit",
             ));
         }
-        let frozen = FittedWholeWaveModelV1::fit_independent_attention_v2(
-            fingerprint.clone(),
-            settings.clone(),
-            partition,
-            fit,
-            generated_monotonic_ns,
-        )
-        .map_err(|_| CostProfileError::Metadata("invalid independent-attention fit"))?;
+        let frozen = revision
+            .fit(
+                fingerprint.clone(),
+                settings.clone(),
+                partition,
+                fit,
+                generated_monotonic_ns,
+            )
+            .map_err(|_| CostProfileError::Metadata("invalid independent-attention fit"))?;
         if frozen.parameter_signature() != frozen_fit_parameters_sha256 {
             return Err(CostProfileError::Metadata(
                 "fit changed after its pre-residual freeze",
@@ -136,8 +181,8 @@ impl CostProfileFileV7 {
         Ok(Self {
             capture_identity_sha256: partition.source_sha256,
             fit_parameters_sha256: frozen_fit_parameters_sha256,
-            schema_version: COST_PROFILE_SCHEMA_VERSION_V7,
-            model_revision: INDEPENDENT_ATTENTION_MODEL_REVISION.into(),
+            schema_version,
+            model_revision: revision.as_str().into(),
             fingerprint: fingerprint.into(),
             settings: settings.into(),
             generated_unix_ns,
