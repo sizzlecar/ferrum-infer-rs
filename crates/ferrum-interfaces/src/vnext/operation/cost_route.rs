@@ -128,6 +128,84 @@ impl<'a> OperationCostRouteRequest<'a> {
         ))
     }
 
+    /// Complete resident sequence window as page-aligned extents in actual
+    /// physical-row order. Adjacent pages stay coalesced: extent count is bounded
+    /// by the captured resource limits, never multiplied by context length. Numeric
+    /// evidence only: no sequence identity, address or page grants execution.
+    /// Missing, partial, or non-paged evidence stays unavailable.
+    pub fn binding_sequence_ranges(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+        participant_index: usize,
+        expected_bytes: u64,
+        page_bytes: u64,
+    ) -> Result<Option<Vec<crate::vnext::DeviceCostBufferRange>>, VNextError> {
+        let binding = self
+            .bindings()
+            .iter()
+            .find(|v| v.role() == role && v.ordinal() == ordinal)
+            .ok_or_else(|| invalid_operation("cost pages requested unknown binding"))?;
+        let [component] = binding.storage().components() else {
+            return Ok(None);
+        };
+        if participant_index >= self.rows.len()
+            || expected_bytes == 0
+            || page_bytes == 0
+            || !expected_bytes.is_multiple_of(page_bytes)
+            || component.offset_bytes() != 0
+        {
+            return Ok(None);
+        }
+        let Some(descriptor) = self
+            .memory
+            .dynamic_descriptors()
+            .iter()
+            .find(|d| d.base_resource_id() == component.resource_id())
+        else {
+            return Ok(None);
+        };
+        if descriptor.lifetime() != crate::vnext::AllocationLifetime::Sequence
+            || descriptor.storage().profile().view()
+                != (crate::vnext::DynamicStorageView::PagedRegions {
+                    block_bytes: page_bytes,
+                })
+            || descriptor.element_type() != component.element_type()
+        {
+            return Ok(None);
+        }
+        let row = self.rows[participant_index];
+        let end = row
+            .offset
+            .checked_add(row.count.get())
+            .ok_or_else(|| invalid_operation("cost page frontier overflows"))?;
+        if descriptor.evaluate_request_bytes_for_shape(
+            crate::vnext::DynamicResourceShape::from_validated(1, end, 0),
+        )? != expected_bytes
+        {
+            return Ok(None);
+        }
+        let Some(ranges) = self
+            .physical_ranges
+            .and_then(|proof| proof.sequence(participant_index, component.resource_id()))
+        else {
+            return Ok(None);
+        };
+        let mut bytes = 0_u64;
+        for range in ranges {
+            if !range.length().is_multiple_of(page_bytes) {
+                return Ok(None);
+            }
+            bytes = bytes
+                .checked_add(range.length())
+                .ok_or_else(|| invalid_operation("cost page extent overflows"))?;
+            if bytes > expected_bytes {
+                return Ok(None);
+            }
+        }
+        Ok((bytes == expected_bytes && !ranges.is_empty()).then(|| ranges.to_vec()))
+    }
+
     pub fn node_id(&self) -> &NodeId {
         self.node.id()
     }

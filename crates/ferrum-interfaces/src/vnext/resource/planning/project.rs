@@ -105,7 +105,20 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     )
                     .map_err(|_| U::InvalidDemand)?;
                 charge_logical(&mut next, &demand, &mut domains, true)?;
-                reserve(&mut next, &requests, view.limits, budget)?;
+                let allocated = reserve(&mut next, &requests, view.limits, budget)?;
+                if view.physical_ranges.is_some() {
+                    sequence_ranges::extend(
+                        &mut next.sequence_ranges[row.participant_index],
+                        &requests,
+                        &allocated,
+                        view.limits.maximum_free_extents,
+                        budget,
+                    )?;
+                    sequence_ranges::check_bound(
+                        &next.sequence_ranges,
+                        view.limits.maximum_free_extents,
+                    )?;
+                }
                 next.covered[row.participant_index] = target;
             }
         }
@@ -237,6 +250,9 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                 .ok_or(U::InvalidDemand)?;
         }
         check_extent_bound(&next, view.limits)?;
+        if let (Some(physical), Some(proof)) = (&view.physical_ranges, physical_proof.as_mut()) {
+            physical.insert_sequence_ranges(proof, &next.sequence_ranges, rows, budget)?;
+        }
         poll(budget)?;
         next.waves += 1;
         Ok(ResourcePlanningProjection {

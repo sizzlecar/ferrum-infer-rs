@@ -16,6 +16,7 @@ mod capture;
 mod cost_route;
 mod physical_ranges;
 mod project;
+mod sequence_ranges;
 mod workspace;
 pub(crate) use physical_ranges::ResourceCostRangeProof;
 
@@ -218,6 +219,7 @@ pub struct ResourcePlanningView {
     participants: Vec<ResourcePlanningParticipant>,
     workspace: Option<workspace::WorkspaceReadView>,
     physical_ranges: Option<physical_ranges::PhysicalRanges>,
+    sequence_ranges: sequence_ranges::SequenceRanges,
 }
 
 impl ResourcePlanningView {
@@ -248,6 +250,7 @@ impl ResourcePlanningView {
                 .map(|domain| (domain.domain(), domain.available().get()))
                 .collect(),
             covered: self.participants.iter().map(|p| p.covered).collect(),
+            sequence_ranges: self.sequence_ranges.clone(),
             waves: 0,
         }
     }
@@ -264,6 +267,7 @@ impl ResourcePlanningView {
             && self.participants == other.participants
             && self.workspace == other.workspace
             && self.physical_ranges == other.physical_ranges
+            && self.sequence_ranges == other.sequence_ranges
     }
 }
 
@@ -274,6 +278,7 @@ pub struct ResourcePlanningState {
     workspace: Option<workspace::WorkspaceReadView>,
     logical_available: BTreeMap<CapacityDomainId, u64>,
     covered: Vec<DynamicResourceShape>,
+    sequence_ranges: sequence_ranges::SequenceRanges,
     waves: usize,
 }
 

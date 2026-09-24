@@ -99,6 +99,8 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         let mut slots = Vec::with_capacity(sessions.len());
         let mut backings = Vec::with_capacity(sessions.len());
         let mut participants = Vec::with_capacity(sessions.len());
+        let mut sequence_ranges = Vec::with_capacity(sessions.len());
+        let mut sequence_segments = 0_usize;
         for session in sessions {
             poll(poll_budget)?;
             if session.resources().coordinator_id() != pools.logical_admission.id()
@@ -140,6 +142,16 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             if backing.committed_pages() != 0 {
                 return Err(U::Unsupported);
             }
+            sequence_ranges.push(if physical_ranges.is_some() {
+                sequence_ranges::capture(
+                    backing.backing_slices(),
+                    limits.maximum_free_extents,
+                    &mut sequence_segments,
+                    poll_budget,
+                )?
+            } else {
+                Arc::new(BTreeMap::new())
+            });
             participants.push(ResourcePlanningParticipant {
                 authority: session.sequence_authority(),
                 epoch: session.epoch(),
@@ -293,6 +305,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     participants,
                     workspace,
                     physical_ranges,
+                    sequence_ranges,
                 })
             })
             .map_err(|_| U::BusyOrUnavailable)?

@@ -1,5 +1,5 @@
 //! Fenced numeric copies of actual resident addresses. No buffer or lease is
-//! retained. Metal/default runtimes skip this opt-in path entirely.
+//! retained. Runtimes must explicitly provide stable numeric allocation evidence.
 use super::*;
 use crate::vnext::DeviceCostBufferRange;
 
@@ -13,9 +13,20 @@ pub(super) struct PhysicalRanges {
 pub(crate) struct ResourceCostRangeProof {
     static_ranges: Arc<BTreeMap<ResourceId, (u64, DeviceCostBufferRange)>>,
     dynamic_ranges: BTreeMap<ResourceId, DeviceCostBufferRange>,
+    sequence_ranges: Vec<BTreeMap<ResourceId, Vec<DeviceCostBufferRange>>>,
 }
 
 impl ResourceCostRangeProof {
+    pub(crate) fn sequence(
+        &self,
+        participant: usize,
+        resource: &ResourceId,
+    ) -> Option<&[DeviceCostBufferRange]> {
+        self.sequence_ranges
+            .get(participant)?
+            .get(resource)
+            .map(Vec::as_slice)
+    }
     pub(crate) fn get(&self, resource: &ResourceId) -> Option<DeviceCostBufferRange> {
         self.dynamic_ranges
             .get(resource)
@@ -54,7 +65,10 @@ pub(super) fn capture_static<R: DeviceRuntime>(
                 return Err(U::StaleIdentity);
             }
             let Some(range) = resources.runtime.cost_buffer_range(buffer) else {
-                return Ok(None);
+                // A segmented static arena need not have one physical range.
+                // Keep independent resident dynamic proofs; this missing static
+                // binding itself remains unavailable to its provider query.
+                continue;
             };
             if range.length() != descriptor.size_bytes {
                 return Err(U::InvalidDemand);
@@ -78,7 +92,41 @@ impl PhysicalRanges {
         ResourceCostRangeProof {
             static_ranges: Arc::clone(&self.static_ranges),
             dynamic_ranges: BTreeMap::new(),
+            sequence_ranges: Vec::new(),
         }
+    }
+
+    pub(super) fn insert_sequence_ranges(
+        &self,
+        proof: &mut ResourceCostRangeProof,
+        sequences: &sequence_ranges::SequenceRanges,
+        rows: &[ResourcePlanningRow],
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<(), ResourcePlanningUnknown> {
+        use ResourcePlanningUnknown as U;
+        let mut selected = Vec::with_capacity(rows.len());
+        for row in rows {
+            poll(budget)?;
+            let source = sequences
+                .get(row.participant_index)
+                .ok_or(U::InvalidInput)?;
+            let mut resources = BTreeMap::new();
+            for (resource, segments) in source.iter() {
+                let mut ranges = Vec::with_capacity(segments.len());
+                for segment in segments.iter() {
+                    poll(budget)?;
+                    let base = self.chunks.get(segment.chunk()).ok_or(U::StaleIdentity)?;
+                    ranges.push(
+                        base.slice(segment.offset_bytes(), segment.length_bytes())
+                            .ok_or(U::InvalidDemand)?,
+                    );
+                }
+                resources.insert(resource.clone(), ranges);
+            }
+            selected.push(resources);
+        }
+        proof.sequence_ranges = selected;
+        Ok(())
     }
 
     pub(super) fn insert_projection(
@@ -173,6 +221,57 @@ mod tests {
                 DeviceCostBufferRange::new(4096, 256).unwrap(),
             )]),
         }
+    }
+    #[test]
+    fn selected_sequence_ranges_preserve_row_order_aliases_and_chunk_generation() {
+        let view = capture();
+        let resource = resource("kv");
+        let sequences = vec![
+            Arc::new(BTreeMap::from([(
+                resource.clone(),
+                Arc::new(vec![segment(2, 0, 64)]),
+            )])),
+            Arc::new(BTreeMap::from([(
+                resource.clone(),
+                Arc::new(vec![segment(2, 32, 64)]),
+            )])),
+        ];
+        let rows = [
+            ResourcePlanningRow {
+                participant_index: 1,
+                start_token: 7,
+                token_count: 1,
+            },
+            ResourcePlanningRow {
+                participant_index: 0,
+                start_token: 3,
+                token_count: 1,
+            },
+        ];
+        let mut proof = view.proof();
+        view.insert_sequence_ranges(&mut proof, &sequences, &rows, &mut || true)
+            .unwrap();
+        let first = proof.sequence(0, &resource).unwrap()[0];
+        let second = proof.sequence(1, &resource).unwrap()[0];
+        assert_eq!(first.start(), 4128);
+        assert_eq!(second.start(), 4096);
+        assert!(
+            first.overlaps(second),
+            "different owners never imply disjoint storage"
+        );
+        assert!(proof.sequence(2, &resource).is_none());
+        let stale = vec![Arc::new(BTreeMap::from([(
+            resource,
+            Arc::new(vec![segment(1, 0, 64)]),
+        )]))];
+        assert_eq!(
+            view.insert_sequence_ranges(&mut proof, &stale, &rows[1..], &mut || true),
+            Err(ResourcePlanningUnknown::StaleIdentity)
+        );
+        assert_eq!(
+            view.insert_sequence_ranges(&mut proof, &sequences, &rows, &mut || false),
+            Err(ResourcePlanningUnknown::BudgetExhausted)
+        );
     }
     #[test]
     fn projected_claim_offset_preserves_real_aliases_and_exact_contiguous_span() {
