@@ -630,6 +630,51 @@ family，prefill/terminal/尾部宽度的一次观测通常不能满足 min8。�
 导入成功不能证明未来候选全覆盖，heldout 是实际完成波的回顾检验，不是提交前
 时延承诺；真实 planner witness、完整 ShareGPT 服务质量及六项延迟/吞吐仍需独立验证。
 
+### 独立 attention family 与 work-support（profile 7 / 8）
+
+两种后续模式均为显式选择，默认预测器不变：
+
+| `cost_observation.predictor` 与 manifest `validation_model.kind` | profile / source header | family schema | 模型行为 |
+|---|---|---|---|
+| `selected_independent_attention_v2` | 7 / 2 | 2 | 消费 producer 已证明的独立 attention 行子链，保留原全部支持坐标 |
+| `selected_work_support_v1` | 8 / 3 | 2 | 同一个 V2 family，仅从统计支持匹配中排除 `output_budget_sum` |
+
+family 版本描述 producer 的算法结构证据；model revision 描述如何拟合和判断支持域，
+两者是不同身份。work-support 的 revision 为
+`whole_wave_piecewise_affine_independent_attention_work_support_v1`，进入参数摘要、
+profile 和查询标识；它没有生成新的 family，也没有扩大 Graph 或其他未声明的执行域。
+缺少真正 V2 producer 仍为 Unknown。
+
+`maximum_output_tokens` 继续保留在原始记录、canonical 和 host metadata，参与请求
+授权、终态判断及资源容量；work-support 仅不再拿它的求和作为本波成本支持坐标。
+终态/首 token 类别、真实已生成历史、KV、prompt、selected 工作量及其余支持坐标不变。
+原 7 项回归本来不含该预算轴。移除一个非工作坐标不证明未知族、低样本、其他出域或
+Known 低估已解决，也不把经验 residual q99 变成确定时延保证。
+
+使用新模式时，在原合法策略中只显式设置：
+
+```toml
+[cost_observation]
+predictor = "selected_work_support_v1"
+```
+
+该片段应并入既定策略，保留原 min_samples、residual_quantile、TTL、静态 margin、
+声明 clock bound 和容量；不要用省略字段重新采用不同默认值。manifest 将
+`validation_model.kind` 同样设为 `selected_work_support_v1`，并选择全新的
+`export.path`（profile 8）和 `export.observations_path`（source 3）。其余字段及真实
+请求恢复方式复用上述三阶段协议，不减少原 `max_tokens`、请求、输出或改变 EOS 规则。
+
+先使用目标新 binary 独立采集真实 reference，再以相同执行配置运行新的 fit → freeze →
+residual → 产品导入 → heldout。selected manifest 仍不得组合 `reference`，也不得使用
+旧在线 `profile_export`；各阶段必须完成真实 owner 和原输出。旧 profile 6/7、source 1/2
+不能通过改 header、重写时间或重标参数摘要迁移到新模式。profile 8 也不能由旧模式加载。
+导入、普通观察和 heldout 都不刷新原样本年龄或重新训练被冻结的 fit/residual。
+
+报告继续分别记录两阶段支持数与独立 heldout 的 Known/Unknown/低估；新模式及其导入
+receipt 会明确显示 profile 8 和模型 revision，查询标识仍显示 family schema 2。
+采集成功、产品导入成功及已有 CPU 回归均不能替代同配置 primary 服务、完整输出、
+实际 witness 与六项延迟/吞吐验收。
+
 ### 从真实 singleton 试验发布固定参考
 
 在 schema 1 或 schema 2 manifest 顶层添加 `reference`，并使用

@@ -48,6 +48,11 @@ pub(super) enum ValidationSource {
         export: ferrum_types::SloCostProfileExportConfig,
         residual: Vec<Cohort>,
     },
+    /// Profile8/source3: explicit work-only support with unchanged V2 selected families.
+    SelectedWorkSupportV1 {
+        export: ferrum_types::SloCostProfileExportConfig,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
@@ -69,6 +74,11 @@ impl ValidationSource {
                 export,
                 residual,
             )),
+            Self::SelectedWorkSupportV1 { export, residual } => Some((
+                ferrum_types::SloCostPredictor::SelectedWorkSupportV1,
+                export,
+                residual,
+            )),
             _ => None,
         }
     }
@@ -78,13 +88,15 @@ impl ValidationSource {
             Self::SelectedIndependentAttentionV2 { .. } => {
                 Some("selected_independent_attention_v2")
             }
+            Self::SelectedWorkSupportV1 { .. } => Some("selected_work_support_v1"),
             _ => None,
         }
     }
     pub(super) fn residual(&self) -> &[Cohort] {
         match self {
             Self::SelectedWholeWaveV1 { residual, .. }
-            | Self::SelectedIndependentAttentionV2 { residual, .. } => residual,
+            | Self::SelectedIndependentAttentionV2 { residual, .. }
+            | Self::SelectedWorkSupportV1 { residual, .. } => residual,
             _ => &[],
         }
     }
@@ -92,7 +104,8 @@ impl ValidationSource {
         match self {
             Self::ExportedProfile { profile, source } => Some((profile, source)),
             Self::SelectedWholeWaveV1 { export, .. }
-            | Self::SelectedIndependentAttentionV2 { export, .. } => {
+            | Self::SelectedIndependentAttentionV2 { export, .. }
+            | Self::SelectedWorkSupportV1 { export, .. } => {
                 Some((&export.path, &export.observations_path))
             }
             Self::LiveFrozen => None,
@@ -189,7 +202,8 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
     let destinations = match &mut manifest.validation_model {
         ValidationSource::ExportedProfile { profile, source } => Some((profile, source)),
         ValidationSource::SelectedWholeWaveV1 { export, .. }
-        | ValidationSource::SelectedIndependentAttentionV2 { export, .. } => {
+        | ValidationSource::SelectedIndependentAttentionV2 { export, .. }
+        | ValidationSource::SelectedWorkSupportV1 { export, .. } => {
             Some((&mut export.path, &mut export.observations_path))
         }
         ValidationSource::LiveFrozen => None,

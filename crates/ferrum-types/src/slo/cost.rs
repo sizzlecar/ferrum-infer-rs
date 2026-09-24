@@ -60,12 +60,16 @@ pub enum SloCostPredictor {
     SelectedWholeWaveV1,
     /// Explicit empirical exchangeability of independently proven attention rows; profile7 only.
     SelectedIndependentAttentionV2,
+    /// Profile8: same V2 families; output budget remains authority metadata, not work support.
+    SelectedWorkSupportV1,
 }
 impl SloCostPredictor {
     pub const fn is_selected(self) -> bool {
         matches!(
             self,
-            Self::SelectedWholeWaveV1 | Self::SelectedIndependentAttentionV2
+            Self::SelectedWholeWaveV1
+                | Self::SelectedIndependentAttentionV2
+                | Self::SelectedWorkSupportV1
         )
     }
     fn is_legacy(&self) -> bool {
@@ -85,6 +89,13 @@ impl SloCostObservationConfig {
     pub fn selected_independent_attention_v2() -> Self {
         Self {
             predictor: SloCostPredictor::SelectedIndependentAttentionV2,
+            ..Self::default()
+        }
+    }
+
+    pub fn selected_work_support_v1() -> Self {
+        Self {
+            predictor: SloCostPredictor::SelectedWorkSupportV1,
             ..Self::default()
         }
     }
@@ -600,6 +611,26 @@ mod tests {
 #[cfg(test)]
 mod selected_predictor_tests {
     use super::*;
+    #[test]
+    fn work_support_preset_keeps_limits_and_is_explicit_on_wire() {
+        let selected = SloCostObservationConfig::selected_work_support_v1();
+        selected.validate().unwrap();
+        let mut expected = SloCostObservationConfig::default();
+        expected.predictor = SloCostPredictor::SelectedWorkSupportV1;
+        assert_eq!(selected, expected);
+        let wire = serde_json::to_value(&selected).unwrap();
+        assert_eq!(wire["predictor"], "selected_work_support_v1");
+        assert_eq!(
+            serde_json::from_value::<SloCostObservationConfig>(wire).unwrap(),
+            selected
+        );
+        let mut invalid = selected.clone();
+        invalid.model.min_samples = NonZeroUsize::new(7).unwrap();
+        assert!(invalid.validate().is_err());
+        invalid = selected;
+        invalid.model.residual_quantile = 0.98;
+        assert!(invalid.validate().is_err());
+    }
     #[test]
     fn selected_predictor_is_explicit_and_does_not_relabel_legacy_settings() {
         let legacy: SloCostObservationConfig = serde_json::from_str("{}").unwrap();

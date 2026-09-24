@@ -1,8 +1,9 @@
-//! Explicit schema-6/7 startup import. Ordinary observation and heldout consumption
+//! Explicit schema-6/7/8 startup import. Ordinary observation and heldout consumption
 //! cannot change fit/residual/support/TTL. Explicit feedback has a separate epoch.
 use super::*;
 use file::statistical_v6::{load_whole_wave_profile_v6, ImportedWholeWaveModelV1};
 use file::statistical_v7::load_whole_wave_profile_v7;
+use file::statistical_v8::load_whole_wave_profile_v8;
 use model::statistical::{
     model::{ModelUnknown, WholeWaveSettingsV1},
     SelectedStatisticalFamily,
@@ -56,6 +57,7 @@ pub(super) fn load_seed(
         ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => {
             (7, load_whole_wave_profile_v7)
         }
+        ferrum_types::SloCostPredictor::SelectedWorkSupportV1 => (8, load_whole_wave_profile_v8),
         _ => return Err(FerrumError::config("not a selected predictor")),
     };
     let imported = loader(
@@ -71,7 +73,7 @@ pub(super) fn load_seed(
         selected_whole_wave: Some(ferrum_types::SloSelectedWholeWaveReceiptV1 {
             capture_identity_sha256: imported.capture_identity_sha256,
             fit_parameters_sha256: imported.fit_parameters_sha256,
-            model_revision: imported.selected_family().model_revision().to_owned(),
+            model_revision: imported.model_revision().as_str().to_owned(),
             protocol_sha256: imported.protocol_sha256,
             fit_through_ordinal: p.fit_through_ordinal,
             residual_through_ordinal: p.residual_through_ordinal,

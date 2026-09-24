@@ -316,3 +316,6 @@ fn capture_limit_or_unfrozen_residual_cannot_publish_a_profile() {
     assert!(other.begin().finish(1).is_err());
     assert!(!other.options.path.exists());
 }
+
+#[path = "capture/work_support.rs"]
+mod work_support;

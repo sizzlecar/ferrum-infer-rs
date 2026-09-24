@@ -2,11 +2,13 @@
 //! Only the engine's private completed call capture can supply an observation.
 use super::*;
 use model::statistical::model::{
-    CalibrationPartitionV1, FittedWholeWaveModelV1, WholeWaveObservationV1, WholeWaveSettingsV1,
+    CalibrationPartitionV1, FittedWholeWaveModelV1, WholeWaveModelRevision, WholeWaveObservationV1,
+    WholeWaveSettingsV1,
 };
 use model::statistical::SelectedStatisticalFamily;
 use profile::statistical_v6::{CostProfileFileV6, WholeWaveProfileShapeV6};
 use profile::statistical_v7::CostProfileFileV7;
+use profile::statistical_v8::CostProfileFileV8;
 mod raw;
 use raw::RawSource;
 
@@ -25,6 +27,7 @@ pub(in crate::continuous_engine::inner) struct SelectedCalibrationCapture {
     options: SloCostProfileExportConfig,
     settings: WholeWaveSettingsV1,
     family: SelectedStatisticalFamily,
+    revision: WholeWaveModelRevision,
     fingerprint: model::ExecutionFingerprint,
     identity: [u8; 32],
     protocol: [u8; 32],
@@ -107,15 +110,19 @@ impl SelectedCalibrationCapture {
                 "explicit selected predictor and nonzero protocol are required",
             ));
         }
-        let family = match config.predictor {
+        let revision = match config.predictor {
             ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => {
-                SelectedStatisticalFamily::OrderedV1
+                WholeWaveModelRevision::OrderedV1
             }
             ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => {
-                SelectedStatisticalFamily::IndependentAttentionV2
+                WholeWaveModelRevision::IndependentAttentionV2
+            }
+            ferrum_types::SloCostPredictor::SelectedWorkSupportV1 => {
+                WholeWaveModelRevision::IndependentAttentionWorkSupportV1
             }
             _ => unreachable!("selected checked above"),
         };
+        let family = revision.family();
         let settings = WholeWaveSettingsV1::from_policy_limits(
             &super::super::profile::model_settings(&config.model),
         );
@@ -141,14 +148,21 @@ impl SelectedCalibrationCapture {
             "settings":profile::statistical_v6::WholeWaveProfileSettingsV6::from(&settings),
             "opening":opening,"declared_clock_max_error_ns":options.declared_clock_max_error_ns});
         if family == SelectedStatisticalFamily::IndependentAttentionV2 {
-            header["schema_version"] = 2.into();
-            header["model_revision"] = family.model_revision().into();
+            header["schema_version"] =
+                if revision == WholeWaveModelRevision::IndependentAttentionWorkSupportV1 {
+                    3
+                } else {
+                    2
+                }
+                .into();
+            header["model_revision"] = revision.as_str().into();
         }
         source.record(&header)?;
         Ok(Self {
             options,
             settings,
             family,
+            revision,
             fingerprint,
             identity,
             protocol,
@@ -291,20 +305,16 @@ impl SelectedCalibrationCapture {
             fit_through_ordinal: cut,
             residual_through_ordinal: u64::MAX,
         };
-        let fit = match self.family {
-            SelectedStatisticalFamily::OrderedV1 => FittedWholeWaveModelV1::fit,
-            SelectedStatisticalFamily::IndependentAttentionV2 => {
-                FittedWholeWaveModelV1::fit_independent_attention_v2
-            }
-        };
-        let fitted = fit(
-            self.fingerprint.clone(),
-            self.settings.clone(),
-            partition,
-            &self.fit,
-            now,
-        )
-        .map_err(|e| ExportError::Config(format!("whole-wave fit: {e:?}")))?;
+        let fitted = self
+            .revision
+            .fit(
+                self.fingerprint.clone(),
+                self.settings.clone(),
+                partition,
+                &self.fit,
+                now,
+            )
+            .map_err(|e| ExportError::Config(format!("whole-wave fit: {e:?}")))?;
         let receipt = SelectedFitFreezeReceipt {
             capture_identity_sha256: self.identity,
             protocol_sha256: self.protocol,
@@ -411,10 +421,13 @@ impl SelectedCalibrationCapture {
         let profile_source = profile::ProfileSource {
             generator: "ferrum.calibrate-slo".into(),
             generator_revision: env!("CARGO_PKG_VERSION").into(),
-            measurement_protocol: match self.family {
-                SelectedStatisticalFamily::OrderedV1 => "selected-whole-wave-fit-residual-v1",
-                SelectedStatisticalFamily::IndependentAttentionV2 => {
+            measurement_protocol: match self.revision {
+                WholeWaveModelRevision::OrderedV1 => "selected-whole-wave-fit-residual-v1",
+                WholeWaveModelRevision::IndependentAttentionV2 => {
                     "selected-independent-attention-fit-residual-v2"
+                }
+                WholeWaveModelRevision::IndependentAttentionWorkSupportV1 => {
+                    "selected-work-support-fit-residual-v1"
                 }
             }
             .into(),
@@ -422,8 +435,8 @@ impl SelectedCalibrationCapture {
         };
         let mut output =
             StagedFile::create(&self.options.path, self.options.max_file_bytes.get() as u64)?;
-        match self.family {
-            SelectedStatisticalFamily::OrderedV1 => output.json(
+        match self.revision {
+            WholeWaveModelRevision::OrderedV1 => output.json(
                 &CostProfileFileV6::from_capture_observations(
                     &self.fingerprint,
                     &self.settings,
@@ -438,8 +451,23 @@ impl SelectedCalibrationCapture {
                 )
                 .map_err(|e| ExportError::Config(e.to_string()))?,
             )?,
-            SelectedStatisticalFamily::IndependentAttentionV2 => output.json(
+            WholeWaveModelRevision::IndependentAttentionV2 => output.json(
                 &CostProfileFileV7::from_capture_observations(
+                    &self.fingerprint,
+                    &self.settings,
+                    partition,
+                    profile_source,
+                    closing.monotonic_ns,
+                    closing.wall_unix_ns,
+                    self.options.declared_clock_max_error_ns.unwrap(),
+                    freeze.fit_parameters_sha256,
+                    &self.fit,
+                    &self.residual,
+                )
+                .map_err(|e| ExportError::Config(e.to_string()))?,
+            )?,
+            WholeWaveModelRevision::IndependentAttentionWorkSupportV1 => output.json(
+                &CostProfileFileV8::from_capture_observations(
                     &self.fingerprint,
                     &self.settings,
                     partition,

@@ -48,7 +48,7 @@ impl ValidationModel {
                 })
                 .await
                 .map(Self::ExportedProfile),
-            manifest::ValidationSource::SelectedWholeWaveV1 { .. } | manifest::ValidationSource::SelectedIndependentAttentionV2 { .. } => Err(FerrumError::internal(
+            manifest::ValidationSource::SelectedWholeWaveV1 { .. } | manifest::ValidationSource::SelectedIndependentAttentionV2 { .. } | manifest::ValidationSource::SelectedWorkSupportV1 { .. } => Err(FerrumError::internal(
                 "selected calibration must freeze fit and complete independent residual collection before import",
             )),
         }

@@ -12,6 +12,11 @@ fn selected_heldout_keeps_real_receipt_session_cut_and_model_identity() {
     }
 }
 
+#[test]
+fn work_support_heldout_keeps_real_receipt_session_cut_and_model_identity() {
+    selected_heldout_query_identity_for(ferrum_types::SloCostPredictor::SelectedWorkSupportV1);
+}
+
 fn selected_heldout_query_identity_for(predictor: ferrum_types::SloCostPredictor) {
     let mut fixture = Fixture::new();
     fixture.config.predictor = predictor;
@@ -56,7 +61,8 @@ fn selected_heldout_query_identity_for(predictor: ferrum_types::SloCostPredictor
         ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => {
             observation.selected.family_signature()
         }
-        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => observation
+        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2
+        | ferrum_types::SloCostPredictor::SelectedWorkSupportV1 => observation
             .selected
             .independent_attention_v2()
             .unwrap()
@@ -77,7 +83,8 @@ fn selected_heldout_query_identity_for(predictor: ferrum_types::SloCostPredictor
         identity.family_schema_version,
         match predictor {
             ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => 1,
-            ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => 2,
+            ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2
+            | ferrum_types::SloCostPredictor::SelectedWorkSupportV1 => 2,
             _ => unreachable!(),
         }
     );

@@ -205,3 +205,5 @@ fn selected_calibration_startup_rejects_legacy_predictor_clock_and_path_aliases(
     value.validation_model = manifest::ValidationSource::LiveFrozen;
     assert!(startup::validate_export_configuration(&cmd, &value, &policy).is_err());
 }
+
+mod work_support;
