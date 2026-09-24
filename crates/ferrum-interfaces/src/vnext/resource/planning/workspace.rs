@@ -233,6 +233,51 @@ fn check_same_items<T: PartialEq>(
     Ok(())
 }
 
+// The table is private to one immutable slot and one canonical request slice.
+// A match is always established by complete claim identity, never an index or
+// hash alone. Coalesced projections reuse that match while their own resource,
+// range, capacity and logical demand are still checked separately below.
+fn validate_idle_projections(
+    claims: &[ClaimReadView],
+    projections: &[ProjectionReadView],
+    canonical: &[&EvaluatedBackingRequest<'_>],
+    budget: &mut dyn ResourcePlanningBudget,
+) -> Result<(), ResourcePlanningUnknown> {
+    use ResourcePlanningUnknown as U;
+    // Capture/project already bound the number of claims by maximum_descriptors.
+    // No reference escapes this call or pins a physical resource/owner/epoch.
+    let mut request_indices = vec![None; claims.len()];
+    for projection in projections {
+        poll(budget)?;
+        let claim = claims.get(projection.claim).ok_or(U::InvalidDemand)?;
+        let index = match request_indices[projection.claim] {
+            Some(index) => index,
+            None => {
+                let index = canonical
+                    .binary_search_by(|request| request.claim_identity.cmp(&claim.identity))
+                    .map_err(|_| U::InvalidDemand)?;
+                request_indices[projection.claim] = Some(index);
+                index
+            }
+        };
+        let request = canonical[index];
+        let matched = request
+            .projections
+            .iter()
+            .find(|candidate| candidate.descriptor.base_resource_id() == &projection.resource)
+            .ok_or(U::InvalidDemand)?;
+        if request.capacity_size_bytes != claim.physical_size
+            || matched.physical_offset_bytes != projection.physical_offset
+            || matched.capacity_size_bytes != projection.capacity
+            || matched.logical_size_bytes == 0
+            || matched.logical_size_bytes > matched.capacity_size_bytes
+        {
+            return Err(U::InvalidDemand);
+        }
+    }
+    Ok(())
+}
+
 /// Match the same first idle slot as LaneStableArenaEntry::claim_idle_slot.
 /// A new slot uses real resident free extents and is retained after this wave.
 pub(super) fn reserve(
@@ -294,28 +339,7 @@ pub(super) fn reserve(
         if slot.projections.len() != new_projection_count {
             return Err(U::InvalidDemand);
         }
-        for projection in &slot.projections {
-            poll(budget)?;
-            let claim = slot.claims.get(projection.claim).ok_or(U::InvalidDemand)?;
-            let request = canonical
-                .binary_search_by(|request| request.claim_identity.cmp(&claim.identity))
-                .ok()
-                .map(|index| canonical[index])
-                .ok_or(U::InvalidDemand)?;
-            let matched = request
-                .projections
-                .iter()
-                .find(|candidate| candidate.descriptor.base_resource_id() == &projection.resource)
-                .ok_or(U::InvalidDemand)?;
-            if request.capacity_size_bytes != claim.physical_size
-                || matched.physical_offset_bytes != projection.physical_offset
-                || matched.capacity_size_bytes != projection.capacity
-                || matched.logical_size_bytes == 0
-                || matched.logical_size_bytes > matched.capacity_size_bytes
-            {
-                return Err(U::InvalidDemand);
-            }
-        }
+        validate_idle_projections(&slot.claims, &slot.projections, &canonical, budget)?;
         return Ok(Some(slot_identity(&slot.key, slot.slot_id)));
     }
     if workspace.slots.len() >= limits.maximum_descriptors {
