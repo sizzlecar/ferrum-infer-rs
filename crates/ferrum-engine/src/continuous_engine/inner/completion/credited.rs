@@ -239,6 +239,19 @@ impl EngineInner {
             FinishReason::Error,
             super::super::slo_clock_now(),
         );
+        let execution_evidence = if failure.is_none() {
+            match sequence.take_credited_execution_evidence() {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    failure = Some(BoundedOutputError::new(&error.to_string()));
+                    reason = FinishReason::Error;
+                    final_text.clear();
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let resources = sequence.take_completion_resources();
         let mut response = InferenceResponse {
             request_id: request_id.clone(),
@@ -250,7 +263,7 @@ impl EngineInner {
             created_at: chrono::Utc::now(),
             metadata: HashMap::new(),
             api_response: None,
-            execution_evidence: None,
+            execution_evidence,
         };
         let admission_cancellation_work = if pending.is_some() {
             self.model_executor
@@ -330,6 +343,7 @@ impl EngineInner {
                 }),
                 reason,
                 usage: response.usage,
+                execution_evidence: response.execution_evidence,
             }
         };
         let output = sequence.credited_output.as_mut().expect("credited route");

@@ -7,6 +7,7 @@ use ferrum_interfaces::output_flow::{
     CreditedOutputFrame, CreditedOutputSession, OutputProjectionContract,
 };
 mod chat;
+mod evidence;
 pub(super) use chat::stream as chat_stream;
 use ferrum_types::SloOutputTransport;
 
@@ -34,9 +35,19 @@ pub(super) fn require_legacy_endpoint(
 pub(super) async fn completions_stream(
     state: AppState,
     openai_request: CompletionsRequest,
-    inference_request: InferenceRequest,
+    mut inference_request: InferenceRequest,
     context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
+    inference_request
+        .evidence_request
+        .capture_engine_token_timing = state.profile_detail.captures_engine_token_timing();
+    inference_request.evidence_request.capture_prompt_token_ids = state.request_dump_dir.is_some();
+    let observer = evidence::Observer::new(
+        &state,
+        openai_request.model.clone(),
+        "/v1/completions",
+        None,
+    );
     let engine = state.llm.ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; completions unavailable".into())
     })?;
@@ -53,13 +64,20 @@ pub(super) async fn completions_stream(
         .infer_credited_stream(inference_request, context, contract)
         .await
         .map_err(server_error_from_ferrum_error)?;
-    Ok(stream_response(session))
+    Ok(stream_response(session, observer))
 }
 
-fn stream_response(session: CreditedOutputSession) -> Response {
-    // HTTP needs no retained copy of the final text/token history. This drop
-    // does not cancel inference; frames remain the cancellation authority.
-    drop(session.completion);
+fn stream_response(
+    session: CreditedOutputSession,
+    observer: Option<evidence::Observer>,
+) -> Response {
+    // The optional observer owns only the terminal receiver. Frames remain the
+    // cancellation authority; no second wire queue or text copy is introduced.
+    if let Some(observer) = observer {
+        observer.spawn(session.completion);
+    } else {
+        drop(session.completion);
+    }
     let body =
         crate::credited_output::stream_body(session.frames.map(CreditedOutputFrame::into_wire));
     (

@@ -374,6 +374,7 @@ async fn credited_prepared_completion_multitoken_and_alternate_match_legacy_each
                 history: Some(history),
                 usage,
                 reason,
+                ..
             } => {
                 assert_eq!(*reason, FinishReason::EOS);
                 assert_eq!(usage.completion_tokens, trace.len());
@@ -579,6 +580,7 @@ async fn credited_prepared_completion_ignore_eos_keeps_original_one_token_budget
             reason,
             usage,
             history: Some(history),
+            ..
         } => {
             assert_eq!(*reason, FinishReason::Length);
             assert_eq!(usage.completion_tokens, 1);

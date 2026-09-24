@@ -2550,7 +2550,14 @@ async fn handle_chat_completions_stream(
     context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
     if credited::enabled(&state) {
-        return credited::chat_stream(state, openai_request, inference_request, context).await;
+        return credited::chat_stream(
+            state,
+            openai_request,
+            inference_request,
+            context,
+            benchmark_correlation,
+        )
+        .await;
     }
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
 
@@ -6822,6 +6829,7 @@ mod tests {
                 .collect(),
             engine_token_timing: requested.capture_engine_token_timing.then(|| {
                 EngineTokenTimingEvidence {
+                    decode_stage_intervals_omitted: 0,
                     clock_source: "rust_std_instant".to_string(),
                     wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                     wall_anchor_max_error_nanos: 500,

@@ -19,6 +19,36 @@ pub(super) fn validate_options(one_shot: bool, format: super::OutputFormat) -> R
     Ok(())
 }
 
+/// Only the bounded terminal evidence serialized by `write_evidence` is
+/// supported here. Lifecycle sinks and replay/resource bundles still need their
+/// own credited contracts; silently accepting them would drop requested data.
+pub(super) fn validate_observability(
+    config: &crate::observability_product::ProductObservabilityConfig,
+) -> Result<()> {
+    use ferrum_types::ObservabilityProfileDetail as Detail;
+    if config.synthetic_no_weight_enabled() {
+        return Err(FerrumError::unsupported(
+            "credited output requires real inference, not synthetic observability",
+        ));
+    }
+    if config.request_dump_dir.is_some()
+        || config.memory_profile_jsonl.is_some()
+        || config.scheduler_trace_jsonl.is_some()
+        || !matches!(
+            config.profile_detail,
+            Detail::Off | Detail::Basic | Detail::Latency | Detail::Kernel
+        )
+    {
+        return Err(FerrumError::unsupported(
+            "credited CLI output supports basic, latency, and kernel terminal profiles; resource/lifecycle sinks and replay/debug/verify/full bundles require separate output contracts",
+        ));
+    }
+    config
+        .core
+        .validate()
+        .map_err(FerrumError::invalid_parameter)
+}
+
 pub(super) struct CreditedRunStats {
     pub usage: TokenUsage,
     pub visible_frames: usize,
@@ -33,33 +63,49 @@ pub(super) async fn execute_one_shot(
     request: InferenceRequest,
     context: InferenceRequestContext,
     suppress_text: bool,
+    observability: &crate::observability_product::ProductObservabilityConfig,
 ) -> Result<CreditedRunStats> {
     if suppress_text {
-        execute_with(engine, request, context, std::io::sink(), std::io::stderr()).await
+        execute_observed(
+            engine,
+            request,
+            context,
+            std::io::sink(),
+            std::io::stderr(),
+            Some(observability),
+        )
+        .await
     } else {
-        execute_with(
+        execute_observed(
             engine,
             request,
             context,
             std::io::stdout(),
             std::io::stderr(),
+            Some(observability),
         )
         .await
     }
 }
 
-async fn execute_with<W, E>(
+async fn execute_observed<W, E>(
     engine: &dyn LlmInferenceEngine,
     mut request: InferenceRequest,
     context: InferenceRequestContext,
     output: W,
     errors: E,
+    observability: Option<&crate::observability_product::ProductObservabilityConfig>,
 ) -> Result<CreditedRunStats>
 where
     W: Write + Send + 'static,
     E: Write + Send + 'static,
 {
     request.stream = true;
+    if let Some(config) = observability {
+        request.evidence_request.capture_engine_token_timing =
+            config.profile_detail.captures_engine_token_timing();
+        request.evidence_request.capture_prompt_token_ids = config.request_dump_dir.is_some();
+    }
     let started = std::time::Instant::now();
     let result = async {
         let session = engine
@@ -70,11 +116,20 @@ where
             )
             .await?;
         let written = write_with(session, output, errors).await?;
-        match written.completion.payload() {
+        let elapsed = started.elapsed();
+        let completion = Arc::new(written.completion);
+        if let Some(config) = observability.filter(|config| config.enabled()) {
+            let config = config.clone();
+            let retained = completion.clone();
+            tokio::task::spawn_blocking(move || write_evidence(&config, retained, elapsed))
+                .await
+                .map_err(|e| FerrumError::internal(e.to_string()))??;
+        }
+        match completion.payload() {
             OutputCompletion::Succeeded { usage, .. } => Ok(CreditedRunStats {
                 usage: usage.clone(),
                 visible_frames: written.visible_frames,
-                elapsed: started.elapsed(),
+                elapsed,
             }),
             OutputCompletion::Failed(error) => Err(FerrumError::backend(error.message())),
         }
@@ -160,5 +215,55 @@ where
     .map_err(|error| FerrumError::internal(format!("credited output writer failed: {error}")))?
 }
 
+fn write_evidence(
+    config: &crate::observability_product::ProductObservabilityConfig,
+    completion: Arc<LeasedOutput<OutputCompletion>>,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    use ferrum_interfaces::output_flow::{CreditedExecutionProfile, CreditedPromptEvidence};
+    if let Some(path) = config.profile_jsonl.as_ref() {
+        let record = CreditedExecutionProfile::new(
+            completion.clone(),
+            ferrum_types::ProfileEntrypoint::Run,
+            config.model.clone(),
+            "cli_text",
+            config.profile_detail,
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            crate::observability_product::runtime_preset_hash(config),
+            Default::default(),
+        )
+        .map_err(|e| FerrumError::internal(e.to_string()))?;
+        ferrum_bench_core::write_jsonl_owned_record(path, record)
+            .map_err(|e| FerrumError::io(e.to_string()))?;
+    }
+    if let Some(root) = config
+        .request_dump_dir
+        .as_ref()
+        .filter(|_| matches!(completion.payload(), OutputCompletion::Succeeded { .. }))
+    {
+        let dir = root.join(completion.request_id().to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| FerrumError::io(e.to_string()))?;
+        ferrum_bench_core::write_json_owned_record(
+            &dir.join("prompt_token_ids.json"),
+            CreditedPromptEvidence {
+                completion,
+                model: config.model.clone(),
+            },
+        )
+        .map_err(|e| FerrumError::io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn execute_with<W: Write + Send + 'static, E: Write + Send + 'static>(
+    engine: &dyn LlmInferenceEngine,
+    request: InferenceRequest,
+    context: InferenceRequestContext,
+    output: W,
+    errors: E,
+) -> Result<CreditedRunStats> {
+    execute_observed(engine, request, context, output, errors, None).await
+}
 #[cfg(test)]
 mod tests;

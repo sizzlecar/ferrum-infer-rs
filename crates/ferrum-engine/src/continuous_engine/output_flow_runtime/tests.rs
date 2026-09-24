@@ -138,6 +138,7 @@ fn terminal(through: u64, generated_tokens: usize, final_text: &str) -> OutputTe
     OutputTerminalDecision {
         through_output_ordinal: through,
         outcome: OutputCompletion::Succeeded {
+            execution_evidence: None,
             history: None,
             reason: FinishReason::Stop,
             usage: TokenUsage {
@@ -230,6 +231,7 @@ async fn output_owner_committed_empty_advances_once_without_wire_then_flushes_in
     let completion = bounded(session.completion).await.unwrap();
     match completion.payload() {
         OutputCompletion::Succeeded {
+            execution_evidence: None,
             history: Some(history),
             ..
         } => {
@@ -467,3 +469,32 @@ mod chat;
 mod future_capacity;
 mod planning;
 mod slow_consumer;
+
+#[tokio::test]
+async fn credited_actor_rejects_unreserved_execution_evidence_and_releases_storage() {
+    let pool = pool(1);
+    let (mut port, mut session) = start(&pool, 1);
+    ready(&port).await.return_unsubmitted();
+    state(&port, OutputReadinessState::Ready).await;
+    let mut decision = terminal(0, 0, "");
+    if let OutputCompletion::Succeeded {
+        execution_evidence, ..
+    } = &mut decision.outcome
+    {
+        *execution_evidence = Some(ferrum_types::InferenceExecutionEvidence {
+            prompt_token_ids: vec![],
+            output_token_ids: vec![],
+            engine_token_timing: None,
+        });
+    }
+    assert!(port.terminal(decision).is_ok());
+    drop(port);
+    while let Some(frame) = bounded(session.frames.next()).await {
+        drop(frame);
+    }
+    let completion = bounded(session.completion).await.unwrap();
+    assert!(matches!(completion.payload(), OutputCompletion::Failed(_)));
+    drop(completion);
+    drop(session.frames);
+    drained(&pool).await;
+}

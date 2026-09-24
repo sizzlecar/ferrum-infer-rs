@@ -18,6 +18,9 @@ mod chat;
 #[path = "credited_prepared_completion_tests.rs"]
 mod prepared_completion;
 
+#[path = "credited_evidence_tests.rs"]
+mod evidence;
+
 #[derive(Default)]
 struct CreditedLegacyDecodeCalls {
     decode: AtomicUsize,
@@ -569,6 +572,7 @@ async fn credited_engine_one_token_terminal_settles_grant_before_sequence_remova
             history: Some(history),
             reason,
             usage,
+            ..
         } => {
             assert_eq!(history.text, "ok");
             assert_eq!(history.tokens, vec![TokenId::new(6)]);

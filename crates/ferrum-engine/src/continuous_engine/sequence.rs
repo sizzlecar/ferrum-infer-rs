@@ -8,6 +8,9 @@ struct SequenceTokenTiming {
     token_commit_nanos_since_request_start: Vec<u64>,
     decode_stage_intervals: Vec<EngineDecodeStageInterval>,
     pending_decode_scheduling_started_at: Option<Instant>,
+    retained_limits: Option<(usize, usize)>,
+    decode_stage_intervals_omitted: u64,
+    commit_bound_exceeded: bool,
 }
 
 impl SequenceTokenTiming {
@@ -28,6 +31,9 @@ impl SequenceTokenTiming {
                 token_commit_nanos_since_request_start: Vec::new(),
                 decode_stage_intervals: Vec::new(),
                 pending_decode_scheduling_started_at: None,
+                retained_limits: None,
+                decode_stage_intervals_omitted: 0,
+                commit_bound_exceeded: false,
             },
         ))
     }
@@ -47,6 +53,12 @@ impl SequenceTokenTiming {
             .last()
             .copied()
             .map_or(elapsed, |previous| previous.max(elapsed));
+        if self.retained_limits.is_some_and(|(commits, _)| {
+            self.token_commit_nanos_since_request_start.len() >= commits
+        }) {
+            self.commit_bound_exceeded = true;
+            return;
+        }
         self.token_commit_nanos_since_request_start.push(monotonic);
         self.pending_decode_scheduling_started_at = Some(committed_at);
     }
@@ -69,6 +81,14 @@ impl SequenceTokenTiming {
             return;
         };
         if end_nanos_since_request_start < start_nanos_since_request_start {
+            return;
+        }
+        if self
+            .retained_limits
+            .is_some_and(|(_, stages)| self.decode_stage_intervals.len() >= stages)
+        {
+            self.decode_stage_intervals_omitted =
+                self.decode_stage_intervals_omitted.saturating_add(1);
             return;
         }
         self.decode_stage_intervals.push(EngineDecodeStageInterval {
@@ -104,6 +124,11 @@ impl SequenceTokenTiming {
     }
 
     fn into_evidence(self, output_tokens: usize) -> Result<EngineTokenTimingEvidence> {
+        if self.commit_bound_exceeded {
+            return Err(FerrumError::internal(
+                "credited timing exceeded its admitted commit bound",
+            ));
+        }
         let evidence = EngineTokenTimingEvidence {
             clock_source: "rust_std_instant".to_string(),
             wall_anchor_unix_nanos: self.wall_anchor_unix_nanos,
@@ -111,6 +136,7 @@ impl SequenceTokenTiming {
             decode_ready_nanos_since_request_start: self.decode_ready_nanos_since_request_start,
             token_commit_nanos_since_request_start: self.token_commit_nanos_since_request_start,
             decode_stage_intervals: self.decode_stage_intervals,
+            decode_stage_intervals_omitted: self.decode_stage_intervals_omitted,
         };
         evidence.validate(output_tokens).map_err(|error| {
             FerrumError::internal(format!("invalid engine token timing evidence: {error}"))
@@ -1029,6 +1055,73 @@ impl SequenceState {
                     Vec::new()
                 },
                 output_token_ids: self.generated_tokens.clone(),
+                engine_token_timing: timing,
+            }),
+        )
+    }
+
+    /// Called after credit reservation but before publishing the request. Keep
+    /// the original clock anchor; binding storage does not restart ingress.
+    pub(super) fn bind_credited_execution_evidence(
+        &mut self,
+        plan: ferrum_interfaces::output_flow::EngineEvidenceRetentionPlan,
+    ) -> Result<()> {
+        if let Some(timing) = &mut self.token_timing {
+            if !plan.captures_timing()
+                || !timing.token_commit_nanos_since_request_start.is_empty()
+                || !timing.decode_stage_intervals.is_empty()
+            {
+                return Err(FerrumError::internal(
+                    "credited evidence must bind before execution",
+                ));
+            }
+            timing
+                .token_commit_nanos_since_request_start
+                .try_reserve_exact(plan.maximum_output_tokens())
+                .map_err(|e| FerrumError::resource_exhausted(e.to_string()))?;
+            timing
+                .decode_stage_intervals
+                .try_reserve_exact(plan.maximum_stage_intervals())
+                .map_err(|e| FerrumError::resource_exhausted(e.to_string()))?;
+            if timing.token_commit_nanos_since_request_start.capacity()
+                > plan.maximum_output_tokens()
+                || timing.decode_stage_intervals.capacity() > plan.maximum_stage_intervals()
+            {
+                return Err(FerrumError::resource_exhausted(
+                    "timing allocation exceeds credited capacity",
+                ));
+            }
+            timing.retained_limits =
+                Some((plan.maximum_output_tokens(), plan.maximum_stage_intervals()));
+        } else if plan.captures_timing() {
+            return Err(FerrumError::internal("missing requested token timing"));
+        }
+        Ok(())
+    }
+
+    /// Copy only the separately reserved evidence token histories. The engine
+    /// still needs its original prompt for lifecycle accounting below; never
+    /// move it out before those operations have captured their counts.
+    pub(super) fn take_credited_execution_evidence(
+        &mut self,
+    ) -> Result<Option<InferenceExecutionEvidence>> {
+        let capture_prompt = self
+            .original_request
+            .evidence_request
+            .capture_prompt_token_ids;
+        let timing = self
+            .token_timing
+            .take()
+            .map(|t| t.into_evidence(self.generated_tokens.len()))
+            .transpose()?;
+        Ok(
+            (capture_prompt || timing.is_some()).then(|| InferenceExecutionEvidence {
+                prompt_token_ids: if capture_prompt {
+                    self.input_tokens.as_slice().to_vec()
+                } else {
+                    Vec::new()
+                },
+                output_token_ids: self.generated_tokens.as_slice().to_vec(),
                 engine_token_timing: timing,
             }),
         )

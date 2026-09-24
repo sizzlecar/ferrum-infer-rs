@@ -362,6 +362,7 @@ async fn enforce_shared_credited_cli_and_chat_entries_finish_real_guarded_reques
                 history: Some(history),
                 reason,
                 usage,
+                ..
             } => {
                 assert_eq!(history.tokens.len(), 2);
                 assert_eq!(usage.completion_tokens, 2);

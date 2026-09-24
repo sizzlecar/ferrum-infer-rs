@@ -5,7 +5,7 @@ use ferrum_interfaces::{
         BoundedOutputError, CreditedOutputFrame, OutputConsumerControl, OutputFrameMetadata,
     },
 };
-use ferrum_types::{FinishReason, RequestId, TokenUsage};
+use ferrum_types::{FinishReason, RequestId, TokenId, TokenUsage};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -52,9 +52,10 @@ fn reserve(
     }
 }
 
-fn session(
+fn session_with_evidence(
     text: &[u8],
     terminal: Option<&[u8]>,
+    evidence: Option<ferrum_types::InferenceExecutionEvidence>,
 ) -> (
     CreditedOutputSession,
     OutputCreditPool,
@@ -133,6 +134,7 @@ fn session(
         OutputCompletion::Failed(BoundedOutputError::new("injected failure"))
     } else {
         OutputCompletion::Succeeded {
+            execution_evidence: evidence,
             history: None,
             reason: FinishReason::Length,
             usage: TokenUsage::new(1, 2),
@@ -422,4 +424,84 @@ fn credited_cli_options_require_a_supported_projection_before_model_loading() {
     assert!(validate_options(true, super::super::OutputFormat::Text).is_ok());
     assert!(validate_options(false, super::super::OutputFormat::Text).is_err());
     assert!(validate_options(true, super::super::OutputFormat::Jsonl).is_err());
+}
+
+fn session(
+    text: &[u8],
+    terminal: Option<&[u8]>,
+) -> (
+    CreditedOutputSession,
+    OutputCreditPool,
+    Arc<Consumer>,
+    usize,
+) {
+    session_with_evidence(text, terminal, None)
+}
+#[tokio::test]
+async fn credited_run_latency_and_kernel_write_full_commit_evidence_without_legacy_collection() {
+    for detail in [
+        crate::observability_product::ProfileDetailArg::Latency,
+        crate::observability_product::ProfileDetailArg::Kernel,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.jsonl");
+        let config = crate::observability_product::ProductObservabilityConfig::new(
+            ferrum_types::ProfileEntrypoint::Run,
+            "model",
+            Some(&profile),
+            detail,
+            None,
+            None,
+            None,
+            1.0,
+        );
+        let evidence = ferrum_types::InferenceExecutionEvidence {
+            prompt_token_ids: vec![],
+            output_token_ids: vec![TokenId::new(1), TokenId::new(2)],
+            engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
+                clock_source: "rust_std_instant".into(),
+                wall_anchor_unix_nanos: 1,
+                wall_anchor_max_error_nanos: 0,
+                decode_ready_nanos_since_request_start: Some(1000),
+                token_commit_nanos_since_request_start: vec![1000, 2000],
+                decode_stage_intervals: vec![],
+                decode_stage_intervals_omitted: 7,
+            }),
+        };
+        let (session, pool, _, _) = session_with_evidence(b"answer", Some(b""), Some(evidence));
+        let engine = Engine::new(session);
+        let mut request = InferenceRequest::new("prompt", "model");
+        request.sampling_params.max_tokens = 2;
+        let stats = bounded(execute_observed(
+            &engine,
+            request,
+            InferenceRequestContext::capture(),
+            Writer::default(),
+            std::io::sink(),
+            Some(&config),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(stats.usage.completion_tokens, 2);
+        assert!(
+            engine
+                .seen
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .evidence_request
+                .capture_engine_token_timing
+        );
+        let event: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(profile).unwrap()).unwrap();
+        assert_eq!(event["attributes"]["engine_token_commit_count"], 2);
+        assert_eq!(
+            event["attributes"]["engine_decode_stage_intervals_omitted"],
+            7
+        );
+        assert_eq!(event["attributes"]["itl_nanos"], serde_json::json!([1000]));
+        assert_eq!(pool.snapshot().retained_accounts, 0);
+    }
 }

@@ -51,6 +51,9 @@ pub enum OutputCompletion {
         history: Option<OutputHistory>,
         reason: FinishReason,
         usage: TokenUsage,
+        /// Engine evidence is not part of the wire payload. Its complete lifetime
+        /// remains covered by this completion's retained projection lease.
+        execution_evidence: Option<ferrum_types::InferenceExecutionEvidence>,
     },
     Failed(BoundedOutputError),
 }

@@ -1233,7 +1233,7 @@ fn actual_base_event(
     event
 }
 
-fn runtime_preset_hash(config: &ProductObservabilityConfig) -> String {
+pub(crate) fn runtime_preset_hash(config: &ProductObservabilityConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(config.entrypoint.as_str().as_bytes());
     hasher.update(b"\0");
@@ -2445,6 +2445,7 @@ mod tests {
                         ferrum_types::TokenId::new(11),
                     ],
                     engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
+                        decode_stage_intervals_omitted: 0,
                         clock_source: "rust_std_instant".to_string(),
                         wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
                         wall_anchor_max_error_nanos: 500,

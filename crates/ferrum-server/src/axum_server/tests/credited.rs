@@ -199,6 +199,28 @@ impl LlmInferenceEngine for CreditedRouteLlm {
             .unwrap();
         let completion = budget
             .into_retained_projection(OutputCompletion::Succeeded {
+                execution_evidence: (request.evidence_request.capture_engine_token_timing
+                    || request.evidence_request.capture_prompt_token_ids)
+                    .then(|| InferenceExecutionEvidence {
+                        prompt_token_ids: if request.evidence_request.capture_prompt_token_ids {
+                            vec![TokenId::new(0); 3]
+                        } else {
+                            vec![]
+                        },
+                        output_token_ids: vec![TokenId::new(0)],
+                        engine_token_timing: request
+                            .evidence_request
+                            .capture_engine_token_timing
+                            .then(|| EngineTokenTimingEvidence {
+                                clock_source: "rust_std_instant".into(),
+                                wall_anchor_unix_nanos: 1,
+                                wall_anchor_max_error_nanos: 0,
+                                decode_ready_nanos_since_request_start: None,
+                                token_commit_nanos_since_request_start: vec![1000],
+                                decode_stage_intervals: vec![],
+                                decode_stage_intervals_omitted: 0,
+                            }),
+                    }),
                 history: Some(OutputHistory {
                     text: self.text.clone(),
                     tokens: vec![TokenId::new(0)],
@@ -564,5 +586,88 @@ async fn credited_chat_startup_error_stays_json_and_legacy_selection_is_unchange
         assert_eq!(engine.legacy_calls.load(Ordering::Relaxed), 1);
         assert_eq!(engine.credited_calls.load(Ordering::Relaxed), 0);
         engine.assert_released();
+    }
+}
+
+#[tokio::test]
+async fn credited_text_latency_and_kernel_profiles_consume_terminal_evidence_and_release_credit() {
+    for detail in [
+        ferrum_types::ObservabilityProfileDetail::Latency,
+        ferrum_types::ObservabilityProfileDetail::Kernel,
+    ] {
+        for chat in [false, true] {
+            let dump = unique_request_dump_dir("credited-terminal-evidence");
+            let profile = unique_profile_jsonl("credited-terminal-evidence");
+            let engine = Arc::new(CreditedRouteLlm::new(SloOutputTransport::Credited).await);
+            let router = AxumServer::from_state(
+                AppState::default()
+                    .with_llm(engine.clone())
+                    .with_prompt_template(Some(prompt_opened_literal_json_template()))
+                    .with_profile_detail(detail)
+                    .with_profile_jsonl(Some(profile.clone()))
+                    .with_request_dump_dir(Some(dump.clone())),
+            )
+            .build_router();
+            let endpoint = if chat {
+                "/v1/chat/completions"
+            } else {
+                "/v1/completions"
+            };
+            let response = post_json(
+                router,
+                endpoint,
+                if chat {
+                    ordinary_chat_request(None)
+                } else {
+                    completion_request()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+            let mut changed = engine.pool.subscribe();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while engine.pool.snapshot().retained_accounts != 0 {
+                    changed.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            engine.assert_released();
+            let request = engine.last_request.lock().unwrap().clone().unwrap();
+            assert!(request.evidence_request.capture_engine_token_timing);
+            assert!(request.evidence_request.capture_prompt_token_ids);
+            let lines = std::fs::read_to_string(&profile).unwrap();
+            let events: Vec<Value> = lines
+                .lines()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+            let event = events
+                .iter()
+                .find(|v| v["phase"] == "credited_generation")
+                .unwrap();
+            assert_eq!(event["status"], "ok");
+            assert_eq!(event["attributes"]["endpoint"], endpoint);
+            assert_eq!(event["attributes"]["engine_token_commit_count"], 1);
+            assert_eq!(
+                event["attributes"]["engine_token_commit_nanos_since_request_start"],
+                json!([1000])
+            );
+            let prompt: Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    dump.join(request.id.to_string())
+                        .join("prompt_token_ids.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(prompt["token_count"], 3);
+            assert_eq!(engine.legacy_calls.load(Ordering::Relaxed), 0);
+            std::fs::remove_dir_all(dump).unwrap();
+            std::fs::remove_file(profile).unwrap();
+        }
     }
 }

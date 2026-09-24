@@ -19,8 +19,12 @@ mod budget;
 mod chat_projection;
 mod codec;
 mod completion_plan;
+mod evidence;
+mod evidence_profile;
 pub use chat_projection::{BoundedChatProjection, ChatOutputDelta, TextReasoningPolicy};
 pub use completion_plan::{CompletionTokenIds, ResponseCompletionPlan};
+pub use evidence::EngineEvidenceRetentionPlan;
+pub use evidence_profile::{CreditedExecutionProfile, CreditedPromptEvidence};
 mod session;
 pub use budget::{
     OutputFrameAttempt, OutputFramePermit, PrepaidOutputCapacityView, RequestOutputBudget,
@@ -186,6 +190,7 @@ pub struct RequestOutputPlan {
     text_reasoning: Option<TextReasoningPolicy>,
     incremental: Option<BoundedIncrementalDecodePolicy>,
     completion: ResponseCompletionPlan,
+    evidence: EngineEvidenceRetentionPlan,
     data_frames: usize,
     wire_bytes: usize,
     projection_bytes: usize,
@@ -272,17 +277,15 @@ impl RequestOutputPlan {
             None
         };
         let completion_storage = completion.retained_storage_bytes();
-        if request.evidence_request.capture_prompt_token_ids
-            || request.evidence_request.capture_engine_token_timing
-        {
-            return Err(OutputFlowError::Unsupported(
-                "execution evidence requires its own retained-storage contract",
-            ));
-        }
         let max_tokens = request.sampling_params.max_tokens;
         if max_tokens == 0 {
             return Err(OutputFlowError::Unsupported("zero effective max_tokens"));
         }
+        let evidence = EngineEvidenceRetentionPlan::derive(
+            &request.evidence_request,
+            prompt_tokens,
+            max_tokens,
+        )?;
         let decoder = tokenizer
             .bounded_decode_bound()
             .ok_or(OutputFlowError::Unsupported(
@@ -379,6 +382,7 @@ impl RequestOutputPlan {
             .and_then(|bytes| bytes.checked_add(fixed_storage))
             .and_then(|bytes| bytes.checked_add(stop_storage))
             .and_then(|bytes| bytes.checked_add(completion_storage))
+            .and_then(|bytes| bytes.checked_add(evidence.retained_bytes()))
             // BoundedOutputError's retained Box<str> can coexist with the
             // serialized terminal Vec, which owns separate wire credit.
             .and_then(|bytes| bytes.checked_add(MAX_OUTPUT_ERROR_BYTES))
@@ -395,6 +399,7 @@ impl RequestOutputPlan {
             text_reasoning,
             incremental,
             completion,
+            evidence,
             data_frames,
             wire_bytes,
             projection_bytes,
@@ -425,6 +430,10 @@ impl RequestOutputPlan {
     }
     pub fn completion_plan(&self) -> ResponseCompletionPlan {
         self.completion
+    }
+    /// Separate engine evidence storage, covered by the retained projection lease.
+    pub fn evidence_plan(&self) -> EngineEvidenceRetentionPlan {
+        self.evidence
     }
     pub fn max_token_bytes(&self) -> usize {
         self.token_bytes_bound

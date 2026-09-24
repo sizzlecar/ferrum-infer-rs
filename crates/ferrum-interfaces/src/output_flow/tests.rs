@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 
 mod capacity;
 mod chat;
+mod evidence;
 
 struct BoundedTokenizer {
     bound: Option<DecodedTextBound>,
@@ -208,7 +209,7 @@ fn output_flow_derive_uses_real_capability_and_effective_request_limit() {
     request.evidence_request.capture_engine_token_timing = true;
     assert!(matches!(
         RequestOutputPlan::derive(contract, &BoundedTokenizer::new(7), &request, 8),
-        Err(OutputFlowError::Unsupported(_))
+        Ok(plan) if plan.evidence_plan().captures_timing()
     ));
 }
 

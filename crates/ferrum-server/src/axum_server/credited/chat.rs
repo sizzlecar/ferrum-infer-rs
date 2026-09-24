@@ -7,6 +7,7 @@ pub(in crate::axum_server) async fn stream(
     request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     context: InferenceRequestContext,
+    correlation: Option<BenchmarkRequestCorrelation>,
 ) -> std::result::Result<Response, ServerError> {
     let unsupported = || {
         ServerError::unsupported_feature(
@@ -41,6 +42,12 @@ pub(in crate::axum_server) async fn stream(
         .as_ref()
         .and_then(|options| options.include_usage)
         .unwrap_or(false);
+    let observer = evidence::Observer::new(
+        &state,
+        request.model.clone(),
+        "/v1/chat/completions",
+        correlation,
+    );
     let contract = Arc::new(OutputProjectionContract::chat_sse(
         inference_request.id.to_string(),
         request.model,
@@ -53,5 +60,5 @@ pub(in crate::axum_server) async fn stream(
         .infer_credited_stream(inference_request, context, contract)
         .await
         .map_err(server_error_from_ferrum_error)?;
-    Ok(stream_response(session))
+    Ok(stream_response(session, observer))
 }

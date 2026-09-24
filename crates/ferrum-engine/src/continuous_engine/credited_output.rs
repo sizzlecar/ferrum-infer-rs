@@ -136,6 +136,7 @@ impl ContinuousBatchEngine {
             None,
             Some(&completion_plan),
         )?;
+        sequence.bind_credited_execution_evidence(budget.plan().evidence_plan())?;
         // Avoid geometric growth beyond the declared token-history envelope.
         sequence.generated_tokens = Vec::with_capacity(request.sampling_params.max_tokens);
         let (port, session) = spawn_output_flow_runtime(

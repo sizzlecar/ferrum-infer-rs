@@ -1041,10 +1041,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.request_dump_dir.as_ref(),
         cmd.profile_sample_rate,
     );
-    if credited_output && product_observability.enabled() {
-        return Err(FerrumError::unsupported(
-            "credited CLI output does not yet support retained product profile/request dumps",
-        ));
+    if credited_output {
+        credited::validate_observability(&product_observability)?;
     }
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
@@ -1461,6 +1459,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 request,
                 request_context,
                 cmd.bench_mode,
+                &product_observability,
             )
             .await?;
             let elapsed = stats.elapsed.as_secs_f64();
@@ -3031,7 +3030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credited_run_rejects_retained_profiles_before_model_resolution() {
+    async fn credited_run_rejects_replay_dump_before_model_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credited.toml");
         std::fs::write(

@@ -110,6 +110,7 @@ async fn credited_engine_chat_terminal_token_preserves_actual_reasoning_policy_a
                 history: Some(history),
                 usage,
                 reason,
+                ..
             } => {
                 assert_eq!(history.text, "ok");
                 assert_eq!(history.tokens, vec![TokenId::new(6)]);

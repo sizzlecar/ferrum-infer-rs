@@ -74,6 +74,14 @@ pub struct EngineTokenTimingEvidence {
     /// Opt-in decode-stage evidence captured only with engine token timing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_stage_intervals: Vec<EngineDecodeStageInterval>,
+    /// Stages omitted after a bounded retained prefix filled. Commit timestamps
+    /// remain complete; a nonzero value forbids treating stages as a full trace.
+    #[serde(default, skip_serializing_if = "is_zero_omitted_intervals")]
+    pub decode_stage_intervals_omitted: u64,
+}
+
+fn is_zero_omitted_intervals(value: &u64) -> bool {
+    *value == 0
 }
 
 impl EngineTokenTimingEvidence {

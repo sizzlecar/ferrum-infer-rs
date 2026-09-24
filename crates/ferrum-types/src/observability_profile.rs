@@ -69,6 +69,14 @@ pub fn engine_token_timing_profile_attributes(
             serde_json::json!(average_itl_nanos / 1_000),
         ),
     ]);
+    attributes.insert(
+        "engine_decode_stage_intervals_omitted".into(),
+        serde_json::json!(timing.decode_stage_intervals_omitted),
+    );
+    attributes.insert(
+        "engine_decode_stages_complete".into(),
+        serde_json::json!(timing.decode_stage_intervals_omitted == 0),
+    );
     if let Some(ttft_nanos) = timing.ttft_nanos() {
         attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_nanos / 1_000));
     }
@@ -570,6 +578,7 @@ mod tests {
     #[test]
     fn engine_token_timing_preserves_exact_commit_intervals() {
         let timing = EngineTokenTimingEvidence {
+            decode_stage_intervals_omitted: 0,
             clock_source: "rust_std_instant".to_string(),
             wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
             wall_anchor_max_error_nanos: 400,

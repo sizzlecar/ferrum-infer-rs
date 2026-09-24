@@ -717,7 +717,22 @@ impl Owner {
         {
             return false;
         }
-        if let OutputCompletion::Succeeded { history, usage, .. } = &decision.outcome {
+        if let OutputCompletion::Succeeded {
+            history,
+            usage,
+            execution_evidence,
+            ..
+        } = &decision.outcome
+        {
+            if self
+                .budget
+                .plan()
+                .evidence_plan()
+                .validate(execution_evidence.as_ref(), usage)
+                .is_err()
+            {
+                return false;
+            }
             if usage.completion_tokens != self.generated_tokens
                 && decision.through_output_ordinal == self.applied
             {
