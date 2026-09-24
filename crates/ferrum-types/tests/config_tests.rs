@@ -402,3 +402,31 @@ fn sampling_presets_contains_expected() {
     assert!(presets.presets.get("creative").is_some());
     assert!(presets.presets.get("precise").is_some());
 }
+
+#[test]
+fn workspace_preparation_defaults_and_wire_are_independent_of_device_programs() {
+    let mut config = EngineConfig::default();
+    assert_eq!(
+        config.backend.workspace_preparation,
+        WorkspacePreparationMode::DemandDriven
+    );
+    let mut wire = serde_json::to_value(&config.backend).unwrap();
+    wire.as_object_mut()
+        .unwrap()
+        .remove("workspace_preparation");
+    let old: BackendConfig = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        old.workspace_preparation,
+        WorkspacePreparationMode::DemandDriven
+    );
+    config.backend.enable_reusable_execution = false;
+    config.backend.workspace_preparation = "startup".parse().unwrap();
+    let restored: EngineConfig =
+        serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+    assert_eq!(
+        restored.backend.workspace_preparation,
+        WorkspacePreparationMode::Startup
+    );
+    assert!(!restored.backend.enable_reusable_execution);
+    assert!("auto".parse::<WorkspacePreparationMode>().is_err());
+}

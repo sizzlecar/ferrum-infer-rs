@@ -307,6 +307,9 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
             self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_WORKSPACE_PREPARATION") {
+            self.backend.workspace_preparation = value.parse()?;
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION") {
             self.backend.enable_reusable_execution = parse_presence_bool(value)?;
         }
@@ -1002,6 +1005,36 @@ impl Default for ReusableExecutionCaptureConfig {
     }
 }
 
+/// Resource preparation independent of reusable device programs. Startup only
+/// claims and releases declared workspace buckets; it never encodes model work.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePreparationMode {
+    #[default]
+    DemandDriven,
+    Startup,
+}
+
+impl WorkspacePreparationMode {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::DemandDriven => "demand_driven",
+            Self::Startup => "startup",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkspacePreparationMode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "demand_driven" => Ok(Self::DemandDriven),
+            "startup" => Ok(Self::Startup),
+            _ => Err("workspace preparation must be demand_driven or startup".to_owned()),
+        }
+    }
+}
+
 /// Backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -1025,6 +1058,10 @@ pub struct BackendConfig {
     /// bridge: the resolved execution policy must fingerprint its outcome.
     #[serde(default)]
     pub reusable_execution_capture: ReusableExecutionCaptureConfig,
+    /// Prepare existing Step/Invocation buckets before readiness, independently
+    /// of device-program capture. Default performs no extra startup work.
+    #[serde(default)]
+    pub workspace_preparation: WorkspacePreparationMode,
     /// Enable kernel fusion
     pub enable_kernel_fusion: bool,
     /// Custom backend-specific options
@@ -1042,6 +1079,7 @@ impl Default for BackendConfig {
             enable_cuda_graphs: false,
             enable_reusable_execution: default_enable_reusable_execution(),
             reusable_execution_capture: ReusableExecutionCaptureConfig::default(),
+            workspace_preparation: WorkspacePreparationMode::default(),
             enable_kernel_fusion: true,
             backend_options: HashMap::new(),
         }
