@@ -1,6 +1,6 @@
 # Ferrum SLO 核心算法：研究结论与设计取舍
 
-状态：设计提案，2026-09-24；不是已实现功能或性能结论。
+状态：设计与迁移记录，2026-09-24。A0 独立枚举器及 A1 统一转移已落源码；A2–A5 仍在实施，性能结论尚未建立。
 承接原 RFC v2、[完整实施与验收清单](slo-implementation-plan.zh.md)及交接中的执行/资源基础。
 本轮代码审查基点为 `88dc391b` 加现存工作树，不能仅用提交号重现全部代码。
 第三方源码只阅读，未引入依赖或复制实现。本文的算法组合是 Ferrum 的待验证设计，不声称学术首创。
@@ -124,7 +124,7 @@ Theorem 4.1 / Appendix E 的竞争界限于其模型，不继承为我们的 Com
 
 ## 5. 统一状态转移，消除重复推演
 
-设计接口（名称为草图，尚未实现）：
+转移语义如下；实际接口为 scheduler 的 `PlanningExecutionContext`、`PlanningExecutionState::project` 和 `simulation::advance`：
 
 ```rust,ignore
 transition(parent, logical_action, frozen_context, budget)
@@ -134,6 +134,17 @@ transition(parent, logical_action, frozen_context, budget)
 // resolved_action + canonical_cost_shape + predicted_interval
 // resource/output delta + next logical state + obligation result
 ```
+
+当前 A1 实现由引擎捕获同一 epoch 的请求、资源和路线，搜索节点同时持有逻辑状态与不可变执行后继。
+`simulation::advance` 只投影新增动作；完整逻辑、时间和输出检查成功后才保留联合后继。
+生产适配器不再逐节点从根重放路线；旧 resolver API 通过显式兼容适配器重放，不作为生产性能路径。
+最终选中序列仍从同一捕获的根状态、以新的实际时间独立重验，随后由原提交 guard 检查当前真实状态。
+这两个边界不同：重新模拟不等于重新捕获 live authority，任何规划后继都不携带执行许可。
+
+A1 的硬件无关状态、预算、独立小模型及当前集成工作树检查已通过；真实 Metal 小模型也已验证
+partial→final 后继、重新捕获后的 decode/mixed 与完整 native/host 记录一致，且纯投影不提交工作。
+冷 mixed 的物理池不足保持 Unknown；测试经真实容量维护和执行后才验证驻留路线，未把冷状态重标为已准备。
+新构建的 9B Enforce 诊断仍在进行。尚无证据表明完整可行计划比例或端到端性能已经改善。
 
 一次 transition 同时完成语义检查、合法物理路线解析、资源/输出投影、时间推进和义务检查。
 搜索节点持有该转移产生的轻量不可变状态；扩展一个节点只计算新动作，不从初始状态重新计算整条路径。
