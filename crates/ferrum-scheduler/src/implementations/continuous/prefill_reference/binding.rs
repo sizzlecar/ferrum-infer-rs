@@ -8,8 +8,9 @@ pub struct ReferenceChunkLimits {
     pub maximum_candidates: NonZeroUsize,
 }
 impl LoadedPrefillReference {
-    /// A bounded subset of measured endpoints, intersected with backend rules.
-    /// Merging reference segments changes physical cost, never the work unit.
+    /// Bounded legal endpoints for reference accounting, intersected with
+    /// backend rules. Piecewise references permit aligned intermediate work;
+    /// each resulting physical wave still requires its own cost prediction.
     pub fn legal_chunks(
         &self,
         total: NonZeroU32,
@@ -25,7 +26,6 @@ impl LoadedPrefillReference {
             {
                 return Err(ReferenceUnknown::LengthNotCalibrated);
             }
-            let mut counts = std::collections::BTreeSet::new();
             let remaining = total
                 .get()
                 .checked_sub(offset)
@@ -33,29 +33,7 @@ impl LoadedPrefillReference {
             if offset % limits.alignment.get() != 0 {
                 return Err(ReferenceUnknown::NoLegalChunk);
             }
-            for value in [
-                limits.alignment.get(),
-                self.protocol.granule_tokens.get(),
-                limits.maximum_tokens.get(),
-            ] {
-                let count = value.min(remaining).min(limits.maximum_tokens.get());
-                let count = count - count % limits.alignment.get();
-                if let Some(count) = NonZeroU32::new(count) {
-                    counts.insert(count);
-                }
-            }
-            if limits.allow_final_short_chunk && remaining <= limits.maximum_tokens.get() {
-                if let Some(tail) = NonZeroU32::new(remaining) {
-                    counts.insert(tail);
-                }
-            }
-            if counts.is_empty() {
-                return Err(ReferenceUnknown::NoLegalChunk);
-            }
-            return Ok(counts
-                .into_iter()
-                .take(limits.maximum_candidates.get())
-                .collect());
+            return piecewise_chunk_candidates(remaining, self.protocol.granule_tokens, limits);
         }
         let curve = self.curve(total)?;
         curve
@@ -124,6 +102,56 @@ impl LoadedPrefillReference {
         })
     }
 }
+
+/// Keep the original minimum/reference/maximum/tail anchors, then fill the
+/// available candidate budget with a geometric ladder of aligned sizes.
+/// Large intermediate chunks are inserted first so a small optional budget
+/// does not replace all throughput opportunities with tiny chunks. At most
+/// 32 doubling steps are possible for a u32 token count. This is a bounded
+/// search heuristic, not a claim that intermediate physical costs are known
+/// or that latency is monotonic in the token count.
+fn piecewise_chunk_candidates(
+    remaining: u32,
+    reference_granule: NonZeroU32,
+    limits: ReferenceChunkLimits,
+) -> Result<Vec<NonZeroU32>, ReferenceUnknown> {
+    let alignment = limits.alignment.get();
+    let ceiling = remaining.min(limits.maximum_tokens.get());
+    let mut counts = std::collections::BTreeSet::new();
+    for value in [
+        alignment,
+        reference_granule.get(),
+        limits.maximum_tokens.get(),
+    ] {
+        let count = value.min(ceiling);
+        if let Some(count) = NonZeroU32::new(count - count % alignment) {
+            counts.insert(count);
+        }
+    }
+    if limits.allow_final_short_chunk && remaining <= limits.maximum_tokens.get() {
+        if let Some(tail) = NonZeroU32::new(remaining) {
+            counts.insert(tail);
+        }
+    }
+    let mut stride = alignment;
+    while let Some(next) = stride.checked_mul(2).filter(|next| *next <= ceiling) {
+        stride = next;
+    }
+    while stride > alignment && counts.len() < limits.maximum_candidates.get() {
+        counts.insert(NonZeroU32::new(stride).unwrap());
+        stride /= 2;
+    }
+    if counts.is_empty() {
+        return Err(ReferenceUnknown::NoLegalChunk);
+    }
+    Ok(counts
+        .into_iter()
+        .take(limits.maximum_candidates.get())
+        .collect())
+}
+
+#[cfg(test)]
+mod chunk_ladder_tests;
 
 /// Fixed per-incarnation accounting. No setter can refresh the original
 /// admission, replace the curve, or reset useful high-water during recompute.

@@ -3,6 +3,73 @@
 use super::*;
 use std::cell::Cell;
 
+#[test]
+fn intermediate_chunk_can_be_required_by_joint_prefill_and_decode_deadlines() {
+    let mut p = prefill(1);
+    p.timing.budgets.ttft_ns = n64(126);
+    if let RequestPhaseView::Prefill(progress) = &mut p.phase {
+        progress.reference = Arc::new(PrefillReferenceWork {
+            evaluation: Default::default(),
+            version: 1,
+            points: (0..=8)
+                .map(|tokens| ReferenceWorkPoint {
+                    prompt_tokens: tokens,
+                    cumulative_work_ns: u64::from(tokens) * 10,
+                })
+                .collect(),
+        });
+    }
+    let mut d = decode(2);
+    d.timing.maximum_output_tokens = n32(2);
+    d.timing.budgets.itl_ns = n64(24);
+    d.timing.budgets.tpot_ns = n64(34);
+    let mut s = snapshot(vec![p, d]);
+    s.scope.horizon_end_ns = 126;
+    s.capabilities.native_mixed = false;
+    s.capabilities.prefill_alignment = n32(1);
+    s.capabilities.prefill_chunk_sizes = vec![n32(1), n32(4), n32(8)];
+    let model = Model(|shape: &WaveExecutionShape| {
+        if shape.kind == WaveKind::Decode {
+            return Some(2);
+        }
+        match shape.prefill_chunks.as_slice() {
+            [chunk] => match chunk.count.get() {
+                1 => Some(8),
+                2 => Some(3),
+                4 => Some(30),
+                8 => Some(60),
+                _ => None,
+            },
+            _ => None,
+        }
+    });
+    assert!(matches!(
+        planner(8).propose(&s, &model, &TestResolver, &mut Clock(100)),
+        PlanningDecision::Unknown { .. }
+    ));
+    s.capabilities.prefill_chunk_sizes.insert(1, n32(2));
+    let (_, witness, _) = feasible(planner(8).propose(&s, &model, &TestResolver, &mut Clock(100)));
+    assert!(witness.predicted_output_tokens >= 2);
+    // Adding a legal shape must not imply empirical support for its cost.
+    let unknown_intermediate = Model(|shape: &WaveExecutionShape| {
+        if shape
+            .prefill_chunks
+            .iter()
+            .any(|chunk| chunk.count.get() == 2)
+        {
+            None
+        } else if shape.kind == WaveKind::Decode {
+            Some(2)
+        } else {
+            Some(60)
+        }
+    });
+    assert!(matches!(
+        planner(8).propose(&s, &unknown_intermediate, &TestResolver, &mut Clock(100)),
+        PlanningDecision::Unknown { .. }
+    ));
+}
+
 struct TransactionClock {
     now: u64,
     origin: u64,

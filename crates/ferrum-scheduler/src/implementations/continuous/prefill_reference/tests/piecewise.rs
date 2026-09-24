@@ -187,6 +187,52 @@ fn piecewise_legal_counts_are_not_limited_to_measured_endpoints() {
 }
 
 #[test]
+fn piecewise_chunk_ladder_only_enriches_legally_accounted_progress() {
+    let value = loaded();
+    let chunks = value
+        .legal_chunks(
+            n32(10),
+            0,
+            ReferenceChunkLimits {
+                maximum_tokens: n32(8),
+                alignment: n32(1),
+                allow_final_short_chunk: true,
+                maximum_candidates: nz(64),
+            },
+        )
+        .unwrap();
+    assert!(
+        chunks.contains(&n32(2)),
+        "an intermediate action absent from the old three anchors"
+    );
+    let curve = value.curve(n32(10)).unwrap();
+    for chunk in chunks {
+        assert!(curve.work_at(chunk.get()).is_some());
+    }
+    // A ladder cannot create reference coverage, bypass alignment at the
+    // current frontier, or interpolate a V1 exact endpoint.
+    let limits = ReferenceChunkLimits {
+        maximum_tokens: n32(8),
+        alignment: n32(2),
+        allow_final_short_chunk: true,
+        maximum_candidates: nz(64),
+    };
+    assert!(matches!(
+        value.legal_chunks(n32(11), 0, limits),
+        Err(ReferenceUnknown::LengthNotCalibrated)
+    ));
+    assert!(matches!(
+        value.legal_chunks(n32(10), 1, limits),
+        Err(ReferenceUnknown::NoLegalChunk)
+    ));
+    let exact = load(&artifact()).unwrap();
+    assert!(!exact
+        .legal_chunks(n32(10), 0, limits)
+        .unwrap()
+        .contains(&n32(2)));
+}
+
+#[test]
 fn piecewise_wire_cannot_relabel_v1_or_extrapolate_missing_terminal_anchor() {
     let bytes = builder().finish_bytes().unwrap();
     let digest = specification()
