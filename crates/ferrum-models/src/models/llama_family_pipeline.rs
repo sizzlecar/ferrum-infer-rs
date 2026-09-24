@@ -889,6 +889,28 @@ where
     K: KvLayer<B>,
     LlamaFamilyModel<B, K>: DecoderOnlyLLM + LlamaPipelineStageBatchOps<B> + Send,
 {
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        self.stages
+            .iter()
+            .all(|stage| stage.bounded_prefill_supported())
+    }
+
+    fn incremental_prefill_cache_len(&self, cache_id: &str) -> Result<usize> {
+        let mut lengths = self
+            .stages
+            .iter()
+            .map(|stage| stage.exact_prefill_cache_len(cache_id));
+        let length = lengths.next().transpose()?.unwrap_or(0);
+        for observed in lengths {
+            if observed? != length {
+                return Err(FerrumError::backend(
+                    "pipeline prefill stages disagree on completed offset",
+                ));
+            }
+        }
+        Ok(length)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -1529,10 +1551,19 @@ mod tests {
     fn pipeline_incremental_prefill_matches_full_model_position_offset() {
         let (mut full, mut pipeline) = build_full_and_pipeline();
 
+        assert!(full.supports_bounded_incremental_prefill());
+        assert!(pipeline.supports_bounded_incremental_prefill());
+        assert_eq!(full.incremental_prefill_cache_len("full").unwrap(), 0);
+        assert_eq!(pipeline.incremental_prefill_cache_len("pipe").unwrap(), 0);
+
         let _ = full.prefill("full", &[0, 1]);
         let _ = pipeline.prefill("pipe", &[0, 1]);
+        assert_eq!(full.incremental_prefill_cache_len("full").unwrap(), 2);
+        assert_eq!(pipeline.incremental_prefill_cache_len("pipe").unwrap(), 2);
         let full_logits = full.prefill("full", &[2, 3]);
         let pipeline_logits = pipeline.prefill("pipe", &[2, 3]);
+        assert_eq!(full.incremental_prefill_cache_len("full").unwrap(), 4);
+        assert_eq!(pipeline.incremental_prefill_cache_len("pipe").unwrap(), 4);
 
         assert_logits_close("incremental prefill", &full_logits, &pipeline_logits);
     }

@@ -1,6 +1,23 @@
 use super::*;
 
 impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3MoeModel<B, K> {
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        !self.runtime_env.prefix_cache
+    }
+
+    fn incremental_prefill_cache_len(&self, cache_id: &str) -> Result<usize> {
+        let Some(layers) = self.kv_caches.get(cache_id) else {
+            return Ok(0);
+        };
+        let length = layers.first().map(|layer| layer.len).unwrap_or(0);
+        if layers.iter().any(|layer| layer.len != length) {
+            return Err(FerrumError::backend(
+                "incremental MoE prefill KV layers disagree on completed offset",
+            ));
+        }
+        Ok(length)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }

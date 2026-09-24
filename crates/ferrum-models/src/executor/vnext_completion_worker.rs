@@ -294,6 +294,17 @@ impl VNextCompletionWorker {
         self.counters.checkpoint_transfer.reset();
         true
     }
+
+    /// Reserve the only queue slot while inspecting the running task count.
+    /// A pending count alone misses a reservation made before submission.
+    /// No task is enqueued and no timing/counter is reset by this bracket.
+    pub(super) fn try_with_idle<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let _permit = self.sender.as_ref()?.try_reserve().ok()?;
+        if self.pending_tasks() != 0 {
+            return None;
+        }
+        Some(action())
+    }
 }
 
 impl Drop for VNextCompletionWorker {
@@ -326,6 +337,32 @@ mod tests {
     use std::sync::Arc;
     use std::task::Poll;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn calibration_idle_bracket_rejects_running_work_and_preserves_metrics() {
+        let worker = VNextCompletionWorker::new().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let ticket = worker.reserve().await.unwrap().submit(
+            VNextCompletionTaskKind::PostSubmitDrain,
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+        started_rx.await.unwrap();
+        // The queue slot is free again while the real worker task is running.
+        assert!(worker
+            .try_with_idle(|| panic!("must not run while busy"))
+            .is_none());
+        release_tx.send(()).unwrap();
+        ticket.wait().await.unwrap();
+        let before = worker.metrics_snapshot();
+        assert_eq!(worker.try_with_idle(|| 23), Some(23));
+        assert_eq!(worker.metrics_snapshot(), before);
+        assert_eq!(before["scheduled_tasks"], 1);
+        assert_eq!(before["completed_tasks"], 1);
+    }
 
     #[tokio::test]
     async fn reservation_is_bounded_and_drop_releases_capacity_without_a_task() {

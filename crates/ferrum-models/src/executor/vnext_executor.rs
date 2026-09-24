@@ -31,9 +31,9 @@ use ferrum_interfaces::model_executor::{
     ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
     MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
     PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimeMixedBatchOutcome,
-    PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
-    PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
-    PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
+    PlanRuntimeMixedBatchOutput, PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion,
+    PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput,
+    PlanRuntimePrefillProduct, PlanRuntimePrefixRestoreDeferral, PlanRuntimePrefixRestoreInput,
     PlanRuntimePrefixRestoreOutcome, PlanRuntimePrefixRestoreOutput, PlanRuntimeResourceSnapshot,
     PrefillChunk, PrefillInput, PrefillOutput, PrefixCaptureBoundary, PrefixCaptureLease,
     PrefixCapturePlan, PrefixCaptureRequest, TypedSequenceStateMemory,
@@ -68,19 +68,24 @@ use super::{
 };
 
 mod backing_maintenance;
+mod completion_observation;
 mod composition;
 mod cost_observation;
 mod determinism;
+mod execution_maintenance;
+mod guarded_submission;
 mod mixed_batch;
+use guarded_submission::GuardedExecution;
 mod planning_cost_route;
 mod readback_logits;
+mod resource_planning;
+mod workspace_startup;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod prefix_cache;
 mod request;
-mod resource_planning;
 mod reusable_catalog;
 mod state_memory;
-mod workspace_startup;
+mod token_policy_residency;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -3892,6 +3897,7 @@ enum DispatchOutcome<R: DeviceRuntime> {
         attribution: Option<BoundDeviceSubmissionAttribution>,
     },
     QuiescentFailure(String),
+    GuardRejected(PendingGuardedWaveRejection),
     SubmissionIndeterminate {
         message: String,
         recovery: IndeterminateSubmissionHandle<R>,
@@ -7312,6 +7318,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         output_mode: VNextProductOutputMode,
         token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
         mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
@@ -7648,7 +7655,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .provider_encode_submit
                     .start_if(timing_enabled);
                 let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
-                if cost_observation.is_some() {
+                if let Some(selected) = guarded {
+                    let guard = guarded_submission::ActualPreparedGuard {
+                        executor: self,
+                        selected,
+                        participants,
+                        kind,
+                        output: output_mode,
+                        masks: token_mask_plans,
+                    };
+                    match OperationDispatch::encode_and_submit_guarded_wave(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &identity,
+                        active_bindings(),
+                        &uploads,
+                        &guard,
+                        wave,
+                        &self.lane,
+                        &self.reaper,
+                    ) {
+                        GuardedWaveSubmissionOutcome::Dispatch(result) => {
+                            result.map(ProfiledSubmissionHandle::into_parts)
+                        }
+                        GuardedWaveSubmissionOutcome::NotSubmitted(rejection) => {
+                            return DispatchOutcome::GuardRejected(rejection);
+                        }
+                    }
+                } else if cost_observation.is_some() {
                     if timing_enabled {
                         OperationDispatch::encode_and_submit_wave_with_cost_observation(
                             self.providers.providers(),
@@ -7801,7 +7835,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     };
                 }
                 Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
-                    if retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
+                    if guarded.is_none() && retries < MAX_DEFINITELY_NOT_SUBMITTED_RETRIES =>
                 {
                     retries += 1;
                     if reusable_program_stats.is_some() {
@@ -7979,6 +8013,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         output_roles: &[VNextParticipantOutputRole],
         cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> Result<VNextExecutionCapacityDecision<Vec<ExecutorSamplingOutput>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
@@ -8023,37 +8058,54 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step =
-                match self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)? {
-                    VNextExecutionCapacityDecision::Ready(step) => step,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+            let step_decision = if guarded.is_some() {
+                self.guarded_begin_step_once(batch, spans, kind, guarded.expect("guarded branch"))
+            } else {
+                self.begin_step_for_spans_with_capacity(batch, sequences, spans, kind)
+            };
+            let step = match step_decision? {
+                VNextExecutionCapacityDecision::Ready(step) => step,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                        deferred,
+                    ))
+                }
+            };
+            let wave_attempt = if guarded.is_some() {
+                self.guarded_prepare_wave_once(
+                    &step,
+                    sequences,
+                    spans,
+                    guarded.expect("guarded branch"),
+                )
+            } else {
+                self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)
+            };
+            let wave_decision = match wave_attempt {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Err(cleanup_error) =
+                        self.rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
+                    {
+                        return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
                     }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ))
-                    }
-                };
-            let wave_decision =
-                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        if let Err(cleanup_error) = self
-                            .rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
-                        {
-                            return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
-                        }
-                        return Err(error);
-                    }
-                };
+                    return Err(error);
+                }
+            };
             let wave = match wave_decision {
                 VNextExecutionCapacityDecision::Ready(wave) => wave,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    self.rollback_unsubmitted_step(
-                        step,
-                        "vNext capacity-deferred unsubmitted step",
-                    )?;
+                    if let Some(selected) = guarded {
+                        self.reconcile_guarded_maintenance_step(step, selected)?;
+                    } else {
+                        self.rollback_unsubmitted_step(
+                            step,
+                            "vNext capacity-deferred unsubmitted step",
+                        )?;
+                    }
                     return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                 }
                 VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
@@ -8082,7 +8134,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 },
             )
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, prepared, kind, cost_observation)
+        self.execute_prepared_participants(&participants, prepared, kind, cost_observation, guarded)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
     }
@@ -8103,7 +8155,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             output_role: &output_role,
         };
         let mut logits = self
-            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind, None)
+            .execute_prepared_participants(
+                std::slice::from_ref(&participant),
+                prepared,
+                kind,
+                None,
+                None,
+            )
             .await?;
         logits
             .pop()
@@ -8116,6 +8174,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         prepared: PreparedVNextPrefill<R>,
         kind: VNextExecutionWaveKind,
         mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let mut terminal_observed = false;
         let result = self
@@ -8125,6 +8184,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 kind,
                 cost_observation.as_deref_mut(),
                 &mut terminal_observed,
+                guarded,
             )
             .await;
         if let Some(observation) = cost_observation {
@@ -8145,6 +8205,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         kind: VNextExecutionWaveKind,
         mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
         terminal_observed: &mut bool,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> Result<Vec<ExecutorSamplingOutput>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let phase_timing = self.metrics.wave_timing_for(kind);
@@ -8255,11 +8316,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 output_mode,
                 token_mask_residency.plans(),
                 cost_observation.as_deref_mut(),
+                guarded,
             );
             (token_mask_residency, dispatch)
         };
         let mut execution_event_error = None;
         let (completion, attribution) = match dispatch {
+            DispatchOutcome::GuardRejected(rejection) => {
+                drop(completion_reservation);
+                token_mask_residency.invalidate_before_slot_release();
+                match rejection.reconcile_step(step) {
+                    Ok(receipt) => {
+                        if let Some(guarded) = guarded {
+                            guarded.record_reconciled(receipt);
+                        }
+                        return Err(FerrumError::backend(
+                            "selected wave was rejected before native submission",
+                        ));
+                    }
+                    Err((error, step)) => {
+                        return Err(self.abort_unsubmitted_step(
+                            step,
+                            FerrumError::backend(format!("selected wave cleanup failed: {error}")),
+                        ));
+                    }
+                }
+            }
             DispatchOutcome::Submitted {
                 completion,
                 attribution,
@@ -8902,7 +8984,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     async fn execute_plan_runtime_decode_batch(
         &self,
         inputs: &[PlanRuntimeDecodeInput],
+        cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+    ) -> Result<PlanRuntimeBatchDecodeOutcome> {
+        self.execute_plan_runtime_decode_batch_inner(inputs, cost_observation, None)
+            .await
+    }
+
+    async fn execute_plan_runtime_decode_batch_inner(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
         mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
         let started = Instant::now();
         if inputs.is_empty() {
@@ -8997,7 +9089,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let extension = ResourceWorkShape::single(extension_span)
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match self.extend_sequence_with_capacity(&candidate.sequence, extension) {
+            let extension_attempt = match guarded {
+                Some(guarded) => self.guarded_extend_once(&candidate.sequence, extension, guarded),
+                None => self.extend_sequence_with_capacity(&candidate.sequence, extension),
+            };
+            match extension_attempt {
                 Ok(VNextExecutionCapacityDecision::Ready(())) => {}
                 Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
                     return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
@@ -9008,8 +9104,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     ));
                 }
                 Err(error) => {
-                    if DecodeFailureDisposition::from_error(&error)
-                        == DecodeFailureDisposition::AbortSequence
+                    if !guarded.is_some_and(GuardedExecution::preserves_request)
+                        && DecodeFailureDisposition::from_error(&error)
+                            == DecodeFailureDisposition::AbortSequence
                     {
                         self.abort_decode_candidates(std::slice::from_ref(candidate));
                     }
@@ -9040,6 +9137,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 VNextExecutionWaveKind::Decode,
                 &output_roles,
                 cost_observation.as_deref_mut(),
+                guarded,
             )
             .await
         {
@@ -9051,8 +9149,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
             }
             Err(error) => {
-                if DecodeFailureDisposition::from_error(&error)
-                    == DecodeFailureDisposition::AbortSequence
+                if !guarded.is_some_and(GuardedExecution::preserves_request)
+                    && DecodeFailureDisposition::from_error(&error)
+                        == DecodeFailureDisposition::AbortSequence
                 {
                     self.abort_decode_candidates(&canonical_candidates);
                 }
@@ -9293,6 +9392,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextExecutionWaveKind::Prefill,
                     &[VNextParticipantOutputRole::prefill(completed_chunk)],
                     cost_observation.as_deref_mut(),
+                    None,
                 )
                 .await?
             {
@@ -9377,7 +9477,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     async fn execute_plan_runtime_prefill_batch_with_capacity(
         &self,
         inputs: &[PlanRuntimePrefillInput],
+        cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+    ) -> Result<PlanRuntimeBatchPrefillOutcome> {
+        self.execute_plan_runtime_prefill_batch_inner(inputs, cost_observation, None)
+            .await
+    }
+
+    async fn execute_plan_runtime_prefill_batch_inner(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
         mut cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
     ) -> Result<PlanRuntimeBatchPrefillOutcome> {
         if inputs.is_empty() {
             return Ok(PlanRuntimeBatchPrefillOutcome::Completed(Vec::new()));
@@ -9540,11 +9650,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
                 let extension = ResourceWorkShape::single(extension_span)
                     .map_err(|error| FerrumError::backend(error.to_string()))?;
-                if let VNextExecutionCapacityDecision::Deferred(deferred) =
-                    self.extend_sequence_with_capacity(&candidate.sequence, extension)?
-                {
-                    if let Some(next_tokens) =
-                        deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                let extension_attempt = match guarded {
+                    Some(selected) => {
+                        self.guarded_extend_once(&candidate.sequence, extension, selected)
+                    }
+                    None => self.extend_sequence_with_capacity(&candidate.sequence, extension),
+                };
+                let extension_decision = match extension_attempt {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        if let Some(selected) =
+                            guarded.filter(|selected| selected.preserves_request())
+                        {
+                            self.restore_guarded_prefills(
+                                &candidates,
+                                &mut execution_guards,
+                                selected,
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if let VNextExecutionCapacityDecision::Deferred(deferred) = extension_decision {
+                    if let Some(next_tokens) = guarded
+                        .is_none()
+                        .then(|| {
+                            deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                        })
+                        .flatten()
                     {
                         capacity_probe_counts[index] =
                             capacity_probe_counts[index].checked_add(1).ok_or_else(|| {
@@ -9591,7 +9724,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .copied()
                 .map(VNextParticipantOutputRole::prefill)
                 .collect::<Vec<_>>();
-            match self
+            let execution = self
                 .execute_batch_step(
                     &batch,
                     &sequences,
@@ -9600,15 +9733,35 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextExecutionWaveKind::Prefill,
                     &output_roles,
                     cost_observation.as_deref_mut(),
+                    guarded,
                 )
-                .await?
-            {
+                .await;
+            let execution = match execution {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Some(selected) = guarded.filter(|selected| selected.preserves_request())
+                    {
+                        self.restore_guarded_prefills(
+                            &candidates,
+                            &mut execution_guards,
+                            selected,
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
+            match execution {
                 VNextExecutionCapacityDecision::Ready(logits) => break logits,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
                     let mut narrowed = false;
                     for (index, completed_chunk) in completed_chunks.iter_mut().enumerate() {
-                        let Some(next_tokens) =
-                            deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                        let Some(next_tokens) = guarded
+                            .is_none()
+                            .then(|| {
+                                deferred
+                                    .narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                            })
+                            .flatten()
                         else {
                             continue;
                         };
@@ -9672,9 +9825,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         // Every participating FullPlan has retired. Optional copying here
         // cannot turn a zero-submission capacity outcome into hidden work.
-        for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
-            self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
-                .await?;
+        if guarded.is_none() {
+            for (candidate, chunk) in candidates.iter().zip(&completed_chunks) {
+                self.retain_prefill_boundary(&candidate.sequence, &candidate.tokens, *chunk)
+                    .await?;
+            }
         }
 
         let mut ordered = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
@@ -10050,6 +10205,41 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[async_trait::async_trait]
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
+    fn calibration_invalidate_token_policy_residency(
+        &self,
+    ) -> ferrum_interfaces::model_executor::TokenPolicyResidencyInvalidation {
+        token_policy_residency::invalidate(
+            &self.sequences,
+            &self.completion_worker,
+            &self.lane,
+            &self.product_token_mask_residency,
+        )
+    }
+
+    fn slo_execution_capability(&self) -> ferrum_interfaces::model_executor::ExecutorSloCapability {
+        use ferrum_interfaces::model_executor::ExecutorSloCapability;
+        if self.supports_slo_execution() {
+            ExecutorSloCapability::GuardedEagerWaves
+        } else {
+            ExecutorSloCapability::Unavailable
+        }
+    }
+
+    fn guarded_prefill_granularity(&self) -> Option<std::num::NonZeroUsize> {
+        // PlanRuntime PrefillChunk/ExecutionWorkSpan accept a non-empty exact
+        // one-token span, including partial prefill. Guarded preparation still
+        // validates its actual provider and backing; no implicit fallback.
+        self.supports_slo_execution()
+            .then_some(std::num::NonZeroUsize::MIN)
+    }
+
+    fn maintain_execution_capacity_once(
+        &self,
+        ticket: ferrum_interfaces::model_executor::ExecutorExecutionMaintenanceTicket,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+    ) -> Result<ferrum_interfaces::model_executor::ExecutorExecutionMaintenanceOutcome> {
+        self.maintain_guarded_execution_once(ticket, guard)
+    }
     fn execution_cost_identity(
         &self,
     ) -> ferrum_interfaces::execution_cost::ExecutorCostIdentityAvailability {
@@ -10133,23 +10323,112 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         ObservedDispatch::Executed(result)
     }
 
-    fn execution_cost_route_view(
+    async fn plan_runtime_batch_prefill_guarded_observed(
         &self,
-        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
-        limits: ResourcePlanningLimits,
-        budget: &mut dyn ResourcePlanningBudget,
-    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteView> {
-        self.capture_future_cost_route(requests, limits, budget)
+        inputs: &[PlanRuntimePrefillInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionCostWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>>
+    {
+        let Ok(expected) =
+            ferrum_interfaces::execution_cost::ExpectedExecutionWave::from_cost_witness(
+                expected.clone(),
+                |_| None,
+            )
+        else {
+            return ferrum_interfaces::execution_cost::GuardedDispatchOutcome::Unsupported;
+        };
+        self.execute_guarded_prefill(inputs, &expected, guard, observation)
+            .await
     }
 
-    fn project_execution_cost_wave(
+    async fn plan_runtime_mixed_batch_guarded_observed(
         &self,
-        view: &ExecutionCostRouteView,
-        state: &ExecutionCostRouteState,
-        query: &FutureWaveCostQuery<'_>,
-        budget: &mut dyn ResourcePlanningBudget,
-    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteProjection> {
-        self.project_future_cost_route(view, state, query, budget)
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionCostWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput>
+    {
+        let Ok(expected) =
+            ferrum_interfaces::execution_cost::ExpectedExecutionWave::from_cost_witness(
+                expected.clone(),
+                |id| {
+                    decodes
+                        .iter()
+                        .find(|input| &input.request_id == id)
+                        .map(|input| &input.logits_policy)
+                },
+            )
+        else {
+            return ferrum_interfaces::execution_cost::GuardedDispatchOutcome::Unsupported;
+        };
+        self.execute_guarded_mixed(prefills, decodes, &expected, guard, observation)
+            .await
+    }
+
+    async fn plan_runtime_batch_decode_guarded_observed(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionCostWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>>
+    {
+        let Ok(expected) =
+            ferrum_interfaces::execution_cost::ExpectedExecutionWave::from_cost_witness(
+                expected.clone(),
+                |id| {
+                    inputs
+                        .iter()
+                        .find(|input| &input.request_id == id)
+                        .map(|input| &input.logits_policy)
+                },
+            )
+        else {
+            return ferrum_interfaces::execution_cost::GuardedDispatchOutcome::Unsupported;
+        };
+        self.execute_guarded_decode(inputs, &expected, guard, observation)
+            .await
+    }
+
+    async fn plan_runtime_batch_prefill_guarded_work_observed(
+        &self,
+        inputs: &[PlanRuntimePrefillInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>>
+    {
+        self.execute_guarded_prefill(inputs, expected, guard, observation)
+            .await
+    }
+
+    async fn plan_runtime_mixed_batch_guarded_work_observed(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput>
+    {
+        self.execute_guarded_mixed(prefills, decodes, expected, guard, observation)
+            .await
+    }
+
+    async fn plan_runtime_batch_decode_guarded_work_observed(
+        &self,
+        inputs: &[PlanRuntimeDecodeInput],
+        expected: &ferrum_interfaces::execution_cost::ExpectedExecutionWave,
+        guard: &dyn ferrum_interfaces::execution_cost::NonblockingHostSubmissionGuard,
+        observation: ferrum_interfaces::execution_cost::GuardedCostObservation<'_, '_>,
+    ) -> ferrum_interfaces::execution_cost::GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>>
+    {
+        self.execute_guarded_decode(inputs, expected, guard, observation)
+            .await
     }
 
     fn plan_prompt_tail_capture_boundary(&self, chunk: PrefillChunk) -> Option<PrefixCapturePlan> {
@@ -10259,6 +10538,25 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ResourcePlanningAvailability<ResourcePlanningView> {
         self.capture_resource_planning_view(requests, limits, budget)
+    }
+
+    fn execution_cost_route_view(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        limits: ResourcePlanningLimits,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteView> {
+        self.capture_future_cost_route(requests, limits, budget)
+    }
+
+    fn project_execution_cost_wave(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        query: &FutureWaveCostQuery<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteProjection> {
+        self.project_future_cost_route(view, state, query, budget)
     }
 
     fn project_execution_resource_wave(
@@ -10445,6 +10743,26 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
         self.sequences.lock().cancel_prefill(request_id)
+    }
+
+    fn cancel_prefill_admission_observed(
+        &self,
+        request_id: &RequestId,
+    ) -> ferrum_interfaces::model_executor::ExecutorAdmissionCancellationObservation {
+        use ferrum_interfaces::model_executor::{
+            ExecutorAdmissionCancellationObservation, ExecutorCompletionWork,
+        };
+        let released = self.sequences.lock().cancel_prefill(request_id);
+        ExecutorAdmissionCancellationObservation {
+            released,
+            // A present slot can include an executing/deferred owner whose
+            // abort/drop scope is deliberately not declared isolated here.
+            work: if released {
+                ExecutorCompletionWork::Unknown
+            } else {
+                ExecutorCompletionWork::NoAdditionalWork
+            },
+        }
     }
 
     fn write_execution_capacity_release_sources(
@@ -10824,36 +11142,31 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
-        let sequence = self
-            .sequences
-            .lock()
-            .active
-            .remove(completion.cache_id())
-            .ok_or_else(|| {
-                FerrumError::not_found(format!(
-                    "vNext completion cache `{}` is not active",
-                    completion.cache_id()
-                ))
-            })?;
-        // Removing the registry entry prevents new callers from finding this
-        // incarnation. Wait for already-owned work before inspecting its final
-        // executed tokens or completing the native session.
-        let mut pending = PendingSequenceCompletion {
-            sequence: &sequence,
-            operation: None,
-            completed: false,
+        self.complete_cache_inner(completion, None).await
+    }
+
+    async fn complete_cache_observed(
+        &self,
+        completion: ExecutorSequenceCompletion,
+    ) -> ferrum_interfaces::model_executor::ExecutorCompletionObservation {
+        use ferrum_interfaces::model_executor::{
+            ExecutorCompletionObservation, ExecutorCompletionWork,
         };
-        pending.operation = Some(sequence.operation.lock().await);
-        validate_sequence_completion_accounting(
-            sequence.request_id(),
-            sequence.product_prompt_tokens,
-            sequence.replayed_output_tokens,
-            &completion,
-        )?;
-        self.retain_completed_sequence_boundary(&sequence).await?;
-        sequence.complete(&completion)?;
-        pending.completed = true;
-        Ok(())
+        let probe = Arc::new(completion_observation::CompletionProbe::default());
+        let result = self.complete_cache_inner(completion, Some(&probe)).await;
+        // An early error can drop/abort the removed session. No successful
+        // no-work claim follows from merely not entering prefix retention.
+        let work = if result.is_ok() {
+            probe.work()
+        } else {
+            match probe.work() {
+                ExecutorCompletionWork::AdditionalOrUnproven(activities) => {
+                    ExecutorCompletionWork::AdditionalOrUnproven(activities)
+                }
+                _ => ExecutorCompletionWork::Unknown,
+            }
+        };
+        ExecutorCompletionObservation { result, work }
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

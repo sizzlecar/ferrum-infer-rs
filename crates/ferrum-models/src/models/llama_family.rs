@@ -2076,6 +2076,26 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             .unwrap_or(0)
     }
 
+    pub(crate) fn bounded_prefill_supported(&self) -> bool {
+        // Prefix import needs its own receipt; a consumed-token count alone
+        // cannot distinguish imported KV from work executed in this wave.
+        !self.runtime_env.prefix_cache
+    }
+
+    pub(crate) fn exact_prefill_cache_len(&self, cache_id: &str) -> ferrum_types::Result<usize> {
+        let length = self.cache_len(cache_id);
+        if self
+            .kv_caches
+            .get(cache_id)
+            .is_some_and(|layers| layers.iter().any(|layer| K::len(layer) != length))
+        {
+            return Err(ferrum_types::FerrumError::backend(
+                "incremental prefill KV layers disagree on completed offset",
+            ));
+        }
+        Ok(length)
+    }
+
     fn local_layer_indices(&self) -> Range<usize> {
         0..self.local_layer_count()
     }
@@ -4967,6 +4987,14 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
 
 // FP16 DecoderOnlyLLM impl — full path with batched + unified-forward overrides.
 impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        self.bounded_prefill_supported()
+    }
+
+    fn incremental_prefill_cache_len(&self, cache_id: &str) -> ferrum_types::Result<usize> {
+        self.exact_prefill_cache_len(cache_id)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }
@@ -5199,6 +5227,14 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
 // (default trait impl falls back to per-item decode). PR D will add INT8
 // batched paths once the kernels stabilize.
 impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B, KvInt8> {
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        self.bounded_prefill_supported()
+    }
+
+    fn incremental_prefill_cache_len(&self, cache_id: &str) -> ferrum_types::Result<usize> {
+        self.exact_prefill_cache_len(cache_id)
+    }
+
     fn config(&self) -> &LlmRuntimeConfig {
         &self.runtime_cfg
     }

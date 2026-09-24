@@ -46,6 +46,35 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Runtime-facing configuration.
     fn config(&self) -> &LlmRuntimeConfig;
 
+    /// Legacy families remain explicitly unsupported unless they can supply
+    /// the same whole-wave, read-only contract as a PlanRuntime executor.
+    fn execution_cost_route_view(
+        &self,
+        _requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        _limits: ferrum_interfaces::vnext::ResourcePlanningLimits,
+        _budget: &mut dyn ferrum_interfaces::vnext::ResourcePlanningBudget,
+    ) -> ferrum_interfaces::vnext::ExecutionCostRouteAvailability<
+        ferrum_interfaces::vnext::ExecutionCostRouteView,
+    > {
+        ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
+            ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
+    fn project_execution_cost_wave(
+        &self,
+        _view: &ferrum_interfaces::vnext::ExecutionCostRouteView,
+        _state: &ferrum_interfaces::vnext::ExecutionCostRouteState,
+        _query: &ferrum_interfaces::vnext::FutureWaveCostQuery<'_>,
+        _budget: &mut dyn ferrum_interfaces::vnext::ResourcePlanningBudget,
+    ) -> ferrum_interfaces::vnext::ExecutionCostRouteAvailability<
+        ferrum_interfaces::vnext::ExecutionCostRouteProjection,
+    > {
+        ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
+            ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
     /// Optional model-level cache metrics.
     ///
     /// Models with real paged-KV prefix reuse override this so the executor
@@ -158,6 +187,22 @@ pub trait DecoderOnlyLLM: Send + Sync {
     /// Prefill the model with a prompt. Returns `[vocab_size]` logits for
     /// the last prompt token.
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32>;
+
+    /// Declare exact KV-only incremental prefill without implicit prefix
+    /// import, recurrent-state reset, or future-token execution. Returning true
+    /// requires `incremental_prefill_cache_len` to observe actual model state
+    /// and `prefill` to finish its terminal readback before returning.
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        false
+    }
+
+    /// Actual model-owned KV progress, checking every layer/stage agrees.
+    /// An absent fresh cache has length zero; unsupported models fail closed.
+    fn incremental_prefill_cache_len(&self, _cache_id: &str) -> Result<usize> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "model does not expose an exact incremental KV frontier",
+        ))
+    }
 
     /// Advance the model by one generated token. `pos` is the position of
     /// `token` in the sequence (number of tokens already consumed so far).

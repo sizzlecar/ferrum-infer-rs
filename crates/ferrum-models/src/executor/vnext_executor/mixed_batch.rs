@@ -53,6 +53,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         decodes: &[PlanRuntimeDecodeInput],
         cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
     ) -> Result<PlanRuntimeMixedBatchOutcome> {
+        self.execute_plan_runtime_mixed_batch_inner(prefills, decodes, cost_observation, None)
+            .await
+    }
+
+    pub(super) async fn execute_plan_runtime_mixed_batch_inner(
+        &self,
+        prefills: &[PlanRuntimePrefillInput],
+        decodes: &[PlanRuntimeDecodeInput],
+        cost_observation: Option<&mut PlanRuntimeCostObservationContext<'_>>,
+        guarded: Option<&GuardedExecution<'_>>,
+    ) -> Result<PlanRuntimeMixedBatchOutcome> {
         // Diagnostic checkpoint capture assigns separate phase counters and
         // teacher-forced ownership. Preserve its existing execution contract.
         if prefills.is_empty()
@@ -271,7 +282,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let extension = ResourceWorkShape::single(extension_span)
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match self.extend_sequence_with_capacity(sequence, extension)? {
+            let extension = match guarded {
+                Some(selected) => self.guarded_extend_once(sequence, extension, selected),
+                None => self.extend_sequence_with_capacity(sequence, extension),
+            };
+            let extension = match extension {
+                Ok(decision) => decision,
+                Err(error) => {
+                    if let Some(selected) = guarded.filter(|selected| selected.preserves_request())
+                    {
+                        self.restore_guarded_prefills(
+                            &prefill_candidates,
+                            &mut prefill_guards,
+                            selected,
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
+            match extension {
                 VNextExecutionCapacityDecision::Ready(()) => {}
                 VNextExecutionCapacityDecision::Deferred(deferral) => {
                     restore_prefills(&mut prefill_guards)?;
@@ -290,7 +319,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             candidates: &decode_candidates,
             armed: true,
         };
-        let sampling_outputs = match self
+        let execution = self
             .execute_batch_step(
                 &batch,
                 &sequences,
@@ -299,9 +328,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 VNextExecutionWaveKind::Mixed,
                 &output_roles,
                 cost_observation,
+                guarded,
             )
-            .await?
-        {
+            .await;
+        let execution = match execution {
+            Ok(decision) => decision,
+            Err(error) => {
+                if let Some(selected) = guarded.filter(|selected| selected.preserves_request()) {
+                    self.restore_guarded_prefills(
+                        &prefill_candidates,
+                        &mut prefill_guards,
+                        selected,
+                    )?;
+                    decode_guard.armed = false;
+                }
+                return Err(error);
+            }
+        };
+        let sampling_outputs = match execution {
             VNextExecutionCapacityDecision::Ready(outputs) => outputs,
             VNextExecutionCapacityDecision::Deferred(deferral) => {
                 restore_prefills(&mut prefill_guards)?;
@@ -339,13 +383,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         // The shared FullPlan fence has retired. Checkpoint copies belong only
         // to prefill boundaries, never to their decode peers' token histories.
-        for candidate in &prefill_candidates {
-            self.retain_prefill_boundary(
-                &candidate.sequence,
-                &candidate.tokens,
-                candidate.planned_chunk,
-            )
-            .await?;
+        if guarded.is_none() {
+            for candidate in &prefill_candidates {
+                self.retain_prefill_boundary(
+                    &candidate.sequence,
+                    &candidate.tokens,
+                    candidate.planned_chunk,
+                )
+                .await?;
+            }
         }
 
         let mut ordered_prefills = (0..prefills.len()).map(|_| None).collect::<Vec<_>>();

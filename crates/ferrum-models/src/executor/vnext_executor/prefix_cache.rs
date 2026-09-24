@@ -1008,7 +1008,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Ok(());
         }
         let result = self
-            .retain_sequence_boundary(sequence, tokens, chunk.end())
+            .retain_sequence_boundary(sequence, tokens, chunk.end(), None)
             .await;
         rendezvous::finish(&interests);
         result
@@ -1017,6 +1017,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     pub(super) async fn retain_completed_sequence_boundary(
         &self,
         sequence: &Arc<VNextSequence<R>>,
+        probe: Option<&Arc<completion_observation::CompletionProbe>>,
     ) -> Result<()> {
         let Some(layout) = usable_layout(self.resolved_plan.execution_plan()) else {
             return Ok(());
@@ -1038,7 +1039,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         // The native facade checks the last retired span and every selected
         // provider's permission to capture at the end of the known input.
-        self.retain_sequence_boundary(sequence, &tokens, tokens.len())
+        self.retain_sequence_boundary(sequence, &tokens, tokens.len(), probe)
             .await
     }
 
@@ -1047,7 +1048,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &Arc<VNextSequence<R>>,
         tokens: &[u32],
         completed_tokens: usize,
+        probe: Option<&Arc<completion_observation::CompletionProbe>>,
     ) -> Result<()> {
+        if let Some(probe) = probe {
+            probe.retention();
+        }
         let purpose = if completed_tokens == tokens.len()
             && (tokens.len() as u64) > sequence.product_prompt_tokens
         {
@@ -1068,6 +1073,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         // select an unprotected victim. Optional capture may simply not fit.
         let entries = self.prefix_cache.lock().entries.len();
         let result = capture_with_capacity(entries, || async {
+            let probe = probe.cloned();
             let reaper = Arc::clone(&self.reaper);
             let plan = self.resolved_plan.execution_plan().clone();
             let resources = Arc::clone(&self.plan_resources);
@@ -1078,6 +1084,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .completion_worker
                 .execute(VNextCompletionTaskKind::CheckpointTransfer, move || -> Result<_> {
                     let recovery_started = Instant::now();
+                    if let Some(probe) = &probe { probe.recovery(); }
                     let _ = reaper.recover_abandoned_checkpoints(MAX_COMPLETION_SWEEP_SLOTS);
                     reaper.record_checkpoint_cache_timing(
                         CheckpointCacheTimingPhase::AbandonedRecovery,
@@ -1098,6 +1105,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         }
                         Ok(start) => start,
                     };
+                    if let Some(probe) = &probe { probe.checkpoint(&start); }
                     let start = match start {
                         NativeCheckpointStart::CapacityMaintenance { reason, maintenance } => {
                             tracing::debug!(?reason, "prefix capture needs optional pool maintenance");
@@ -1125,6 +1133,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .await
                 .map_err(|error| FerrumError::backend(error.to_string()))?
         }, |maintenance: CheckpointCapacityMaintenance<R>| async move {
+                    let probe = probe.cloned();
                     let source = Arc::clone(&sequence.session);
                     let reaper = Arc::clone(&self.reaper);
                     let resources = Arc::clone(&self.plan_resources);
@@ -1139,6 +1148,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             source.write_release_capacity_sources(&mut Vec::new())
                                 .map_err(|error| FerrumError::backend(format!("capture source became unavailable before maintenance: {error}")))?;
                             let maintenance_started = Instant::now();
+                            if let Some(probe) = &probe { probe.maintenance(); }
                             let result = resources.try_maintain_checkpoint_with_idle_reclaim(maintenance);
                             reaper.record_checkpoint_cache_timing(
                                 CheckpointCacheTimingPhase::Maintenance,

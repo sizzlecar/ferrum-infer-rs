@@ -31,6 +31,8 @@ use crate::lora::ActiveLoraAdapter;
 
 use super::common::{self, GenericKvCacheHandle};
 
+mod bounded_prefill;
+
 const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +296,43 @@ impl LlmExecutor {
 
 #[async_trait::async_trait]
 impl ModelExecutor for LlmExecutor {
+    fn execution_cost_route_view(
+        &self,
+        requests: &[ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest<'_>],
+        limits: ferrum_interfaces::vnext::ResourcePlanningLimits,
+        budget: &mut dyn ferrum_interfaces::vnext::ResourcePlanningBudget,
+    ) -> ferrum_interfaces::vnext::ExecutionCostRouteAvailability<
+        ferrum_interfaces::vnext::ExecutionCostRouteView,
+    > {
+        match self.model.try_lock() {
+            Some(model) => model.execution_cost_route_view(requests, limits, budget),
+            None => ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
+                ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(
+                    ferrum_interfaces::vnext::ResourcePlanningUnknown::BusyOrUnavailable,
+                ),
+            ),
+        }
+    }
+
+    fn project_execution_cost_wave(
+        &self,
+        view: &ferrum_interfaces::vnext::ExecutionCostRouteView,
+        state: &ferrum_interfaces::vnext::ExecutionCostRouteState,
+        query: &ferrum_interfaces::vnext::FutureWaveCostQuery<'_>,
+        budget: &mut dyn ferrum_interfaces::vnext::ResourcePlanningBudget,
+    ) -> ferrum_interfaces::vnext::ExecutionCostRouteAvailability<
+        ferrum_interfaces::vnext::ExecutionCostRouteProjection,
+    > {
+        match self.model.try_lock() {
+            Some(model) => model.project_execution_cost_wave(view, state, query, budget),
+            None => ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
+                ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(
+                    ferrum_interfaces::vnext::ResourcePlanningUnknown::BusyOrUnavailable,
+                ),
+            ),
+        }
+    }
+
     fn info(&self) -> &ModelInfo {
         &self.info
     }
@@ -303,6 +342,17 @@ impl ModelExecutor for LlmExecutor {
         // use the legacy split path. The device→capability mapping lives here
         // (the executor is backend-aware) so the engine needs no platform cfg.
         matches!(self.info.device, ferrum_types::Device::CUDA(_))
+    }
+
+    fn supports_bounded_incremental_prefill(&self) -> bool {
+        self.lock_model().supports_bounded_incremental_prefill()
+    }
+
+    async fn bounded_incremental_prefill(
+        &self,
+        input: &PrefillInput,
+    ) -> Result<ferrum_interfaces::model_executor::ExecutorPrefillOutcome> {
+        self.execute_bounded_incremental_prefill(input)
     }
 
     fn kv_capacity(&self) -> Option<usize> {
