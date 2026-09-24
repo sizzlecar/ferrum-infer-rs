@@ -1,23 +1,24 @@
 use super::{obligations::PlanningObligationSet, shape, types::*};
 use std::{cmp::Reverse, num::NonZeroU32};
 
-pub(super) struct CandidateSet {
+pub(super) struct LogicalCandidates {
     required: Option<RequestWorkKey>,
-    pub waves: Vec<WaveCandidate>,
+    pub work: Vec<Vec<CandidateWork>>,
     pub truncated: bool,
     pub attempts: usize,
-    pub shape_unknown: usize,
 }
 
-pub(super) fn enumerate(
+pub(super) fn logical_candidates(
     snapshot: &SchedulerSnapshot,
     requests: &[RequestSchedulingView],
     now_ns: u64,
     limit: usize,
+    raw_limit: usize,
+    observed_attempts: &mut usize,
     protection: Option<&PlanningObligationSet>,
     resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
-) -> Result<CandidateSet, PlanningUnknownReason> {
+) -> Result<LogicalCandidates, PlanningUnknownReason> {
     poll_budget()?;
     let mut decoders: Vec<_> = requests
         .iter()
@@ -59,16 +60,15 @@ pub(super) fn enumerate(
         }
     }
     let caps = &snapshot.capabilities;
-    let mut result = CandidateSet {
+    let mut result = LogicalCandidates {
         required: required.map(|index| requests[index].key.clone()),
-        waves: Vec::new(),
+        work: Vec::new(),
         truncated: false,
         attempts: 0,
-        shape_unknown: 0,
     };
     // K bounds admitted candidates; 8*K independently bounds ALL raw attempts,
     // including impossible and duplicate shapes. The absolute ceiling is 2048.
-    let attempt_limit = limit.min(256).saturating_mul(8);
+    let attempt_limit = limit.min(256).saturating_mul(8).min(raw_limit);
     macro_rules! attempt {
         () => {
             poll_budget()?;
@@ -77,7 +77,28 @@ pub(super) fn enumerate(
                 return Ok(result);
             }
             result.attempts += 1;
+            *observed_attempts += 1;
         };
+    }
+    // Try the complete ready decode cohort first, if it is a declared legal
+    // width. Only this one width precedes the interleaved first-token family.
+    // Physical resolution stays lazy: a missing route does not consume K.
+    if let Some(size) = caps
+        .decode_batch_sizes
+        .iter()
+        .filter(|size| size.get() <= decoders.len() && size.get() <= caps.max_wave_rows.get())
+        .max_by_key(|size| size.get())
+    {
+        attempt!();
+        push_decode(
+            snapshot,
+            requests,
+            &decoders,
+            size.get(),
+            &mut result,
+            resolver,
+            poll_budget,
+        )?;
     }
     // Interleave action families so a small K does not enumerate every decode
     // size before considering any first-token work.
@@ -94,7 +115,6 @@ pub(super) fn enumerate(
                 &decoders,
                 size.get(),
                 &mut result,
-                limit,
                 resolver,
                 poll_budget,
             )?;
@@ -110,7 +130,6 @@ pub(super) fn enumerate(
                         requests,
                         work.clone(),
                         &mut result,
-                        limit,
                         resolver,
                         poll_budget,
                     )?;
@@ -123,15 +142,7 @@ pub(super) fn enumerate(
                             &prefill_work,
                         ) {
                             work.extend(prefill.iter().cloned());
-                            push(
-                                snapshot,
-                                requests,
-                                work,
-                                &mut result,
-                                limit,
-                                resolver,
-                                poll_budget,
-                            )?;
+                            push(snapshot, requests, work, &mut result, resolver, poll_budget)?;
                         }
                         if result.truncated {
                             return Ok(result);
@@ -165,7 +176,6 @@ pub(super) fn enumerate(
             &decoders,
             size.get(),
             &mut result,
-            limit,
             resolver,
             poll_budget,
         )?;
@@ -179,15 +189,7 @@ pub(super) fn enumerate(
             if let Some(work) =
                 prefill_work(requests, &prefills, size.get(), chunk, caps, poll_budget)?
             {
-                push(
-                    snapshot,
-                    requests,
-                    work,
-                    &mut result,
-                    limit,
-                    resolver,
-                    poll_budget,
-                )?;
+                push(snapshot, requests, work, &mut result, resolver, poll_budget)?;
             }
             if result.truncated {
                 return Ok(result);
@@ -251,21 +253,12 @@ fn push_decode(
     requests: &[RequestSchedulingView],
     indices: &[usize],
     size: usize,
-    output: &mut CandidateSet,
-    limit: usize,
+    output: &mut LogicalCandidates,
     resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<(), PlanningUnknownReason> {
     if let Some(work) = decode_work(requests, indices, size) {
-        push(
-            snapshot,
-            requests,
-            work,
-            output,
-            limit,
-            resolver,
-            poll_budget,
-        )?;
+        push(snapshot, requests, work, output, resolver, poll_budget)?;
     }
     Ok(())
 }
@@ -319,10 +312,9 @@ fn prefill_work(
 
 fn push(
     snapshot: &SchedulerSnapshot,
-    requests: &[RequestSchedulingView],
+    _requests: &[RequestSchedulingView],
     mut work: Vec<CandidateWork>,
-    output: &mut CandidateSet,
-    limit: usize,
+    output: &mut LogicalCandidates,
     resolver: &dyn PlanningShapeResolver,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<(), PlanningUnknownReason> {
@@ -337,28 +329,70 @@ fn push(
         return Ok(());
     }
     shape::order_work(snapshot, &mut work, resolver, poll_budget)?;
-    if output.waves.iter().any(|candidate| candidate.work == work) {
+    if output.work.contains(&work) {
         return Ok(());
     }
-    let shape = match shape::resolve(snapshot, requests, &work, resolver, poll_budget) {
-        Err(PlanningUnknownReason::ShapeUnavailable) => {
-            output.shape_unknown += 1;
-            return Ok(());
-        }
-        result => result?,
-    };
-    let Some(shape) = shape else {
-        return Ok(());
-    };
-    if output.waves.len() == limit {
-        output.truncated = true;
-        return Ok(());
-    }
-    output.waves.push(WaveCandidate {
-        work,
-        execution_shape: shape,
-        based_on_generation: snapshot.generation,
-        cost_model_version: snapshot.cost_model_version,
-    });
+    output.work.push(work);
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) struct CandidateSet {
+    pub waves: Vec<WaveCandidate>,
+    pub truncated: bool,
+    pub attempts: usize,
+    pub shape_unknown: usize,
+}
+
+#[cfg(test)]
+pub(super) fn enumerate(
+    snapshot: &SchedulerSnapshot,
+    requests: &[RequestSchedulingView],
+    now_ns: u64,
+    limit: usize,
+    protection: Option<&PlanningObligationSet>,
+    resolver: &dyn PlanningShapeResolver,
+    poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<CandidateSet, PlanningUnknownReason> {
+    let logical = logical_candidates(
+        snapshot,
+        requests,
+        now_ns,
+        limit,
+        usize::MAX,
+        &mut 0,
+        protection,
+        resolver,
+        poll_budget,
+    )?;
+    let mut result = CandidateSet {
+        waves: Vec::new(),
+        truncated: logical.truncated,
+        attempts: logical.attempts,
+        shape_unknown: 0,
+    };
+    for work in logical.work {
+        let execution_shape = match shape::resolve(snapshot, requests, &work, resolver, poll_budget)
+        {
+            Err(PlanningUnknownReason::ShapeUnavailable) => {
+                result.shape_unknown += 1;
+                continue;
+            }
+            other => other?,
+        };
+        let Some(execution_shape) = execution_shape else {
+            continue;
+        };
+        if result.waves.len() == limit {
+            result.truncated = true;
+            break;
+        }
+        result.waves.push(WaveCandidate {
+            work,
+            execution_shape,
+            based_on_generation: snapshot.generation,
+            cost_model_version: snapshot.cost_model_version,
+        });
+    }
+    Ok(result)
 }

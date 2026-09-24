@@ -194,14 +194,14 @@ fn explicit_outer_window_does_not_restart_admission_after_capture() {
     assert_eq!(predictions.get(), 0);
 }
 
-/// Completing the one-token target establishes a whole admission witness.
-/// Exploring the alternative partial-prefill continuation afterwards is
-/// optional and would consume the remaining transaction. Nothing here uses
-/// machine elapsed time or changes the cost/deadline of the simulated work.
+/// The first successful final-prefill cost lookup completes this fixture's
+/// only one-token target. Decision work then crosses the outer soft deadline.
+/// A partial -> final prefix is a required search path before that event, not
+/// "optional" merely because its physical query has nonempty prior_waves.
 struct AdmissionPhaseResolver<'a> {
     now: &'a Cell<u64>,
-    complete_calls: Cell<usize>,
-    optional_calls: Cell<usize>,
+    completed_predictions: &'a Cell<usize>,
+    replay_queries: std::cell::RefCell<Vec<(usize, u32, u32)>>,
     replay_at: Option<u64>,
 }
 
@@ -215,31 +215,24 @@ impl PlanningShapeResolver for AdmissionPhaseResolver<'_> {
         PlanningUnknownReason,
     > {
         use ferrum_interfaces::execution_cost::ActualRowWork;
-        if !query.prior_waves.is_empty() {
-            self.optional_calls.set(self.optional_calls.get() + 1);
-            self.now.set(1_200);
-        } else if query.rows.iter().any(|row| {
-            matches!(
-                row.work,
-                ActualRowWork::Prefill {
-                    offset: 0,
-                    count: 8,
-                    total_prompt_tokens: 8
-                }
-            )
-        }) {
-            let calls = self.complete_calls.get() + 1;
-            self.complete_calls.set(calls);
-            if calls == 2 {
-                // Candidate discovery was the first call; this second call
-                // simulates the complete witness after 550ns of decision work.
-                self.now.set(650);
-            } else if calls == 3 {
-                // The final full replay is mandatory, including its real cost.
+        if self.completed_predictions.get() > 0 {
+            let mut replay = self.replay_queries.borrow_mut();
+            if replay.is_empty() {
                 if let Some(now) = self.replay_at {
                     self.now.set(now);
                 }
             }
+            assert_eq!(query.rows.len(), 1);
+            let ActualRowWork::Prefill {
+                offset,
+                count,
+                total_prompt_tokens,
+            } = query.rows[0].work
+            else {
+                panic!("the one-token target has no decode work");
+            };
+            assert_eq!(total_prompt_tokens, 8);
+            replay.push((query.prior_waves.len(), offset, count));
         }
         TestResolver.resolve(query, poll)
     }
@@ -247,22 +240,34 @@ impl PlanningShapeResolver for AdmissionPhaseResolver<'_> {
 
 fn admission_with_capture_and_optional_branch(
     replay_at: Option<u64>,
-) -> (TimeAdmissionDecision, usize, usize) {
+) -> (TimeAdmissionDecision, Vec<(usize, u32, u32)>, usize) {
     let snapshot = long_window();
     assert_eq!(snapshot.observed_at_ns, 100);
     let at = Instant::now();
     let origin = PlanningTimeOrigin::from_origin(at, at + Duration::from_nanos(100)).unwrap();
     let now = Cell::new(100);
+    let completed_predictions = Cell::new(0);
     let shapes = AdmissionPhaseResolver {
         now: &now,
-        complete_calls: Cell::new(0),
-        optional_calls: Cell::new(0),
+        completed_predictions: &completed_predictions,
+        replay_queries: std::cell::RefCell::new(Vec::new()),
         replay_at,
     };
     let mut planner = planner(2);
     planner.settings.search.max_planning_us = n64(1);
     let policy = SloAdmissionConfig::default();
-    let model = Model(|_: &WaveExecutionShape| Some(5));
+    let model = Model(|shape: &WaveExecutionShape| {
+        if shape.prefill_chunks.iter().any(|chunk| {
+            chunk.offset.checked_add(chunk.count.get()) == Some(chunk.total_prompt_tokens.get())
+        }) {
+            let completed = completed_predictions.get();
+            completed_predictions.set(completed + 1);
+            if completed == 0 {
+                now.set(650);
+            }
+        }
+        Some(5)
+    });
     let evaluator = TimeAdmissionEvaluator {
         policy: &policy,
         planner: &planner,
@@ -290,14 +295,15 @@ fn admission_with_capture_and_optional_branch(
         .unwrap();
     (
         result,
-        shapes.complete_calls.get(),
-        shapes.optional_calls.get(),
+        shapes.replay_queries.into_inner(),
+        completed_predictions.get(),
     )
 }
 
 #[test]
 fn admission_preserves_outer_soft_deadline_and_replays_the_complete_witness() {
-    let (result, complete_calls, optional_calls) = admission_with_capture_and_optional_branch(None);
+    let (result, replay_queries, completed_predictions) =
+        admission_with_capture_and_optional_branch(None);
     let TimeAdmissionDecision::Admit {
         first_wave,
         witness,
@@ -307,20 +313,33 @@ fn admission_preserves_outer_soft_deadline_and_replays_the_complete_witness() {
         panic!("the complete witness fits the original replay window: {result:?}");
     };
     assert_eq!(search.search_soft_stops, 1);
-    assert_eq!(witness.waves, 1);
+    assert_eq!(
+        replay_queries.len(),
+        witness.waves,
+        "replay every wave exactly once"
+    );
+    let mut completed_prompt = 0;
+    for (index, &(prior_waves, offset, count)) in replay_queries.iter().enumerate() {
+        assert_eq!(prior_waves, index, "replay retains the complete prefix");
+        assert_eq!(
+            offset, completed_prompt,
+            "replay starts at the original frontier"
+        );
+        completed_prompt += count;
+    }
+    assert_eq!(completed_prompt, 8);
     assert_eq!(witness.predicted_output_tokens, 1);
     assert_eq!(first_wave.planning_observed_at_ns, 650);
     assert_eq!(
-        complete_calls, 3,
-        "discovery, full simulation, final replay"
+        completed_predictions, 2,
+        "initial complete witness and final replay"
     );
-    assert_eq!(optional_calls, 0, "no fresh search budget after capture");
 }
 
 #[test]
 fn admission_original_replay_deadline_never_returns_the_saved_witness() {
     for replay_at in [800, 1_000, 1_200] {
-        let (result, complete_calls, optional_calls) =
+        let (result, replay_queries, completed_predictions) =
             admission_with_capture_and_optional_branch(Some(replay_at));
         assert!(
             matches!(
@@ -334,7 +353,16 @@ fn admission_original_replay_deadline_never_returns_the_saved_witness() {
             ),
             "{replay_at}: {result:?}"
         );
-        assert_eq!(complete_calls, 3, "the final replay was actually entered");
-        assert_eq!(optional_calls, 0);
+        assert_eq!(
+            replay_queries.len(),
+            1,
+            "replay was entered but stopped at its original deadline"
+        );
+        assert_eq!(replay_queries[0].0, 0);
+        assert_eq!(replay_queries[0].1, 0);
+        assert_eq!(
+            completed_predictions, 1,
+            "the expired replay cannot reach another cost lookup"
+        );
     }
 }

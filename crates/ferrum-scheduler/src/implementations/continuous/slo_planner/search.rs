@@ -24,6 +24,21 @@ struct Node {
     ordinal: usize,
 }
 
+struct Frame {
+    node: Node,
+    work: Option<std::vec::IntoIter<Vec<CandidateWork>>>,
+    resolved: usize,
+}
+impl Frame {
+    fn new(node: Node) -> Self {
+        Self {
+            node,
+            work: None,
+            resolved: 0,
+        }
+    }
+}
+
 struct ComputeBudget {
     last_ns: u64,
     search_deadline_ns: u64,
@@ -230,13 +245,21 @@ impl BoundedSloPlanner {
             Ok(state) => state,
             Err(error) => return unknown(simulation_reason(error), stats),
         };
-        let mut beam = vec![Node {
+        let horizon = self.settings.search.lookahead_waves.get();
+        let width = self.settings.search.beam_width.get();
+        let candidate_limit = self.settings.search.candidate_limit.get();
+        // Validation bounds this product. Changing exploration order must not
+        // increase the original K * B * H successful-expansion/work envelope.
+        let expansion_limit = candidate_limit * width * horizon;
+        let raw_limit = expansion_limit * 8;
+        let mut pending: Vec<Vec<Frame>> = (0..horizon).map(|_| Vec::new()).collect();
+        pending[0].push(Frame::new(Node {
             waves: Vec::new(),
             state: initial,
             score: 0.0,
             debt: 0,
             ordinal: 0,
-        }];
+        }));
         let mut solutions = Vec::new();
         let mut saw_resource_block = false;
         let mut saw_candidate = false;
@@ -253,116 +276,168 @@ impl BoundedSloPlanner {
                 return unknown(reason, stats);
             }};
         }
-        'exploration: for depth in 1..=self.settings.search.lookahead_waves.get() {
-            let mut next = Vec::new();
-            stats.max_depth_reached = depth;
-            for node in &beam {
-                budget.optional_search = !solutions.is_empty();
-                if let Err(reason) = budget.read(clock) {
-                    stop_or_unknown!(reason, 'exploration);
+        // Resolve and evaluate one candidate at a time, then first pursue its
+        // complete shared witness. Parent cursors retain untried siblings: a
+        // dead-end full decode prefix cannot permanently occupy a depth quota.
+        // Pending nodes (not lifetime-expanded nodes) are beam-bounded per depth.
+        let mut preferred_depth: Option<usize> = None;
+        'exploration: loop {
+            // Follow a newly viable prefix once. After a dead end or leaf,
+            // return to its retained siblings rather than exhaust that entire
+            // subtree before admitting a later mixed/prefill family to the beam.
+            let Some(depth) = preferred_depth
+                .take()
+                .filter(|&depth| !pending[depth].is_empty())
+                .or_else(|| pending.iter().position(|nodes| !nodes.is_empty()))
+            else {
+                break;
+            };
+            budget.optional_search = !solutions.is_empty();
+            if let Err(reason) = budget.read(clock) {
+                stop_or_unknown!(reason, 'exploration);
+            }
+            if stats.expanded_candidates == expansion_limit {
+                stats.candidate_truncations += 1;
+                break;
+            }
+            let mut frame = pending[depth].remove(0);
+            stats.max_depth_reached = stats.max_depth_reached.max(depth + 1);
+            if frame.work.is_none() {
+                let remaining_raw = raw_limit - stats.enumeration_attempts;
+                if remaining_raw == 0 {
+                    stats.candidate_truncations += 1;
+                    continue;
                 }
-                let generated = match candidates::enumerate(
+                let generated = match candidates::logical_candidates(
                     snapshot,
-                    &node.state.requests,
-                    node.state.now_ns,
-                    self.settings.search.candidate_limit.get(),
+                    &frame.node.state.requests,
+                    frame.node.state.now_ns,
+                    candidate_limit,
+                    remaining_raw,
+                    &mut stats.enumeration_attempts,
                     protection.as_deref(),
                     &super::shape::PriorWaveResolver {
                         resolver,
-                        prior_waves: &node.waves,
+                        prior_waves: &frame.node.waves,
                     },
                     &mut || budget.read(clock).map(|_| ()),
                 ) {
                     Ok(generated) => generated,
                     Err(reason) => stop_or_unknown!(reason, 'exploration),
                 };
-                stats.enumeration_attempts += generated.attempts;
-                stats.shape_unknown_candidates += generated.shape_unknown;
-                stats.generated_candidates += generated.waves.len();
                 stats.candidate_truncations += usize::from(generated.truncated);
-                for candidate in generated.waves {
-                    budget.optional_search = !solutions.is_empty();
-                    saw_candidate = true;
-                    let now_ns = match budget.read(clock) {
-                        Ok(now) => now,
-                        Err(reason) => stop_or_unknown!(reason, 'exploration),
-                    };
-                    let mut waves = node.waves.clone();
-                    waves.push(candidate);
-                    stats.expanded_candidates += 1;
-                    let state = match simulation::simulate(
-                        snapshot,
-                        &waves,
-                        model,
-                        resolver,
-                        resources,
-                        &mut || budget.read(clock).map(|_| ()),
-                        now_ns,
-                        milestones,
-                        protection.as_deref(),
-                    ) {
-                        Ok(state) => state,
-                        Err(SimulationFailure::Unknown(
-                            PlanningUnknownReason::ShapeUnavailable,
-                        )) => {
-                            stats.shape_unknown_candidates += 1;
-                            continue;
-                        }
-                        Err(SimulationFailure::Unknown(PlanningUnknownReason::CostUnavailable)) => {
-                            stats.cost_unknown_candidates += 1;
-                            continue;
-                        }
-                        Err(SimulationFailure::Unknown(
-                            PlanningUnknownReason::UnknownResourceEvidence,
-                        )) => {
-                            stats.resource_unknown_candidates += 1;
-                            continue;
-                        }
-                        Err(SimulationFailure::Unknown(
-                            PlanningUnknownReason::OutputOrResourceBlocked,
-                        )) => {
-                            saw_resource_block = true;
-                            continue;
-                        }
-                        Err(SimulationFailure::SequenceViolation) => continue,
-                        Err(SimulationFailure::Unknown(reason)) => {
-                            stop_or_unknown!(reason, 'exploration)
-                        }
-                    };
-                    let (score, debt) = match simulation::score(snapshot, &state, &self.settings) {
-                        Ok(value) => value,
-                        Err(reason) => return unknown(reason, stats),
-                    };
-                    let node = Node {
-                        waves,
-                        state,
-                        score,
-                        debt,
-                        ordinal: stats.expanded_candidates,
-                    };
-                    match simulation::ready_witness(
-                        snapshot,
-                        &node.state,
-                        milestones,
-                        protection.as_deref(),
-                    ) {
-                        Ok(true) if admission_serviced(admission_target, &node.state) => {
-                            solutions.push(node.clone());
-                            retain_best(&mut solutions, self.settings.search.beam_width.get());
-                        }
-                        Ok(_) => {}
-                        Err(reason) => return unknown(reason, stats),
+                frame.work = Some(generated.work.into_iter());
+            }
+            let work = frame.work.as_mut().expect("initialized logical cursor");
+            if frame.resolved == candidate_limit {
+                stats.candidate_truncations += usize::from(work.len() != 0);
+                continue;
+            }
+            let Some(work) = work.next() else { continue };
+            let resolved = super::shape::resolve(
+                snapshot,
+                &frame.node.state.requests,
+                &work,
+                &super::shape::PriorWaveResolver {
+                    resolver,
+                    prior_waves: &frame.node.waves,
+                },
+                &mut || budget.read(clock).map(|_| ()),
+            );
+            let shape_unknown = matches!(&resolved, Err(PlanningUnknownReason::ShapeUnavailable));
+            let execution_shape = match resolved {
+                Ok(Some(shape)) => shape,
+                Ok(None) | Err(PlanningUnknownReason::ShapeUnavailable) => {
+                    if shape_unknown {
+                        stats.shape_unknown_candidates += 1;
                     }
-                    next.push(node);
+                    pending[depth].insert(0, frame);
+                    continue;
                 }
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
+            frame.resolved += 1;
+            stats.generated_candidates += 1;
+            saw_candidate = true;
+            let mut waves = frame.node.waves.clone();
+            waves.push(WaveCandidate {
+                work,
+                execution_shape,
+                based_on_generation: snapshot.generation,
+                cost_model_version: snapshot.cost_model_version,
+            });
+            // Keep the exact parent continuation before attempting its child.
+            // Its state/required service are never recaptured from a new scope.
+            pending[depth].insert(0, frame);
+            let now_ns = match budget.read(clock) {
+                Ok(now) => now,
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
+            stats.expanded_candidates += 1;
+            let state = match simulation::simulate(
+                snapshot,
+                &waves,
+                model,
+                resolver,
+                resources,
+                &mut || budget.read(clock).map(|_| ()),
+                now_ns,
+                milestones,
+                protection.as_deref(),
+            ) {
+                Ok(state) => state,
+                Err(SimulationFailure::Unknown(PlanningUnknownReason::ShapeUnavailable)) => {
+                    stats.shape_unknown_candidates += 1;
+                    continue;
+                }
+                Err(SimulationFailure::Unknown(PlanningUnknownReason::CostUnavailable)) => {
+                    stats.cost_unknown_candidates += 1;
+                    continue;
+                }
+                Err(SimulationFailure::Unknown(PlanningUnknownReason::UnknownResourceEvidence)) => {
+                    stats.resource_unknown_candidates += 1;
+                    continue;
+                }
+                Err(SimulationFailure::Unknown(PlanningUnknownReason::OutputOrResourceBlocked)) => {
+                    saw_resource_block = true;
+                    continue;
+                }
+                Err(SimulationFailure::SequenceViolation) => continue,
+                Err(SimulationFailure::Unknown(reason)) => stop_or_unknown!(reason, 'exploration),
+            };
+            let (score, debt) = match simulation::score(snapshot, &state, &self.settings) {
+                Ok(value) => value,
+                Err(reason) => return unknown(reason, stats),
+            };
+            let node = Node {
+                waves,
+                state,
+                score,
+                debt,
+                ordinal: stats.expanded_candidates,
+            };
+            match simulation::ready_witness(
+                snapshot,
+                &node.state,
+                milestones,
+                protection.as_deref(),
+            ) {
+                Ok(true) if admission_serviced(admission_target, &node.state) => {
+                    solutions.push(node.clone());
+                    retain_best(&mut solutions, width);
+                }
+                Ok(_) => {}
+                Err(reason) => return unknown(reason, stats),
             }
-            let before = next.len();
-            retain_best(&mut next, self.settings.search.beam_width.get());
-            stats.beam_pruned_nodes += before - next.len();
-            if next.is_empty() {
-                break;
+            if depth + 1 < horizon {
+                pending[depth + 1].push(Frame::new(node));
+                let nodes = &mut pending[depth + 1];
+                nodes.sort_by(|left, right| compare_nodes(&left.node, &right.node));
+                let before = nodes.len();
+                nodes.truncate(width);
+                stats.beam_pruned_nodes += before - nodes.len();
+                preferred_depth = Some(depth + 1);
             }
-            beam = next;
         }
         // Replay the complete shared witness after search overhead. The engine
         // must still revalidate identity/resources/credits and its real current
@@ -536,25 +611,27 @@ fn admission_serviced(target: Option<&RequestWorkKey>, state: &SimulatedSequence
     })
 }
 
+fn compare_nodes(left: &Node, right: &Node) -> std::cmp::Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.debt.cmp(&right.debt))
+        .then_with(|| {
+            right
+                .state
+                .net_prefill_work_ns
+                .cmp(&left.state.net_prefill_work_ns)
+        })
+        .then_with(|| {
+            left.state
+                .first_fairness_rank
+                .cmp(&right.state.first_fairness_rank)
+        })
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
+}
+
 fn retain_best(nodes: &mut Vec<Node>, limit: usize) {
-    nodes.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.debt.cmp(&right.debt))
-            .then_with(|| {
-                right
-                    .state
-                    .net_prefill_work_ns
-                    .cmp(&left.state.net_prefill_work_ns)
-            })
-            .then_with(|| {
-                left.state
-                    .first_fairness_rank
-                    .cmp(&right.state.first_fairness_rank)
-            })
-            .then_with(|| left.ordinal.cmp(&right.ordinal))
-    });
+    nodes.sort_by(compare_nodes);
     nodes.truncate(limit);
 }
 

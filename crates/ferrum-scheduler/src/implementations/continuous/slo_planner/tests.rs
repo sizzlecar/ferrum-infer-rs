@@ -13,6 +13,7 @@ mod admission;
 mod boundaries;
 mod budget_phases;
 mod host_domain;
+mod lazy_search;
 mod ordering;
 mod output;
 mod recovery;
