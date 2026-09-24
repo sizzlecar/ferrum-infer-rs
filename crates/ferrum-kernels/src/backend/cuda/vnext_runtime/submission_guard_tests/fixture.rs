@@ -3,6 +3,7 @@ use super::*;
 struct Scale {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    program_binding: bool,
     pub(super) enqueues: Arc<AtomicU64>,
     pub(super) encoded: Arc<AtomicU64>,
 }
@@ -17,7 +18,7 @@ impl OperationResourceEstimator for Scale {
         if request.operation().fingerprint()? != self.descriptor.operation_fingerprint() {
             return Err(invalid("scale estimator operation mismatch"));
         }
-        Ok(OperationResourceEstimate::new(
+        let estimate = OperationResourceEstimate::new(
             self.descriptor.resource_estimator_id(),
             self.descriptor.resource_estimator_version(),
             self.descriptor
@@ -26,7 +27,18 @@ impl OperationResourceEstimator for Scale {
             16,
             None,
             None,
-        ))
+        );
+        Ok(if self.program_binding {
+            estimate.with_binding(ProviderWorkspaceRequirement::new(
+                16,
+                16,
+                ProviderWorkspaceScope::Invocation,
+                ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+                DynamicStorageRequirement::contiguous(),
+            )?)
+        } else {
+            estimate
+        })
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for Scale {
@@ -110,7 +122,38 @@ impl OperationProvider<CudaDeviceRuntime> for Scale {
         .unwrap()
         .with_work_attribution(DeviceBatchingForm::Packed, 1, 1, 1, 0)
         .unwrap();
-        Ok(EncodedDeviceOperation::compute(command))
+        let operation = EncodedDeviceOperation::compute(command);
+        Ok(if self.program_binding {
+            operation.with_program_binding(self.binding_command(&invocation))
+        } else {
+            operation
+        })
+    }
+}
+
+impl Scale {
+    fn binding_command(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> CudaDeviceCommand {
+        let binding = invocation.program_binding().cloned().unwrap();
+        let view = invocation.participants()[0].binding_view().unwrap();
+        let regions = view.translate(0, 16).unwrap();
+        let mut pieces = regions.iter();
+        let physical = pieces.next().unwrap();
+        assert!(pieces.next().is_none());
+        let (buffer, range, retention) = physical.buffer_and_physical_range();
+        let destination = buffer.retained_region(range, retention).unwrap();
+        CudaDeviceCommand::program_binding_patch(
+            "cuda_guard_fixture_binding",
+            binding,
+            destination,
+            vec![CudaProgramBindingWrite::new(0, vec![0x5a; 16].into_boxed_slice()).unwrap()],
+            vec![],
+        )
+        .unwrap()
+        .with_work_attribution(DeviceBatchingForm::Packed, 1, 1, 0, 1)
+        .unwrap()
     }
 }
 
@@ -121,6 +164,7 @@ pub(super) struct Fixture {
     resources: Arc<PlanRuntimeResources<CudaDeviceRuntime>>,
     pub(super) session: Arc<SequenceSession<CudaDeviceRuntime>>,
     batch: ExecutionBatchParticipants<CudaDeviceRuntime>,
+    bucket: Option<ReusableExecutionBucketSpec>,
     pub(super) lane: Arc<ExecutionLane<CudaDeviceRuntime>>,
     pub(super) reaper: Arc<CompletionReaper<CudaDeviceRuntime>>,
     pub(super) enqueues: Arc<AtomicU64>,
@@ -129,6 +173,12 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new() -> Self {
+        Self::configured(false)
+    }
+    pub(super) fn new_program_binding() -> Self {
+        Self::configured(true)
+    }
+    fn configured(program_binding: bool) -> Self {
         let runtime = Arc::new(
             CudaDeviceRuntime::new(CudaDeviceRuntimeConfig {
                 ordinal: 0,
@@ -144,7 +194,7 @@ impl Fixture {
             })
             .expect("requires an actual configured CUDA device"),
         );
-        let contract = constant_scale_contract().unwrap();
+        let contract = family::scale_contract(program_binding);
         let descriptor = OperationProviderDescriptor::new(
             id("provider.cuda-guard-fixture.scale"),
             contract.descriptor().id.clone(),
@@ -170,7 +220,11 @@ impl Fixture {
             ],
             "resource-estimator.cuda-guard-fixture",
             ContractVersion::new(1, 0),
-            digest(b"scale-no-workspace-v1"),
+            digest(if program_binding {
+                b"scale-invocation-binding-v1"
+            } else {
+                b"scale-no-workspace-v1"
+            }),
         )
         .unwrap();
         let function = runtime
@@ -182,10 +236,11 @@ impl Fixture {
         let enqueues = Arc::new(AtomicU64::new(0));
         let encoded = Arc::new(AtomicU64::new(0));
         let registry = OperationRuntimeRegistry::new(
-            vec![Box::new(contract)],
+            vec![contract],
             vec![Box::new(Scale {
                 descriptor,
                 function,
+                program_binding,
                 enqueues: Arc::clone(&enqueues),
                 encoded: Arc::clone(&encoded),
             })],
@@ -204,9 +259,27 @@ impl Fixture {
                 .unwrap()],
             )
             .unwrap();
-        let family = TypedFamilyRegistration::new(family::Family::default())
-            .prepare_with_profile(&serde_json::json!({"width": 4}), &id("fixture.f16"))
-            .unwrap();
+        let family = TypedFamilyRegistration::new(if program_binding {
+            family::Family::with_program_binding()
+        } else {
+            family::Family::default()
+        })
+        .prepare_with_profile(&serde_json::json!({"width": 4}), &id("fixture.f16"))
+        .unwrap();
+        // Workspace reuse is deliberately independent from graph execution.
+        let bucket = program_binding.then(|| {
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("fixture.decode").unwrap(),
+                ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+            )
+            .unwrap()
+        });
+        let reusable = bucket
+            .as_ref()
+            .map(|bucket| ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap());
+        assert!(reusable
+            .as_ref()
+            .is_none_or(|policy| policy.program_policy().is_none()));
         let policy = ResolvedRuntimePolicy::new(
             "runtime-policy.cuda-guard-fixture",
             ContractVersion::new(1, 0),
@@ -232,7 +305,7 @@ impl Fixture {
             },
             AttentionExecutionPolicy::Portable,
             ExecutionDeterminismRequirement::BitwiseSameRuntime,
-            None,
+            reusable,
         )
         .unwrap();
         let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
@@ -341,11 +414,16 @@ impl Fixture {
             resources,
             session,
             batch,
+            bucket,
             lane,
             reaper: CompletionReaper::new(),
             enqueues,
             encoded,
         }
+    }
+
+    pub(super) fn has_program_binding(&self) -> bool {
+        self.bucket.is_some()
     }
 
     pub(super) fn prepare(
@@ -354,12 +432,15 @@ impl Fixture {
         Arc<StepResourceLease<CudaDeviceRuntime>>,
         PreparedStepSubmissionWave<CudaDeviceRuntime>,
     ) {
-        let request = StepResourceAdmissionRequest::new(
+        let mut request = StepResourceAdmissionRequest::new(
             self.batch.bind_work_shape(vec![span()]).unwrap(),
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
         .unwrap();
+        if let Some(bucket) = &self.bucket {
+            request = request.with_reusable_execution_bucket(bucket.bucket_id().clone());
+        }
         let step = (0..4)
             .find_map(|_| {
                 match self

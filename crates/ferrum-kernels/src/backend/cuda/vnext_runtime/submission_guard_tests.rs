@@ -48,8 +48,46 @@ fn cuda_guard_fixture_family_prepares_through_product_configuration_contract() {
         .is_err());
 }
 
+#[test]
+fn cuda_guard_fixture_binding_has_its_own_declared_operation_contract() {
+    let standard = family::scale_contract(false);
+    let binding = family::scale_contract(true);
+    assert_eq!(standard.descriptor().id, id(CONSTANT_SCALE_OPERATION_ID));
+    assert_eq!(
+        standard.descriptor().resources.binding,
+        ResourcePresenceRequirement::Forbidden
+    );
+    assert_eq!(
+        binding.descriptor().resources.binding,
+        ResourcePresenceRequirement::Required
+    );
+    assert_ne!(standard.descriptor().id, binding.descriptor().id);
+    assert_ne!(
+        standard.descriptor().fingerprint().unwrap(),
+        binding.descriptor().fingerprint().unwrap()
+    );
+    binding
+        .validate_signature(
+            &standard.descriptor().inputs,
+            &standard.descriptor().outputs,
+        )
+        .unwrap();
+    let family = family::Family::with_program_binding();
+    let config = family
+        .parse_config(&serde_json::json!({"width": 4}))
+        .unwrap();
+    let profiles = family.numerical_profiles(&config).unwrap();
+    // Typed family preparation independently checks the numerical and semantic
+    // operation identities; the actual CUDA test checks provider resource fit.
+    let _ = profiles;
+    TypedFamilyRegistration::new(family)
+        .prepare_with_profile(&serde_json::json!({"width": 4}), &id("fixture.f16"))
+        .unwrap();
+}
+
 struct Guard {
     reject: bool,
+    program_binding: bool,
     calls: AtomicU64,
     enqueues: Arc<AtomicU64>,
 }
@@ -57,6 +95,7 @@ impl Guard {
     fn new(f: &Fixture, reject: bool) -> Self {
         Self {
             reject,
+            program_binding: f.has_program_binding(),
             calls: AtomicU64::new(0),
             enqueues: Arc::clone(&f.enqueues),
         }
@@ -74,6 +113,29 @@ impl PreparedWaveSubmissionGuard for Guard {
             "actual CUDA compute must not have entered enqueue"
         );
         assert!(actual.graph_evidence().unwrap().proves_unconfigured_eager());
+        assert!(actual.replayed_segments().is_empty());
+        assert!(actual.commands().iter().all(|command| {
+            command.execution_path() == DeviceExecutionPath::Eager
+                && command.reusable_graph_node_count().is_none()
+        }));
+        let bindings = actual
+            .commands()
+            .iter()
+            .filter(|command| {
+                command.native_op_id() == core_cost_route::PROGRAM_BINDING_NATIVE_OPERATION
+            })
+            .collect::<Vec<_>>();
+        if self.program_binding {
+            let [binding] = bindings.as_slice() else {
+                panic!("one real coalesced program-binding upload must reach the final guard")
+            };
+            assert_eq!(binding.command_phase(), DeviceCommandPhase::DynamicBinding);
+            assert_eq!(binding.transfer_command_count(), 1);
+            assert_eq!(binding.compute_dispatch_count(), 0);
+            assert_eq!(binding.participant_count(), 1);
+        } else {
+            assert!(bindings.is_empty());
+        }
         assert_eq!(readback, CoreReadbackRoute::SubmissionStaged);
         assert_eq!(
             actual
@@ -106,7 +168,16 @@ fn accepted(
 #[test]
 #[ignore = "requires an actual CUDA device and installed native operator artifacts"]
 fn guarded_cuda_core_rejection_rolls_back_and_same_lane_submits() {
-    let f = Fixture::new();
+    rejected_then_retry(Fixture::new());
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_core_program_binding_stays_eager_and_retries_after_rejection() {
+    rejected_then_retry(Fixture::new_program_binding());
+}
+
+fn rejected_then_retry(f: Fixture) {
     let lane_id = f.lane.id();
     let (step, wave) = f.prepare();
     let guard = Guard::new(&f, true);

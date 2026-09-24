@@ -6,12 +6,52 @@ pub(super) struct Config {
     width: u64,
 }
 
-pub(super) struct Family(ModelFamilyId);
+pub(super) struct Family(ModelFamilyId, bool);
 impl Default for Family {
     fn default() -> Self {
-        Self(id("family.cuda-guard-fixture"))
+        Self(id("family.cuda-guard-fixture"), false)
     }
 }
+impl Family {
+    pub(super) fn with_program_binding() -> Self {
+        Self(id("family.cuda-guard-fixture"), true)
+    }
+    fn operation_id(&self) -> OperationId {
+        if self.1 {
+            id("operation.cuda-guard-fixture.scale-with-binding")
+        } else {
+            id(CONSTANT_SCALE_OPERATION_ID)
+        }
+    }
+}
+
+/// The binding fixture has a distinct contract: the production scale operation
+/// forbids auxiliary resources and is never weakened for a test provider.
+struct BindingScaleContract(OperationDescriptor);
+impl OperationContract for BindingScaleContract {
+    fn descriptor(&self) -> &OperationDescriptor {
+        &self.0
+    }
+    fn validate_signature(
+        &self,
+        inputs: &[TensorContract],
+        outputs: &[TensorContract],
+    ) -> Result<(), VNextError> {
+        constant_scale_contract()?.validate_signature(inputs, outputs)
+    }
+}
+pub(super) fn scale_contract(program_binding: bool) -> Box<dyn OperationContract> {
+    let standard = constant_scale_contract().unwrap();
+    if !program_binding {
+        return Box::new(standard);
+    }
+    let mut descriptor = standard.descriptor().clone();
+    descriptor.id = Family::with_program_binding().operation_id();
+    descriptor.resources.binding = ResourcePresenceRequirement::Required;
+    descriptor.validate().unwrap();
+    Box::new(BindingScaleContract(descriptor))
+}
+
 impl ModelFamilyProvider for Family {
     type Config = Config;
     fn family_id(&self) -> &ModelFamilyId {
@@ -85,7 +125,7 @@ impl ModelFamilyProvider for Family {
                 states: vec![],
                 kv_storage: vec![],
                 operations: vec![NumericalOperationContract {
-                    operation_id: id(CONSTANT_SCALE_OPERATION_ID),
+                    operation_id: self.operation_id(),
                     version: ContractVersion::new(1, 0),
                     multiplication_type: Some(ElementType::F32),
                     accumulation_type: None,
@@ -106,7 +146,7 @@ impl ModelFamilyProvider for Family {
                 id: "block.scale".into(),
                 nodes: vec![ProgramNode {
                     id: id("node.scale"),
-                    operation_id: id(CONSTANT_SCALE_OPERATION_ID),
+                    operation_id: self.operation_id(),
                     required_version: ContractVersion::new(1, 0),
                     work: ProgramNodeWorkSpec::tokens(id("value.input"), 0),
                     inputs: vec![id("value.input")],
