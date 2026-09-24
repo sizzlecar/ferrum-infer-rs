@@ -29,6 +29,7 @@ mod numeric;
 mod numeric_tests;
 #[cfg(test)]
 pub(super) mod prompt_range_tests;
+pub mod statistical;
 
 #[cfg(test)]
 #[path = "cost_model/expiry_tests.rs"]
