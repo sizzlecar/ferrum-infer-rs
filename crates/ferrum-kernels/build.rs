@@ -47,6 +47,7 @@ const CUDA_NATIVE_SIGNATURE_SCHEMA: &str = "ferrum-cuda-native-input-v2";
 static CUDA_BUILD_SUMMARY_ROWS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 
 const CORE_PTX_KERNELS: &[&str] = &[
+    "kernels/vnext_q4_stream_mmq.cu",
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
     "kernels/rms_norm.cu",
@@ -1419,7 +1420,10 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         // the cache identity and the actual compiler invocation.
         let precise_math = matches!(
             *kernel,
-            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+            gguf::KERNEL
+                | "kernels/vnext_q4_stream_mmq.cu"
+                | "kernels/residual_add.cu"
+                | "kernels/argmax_rows.cu"
         );
         if precise_math {
             flags.retain(|flag| flag != "--use_fast_math");
