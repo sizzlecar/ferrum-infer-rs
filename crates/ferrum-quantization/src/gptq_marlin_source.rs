@@ -82,6 +82,7 @@ impl GptqMarlinSafetensorsSource {
         let k = usize::try_from(*k)
             .map_err(|_| invalid_component(component, "dense GPTQ K overflows"))?;
         let (group_count, scale_n) = validate_scale_shape(component, &scales)?;
+        let scale_type = scales.element_type();
         if n == 0
             || k == 0
             || !n.is_multiple_of(8)
@@ -91,7 +92,10 @@ impl GptqMarlinSafetensorsSource {
             || scale_n != n
             || qweight.dtype() != Dtype::I32
             || qweight.shape() != [k as u64 / 8, n as u64]
-            || scales.dtype() != Dtype::F16
+            || !matches!(
+                scale_type,
+                Some(ElementType::F16 | ElementType::Bf16 | ElementType::F32)
+            )
         {
             return Err(invalid_component(
                 component,
@@ -102,7 +106,16 @@ impl GptqMarlinSafetensorsSource {
         validate_symmetric_qzeros_shape(component, &qzeros, k, n, group_size)?;
         validate_canonical_g_idx(component, &g_idx, k, group_size)?;
         let packed = decode_i32(qweight.bytes(), component, "qweight")?;
-        let scales_values = decode_f16(scales.bytes(), component)?;
+        // Match ordinary Marlin scales: convert checkpoint storage to the
+        // physical F16 scale ABI before dequantizing the dense router.
+        let scale_bytes = transcode_dense_bytes(
+            scales.bytes(),
+            scale_type.expect("floating scale type was validated above"),
+            ElementType::F16,
+            scales_name,
+            None,
+        )?;
+        let scales_values = decode_f16(&scale_bytes, component)?;
         let byte_count = usize::try_from(component.physical_bytes()?)
             .map_err(|_| invalid_component(component, "dense GPTQ byte count overflows"))?;
         let mut bytes = Vec::with_capacity(byte_count);
@@ -973,6 +986,78 @@ mod tests {
     }
 
     #[test]
+    fn dense_gptq_converts_floating_scales_before_f16_dequantization() {
+        let component = dense_component();
+        for dtype in [Dtype::BF16, Dtype::F32] {
+            let source_values: Vec<f32> = (0..16)
+                .map(|index| {
+                    let value = [0.10003_f32, 1.0006, 1.0e-7, -0.33013][index % 4];
+                    if dtype == Dtype::BF16 {
+                        half::bf16::from_f32(value).to_f32()
+                    } else {
+                        value
+                    }
+                })
+                .collect();
+            assert!(source_values
+                .iter()
+                .any(|&value| f16::from_f32(value).to_f32() != value));
+            let directory = dense_fixture(0x7777_7777, |tensors| {
+                let scales = tensors.get_mut("layer.proj.scales").unwrap();
+                scales.0 = dtype;
+                scales.2 = source_values
+                    .iter()
+                    .flat_map(|&value| match dtype {
+                        Dtype::BF16 => half::bf16::from_f32(value).to_le_bytes().to_vec(),
+                        Dtype::F32 => value.to_le_bytes().to_vec(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+            });
+            let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
+            let payload = source.component(&component).unwrap();
+            assert_eq!(payload.external_names(), component.external_names);
+            assert_eq!(payload.source_files(), vec!["model.safetensors"; 4]);
+            assert_eq!(payload.element_type(), ElementType::F16);
+            assert_eq!(payload.dimensions(), [8, 256]);
+            let values = decode_f16(payload.bytes(), &component).unwrap();
+            for output in 0..8 {
+                for input in 0..256 {
+                    let code = ((input + 3 * output) % 16) as i32;
+                    let scale = f16::from_f32(source_values[(input / 128) * 8 + output]);
+                    let expected = f16::from_f32((code - 8) as f32 * scale.to_f32());
+                    assert_eq!(values[output * 256 + input].to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gptq_rejects_nonfinite_or_overflowing_converted_scales() {
+        for dtype in [Dtype::BF16, Dtype::F32] {
+            for value in [f32::NAN, f32::INFINITY, 70_000.0, 10_000.0] {
+                let directory = dense_fixture(0x7777_7777, |tensors| {
+                    let scales = tensors.get_mut("layer.proj.scales").unwrap();
+                    scales.0 = dtype;
+                    scales.2 = (0..16)
+                        .flat_map(|_| match dtype {
+                            Dtype::BF16 => half::bf16::from_f32(value).to_le_bytes().to_vec(),
+                            Dtype::F32 => value.to_le_bytes().to_vec(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                });
+                let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
+                // Includes finite scales whose -8 coefficient overflows F16.
+                assert!(
+                    source.component(&dense_component()).is_err(),
+                    "{dtype:?} {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dense_gptq_rejects_invalid_source_recipes_and_dimensions() {
         let directory = dense_fixture(0x7777_7777, |_| {});
         let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
@@ -1010,7 +1095,7 @@ mod tests {
             let directory = dense_fixture(0x7777_7777, |tensors| match case {
                 0 => tensors.get_mut("layer.proj.g_idx").unwrap().2[..4]
                     .copy_from_slice(&1_i32.to_le_bytes()),
-                1 => tensors.get_mut("layer.proj.scales").unwrap().0 = Dtype::BF16,
+                1 => tensors.get_mut("layer.proj.scales").unwrap().0 = Dtype::I16,
                 2 => tensors.get_mut("layer.proj.scales").unwrap().1 = vec![1, 16],
                 3 => tensors.get_mut("layer.proj.qzeros").unwrap().0 = Dtype::F32,
                 4 => {

@@ -11,7 +11,7 @@ use ferrum_quantization::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::config::{Qwen3MoeGptqConfig, Qwen3MoeSemanticConfig};
 use super::invalid_config;
@@ -35,7 +35,7 @@ pub(super) const ROUTED_DOWN_ROLE: &str = "moe_routed_down";
 const STRUCTURE_FINGERPRINT_VERSION: u8 = 1;
 
 /// Source-specific proof that the checkpoint header matched the deterministic
-/// Qwen3 MoE schema. GPTQ keeps only a compact fingerprint; GGUF retains its
+/// Qwen3 MoE schema. GPTQ keeps a fingerprint and non-F16 source types; GGUF retains its
 /// much smaller native tensor inventory because each component's block ABI is
 /// part of the zero-copy execution contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +45,10 @@ pub(super) enum Qwen3MoeWeightManifest {
         quantization: Qwen3MoeGptqConfig,
         #[serde(default)]
         quantized_router_layers: BTreeSet<u32>,
+        /// Non-F16 checkpoint storage types for expected floating tensors only.
+        /// Physical components are still materialized as F16.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        floating_source_types: BTreeMap<String, ElementType>,
         tensor_count: u64,
         structure_fingerprint: String,
     },
@@ -93,21 +97,16 @@ impl Qwen3MoeWeightManifest {
                 return Err(format!("missing dense or GPTQ router {stem}"));
             }
         }
-        let manifest =
-            expected_manifest_for_routers(semantic, quantization, &quantized_router_layers)
-                .map_err(|error| format!("build weight contract: {error}"))?;
-        let Qwen3MoeWeightManifest::SafetensorsGptqMarlin { tensor_count, .. } = &manifest else {
-            unreachable!("GPTQ manifest constructor returned a GGUF manifest")
-        };
-        validate_archive(
-            archive,
+        let floating_source_types =
+            validate_archive(archive, semantic, quantization, &quantized_router_layers)
+                .map_err(|error| error.to_string())?;
+        expected_manifest_for_sources(
             semantic,
             quantization,
             &quantized_router_layers,
-            *tensor_count,
+            &floating_source_types,
         )
-        .map_err(|error| error.to_string())?;
-        Ok(manifest)
+        .map_err(|error| format!("build weight contract: {error}"))
     }
 
     pub(super) fn load_gguf(
@@ -148,13 +147,18 @@ impl Qwen3MoeWeightManifest {
             Self::SafetensorsGptqMarlin {
                 quantization,
                 quantized_router_layers,
+                floating_source_types,
                 ..
             } => {
                 semantic
                     .validate_gptq(quantization)
                     .map_err(|reason| invalid_config("semantic", reason))?;
-                let expected =
-                    expected_manifest_for_routers(semantic, quantization, quantized_router_layers)?;
+                let expected = expected_manifest_for_sources(
+                    semantic,
+                    quantization,
+                    quantized_router_layers,
+                    floating_source_types,
+                )?;
                 if self != &expected {
                     return Err(invalid_config(
                         "weights",
@@ -1135,8 +1139,41 @@ fn validate_archive(
     semantic: &Qwen3MoeSemanticConfig,
     quantization: &Qwen3MoeGptqConfig,
     quantized_router_layers: &BTreeSet<u32>,
-    expected_count: u64,
-) -> Result<(), VNextError> {
+) -> Result<BTreeMap<String, ElementType>, VNextError> {
+    let mut floating_source_types = BTreeMap::new();
+    let expected_count = visit_expected_tensors(
+        semantic,
+        quantization,
+        quantized_router_layers,
+        |name, element_type, dimensions| {
+            let tensor = archive
+                .tensor(&name)
+                .map_err(|error| invalid_config("weights", error.to_string()))?;
+            let actual_type = tensor.element_type();
+            let compatible_type = if element_type == ElementType::F16 {
+                matches!(
+                    actual_type,
+                    Some(ElementType::F16 | ElementType::Bf16 | ElementType::F32)
+                )
+            } else {
+                actual_type == Some(element_type)
+            };
+            if !compatible_type || tensor.shape() != dimensions {
+                return Err(invalid_config(
+                    "weights",
+                    format!(
+                        "tensor {name:?} has {:?}/{:?}, expected {element_type:?}/{dimensions:?} (floating sources allow F16/BF16/F32)",
+                        tensor.dtype(),
+                        tensor.shape()
+                    ),
+                ));
+            }
+            if let Some(actual @ (ElementType::Bf16 | ElementType::F32)) = actual_type {
+                floating_source_types.insert(name, actual);
+            }
+            Ok(())
+        },
+    )?;
     if u64::try_from(archive.tensor_count()).ok() != Some(expected_count) {
         return Err(invalid_config(
             "weights",
@@ -1146,34 +1183,7 @@ fn validate_archive(
             ),
         ));
     }
-    let observed = visit_expected_tensors(
-        semantic,
-        quantization,
-        quantized_router_layers,
-        |name, element_type, dimensions| {
-            let tensor = archive
-                .tensor(&name)
-                .map_err(|error| invalid_config("weights", error.to_string()))?;
-            if tensor.element_type() != Some(element_type) || tensor.shape() != dimensions {
-                return Err(invalid_config(
-                    "weights",
-                    format!(
-                        "tensor {name:?} has {:?}/{:?}, expected {element_type:?}/{dimensions:?}",
-                        tensor.dtype(),
-                        tensor.shape()
-                    ),
-                ));
-            }
-            Ok(())
-        },
-    )?;
-    if observed != expected_count {
-        return Err(invalid_config(
-            "weights",
-            "internal Qwen3 MoE tensor cardinality drift",
-        ));
-    }
-    Ok(())
+    Ok(floating_source_types)
 }
 
 #[cfg(test)]
@@ -1184,10 +1194,25 @@ pub(super) fn expected_manifest(
     expected_manifest_for_routers(semantic, quantization, &BTreeSet::new())
 }
 
+#[cfg(test)]
 fn expected_manifest_for_routers(
     semantic: &Qwen3MoeSemanticConfig,
     quantization: &Qwen3MoeGptqConfig,
     quantized_router_layers: &BTreeSet<u32>,
+) -> Result<Qwen3MoeWeightManifest, VNextError> {
+    expected_manifest_for_sources(
+        semantic,
+        quantization,
+        quantized_router_layers,
+        &BTreeMap::new(),
+    )
+}
+
+fn expected_manifest_for_sources(
+    semantic: &Qwen3MoeSemanticConfig,
+    quantization: &Qwen3MoeGptqConfig,
+    quantized_router_layers: &BTreeSet<u32>,
+    floating_source_types: &BTreeMap<String, ElementType>,
 ) -> Result<Qwen3MoeWeightManifest, VNextError> {
     if quantized_router_layers
         .iter()
@@ -1200,18 +1225,39 @@ fn expected_manifest_for_routers(
     }
     let mut hasher = Sha256::new();
     hasher.update([STRUCTURE_FINGERPRINT_VERSION]);
+    let mut used_overrides = 0;
     let tensor_count = visit_expected_tensors(
         semantic,
         quantization,
         quantized_router_layers,
         |name, element_type, dimensions| {
-            hash_header(&mut hasher, &name, element_type, &dimensions);
+            let source_type = match floating_source_types.get(&name) {
+                Some(actual @ (ElementType::Bf16 | ElementType::F32))
+                    if element_type == ElementType::F16 =>
+                {
+                    used_overrides += 1;
+                    *actual
+                }
+                Some(_) => return Err(invalid_config(
+                    "weights",
+                    format!("source type override for {name:?} must be BF16/F32 on an expected floating tensor"),
+                )),
+                None => element_type,
+            };
+            hash_header(&mut hasher, &name, source_type, &dimensions);
             Ok(())
         },
     )?;
+    if used_overrides != floating_source_types.len() {
+        return Err(invalid_config(
+            "weights",
+            "source type proof contains unknown or unused tensors",
+        ));
+    }
     Ok(Qwen3MoeWeightManifest::SafetensorsGptqMarlin {
         quantization: quantization.clone(),
         quantized_router_layers: quantized_router_layers.clone(),
+        floating_source_types: floating_source_types.clone(),
         tensor_count,
         structure_fingerprint: format!("{:x}", hasher.finalize()),
     })
@@ -1410,7 +1456,9 @@ fn hash_header(hasher: &mut Sha256, name: &str, element_type: ElementType, dimen
     hasher.update([match element_type {
         ElementType::F16 => 1,
         ElementType::I32 => 2,
-        _ => unreachable!("Qwen3 MoE header fingerprint only emits F16 and I32"),
+        ElementType::Bf16 => 3,
+        ElementType::F32 => 4,
+        _ => unreachable!("Qwen3 MoE source types were validated before fingerprinting"),
     }]);
     hasher.update((dimensions.len() as u64).to_le_bytes());
     for extent in dimensions {
@@ -1425,7 +1473,7 @@ mod tests {
     use ferrum_interfaces::vnext::{
         CanonicalRational, ModelFamilyId, ROUTED_SWIGLU_MOE_OPERATION_ID,
     };
-    use half::f16;
+    use half::{bf16, f16};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     use super::*;
@@ -1471,6 +1519,33 @@ mod tests {
         views.insert(
             name.into(),
             TensorView::new(Dtype::F16, dimensions, leak_bytes(vec![0_u8; elements * 2])).unwrap(),
+        );
+    }
+
+    fn floating_fixture_value(index: usize) -> f32 {
+        ((index % 7) as f32 - 3.0) * 0.25
+    }
+
+    fn replace_floating_source(
+        views: &mut BTreeMap<String, TensorView<'static>>,
+        name: &str,
+        dtype: Dtype,
+    ) {
+        let shape = views.get(name).unwrap().shape().to_vec();
+        let values = (0..shape.iter().product()).map(floating_fixture_value);
+        let bytes = match dtype {
+            Dtype::BF16 => values
+                .flat_map(|v| bf16::from_f32(v).to_le_bytes())
+                .collect(),
+            Dtype::F32 => values.flat_map(f32::to_le_bytes).collect(),
+            Dtype::F16 => values
+                .flat_map(|v| f16::from_f32(v).to_le_bytes())
+                .collect(),
+            _ => panic!("fixture requires a floating source type"),
+        };
+        views.insert(
+            name.into(),
+            TensorView::new(dtype, shape, leak_bytes(bytes)).unwrap(),
         );
     }
 
@@ -1814,12 +1889,160 @@ mod tests {
 
     #[test]
     fn product_preparation_accepts_standalone_template_and_binds_immutable_source() {
-        assert_product_preparation(false);
+        assert_product_preparation(false, &[]);
     }
 
     #[test]
     fn product_preparation_materializes_gptq_router_from_standalone_template_checkpoint() {
-        assert_product_preparation(true);
+        assert_product_preparation(true, &[]);
+    }
+
+    #[test]
+    fn product_preparation_converts_mixed_floating_sources_with_gptq_router() {
+        // Match mixed checkpoint storage: BF16 dense weights, F32 norms,
+        // and F16 GPTQ scales, all materialized into the unchanged F16 program.
+        assert_product_preparation(
+            true,
+            &[
+                ("model.embed_tokens.weight", Dtype::BF16),
+                ("lm_head.weight", Dtype::BF16),
+                ("model.norm.weight", Dtype::BF16),
+                ("model.layers.0.input_layernorm.weight", Dtype::BF16),
+                ("model.layers.0.post_attention_layernorm.weight", Dtype::F32),
+                ("model.layers.0.self_attn.q_norm.weight", Dtype::F32),
+                ("model.layers.0.self_attn.k_norm.weight", Dtype::BF16),
+            ],
+        );
+    }
+
+    #[test]
+    fn product_preparation_converts_router_and_projection_floating_scales() {
+        for dtype in [Dtype::BF16, Dtype::F32] {
+            assert_product_preparation_with_scales(true, &[], Some(dtype));
+        }
+    }
+
+    #[test]
+    fn floating_source_proof_preserves_f16_schema_and_rejects_tampering() {
+        let mut semantic = fixture_semantics();
+        semantic.expert_count = 8;
+        let quantization = fixture_quantization();
+        let routers = BTreeSet::from([0]);
+        let all_f16 = expected_manifest_for_routers(&semantic, &quantization, &routers).unwrap();
+        let legacy = serde_json::to_value(&all_f16).unwrap();
+        assert!(legacy.get("floating_source_types").is_none());
+        serde_json::from_value::<Qwen3MoeWeightManifest>(legacy)
+            .unwrap()
+            .validate(&semantic)
+            .unwrap();
+        let overrides = BTreeMap::from([
+            ("model.embed_tokens.weight".into(), ElementType::Bf16),
+            ("model.norm.weight".into(), ElementType::F32),
+            (
+                "model.layers.0.self_attn.q_proj.scales".into(),
+                ElementType::F32,
+            ),
+        ]);
+        let (_directory, archive) = fixture_archive_for(&semantic, &routers, |views| {
+            replace_floating_source(views, "model.embed_tokens.weight", Dtype::BF16);
+            replace_floating_source(views, "model.norm.weight", Dtype::F32);
+            replace_floating_source(views, "model.layers.0.self_attn.q_proj.scales", Dtype::F32);
+        });
+        let mixed = Qwen3MoeWeightManifest::load(&archive, &semantic, &quantization).unwrap();
+        let encoded = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(
+            encoded["floating_source_types"],
+            serde_json::to_value(&overrides).unwrap()
+        );
+        assert_ne!(mixed, all_f16);
+        assert_eq!(
+            mixed.weight_schema(&semantic).unwrap(),
+            all_f16.weight_schema(&semantic).unwrap()
+        );
+        let family = ModelFamilyId::new(super::super::FAMILY_ID).unwrap();
+        let profiles = super::super::program::numerical_profiles(&family, &semantic).unwrap();
+        for profile in profiles.profiles() {
+            assert_eq!(
+                super::super::program::build_semantic_program(&family, &semantic, &mixed, profile)
+                    .unwrap(),
+                super::super::program::build_semantic_program(
+                    &family, &semantic, &all_f16, profile
+                )
+                .unwrap(),
+            );
+        }
+        serde_json::from_value::<Qwen3MoeWeightManifest>(encoded.clone())
+            .unwrap()
+            .validate(&semantic)
+            .unwrap();
+
+        let mut changed_dtype = overrides.clone();
+        changed_dtype.insert("model.embed_tokens.weight".into(), ElementType::F32);
+        for invalid in [BTreeMap::new(), changed_dtype] {
+            let mut tampered = encoded.clone();
+            tampered["floating_source_types"] = serde_json::to_value(invalid).unwrap();
+            assert!(serde_json::from_value::<Qwen3MoeWeightManifest>(tampered)
+                .unwrap()
+                .validate(&semantic)
+                .is_err());
+        }
+        for (name, dtype) in [
+            ("unexpected.weight", ElementType::Bf16),
+            ("model.layers.1.input_layernorm.weight", ElementType::Bf16),
+            ("model.layers.0.mlp.gate.weight", ElementType::Bf16),
+            ("model.layers.0.mlp.gate.qweight", ElementType::Bf16),
+            ("model.layers.0.mlp.gate.qzeros", ElementType::F32),
+            ("model.layers.0.mlp.gate.g_idx", ElementType::F32),
+            ("model.embed_tokens.weight", ElementType::I32),
+            ("model.embed_tokens.weight", ElementType::F16),
+        ] {
+            let mut invalid = overrides.clone();
+            invalid.insert(name.into(), dtype);
+            // Even a freshly computed fingerprint cannot authorize an unknown,
+            // redundant, unsupported or integer-tensor override.
+            assert!(
+                expected_manifest_for_sources(&semantic, &quantization, &routers, &invalid)
+                    .is_err(),
+                "{name} {dtype:?}"
+            );
+            let mut tampered = encoded.clone();
+            tampered["floating_source_types"] = serde_json::to_value(invalid).unwrap();
+            assert!(serde_json::from_value::<Qwen3MoeWeightManifest>(tampered)
+                .unwrap()
+                .validate(&semantic)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn floating_source_headers_reject_integer_substitution_and_wrong_shape() {
+        let mut semantic = fixture_semantics();
+        semantic.expert_count = 8;
+        for (name, dtype, transpose) in [
+            ("model.embed_tokens.weight", Dtype::I32, false),
+            ("model.norm.weight", Dtype::F64, false),
+            ("model.layers.0.mlp.gate.scales", Dtype::I32, false),
+            ("model.layers.0.mlp.gate.qweight", Dtype::F16, false),
+            ("model.layers.0.mlp.gate.qzeros", Dtype::I64, false),
+            ("model.layers.0.mlp.gate.g_idx", Dtype::BF16, false),
+            ("model.embed_tokens.weight", Dtype::BF16, true),
+        ] {
+            let (_directory, archive) =
+                fixture_archive_for(&semantic, &BTreeSet::from([0]), |views| {
+                    let mut shape = views.get(name).unwrap().shape().to_vec();
+                    if transpose {
+                        shape.reverse();
+                    }
+                    let bytes = vec![0; shape.iter().product::<usize>() * dtype.size()];
+                    views.insert(
+                        name.into(),
+                        TensorView::new(dtype, shape, leak_bytes(bytes)).unwrap(),
+                    );
+                });
+            let error = Qwen3MoeWeightManifest::load(&archive, &semantic, &fixture_quantization())
+                .unwrap_err();
+            assert!(error.contains(name), "{error}");
+        }
     }
 
     #[test]
@@ -1949,10 +2172,29 @@ mod tests {
         }
     }
 
-    fn assert_product_preparation(quantized_router: bool) {
+    fn assert_product_preparation(quantized_router: bool, floating_sources: &[(&str, Dtype)]) {
+        assert_product_preparation_with_scales(quantized_router, floating_sources, None);
+    }
+
+    fn assert_product_preparation_with_scales(
+        quantized_router: bool,
+        floating_sources: &[(&str, Dtype)],
+        scale_type: Option<Dtype>,
+    ) {
         use crate::vnext::{resolve_registered_model_from_sources, ProductionModelSourceBundle};
         use ferrum_interfaces::vnext::ModelArtifactSourceRole;
         use std::{fs, sync::Arc};
+        let source_scale = scale_type.map(|dtype| match dtype {
+            // BF16 subnormal-in-F16 and ordinary F32 values both require
+            // rounding into the physical F16 scale protocol.
+            Dtype::BF16 => bf16::from_f32(1.0e-7).to_f32(),
+            Dtype::F32 => 0.10003,
+            _ => panic!("this test covers non-F16 floating scales"),
+        });
+        let physical_scale = source_scale.map(f16::from_f32);
+        if let (Some(source), Some(physical)) = (source_scale, physical_scale) {
+            assert_ne!(source, physical.to_f32());
+        }
         let mut semantic = fixture_semantics();
         let routers = if quantized_router {
             semantic.expert_count = 8;
@@ -1960,7 +2202,33 @@ mod tests {
         } else {
             BTreeSet::new()
         };
-        let (directory, _archive) = fixture_archive_for(&semantic, &routers, |_| {});
+        let (directory, archive) = fixture_archive_for(&semantic, &routers, |views| {
+            for &(name, dtype) in floating_sources {
+                replace_floating_source(views, name, dtype);
+            }
+            if let Some(dtype) = scale_type {
+                assert!(quantized_router);
+                for name in [
+                    "model.layers.0.mlp.gate.scales",
+                    "model.layers.0.self_attn.q_proj.scales",
+                ] {
+                    let shape = views.get(name).unwrap().shape().to_vec();
+                    let bytes = (0..shape.iter().product::<usize>())
+                        .flat_map(|_| match dtype {
+                            Dtype::BF16 => {
+                                bf16::from_f32(source_scale.unwrap()).to_le_bytes().to_vec()
+                            }
+                            Dtype::F32 => source_scale.unwrap().to_le_bytes().to_vec(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    views.insert(
+                        name.into(),
+                        TensorView::new(dtype, shape, leak_bytes(bytes)).unwrap(),
+                    );
+                }
+            }
+        });
         let config = serde_json::json!({
             "architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe",
             "hidden_size":semantic.hidden_size,"num_hidden_layers":semantic.layer_count,
@@ -2003,6 +2271,24 @@ mod tests {
             registered.define_from_sources(sources).unwrap(),
         )
         .unwrap();
+        for component in &prepared.family().weight_schema().components {
+            let payload = prepared.weights().component(component).unwrap();
+            assert_eq!(payload.external_names(), component.external_names);
+            assert_eq!(payload.dimensions(), component.dimensions);
+            assert_eq!(
+                payload.bytes().len() as u64,
+                component.physical_bytes().unwrap()
+            );
+        }
+        let source_identity = prepared
+            .sources()
+            .fingerprint(ModelArtifactSourceRole::Weights, "model.safetensors")
+            .unwrap();
+        let source_bytes = fs::read(directory.path().join("model.safetensors")).unwrap();
+        assert_eq!(
+            source_identity.sha256,
+            format!("{:x}", Sha256::digest(&source_bytes))
+        );
         let router_id = layer_component_id(0, ROUTER_ROLE).unwrap();
         let router = prepared
             .family()
@@ -2016,13 +2302,69 @@ mod tests {
             payload.dimensions(),
             [semantic.expert_count, semantic.hidden_size]
         );
-        let expected = f16::from_f32(if quantized_router { -8.0 } else { 0.0 })
-            .to_bits()
-            .to_le_bytes();
+        let expected = f16::from_f32(if quantized_router {
+            -8.0 * physical_scale.map_or(1.0, f16::to_f32)
+        } else {
+            0.0
+        })
+        .to_bits()
+        .to_le_bytes();
         assert!(payload
             .bytes()
             .chunks_exact(2)
             .all(|value| value == expected));
+        assert_eq!(payload.external_names(), router.external_names);
+        if let Some(scale) = physical_scale {
+            assert_eq!(payload.source_files(), ["model.safetensors"; 4]);
+            let name = "model.layers.0.self_attn.q_proj.scales";
+            let component = prepared
+                .family()
+                .weight_schema()
+                .components
+                .iter()
+                .find(|component| component.external_names == [name])
+                .unwrap();
+            assert_eq!(component.role, WeightComponentRole::Scales);
+            let payload = prepared.weights().component(component).unwrap();
+            assert_eq!(payload.external_names(), [name]);
+            assert_eq!(payload.source_files(), ["model.safetensors"]);
+            assert_eq!(payload.element_type(), ElementType::F16);
+            // Constant source columns remain constant through the real Marlin
+            // repack, so this checks conversion without reimplementing it.
+            assert!(payload
+                .bytes()
+                .chunks_exact(2)
+                .all(|bytes| bytes == scale.to_le_bytes()));
+            for name in [name, "model.layers.0.mlp.gate.scales"] {
+                assert_eq!(archive.tensor(name).unwrap().dtype(), scale_type.unwrap());
+            }
+        }
+        for &(name, dtype) in floating_sources {
+            let component = prepared
+                .family()
+                .weight_schema()
+                .components
+                .iter()
+                .find(|component| component.external_names == [name])
+                .unwrap();
+            assert_eq!(
+                component.encoding,
+                WeightEncoding::Dense {
+                    element_type: ElementType::F16
+                }
+            );
+            let source = archive.tensor(name).unwrap();
+            assert_eq!(source.dtype(), dtype);
+            let payload = prepared.weights().component(component).unwrap();
+            assert_eq!(payload.external_names(), [name]);
+            assert_eq!(payload.source_files(), ["model.safetensors"]);
+            assert_eq!(payload.dimensions(), component.dimensions);
+            assert_eq!(payload.element_type(), ElementType::F16);
+            let expected: Vec<u8> = (0..component.dimensions.iter().product::<u64>() as usize)
+                .flat_map(|index| f16::from_f32(floating_fixture_value(index)).to_le_bytes())
+                .collect();
+            assert_eq!(payload.bytes(), expected, "converted {name}");
+        }
         let metadata = &prepared.family().metadata().template;
         assert_eq!(metadata.template.as_bytes(), template);
         assert_eq!(metadata.source_file, "chat_template.jinja");
