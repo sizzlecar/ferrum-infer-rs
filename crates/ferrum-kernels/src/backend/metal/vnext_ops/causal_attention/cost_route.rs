@@ -4,8 +4,8 @@
 use super::super::linear::{prepare_leaf_encoding, PreparedLinearPart};
 use super::*;
 use ferrum_interfaces::vnext::{
-    DeviceCommandPhase, OperationCostCommand, OperationCostRoute, OperationCostRouteRequest,
-    OperationCostWorkRow, PhysicalWeightLayout, ResolvedWeightBinding,
+    DeviceCommandPhase, DeviceCostBufferRange, OperationCostCommand, OperationCostRoute,
+    OperationCostRouteRequest, OperationCostWorkRow, PhysicalWeightLayout, ResolvedWeightBinding,
 };
 
 #[derive(Clone, Copy)]
@@ -258,6 +258,7 @@ pub(super) fn eager_route(
             packed,
             weights,
             caps,
+            Some(&request),
         )
     };
     calculate()
@@ -333,6 +334,7 @@ fn project(
     packed: bool,
     weights: [PreparedLinearPart; 4],
     caps: Capabilities,
+    request: Option<&OperationCostRouteRequest<'_>>,
 ) -> Result<Option<[OperationCostCommand; 2]>, String> {
     let mut params = Vec::new();
     params
@@ -347,12 +349,48 @@ fn project(
             caps,
         )?);
     }
-    if packed && caps.may_batch_grouped(params.iter()) {
-        // This affects normal long-context Qwen decode cohorts too. A future
-        // read-only resource proof must distinguish disjoint vs shared pages;
-        // do not silently treat this as complete C4/C8 decode coverage.
-        return Ok(None);
-    }
+    let batched_grouped = if packed && caps.may_batch_grouped(params.iter()) {
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let mut pages = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let end = row
+                .offset
+                .checked_add(row.count.get())
+                .ok_or("causal cost context overflow")?;
+            let Some(mut participant_pages) = request
+                .binding_sequence_ranges(
+                    ResolvedValueRole::Input,
+                    8,
+                    index,
+                    shape.physical_state_bytes_with_type(end, caps.kv_type)?,
+                    VNEXT_KV_PAGE_BYTES,
+                )
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(None);
+            };
+            if participant_pages
+                .iter()
+                .any(|range| range.allocation_id().is_none())
+            {
+                return Ok(None);
+            }
+            if participant_pages
+                .iter()
+                .map(|p| p.length() / VNEXT_KV_PAGE_BYTES)
+                .sum::<u64>()
+                != u64::from(params[index].page_count)
+            {
+                return Ok(None);
+            }
+            pages.append(&mut participant_pages);
+        }
+        pages_are_disjoint(&mut pages)
+    } else {
+        false
+    };
     let layout = ScratchLayout::new_with_storage(shape, total, rows.len(), caps.kv_type)?;
     let mut extra = if packed {
         projection_extra(projected_launches(shape, weights, layout, 0, total)?)?
@@ -390,10 +428,20 @@ fn project(
         total,
         packed,
         grouped,
-        false,
+        batched_grouped,
         extra,
     )
     .map(Some)
+}
+
+/// Same whole-page exclusion as actual grouped dispatch, including aliases
+/// within one row. Unknown identity domains cannot authorize batching.
+pub(super) fn pages_are_disjoint(pages: &mut [DeviceCostBufferRange]) -> bool {
+    if pages.is_empty() || pages.iter().any(|page| page.allocation_id().is_none()) {
+        return false;
+    }
+    pages.sort_unstable_by_key(|page| (page.allocation_id(), page.start()));
+    !pages.windows(2).any(|pair| pair[0].overlaps(pair[1]))
 }
 
 fn projected_launches(

@@ -9,9 +9,20 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub async fn new(maximum_batch_tokens: usize, prefix: bool) -> Self {
+        Self::with_causal_geometry(maximum_batch_tokens, prefix, weights::CausalGeometry::TINY)
+            .await
+    }
+    pub async fn grouped() -> Self {
+        Self::with_causal_geometry(64, false, weights::CausalGeometry::GROUPED).await
+    }
+    async fn with_causal_geometry(
+        maximum_batch_tokens: usize,
+        prefix: bool,
+        geometry: weights::CausalGeometry,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        weights::write_config(directory.path());
-        weights::write_weights(directory.path());
+        weights::write_config(directory.path(), geometry);
+        weights::write_weights(directory.path(), geometry);
         std::fs::write(directory.path().join("tokenizer.json"), br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"<eos>":2},"unk_token":"<unk>"}}"#).unwrap();
         std::fs::write(directory.path().join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
         let defined = define_from_model_dir(directory.path()).unwrap();

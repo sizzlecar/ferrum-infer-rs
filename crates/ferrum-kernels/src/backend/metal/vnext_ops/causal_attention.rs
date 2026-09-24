@@ -2209,19 +2209,17 @@ fn can_batch_grouped_decode<'a>(
         if scale_page_count != 0 {
             return false;
         }
-        pages.extend(participant_pages);
+        for page in participant_pages {
+            let Some(range) = page.cost_allocation_range() else {
+                return false;
+            };
+            pages.push(range);
+        }
     }
-    // The retained allocation's identity is used only for this local sort.
-    // Reject even same-row overlap: independent pages need no alias exception.
-    // Whole-page exclusion conservatively keeps shared read-only prefixes on
-    // the original route and proves all peer KV read/write ranges disjoint.
-    pages.sort_unstable_by(|left: &&MetalBufferRegion, right| {
-        left.compare_physical_allocation(right)
-            .then_with(|| left.offset_bytes().cmp(&right.offset_bytes()))
-    });
-    !pages
-        .windows(2)
-        .any(|pair| pair[0].overlaps_physical_region(pair[1]))
+    // The same allocation/offset predicate consumes actual pages here and
+    // bounded page-aligned extents in future projection. Neither sequence IDs
+    // nor equal page counts establish nonaliasing; even same-row aliases fail.
+    cost_route::pages_are_disjoint(&mut pages)
 }
 #[allow(clippy::too_many_arguments)]
 fn dispatch_batched_grouped_decode(

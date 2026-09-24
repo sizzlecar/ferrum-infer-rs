@@ -408,3 +408,5 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
         .unwrap();
     assert_eq!(fixture.executor.device_timing_mode(), DeviceTimingMode::Off);
 }
+
+mod grouped;

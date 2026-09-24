@@ -634,23 +634,16 @@ impl MetalBufferRegion {
     }
 
     /// Compare retained allocation ranges, including overlapping subviews.
-    /// An invalid extent conservatively aliases rather than authorizing reorder.
-    pub(crate) fn overlaps_physical_region(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.allocation, &other.allocation)
-            && match (
-                self.offset_bytes.checked_add(self.length_bytes),
-                other.offset_bytes.checked_add(other.length_bytes),
-            ) {
-                (Some(end), Some(other_end)) => {
-                    self.offset_bytes < other_end && other.offset_bytes < end
-                }
-                _ => true,
-            }
-    }
-
-    /// Local ordering of live owned allocations; never persisted as authority.
-    pub(crate) fn compare_physical_allocation(&self, other: &Self) -> std::cmp::Ordering {
-        Arc::as_ptr(&self.allocation).cmp(&Arc::as_ptr(&other.allocation))
+    /// Numeric copy of the same retained allocation identity and byte range
+    /// used by actual physical-alias validation. It carries no ownership.
+    pub(crate) fn cost_allocation_range(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceCostBufferRange> {
+        ferrum_interfaces::vnext::DeviceCostBufferRange::in_allocation(
+            Arc::as_ptr(&self.allocation) as usize as u64,
+            self.offset_bytes,
+            self.length_bytes,
+        )
     }
 }
 
@@ -2453,6 +2446,30 @@ impl DeviceRuntime for MetalDeviceRuntime {
         permit: ferrum_interfaces::vnext::DeviceAllocationPermit<'_>,
     ) -> Result<Self::Buffer, Self::Error> {
         self.allocate_request(permit.into_request())
+    }
+
+    fn supports_cost_buffer_ranges(&self) -> bool {
+        true
+    }
+
+    fn cost_buffer_range(
+        &self,
+        buffer: &Self::Buffer,
+    ) -> Option<ferrum_interfaces::vnext::DeviceCostBufferRange> {
+        if buffer.runtime_instance != self.runtime_instance {
+            return None;
+        }
+        let MetalDeviceBufferBacking::Contiguous(allocation) = &buffer.backing else {
+            return None;
+        };
+        if buffer.descriptor.size_bytes > allocation.requested_bytes {
+            return None;
+        }
+        ferrum_interfaces::vnext::DeviceCostBufferRange::in_allocation(
+            Arc::as_ptr(allocation) as usize as u64,
+            allocation.aligned_offset_bytes,
+            buffer.descriptor.size_bytes,
+        )
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {

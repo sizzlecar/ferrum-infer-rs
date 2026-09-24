@@ -13,12 +13,36 @@ const HEAD_DIM: usize = 4;
 const VALUE_FEATURES: usize = VALUE_HEADS * HEAD_DIM;
 const QKV_FEATURES: usize = 2 * KEY_HEADS * HEAD_DIM + VALUE_FEATURES;
 
-pub(super) fn write_config(dir: &Path) {
+#[derive(Clone, Copy)]
+pub(super) struct CausalGeometry {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub context: usize,
+    pub gate: bool,
+}
+impl CausalGeometry {
+    pub const TINY: Self = Self {
+        heads: 1,
+        kv_heads: 1,
+        head_dim: HIDDEN,
+        context: 16,
+        gate: false,
+    };
+    pub const GROUPED: Self = Self {
+        heads: 16,
+        kv_heads: 4,
+        head_dim: 256,
+        context: 512,
+        gate: true,
+    };
+}
+pub(super) fn write_config(dir: &Path, causal: CausalGeometry) {
     let config = serde_json::json!({
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "model_type": "qwen3_5",
         "vocab_size": 3,
-        "max_position_embeddings": 16,
+        "max_position_embeddings": causal.context,
         "rms_norm_eps": 1e-6,
         "rope_theta": 10000.0,
         "tie_word_embeddings": false,
@@ -34,11 +58,12 @@ pub(super) fn write_config(dir: &Path) {
             "linear_value_head_dim": HEAD_DIM,
             "linear_conv_kernel_dim": 2,
             "mamba_ssm_dtype": "float32",
-            "head_dim": HIDDEN,
-            "num_attention_heads": 1,
-            "num_key_value_heads": 1,
+            "head_dim": causal.head_dim,
+            "num_attention_heads": causal.heads,
+            "num_key_value_heads": causal.kv_heads,
+            "attn_output_gate": causal.gate,
             "vocab_size": 3,
-            "max_position_embeddings": 16,
+            "max_position_embeddings": causal.context,
             "tie_word_embeddings": false
         }
     });
@@ -49,7 +74,7 @@ pub(super) fn write_config(dir: &Path) {
     .unwrap();
 }
 
-pub(super) fn write_weights(dir: &Path) {
+pub(super) fn write_weights(dir: &Path, causal: CausalGeometry) {
     let tensors: Vec<(String, Vec<f32>)> = vec![
         (
             "model.embed_tokens.weight".to_string(),
@@ -184,16 +209,21 @@ pub(super) fn write_weights(dir: &Path) {
             } else if name.ends_with("mlp.gate_proj.weight") || name.ends_with("mlp.up_proj.weight")
             {
                 vec![INTERMEDIATE, HIDDEN]
-            } else if [
-                "q_proj.weight",
-                "k_proj.weight",
-                "v_proj.weight",
-                "o_proj.weight",
-            ]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
+            } else if name.ends_with("self_attn.q_proj.weight") {
+                vec![
+                    causal.heads * causal.head_dim * if causal.gate { 2 } else { 1 },
+                    HIDDEN,
+                ]
+            } else if name.ends_with("self_attn.k_proj.weight")
+                || name.ends_with("self_attn.v_proj.weight")
             {
-                vec![HIDDEN, HIDDEN]
+                vec![causal.kv_heads * causal.head_dim, HIDDEN]
+            } else if name.ends_with("self_attn.o_proj.weight") {
+                vec![HIDDEN, causal.heads * causal.head_dim]
+            } else if name.ends_with("self_attn.q_norm.weight")
+                || name.ends_with("self_attn.k_norm.weight")
+            {
+                vec![causal.head_dim]
             } else {
                 vec![HIDDEN]
             };

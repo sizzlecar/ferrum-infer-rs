@@ -118,6 +118,7 @@ fn route(
         packed,
         weights(shape),
         caps,
+        None,
     )
     .unwrap()
 }
@@ -352,4 +353,41 @@ fn plain_abi_and_projection_scratch_checks_reject_mismatch_and_transform() {
         ..shape
     };
     assert!(overflowing.validate_page_count(ElementType::F16).is_err());
+}
+
+#[test]
+fn grouped_page_proof_keeps_real_allocation_offset_alias_boundaries() {
+    let range = |allocation, offset, bytes| {
+        DeviceCostBufferRange::in_allocation(allocation, offset, bytes).unwrap()
+    };
+    assert!(pages_are_disjoint(&mut [
+        range(1, 0, 128),
+        range(1, 128, 64),
+        range(2, 0, 128)
+    ]));
+    assert!(!pages_are_disjoint(&mut [
+        range(1, 0, 128),
+        range(1, 127, 64)
+    ]));
+    assert!(!pages_are_disjoint(&mut [
+        range(1, 64, 64),
+        range(1, 64, 64)
+    ]));
+    assert!(!pages_are_disjoint(&mut [
+        DeviceCostBufferRange::new(64, 64).unwrap(),
+        range(2, 0, 64)
+    ]));
+    assert!(!pages_are_disjoint(&mut []));
+    // Page expansion does not change whole-page exclusion. Test both a packed
+    // extent and the actual page representation, including a shared prefix.
+    let extents = [range(1, 0, 256), range(1, 256, 128)];
+    let mut pages = [range(1, 0, 128), range(1, 128, 128), range(1, 256, 128)];
+    assert_eq!(
+        pages_are_disjoint(&mut extents.clone()),
+        pages_are_disjoint(&mut pages)
+    );
+    assert!(!pages_are_disjoint(&mut [
+        range(1, 0, 256),
+        range(1, 128, 128)
+    ]));
 }
