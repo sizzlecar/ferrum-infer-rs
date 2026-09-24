@@ -83,7 +83,9 @@ pub use ferrum_scheduler::BatchPlan;
 pub use continuous_engine::{
     CalibrationAction, CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
     CalibrationFrontier, CalibrationLimits, CalibrationObservation, CalibrationProfileArtifact,
-    CalibrationProfilePaths, CalibrationQueueDisposition, CalibrationRequestEvidence,
+    CalibrationProfilePaths, CalibrationQueueDisposition, CalibrationReferenceArtifact,
+    CalibrationReferenceCollector, CalibrationReferenceCurve, CalibrationReferenceDiscoverySample,
+    CalibrationReferencePlan, CalibrationReferenceTrial, CalibrationRequestEvidence,
     CalibrationSession, CalibrationSubmissionState, CalibrationTurn, CalibrationWaveReport,
     CalibrationWork, ContinuousBatchEngine, FrozenCalibrationModel, ImportedCalibrationModel,
     SequenceState,

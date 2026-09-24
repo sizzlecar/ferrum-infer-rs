@@ -12,15 +12,22 @@ pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
 mod checkpoint;
 mod evidence;
 mod observation;
+mod reference;
 mod token_policy_residency;
 pub use artifact::{CalibrationProfileArtifact, CalibrationProfilePaths, ImportedCalibrationModel};
 pub use checkpoint::FrozenCalibrationModel;
 pub use evidence::CalibrationRequestEvidence;
+pub use reference::{
+    CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
+    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
+};
 mod types;
 pub use observation::{
     CalibrationCommittedRow, CalibrationCommittedWork, CalibrationObservation,
     CalibrationQueueDisposition,
 };
+#[cfg(test)]
+mod tests;
 pub(super) use types::CalibrationWaveReceipt;
 pub use types::{
     CalibrationAction, CalibrationBlockReason, CalibrationDecodeRoute, CalibrationFrontier,

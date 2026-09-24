@@ -74,3 +74,6 @@ impl PendingCheckpoint {
         let _ = self.reply.send(value);
     }
 }
+
+#[cfg(test)]
+mod tests;

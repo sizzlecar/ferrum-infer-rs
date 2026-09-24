@@ -1240,6 +1240,8 @@ pub use inner::calibration::{
     CalibrationAction, CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
     CalibrationDecodeRoute, CalibrationFrontier, CalibrationLimits, CalibrationObservation,
     CalibrationProfileArtifact, CalibrationProfilePaths, CalibrationQueueDisposition,
+    CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
+    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
     CalibrationRequestEvidence, CalibrationSession, CalibrationSubmissionState, CalibrationTurn,
     CalibrationWaveReport, CalibrationWork, FrozenCalibrationModel, ImportedCalibrationModel,
     SelectedCalibrationOptions, SelectedFitFreezeReceipt,

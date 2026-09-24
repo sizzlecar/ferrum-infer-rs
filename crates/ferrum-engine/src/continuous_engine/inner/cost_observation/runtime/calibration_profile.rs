@@ -7,6 +7,9 @@ pub(in crate::continuous_engine) struct LoadedCalibrationProfile {
     pub receipt: ferrum_types::SloCostProfileReceipt,
 }
 
+#[cfg(test)]
+mod tests;
+
 impl EngineCostRuntime {
     /// The input is the worker's actual publication receipt, never a path or
     /// predicted model supplied by the external calibration caller.
