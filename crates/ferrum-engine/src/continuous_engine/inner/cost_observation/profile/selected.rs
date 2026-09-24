@@ -1,5 +1,5 @@
 //! Explicit schema-6 startup import. Ordinary observation and heldout consumption
-//! cannot change this immutable model, its coefficients, TTL or generation.
+//! cannot change fit/residual/support/TTL. Explicit feedback has a separate epoch.
 use super::*;
 use file::statistical_v6::{load_whole_wave_profile_v6, ImportedWholeWaveModelV1};
 use model::statistical::model::{ModelUnknown, WholeWaveSettingsV1, MODEL_REVISION};
@@ -94,7 +94,10 @@ pub(super) fn load_seed(
     Ok(TrainingSeed {
         trainer: None,
         snapshot: Some(Arc::new(EngineCostSnapshot {
-            inner: Snapshot::Selected(imported),
+            inner: Snapshot::Selected(SelectedSnapshot {
+                model: Arc::new(imported),
+                feedback: None,
+            }),
             fingerprint,
         })),
         receipt: Some(receipt),
@@ -102,7 +105,7 @@ pub(super) fn load_seed(
 }
 
 pub(super) fn predict(
-    snapshot: &ImportedWholeWaveModelV1,
+    snapshot: &SelectedSnapshot,
     fingerprint: &model::ExecutionFingerprint,
     shape: &model::WaveExecutionShape,
     evidence: Option<&PlanningCostEvidence>,
@@ -114,7 +117,10 @@ pub(super) fn predict(
         .ok_or(ModelUnknown::Evidence(
             ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,
         ))
-        .and_then(|input| snapshot.predict_input(fingerprint, input, now_ns));
+        .and_then(|input| {
+            let value = snapshot.model.predict_input(fingerprint, input, now_ns)?;
+            snapshot.apply(value, input.family_signature())
+        });
     match result {
         Ok(value) => Some(PlanningCost {
             typical_ns: value.fitted_ns,
@@ -123,12 +129,36 @@ pub(super) fn predict(
             // Imported model timestamps have an anchored epoch, never local now.
             valid_for_ns: value
                 .valid_until_ns
-                .checked_sub(snapshot.clock.model_now_ns(now_ns).ok()?)?,
+                .checked_sub(snapshot.model.clock.model_now_ns(now_ns).ok()?)?,
         }),
         Err(reason) => {
             tracing::trace!(?reason, kind = ?shape.kind, decode_kv_tokens = ?shape.decode_kv_tokens,
                 prefill_chunks = ?shape.prefill_chunks, "SLO candidate has no selected whole-wave cost prediction");
             None
         }
+    }
+}
+
+/// Base artifact remains shared and immutable across all feedback epochs.
+pub(super) struct SelectedSnapshot {
+    pub model: Arc<ImportedWholeWaveModelV1>,
+    pub feedback: Option<Arc<super::super::selected_feedback::View>>,
+}
+impl SelectedSnapshot {
+    pub fn apply(
+        &self,
+        mut value: model::statistical::model::WholeWavePredictionV1,
+        family: &[u8; 32],
+    ) -> Result<model::statistical::model::WholeWavePredictionV1, ModelUnknown> {
+        if let Some(view) = &self.feedback {
+            if !view.current() {
+                return Err(ModelUnknown::RuntimeValidity);
+            }
+            value.planning_ns = value
+                .planning_ns
+                .checked_add(view.margin(family))
+                .ok_or(ModelUnknown::Numerical)?;
+        }
+        Ok(value)
     }
 }

@@ -364,6 +364,7 @@ impl EngineInner {
                 timing: owner::ControllerTimingCommitment::Witness {
                     valid_until,
                     model_version: selected.cost_model_version,
+                    predicted_wall_ns: selected.predicted_wall_ns,
                     admission,
                 },
                 proof: captured.into_safety(),

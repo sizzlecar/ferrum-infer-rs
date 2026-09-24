@@ -23,6 +23,7 @@ pub(super) enum ControllerTimingCommitment {
     Witness {
         valid_until: Instant,
         model_version: u64,
+        predicted_wall_ns: u64,
         admission: Option<super::admission::PendingTimeWitness>,
     },
     CompleteRequests,

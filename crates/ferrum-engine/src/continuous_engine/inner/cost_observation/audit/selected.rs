@@ -22,9 +22,10 @@ pub(in crate::continuous_engine::inner::cost_observation) enum SelectedUnknownRe
     FamilyMissing,
     JointSupport,
     Numerical,
+    RuntimeValidity,
 }
 impl SelectedUnknownReason {
-    const ALL: [Self; 24] = {
+    const ALL: [Self; 25] = {
         use StatisticalEvidenceUnknown as E;
         [
             Self::Evidence(E::MissingProducer),
@@ -51,6 +52,7 @@ impl SelectedUnknownReason {
             Self::FamilyMissing,
             Self::JointSupport,
             Self::Numerical,
+            Self::RuntimeValidity,
         ]
     };
 }
@@ -73,6 +75,7 @@ impl From<ModelUnknown> for SelectedUnknownReason {
             M::FamilyMissing => Self::FamilyMissing,
             M::JointSupport => Self::JointSupport,
             M::Numerical => Self::Numerical,
+            M::RuntimeValidity => Self::RuntimeValidity,
         }
     }
 }
@@ -121,16 +124,17 @@ pub(in crate::continuous_engine::inner::cost_observation) enum SelectedServingEv
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(in crate::continuous_engine::inner::cost_observation) struct SelectedServingAudit {
+    pub presubmit: super::presubmit::PresubmitAudit,
     pub scope: &'static str,
     /// All selected-mode entries actually drained, including missing/invalid data.
     /// Pre-queue offers and drops remain in ObservationFunnelSnapshot.sink.
     pub drained_entries: u64,
     pub not_completed: [ReasonCount<SelectedNotCompleted>; 4],
-    pub actual_unavailable: [ReasonCount<SelectedUnknownReason>; 24],
+    pub actual_unavailable: [ReasonCount<SelectedUnknownReason>; 25],
     pub constructable_actual: u64,
     pub constructable_terminal: u64,
     pub no_published_model: u64,
-    pub prediction_unknown: [ReasonCount<SelectedUnknownReason>; 24],
+    pub prediction_unknown: [ReasonCount<SelectedUnknownReason>; 25],
     pub known_compared: u64,
     pub terminal_compared: u64,
     pub underestimates: u64,
@@ -145,6 +149,7 @@ impl Default for SelectedServingAudit {
 impl SelectedServingAudit {
     pub(super) fn filled(count: u64) -> Self {
         Self {
+            presubmit: super::presubmit::PresubmitAudit::default(),
             scope: "ordinary selected-model FIFO entries; retrospective complete actual host-settled waves against the immutable pre-drain model at real consumption time, not the pre-submit prediction, client-visible SLO or drift control; sink.entries_offered/published/dropped_* remain the full queue population; missing, failed, non-submitted and expired evidence never has zero measured error",
             drained_entries: count,
             not_completed: SelectedNotCompleted::ALL.map(|reason| ReasonCount { reason, count }),
@@ -209,7 +214,7 @@ impl SelectedServingAudit {
     }
 }
 fn record_reason(
-    counts: &mut [ReasonCount<SelectedUnknownReason>; 24],
+    counts: &mut [ReasonCount<SelectedUnknownReason>; 25],
     reason: ModelUnknown,
     exhausted: &mut bool,
 ) {

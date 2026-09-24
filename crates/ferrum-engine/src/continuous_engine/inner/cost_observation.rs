@@ -36,7 +36,9 @@ mod trainer;
 mod worker;
 pub(in crate::continuous_engine) use engine::*;
 pub(in crate::continuous_engine) use runtime::*;
+mod presubmit;
 mod sample;
+mod selected_feedback;
 mod sink;
 pub(in crate::continuous_engine) use clock::*;
 pub(in crate::continuous_engine) use sink::*;
@@ -165,6 +167,7 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     stage_rejection: Option<CostCallRejection>,
     finished: bool,
     calibration_capture: Option<Arc<CostCalibrationCapture>>,
+    presubmit_prediction: Option<presubmit::PendingPrediction>,
 }
 
 /// Dropping this guard copies only already observed facts. In particular,
@@ -268,6 +271,7 @@ impl EngineCostCall {
             stage_rejection: None,
             finished: false,
             calibration_capture: None,
+            presubmit_prediction: None,
         })
     }
 

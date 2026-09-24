@@ -30,6 +30,8 @@ pub enum ModelUnknown {
     FamilyMissing,
     JointSupport,
     Numerical,
+    /// Engine-only explicit feedback gate; never inferred from offline samples.
+    RuntimeValidity,
 }
 impl From<Unknown> for ModelUnknown {
     fn from(value: Unknown) -> Self {

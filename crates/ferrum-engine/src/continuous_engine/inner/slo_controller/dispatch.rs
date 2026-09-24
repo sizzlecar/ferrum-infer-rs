@@ -96,6 +96,28 @@ impl EngineInner {
             .map(|input| input.request_id.clone())
             .collect();
         let mut cost = preparation.and_then(EngineCostPreparation::begin);
+        if let (
+            Some(runtime),
+            Some(call),
+            owner::ControllerTimingCommitment::Witness {
+                model_version,
+                predicted_wall_ns,
+                ..
+            },
+            ferrum_interfaces::execution_cost::WaveCommitment::CostWitness(witness),
+        ) = (
+            self.cost_runtime.as_ref(),
+            cost.as_deref_mut(),
+            &work.timing,
+            work.expected.commitment(),
+        ) {
+            runtime.attach_selected_witness_prediction(
+                call,
+                *model_version,
+                *predicted_wall_ns,
+                witness.canonical(),
+            );
+        }
         if let (Some(call), Some(receipt)) = (cost.as_deref_mut(), &flight.calibration) {
             call.attach_calibration_capture(Arc::clone(&receipt.capture));
         }

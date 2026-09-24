@@ -262,7 +262,7 @@ impl CostTrainer {
 }
 
 enum Snapshot {
-    Selected(file::statistical_v6::ImportedWholeWaveModelV1),
+    Selected(selected::SelectedSnapshot),
     Live(Arc<model::CostModelSnapshot>),
     Imported(file::ImportedCostSnapshot),
 }
@@ -275,6 +275,44 @@ pub(in crate::continuous_engine) struct EngineCostSnapshot {
 }
 
 impl EngineCostSnapshot {
+    pub(super) fn feedback_enabled(&self) -> bool {
+        matches!(&self.inner, Snapshot::Selected(s) if s.feedback.is_some())
+    }
+    pub(super) fn selected_import(
+        &self,
+    ) -> Option<&Arc<file::statistical_v6::ImportedWholeWaveModelV1>> {
+        match &self.inner {
+            Snapshot::Selected(s) => Some(&s.model),
+            _ => None,
+        }
+    }
+    pub(super) fn with_feedback(
+        &self,
+        feedback: Arc<super::selected_feedback::View>,
+    ) -> Option<Arc<Self>> {
+        let Snapshot::Selected(s) = &self.inner else {
+            return None;
+        };
+        Some(Arc::new(Self {
+            inner: Snapshot::Selected(selected::SelectedSnapshot {
+                model: s.model.clone(),
+                feedback: Some(feedback),
+            }),
+            fingerprint: self.fingerprint.clone(),
+        }))
+    }
+    pub(super) fn feedback_margin(&self, family: &[u8; 32]) -> u64 {
+        match &self.inner {
+            Snapshot::Selected(s) => s.feedback.as_ref().map_or(0, |v| v.margin(family)),
+            _ => 0,
+        }
+    }
+    pub(super) fn current(&self) -> bool {
+        match &self.inner {
+            Snapshot::Selected(s) => s.feedback.as_ref().is_none_or(|v| v.current()),
+            _ => true,
+        }
+    }
     /// Actual calibration/heldout lookup. It consumes complete canonical and
     /// selected evidence together; legacy snapshots cannot claim this protocol.
     pub fn predict_selected_wave(
@@ -288,7 +326,11 @@ impl EngineCostSnapshot {
     > {
         match &self.inner {
             Snapshot::Selected(snapshot) => {
-                snapshot.predict(&self.fingerprint, exact, evidence, local_now_ns)
+                let value =
+                    snapshot
+                        .model
+                        .predict(&self.fingerprint, exact, evidence, local_now_ns)?;
+                snapshot.apply(value, evidence.family_signature())
             }
             _ => Err(model::statistical::model::ModelUnknown::Evidence(
                 ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,
@@ -305,14 +347,14 @@ impl EngineCostSnapshot {
     }
     pub fn model_version(&self) -> u64 {
         match &self.inner {
-            Snapshot::Selected(_) => 1, // One immutable startup publication; observations cannot republish it.
+            Snapshot::Selected(snapshot) => snapshot.feedback.as_ref().map_or(1, |v| v.epoch),
             Snapshot::Live(snapshot) => snapshot.model_version(),
             Snapshot::Imported(snapshot) => snapshot.model_version(),
         }
     }
     pub fn bucket_count(&self) -> usize {
         match &self.inner {
-            Snapshot::Selected(snapshot) => snapshot.segment_count(),
+            Snapshot::Selected(snapshot) => snapshot.model.segment_count(),
             Snapshot::Live(snapshot) => snapshot.bucket_count(),
             Snapshot::Imported(snapshot) => snapshot.bucket_count(),
         }

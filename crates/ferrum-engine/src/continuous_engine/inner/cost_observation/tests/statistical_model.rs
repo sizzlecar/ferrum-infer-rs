@@ -28,6 +28,16 @@ fn recorded_case(
     epoch: u64,
     host_delay_ns: u64,
 ) -> (u64, CostEvidenceEntry, Arc<CostCalibrationCapture>) {
+    recorded_case_with_prediction(ids, queue, terminal, epoch, host_delay_ns, None)
+}
+fn recorded_case_with_prediction(
+    ids: &EngineCostIds,
+    queue: &Arc<BoundedCostSampleSink>,
+    terminal: bool,
+    epoch: u64,
+    host_delay_ns: u64,
+    prediction: Option<(&EngineCostRuntime, u64, u64)>,
+) -> (u64, CostEvidenceEntry, Arc<CostCalibrationCapture>) {
     let work = ActualRowWork::Decode { kv_tokens: 7 };
     let mut command = SelectedCommandCostBuilderV1::new(1);
     command
@@ -105,6 +115,7 @@ fn recorded_case(
         )
         .unwrap();
     let mut actual = shape(&[work]);
+    let expected = canonical.exact.clone();
     actual.provider_signature = canonical.exact.provider_signature;
     actual.output_policy_signature = canonical.exact.output_policy_signature;
     actual.numeric_features = canonical.exact.numeric_features;
@@ -140,6 +151,9 @@ fn recorded_case(
         },
     )
     .unwrap();
+    if let Some((runtime, version, bound)) = prediction {
+        runtime.attach_selected_witness_prediction(&mut call, version, bound, &expected);
+    }
     let capture = Arc::new(CostCalibrationCapture::default());
     call.attach_calibration_capture(Arc::clone(&capture));
     let mut context = call.context().unwrap();
@@ -258,7 +272,7 @@ fn converter_rejects_missing_unbound_failed_or_unaccepted_evidence() {
 }
 
 #[path = "statistical_model/runtime.rs"]
-mod runtime;
+pub(in crate::continuous_engine::inner) mod runtime;
 
 #[path = "statistical_model/capture.rs"]
 pub(in crate::continuous_engine::inner) mod capture;

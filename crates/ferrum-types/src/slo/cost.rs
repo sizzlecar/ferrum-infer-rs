@@ -5,6 +5,9 @@ use std::{
     path::PathBuf,
 };
 
+mod feedback;
+pub use feedback::*;
+
 /// Bounded observation storage and CPU training work. These limits never
 /// authorize model work or turn missing cost evidence into a prediction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -13,6 +16,8 @@ pub struct SloCostObservationConfig {
     /// Selects a predictor protocol; profile schemas 1–5 remain legacy-only.
     #[serde(skip_serializing_if = "SloCostPredictor::is_legacy")]
     pub predictor: SloCostPredictor,
+    #[serde(skip_serializing_if = "SloSelectedFeedbackPolicy::is_disabled")]
+    pub selected_feedback: SloSelectedFeedbackPolicy,
     pub max_queued_samples: NonZeroUsize,
     /// Sum of allocated row capacities in the pending sample queue.
     pub max_queued_shape_rows: NonZeroUsize,
@@ -31,6 +36,7 @@ impl Default for SloCostObservationConfig {
     fn default() -> Self {
         Self {
             predictor: SloCostPredictor::default(),
+            selected_feedback: SloSelectedFeedbackPolicy::Disabled,
             max_queued_samples: NonZeroUsize::new(256).unwrap(),
             max_queued_shape_rows: NonZeroUsize::new(8192).unwrap(),
             max_samples_per_update: NonZeroUsize::new(256).unwrap(),
@@ -70,6 +76,7 @@ impl SloCostObservationConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
+        self.selected_feedback.validate(self)?;
         if self.predictor == SloCostPredictor::SelectedWholeWaveV1 {
             if self.model.feature_model != SloCostFeatureModel::default()
                 || self.model.context_bucket_tokens.get() != 1

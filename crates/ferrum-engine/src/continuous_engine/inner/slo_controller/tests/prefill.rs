@@ -365,6 +365,7 @@ pub(in crate::continuous_engine::inner::slo_controller) async fn install_with_ad
                 })
                 .unwrap(),
                 timing: owner::ControllerTimingCommitment::Witness {
+                    predicted_wall_ns: 1,
                     admission,
                     valid_until: slo_clock_now() + Duration::from_secs(30),
                     model_version: captured.snapshot.cost_model_version,

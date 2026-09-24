@@ -208,3 +208,6 @@ fn selected_runtime_requires_explicit_protocol_identity_and_clock() {
 
 #[path = "runtime/serving_audit.rs"]
 mod serving_audit;
+
+#[path = "runtime/feedback.rs"]
+pub(in crate::continuous_engine::inner) mod feedback;

@@ -16,6 +16,7 @@ pub(super) use host_content::statistical::whole_wave_observation;
 pub(super) struct CostTrainingState {
     pub sink: Arc<BoundedCostSampleSink>,
     trainer: Mutex<Option<CostTrainer>>,
+    feedback: Mutex<Option<super::selected_feedback::Monitor>>,
     snapshot: RwLock<Option<Arc<EngineCostSnapshot>>>,
     pub receipt: Option<ferrum_types::SloCostProfileReceipt>,
     audit: Mutex<TrainingAuditSnapshot>,
@@ -31,11 +32,41 @@ pub(super) struct CostTrainingState {
 impl CostTrainingState {
     pub fn new(
         config: &ferrum_types::SloCostObservationConfig,
-        seed: TrainingSeed,
+        mut seed: TrainingSeed,
         export: Option<ExportPlan>,
         clock: Arc<dyn CostObservationClock>,
     ) -> Result<Self, ferrum_types::FerrumError> {
+        let feedback = if config.selected_feedback.is_disabled() {
+            None
+        } else {
+            let snapshot = seed.snapshot.as_ref().ok_or_else(|| {
+                ferrum_types::FerrumError::config(
+                    "selected feedback requires an actually imported profile6",
+                )
+            })?;
+            let model = snapshot.selected_import().ok_or_else(|| {
+                ferrum_types::FerrumError::config(
+                    "selected feedback cannot reinterpret a legacy model",
+                )
+            })?;
+            super::selected_feedback::Monitor::open(&config.selected_feedback, model)?
+        };
+        if let Some(monitor) = &feedback {
+            let view = monitor.current_view();
+            seed.snapshot = seed
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.with_feedback(view));
+            if let Some(receipt) = &mut seed.receipt {
+                receipt.model_version = seed
+                    .snapshot
+                    .as_ref()
+                    .expect("selected feedback snapshot")
+                    .model_version();
+            }
+        }
         Ok(Self {
+            feedback: Mutex::new(feedback),
             sink: Arc::new(
                 BoundedCostSampleSink::new(CostSampleSinkLimits {
                     max_samples: config.max_queued_samples.get(),
@@ -83,6 +114,7 @@ impl CostTrainingState {
         let mut trainer = self.trainer.lock();
         let mut export = self.export.lock();
         let mut audit = self.audit.lock();
+        let mut feedback = self.feedback.lock();
         // One immutable pre-batch snapshot: neither earlier observations in
         // this drain nor the new publication can improve their own coverage.
         // This Arc is never attached to queued or retained raw observations.
@@ -98,6 +130,12 @@ impl CostTrainingState {
             if let Some(selected_audit) = audit.selected_serving.as_mut() {
                 let evaluation =
                     selected::evaluate(&entry, ordinal, previous.as_deref(), self.clock.as_ref());
+                selected_audit
+                    .presubmit
+                    .record(&entry, &evaluation, &mut exhausted);
+                if let Some(monitor) = feedback.as_mut() {
+                    monitor.observe(ordinal, &entry, &evaluation, previous.as_deref());
+                }
                 selected_audit.record(evaluation, &mut exhausted);
             }
             audit.counter_exhausted = exhausted;
@@ -149,6 +187,9 @@ impl CostTrainingState {
                     // explicit host-content model was evaluated above using
                     // its own boundary, outcome counters, and receipt clock.
                     self.processed_ordinal.store(ordinal, Ordering::Release);
+                    if feedback.as_ref().is_some_and(|m| m.pending_publication()) {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -194,6 +235,25 @@ impl CostTrainingState {
             }
             // Rejected samples still complete their accepted queue position.
             self.processed_ordinal.store(ordinal, Ordering::Release);
+            if feedback.as_ref().is_some_and(|m| m.pending_publication()) {
+                break;
+            }
+        }
+        if let Some(monitor) = feedback.as_mut() {
+            let stats = self.sink.stats();
+            let drops = stats
+                .entries_dropped_capacity
+                .checked_add(stats.entries_dropped_contention);
+            if let Some(view) = monitor.publish(drops) {
+                // Persisted first; this lock only swaps an Arc, never performs IO.
+                let next = self
+                    .snapshot
+                    .read()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.with_feedback(view.clone()));
+                *self.snapshot.write() = next;
+                view.activate();
+            }
         }
         drop(previous);
         if let Some(watermark) = watermark {
@@ -243,9 +303,13 @@ impl CostTrainingState {
         let needs_drain = self.sink.needs_drain(processed);
         if !needs_drain && self.finalize_export.load(Ordering::Acquire) {
             export.finish(self.clock.as_ref(), self.sink.stats(), audit.clone());
+            if let Some(monitor) = feedback.as_mut() {
+                monitor.finish();
+            }
         }
         drop(export);
         drop(audit);
+        drop(feedback);
         self.publish_metrics();
         metrics::histogram!("ferrum.engine.cost_training_update_seconds")
             .record(started.elapsed().as_secs_f64());
@@ -321,6 +385,29 @@ impl CostTrainingState {
                 .set(selected.underestimates as f64);
             metrics::gauge!("ferrum.engine.selected_serving_underestimate_max_ns")
                 .set(selected.max_underestimate_ns as f64);
+            metrics::gauge!("ferrum.engine.selected_presubmit_compared")
+                .set(selected.presubmit.compared as f64);
+            metrics::gauge!("ferrum.engine.selected_presubmit_underestimates")
+                .set(selected.presubmit.underestimates as f64);
+            metrics::gauge!("ferrum.engine.selected_presubmit_underestimate_max_ns")
+                .set(selected.presubmit.maximum_underestimate_ns as f64);
+        }
+        if let Some(monitor) = self.feedback.lock().as_ref() {
+            let feedback = monitor.audit();
+            metrics::gauge!("ferrum.engine.selected_feedback_epoch").set(feedback.epoch as f64);
+            metrics::gauge!("ferrum.engine.selected_feedback_revoked")
+                .set(if feedback.revoked.is_some() { 1.0 } else { 0.0 });
+            metrics::gauge!("ferrum.engine.selected_feedback_corrections")
+                .set(feedback.corrections as f64);
+            metrics::gauge!("ferrum.engine.selected_feedback_maximum_margin_ns")
+                .set(feedback.maximum_margin_ns as f64);
+            metrics::gauge!("ferrum.engine.selected_feedback_persistence_failed").set(
+                if feedback.persistence_failed {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
         }
         if let Some(snapshot) = self.snapshot() {
             metrics::gauge!("ferrum.engine.cost_model_version")
@@ -330,11 +417,16 @@ impl CostTrainingState {
     }
 
     pub fn snapshot(&self) -> Option<Arc<EngineCostSnapshot>> {
-        self.snapshot.read().clone()
+        self.snapshot
+            .read()
+            .clone()
+            .filter(|snapshot| snapshot.current())
     }
 
     pub fn try_snapshot(&self) -> Option<Option<Arc<EngineCostSnapshot>>> {
-        self.snapshot.try_read().map(|snapshot| snapshot.clone())
+        self.snapshot
+            .try_read()
+            .map(|snapshot| snapshot.clone().filter(|snapshot| snapshot.current()))
     }
 
     pub fn trained_samples(&self) -> u64 {
@@ -351,6 +443,7 @@ impl CostTrainingState {
         let export = self.export.lock().audit_snapshot();
         let training = self.audit.lock().clone();
         ObservationFunnelSnapshot {
+            selected_feedback: self.feedback.lock().as_ref().map(|monitor| monitor.audit()),
             scope: "instrumented calls and offered cost observations; entries_* also count auxiliary host-stage-only records; auxiliary stages train only the explicit empirical-host-content model at their original receipt clock and never become legacy samples; host_content and legacy training populations remain separate; live counters are not an atomic cut; pre-update prediction is retrospective actual-shape diagnostics, not pre-execution candidate coverage; uninstrumented physical waves remain unknown",
             sink: self.sink.stats(),
             training,
@@ -364,7 +457,11 @@ impl CostTrainingState {
     }
 
     pub fn export_result(&self) -> Result<(), ferrum_types::FerrumError> {
-        self.export.lock().check_finished()
+        self.export.lock().check_finished()?;
+        if let Some(monitor) = self.feedback.lock().as_ref() {
+            monitor.check_finished()?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -384,6 +481,11 @@ impl TrainingWorkerOwner {
 }
 impl Drop for TrainingWorkerOwner {
     fn drop(&mut self) {
+        if std::thread::panicking() || !self.0.finalize_export.load(Ordering::Acquire) {
+            if let Some(monitor) = self.0.feedback.lock().as_mut() {
+                monitor.worker_stopped_unclean();
+            }
+        }
         self.0.sink.worker_stopped();
     }
 }

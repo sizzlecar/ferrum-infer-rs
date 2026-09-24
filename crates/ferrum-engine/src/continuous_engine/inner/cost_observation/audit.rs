@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod host_content;
 mod prediction;
+mod presubmit;
 mod selected;
 pub(super) use host_content::{HostContentAudit, HostContentEvaluation, HostContentRejection};
 use prediction::PredictionAuditSnapshot;
@@ -290,6 +291,8 @@ impl TrainingAuditSnapshot {
 /// that every physical executor path was instrumented.
 #[derive(Debug, Clone, Serialize)]
 pub(in crate::continuous_engine) struct ObservationFunnelSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_feedback: Option<super::selected_feedback::FeedbackAudit>,
     pub scope: &'static str,
     pub sink: CostSampleStats,
     pub training: TrainingAuditSnapshot,

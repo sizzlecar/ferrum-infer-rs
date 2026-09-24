@@ -24,6 +24,7 @@ mod recompute_boundary;
 mod recovery;
 mod recurrent_state;
 mod reference_projection;
+mod selected_feedback;
 mod timing_metrics;
 use fixture::*;
 
@@ -169,6 +170,7 @@ async fn installed(
         batch,
         expected,
         timing: owner::ControllerTimingCommitment::Witness {
+            predicted_wall_ns: 1,
             admission: None,
             valid_until: slo_clock_now().checked_add(expires).unwrap(),
             model_version: captured.snapshot.cost_model_version,

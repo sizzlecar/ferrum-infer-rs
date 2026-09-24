@@ -93,6 +93,10 @@ pub struct HostRowStageV1 {
 pub struct HostStageEvidenceV1 {
     pub schema_version: u32,
     pub call_id: u64,
+    /// Optional same-call issued bound. It is separate from the worker's later
+    /// actual-shape lookup, and does not alter any fit/residual source fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presubmit_prediction: Option<super::presubmit::PresubmitPredictionReceiptV1>,
     #[serde(serialize_with = "serialize_fingerprint")]
     pub fingerprint: Option<ExecutionFingerprint>,
     #[serde(serialize_with = "wire::serialize_shape")]
@@ -587,6 +591,7 @@ impl EngineCostCall {
         Some(Arc::new(HostStageEvidenceV1 {
             schema_version: 1,
             call_id: self.call_id.get(),
+            presubmit_prediction: self.presubmit_prediction.as_ref().map(|p| p.receipt(shape)),
             fingerprint,
             actual_shape: super::sample::scheduler_shape(shape).ok(),
             statistical_evidence: shape
