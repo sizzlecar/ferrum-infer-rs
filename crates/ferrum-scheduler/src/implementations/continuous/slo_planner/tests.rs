@@ -12,6 +12,7 @@ use std::{
 mod admission;
 mod boundaries;
 mod budget_phases;
+mod candidate_ranking;
 mod constructive;
 mod host_domain;
 mod joint_execution;

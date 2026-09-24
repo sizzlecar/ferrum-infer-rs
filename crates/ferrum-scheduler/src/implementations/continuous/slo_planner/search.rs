@@ -33,6 +33,9 @@ struct Frame<'epoch> {
     node: Node<'epoch>,
     work: Option<candidates::FrontierCursor>,
     resolved: usize,
+    /// One known child is waiting for a same-parent challenger. This is a
+    /// proposal comparison, not an incumbent or a second planning budget.
+    challenge_pending: bool,
 }
 impl<'epoch> Frame<'epoch> {
     fn new(node: Node<'epoch>) -> Self {
@@ -40,6 +43,7 @@ impl<'epoch> Frame<'epoch> {
             node,
             work: None,
             resolved: 0,
+            challenge_pending: false,
         }
     }
 }
@@ -401,26 +405,35 @@ impl BoundedSloPlanner {
                 Ok(now) => now,
                 Err(reason) => stop_or_unknown!(reason, 'exploration),
             };
-            if let Err(reason) = rank_frames(
-                &mut pending[depth],
-                snapshot,
-                &self.settings,
-                window.started_at_ns,
-                ranking_now,
-                &mut || budget.read(clock).map(|_| ()),
-            ) {
-                stop_or_unknown!(reason, 'exploration);
-            }
-            let mut frame = pending[depth].remove(0);
+            let selected =
+                if let Some(index) = pending[depth].iter().position(|f| f.challenge_pending) {
+                    // Finish this bounded comparison against the same parent,
+                    // rather than accidentally probing a differently scored peer.
+                    index
+                } else {
+                    if let Err(reason) = rank_frames(
+                        &mut pending[depth],
+                        snapshot,
+                        &self.settings,
+                        window.started_at_ns,
+                        ranking_now,
+                        &mut || budget.read(clock).map(|_| ()),
+                    ) {
+                        stop_or_unknown!(reason, 'exploration);
+                    }
+                    0
+                };
+            let mut frame = pending[depth].remove(selected);
             stats.max_depth_reached = stats.max_depth_reached.max(depth + 1);
             if frame.work.is_none() {
                 frame.work = Some(
-                    match candidates::FrontierCursor::new(
+                    match candidates::FrontierCursor::with_remaining_waves(
                         snapshot,
                         &frame.node.state.requests,
                         frame.node.state.now_ns,
                         candidate_limit,
                         protection.as_deref(),
+                        std::num::NonZeroUsize::new(horizon - depth),
                         &mut || budget.read(clock).map(|_| ()),
                     ) {
                         Ok(cursor) => cursor,
@@ -431,6 +444,9 @@ impl BoundedSloPlanner {
             let cursor = frame.work.as_mut().expect("initialized logical cursor");
             if frame.resolved == candidate_limit {
                 stats.candidate_truncations += usize::from(cursor.may_have_more());
+                if frame.challenge_pending {
+                    preferred_depth = Some(depth + 1);
+                }
                 continue;
             }
             let work = match cursor.next(
@@ -443,10 +459,20 @@ impl BoundedSloPlanner {
                 Ok(Some(work)) => work,
                 Ok(None) => {
                     stats.candidate_truncations += usize::from(cursor.truncated);
+                    if frame.challenge_pending {
+                        preferred_depth = Some(depth + 1);
+                    }
                     continue;
                 }
                 Err(reason) => stop_or_unknown!(reason, 'exploration),
             };
+            let has_prefill_choices = cursor.has_prefill_choices();
+            let was_challenger = std::mem::take(&mut frame.challenge_pending);
+            if was_challenger {
+                // A rejected/Unknown challenger still ends the pair. It must
+                // not force repeated probes before the known child can run.
+                preferred_depth = Some(depth + 1);
+            }
             // All search nodes use one execution-time origin. CPU time is
             // charged by the shared real budget and fresh final replay; extending
             // a node never shifts its ancestors or replays their physical work.
@@ -524,6 +550,7 @@ impl BoundedSloPlanner {
                 debt: 0,
                 ordinal: stats.expanded_candidates,
             };
+            let mut complete = false;
             match simulation::ready_witness(
                 snapshot,
                 &node.state,
@@ -531,6 +558,7 @@ impl BoundedSloPlanner {
                 protection.as_deref(),
             ) {
                 Ok(true) if admission_serviced(admission_target, &node.state) => {
+                    complete = true;
                     solutions.push(CommonPlan(node.clone()));
                     if let Err(reason) = budget.replay_reserve.observe_complete(node.replay_work) {
                         return unknown(reason, stats);
@@ -580,7 +608,30 @@ impl BoundedSloPlanner {
                 let before = nodes.len();
                 nodes.truncate(width);
                 stats.beam_pruned_nodes += before - nodes.len();
-                preferred_depth = Some(depth + 1);
+                let parent = &mut pending[depth][0];
+                // Before any complete incumbent, continue the first viable prefix.
+                // A cheap sibling has no certified tail and must not evict it just
+                // on partial score. Dead ends still return to shallow siblings;
+                // this is not an unbounded depth-first search or an extra beam.
+                if !solutions.is_empty()
+                    && !complete
+                    && !was_challenger
+                    && has_prefill_choices
+                    && parent.resolved < candidate_limit
+                    && parent
+                        .work
+                        .as_ref()
+                        .is_some_and(|cursor| cursor.may_have_more())
+                {
+                    // At most one additional real transition before descent:
+                    // compare useful work/cost at one ranking_now, not raw
+                    // ascending chunk counts. Both transitions retain their
+                    // original pure successors and consume the global limits.
+                    parent.challenge_pending = true;
+                    preferred_depth = Some(depth);
+                } else {
+                    preferred_depth = Some(depth + 1);
+                }
             }
         }
         // Replay the complete shared witness after search overhead. The engine

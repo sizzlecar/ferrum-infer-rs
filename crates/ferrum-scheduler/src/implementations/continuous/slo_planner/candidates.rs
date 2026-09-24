@@ -3,6 +3,7 @@ use super::shape;
 use super::{obligations::PlanningObligationSet, types::*};
 use std::{cmp::Reverse, num::NonZeroU32};
 
+mod chunk_order;
 mod frontier;
 pub(super) use frontier::FrontierCursor;
 

@@ -22,6 +22,8 @@ pub(crate) struct FrontierCursor {
 #[derive(Clone, Copy)]
 enum Stage {
     WholeDecode,
+    OpeningMixed,
+    OpeningPrefill,
     RoundDecode(usize),
     Prefill {
         round: usize,
@@ -65,6 +67,18 @@ impl FrontierCursor {
         now_ns: u64,
         limit: usize,
         protection: Option<&PlanningObligationSet>,
+        poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    ) -> Result<Self, PlanningUnknownReason> {
+        Self::with_remaining_waves(snapshot, requests, now_ns, limit, protection, None, poll)
+    }
+
+    pub(crate) fn with_remaining_waves(
+        snapshot: &SchedulerSnapshot,
+        requests: &[RequestSchedulingView],
+        now_ns: u64,
+        limit: usize,
+        protection: Option<&PlanningObligationSet>,
+        remaining_waves: Option<std::num::NonZeroUsize>,
         poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     ) -> Result<Self, PlanningUnknownReason> {
         let mut decoders = Vec::new();
@@ -122,15 +136,31 @@ impl FrontierCursor {
             }
         }
         let mut chunks = Vec::new();
+        let mut credits = Vec::new();
+        let goal = match (remaining_waves, prefills.first()) {
+            (Some(waves), Some(&index)) => Some(super::chunk_order::Goal::new(
+                &requests[index],
+                snapshot.scope.horizon_end_ns,
+                waves,
+                poll,
+            )?),
+            _ => None,
+        };
         if !prefill_sizes.is_empty() {
             for &chunk in &caps.prefill_chunk_sizes {
                 poll()?;
                 // This only rules out mathematically illegal endpoints. It
                 // never infers physical capacity, route coverage or cost.
-                if prefill_work(requests, &prefills, 1, chunk, caps, poll)?.is_some() {
+                if let Some(work) = prefill_work(requests, &prefills, 1, chunk, caps, poll)? {
                     chunks.push(chunk);
+                    if let Some(goal) = &goal {
+                        credits.push(goal.credit(&work[0])?);
+                    }
                 }
             }
+        }
+        if let Some(goal) = goal {
+            super::chunk_order::interleave(&mut chunks, &credits, goal.per_wave_work, poll)?;
         }
         Ok(Self {
             decoders,
@@ -164,6 +194,7 @@ impl FrontierCursor {
             poll()?;
             let Some(action) = self.action(
                 snapshot.capabilities.native_mixed && snapshot.capabilities.work_policy.allow_mixed,
+                snapshot.capabilities.max_wave_rows.get(),
                 poll,
             )?
             else {
@@ -260,18 +291,60 @@ impl FrontierCursor {
         !matches!(self.stage, Stage::Done)
     }
 
+    /// Probe a sibling before descending only when a prefill scale can compete.
+    /// Pure decode retains its complete-cohort constructive fast path.
+    pub(crate) fn has_prefill_choices(&self) -> bool {
+        !self.chunks.is_empty() && !self.prefill_sizes.is_empty()
+    }
+
     fn action(
         &mut self,
         mixed: bool,
+        maximum_rows: usize,
         poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     ) -> Result<Option<Action>, PlanningUnknownReason> {
         loop {
             poll()?;
             match self.stage {
                 Stage::WholeDecode => {
-                    self.stage = Stage::RoundDecode(0);
+                    self.stage = Stage::OpeningMixed;
                     if let Some(&size) = self.decode_sizes.iter().max() {
                         return Ok(Some(Action::Decode { size, fair: false }));
+                    }
+                }
+                Stage::OpeningMixed => {
+                    self.stage = Stage::OpeningPrefill;
+                    if mixed && !self.prefill_sizes.is_empty() {
+                        if let (Some(&chunk), Some(&decode)) = (
+                            self.chunks.first(),
+                            self.decode_sizes
+                                .iter()
+                                .filter(|size| {
+                                    (**size)
+                                        .checked_add(self.prefill_sizes[0])
+                                        .is_some_and(|rows| rows <= maximum_rows)
+                                })
+                                .max(),
+                        ) {
+                            // next() applies the actual total-row/work/due limits.
+                            return Ok(Some(Action::Mixed {
+                                prefill: self.prefill_sizes[0],
+                                chunk,
+                                decode,
+                            }));
+                        }
+                    }
+                }
+                Stage::OpeningPrefill => {
+                    self.stage = Stage::RoundDecode(0);
+                    if !self.prefill_sizes.is_empty() {
+                        if let Some(&chunk) = self.chunks.first() {
+                            return Ok(Some(Action::Prefill {
+                                size: self.prefill_sizes[0],
+                                chunk,
+                                fair: false,
+                            }));
+                        }
                     }
                 }
                 Stage::RoundDecode(round) => {

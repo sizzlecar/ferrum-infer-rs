@@ -146,13 +146,17 @@ fn unknown_full_batch_does_not_spend_successful_candidate_limit_or_hide_singleto
     assert!(search.enumeration_attempts <= 16);
 }
 
-struct FirstPrefillUnavailable;
+#[derive(Default)]
+struct FirstPrefillUnavailable(RefCell<Vec<ActualWaveKind>>);
 impl PlanningShapeResolver for FirstPrefillUnavailable {
     fn resolve(
         &self,
         query: &PlanningShapeQuery<'_>,
         poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     ) -> Result<Option<CanonicalWaveCostShape>, PlanningUnknownReason> {
+        if query.prior_waves.is_empty() {
+            self.0.borrow_mut().push(query.kind);
+        }
         if query.prior_waves.is_empty() && query.kind == ActualWaveKind::Prefill {
             return Ok(None);
         }
@@ -174,10 +178,11 @@ fn dead_end_decode_prefix_does_not_lock_out_later_mixed_three_wave_witness() {
     let mut p = planner(3);
     p.settings.search.candidate_limit = nz(3);
     p.settings.search.beam_width = nz(1);
+    let resolver = FirstPrefillUnavailable::default();
     let (first, witness, search) = feasible(p.propose(
         &s,
         &Model(|_: &WaveExecutionShape| Some(5)),
-        &FirstPrefillUnavailable,
+        &resolver,
         &mut Clock(100),
     ));
     // Decode -> partial -> final reaches H without the new decoder's service.
@@ -194,7 +199,12 @@ fn dead_end_decode_prefix_does_not_lock_out_later_mixed_three_wave_witness() {
         .any(|row| matches!(row.action, WaveAction::Prefill { count, .. } if count.get() == 4)));
     assert_eq!(witness.waves, 3);
     assert_eq!(witness.predicted_output_tokens, 3);
-    assert!(search.expanded_candidates >= 6);
+    // Both root alternatives were really resolved. A better ordering can find
+    // the complete mixed plan before descending the dead-end decode prefix;
+    // requiring six expansions would force the old traversal rather than the
+    // backtracking/complete-witness contract exercised here.
+    assert!(resolver.0.borrow().contains(&ActualWaveKind::Decode));
+    assert!(resolver.0.borrow().contains(&ActualWaveKind::Mixed));
     assert!(search.expanded_candidates <= 9);
     assert_eq!(s, before);
 }
