@@ -1358,8 +1358,10 @@ impl OperationDispatch {
         )
     }
 
-    /// The runtime invokes the guard after native encoding, immediately before
-    /// commit. This path never retries a rejected route through ordinary submit.
+    /// The runtime invokes the guard after eager native encoding, immediately
+    /// before commit. Program-binding capacity remains available to providers,
+    /// but this entrypoint does not request graph capture or replay. It never
+    /// retries a rejected route through ordinary submit.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit_guarded_wave<'binding, R, I>(
         providers: &[BoundOperationProvider<'_, R>],
@@ -1384,7 +1386,7 @@ impl OperationDispatch {
             active_bindings,
             DeviceTimingMode::Off,
             input_uploads,
-            SubmissionExecutionPolicy::adaptive(),
+            SubmissionExecutionPolicy::eager(),
             None,
             None,
             true,
@@ -2070,7 +2072,9 @@ impl OperationDispatch {
         for (node_index, dynamic_bindings, compute, result_bindings) in encoded_operations {
             commands.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
         }
-        if reusable_program.is_none() {
+        if reusable_program.is_none()
+            && effective_compute_path != DeviceComputePathRequirement::EagerOnly
+        {
             if let Some(authority) = reusable_execution_authority {
                 commands
                     .set_reusable_execution_capture(

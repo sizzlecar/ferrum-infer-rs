@@ -204,6 +204,47 @@ fn guarded_core_missing_attribution_rejects_before_host_gate_and_submit() {
 }
 
 #[test]
+fn guarded_eager_wave_uses_program_bindings_without_requesting_capture() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let guard = Guard {
+        rejection: None,
+        calls: AtomicU64::new(0),
+        staging: false,
+        trace: Arc::clone(&fixture.runtime_trace),
+    };
+    let reaper = CompletionReaper::new();
+    let handle = accepted(dispatch(&fixture, &session, &step, &reaper, &guard));
+    assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(trace.submit_calls, 1);
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::EagerOnly]
+        );
+        assert_eq!(trace.submitted_reusable_captures, vec![None]);
+        assert_eq!(trace.program_binding_coalesce_calls, 1);
+        assert_eq!(trace.program_binding_input_counts, vec![2]);
+        assert_eq!(
+            trace.submitted_commands,
+            vec![vec![
+                TestCommand::CoalescedProgramBinding,
+                TestCommand::Provider,
+                TestCommand::Provider,
+            ]]
+        );
+    }
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    drop((handle, reaper));
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn guarded_core_submitted_handle_drop_retains_flight_and_cannot_rollback() {
     let (fixture, sequence, session, batch, step) = setup();
     let lane = Arc::clone(step.execution_lane());

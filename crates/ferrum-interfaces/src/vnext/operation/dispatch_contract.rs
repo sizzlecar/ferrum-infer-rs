@@ -598,6 +598,15 @@ impl SubmissionExecutionPolicy {
         }
     }
 
+    /// Execute providers directly while preserving their scratch contract.
+    /// Reserved program-binding storage does not authorize graph capture.
+    pub const fn eager() -> Self {
+        Self {
+            compute_path: DeviceComputePathRequirement::EagerOnly,
+            scratch_initialization: SubmissionScratchInitialization::ProviderContract,
+        }
+    }
+
     pub const fn determinism_eager(scratch_fill: u8) -> Self {
         Self {
             compute_path: DeviceComputePathRequirement::EagerOnly,
