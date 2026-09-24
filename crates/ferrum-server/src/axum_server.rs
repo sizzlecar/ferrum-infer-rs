@@ -20,13 +20,14 @@ use axum::{
     http::{HeaderMap, StatusCode as AxumStatusCode},
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use ferrum_bench_core::{
     BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
     BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
+use ferrum_interfaces::InferenceRequestContext;
 use ferrum_types::{
     has_unclosed_model_reasoning_block, model_reasoning_markers,
     parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
@@ -61,6 +62,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
+mod credited;
 mod responses;
 
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
@@ -359,7 +361,10 @@ impl AxumServer {
     fn build_router_with_state(&self, app_state: AppState) -> Router {
         Router::new()
             // OpenAI API routes
-            .route("/v1/chat/completions", post(chat_completions_handler))
+            .route(
+                "/v1/chat/completions",
+                post(chat_completions_ingress_handler),
+            )
             .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/embeddings", post(embeddings_handler))
@@ -373,6 +378,7 @@ impl AxumServer {
             // Apply middleware
             .layer(
                 ServiceBuilder::new()
+                    .layer(axum::middleware::from_fn(capture_inference_ingress))
                     .layer(TraceLayer::new_for_http())
                     .layer(CorsLayer::permissive()), // For MVP, allow all origins
             )
@@ -1248,13 +1254,44 @@ impl HttpServer for AxumServer {
     }
 }
 
-/// Main chat completions handler
+/// Capture before the JSON body extractor or any prompt/template work. This
+/// server-owned extension never reads timestamps or service authority from wire
+/// metadata. Responses adaptation must forward it without taking a new anchor.
+async fn capture_inference_ingress(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    request
+        .extensions_mut()
+        .insert(InferenceRequestContext::capture());
+    next.run(request).await
+}
+
+async fn chat_completions_ingress_handler(
+    State(state): State<AppState>,
+    Extension(context): Extension<InferenceRequestContext>,
+    headers: HeaderMap,
+    request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
+) -> std::result::Result<Response, ServerError> {
+    chat_completions_handler_with_phases(State(state), headers, request, None, context).await
+}
+
+/// Direct fixtures have no HTTP body-reading boundary; production uses the
+/// middleware context above. Preserve the existing protocol fixture entrypoint.
+#[cfg(test)]
 async fn chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    chat_completions_handler_with_phases(State(state), headers, request, None).await
+    chat_completions_handler_with_phases(
+        State(state),
+        headers,
+        request,
+        None,
+        InferenceRequestContext::capture(),
+    )
+    .await
 }
 
 async fn chat_completions_handler_with_phases(
@@ -1262,6 +1299,7 @@ async fn chat_completions_handler_with_phases(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
     mut message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+    context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
     let Json(mut request) = request.map_err(|error| {
         ServerError::invalid_request(
@@ -1272,6 +1310,9 @@ async fn chat_completions_handler_with_phases(
             None,
         )
     })?;
+    if !request.stream.unwrap_or(false) {
+        credited::require_legacy_endpoint(&state, "non-streaming /v1/chat/completions")?;
+    }
     let benchmark_correlation = benchmark_request_correlation(&headers)?;
     let cache_policy = CachePolicy::current();
     if message_phases
@@ -1343,8 +1384,14 @@ async fn chat_completions_handler_with_phases(
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
-        handle_chat_completions_stream(state, request, inference_request, benchmark_correlation)
-            .await
+        handle_chat_completions_stream(
+            state,
+            request,
+            inference_request,
+            benchmark_correlation,
+            context,
+        )
+        .await
     } else {
         handle_chat_completions_sync(
             state,
@@ -1352,6 +1399,7 @@ async fn chat_completions_handler_with_phases(
             inference_request,
             session_context,
             benchmark_correlation,
+            context,
         )
         .await
     }
@@ -2499,7 +2547,11 @@ async fn handle_chat_completions_stream(
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
+    if credited::enabled(&state) {
+        return credited::chat_stream(state, openai_request, inference_request, context).await;
+    }
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
 
     // Spawn task to generate tokens
@@ -2544,7 +2596,10 @@ async fn handle_chat_completions_stream(
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
     let request_memory_before = request_memory_sample_before(&state);
-    let mut stream = match engine.infer_stream(inference_request).await {
+    let mut stream = match engine
+        .infer_stream_with_context(inference_request, context)
+        .await
+    {
         Ok(stream) => stream,
         Err(e) => {
             let failure_kind = e.observability_failure_kind();
@@ -3131,6 +3186,7 @@ async fn handle_chat_completions_sync(
     inference_request: InferenceRequest,
     session_context: Option<SessionContext>,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
     info!("Processing non-streaming chat completion");
 
@@ -3155,7 +3211,7 @@ async fn handle_chat_completions_sync(
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
     let request_memory_before = request_memory_sample_before(&state);
-    match engine.infer(inference_request).await {
+    match engine.infer_with_context(inference_request, context).await {
         Ok(output) => {
             let InferenceResponse {
                 text: output_text,
@@ -3559,6 +3615,39 @@ fn convert_chat_request_with_template_model(
         true,
         None,
     )
+}
+
+/// Prepare a model-bound Chat request through the same validation, template,
+/// reasoning and completion contracts as the HTTP product. This performs no
+/// admission or inference and does not resolve public aliases or LoRA models.
+pub fn prepare_model_chat_request(
+    request: &ChatCompletionsRequest,
+    engine_model_id: &str,
+    model_template: &ModelChatTemplate,
+    default_enable_thinking: Option<bool>,
+    interleaved_system_coalescing: bool,
+) -> ferrum_types::Result<InferenceRequest> {
+    validate_chat_request(request).map_err(|error| match error {
+        ServerError::InvalidRequest { message, .. }
+        | ServerError::ContextLengthExceeded(message) => {
+            ferrum_types::FerrumError::invalid_request(message)
+        }
+        ServerError::UnsupportedFeature { message, .. } | ServerError::NotImplemented(message) => {
+            ferrum_types::FerrumError::unsupported(message)
+        }
+        ServerError::InternalError(message) => ferrum_types::FerrumError::internal(message),
+        ServerError::ServiceUnavailable(message) => ferrum_types::FerrumError::backend(message),
+    })?;
+    let mut prepared = convert_chat_request_with_template_model_and_default(
+        request,
+        engine_model_id,
+        Some(model_template),
+        default_enable_thinking,
+        interleaved_system_coalescing,
+        None,
+    )?;
+    apply_served_model_resolution(&mut prepared, ModelId(engine_model_id.to_owned()), None);
+    Ok(prepared)
 }
 
 fn convert_chat_request_with_template_model_and_default(
@@ -4966,6 +5055,7 @@ fn stream_validation_error_message(error: ServerError) -> String {
 fn server_error_from_ferrum_error(error: Error) -> ServerError {
     match error {
         Error::RequestValidation { message } => ServerError::invalid_request(message, None),
+        Error::Unsupported { message } => ServerError::unsupported_feature(message, None),
         error @ Error::ContextLengthExceeded { .. } => {
             ServerError::ContextLengthExceeded(error.to_string())
         }
@@ -5092,11 +5182,12 @@ async fn handle_completions_sync(
     state: AppState,
     openai_request: CompletionsRequest,
     inference_request: InferenceRequest,
+    context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; completions unavailable".into())
     })?;
-    match engine.infer(inference_request).await {
+    match engine.infer_with_context(inference_request, context).await {
         Ok(output) => {
             let InferenceResponse {
                 text: output_text,
@@ -5141,7 +5232,12 @@ async fn handle_completions_stream(
     state: AppState,
     openai_request: CompletionsRequest,
     inference_request: InferenceRequest,
+    context: InferenceRequestContext,
 ) -> std::result::Result<Response, ServerError> {
+    if credited::enabled(&state) {
+        return credited::completions_stream(state, openai_request, inference_request, context)
+            .await;
+    }
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
     let engine = state.llm.clone().ok_or_else(|| {
         ServerError::ServiceUnavailable("LLM engine not loaded; completions unavailable".into())
@@ -5150,10 +5246,13 @@ async fn handle_completions_stream(
 
     // Resolve startup rejection before sending SSE headers, as on the Chat
     // route. Once a stream exists, later failures remain SSE error events.
-    let mut stream = engine.infer_stream(inference_request).await.map_err(|e| {
-        error!("Failed to start completion stream: {}", e);
-        server_error_from_ferrum_error(e)
-    })?;
+    let mut stream = engine
+        .infer_stream_with_context(inference_request, context)
+        .await
+        .map_err(|e| {
+            error!("Failed to start completion stream: {}", e);
+            server_error_from_ferrum_error(e)
+        })?;
     tokio::spawn(async move {
         while let Some(result) = stream.next().await {
             match result {
@@ -5220,12 +5319,16 @@ async fn handle_completions_stream(
 /// Other handlers
 async fn completions_handler(
     State(state): State<AppState>,
+    Extension(context): Extension<InferenceRequestContext>,
     request: std::result::Result<Json<CompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
     let Json(request) = request.map_err(|e| {
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
+    if !request.stream.unwrap_or(false) {
+        credited::require_legacy_endpoint(&state, "non-streaming /v1/completions")?;
+    }
     let (engine_model_id, lora_adapter) = resolve_request_model(
         &state.served_model_registry,
         &request.model,
@@ -5234,9 +5337,9 @@ async fn completions_handler(
     let mut inference_request = convert_completion_request(&request);
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
-        handle_completions_stream(state, request, inference_request).await
+        handle_completions_stream(state, request, inference_request, context).await
     } else {
-        handle_completions_sync(state, request, inference_request).await
+        handle_completions_sync(state, request, inference_request, context).await
     }
 }
 
@@ -5735,6 +5838,17 @@ async fn health_handler(
             "iteration_lock_wait_time_ms": scheduler_metrics
                 .performance_breakdown
                 .other_overhead_time_ms,
+            "controller_timing": scheduler_metrics.performance_breakdown.controller_timing,
+            "timing_scope": {
+                "scheduling_time_ms": "legacy scheduling interval average; excludes SLO controller",
+                "model_execution_time_ms": "legacy process_batch wall average; not pure GPU time",
+                "iteration_lock_wait_time_ms": "iteration entry lock wait average; separate from controller flight lock wait",
+                "controller_timing": "cumulative finalized transactions, including failed/unknown/withdrawn; in-flight transactions excluded; null before first audit",
+                "controller_planning": "synchronous planning wall including capture, search/replay and publication; excludes pre-planning admission/maintenance",
+                "controller_executor_await": "inclusive model preparation/encoding/submission/device wait/readback wall; includes native host guard callbacks; not pure GPU time",
+                "controller_host_guard": "all callback invocations, including failures; native callbacks nested in executor_await",
+                "aggregation": "inclusive/nested intervals are not additive; no CPU-cycle or pure GPU total is inferred"
+            },
         },
         "config": runtime_config,
         "auto_config": auto_config,
@@ -5970,6 +6084,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
 #[cfg(test)]
 mod tests {
     mod auto_tools_json;
+    mod credited;
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
@@ -5977,6 +6092,7 @@ mod tests {
     mod model_reasoning_metadata;
     mod native_tool_stream;
     mod reasoning_controls;
+    mod slo_ingress;
     mod tool_argument_strictness;
     mod tool_length;
     use super::*;
@@ -6119,6 +6235,7 @@ mod tests {
 
     struct StubLlm {
         config: EngineConfig,
+        metrics: EngineMetrics,
         resource_authority: ExecutionResourceAuthority,
         context_capacity: Option<usize>,
         text: String,
@@ -6142,6 +6259,7 @@ mod tests {
             config.model.model_id = ModelId::new("stub-model");
             Self {
                 config,
+                metrics: EngineMetrics::default(),
                 resource_authority: ExecutionResourceAuthority::LegacyEngine,
                 text: text.to_string(),
                 context_capacity: None,
@@ -6356,6 +6474,7 @@ mod tests {
     struct CapturingLlm {
         config: EngineConfig,
         last_request: Mutex<Option<InferenceRequest>>,
+        last_context: Mutex<Option<InferenceRequestContext>>,
     }
 
     impl CapturingLlm {
@@ -6365,6 +6484,7 @@ mod tests {
             Self {
                 config,
                 last_request: Mutex::new(None),
+                last_context: Mutex::new(None),
             }
         }
 
@@ -6414,7 +6534,7 @@ mod tests {
         }
 
         fn metrics(&self) -> EngineMetrics {
-            EngineMetrics::default()
+            self.metrics.clone()
         }
 
         async fn health_check(&self) -> EngineHealthStatus {
@@ -6865,6 +6985,26 @@ mod tests {
 
     #[async_trait]
     impl LlmInferenceEngine for CapturingLlm {
+        async fn infer_with_context(
+            &self,
+            request: InferenceRequest,
+            context: InferenceRequestContext,
+        ) -> ferrum_types::Result<InferenceResponse> {
+            *self.last_context.lock().expect("context lock") = Some(context);
+            self.infer(request).await
+        }
+
+        async fn infer_stream_with_context(
+            &self,
+            request: InferenceRequest,
+            context: InferenceRequestContext,
+        ) -> ferrum_types::Result<
+            Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
+        > {
+            *self.last_context.lock().expect("context lock") = Some(context);
+            self.infer_stream(request).await
+        }
+
         async fn infer(
             &self,
             request: InferenceRequest,
@@ -8563,10 +8703,60 @@ mod tests {
         assert!(body["scheduler"]["scheduling_time_ms"].is_number());
         assert!(body["scheduler"]["model_execution_time_ms"].is_number());
         assert!(body["scheduler"]["iteration_lock_wait_time_ms"].is_number());
+        assert!(body["scheduler"]["controller_timing"].is_null());
+        assert!(body["scheduler"]["timing_scope"]["scheduling_time_ms"]
+            .as_str()
+            .unwrap()
+            .contains("excludes SLO controller"));
         assert!(
             body["auto_config"]["decisions"].is_array() || body["auto_config"]["error"].is_string(),
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_health_exposes_inclusive_controller_timing_without_device_profile() {
+        let mut engine = StubLlm::new("ok");
+        engine.metrics.performance_breakdown.controller_timing =
+            Some(ferrum_types::ControllerTimingMetrics {
+                finalized_transactions: 1,
+                failed: 1,
+                planning: ferrum_types::WallTimingAggregate {
+                    wall_ns_total: 1_000_000,
+                    calls: 1,
+                },
+                transaction: ferrum_types::WallTimingAggregate {
+                    wall_ns_total: 52_000_000,
+                    calls: 1,
+                },
+                executor_await: ferrum_types::WallTimingAggregate {
+                    wall_ns_total: 51_000_000,
+                    calls: 1,
+                },
+                host_guard: ferrum_types::WallTimingAggregate {
+                    wall_ns_total: 1_000_000,
+                    calls: 1,
+                },
+                ..Default::default()
+            });
+        let expected =
+            serde_json::to_value(&engine.metrics.performance_breakdown.controller_timing).unwrap();
+        let router = AxumServer::from_llm(Arc::new(engine)).build_router();
+        let response = get(router, "/health").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["scheduler"]["controller_timing"], expected);
+        assert_eq!(body["scheduler"]["scheduling_time_ms"], 0.0);
+        assert!(
+            body["scheduler"]["timing_scope"]["controller_executor_await"]
+                .as_str()
+                .unwrap()
+                .contains("not pure GPU time")
+        );
+        assert!(body["scheduler"]["timing_scope"]["aggregation"]
+            .as_str()
+            .unwrap()
+            .contains("not additive"));
     }
 
     #[tokio::test]
@@ -13524,9 +13714,13 @@ mod tests {
             logprobs: None,
             logit_bias: None,
         };
-        let response = completions_handler(State(state_with_stub("done")), Ok(Json(request)))
-            .await
-            .expect("completion response");
+        let response = completions_handler(
+            State(state_with_stub("done")),
+            Extension(InferenceRequestContext::capture()),
+            Ok(Json(request)),
+        )
+        .await
+        .expect("completion response");
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["object"], "text_completion");

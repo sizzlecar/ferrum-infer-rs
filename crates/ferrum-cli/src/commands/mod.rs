@@ -54,6 +54,7 @@ pub mod pull;
 pub mod replay_bundle;
 pub mod run;
 pub mod serve;
+mod slo;
 pub mod stop;
 pub mod transcribe;
 pub mod tts;

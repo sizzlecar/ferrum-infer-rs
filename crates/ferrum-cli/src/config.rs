@@ -192,6 +192,10 @@ pub struct DevConfig {
 /// Runtime knobs that can be sourced from the CLI config file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeCliConfig {
+    /// TOML/JSON SLO policy file; --slo-config takes precedence. Relative paths
+    /// use the process working directory, with no environment override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slo_config: Option<std::path::PathBuf>,
     /// Named startup/runtime preset. Presets provide product-owned default
     /// bundles and can still be overridden by explicit runtime keys below,
     /// environment variables, or CLI flags.

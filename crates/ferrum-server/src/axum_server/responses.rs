@@ -8,7 +8,7 @@ use axum::{
     extract::{rejection::JsonRejection, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -106,6 +106,7 @@ impl ToolNameMap {
 
 pub(super) async fn responses_handler(
     State(state): State<AppState>,
+    Extension(context): Extension<ferrum_interfaces::InferenceRequestContext>,
     headers: HeaderMap,
     request: std::result::Result<Json<ResponsesRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
@@ -118,12 +119,14 @@ pub(super) async fn responses_handler(
             None,
         )
     })?;
+    super::credited::require_legacy_endpoint(&state, "/v1/responses")?;
     let converted = request.convert()?;
     let chat_response = super::chat_completions_handler_with_phases(
         State(state),
         headers,
         Ok(Json(converted.chat)),
         Some(converted.message_phases),
+        context,
     )
     .await?;
     if converted.stream {

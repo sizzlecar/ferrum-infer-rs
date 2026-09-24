@@ -110,6 +110,9 @@ pub struct ServeCommand {
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
+    #[arg(long, value_name = "PATH", help = super::slo::HELP)]
+    pub slo_config: Option<PathBuf>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -402,6 +405,7 @@ async fn execute_with_compatibility(
         spec_tokens,
         gpu_memory_utilization,
         runtime_memory_budget_bytes,
+        slo_config,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
@@ -454,6 +458,12 @@ async fn execute_with_compatibility(
         lora_model_id_template,
     } = cmd;
 
+    // Keep the original user environment independent of inferred defaults.
+    let user_environment = RuntimeConfigSnapshot::capture_current();
+    let loaded_slo =
+        super::slo::load(slo_config.as_deref(), config.runtime.slo_config.as_deref()).await?;
+    let pid_file = std::env::temp_dir().join("ferrum.pid");
+
     let default_enable_thinking = if enable_thinking {
         Some(true)
     } else if disable_thinking {
@@ -472,6 +482,9 @@ async fn execute_with_compatibility(
     let lora_specs = parse_lora_specs(&lora)?;
 
     if let Some(out_dir) = observability_vertical_slice_out.as_ref() {
+        if let Some(slo) = &loaded_slo {
+            slo.validate_real_execution(true)?;
+        }
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Serve,
             out_dir,
@@ -518,6 +531,9 @@ async fn execute_with_compatibility(
         .clone()
         .map(crate::memory_profile::ProcessMemoryObservation::from_sample);
     if product_observability.synthetic_no_weight_enabled() {
+        if let Some(slo) = &loaded_slo {
+            slo.validate_real_execution(true)?;
+        }
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
         )?;
@@ -531,9 +547,6 @@ async fn execute_with_compatibility(
         );
         return Ok(());
     }
-
-    // Keep the original user environment independent of inferred defaults.
-    let user_environment = RuntimeConfigSnapshot::capture_current();
 
     // Select the requested device before model/cache resolution. Explicit
     // backend requests must fail closed instead of doing model work and then
@@ -580,7 +593,10 @@ async fn execute_with_compatibility(
     let mut product_engine_config = product_input.engine_config;
     product_engine_config.numerical_execution =
         config.resolve_numerical_execution(numerical_profile.as_ref());
-    let config_runtime_entries = config.runtime.runtime_config_entries();
+    let mut config_runtime_entries = config.runtime.runtime_config_entries();
+    if let Some(slo) = &loaded_slo {
+        config_runtime_entries.extend_from_slice(slo.runtime_entries());
+    }
     let configured_runtime_preset = runtime_preset
         .as_deref()
         .map(|preset| (preset, RuntimeConfigSource::Cli))
@@ -921,6 +937,9 @@ async fn execute_with_compatibility(
     } else {
         ferrum_types::ExecutionResourceAuthority::LegacyEngine
     };
+    if let Some(slo) = &loaded_slo {
+        slo.validate_authority(execution_resource_authority)?;
+    }
     let mut runtime_config = merge_runtime_config_sources(
         non_env_runtime_entries,
         user_environment,
@@ -982,6 +1001,15 @@ async fn execute_with_compatibility(
         _ => ServedModelKind::Llm,
     };
     validate_served_model_kv_dtype(served_model_kind, product_engine_config.kv_cache.dtype)?;
+    if served_model_kind != ServedModelKind::Llm
+        && loaded_slo
+            .as_ref()
+            .is_some_and(|slo| slo.config.mode != ferrum_types::SloMode::Off)
+    {
+        return Err(FerrumError::unsupported(
+            "enabled SLO policy requires a language-model runtime",
+        ));
+    }
     if vnext_checkpoint.teacher_token_file.is_some() {
         return Err(FerrumError::unsupported(
             "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
@@ -1264,7 +1292,6 @@ async fn execute_with_compatibility(
     println!();
 
     // Write PID file for stop command
-    let pid_file = std::env::temp_dir().join("ferrum.pid");
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
     // Keep the server future alive while stop requests graceful HTTP drain.

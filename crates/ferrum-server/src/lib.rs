@@ -17,6 +17,7 @@
 
 pub mod axum_server;
 pub mod chat_template;
+pub mod credited_output;
 pub mod middleware;
 pub mod model_registry;
 pub mod openai;

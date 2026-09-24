@@ -38,6 +38,9 @@ pub fn push_cli_runtime_usize(
 pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in entries {
+        if ferrum_types::is_typed_only_runtime_config_key(&entry.key) {
+            continue;
+        }
         if std::env::var_os(&entry.key).is_none() {
             std::env::set_var(&entry.key, &entry.effective_value);
             materialized.push(entry.key.clone());
@@ -49,6 +52,9 @@ pub fn materialize_runtime_env_defaults(entries: &[RuntimeConfigEntry]) -> Vec<S
 pub fn materialize_runtime_env_effective(snapshot: &RuntimeConfigSnapshot) -> Vec<String> {
     let mut materialized = Vec::new();
     for entry in &snapshot.entries {
+        if ferrum_types::is_typed_only_runtime_config_key(&entry.key) {
+            continue;
+        }
         if entry.source != RuntimeConfigSource::Env {
             std::env::set_var(&entry.key, &entry.effective_value);
             materialized.push(entry.key.clone());

@@ -37,6 +37,9 @@ use ferrum_types::{has_unclosed_thinking_block, THINK_END_TAG};
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
 
+mod credited;
+pub(super) mod model_startup;
+
 /// Keep the raw history evidence separate from the model template's messages.
 #[derive(Clone, Debug)]
 struct RunHistoryMessage {
@@ -857,6 +860,9 @@ pub struct RunCommand {
     #[arg(long, value_name = "BYTES")]
     pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
 
+    #[arg(long, value_name = "PATH", help = super::slo::HELP)]
+    pub slo_config: Option<PathBuf>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -989,7 +995,29 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    // Capture user input once, before validating sink aliases. Inferred startup
+    // values never re-enter this snapshot through the process environment.
+    let user_environment = RuntimeConfigSnapshot::capture_current();
+    let loaded_slo = super::slo::load(
+        cmd.slo_config.as_deref(),
+        config.runtime.slo_config.as_deref(),
+    )
+    .await?;
+    let credited_output = loaded_slo.as_ref().is_some_and(|slo| {
+        slo.config.output.transport == ferrum_types::SloOutputTransport::Credited
+    });
+    if credited_output {
+        credited::validate_options(cmd.prompt.is_some(), cmd.output_format)?;
+        if cmd.observability_vertical_slice_out.is_some() {
+            return Err(FerrumError::unsupported(
+                "credited output requires real inference, not synthetic observability",
+            ));
+        }
+    }
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
+        if let Some(slo) = &loaded_slo {
+            slo.validate_real_execution(true)?;
+        }
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Run,
             out_dir,
@@ -1013,6 +1041,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.request_dump_dir.as_ref(),
         cmd.profile_sample_rate,
     );
+    if credited_output && product_observability.enabled() {
+        return Err(FerrumError::unsupported(
+            "credited CLI output does not yet support retained product profile/request dumps",
+        ));
+    }
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
     let product_memory_enabled = product_observability.enabled();
     let process_start_sample = product_memory_enabled
@@ -1022,6 +1055,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .clone()
         .map(crate::memory_profile::ProcessMemoryObservation::from_sample);
     if product_observability.synthetic_no_weight_enabled() {
+        if let Some(slo) = &loaded_slo {
+            slo.validate_real_execution(true)?;
+        }
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
         )?;
@@ -1035,10 +1071,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         );
         return Ok(());
     }
-
-    // Capture user input once. Inferred startup values never re-enter this
-    // snapshot through the process environment.
-    let user_environment = RuntimeConfigSnapshot::capture_current();
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
@@ -1063,43 +1095,29 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let mut startup_cli_runtime_entries =
         run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
-    let early_runtime_config = run_base_runtime_config(&config, user_environment);
+    let mut early_runtime_config = run_base_runtime_config(&config, user_environment);
+    if let Some(slo) = &loaded_slo {
+        slo.apply_to_snapshot(&mut early_runtime_config);
+    }
     let early_effective_runtime_config =
         run_effective_runtime_config(&early_runtime_config, &startup_cli_runtime_entries);
     // Source resolution selects artifacts only. Resource policy follows the
     // registered model definition, once its execution authority is known.
-    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
-    let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
+    let prepared_source = model_startup::prepare_product_source(
         model,
-        &cache_dir,
-        crate::source_resolver::DownloadPolicy::AutoDownload,
-        None,
         &cmd.product_sources,
+        &config,
+        cmd.numerical_profile.as_ref(),
+        &early_effective_runtime_config,
     )
     .await?;
-    let product_input = resolved.into_product_engine_input();
+    let product_input = prepared_source.input;
     let requested_model = product_input.requested_model.clone();
     let model_id = product_input.public_model_id.clone();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
-    engine_config.numerical_execution =
-        config.resolve_numerical_execution(cmd.numerical_profile.as_ref());
-    // Family candidates and startup sizing must see the same KV request as
-    // the eventual executor; resolving it after model definition loses this
-    // constraint when the numerical policy is Auto.
-    apply_kv_dtype_override(
-        &mut engine_config,
-        crate::runtime_env::runtime_snapshot_value(
-            &early_effective_runtime_config,
-            "FERRUM_KV_DTYPE",
-        ),
-    )?;
     let model_sources = product_input.model_sources;
-    let defined_model = crate::source_resolver::define_registered_product_model(
-        model_sources.as_ref(),
-        &engine_config.numerical_execution,
-        engine_config.kv_cache.dtype,
-    )?;
+    let defined_model = prepared_source.defined_model;
     let model_definition_for_config = if defined_model.is_none() {
         load_run_model_definition(&source, model_sources.as_deref()).await?
     } else {
@@ -1181,6 +1199,9 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     } else {
         ferrum_types::ExecutionResourceAuthority::LegacyEngine
     };
+    if let Some(slo) = &loaded_slo {
+        slo.validate_authority(execution_resource_authority)?;
+    }
     if execution_resource_authority == ferrum_types::ExecutionResourceAuthority::LegacyEngine {
         let defaults = crate::runtime_env::moe_graph_default_entries(
             &effective_runtime_config,
@@ -1364,6 +1385,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // stdin is not a TTY.
     if let Some(one_shot) = cmd.prompt.clone() {
         let format = cmd.output_format;
+        let request_context = ferrum_interfaces::InferenceRequestContext::capture();
         let plan = build_run_prompt_plan(
             &[],
             &one_shot,
@@ -1433,6 +1455,29 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             },
             metadata,
         };
+        if credited_output {
+            let stats = credited::execute_one_shot(
+                engine.as_ref(),
+                request,
+                request_context,
+                cmd.bench_mode,
+            )
+            .await?;
+            let elapsed = stats.elapsed.as_secs_f64();
+            let tokens = stats.usage.completion_tokens;
+            let throughput = if elapsed > 0.0 {
+                tokens as f64 / elapsed
+            } else {
+                0.0
+            };
+            // The raw text codec owns stdout exactly, including whitespace.
+            // Diagnostics stay on stderr and distinguish events from tokens.
+            eprintln!(
+                "[{tokens} tokens, {} text events, {throughput:.1} tok/s, {elapsed:.1}s]",
+                stats.visible_frames,
+            );
+            return Ok(());
+        }
         let profile_request_id = request.id.to_string();
         let memory_before = product_observability
             .enabled()
@@ -1444,10 +1489,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 .is_some();
         let generation_result = match format {
             OutputFormat::Text => engine
-                .infer(request)
+                .infer_with_context(request, request_context)
                 .await
                 .and_then(CollectedRunGeneration::from_response),
-            OutputFormat::Jsonl => match engine.infer_stream(request).await {
+            OutputFormat::Jsonl => match engine
+                .infer_stream_with_context(request, request_context)
+                .await
+            {
                 Ok(stream) => {
                     collect_run_stream(
                         stream,
@@ -1716,6 +1764,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     continue;
                 }
 
+                let request_context = ferrum_interfaces::InferenceRequestContext::capture();
                 let plan = build_run_prompt_plan(
                     &history,
                     input,
@@ -1802,7 +1851,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 )
                 .is_some();
                 let generation_result = match format {
-                    OutputFormat::Text => match engine.infer_stream(request).await {
+                    OutputFormat::Text => match engine
+                        .infer_stream_with_context(request, request_context)
+                        .await
+                    {
                         Ok(stream) => {
                             collect_run_text_stream(
                                 stream,
@@ -1817,7 +1869,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                         }
                         Err(error) => Err(error),
                     },
-                    OutputFormat::Jsonl => match engine.infer_stream(request).await {
+                    OutputFormat::Jsonl => match engine
+                        .infer_stream_with_context(request, request_context)
+                        .await
+                    {
                         Ok(stream) => {
                             collect_run_stream(
                                 stream,
@@ -2638,7 +2693,7 @@ fn run_effective_runtime_config(
     snapshot
 }
 
-fn run_base_runtime_config(
+pub(super) fn run_base_runtime_config(
     config: &CliConfig,
     env_snapshot: RuntimeConfigSnapshot,
 ) -> RuntimeConfigSnapshot {
@@ -2921,6 +2976,7 @@ mod tests {
             seed: None,
             gpu_memory_utilization: 0.9,
             runtime_memory_budget_bytes: None,
+            slo_config: None,
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
@@ -2954,6 +3010,43 @@ mod tests {
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
         }
+    }
+
+    #[tokio::test]
+    async fn credited_run_rejects_unbounded_history_before_model_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credited.toml");
+        std::fs::write(
+            &path,
+            "mode = \"off\"\n[output]\ntransport = \"credited\"\n",
+        )
+        .unwrap();
+        let mut cmd = test_run_cmd();
+        // No model is supplied: the output-contract error must precede even
+        // model selection, so an unsupported UI cannot trigger a download.
+        cmd.model = None;
+        cmd.slo_config = Some(path);
+        let error = execute(cmd, CliConfig::default()).await.unwrap_err();
+        assert!(matches!(error, FerrumError::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn credited_run_rejects_retained_profiles_before_model_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credited.toml");
+        std::fs::write(
+            &path,
+            "mode = \"off\"\n[output]\ntransport = \"credited\"\n",
+        )
+        .unwrap();
+        let mut cmd = test_run_cmd();
+        cmd.model = Some("/not-resolved/credited-test-model".into());
+        cmd.prompt = Some("prompt".into());
+        cmd.slo_config = Some(path);
+        cmd.request_dump_dir = Some(dir.path().join("dumps"));
+        let error = execute(cmd, CliConfig::default()).await.unwrap_err();
+        assert!(matches!(error, FerrumError::Unsupported { .. }));
+        assert!(!dir.path().join("dumps").exists());
     }
 
     #[test]
