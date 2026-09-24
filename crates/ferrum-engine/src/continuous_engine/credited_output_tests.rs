@@ -12,6 +12,12 @@ use futures::{Future, StreamExt};
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
 
+#[path = "credited_chat_tests.rs"]
+mod chat;
+
+#[path = "credited_prepared_completion_tests.rs"]
+mod prepared_completion;
+
 #[derive(Default)]
 struct CreditedLegacyDecodeCalls {
     decode: AtomicUsize,
