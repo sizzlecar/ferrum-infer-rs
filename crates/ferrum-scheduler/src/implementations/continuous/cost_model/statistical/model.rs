@@ -13,6 +13,16 @@ use support::{coordinates, Support};
 pub(crate) mod tests;
 
 pub const MODEL_REVISION: &str = "whole_wave_piecewise_affine_v1";
+pub const INDEPENDENT_ATTENTION_MODEL_REVISION: &str =
+    "whole_wave_piecewise_affine_independent_attention_v2";
+impl SelectedStatisticalFamily {
+    pub fn model_revision(self) -> &'static str {
+        match self {
+            Self::OrderedV1 => MODEL_REVISION,
+            Self::IndependentAttentionV2 => INDEPENDENT_ATTENTION_MODEL_REVISION,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelUnknown {
     Evidence(Unknown),
@@ -139,6 +149,7 @@ struct FittedSegment {
 }
 #[derive(Debug, Clone)]
 pub struct FittedWholeWaveModelV1 {
+    family: SelectedStatisticalFamily,
     fingerprint: ExecutionFingerprint,
     settings: WholeWaveSettingsV1,
     partition: CalibrationPartitionV1,
@@ -160,6 +171,7 @@ struct CalibratedSegment {
 }
 #[derive(Debug, Clone)]
 pub struct WholeWaveModelV1 {
+    family: SelectedStatisticalFamily,
     fingerprint: ExecutionFingerprint,
     settings: WholeWaveSettingsV1,
     partition: CalibrationPartitionV1,
@@ -205,7 +217,7 @@ impl FittedWholeWaveModelV1 {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"ferrum.whole-wave.frozen-fit.v1\0");
-        hash.update(MODEL_REVISION.as_bytes());
+        hash.update(self.family.model_revision().as_bytes());
         for (family, fitted) in &self.segments {
             hash.update(family);
             hash.update((fitted.samples as u64).to_le_bytes());
@@ -223,9 +235,52 @@ impl FittedWholeWaveModelV1 {
         samples: &[WholeWaveObservationV1],
         now_ns: u64,
     ) -> Result<Self, ModelUnknown> {
+        Self::fit_for_family(
+            fingerprint,
+            settings,
+            partition,
+            samples,
+            now_ns,
+            SelectedStatisticalFamily::OrderedV1,
+        )
+    }
+    /// New capture only: every sample must carry the independently produced V2
+    /// digest. This does not reinterpret profile6 or infer grouped evidence.
+    pub fn fit_independent_attention_v2(
+        fingerprint: ExecutionFingerprint,
+        settings: WholeWaveSettingsV1,
+        partition: CalibrationPartitionV1,
+        samples: &[WholeWaveObservationV1],
+        now_ns: u64,
+    ) -> Result<Self, ModelUnknown> {
+        Self::fit_for_family(
+            fingerprint,
+            settings,
+            partition,
+            samples,
+            now_ns,
+            SelectedStatisticalFamily::IndependentAttentionV2,
+        )
+    }
+    fn fit_for_family(
+        fingerprint: ExecutionFingerprint,
+        settings: WholeWaveSettingsV1,
+        partition: CalibrationPartitionV1,
+        samples: &[WholeWaveObservationV1],
+        now_ns: u64,
+        family: SelectedStatisticalFamily,
+    ) -> Result<Self, ModelUnknown> {
         settings_valid(&settings)?;
         partition.validate()?;
-        let groups = group_samples(samples, &fingerprint, &settings, partition, now_ns, false)?;
+        let groups = group_samples(
+            samples,
+            &fingerprint,
+            &settings,
+            partition,
+            now_ns,
+            false,
+            family,
+        )?;
         let mut segments = BTreeMap::new();
         let mut unavailable = BTreeMap::new();
         for (family, points) in groups {
@@ -250,6 +305,7 @@ impl FittedWholeWaveModelV1 {
             return Err(ModelUnknown::InsufficientFit);
         }
         Ok(Self {
+            family,
             fingerprint,
             settings,
             partition,
@@ -295,6 +351,7 @@ impl FittedWholeWaveModelV1 {
             self.partition,
             now_ns,
             true,
+            self.family,
         )?;
         if residual.iter().any(|s| self.fit_calls.contains(&s.call_id)) {
             return Err(ModelUnknown::DuplicateRecord);
@@ -363,6 +420,7 @@ impl FittedWholeWaveModelV1 {
         let mut calibration_calls = self.fit_calls;
         calibration_calls.extend(residual.iter().map(|s| s.call_id));
         Ok(WholeWaveModelV1 {
+            family: self.family,
             fingerprint: self.fingerprint,
             settings: self.settings,
             partition: self.partition,
@@ -374,6 +432,9 @@ impl FittedWholeWaveModelV1 {
     }
 }
 impl WholeWaveModelV1 {
+    pub fn selected_family(&self) -> SelectedStatisticalFamily {
+        self.family
+    }
     pub fn predict(
         &self,
         fingerprint: &ExecutionFingerprint,
@@ -407,9 +468,10 @@ impl WholeWaveModelV1 {
         }
 
         validate_input(input, &self.settings)?;
-        let segment = self.segments.get(input.family_signature()).ok_or_else(|| {
+        let family = input.family_signature_for(self.family)?;
+        let segment = self.segments.get(family).ok_or_else(|| {
             self.unavailable
-                .get(input.family_signature())
+                .get(family)
                 .copied()
                 .unwrap_or(ModelUnknown::FamilyMissing)
         })?;
@@ -476,6 +538,7 @@ fn group_samples(
     partition: CalibrationPartitionV1,
     now: u64,
     residual: bool,
+    family: SelectedStatisticalFamily,
 ) -> Result<BTreeMap<[u8; 32], Vec<Point>>, ModelUnknown> {
     if samples.len() > settings.max_retained_samples.get() {
         return Err(ModelUnknown::Capacity);
@@ -511,7 +574,7 @@ fn group_samples(
         if retained_rows > settings.max_retained_shape_rows.get() {
             return Err(ModelUnknown::Capacity);
         }
-        let key = *input.family_signature();
+        let key = *input.family_signature_for(family)?;
         if !result.contains_key(&key) && result.len() == settings.max_buckets.get() {
             return Err(ModelUnknown::Capacity);
         }

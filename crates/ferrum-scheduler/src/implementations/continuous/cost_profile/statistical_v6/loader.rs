@@ -26,6 +26,11 @@ pub struct WholeWaveImportProvenanceV1 {
     pub residual_through_ordinal: u64,
 }
 impl ImportedWholeWaveModelV1 {
+    pub fn selected_family(
+        &self,
+    ) -> super::super::super::cost_model::statistical::SelectedStatisticalFamily {
+        self.model.selected_family()
+    }
     pub fn predict(
         &self,
         fingerprint: &ExecutionFingerprint,
@@ -67,6 +72,29 @@ pub fn load_whole_wave_profile_v6(
     limits: &CostProfileLoadLimits,
     clock: ProfileLoadClock,
 ) -> Result<ImportedWholeWaveModelV1, CostProfileError> {
+    load_selected_profile_path(
+        path,
+        fingerprint,
+        settings,
+        limits,
+        clock,
+        load_whole_wave_profile_v6_bytes,
+    )
+}
+pub(in crate::implementations::continuous::cost_profile) fn load_selected_profile_path(
+    path: &Path,
+    fingerprint: &ExecutionFingerprint,
+    settings: &WholeWaveSettingsV1,
+    limits: &CostProfileLoadLimits,
+    clock: ProfileLoadClock,
+    loader: fn(
+        &[u8],
+        &ExecutionFingerprint,
+        &WholeWaveSettingsV1,
+        &CostProfileLoadLimits,
+        ProfileLoadClock,
+    ) -> Result<ImportedWholeWaveModelV1, CostProfileError>,
+) -> Result<ImportedWholeWaveModelV1, CostProfileError> {
     limits.validate()?;
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
@@ -86,8 +114,7 @@ pub fn load_whole_wave_profile_v6(
     if file.read(&mut [0u8; 1])? != 0 {
         return Err(CostProfileError::Metadata("profile grew while reading"));
     }
-    let mut loaded =
-        load_whole_wave_profile_v6_bytes(&bytes, fingerprint, settings, limits, clock)?;
+    let mut loaded = loader(&bytes, fingerprint, settings, limits, clock)?;
     loaded.provenance.loaded_from = Some(path.to_owned());
     Ok(loaded)
 }
@@ -115,7 +142,48 @@ pub fn load_whole_wave_profile_v6_bytes(
         return Err(CostProfileError::UnsupportedVersion(version.schema_version));
     }
     let file: CostProfileFileV6 = serde_json::from_slice(bytes)?;
-    if file.model_revision != MODEL_REVISION {
+    import_selected_profile(
+        file,
+        bytes,
+        fingerprint,
+        settings,
+        limits,
+        clock,
+        super::super::super::cost_model::statistical::SelectedStatisticalFamily::OrderedV1,
+    )
+}
+
+pub(in crate::implementations::continuous::cost_profile) trait SelectedProfileRecord {
+    fn into_parts(
+        self,
+    ) -> (
+        WholeWaveProfileSampleV6,
+        Option<ferrum_interfaces::execution_cost::IndependentAttentionWaveEvidenceWireV2>,
+    );
+}
+impl SelectedProfileRecord for WholeWaveProfileSampleV6 {
+    fn into_parts(
+        self,
+    ) -> (
+        Self,
+        Option<ferrum_interfaces::execution_cost::IndependentAttentionWaveEvidenceWireV2>,
+    ) {
+        (self, None)
+    }
+}
+
+pub(in crate::implementations::continuous::cost_profile) fn import_selected_profile<
+    S: SelectedProfileRecord,
+>(
+    file: WholeWaveProfileFile<S>,
+    bytes: &[u8],
+    fingerprint: &ExecutionFingerprint,
+    settings: &WholeWaveSettingsV1,
+    limits: &CostProfileLoadLimits,
+    clock: ProfileLoadClock,
+    family: super::super::super::cost_model::statistical::SelectedStatisticalFamily,
+) -> Result<ImportedWholeWaveModelV1, CostProfileError> {
+    if file.model_revision != family.model_revision() {
         return Err(CostProfileError::Metadata(
             "unsupported whole-wave model revision",
         ));
@@ -192,6 +260,7 @@ pub fn load_whole_wave_profile_v6_bytes(
     let mut oldest_age = 0;
     let mut newest_age = u64::MAX;
     for record in file.samples {
+        let (record, independent) = record.into_parts();
         if !ordinals.insert(record.accepted_ordinal) || !calls.insert(record.call_id) {
             return Err(CostProfileError::Metadata(
                 "duplicate accepted ordinal or call ID",
@@ -218,6 +287,16 @@ pub fn load_whole_wave_profile_v6_bytes(
         let exact = record.shape.canonical()?;
         let selected = StatisticalWaveEvidenceV1::from_wire_v1(record.selected, &exact)
             .map_err(|_| CostProfileError::Metadata("unbound selected-algorithm evidence"))?;
+        let selected = match (family, independent) {
+            (super::super::super::cost_model::statistical::SelectedStatisticalFamily::OrderedV1, None) => selected,
+            (super::super::super::cost_model::statistical::SelectedStatisticalFamily::IndependentAttentionV2, Some(wire)) => {
+                let value = ferrum_interfaces::execution_cost::IndependentAttentionWaveEvidenceV2::from_wire_v2(wire, &exact)
+                    .map_err(|_| CostProfileError::Metadata("unbound independent-attention evidence"))?;
+                selected.with_independent_attention_v2(value, &exact)
+                    .map_err(|_| CostProfileError::Metadata("independent-attention work differs from original receipt"))?
+            }
+            _ => return Err(CostProfileError::Metadata("profile family/evidence version mismatch")),
+        };
         let sample = WholeWaveObservationV1 {
             source_sha256: partition.source_sha256,
             accepted_ordinal: record.accepted_ordinal,
@@ -241,7 +320,11 @@ pub fn load_whole_wave_profile_v6_bytes(
             }
         }
     }
-    let frozen = FittedWholeWaveModelV1::fit(
+    let fit_model = match family {
+        super::super::super::cost_model::statistical::SelectedStatisticalFamily::OrderedV1 => FittedWholeWaveModelV1::fit,
+        super::super::super::cost_model::statistical::SelectedStatisticalFamily::IndependentAttentionV2 => FittedWholeWaveModelV1::fit_independent_attention_v2,
+    };
+    let frozen = fit_model(
         fingerprint.clone(),
         settings.clone(),
         partition,

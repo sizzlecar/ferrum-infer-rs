@@ -29,15 +29,35 @@ pub struct HostAndSequenceNumericWorkV1 {
     pub decode_scratch_bytes_sum: u64,
     pub recurrent_bytes: u64,
 }
+/// Explicit empirical family interpretation, independent of execution authority.
+/// OrderedV1 remains the default entry point and profile-6 protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedStatisticalFamily {
+    OrderedV1,
+    IndependentAttentionV2,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatisticalModelInputV1 {
     family_signature: [u8; 32],
+    independent_attention_family_v2: Option<[u8; 32]>,
     device: DeviceNumericWorkV1,
     host_and_sequence: HostAndSequenceNumericWorkV1,
 }
 impl StatisticalModelInputV1 {
     pub fn family_signature(&self) -> &[u8; 32] {
         &self.family_signature
+    }
+    pub fn family_signature_for(
+        &self,
+        family: SelectedStatisticalFamily,
+    ) -> Result<&[u8; 32], Unknown> {
+        match family {
+            SelectedStatisticalFamily::OrderedV1 => Ok(&self.family_signature),
+            SelectedStatisticalFamily::IndependentAttentionV2 => self
+                .independent_attention_family_v2
+                .as_ref()
+                .ok_or(Unknown::MissingProducer),
+        }
     }
     pub fn device(&self) -> DeviceNumericWorkV1 {
         self.device
@@ -144,6 +164,12 @@ impl StatisticalModelInputV1 {
         }
         Ok(Self {
             family_signature: *evidence.family_signature(),
+            // The enclosing private V1 evidence binds both digests to one exact
+            // receipt. This copies only a fixed digest: do not rehash/reaggregate
+            // the same edge for the new predictor in the planner hot path.
+            independent_attention_family_v2: evidence
+                .independent_attention_v2()
+                .map(|v| *v.family_signature()),
             device: evidence.work(),
             host_and_sequence: out,
         })

@@ -86,6 +86,22 @@ impl IndependentAttentionWaveEvidenceV2 {
     }
 }
 impl StatisticalWaveEvidenceV1 {
+    /// Explicit new-profile import only. Both independently serialized records
+    /// must bind the same exact shape and identical actual numeric work/counts.
+    /// The old V1 import never calls this and never gains a V2 family implicitly.
+    pub fn with_independent_attention_v2(
+        mut self,
+        value: IndependentAttentionWaveEvidenceV2,
+        exact: &CanonicalWaveCostShape,
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        self.validate_exact(exact)?;
+        value.validate_exact(exact)?;
+        if self.physical_commands != value.physical_commands || self.work != value.work {
+            return Err(StatisticalEvidenceUnknown::CommandMismatch);
+        }
+        self.independent_attention_v2 = Some(value);
+        Ok(self)
+    }
     pub fn independent_attention_v2(&self) -> Option<&IndependentAttentionWaveEvidenceV2> {
         self.independent_attention_v2.as_ref()
     }

@@ -10,7 +10,7 @@ use ferrum_interfaces::execution_cost::{
 };
 mod wire;
 pub use wire::*;
-mod loader;
+pub(in crate::implementations::continuous::cost_profile) mod loader;
 pub use loader::*;
 #[cfg(test)]
 mod tests;

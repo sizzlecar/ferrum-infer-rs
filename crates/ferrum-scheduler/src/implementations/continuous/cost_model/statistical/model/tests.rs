@@ -328,3 +328,5 @@ fn q99_is_an_empirical_quantile_not_a_maximum_or_heldout_guarantee() {
     assert_eq!(evaluation.prediction.unwrap().planning_ns, 125);
     assert_eq!(evaluation.underestimate_ns, Some(875));
 }
+
+pub(crate) mod independent_rows;

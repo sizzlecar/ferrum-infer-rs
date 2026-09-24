@@ -145,7 +145,9 @@ impl TryFrom<&CanonicalWaveCostShape> for WholeWaveProfileShapeV6 {
     }
 }
 impl WholeWaveProfileShapeV6 {
-    pub(super) fn canonical(self) -> Result<CanonicalWaveCostShape, CostProfileError> {
+    pub(in crate::implementations::continuous::cost_profile) fn canonical(
+        self,
+    ) -> Result<CanonicalWaveCostShape, CostProfileError> {
         let decode = self
             .rows
             .iter()
@@ -199,8 +201,8 @@ pub struct WholeWaveProfileSampleV6 {
     pub wall_ns: u64,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CostProfileFileV6 {
+#[serde(deny_unknown_fields, bound(deserialize = "S: Deserialize<'de>"))]
+pub struct WholeWaveProfileFile<S> {
     /// Stable capture identity, distinct from the eventually sealed raw bytes.
     pub capture_identity_sha256: [u8; 32],
     /// Frozen before residual collection; loading must reproduce these parameters.
@@ -216,11 +218,12 @@ pub struct CostProfileFileV6 {
     pub fit_through_ordinal: u64,
     pub residual_through_ordinal: u64,
     #[serde(deserialize_with = "bounded_samples")]
-    pub samples: Vec<WholeWaveProfileSampleV6>,
+    pub samples: Vec<S>,
 }
-fn bounded_samples<'de, D: Deserializer<'de>>(
+pub type CostProfileFileV6 = WholeWaveProfileFile<WholeWaveProfileSampleV6>;
+fn bounded_samples<'de, D: Deserializer<'de>, S: Deserialize<'de>>(
     d: D,
-) -> Result<Vec<WholeWaveProfileSampleV6>, D::Error> {
+) -> Result<Vec<S>, D::Error> {
     bounded_vec::<D, _, HARD_SAMPLES>(d)
 }
 impl CostProfileFileV6 {
@@ -341,6 +344,8 @@ impl CostProfileFileV6 {
             samples,
         })
     }
+}
+impl<S: Serialize> WholeWaveProfileFile<S> {
     pub fn to_bounded_bytes(&self, max_file_bytes: usize) -> Result<Vec<u8>, CostProfileError> {
         if max_file_bytes == 0 || max_file_bytes > HARD_FILE_BYTES {
             return Err(CostProfileError::Limit("invalid export byte bound"));
