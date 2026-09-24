@@ -10,6 +10,7 @@ use cudarc::{
 
 pub(super) mod hadamard;
 pub(super) mod q8_f32scale;
+pub(super) mod stream_mmq;
 pub(super) mod weights;
 
 // Must match the bounded row tile instantiated by vnext_gguf_linear_tiled_*.

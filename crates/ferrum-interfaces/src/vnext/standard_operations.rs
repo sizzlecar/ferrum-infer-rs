@@ -40,6 +40,10 @@ pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swi
 pub const DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID: &str = "operation.dense_swiglu.q8-f32scale";
 pub const DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID: &str =
     "capability.operation.dense_swiglu.q8-f32scale";
+pub const DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID: &str =
+    "operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale";
+pub const DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID: &str =
+    "capability.operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale";
 pub const DENSE_GEGLU_TANH_OPERATION_ID: &str = "operation.dense_geglu_tanh";
 pub const DENSE_GEGLU_TANH_F16_CAPABILITY_ID: &str = "capability.operation.dense_geglu_tanh.f16";
 pub const CONSTANT_SCALE_OPERATION_ID: &str = "operation.constant_scale";
