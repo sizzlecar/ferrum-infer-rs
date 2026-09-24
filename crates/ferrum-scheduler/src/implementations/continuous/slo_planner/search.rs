@@ -8,6 +8,9 @@ use super::{
 };
 use std::sync::Arc;
 
+mod replay_budget;
+use replay_budget::{MeasuredReplayWork, ReplayReserve};
+
 /// Finite heuristic search. Neither candidate truncation, beam pruning, nor
 /// exhausted depth is ever an impossibility proof. All surviving branches are
 /// replayed from the current observation clock before proposing their first wave.
@@ -20,6 +23,7 @@ pub struct BoundedSloPlanner {
 struct Node<'epoch> {
     waves: Vec<WaveCandidate>,
     state: PlanningState<'epoch>,
+    replay_work: MeasuredReplayWork,
     score: f64,
     debt: u64,
     ordinal: usize,
@@ -44,18 +48,13 @@ impl<'epoch> Frame<'epoch> {
 /// improvement share the same transaction, action limits and final replay.
 struct CommonPlan<'epoch>(Node<'epoch>);
 
-#[derive(Clone, Copy)]
-enum SearchPhase {
-    Construct,
-    Improve,
-}
-
 struct ComputeBudget {
     last_ns: u64,
-    search_deadline_ns: u64,
+    replay_reserve: ReplayReserve,
     planner_deadline_ns: u64,
     optional_search: bool,
     soft_stopped: bool,
+    stopped_for_replay_reserve: bool,
 }
 
 impl ComputeBudget {
@@ -70,10 +69,15 @@ impl ComputeBudget {
         }
         Ok(Self {
             last_ns: now_ns,
-            search_deadline_ns,
+            replay_reserve: ReplayReserve::new(
+                window.started_at_ns,
+                search_deadline_ns,
+                planner_deadline_ns,
+            ),
             planner_deadline_ns,
             optional_search: false,
             soft_stopped: false,
+            stopped_for_replay_reserve: false,
         })
     }
 
@@ -86,8 +90,9 @@ impl ComputeBudget {
         if now >= self.planner_deadline_ns {
             return Err(PlanningUnknownReason::ComputeBudgetExhausted);
         }
-        if self.optional_search && now >= self.search_deadline_ns {
+        if self.optional_search && now >= self.replay_reserve.deadline_ns() {
             self.soft_stopped = true;
+            self.stopped_for_replay_reserve = self.replay_reserve.is_early_stop(now);
             return Err(PlanningUnknownReason::SearchIncomplete);
         }
         Ok(now)
@@ -307,6 +312,10 @@ impl BoundedSloPlanner {
         let execution_session = ExecutionSession::new(context, &self.settings);
         let context: &dyn PlanningExecutionContext = &execution_session;
         let milestones = self.settings.search.enable_prefill_milestones;
+        let begin_started = match budget.read(clock) {
+            Ok(now) => now,
+            Err(reason) => return unknown(reason, stats),
+        };
         let initial = match simulation::begin(
             snapshot,
             context,
@@ -315,6 +324,13 @@ impl BoundedSloPlanner {
         ) {
             Ok(state) => state,
             Err(error) => return unknown(simulation_reason(error), stats),
+        };
+        let initial_replay_work = match budget
+            .read(clock)
+            .and_then(|now| MeasuredReplayWork::default().with_span(begin_started, now))
+        {
+            Ok(work) => work,
+            Err(reason) => return unknown(reason, stats),
         };
         let horizon = self.settings.search.lookahead_waves.get();
         let width = self.settings.search.beam_width.get();
@@ -327,6 +343,7 @@ impl BoundedSloPlanner {
         pending[0].push(Frame::new(Node {
             waves: Vec::new(),
             state: initial,
+            replay_work: initial_replay_work,
             score: 0.0,
             debt: 0,
             ordinal: 0,
@@ -342,6 +359,7 @@ impl BoundedSloPlanner {
                     && !solutions.is_empty()
                 {
                     stats.search_soft_stops += 1;
+                    stats.replay_reserve_stops += usize::from(budget.stopped_for_replay_reserve);
                     break $label;
                 }
                 return unknown(reason, stats);
@@ -364,11 +382,12 @@ impl BoundedSloPlanner {
                 break;
             };
             let phase = if solutions.is_empty() {
-                SearchPhase::Construct
+                PlanningSearchPhase::Construct
             } else {
-                SearchPhase::Improve
+                PlanningSearchPhase::Improve
             };
-            budget.optional_search = matches!(phase, SearchPhase::Improve);
+            stats.phase = phase;
+            budget.optional_search = matches!(phase, PlanningSearchPhase::Improve);
             if let Err(reason) = budget.read(clock) {
                 stop_or_unknown!(reason, 'exploration);
             }
@@ -431,6 +450,11 @@ impl BoundedSloPlanner {
             // All search nodes use one execution-time origin. CPU time is
             // charged by the shared real budget and fresh final replay; extending
             // a node never shifts its ancestors or replays their physical work.
+            let advance_started = match budget.read(clock) {
+                Ok(now) => now,
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
+            let parent_replay_work = frame.node.replay_work;
             let transition = simulation::advance(
                 snapshot,
                 &frame.node.state,
@@ -480,11 +504,22 @@ impl BoundedSloPlanner {
                 Err(SimulationFailure::SequenceViolation) => continue,
                 Err(SimulationFailure::Unknown(reason)) => stop_or_unknown!(reason, 'exploration),
             };
+            // Measure this edge and its adjacent successful-result bookkeeping,
+            // never a previously measured parent or sibling. Failed branches do
+            // not create an estimate; final ranking remains covered only by F.
+            let replay_work = match budget
+                .read(clock)
+                .and_then(|now| parent_replay_work.with_span(advance_started, now))
+            {
+                Ok(work) => work,
+                Err(reason) => stop_or_unknown!(reason, 'exploration),
+            };
             waves.push(transition.wave);
             let state = transition.state;
             let node = Node {
                 waves,
                 state,
+                replay_work,
                 score: 0.0,
                 debt: 0,
                 ordinal: stats.expanded_candidates,
@@ -497,9 +532,15 @@ impl BoundedSloPlanner {
             ) {
                 Ok(true) if admission_serviced(admission_target, &node.state) => {
                     solutions.push(CommonPlan(node.clone()));
+                    if let Err(reason) = budget.replay_reserve.observe_complete(node.replay_work) {
+                        return unknown(reason, stats);
+                    }
+                    stats.measured_replay_work_ns = budget.replay_reserve.measured_ns();
+                    stats.replay_reserve_ns = budget.replay_reserve.reserved_ns();
                     // Crossing Construct -> Improve does not create a new
                     // budget or permit an uncertified tail into solutions.
                     budget.optional_search = true;
+                    stats.phase = PlanningSearchPhase::Improve;
                     let now = match budget.read(clock) {
                         Ok(now) => now,
                         Err(reason) => stop_or_unknown!(reason, 'exploration),
@@ -546,6 +587,7 @@ impl BoundedSloPlanner {
         // must still revalidate identity/resources/credits and its real current
         // clock immediately before committing this *first* wave.
         budget.optional_search = false;
+        stats.phase = PlanningSearchPhase::Finalization;
         // Re-rank every complete plan at the same end-of-search CPU instant.
         // A soft stop may interrupt an earlier ranking; cached scores cannot
         // select a winner at a different time basis from its peers.

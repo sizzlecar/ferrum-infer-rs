@@ -799,8 +799,19 @@ pub struct PlanningWitnessSummary {
     pub requests_with_obligations_beyond_horizon: usize,
 }
 
+/// Last phase reached, including on Unknown. Finalization includes common
+/// ranking, independent replay and final clock/TTL checks, not just projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlanningSearchPhase {
+    #[default]
+    Construct,
+    Improve,
+    Finalization,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlanningSearchStats {
+    pub phase: PlanningSearchPhase,
     pub enumeration_attempts: usize,
     pub expanded_candidates: usize,
     pub generated_candidates: usize,
@@ -809,6 +820,13 @@ pub struct PlanningSearchStats {
     /// A complete common witness existed when optional exploration stopped.
     /// This is a truncated search, never an optimality claim.
     pub search_soft_stops: usize,
+    /// Subset of soft stops before the configured optional-search ceiling.
+    pub replay_reserve_stops: usize,
+    /// Largest observed complete-path begin/advance span; not a runtime bound.
+    pub measured_replay_work_ns: u64,
+    /// Configured final window plus that observed path high-water. Zero before
+    /// any complete plan; never a guarantee that final replay will fit.
+    pub replay_reserve_ns: u64,
     pub beam_pruned_nodes: usize,
     pub cost_unknown_candidates: usize,
     pub shape_unknown_candidates: usize,

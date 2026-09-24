@@ -68,7 +68,7 @@ Observe/Enforce 要求显式 `default_service_class`，且该 ID 必须存在于
 | 配置分组 | 字段与默认值 | 当前含义 |
 | --- | --- | --- |
 | `planner` | `candidate_limit=16`, `beam_width=4`, `lookahead_waves=3`, `max_planning_us=2000`, `max_replan_attempts=2`, `retry_backoff_ms=1` | 有界规划参数合同；重试定时器仅处理瞬时竞争或计算预算耗尽，不授予容量或重置请求时间 |
-| `planner` | `search_budget_percent=60`, `publication_reserve_percent=20` | 同一同步事务的阶段份额：已有完整共同见证时，在原始预算 60% 处停止可选探索；共同序列最终回放必须在 80% 前结束，余下 20% 留给真实资源、路线、输出重验和发布。capture 消耗的时间已计入，不重置预算；份额不是性能保证 |
+| `planner` | `search_budget_percent=60`, `publication_reserve_percent=20` | 同一同步事务的阶段份额：已有完整共同见证时，可选探索最迟在原始预算 60% 处停止，并按已测完整路径工作量提前预留复验时间；共同序列最终回放必须在 80% 前结束，余下 20% 留给真实资源、路线、输出重验和发布。capture 消耗的时间已计入，不重置预算；份额不是性能保证 |
 | `planner` | `prefill_credit_beta=1.0`, `prefill_debt_gamma=1.0`, `enable_prefill_milestones=true` | 预填充收益与债务的显式参数 |
 | `cost_observation` | `max_queued_samples=256`, `max_queued_shape_rows=8192`, `max_samples_per_update=256` | 待训练队列与单次后台更新的硬上限，shape rows 按已分配容量计数 |
 | `cost_observation` | `max_waves_per_call=4`, `max_rows_per_wave=1024`, `max_retained_rows_per_call=4096` | 单次执行观察器的波次和行存储上限；不授权增加模型工作 |
@@ -86,6 +86,14 @@ Observe/Enforce 要求显式 `default_service_class`，且该 ID 必须存在于
 审计 `planner_budget_exhausted` 表示搜索/回放额度停止（包含 80% 阶段截止），
 `budget_exhausted` 只在同一事务的真实 100% 硬截止到达时置位，两项分别导出指标。
 因此 1.6ms 阶段停止不再被报告成默认 2ms 总预算已经耗尽。
+
+形成完整共同计划后，规划器用该路径 `begin` 与成功 `advance` 的实际墙钟耗时，
+加上原配置中搜索截止与回放截止之间的余量，预留最终复验时间。同一事务只会
+收紧可选搜索截止；没有完整计划时不会提前终止构造。这个估计不保证复验一定
+来得及，最终仍须重新回放并通过真实时钟与提交前检查。审计中的
+`measured_replay_work_ns`、`replay_reserve_ns` 和 `replay_reserve_stops` 分别记录
+完整路径耗时高水位、预留量和因此提前停止探索的次数。`phase=Finalization`
+包含统一排序、独立回放及末端检查，不能据此把全部耗时归因于执行形状投影。
 
 `output_length_policy` 还接受 `statistical-capacity`，但启用统计容量需要独立校准证据；
 单纯选择枚举不能建立覆盖率。输出总预算必须容纳 `max_active_requests` 个请求的

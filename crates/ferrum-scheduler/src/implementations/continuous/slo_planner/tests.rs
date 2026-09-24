@@ -19,6 +19,7 @@ mod lazy_search;
 mod ordering;
 mod output;
 mod recovery;
+mod replay_budget;
 mod replayed_first_wave;
 mod resolver;
 mod resources;

@@ -204,8 +204,10 @@ pub struct SloPlannerConfig {
     /// Complete whole-wave cost alternatives. Independent of candidate count.
     pub max_shape_alternatives: NonZeroUsize,
     pub max_planning_us: NonZeroU64,
-    /// Optional exploration stops at this percentage of the original planning
-    /// transaction once a complete shared witness exists. Never a fresh budget.
+    /// Ceiling for optional exploration as a percentage of the original
+    /// transaction. Complete-path replay work may stop it earlier; the gap to
+    /// the planner endpoint remains configured finalization slack, not a
+    /// measured time bound. Never a fresh budget.
     pub search_budget_percent: u8,
     /// Reserve the final part of that same transaction for engine resource,
     /// route and output revalidation/publication, after the planner's replay.
