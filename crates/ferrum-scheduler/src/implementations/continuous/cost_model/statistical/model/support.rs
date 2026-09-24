@@ -42,7 +42,7 @@ pub(super) struct Support {
 }
 impl Support {
     pub(super) fn new(points: impl Iterator<Item = [u64; AXES]>) -> Result<Self, ModelUnknown> {
-        let points: Vec<_> = points.collect();
+        let mut points: Vec<_> = points.collect();
         if points.is_empty() || points.len() > 4096 {
             return Err(ModelUnknown::Capacity);
         }
@@ -54,6 +54,28 @@ impl Support {
                 maximum[i] = maximum[i].max(p[i]);
             }
         }
+        // Freeze an equivalent upper skyline once, outside prediction. If an
+        // observed point p is dominated by another observed point m, every
+        // query supported by p is also supported by m. Keep the original lower
+        // bounds: deriving them from the skyline would reject valid queries.
+        // Descending lexicographic order puts every possible dominator before
+        // its dominated points, so retained points never need to be removed.
+        // No coordinate-wise synthetic point is constructed. Sample counts,
+        // fitting, residuals, raw evidence and expiry remain independent of this
+        // lookup index. The original 4096-point bound is checked above pruning.
+        points.sort_unstable_by(|a, b| b.cmp(a));
+        let mut retained = 0;
+        for next in 0..points.len() {
+            let point = points[next];
+            if !points[..retained]
+                .iter()
+                .any(|upper| point.iter().zip(upper).all(|(p, u)| p <= u))
+            {
+                points[retained] = point;
+                retained += 1;
+            }
+        }
+        points.truncate(retained);
         Ok(Self {
             minimum,
             maximum,
@@ -73,3 +95,6 @@ impl Support {
                 .any(|p| query.iter().zip(p).all(|(q, p)| q <= p))
     }
 }
+
+#[cfg(test)]
+mod tests;
