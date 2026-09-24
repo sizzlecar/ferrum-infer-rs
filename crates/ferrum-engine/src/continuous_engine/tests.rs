@@ -11847,6 +11847,84 @@ fn response_completion_boundary_preserves_ignore_eos() {
 }
 
 #[test]
+fn top_k_one_full_logits_rejects_non_finite_threshold() {
+    // Exercise the actual sequence processor chain, not TopKProcessor alone.
+    // The second case starts with finite logits: a valid repetition reward
+    // overflows the repeated maximum before top-k applies its threshold.
+    for (logits, penalty) in [([f32::INFINITY, 1.0], 1.0), ([f32::MAX, 1.0], 0.5)] {
+        let mut request = policy_request();
+        request.sampling_params.top_k = Some(1);
+        request.sampling_params.repetition_penalty = penalty;
+        let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
+        state.generated_tokens.push(TokenId::new(0));
+        state.sampling_history.record(TokenId::new(0));
+        assert!(matches!(
+            state.model_decode_logits_policy(),
+            LogitsReturnPolicy::FullLogits
+        ));
+
+        let mut filtered = logits;
+        let error = state
+            .sample_and_commit_with_processors(&mut filtered)
+            .unwrap_err();
+        assert!(error.to_string().contains("no finite token"));
+        assert_eq!(filtered, [f32::INFINITY, f32::NEG_INFINITY]);
+        assert_eq!(state.generated_tokens, [TokenId::new(0)]);
+
+        let mut unfiltered_request = policy_request();
+        unfiltered_request.sampling_params.repetition_penalty = penalty;
+        let mut unfiltered = SequenceState::new(unfiltered_request, vec![TokenId::new(0)]);
+        unfiltered.generated_tokens.push(TokenId::new(0));
+        unfiltered.sampling_history.record(TokenId::new(0));
+        let mut unfiltered_logits = logits;
+        assert_eq!(
+            unfiltered
+                .sample_and_commit_with_processors(&mut unfiltered_logits)
+                .unwrap(),
+            TokenId::new(1),
+            "skipping top-k changes failure into a finite-token selection"
+        );
+    }
+}
+
+#[test]
+fn top_k_one_full_logits_preserves_signed_zero_greedy_order() {
+    let mut request = policy_request();
+    request.sampling_params.top_k = Some(1);
+    let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
+    let mut logits = [-0.0_f32, 0.0_f32];
+
+    assert_eq!(
+        state
+            .sample_and_commit_with_processors(&mut logits)
+            .unwrap(),
+        TokenId::new(1),
+        "CPU greedy uses total_cmp: positive zero outranks negative zero"
+    );
+    assert_eq!(logits[0].to_bits(), (-0.0_f32).to_bits());
+    assert_eq!(logits[1].to_bits(), 0.0_f32.to_bits());
+}
+
+#[test]
+fn top_k_one_full_logits_applies_repetition_before_threshold_and_keeps_ties() {
+    let mut request = policy_request();
+    request.sampling_params.top_k = Some(1);
+    request.sampling_params.repetition_penalty = 2.0;
+    let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
+    state.generated_tokens.push(TokenId::new(0));
+    state.sampling_history.record(TokenId::new(0));
+    let mut logits = [4.0_f32, 3.0, 3.0];
+
+    assert_eq!(
+        state
+            .sample_and_commit_with_processors(&mut logits)
+            .unwrap(),
+        TokenId::new(1)
+    );
+    assert_eq!(logits, [f32::NEG_INFINITY, 3.0, 3.0]);
+}
+
+#[test]
 fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         4,
