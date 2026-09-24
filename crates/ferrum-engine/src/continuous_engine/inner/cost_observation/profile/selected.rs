@@ -142,16 +142,30 @@ pub(super) fn predict(
                 input.family_signature_for(snapshot.model.selected_family())?,
             )
         });
-    match result {
-        Ok(value) => Some(PlanningCost {
+    let result = result.and_then(|value| {
+        Ok(PlanningCost {
             typical_ns: value.fitted_ns,
             planning_ns: value.planning_ns,
             model_version: version,
             // Imported model timestamps have an anchored epoch, never local now.
             valid_for_ns: value
                 .valid_until_ns
-                .checked_sub(snapshot.model.clock.model_now_ns(now_ns).ok()?)?,
-        }),
+                .checked_sub(
+                    snapshot
+                        .model
+                        .clock
+                        .model_now_ns(now_ns)
+                        .map_err(|_| ModelUnknown::Clock)?,
+                )
+                .ok_or(ModelUnknown::Clock)?,
+        })
+    });
+    super::super::query_metrics::record(
+        super::super::query_metrics::QueryScope::Candidate,
+        &result,
+    );
+    match result {
+        Ok(value) => Some(value),
         Err(reason) => {
             tracing::trace!(?reason, kind = ?shape.kind, decode_kv_tokens = ?shape.decode_kv_tokens,
                 prefill_chunks = ?shape.prefill_chunks, "SLO candidate has no selected whole-wave cost prediction");

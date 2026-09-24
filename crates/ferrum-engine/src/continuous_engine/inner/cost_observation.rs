@@ -31,6 +31,7 @@ pub(in crate::continuous_engine::inner) use profile_export::selected::SelectedCa
 pub use profile_export::selected::SelectedFitFreezeReceipt;
 pub(in crate::continuous_engine) use profile_export::{CostProfileCutPaths, CostProfileCutReceipt};
 mod publication;
+mod query_metrics;
 mod runtime;
 mod trainer;
 mod worker;

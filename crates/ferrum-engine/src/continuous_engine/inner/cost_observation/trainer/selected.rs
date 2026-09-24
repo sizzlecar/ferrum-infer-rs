@@ -67,6 +67,14 @@ pub(super) fn evaluate(
             "retrospective complete selected wave comparison; not pre-submit or visible SLO");
         Ok(compared)
     });
+    if let Some(result) = &prediction {
+        // Only validated complete actual-wave queries with a published model
+        // participate. Missing/partial calls retain their separate funnel counts.
+        super::super::query_metrics::record(
+            super::super::query_metrics::QueryScope::RetrospectiveActual,
+            result,
+        );
+    }
     if let Some(Err(reason)) = &prediction {
         tracing::trace!(target: "ferrum::selected_serving_audit", accepted_ordinal,
             call_id = actual.call_id, ?reason,
