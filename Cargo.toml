@@ -43,7 +43,7 @@ edition = "2021"
 authors = ["Ferrum Team"]
 license = "MIT"
 repository = "https://github.com/sizzlecar/ferrum-infer-rs"
-homepage = "https://github.com/sizzlecar/ferrum-infer-rs"
+homepage = "https://ferrum.pandaailabs.com"
 
 [workspace.dependencies]
 # Async runtime

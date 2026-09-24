@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "CLI for Ferrum — a Rust-native LLM inference engine"
 readme = "../../README.md"
 

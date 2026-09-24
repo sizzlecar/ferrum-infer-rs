@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "KV cache management with PagedAttention for Ferrum inference"
 readme = "../../README.md"
 

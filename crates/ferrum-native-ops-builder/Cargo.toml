@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Isolated source-build and packaging tools for Ferrum native operators"
 
 [dependencies]

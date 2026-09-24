@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Unified compute kernels (CUDA/Metal/CPU) and model runner for Ferrum inference"
 readme = "../../README.md"
 
