@@ -16,33 +16,26 @@ pub(in crate::continuous_engine) use calibration_capture::*;
 mod checkpoint;
 pub(in crate::continuous_engine) use checkpoint::FrozenCostCheckpoint;
 mod clock;
-mod dispatch;
-mod engine;
 mod host_stages;
 pub use host_stages::{
     HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,
     HostStageQueueReceipt, HostStageWork, HostTerminalStageV1,
 };
 pub(in crate::continuous_engine) use host_stages::{HostSettledReceipt, PendingHostRow};
-mod policy;
 mod profile;
 mod profile_export;
 pub(in crate::continuous_engine::inner) use profile_export::selected::SelectedCalibrationCapture;
 pub use profile_export::selected::SelectedFitFreezeReceipt;
 pub(in crate::continuous_engine) use profile_export::{CostProfileCutPaths, CostProfileCutReceipt};
-mod publication;
 mod runtime;
 mod trainer;
 mod worker;
-pub(in crate::continuous_engine) use engine::*;
 pub(in crate::continuous_engine) use runtime::*;
 mod sample;
 mod sink;
 pub(in crate::continuous_engine) use clock::*;
 pub(in crate::continuous_engine) use sink::*;
 
-#[cfg(test)]
-mod leaf_tests;
 #[cfg(test)]
 pub(in crate::continuous_engine::inner) mod tests;
 

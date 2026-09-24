@@ -5,6 +5,7 @@ use ferrum_interfaces::vnext::DynamicBackingPressure;
 
 mod batch;
 mod completion;
+pub(super) mod cost_observation;
 mod decode;
 mod mixed;
 mod prefill;

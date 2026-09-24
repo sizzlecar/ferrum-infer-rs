@@ -237,6 +237,8 @@ impl SequenceSamplingHistory {
 /// State of a running sequence in the continuous batch.
 #[derive(Debug)]
 pub struct SequenceState {
+    /// Passive cost evidence only. Never used as scheduler or physical authority.
+    pub(super) cost_frontier: Option<inner::cost_observation::CostFrontier>,
     pub request_id: RequestId,
     /// Original request — kept for re-submission after preemption.
     pub original_request: InferenceRequest,
@@ -820,6 +822,7 @@ impl SequenceState {
             (Instant::now(), None)
         };
         Ok(Self {
+            cost_frontier: None,
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,

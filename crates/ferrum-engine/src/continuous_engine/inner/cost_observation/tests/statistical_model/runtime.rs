@@ -16,6 +16,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_terminal(true)
+    }
+    fn with_terminal(terminal: bool) -> Self {
         let config = SloCostObservationConfig {
             profile_import: ferrum_types::SloCostProfileImportConfig {
                 declared_local_clock_max_error_ns: Some(0),
@@ -27,7 +30,7 @@ impl Fixture {
         let queue = sink(4, 32);
         let samples: Vec<_> = (0..16)
             .map(|_| {
-                let (ordinal, entry) = recorded_with(&ids, &queue);
+                let (ordinal, entry, _) = recorded_case(&ids, &queue, terminal, 0, 0);
                 super::super::super::trainer::whole_wave_observation(&entry, ordinal, [7; 32])
                     .unwrap()
             })
@@ -202,3 +205,6 @@ fn selected_runtime_requires_explicit_protocol_identity_and_clock() {
         .declared_local_clock_max_error_ns = None;
     assert!(fixture.build(clock).is_err());
 }
+
+#[path = "runtime/serving_audit.rs"]
+mod serving_audit;
