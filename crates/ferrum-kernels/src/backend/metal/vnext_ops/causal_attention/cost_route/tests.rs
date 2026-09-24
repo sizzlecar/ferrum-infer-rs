@@ -391,3 +391,27 @@ fn grouped_page_proof_keeps_real_allocation_offset_alias_boundaries() {
         range(1, 128, 128)
     ]));
 }
+
+#[test]
+fn independent_rows_v2_requires_mixed_single_token_fp16_routes_and_real_page_proof() {
+    let s = shape(true);
+    let c = caps(ElementType::F16);
+    let direct = row_params(s, 1, 100, 101, c).unwrap();
+    let grouped = row_params(s, 1, 300, 301, c).unwrap();
+    assert!(c.may_group_independent_decode_rows([direct, grouped, direct].iter()));
+    assert!(!c.may_group_independent_decode_rows([direct, direct].iter()));
+    assert!(!c.may_group_independent_decode_rows([grouped, grouped].iter()));
+    assert!(!c.may_group_independent_decode_rows([direct].iter()));
+    assert!(!caps(ElementType::I8).may_group_independent_decode_rows([direct, grouped].iter()));
+    let prefill = row_params(s, 2, 100, 102, c).unwrap();
+    assert!(!c.may_group_independent_decode_rows([prefill, grouped].iter()));
+    let work = [row(100, 1), row(300, 1)];
+    assert_eq!(
+        projected_pages_are_disjoint(s, &work, &[direct, grouped], c, None).unwrap(),
+        None
+    );
+    // The new missing passive proof must not make the old exact route Unknown.
+    assert!(route(s, &work, true, c).is_some());
+    // Alias/unknown-domain negative cases are exercised by the existing actual
+    // and projected shared pages_are_disjoint tests immediately above.
+}

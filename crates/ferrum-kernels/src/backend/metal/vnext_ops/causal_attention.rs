@@ -1699,6 +1699,17 @@ fn encode_attention(
                 )
             }),
         );
+    let independent_rows = packed_enabled
+        && !batched_grouped
+        && cost_route::Capabilities::from(attention.as_ref())
+            .may_group_independent_decode_rows(launches.iter().map(|v| &v.params))
+        && retained_pages_are_disjoint(launches.iter().map(|launch| {
+            (
+                &launch.params,
+                &regions[launch.first_page_region..launch.first_page_region + launch.page_count],
+                launch.scale_page_count,
+            )
+        }));
     let grouped_decode_reductions = launches
         .iter()
         .filter(|launch| {
@@ -1776,6 +1787,7 @@ fn encode_attention(
                 .checked_add(binding_layout.required_bytes)?,
             packed,
             batched_grouped,
+            independent_rows,
             &rows,
         )
     })();
@@ -2252,6 +2264,14 @@ fn can_batch_grouped_decode<'a>(
     {
         return false;
     }
+    retained_pages_are_disjoint(participants)
+}
+
+fn retained_pages_are_disjoint<'a>(
+    participants: impl ExactSizeIterator<
+        Item = (&'a CausalAttentionParams, &'a [MetalBufferRegion], usize),
+    >,
+) -> bool {
     let mut pages = Vec::new();
     for (_, participant_pages, scale_page_count) in participants {
         if scale_page_count != 0 {

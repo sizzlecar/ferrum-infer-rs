@@ -320,3 +320,5 @@ fn numerical_and_layout_contracts_are_part_of_algorithm_identity() {
         Err(StatisticalEvidenceUnknown::MissingProducer)
     );
 }
+
+mod independent_rows;

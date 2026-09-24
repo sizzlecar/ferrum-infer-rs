@@ -6,12 +6,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 mod command;
+mod independent_rows;
 mod wave;
 mod wire;
 pub use command::*;
 pub(in crate::execution_cost) use wave::StatisticalWaveAccumulator;
-pub use wave::{CanonicalStatisticalWave, StatisticalWaveEvidenceV1};
-pub use wire::StatisticalWaveEvidenceWireV1;
+pub use wave::{
+    CanonicalStatisticalWave, IndependentAttentionWaveEvidenceV2, StatisticalWaveEvidenceV1,
+};
+pub use wire::{IndependentAttentionWaveEvidenceWireV2, StatisticalWaveEvidenceWireV1};
 #[cfg(test)]
 mod tests;
 

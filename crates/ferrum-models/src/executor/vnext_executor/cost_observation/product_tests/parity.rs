@@ -410,3 +410,5 @@ async fn future_metal_product_full_canonical_partial_final_decode_and_mixed() {
 }
 
 mod grouped;
+
+mod independent_rows;

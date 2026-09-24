@@ -33,6 +33,29 @@ impl From<&MetalCausalAttentionPipelines> for Capabilities {
 }
 
 impl Capabilities {
+    /// Only the heterogeneous per-row Direct/Grouped decode chain is in the
+    /// empirical exchangeability hypothesis. This never selects a kernel and
+    /// still requires the caller's actual/projected page independence proof.
+    pub(super) fn may_group_independent_decode_rows<'a>(
+        self,
+        rows: impl ExactSizeIterator<Item = &'a CausalAttentionParams>,
+    ) -> bool {
+        if self.kv_type != ElementType::F16 || rows.len() < 2 {
+            return false;
+        }
+        let (mut direct, mut grouped) = (false, false);
+        for row in rows {
+            if row.tokens != 1 {
+                return false;
+            }
+            match self.dispatch_plan(row).kind {
+                AttentionDispatchKind::DirectDecode => direct = true,
+                AttentionDispatchKind::GroupedDecode => grouped = true,
+                _ => return false,
+            }
+        }
+        direct && grouped
+    }
     pub(super) fn simdgroups(self, context: u64) -> u32 {
         self.maximum_attention_simdgroups
             .min(u32::try_from(context).unwrap_or(u32::MAX).max(1))
@@ -381,47 +404,24 @@ fn project_selected(
         )?);
     }
     let batched_grouped = if packed && caps.may_batch_grouped(params.iter()) {
-        let Some(request) = request else {
+        let Some(disjoint) = projected_pages_are_disjoint(shape, rows, &params, caps, request)?
+        else {
             return Ok(None);
         };
-        let mut pages = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            let end = row
-                .offset
-                .checked_add(row.count.get())
-                .ok_or("causal cost context overflow")?;
-            let Some(mut participant_pages) = request
-                .binding_sequence_ranges(
-                    ResolvedValueRole::Input,
-                    8,
-                    index,
-                    shape.physical_state_bytes_with_type(end, caps.kv_type)?,
-                    VNEXT_KV_PAGE_BYTES,
-                )
-                .map_err(|e| e.to_string())?
-            else {
-                return Ok(None);
-            };
-            if participant_pages
-                .iter()
-                .any(|range| range.allocation_id().is_none())
-            {
-                return Ok(None);
-            }
-            if participant_pages
-                .iter()
-                .map(|p| p.length() / VNEXT_KV_PAGE_BYTES)
-                .sum::<u64>()
-                != u64::from(params[index].page_count)
-            {
-                return Ok(None);
-            }
-            pages.append(&mut participant_pages);
-        }
-        pages_are_disjoint(&mut pages)
+        disjoint
     } else {
         false
     };
+    // Failure of the additional passive proof cannot narrow the existing
+    // exact route. Without it V2 retains this command's ordered family.
+    let independent_rows = statistics.is_some()
+        && packed
+        && !batched_grouped
+        && caps.may_group_independent_decode_rows(params.iter())
+        && projected_pages_are_disjoint(shape, rows, &params, caps, request)
+            .ok()
+            .flatten()
+            == Some(true);
     let layout = ScratchLayout::new_with_storage(shape, total, rows.len(), caps.kv_type)?;
     let mut extra = if packed {
         projection_extra(projected_launches(shape, weights, layout, 0, total)?)?
@@ -500,6 +500,7 @@ fn project_selected(
                 layout.required_bytes.checked_add(binding.required_bytes)?,
                 packed,
                 batched_grouped,
+                independent_rows,
                 &projected,
             )
         })();
@@ -510,6 +511,55 @@ fn project_selected(
         }
     }
     Ok(Some(commands))
+}
+
+/// Reads the same real page extents used by actual batching. Missing evidence
+/// stays missing; sequence identity is never used as an alias proof.
+fn projected_pages_are_disjoint(
+    shape: CausalAttentionShape,
+    rows: &[OperationCostWorkRow],
+    params: &[CausalAttentionParams],
+    caps: Capabilities,
+    request: Option<&OperationCostRouteRequest<'_>>,
+) -> Result<Option<bool>, String> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let mut pages = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let end = row
+            .offset
+            .checked_add(row.count.get())
+            .ok_or("causal cost context overflow")?;
+        let Some(mut participant_pages) = request
+            .binding_sequence_ranges(
+                ResolvedValueRole::Input,
+                8,
+                index,
+                shape.physical_state_bytes_with_type(end, caps.kv_type)?,
+                VNEXT_KV_PAGE_BYTES,
+            )
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        if participant_pages
+            .iter()
+            .any(|range| range.allocation_id().is_none())
+        {
+            return Ok(None);
+        }
+        if participant_pages
+            .iter()
+            .map(|p| p.length() / VNEXT_KV_PAGE_BYTES)
+            .sum::<u64>()
+            != u64::from(params[index].page_count)
+        {
+            return Ok(None);
+        }
+        pages.append(&mut participant_pages);
+    }
+    Ok(Some(pages_are_disjoint(&mut pages)))
 }
 
 /// Same whole-page exclusion as actual grouped dispatch, including aliases

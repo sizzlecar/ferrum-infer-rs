@@ -118,3 +118,50 @@ fn causal_batched_real_pso_metadata_keeps_heterogeneous_partition_work() {
     let invalid = [rows[0], params(2, 1088)];
     assert!(batched(&mut b, &a, invalid.iter(), 4096).is_none());
 }
+
+#[test]
+fn independent_rows_v2_real_psos_keep_internal_reduction_and_ordered_v1() {
+    let device = Device::system_default().expect("actual Metal causal PSO catalog");
+    let a = MetalCausalAttentionPipelines::new(&device).unwrap();
+    let d = params(1, 100);
+    let g = params(1, 300);
+    assert_eq!(
+        a.dispatch_plan(&d).kind,
+        AttentionDispatchKind::DirectDecode
+    );
+    assert_eq!(
+        a.dispatch_plan(&g).kind,
+        AttentionDispatchKind::GroupedDecode
+    );
+    let build = |rows: &[CausalAttentionParams], independent: bool| {
+        let mut b = SelectedCommandCostBuilderV1::new(rows.len() as u64);
+        let mut emit = |b: &mut SelectedCommandCostBuilderV1, row: &CausalAttentionParams| {
+            prepare(b, row, 4096)
+                .and_then(|()| attention(b, &a, row, 4096))
+                .ok_or(StatisticalEvidenceUnknown::MissingProducer)
+        };
+        if independent {
+            b.independent_attention_rows_v2(rows.iter(), emit).unwrap();
+        } else {
+            for row in rows {
+                emit(&mut b, row).unwrap();
+            }
+        }
+        b.finish().unwrap()
+    };
+    let dgd = build(&[d, g, d], true);
+    let gdd = build(&[g, d, d], true);
+    let old = build(&[d, g, d], false);
+    dgd.validate_command(3, 7, 0).unwrap();
+    assert_eq!(dgd, old);
+    assert_ne!(dgd.family_signature(), gdd.family_signature());
+    assert_eq!(dgd.work(), gdd.work());
+    assert_eq!(
+        dgd.independent_attention_family_v2(),
+        gdd.independent_attention_family_v2()
+    );
+    assert_ne!(
+        dgd.independent_attention_family_v2(),
+        old.independent_attention_family_v2()
+    );
+}

@@ -3,7 +3,7 @@ use super::*;
 /// Complete selected sub-work of ONE actual or projected physical command.
 /// Private fields prevent independent mutation of its family/work/counts.
 /// Only serialization is provided: old profiles cannot deserialize/invent it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SelectedCommandCostEvidenceV1 {
     schema_version: u32,
     family_signature: [u8; 32],
@@ -11,8 +11,25 @@ pub struct SelectedCommandCostEvidenceV1 {
     compute_dispatches: u64,
     transfer_commands: u64,
     work: DeviceNumericWorkV1,
+    /// The old wire never exports a new empirical family implicitly.
+    #[serde(skip)]
+    independent_attention_family_v2: Option<[u8; 32]>,
 }
+impl PartialEq for SelectedCommandCostEvidenceV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.family_signature == other.family_signature
+            && self.token_count == other.token_count
+            && self.compute_dispatches == other.compute_dispatches
+            && self.transfer_commands == other.transfer_commands
+            && self.work == other.work
+    }
+}
+impl Eq for SelectedCommandCostEvidenceV1 {}
 impl SelectedCommandCostEvidenceV1 {
+    pub fn independent_attention_family_v2(&self) -> Option<&[u8; 32]> {
+        self.independent_attention_family_v2.as_ref()
+    }
     pub fn family_signature(&self) -> &[u8; 32] {
         &self.family_signature
     }
@@ -41,6 +58,7 @@ impl SelectedCommandCostEvidenceV1 {
 /// be completed by defaulting unknown kernels to zero work. Errors are sticky.
 pub struct SelectedCommandCostBuilderV1 {
     family: Sha256,
+    independent: super::independent_rows::IndependentRowsDigest,
     tokens: u64,
     compute: u64,
     transfers: u64,
@@ -53,12 +71,34 @@ impl SelectedCommandCostBuilderV1 {
         bytes(&mut family, b"ferrum.selected-command-cost.v1");
         Self {
             family,
+            independent: super::independent_rows::IndependentRowsDigest::Ordered,
             tokens: token_count,
             compute: 0,
             transfers: 0,
             work: DeviceNumericWorkV1::default(),
             failure: None,
         }
+    }
+    /// Declare one compute-only group of complete, independent attention row
+    /// blocks. The provider must establish actual/future address independence
+    /// and the same packed decode selector before calling. This changes only
+    /// the optional V2 empirical digest; V1, numeric work and execution stay
+    /// ordered. No independence is inferred from owner IDs or kernel labels.
+    pub fn independent_attention_rows_v2<T>(
+        &mut self,
+        rows: impl ExactSizeIterator<Item = T>,
+        mut emit: impl FnMut(&mut Self, T) -> Result<(), StatisticalEvidenceUnknown>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.guard(|this| {
+            this.independent.begin(&this.family, rows.len());
+            for row in rows {
+                this.independent.begin_row();
+                emit(this, row)?;
+                this.independent.end_row();
+            }
+            this.independent.end();
+            Ok(())
+        })
     }
     fn guard(
         &mut self,
@@ -114,6 +154,7 @@ impl SelectedCommandCostBuilderV1 {
             })?;
             number(&mut this.family, 0);
             this.family.update(algorithm.0);
+            this.independent.kernel(algorithm);
             this.compute += 1;
             this.work = next;
             Ok(())
@@ -155,6 +196,7 @@ impl SelectedCommandCostBuilderV1 {
             number(&mut this.family, 1);
             this.family.update(algorithm.0);
             number(&mut this.family, tag);
+            this.independent.transfer(algorithm, tag);
             this.transfers += 1;
             this.work = next;
             Ok(())
@@ -167,9 +209,12 @@ impl SelectedCommandCostBuilderV1 {
         if self.compute + self.transfers == 0 {
             return Err(StatisticalEvidenceUnknown::MissingProducer);
         }
+        let family_signature = self.family.finalize().into();
+        let independent_attention_family_v2 = self.independent.finish(family_signature);
         Ok(SelectedCommandCostEvidenceV1 {
             schema_version: STATISTICAL_ROUTE_WORK_SCHEMA_V1,
-            family_signature: self.family.finalize().into(),
+            family_signature,
+            independent_attention_family_v2,
             token_count: self.tokens,
             compute_dispatches: self.compute,
             transfer_commands: self.transfers,

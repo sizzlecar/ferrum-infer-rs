@@ -4,7 +4,7 @@
 use super::*;
 use ferrum_interfaces::execution_cost::{
     KernelNumericWorkV1, SelectedAlgorithmClassV1, SelectedCommandCostBuilderV1,
-    SelectedCommandCostEvidenceV1,
+    SelectedCommandCostEvidenceV1, StatisticalEvidenceUnknown,
 };
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
@@ -337,6 +337,7 @@ pub(super) fn evidence(
     scratch: u64,
     packed: Option<Projection>,
     batched_grouped: bool,
+    independent_rows: bool,
     rows: &[Row],
 ) -> Option<SelectedCommandCostEvidenceV1> {
     if a.kv_type != ElementType::F16
@@ -357,10 +358,26 @@ pub(super) fn evidence(
             return None;
         }
         input(&mut b, l, p, hidden, v, scratch)?;
-        for row in rows {
-            prepare(&mut b, &row.params, scratch)?;
-            if !batched_grouped {
-                attention(&mut b, a, &row.params, scratch)?;
+        if independent_rows
+            && !batched_grouped
+            && cost_route::Capabilities::from(a)
+                .may_group_independent_decode_rows(rows.iter().map(|row| &row.params))
+        {
+            // Actual and future callers establish page independence. Only the
+            // passive V2 family is a multiset; these launches still enter V1
+            // and the native encoder in their original physical row order.
+            b.independent_attention_rows_v2(rows.iter(), |b, row| {
+                prepare(b, &row.params, scratch)
+                    .and_then(|()| attention(b, a, &row.params, scratch))
+                    .ok_or(StatisticalEvidenceUnknown::MissingProducer)
+            })
+            .ok()?;
+        } else {
+            for row in rows {
+                prepare(&mut b, &row.params, scratch)?;
+                if !batched_grouped {
+                    attention(&mut b, a, &row.params, scratch)?;
+                }
             }
         }
         if batched_grouped {

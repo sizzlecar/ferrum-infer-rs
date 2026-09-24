@@ -84,6 +84,51 @@ impl StatisticalWaveEvidenceV1 {
             family_signature: wire.family_signature,
             physical_commands: wire.physical_commands,
             work: wire.work.into(),
+            independent_attention_v2: None,
+        };
+        value.validate_exact(exact)?;
+        Ok(value)
+    }
+}
+
+/// Only explicit new capture/profile protocols may publish this sidecar. A V1
+/// ordered digest cannot reconstruct it, even if all row counters are known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentAttentionWaveEvidenceWireV2 {
+    schema_version: u32,
+    exact_binding: [u8; 32],
+    family_signature: [u8; 32],
+    physical_commands: u32,
+    work: Work,
+}
+impl IndependentAttentionWaveEvidenceV2 {
+    pub fn to_wire_v2(&self) -> IndependentAttentionWaveEvidenceWireV2 {
+        IndependentAttentionWaveEvidenceWireV2 {
+            schema_version: self.schema_version,
+            exact_binding: self.exact_binding,
+            family_signature: self.family_signature,
+            physical_commands: self.physical_commands,
+            work: self.work.into(),
+        }
+    }
+    pub fn from_wire_v2(
+        wire: IndependentAttentionWaveEvidenceWireV2,
+        exact: &CanonicalWaveCostShape,
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        if wire.family_signature == [0; 32]
+            || wire.work.padded_units < wire.work.logical_units
+            || (wire.work.logical_units > 0
+                && (wire.work.inner_work_units == 0 || wire.work.grid_blocks == 0))
+        {
+            return Err(StatisticalEvidenceUnknown::InvalidWork);
+        }
+        let value = Self {
+            schema_version: wire.schema_version,
+            exact_binding: wire.exact_binding,
+            family_signature: wire.family_signature,
+            physical_commands: wire.physical_commands,
+            work: wire.work.into(),
         };
         value.validate_exact(exact)?;
         Ok(value)
