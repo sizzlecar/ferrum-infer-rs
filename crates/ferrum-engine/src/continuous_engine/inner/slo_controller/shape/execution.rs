@@ -88,7 +88,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
             .source
             .project_domain(&self.domain, &frontiers, &rows, poll)?;
         poll()?;
-        let Some((canonical_domain, domain)) = projected else {
+        let Some((canonical_domain, statistical_evidence, domain)) = projected else {
             return Ok(None);
         };
         if (self.depth == 0 && canonical_domain.exact().is_none())
@@ -100,6 +100,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ExecutorState<'epoch> {
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
         }
         Ok(Some(ProjectedExecution {
+            statistical_evidence,
             ordered_work,
             canonical_domain,
             successor: Arc::new(ExecutorState {

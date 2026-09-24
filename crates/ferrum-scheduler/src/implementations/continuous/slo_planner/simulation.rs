@@ -105,6 +105,7 @@ pub(super) fn advance<'epoch>(
         work,
         parent.execution.as_ref(),
         parent.depth == 0,
+        model.requires_statistical_evidence(),
         poll,
     )
     .map_err(|reason| TransitionFailure {
@@ -297,7 +298,14 @@ fn apply(
     if first_wave && shape.exact().is_none() {
         return Err(PlanningUnknownReason::InvalidShapeEvidence.into());
     }
-    let cost = domain_cost(snapshot, model, shape, state.now_ns, poll_budget)?;
+    let cost = domain_cost(
+        snapshot,
+        model,
+        shape,
+        wave.cost_evidence.as_ref(),
+        state.now_ns,
+        poll_budget,
+    )?;
     state.minimum_cost_freshness_slack_ns =
         state.minimum_cost_freshness_slack_ns.min(cost.valid_for_ns);
     let end_ns = state
@@ -428,6 +436,7 @@ pub(super) fn domain_cost(
     snapshot: &SchedulerSnapshot,
     model: &dyn PlanningCostModel,
     domain: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
+    evidence: Option<&PlanningShapeDomain<PlanningCostEvidence>>,
     now_ns: u64,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<PlanningCost, PlanningUnknownReason> {
@@ -444,10 +453,26 @@ pub(super) fn domain_cost(
         model_version: snapshot.cost_model_version,
         valid_for_ns: u64::MAX,
     };
-    for shape in domain.shapes() {
+    let evidence = evidence.filter(|evidence| {
+        evidence.shapes().len() == domain.shapes().len()
+            && matches!(
+                (domain, *evidence),
+                (PlanningShapeDomain::Exact(_), PlanningShapeDomain::Exact(_))
+                    | (
+                        PlanningShapeDomain::HostContentAlternatives(_),
+                        PlanningShapeDomain::HostContentAlternatives(_)
+                    )
+            )
+    });
+    for (index, shape) in domain.shapes().iter().enumerate() {
         poll()?;
         let cost = model
-            .predict(&snapshot.fingerprint, shape, now_ns)
+            .predict_with_evidence(
+                &snapshot.fingerprint,
+                shape,
+                evidence.map(|domain| &domain.shapes()[index]),
+                now_ns,
+            )
             .ok_or(PlanningUnknownReason::CostUnavailable)?;
         poll()?;
         if cost.model_version != snapshot.cost_model_version {

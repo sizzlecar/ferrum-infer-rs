@@ -199,6 +199,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for JointState<'epoch> {
             Returned::BadRecurrent => canonical.recurrent_state_bytes += 1,
         }
         Ok(Some(ProjectedExecution {
+            statistical_evidence: None,
             ordered_work,
             canonical_domain: PlanningShapeDomain::Exact(canonical),
             successor: Arc::new(Self {
@@ -233,5 +234,7 @@ pub(super) fn project_decode<'epoch>(
             action: WaveAction::Decode,
         })
         .collect();
-    execution::project(snapshot, requests, &work, state, false, &mut || Ok(()))
+    execution::project(snapshot, requests, &work, state, false, false, &mut || {
+        Ok(())
+    })
 }

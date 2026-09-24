@@ -2,7 +2,10 @@
 //! never a guessed exact UTF-8 state. Every reachable physical/residency state
 //! survives until the configured bound; exhaustion cannot select a subset.
 use super::*;
-use ferrum_interfaces::{execution_cost::HostCostFeaturesV1, model_executor::LogitsReturnPolicy};
+use ferrum_interfaces::{
+    execution_cost::{HostCostFeaturesV1, StatisticalWaveEvidenceV1},
+    model_executor::LogitsReturnPolicy,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FutureHostMode {
@@ -121,7 +124,11 @@ impl ExecutorShape<'_> {
         prepared: &[PreparedRow],
         poll: &mut dyn FnMut() -> std::result::Result<(), PlanningUnknownReason>,
     ) -> std::result::Result<
-        Option<(PlanningShapeDomain<CanonicalWaveCostShape>, RouteDomain)>,
+        Option<(
+            PlanningShapeDomain<CanonicalWaveCostShape>,
+            Option<PlanningShapeDomain<StatisticalWaveEvidenceV1>>,
+            RouteDomain,
+        )>,
         PlanningUnknownReason,
     > {
         let Some(modes) = self.future_modes(frontiers, prepared, poll)? else {
@@ -143,6 +150,14 @@ impl ExecutorShape<'_> {
         if empirical && !self.captured.model.supports_empirical_host_content() {
             return Ok(None);
         }
+        let collect_statistics = self.captured.model.requires_statistical_evidence();
+        let mut selected = Vec::new();
+        let mut statistics_complete = collect_statistics;
+        if collect_statistics {
+            selected
+                .try_reserve_exact(count)
+                .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
+        }
         let mut shapes = Vec::new();
         let mut states = Vec::new();
         shapes
@@ -163,6 +178,12 @@ impl ExecutorShape<'_> {
                 if empirical && projected.shape.host_content_features.is_none() {
                     return Ok(None);
                 }
+                if collect_statistics {
+                    match projected.statistical_evidence {
+                        Some(evidence) => selected.push(evidence),
+                        None => statistics_complete = false,
+                    }
+                }
                 shapes.push(projected.shape);
                 states.push(projected.state);
             }
@@ -176,7 +197,24 @@ impl ExecutorShape<'_> {
                     .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?,
             )
         };
-        Ok(Some((domain, RouteDomain { states, empirical })))
+        let statistics = if statistics_complete {
+            Some(if empirical {
+                PlanningShapeDomain::HostContentAlternatives(selected)
+            } else {
+                PlanningShapeDomain::Exact(
+                    selected
+                        .pop()
+                        .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?,
+                )
+            })
+        } else {
+            None
+        };
+        Ok(Some((
+            domain,
+            statistics,
+            RouteDomain { states, empirical },
+        )))
     }
 }
 

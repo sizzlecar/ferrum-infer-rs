@@ -34,6 +34,9 @@ pub trait PlanningExecutionState<'epoch> {
 }
 
 pub struct ProjectedExecution<'epoch> {
+    /// Same ordered alternatives as canonical_domain; absence never implies legacy statistics.
+    pub statistical_evidence:
+        Option<PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
     /// Only a complete permutation of the input work is permitted.
     pub ordered_work: Vec<CandidateWork>,
     pub canonical_domain: PlanningShapeDomain<CanonicalWaveCostShape>,
@@ -147,6 +150,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for BoundedState<'epoch> {
             return Err(PlanningUnknownReason::ShapeCapacity);
         }
         Ok(Some(ProjectedExecution {
+            statistical_evidence: projected.statistical_evidence,
             ordered_work: projected.ordered_work,
             canonical_domain: projected.canonical_domain,
             successor: Arc::new(Self {
@@ -164,6 +168,7 @@ pub(super) fn project<'epoch>(
     work: &[CandidateWork],
     state: &dyn PlanningExecutionState<'epoch>,
     retain_first_canonical: bool,
+    collect_statistics: bool,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
     let mut failure = None;
@@ -212,6 +217,16 @@ pub(super) fn project<'epoch>(
         &projected.canonical_domain,
         poll,
     )?;
+    let cost_evidence = if collect_statistics {
+        bind_statistics(
+            &projected.canonical_domain,
+            &execution_shape,
+            projected.statistical_evidence.as_ref(),
+            poll,
+        )?
+    } else {
+        None
+    };
     // Retain only the first exact edge, not every future alternative. Moving
     // its validated value preserves the provider result without cloning vectors.
     let first_canonical = if retain_first_canonical {
@@ -225,6 +240,7 @@ pub(super) fn project<'epoch>(
     Ok(Some(VerifiedExecution {
         first_canonical,
         wave: WaveCandidate {
+            cost_evidence,
             work: projected.ordered_work,
             execution_shape,
             based_on_generation: snapshot.generation,
@@ -311,6 +327,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
             poll,
         )?;
         let wave = WaveCandidate {
+            cost_evidence: None,
             work: work.clone(),
             execution_shape,
             based_on_generation: self.snapshot.generation,
@@ -342,6 +359,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
         let mut prefix = self.prefix.clone();
         prefix.push((wave, input.requests.to_vec()));
         Ok(Some(ProjectedExecution {
+            statistical_evidence: None,
             ordered_work: work,
             canonical_domain,
             successor: Arc::new(Self {
@@ -351,4 +369,64 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
             }),
         }))
     }
+}
+
+pub(super) fn bind_statistics(
+    canonical: &PlanningShapeDomain<CanonicalWaveCostShape>,
+    shapes: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
+    statistics: Option<
+        &PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    >,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<Option<PlanningShapeDomain<PlanningCostEvidence>>, PlanningUnknownReason> {
+    let Some(statistics) = statistics else {
+        return Ok(None);
+    };
+    // Domain variants and every ordered alternative must correspond. A partial
+    // producer cannot shrink the physical alternatives to a supported subset.
+    let same_variant = matches!(
+        (canonical, shapes, statistics),
+        (
+            PlanningShapeDomain::Exact(_),
+            PlanningShapeDomain::Exact(_),
+            PlanningShapeDomain::Exact(_)
+        ) | (
+            PlanningShapeDomain::HostContentAlternatives(_),
+            PlanningShapeDomain::HostContentAlternatives(_),
+            PlanningShapeDomain::HostContentAlternatives(_)
+        )
+    );
+    if !same_variant
+        || canonical.shapes().len() != statistics.shapes().len()
+        || shapes.shapes().len() != statistics.shapes().len()
+    {
+        return Ok(None);
+    }
+    let mut evidence = Vec::new();
+    evidence
+        .try_reserve_exact(shapes.shapes().len())
+        .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
+    for ((exact, shape), selected) in canonical
+        .shapes()
+        .iter()
+        .zip(shapes.shapes())
+        .zip(statistics.shapes())
+    {
+        poll()?;
+        let Some(bound) = PlanningCostEvidence::bind(exact, shape, selected) else {
+            return Ok(None);
+        };
+        evidence.push(bound);
+    }
+    poll()?;
+    Ok(Some(match canonical {
+        PlanningShapeDomain::Exact(_) => PlanningShapeDomain::Exact(
+            evidence
+                .pop()
+                .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?,
+        ),
+        PlanningShapeDomain::HostContentAlternatives(_) => {
+            PlanningShapeDomain::HostContentAlternatives(evidence)
+        }
+    }))
 }

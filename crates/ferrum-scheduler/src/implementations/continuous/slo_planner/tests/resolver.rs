@@ -16,6 +16,7 @@ impl PlanningShapeResolver for TestResolver {
         let mut builder = CanonicalWaveCostBuilder::new(0, CostProductOutput::FullLogits);
         builder
             .physical_command(CostPhysicalCommand {
+                statistical_evidence: None,
                 native_op_id: "fixture.wave",
                 command_index: 0,
                 node_index: None,
@@ -371,6 +372,7 @@ fn canonical_and_actual_conversion_preserve_the_identical_cost_key() {
         .unwrap()
         .unwrap();
     let actual = ActualWaveShape {
+        statistical_evidence: None,
         numeric_features: canonical.numeric_features.clone(),
         row_multiset_features: canonical.row_multiset_features.clone(),
         host_content_features: canonical.host_content_features,

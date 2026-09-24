@@ -227,7 +227,7 @@ fn host_domain_budget_is_checked_between_each_cost_lookup() {
     let domain = PlanningShapeDomain::HostContentAlternatives(vec![shape, second]);
     let model = model();
     let polls = Cell::new(0);
-    let result = simulation::domain_cost(&s, &model, &domain, 100, &mut || {
+    let result = simulation::domain_cost(&s, &model, &domain, None, 100, &mut || {
         polls.set(polls.get() + 1);
         if polls.get() == 3 {
             Err(PlanningUnknownReason::ComputeBudgetExhausted)

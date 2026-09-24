@@ -323,7 +323,7 @@ impl PlanningShapeResolver for ExecutorShape<'_> {
                 return Err(PlanningUnknownReason::InvalidShapeEvidence);
             }
             let prepared = frontiers.prepare(&prior.work, poll)?;
-            let Some((shapes, next)) =
+            let Some((shapes, _, next)) =
                 self.project_domain(&state, frontiers.requests(), &prepared.rows, poll)?
             else {
                 return Ok(None);
@@ -362,7 +362,9 @@ impl PlanningShapeResolver for ExecutorShape<'_> {
         }
         let projected = self.project_domain(&state, frontiers.requests(), &prepared.rows, poll)?;
         match projected {
-            Some((shapes, _)) if shapes.shapes().iter().all(|shape| shape.kind == query.kind) => {
+            Some((shapes, _, _))
+                if shapes.shapes().iter().all(|shape| shape.kind == query.kind) =>
+            {
                 Ok(Some(shapes))
             }
             Some(_) => Err(PlanningUnknownReason::InvalidShapeEvidence),

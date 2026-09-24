@@ -405,12 +405,58 @@ pub struct CandidateWork {
     pub action: WaveAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct WaveCandidate {
+    /// Passive, per-alternative statistics; never resource/execution permission.
+    pub cost_evidence: Option<PlanningShapeDomain<PlanningCostEvidence>>,
     pub work: Vec<CandidateWork>,
     pub execution_shape: PlanningShapeDomain<WaveExecutionShape>,
     pub based_on_generation: u64,
     pub cost_model_version: u64,
+}
+
+// Optional statistics do not redefine the old executable candidate identity.
+impl PartialEq for WaveCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.work == other.work
+            && self.execution_shape == other.execution_shape
+            && self.based_on_generation == other.based_on_generation
+            && self.cost_model_version == other.cost_model_version
+    }
+}
+impl Eq for WaveCandidate {}
+
+/// Privately bound to one validated canonical alternative. The expected shape
+/// prevents a caller from rejoining a valid sidecar to different logical work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningCostEvidence {
+    expected: WaveExecutionShape,
+    input: super::super::cost_model::statistical::StatisticalModelInputV1,
+}
+impl PlanningCostEvidence {
+    pub(super) fn bind(
+        exact: &CanonicalWaveCostShape,
+        expected: &WaveExecutionShape,
+        selected: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+    ) -> Option<Self> {
+        if super::cost_shape::canonical_cost_shape(exact).ok().as_ref() != Some(expected) {
+            return None;
+        }
+        let input = super::super::cost_model::statistical::StatisticalModelInputV1::from_future(
+            exact, selected,
+        )
+        .ok()?;
+        Some(Self {
+            expected: expected.clone(),
+            input,
+        })
+    }
+    pub fn input_for(
+        &self,
+        shape: &WaveExecutionShape,
+    ) -> Option<&super::super::cost_model::statistical::StatisticalModelInputV1> {
+        (shape == &self.expected).then_some(&self.input)
+    }
 }
 
 /// An exact physical route, or the complete finite set of possible whole-wave
@@ -540,6 +586,25 @@ pub struct PlanningCost {
 }
 
 pub trait PlanningCostModel {
+    /// New predictors explicitly require producer-bound selected statistics.
+    /// The legacy callback remains unchanged for all existing implementations.
+    fn requires_statistical_evidence(&self) -> bool {
+        false
+    }
+    fn predict_with_evidence(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        shape: &WaveExecutionShape,
+        _evidence: Option<&PlanningCostEvidence>,
+        now_ns: u64,
+    ) -> Option<PlanningCost> {
+        if self.requires_statistical_evidence() {
+            None
+        } else {
+            self.predict(fingerprint, shape, now_ns)
+        }
+    }
+
     fn model_version(&self) -> u64;
     /// Only an explicitly calibrated whole-wave host-content model may consume
     /// hypothetical content branches. Legacy exact/numeric models cannot.

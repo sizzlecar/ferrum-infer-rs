@@ -152,6 +152,7 @@ pub(super) fn enumerate(
             break;
         }
         result.waves.push(WaveCandidate {
+            cost_evidence: None,
             work,
             execution_shape,
             based_on_generation: snapshot.generation,

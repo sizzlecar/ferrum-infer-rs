@@ -613,6 +613,24 @@ impl<'a> AnchoredPlanningCostModel<'a> {
 }
 
 impl PlanningCostModel for AnchoredPlanningCostModel<'_> {
+    fn requires_statistical_evidence(&self) -> bool {
+        self.model.requires_statistical_evidence()
+    }
+    fn predict_with_evidence(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        shape: &WaveExecutionShape,
+        evidence: Option<&PlanningCostEvidence>,
+        now_ns: u64,
+    ) -> Option<PlanningCost> {
+        self.model.predict_with_evidence(
+            fingerprint,
+            shape,
+            evidence,
+            self.anchor.cost_time_ns(now_ns).ok()?,
+        )
+    }
+
     fn supports_empirical_host_content(&self) -> bool {
         self.model.supports_empirical_host_content()
     }

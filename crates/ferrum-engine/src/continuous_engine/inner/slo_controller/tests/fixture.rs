@@ -492,6 +492,7 @@ impl ControlledExecutor {
         }
         let signature: [u8; 32] = output_identity.finalize().into();
         let shape = ActualWaveShape {
+            statistical_evidence: None,
             kind: match (prefills.is_empty(), decodes.is_empty()) {
                 (true, _) => ActualWaveKind::Decode,
                 (_, true) => ActualWaveKind::Prefill,
@@ -736,6 +737,7 @@ fn trained_runtime() -> Arc<EngineCostRuntime> {
             let mut context = call.context().unwrap();
             context.physical_wave(
                 Ok(ActualWaveShape {
+                    statistical_evidence: None,
                     kind: ActualWaveKind::Decode,
                     path: ActualWavePath::PlanRuntime,
                     graph: ActualWaveGraphState::Disabled,

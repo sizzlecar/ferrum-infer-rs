@@ -22,6 +22,7 @@ mod recovery;
 mod replayed_first_wave;
 mod resolver;
 mod resources;
+mod selected_evidence;
 use resolver::TestResolver;
 
 fn n32(value: u32) -> NonZeroU32 {

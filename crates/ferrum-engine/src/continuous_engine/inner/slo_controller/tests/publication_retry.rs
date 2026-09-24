@@ -25,6 +25,7 @@ async fn expired_publication_idle_reserves_a_fresh_completion_turn() {
         final_replay_first_wave: None,
         protection: None,
         candidate: WaveCandidate {
+            cost_evidence: None,
             work: vec![CandidateWork {
                 key: captured.snapshot.requests[0].key.clone(),
                 action: WaveAction::Decode,

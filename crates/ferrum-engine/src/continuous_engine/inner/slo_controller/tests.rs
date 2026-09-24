@@ -438,6 +438,7 @@ async fn controller_publication_cannot_reset_an_expired_capture_budget() {
         final_replay_first_wave: None,
         protection: None,
         candidate: WaveCandidate {
+            cost_evidence: None,
             work: vec![CandidateWork {
                 key: captured.snapshot.requests[0].key.clone(),
                 action: WaveAction::Decode,
