@@ -80,6 +80,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             programs: BTreeMap::new(),
         })?;
         Ok(VNextReusableExecutionStartupReport {
+            workspace_preparation: None,
             enabled: true,
             supported: true,
             eager_fallback_required: true,

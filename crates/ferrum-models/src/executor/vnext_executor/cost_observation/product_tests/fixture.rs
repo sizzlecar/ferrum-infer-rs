@@ -20,6 +20,29 @@ impl Fixture {
         prefix: bool,
         geometry: weights::CausalGeometry,
     ) -> Self {
+        Self::with_workspace_preparation(
+            maximum_batch_tokens,
+            prefix,
+            geometry,
+            ferrum_types::WorkspacePreparationMode::DemandDriven,
+        )
+        .await
+    }
+    pub async fn workspace_startup() -> Self {
+        Self::with_workspace_preparation(
+            8,
+            false,
+            weights::CausalGeometry::TINY,
+            ferrum_types::WorkspacePreparationMode::Startup,
+        )
+        .await
+    }
+    async fn with_workspace_preparation(
+        maximum_batch_tokens: usize,
+        prefix: bool,
+        geometry: weights::CausalGeometry,
+        preparation: ferrum_types::WorkspacePreparationMode,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         weights::write_config(directory.path(), geometry);
         weights::write_weights(directory.path(), geometry);
@@ -29,6 +52,7 @@ impl Fixture {
         let mut engine = EngineConfig::default();
         engine.backend.device = Device::Metal;
         engine.backend.enable_reusable_execution = false;
+        engine.backend.workspace_preparation = preparation;
         engine.runtime.prefix_state_cache_enabled = prefix;
         // Keep the existing tiny product fixture capacity; the observed and
         // ordinary arms own separate executors and request lifecycles.

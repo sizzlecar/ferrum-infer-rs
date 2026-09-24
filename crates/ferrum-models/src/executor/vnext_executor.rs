@@ -80,6 +80,7 @@ mod request;
 mod resource_planning;
 mod reusable_catalog;
 mod state_memory;
+mod workspace_startup;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
@@ -543,6 +544,7 @@ pub struct VNextExecutorConfig {
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub device_reusable_execution_enabled: bool,
+    pub workspace_preparation: ferrum_types::WorkspacePreparationMode,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
@@ -805,6 +807,7 @@ impl VNextExecutorConfig {
             static_initialization,
             runtime_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
+            workspace_preparation: engine.backend.workspace_preparation,
             reusable_execution_prefill_chunks,
             reusable_execution_capture_resolution,
             diagnostic_fault,
@@ -1149,6 +1152,9 @@ struct VNextReusableExecutionCaptureCaseReceipt {
 
 #[derive(Debug, Clone, Serialize)]
 struct VNextReusableExecutionStartupReport {
+    /// Resource-only preparation; not GPU warmup, graph capture or cost samples.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_preparation: Option<workspace_startup::WorkspacePreparationReport>,
     enabled: bool,
     supported: bool,
     eager_fallback_required: bool,
@@ -4582,6 +4588,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     static_bytes: u64,
     sequence_state_memory: TypedSequenceStateMemory,
     device_reusable_execution_enabled: bool,
+    workspace_preparation: ferrum_types::WorkspacePreparationMode,
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
     reusable_execution_catalog: RwLock<Option<Arc<VNextReusableExecutionCatalog>>>,
@@ -5152,6 +5159,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             static_bytes,
             sequence_state_memory,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
+            workspace_preparation: config.workspace_preparation,
             reusable_execution_supported,
             reusable_execution_startup_plan,
             reusable_execution_catalog: RwLock::new(None),
@@ -5434,6 +5442,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 programs: BTreeMap::new(),
             })?;
             return Ok(VNextReusableExecutionStartupReport {
+                workspace_preparation: None,
                 enabled: self.device_reusable_execution_enabled,
                 supported: self.reusable_execution_supported,
                 eager_fallback_required: self.device_reusable_execution_enabled
@@ -5805,6 +5814,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         })?;
         let requested_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
+            workspace_preparation: None,
             enabled: true,
             supported: true,
             eager_fallback_required: reusable_execution_requires_eager_fallback(device_preparation)
@@ -10179,13 +10189,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             }
         }
 
-        let preparation = self
-            .prepare_reusable_execution_startup()
-            .await
-            .and_then(|report| {
-                self.reset_request_metrics_after_startup()?;
-                Ok(report)
-            });
+        let preparation: Result<VNextReusableExecutionStartupReport> = async {
+            let workspace = self.prepare_workspace_startup().await?;
+            let mut report = self.prepare_reusable_execution_startup().await?;
+            report.workspace_preparation = workspace;
+            self.reset_request_metrics_after_startup()?;
+            Ok(report)
+        }
+        .await;
         match preparation {
             Ok(report) => {
                 if let Some(capture) = &self.checkpoint_capture {

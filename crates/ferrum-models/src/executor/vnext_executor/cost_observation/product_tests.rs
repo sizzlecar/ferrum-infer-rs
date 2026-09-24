@@ -11,6 +11,7 @@ mod fixture;
 mod parity;
 mod resolver;
 mod weights;
+mod workspace_startup;
 use fixture::{assert_prefill_same, prompt, Fixture};
 
 struct Clock(AtomicU64);

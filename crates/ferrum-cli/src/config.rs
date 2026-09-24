@@ -278,6 +278,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub reusable_execution: Option<bool>,
 
+    /// Prepare declared resource buckets before readiness without model execution.
+    #[serde(default)]
+    pub workspace_preparation: Option<ferrum_types::WorkspacePreparationMode>,
+
     /// vNext preparation lifecycle: auto, startup, or on_demand.
     #[serde(default)]
     pub reusable_execution_preparation: Option<ferrum_types::ReusableExecutionPreparationMode>,
@@ -493,6 +497,12 @@ impl RuntimeCliConfig {
         );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
         push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
+        push_string_entry(
+            &mut entries,
+            "FERRUM_WORKSPACE_PREPARATION",
+            self.workspace_preparation
+                .map(|mode| mode.as_runtime_value()),
+        );
         push_bool_entry(
             &mut entries,
             "FERRUM_REUSABLE_EXECUTION",
@@ -1350,5 +1360,34 @@ mod tests {
         )
         .unwrap();
         assert!(!disabled);
+    }
+}
+
+#[cfg(test)]
+mod workspace_preparation_tests {
+    use super::*;
+    #[test]
+    fn workspace_preparation_toml_reaches_shared_engine_snapshot() {
+        let config: CliConfig = toml::from_str(
+            "[runtime]\nworkspace_preparation = 'startup'\nreusable_execution = false\n",
+        )
+        .unwrap();
+        let entries = config.runtime.runtime_config_entries();
+        let entry = entries
+            .iter()
+            .find(|row| row.key == "FERRUM_WORKSPACE_PREPARATION")
+            .unwrap();
+        assert_eq!(entry.effective_value, "startup");
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine
+            .apply_runtime_config_snapshot(&ferrum_types::RuntimeConfigSnapshot::from_entries(
+                entries,
+            ))
+            .unwrap();
+        assert_eq!(
+            engine.backend.workspace_preparation,
+            ferrum_types::WorkspacePreparationMode::Startup
+        );
+        assert!(!engine.backend.enable_reusable_execution);
     }
 }
