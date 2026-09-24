@@ -10,6 +10,25 @@ pub(super) struct SmallBatchPipelines {
 }
 
 impl SmallBatchPipelines {
+    pub(super) fn selected_entry(&self, actual: &ComputePipelineState) -> Option<&'static str> {
+        for (pipelines, names) in [
+            (&self.q4, ["q4_shared_b2", "q4_shared_b3", "q4_shared_b4"]),
+            (&self.q5, ["q5_shared_b2", "q5_shared_b3", "q5_shared_b4"]),
+            (&self.q6, ["q6_shared_b2", "q6_shared_b3", "q6_shared_b4"]),
+            (
+                &self.q6_f32,
+                ["q6_shared_f32_b2", "q6_shared_f32_b3", "q6_shared_f32_b4"],
+            ),
+        ] {
+            for (pipeline, name) in pipelines.iter().zip(names) {
+                if std::ptr::eq(actual, pipeline) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
     pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
         let library = device
             .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())

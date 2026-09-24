@@ -902,3 +902,9 @@ mod tests {
         assert!(candidate_called.get());
     }
 }
+
+#[cfg(test)]
+pub(crate) use linear::selected_runtime_fixture;
+
+#[cfg(test)]
+pub(crate) use primitives::selected_runtime_fixtures as selected_primitive_runtime_fixtures;

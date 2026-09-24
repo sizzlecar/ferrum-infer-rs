@@ -266,7 +266,7 @@ fn selected(launch: LinearLaunch) -> bool {
     selected_for(launch, StagingPolicy::SwiGlu)
 }
 
-fn selected_for(launch: LinearLaunch, policy: StagingPolicy) -> bool {
+pub(super) fn selected_for(launch: LinearLaunch, policy: StagingPolicy) -> bool {
     if launch.transform.is_some() {
         return false;
     }
@@ -342,6 +342,23 @@ pub(in super::super) fn projection_steps<'a>(
 }
 
 impl Sequence {
+    pub(super) fn statistical_evidence(
+        &self,
+        pipelines: &MetalLinearPipelines,
+        tokens: u64,
+        scratch_bytes: u64,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+        selected::swiglu(
+            pipelines,
+            &self.gate_up,
+            self.down,
+            self.activation,
+            self.workspace.map(|workspace| workspace.policy),
+            tokens,
+            scratch_bytes,
+        )
+    }
+
     pub(super) fn dispatch_count(&self, regions: &[MetalBufferRegion]) -> u64 {
         projection_steps(&self.gate_up, regions)
             .map(|step| step.dispatch_count(self.workspace))

@@ -1,6 +1,7 @@
 //! Dense linear route metadata shares ABI checks and row partition selection
 //! with the real encoder. Resource-dependent transform routes remain unknown.
 use super::*;
+use ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1;
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, OperationCostCommand, OperationCostRoute, OperationCostRouteRequest,
     PhysicalWeightLayout,
@@ -67,6 +68,7 @@ pub(super) fn plain_weight(
 }
 
 pub(super) fn swiglu_route(
+    pipelines: &MetalLinearPipelines,
     request: OperationCostRouteRequest<'_>,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != DENSE_SWIGLU_OPERATION_ID {
@@ -78,7 +80,7 @@ pub(super) fn swiglu_route(
     {
         return Ok(None);
     }
-    let calculate = || -> Result<Option<u64>, String> {
+    let calculate = || -> Result<Option<(u64, Option<SelectedCommandCostEvidenceV1>)>, String> {
         let hidden = unsigned_attribute(request.attributes(), "hidden_size")?;
         let intermediate = unsigned_attribute(request.attributes(), "intermediate_size")?;
         if hidden == 0 || intermediate == 0 {
@@ -128,10 +130,10 @@ pub(super) fn swiglu_route(
             .ok_or("SwiGLU activation bytes overflow")?;
         let staging_bytes =
             staged_prefill::workspace_bytes(request.bindings(), hidden, intermediate)?;
-        activation_bytes
+        let scratch_bytes = activation_bytes
             .checked_add(staging_bytes)
             .ok_or("SwiGLU total scratch bytes overflow")?;
-        swiglu_launch(
+        let activation = swiglu_launch(
             0,
             elements
                 .checked_mul(4)
@@ -141,22 +143,33 @@ pub(super) fn swiglu_route(
             packed,
         )?;
         let policy = (staging_bytes > 0).then_some(staged_prefill::StagingPolicy::SwiGlu);
+        let mut launches = Vec::with_capacity(gate_parts.len());
         let mut dispatches = 1_u64; // Pointwise activation, shared by all rows.
         for part in gate_parts {
             let launch = linear_launch(part, 0, 0, tokens, hidden, packed, 0, 0)?;
             launch.activation_bytes()?;
             dispatches += staged_prefill::policy_dispatch_count(launch, policy);
+            launches.push(launch);
         }
         let launch = linear_launch(down, 0, 0, tokens, intermediate, hidden, 0, 0)?;
         launch.activation_bytes()?;
         dispatches += staged_prefill::policy_dispatch_count(launch, policy);
-        Ok(Some(dispatches))
+        let statistics = selected::swiglu(
+            pipelines,
+            &launches,
+            launch,
+            activation,
+            policy,
+            tokens,
+            scratch_bytes,
+        );
+        Ok(Some((dispatches, statistics)))
     };
-    let Some(dispatches) = calculate().map_err(invalid_plan)? else {
+    let Some((dispatches, statistics)) = calculate().map_err(invalid_plan)? else {
         return Ok(None);
     };
     let participants = request.rows().len() as u32;
-    OperationCostRoute::new(vec![OperationCostCommand::new(
+    let command = OperationCostCommand::new(
         "vnext_dense_swiglu",
         DeviceCommandPhase::Compute,
         if participants == 1 {
@@ -169,8 +182,32 @@ pub(super) fn swiglu_route(
         request.immediate_tokens(),
         dispatches,
         0,
-    )?])
-    .map(Some)
+    )?;
+    let command = if let Some(evidence) = statistics {
+        command
+            .clone()
+            .with_statistical_evidence(evidence)
+            .unwrap_or(command)
+    } else {
+        command
+    };
+    OperationCostRoute::new(vec![command]).map(Some)
+}
+
+pub(super) fn dense_command_selected(
+    pipelines: &MetalLinearPipelines,
+    participants: u32,
+    tokens: u64,
+    launches: &[LinearLaunch],
+) -> Result<OperationCostCommand, VNextError> {
+    let command = dense_command(participants, tokens, launches)?;
+    match selected::dense(pipelines, launches, tokens) {
+        Some(evidence) => Ok(command
+            .clone()
+            .with_statistical_evidence(evidence)
+            .unwrap_or(command)),
+        None => Ok(command),
+    }
 }
 
 pub(super) fn dense_command(
@@ -207,6 +244,7 @@ pub(super) fn dense_command(
 }
 
 pub(super) fn dense_route(
+    pipelines: &MetalLinearPipelines,
     request: OperationCostRouteRequest<'_>,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != DENSE_LINEAR_OPERATION_ID {
@@ -257,7 +295,8 @@ pub(super) fn dense_route(
             append(row.count.get())?;
         }
     }
-    OperationCostRoute::new(vec![dense_command(
+    OperationCostRoute::new(vec![dense_command_selected(
+        pipelines,
         request.rows().len() as u32,
         request.immediate_tokens(),
         &launches,

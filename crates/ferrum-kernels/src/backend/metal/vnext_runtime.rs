@@ -1482,6 +1482,11 @@ pub struct MetalDeviceCommand {
     participant_start: u32,
     participant_count: u32,
     token_count: u64,
+    statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+    core_transfer: Option<(
+        ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        u64,
+    )>,
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
     encode: EncodeAction,
@@ -1525,6 +1530,8 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 1,
             token_count: 0,
+            statistical_evidence: None,
+            core_transfer: None,
             regions,
             staging: Vec::new(),
             encode: Box::new(move |encoder, regions, _staging| encode(encoder, regions)),
@@ -1592,6 +1599,16 @@ impl MetalDeviceCommand {
         Ok(())
     }
 
+    /// Passive metadata is checked against encoder counts at actual submit.
+    /// Unsupported producers leave None; this never changes execution rights.
+    pub(crate) fn with_statistical_evidence(
+        mut self,
+        evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+    ) -> Self {
+        self.statistical_evidence = evidence;
+        self
+    }
+
     pub(crate) fn with_work_shape(
         mut self,
         batching_form: DeviceBatchingForm,
@@ -1623,7 +1640,22 @@ impl MetalDeviceCommand {
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
+        if let Some((kind, bytes)) = self.core_transfer {
+            self.statistical_evidence =
+                core_cost_route::transfer_evidence(kind, bytes, self.token_count);
+        }
         Ok(self)
+    }
+
+    fn with_core_transfer(
+        mut self,
+        kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        bytes: u64,
+    ) -> Self {
+        self.core_transfer = Some((kind, bytes));
+        self.statistical_evidence =
+            core_cost_route::transfer_evidence(kind, bytes, self.token_count);
+        self
     }
 
     fn transfer(
@@ -1640,6 +1672,8 @@ impl MetalDeviceCommand {
             participant_start: 0,
             participant_count: 0,
             token_count: 0,
+            statistical_evidence: None,
+            core_transfer: None,
             regions,
             staging,
             encode,
@@ -2303,6 +2337,18 @@ impl MetalDeviceRuntime {
                     transfer_command_count,
                     None,
                 ) {
+                    // A missing/mismatched extension does not erase the old
+                    // exact attribution or change inference completion.
+                    let observation = command
+                        .statistical_evidence
+                        .as_ref()
+                        .and_then(|evidence| {
+                            observation
+                                .clone()
+                                .with_statistical_evidence(evidence.clone())
+                                .ok()
+                        })
+                        .unwrap_or(observation);
                     attribution.push(observation);
                 }
             }
@@ -2435,6 +2481,15 @@ impl DeviceRuntime for MetalDeviceRuntime {
         ferrum_types::AttentionExecutionPolicy::Portable
     }
 
+    fn cost_core_transfer_evidence(
+        &self,
+        kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        bytes: u64,
+        tokens: u64,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+        core_cost_route::transfer_evidence(kind, bytes, tokens)
+    }
+
     fn cost_core_execution_capabilities(
         &self,
     ) -> Option<ferrum_interfaces::vnext::DeviceCoreCostCapabilities> {
@@ -2486,12 +2541,12 @@ impl DeviceRuntime for MetalDeviceRuntime {
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Some(Err(MetalDeviceRuntimeError::contract(
                     "another Metal static-weight import transaction is active",
-                )))
+                )));
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Some(Err(MetalDeviceRuntimeError::contract(
                     "Metal static-weight import gate is poisoned",
-                )))
+                )));
             }
         };
         Some(
@@ -2568,6 +2623,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 });
                 Ok(())
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::DeviceToDevice,
+            region.length_bytes(),
         ))
     }
 
@@ -2623,6 +2682,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 });
                 Ok(())
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::HostToDevice,
+            source_bytes,
         ))
     }
 
@@ -2660,6 +2723,10 @@ impl DeviceRuntime for MetalDeviceRuntime {
                 });
                 Ok(())
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::Fill,
+            length_bytes,
         ))
     }
 
@@ -4015,3 +4082,6 @@ mod tests {
         assert!(report.retryable());
     }
 }
+
+#[cfg(test)]
+mod statistical_tests;

@@ -1,6 +1,9 @@
 //! Native Metal linear providers over typed physical weight layouts.
 mod cost_route;
 mod head_cost_route;
+mod selected;
+#[cfg(test)]
+pub(crate) use selected::tests::runtime_fixture as selected_runtime_fixture;
 
 use std::ffi::c_void;
 use std::ops::Range;
@@ -58,6 +61,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/plain_prefill.rs"),
     include_str!("linear/cost_route.rs"),
     include_str!("linear/head_cost_route.rs"),
+    include_str!("linear/selected.rs"),
     include_str!("weights.rs"),
     include_str!("linear/staged_prefill.rs"),
     include_str!("linear/transformed_prefill.rs"),
@@ -618,7 +622,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalDenseLinearProvider {
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
     ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
-        cost_route::dense_route(request)
+        cost_route::dense_route(&self.pipelines, request)
     }
 
     fn reusable_execution_topology(
@@ -744,7 +748,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalDenseSwiGluProvider {
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
     ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
-        cost_route::swiglu_route(request)
+        cost_route::swiglu_route(&self.pipelines, request)
     }
 
     fn reusable_execution_topology(
@@ -1281,8 +1285,9 @@ fn encode_dense_linear(
         "Metal dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let route = cost_route::dense_command(participant_count, token_count, &launches)
-        .map_err(|error| error.to_string())?;
+    let route =
+        cost_route::dense_command_selected(&pipelines, participant_count, token_count, &launches)
+            .map_err(|error| error.to_string())?;
     let dispatch_count = route.compute_dispatch_count();
     MetalDeviceCommand::operation(
         route.native_operation(),
@@ -1297,6 +1302,7 @@ fn encode_dense_linear(
     )
     .map_err(|error| error.to_string())?
     .with_work_shape(route.batching(), participant_count, token_count)
+    .map(|command| command.with_statistical_evidence(route.statistical_evidence().cloned()))
     .map_err(|error| error.to_string())
 }
 
@@ -1842,6 +1848,9 @@ fn encode_dense_swiglu(
         scratch_region,
         workspace: staging,
     };
+    let statistics = activation_scratch_bytes
+        .checked_add(staging_bytes)
+        .and_then(|scratch| sequence.statistical_evidence(&pipelines, tokens, scratch));
     MetalDeviceCommand::operation("vnext_dense_swiglu", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(sequence.dispatch_count(regions));
         sequence.encode(&pipelines, regions, |subwork, encode| {
@@ -1860,6 +1869,7 @@ fn encode_dense_swiglu(
         participant_count,
         tokens,
     )
+    .map(|command| command.with_statistical_evidence(statistics))
     .map_err(|error| error.to_string())
 }
 
@@ -3897,4 +3907,15 @@ mod tests {
         bind_linear_params(encoder, params, format, ElementType::F16);
         dispatch_linear_grid(encoder, params, dispatch_kind);
     }
+}
+
+/// Append evidence from the exact immutable linear selector used by this command.
+pub(super) fn append_selected_projection(
+    builder: &mut ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1,
+    pipelines: &MetalLinearPipelines,
+    launch: LinearLaunch,
+    policy: Option<staged_prefill::StagingPolicy>,
+    scratch: u64,
+) -> Option<()> {
+    selected::projection(builder, pipelines, launch, policy, scratch)
 }
