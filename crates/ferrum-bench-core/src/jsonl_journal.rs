@@ -147,6 +147,7 @@ type EncodeJob = Box<dyn FnOnce(&mut Vec<u8>) -> Result<(), serde_json::Error> +
 enum JournalCommand {
     Encode(EncodeJob),
     Encoded(Vec<u8>),
+    StreamOwned(Box<dyn FnOnce(&mut dyn Write) -> Result<(), serde_json::Error> + Send>),
     Flush(SyncSender<Result<(), JsonlJournalError>>),
     Close(SyncSender<Result<(), JsonlJournalError>>),
 }
@@ -407,6 +408,27 @@ where
     }
 }
 
+/// Write a move-only, self-budgeted record without an intermediate encoded
+/// Vec. The existing bounded queue owns the record (and any retention lease)
+/// through serialization. Serialize failure poisons this journal as usual;
+/// partially written JSONL must never be reported as a valid complete record.
+pub fn write_jsonl_owned_record<T: Serialize + Send + 'static>(
+    path: &Path,
+    record: T,
+) -> Result<(), JsonlJournalError> {
+    let inner = open_shared_inner(
+        path.to_path_buf(),
+        JsonlJournalOpenMode::Append,
+        JsonlJournalConfig::default(),
+    )
+    .map_err(|e| JsonlJournalError::new(format!("open JSONL journal {}: {e}", path.display())))?;
+    inner.send(JournalCommand::StreamOwned(Box::new(move |mut writer| {
+        serde_json::to_writer(&mut writer, &record)?;
+        writer.write_all(b"\n").map_err(serde_json::Error::io)
+    })))?;
+    flush_inner(&inner)
+}
+
 pub fn write_jsonl_records<T: Serialize>(
     path: &Path,
     mode: JsonlJournalOpenMode,
@@ -480,6 +502,19 @@ fn run_writer(
             Ok(JournalCommand::Encoded(encoded)) => {
                 flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
                 write_encoded_if_healthy(&mut writer, &encoded, &failure, path, &mut writable);
+            }
+            Ok(JournalCommand::StreamOwned(job)) => {
+                flush_deadline.get_or_insert_with(|| Instant::now() + flush_interval);
+                if writable {
+                    if let Err(error) = job(&mut writer) {
+                        writable = false;
+                        failure.record(JsonlJournalError::new(format!(
+                            "stream JSONL record for {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+                // Dropping an unexecuted job also releases its owned lease.
             }
             Ok(JournalCommand::Flush(reply)) => {
                 flush_if_healthy(&mut writer, &failure, path, &mut writable);
@@ -1050,3 +1085,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+#[path = "jsonl_journal/owned_tests.rs"]
+mod owned_tests;

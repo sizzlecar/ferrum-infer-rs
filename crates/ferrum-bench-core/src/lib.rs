@@ -26,6 +26,7 @@ pub mod arrivals;
 pub mod dataset;
 pub mod decode_isolation;
 pub mod env;
+pub mod json_artifact;
 pub mod jsonl_journal;
 pub mod profile;
 pub mod release_regression;
@@ -35,9 +36,10 @@ pub mod teacher_metrics;
 pub mod trace;
 
 pub use env::{Env, EnvHash};
+pub use json_artifact::write_json_owned_record;
 pub use jsonl_journal::{
-    normalize_jsonl_path, write_jsonl_records, JsonlJournal, JsonlJournalConfig, JsonlJournalError,
-    JsonlJournalOpenMode,
+    normalize_jsonl_path, write_jsonl_owned_record, write_jsonl_records, JsonlJournal,
+    JsonlJournalConfig, JsonlJournalError, JsonlJournalOpenMode,
 };
 pub use profile::{
     configure_global_profile, flush_global_profile, global_profile, parse_profile_event_value,
