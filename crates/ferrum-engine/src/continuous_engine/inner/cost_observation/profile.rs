@@ -117,7 +117,7 @@ pub(super) fn load_seed(
     };
     let settings = model_settings(&config.model);
     settings.validate().map_err(profile_error)?;
-    if config.predictor == ferrum_types::SloCostPredictor::SelectedWholeWaveV1 {
+    if config.predictor.is_selected() {
         return selected::load_seed(fingerprint, config, path, clock);
     }
     let Some(path) = path else {
@@ -301,6 +301,17 @@ impl EngineCostSnapshot {
             fingerprint: self.fingerprint.clone(),
         }))
     }
+    pub(super) fn selected_family_signature<'a>(
+        &self,
+        evidence: &'a ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+    ) -> Result<&'a [u8; 32], model::statistical::model::ModelUnknown> {
+        match &self.inner {
+            Snapshot::Selected(snapshot) => snapshot.family_signature(evidence),
+            _ => Err(model::statistical::model::ModelUnknown::Evidence(
+                ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,
+            )),
+        }
+    }
     pub(super) fn feedback_margin(&self, family: &[u8; 32]) -> u64 {
         match &self.inner {
             Snapshot::Selected(s) => s.feedback.as_ref().map_or(0, |v| v.margin(family)),
@@ -330,7 +341,7 @@ impl EngineCostSnapshot {
                     snapshot
                         .model
                         .predict(&self.fingerprint, exact, evidence, local_now_ns)?;
-                snapshot.apply(value, evidence.family_signature())
+                snapshot.apply(value, snapshot.family_signature(evidence)?)
             }
             _ => Err(model::statistical::model::ModelUnknown::Evidence(
                 ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,

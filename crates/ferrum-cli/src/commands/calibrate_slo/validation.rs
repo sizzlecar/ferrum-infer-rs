@@ -11,7 +11,7 @@ use ferrum_scheduler::implementations::continuous::cost_model::{
 pub(super) enum ValidationModel {
     LiveFrozen(FrozenCalibrationModel),
     ExportedProfile(ImportedCalibrationModel),
-    SelectedWholeWaveV1(ImportedCalibrationModel),
+    SelectedWholeWave(ImportedCalibrationModel, &'static str),
 }
 
 impl ValidationModel {
@@ -20,7 +20,7 @@ impl ValidationModel {
     ) -> Option<ferrum_scheduler::implementations::continuous::cost_model::CostBoundary> {
         match self {
             Self::LiveFrozen(model) => model.planning_boundary(),
-            Self::ExportedProfile(model) | Self::SelectedWholeWaveV1(model) => {
+            Self::ExportedProfile(model) | Self::SelectedWholeWave(model, _) => {
                 Some(model.planning_boundary())
             }
         }
@@ -29,7 +29,7 @@ impl ValidationModel {
         &self,
     ) -> Option<&ferrum_engine::continuous_engine::CalibrationProfileArtifact> {
         match self {
-            Self::LiveFrozen(_) | Self::SelectedWholeWaveV1(_) => None,
+            Self::LiveFrozen(_) | Self::SelectedWholeWave(_, _) => None,
             Self::ExportedProfile(model) => Some(model.artifact()),
         }
     }
@@ -48,7 +48,7 @@ impl ValidationModel {
                 })
                 .await
                 .map(Self::ExportedProfile),
-            manifest::ValidationSource::SelectedWholeWaveV1 { .. } => Err(FerrumError::internal(
+            manifest::ValidationSource::SelectedWholeWaveV1 { .. } | manifest::ValidationSource::SelectedIndependentAttentionV2 { .. } => Err(FerrumError::internal(
                 "selected calibration must freeze fit and complete independent residual collection before import",
             )),
         }
@@ -58,7 +58,7 @@ impl ValidationModel {
         match self {
             Self::LiveFrozen(_) => "live_frozen",
             Self::ExportedProfile(_) => "exported_profile",
-            Self::SelectedWholeWaveV1(_) => "selected_whole_wave_v1",
+            Self::SelectedWholeWave(_, kind) => kind,
         }
     }
 
@@ -66,7 +66,7 @@ impl ValidationModel {
         match self {
             Self::LiveFrozen(model) => model.predict(shape),
             Self::ExportedProfile(model) => model.predict(shape).map(Some),
-            Self::SelectedWholeWaveV1(_) => Err(FerrumError::internal(
+            Self::SelectedWholeWave(_, _) => Err(FerrumError::internal(
                 "selected whole-wave prediction requires its privately bound terminal wave evidence",
             )),
         }
@@ -74,7 +74,7 @@ impl ValidationModel {
 
     pub(super) fn selected(&self) -> Option<&ImportedCalibrationModel> {
         match self {
-            Self::SelectedWholeWaveV1(model) => Some(model),
+            Self::SelectedWholeWave(model, _) => Some(model),
             _ => None,
         }
     }
@@ -92,11 +92,11 @@ impl ValidationModel {
                 "model_version":model.model_version(),
                 "scope":"accepted training cut exported then loaded through the real product importer; validation uses only this immutable imported model"
             })),
-            Self::SelectedWholeWaveV1(model) => Ok(serde_json::json!({
+            Self::SelectedWholeWave(model, _) => Ok(serde_json::json!({
                 "kind":self.kind(), "audit":model.audit(), "artifact":model.artifact(),
                 "import_receipt":model.import_receipt(), "accepted_ordinal":model.accepted_ordinal(),
                 "model_version":model.model_version(),
-                "scope":"fit frozen before independent residual collection; sealed schema6 reloaded by the product importer; heldout never trains or republishes the model"
+                "scope":"fit frozen before independent residual collection; sealed explicitly versioned profile reloaded by the product importer; heldout never trains or republishes the model"
             })),
         }
     }

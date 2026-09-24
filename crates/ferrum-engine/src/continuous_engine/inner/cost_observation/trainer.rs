@@ -80,9 +80,7 @@ impl CostTrainingState {
             snapshot: RwLock::new(seed.snapshot),
             receipt: seed.receipt,
             audit: Mutex::new(TrainingAuditSnapshot {
-                selected_serving: (config.predictor
-                    == ferrum_types::SloCostPredictor::SelectedWholeWaveV1)
-                    .then(Default::default),
+                selected_serving: config.predictor.is_selected().then(Default::default),
                 ..Default::default()
             }),
             max_samples_per_update: config.max_samples_per_update.get(),

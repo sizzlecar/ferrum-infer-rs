@@ -24,9 +24,7 @@ pub(super) async fn collect(
             Some(reference::InputIdentityLedger::new(inputs.count(manifest))?);
     }
     let reference = reference::collect(session, manifest, inputs, artifacts, summary).await?;
-    if let manifest::ValidationSource::SelectedWholeWaveV1 { export, .. } =
-        &manifest.validation_model
-    {
+    if let Some((_, export, _)) = manifest.validation_model.selected() {
         let protocol = serde_json::to_vec(manifest).map_err(|error| {
             FerrumError::config(format!("encode calibration protocol: {error}"))
         })?;
@@ -55,9 +53,7 @@ pub(super) async fn collect(
             .await?;
         }
     }
-    let frozen = if let manifest::ValidationSource::SelectedWholeWaveV1 { residual, .. } =
-        &manifest.validation_model
-    {
+    let frozen = if let Some((_, _, residual)) = manifest.validation_model.selected() {
         let receipt = session.freeze_selected_cost_fit().await?;
         summary.selected_fit_freeze = Some(
             serde_json::to_value(&receipt)
@@ -82,8 +78,12 @@ pub(super) async fn collect(
                 .await?;
             }
         }
-        validation::ValidationModel::SelectedWholeWaveV1(
+        validation::ValidationModel::SelectedWholeWave(
             session.finish_selected_cost_residual().await?,
+            manifest
+                .validation_model
+                .selected_kind()
+                .expect("selected above"),
         )
     } else {
         validation::ValidationModel::prepare(session, &manifest.validation_model).await?

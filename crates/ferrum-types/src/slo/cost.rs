@@ -50,7 +50,7 @@ impl Default for SloCostObservationConfig {
     }
 }
 
-/// The new predictor consumes actual selected-algorithm receipts and schema 6.
+/// Selected predictors consume actual receipts through their explicit profile version.
 /// This is independent of the legacy feature-model enum and its wire protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,8 +58,16 @@ pub enum SloCostPredictor {
     #[default]
     LegacyFeatureModel,
     SelectedWholeWaveV1,
+    /// Explicit empirical exchangeability of independently proven attention rows; profile7 only.
+    SelectedIndependentAttentionV2,
 }
 impl SloCostPredictor {
+    pub const fn is_selected(self) -> bool {
+        matches!(
+            self,
+            Self::SelectedWholeWaveV1 | Self::SelectedIndependentAttentionV2
+        )
+    }
     fn is_legacy(&self) -> bool {
         *self == Self::LegacyFeatureModel
     }
@@ -74,10 +82,17 @@ impl SloCostObservationConfig {
         }
     }
 
+    pub fn selected_independent_attention_v2() -> Self {
+        Self {
+            predictor: SloCostPredictor::SelectedIndependentAttentionV2,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
         self.selected_feedback.validate(self)?;
-        if self.predictor == SloCostPredictor::SelectedWholeWaveV1 {
+        if self.predictor.is_selected() {
             if self.model.feature_model != SloCostFeatureModel::default()
                 || self.model.context_bucket_tokens.get() != 1
                 || self.model.prefill_offset_bucket_tokens.get() != 1
@@ -328,7 +343,7 @@ pub struct SloCostProfileReceipt {
     pub source_observation_artifact_sha256: [u8; 32],
 }
 
-/// Actual schema-6 import provenance. Fit and residual records are disjoint;
+/// Actual selected profile import provenance (explicit schema 6 or 7). Fit and residual records are disjoint;
 /// these counts alone do not prove query coverage or heldout quality.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloSelectedWholeWaveReceiptV1 {

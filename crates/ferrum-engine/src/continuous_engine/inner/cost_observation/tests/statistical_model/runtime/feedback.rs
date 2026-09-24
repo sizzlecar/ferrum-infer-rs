@@ -73,6 +73,96 @@ impl Drop for FeedbackFixture {
 }
 
 #[tokio::test]
+async fn independent_attention_v2_feedback_uses_imported_family_and_original_epoch_ttl() {
+    use ferrum_scheduler::implementations::continuous::{
+        cost_model::statistical::model::FittedWholeWaveModelV1,
+        cost_profile::statistical_v7::CostProfileFileV7,
+    };
+    let mut f = FeedbackFixture::new(false);
+    f.fixture.config.predictor = SloCostPredictor::SelectedIndependentAttentionV2;
+    let settings = WholeWaveSettingsV1::from_policy_limits(
+        &super::super::super::super::profile::model_settings(&f.fixture.config.model),
+    );
+    let partition = CalibrationPartitionV1 {
+        source_sha256: [7; 32],
+        protocol_sha256: [8; 32],
+        fit_through_ordinal: 8,
+        residual_through_ordinal: 16,
+    };
+    let samples = &f.fixture.samples;
+    let fitted = FittedWholeWaveModelV1::fit_independent_attention_v2(
+        samples[0].fingerprint.clone(),
+        settings.clone(),
+        partition,
+        &samples[..8],
+        21,
+    )
+    .unwrap();
+    let file = CostProfileFileV7::from_capture_observations(
+        &samples[0].fingerprint,
+        &settings,
+        partition,
+        file::ProfileSource {
+            generator: "real-engine-fifo-fixture".into(),
+            generator_revision: "v2".into(),
+            measurement_protocol: "independent-attention-live-feedback-fixture".into(),
+            observation_artifact_sha256: [7; 32],
+        },
+        21,
+        1_000_000,
+        0,
+        fitted.parameter_signature(),
+        &samples[..8],
+        &samples[8..],
+    )
+    .unwrap();
+    let bytes = file
+        .to_bounded_bytes(f.fixture.config.profile_import.max_file_bytes.get())
+        .unwrap();
+    fs::write(&f.fixture.path, &bytes).unwrap();
+    let runtime = f.build();
+    let old = runtime.snapshot().unwrap();
+    let sample = f.fixture.samples[0].clone();
+    let family = *old.selected_family_signature(&sample.selected).unwrap();
+    assert_eq!(
+        family,
+        *sample
+            .selected
+            .independent_attention_v2()
+            .unwrap()
+            .family_signature()
+    );
+    assert_ne!(family, *sample.selected.family_signature());
+    let base = old
+        .predict_selected_wave(&sample.exact, &sample.selected, 500)
+        .unwrap();
+    f.train_margin(&runtime, false);
+    let current = runtime.snapshot().unwrap();
+    assert_eq!(current.model_version(), old.model_version() + 1);
+    assert_eq!(
+        old.predict_selected_wave(&sample.exact, &sample.selected, 3_000_000),
+        Err(ModelUnknown::RuntimeValidity)
+    );
+    let updated = current
+        .predict_selected_wave(&sample.exact, &sample.selected, 3_000_000)
+        .unwrap();
+    assert_eq!(
+        updated.planning_ns - base.planning_ns,
+        current.feedback_margin(&family)
+    );
+    assert!(current.feedback_margin(&family) > 0);
+    assert_eq!(
+        current.feedback_margin(sample.selected.family_signature()),
+        0,
+        "V1 key must not receive a V2 model correction"
+    );
+    assert_eq!(updated.valid_until_ns, base.valid_until_ns);
+    assert_eq!(updated.fitted_ns, base.fitted_ns);
+    assert_eq!(fs::read(&f.fixture.path).unwrap(), bytes);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn selected_feedback_worker_publishes_base_relative_margin_and_persists_without_refit_or_ttl_reset(
 ) {
     for terminal in [false, true] {

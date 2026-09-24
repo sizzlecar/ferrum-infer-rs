@@ -81,6 +81,115 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn independent_attention_v2_live_capture_product_import_and_legacy_rejection() {
+    use ferrum_scheduler::implementations::continuous::cost_model::statistical::{
+        model::INDEPENDENT_ATTENTION_MODEL_REVISION, SelectedStatisticalFamily,
+    };
+    let mut fixture = Fixture::new();
+    fixture.config.predictor = ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2;
+    let mut capture = fixture.begin();
+    for _ in 0..8 {
+        let (_, _, receipt) = fixture.completed();
+        capture.record(&receipt, true).unwrap();
+    }
+    let frozen = capture.freeze_fit(8).unwrap();
+    for _ in 0..8 {
+        let (_, _, receipt) = fixture.completed();
+        capture.record(&receipt, true).unwrap();
+    }
+    let (cut, support) = capture.finish(16).unwrap();
+    let raw = fs::read(&cut.source).unwrap();
+    let records: Vec<serde_json::Value> = raw
+        .split(|b| *b == b'\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::from_slice(s).unwrap())
+        .collect();
+    assert_eq!(records[0]["schema_version"], 2);
+    assert_eq!(
+        records[0]["model_revision"],
+        INDEPENDENT_ATTENTION_MODEL_REVISION
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["kind"] == "observation")
+            .count(),
+        16
+    );
+    assert!(records
+        .iter()
+        .filter(|r| r["kind"] == "observation")
+        .all(|r| r["selected"]["schema_version"] == 1
+            && r["independent_attention"]["schema_version"] == 2));
+    let runtime = fixture.runtime();
+    let imported = runtime
+        .load_calibration_profile(&fixture.config, &cut)
+        .unwrap();
+    assert_eq!(imported.receipt.schema_version, 7);
+    let phase = imported.receipt.selected_whole_wave.as_ref().unwrap();
+    assert_eq!(phase.model_revision, INDEPENDENT_ATTENTION_MODEL_REVISION);
+    assert_eq!(phase.fit_parameters_sha256, frozen.fit_parameters_sha256);
+    assert_eq!(
+        imported
+            .snapshot
+            .selected_import()
+            .unwrap()
+            .selected_family(),
+        SelectedStatisticalFamily::IndependentAttentionV2
+    );
+    let (ordinal, entry, _) = fixture.completed();
+    let observation = super::super::super::trainer::whole_wave_observation(
+        &entry,
+        ordinal,
+        frozen.capture_identity_sha256,
+    )
+    .unwrap();
+    let prediction = imported
+        .snapshot
+        .predict_selected_wave(&observation.exact, &observation.selected, 21)
+        .unwrap();
+    assert_eq!(
+        (prediction.fit_samples, prediction.residual_samples),
+        (8, 8)
+    );
+    assert_eq!(
+        *imported
+            .snapshot
+            .selected_family_signature(&observation.selected)
+            .unwrap(),
+        observation
+            .selected
+            .independent_attention_v2()
+            .unwrap()
+            .family_signature()
+            .to_owned()
+    );
+    assert_eq!(support["family_support"][0]["fit_samples"], 8);
+    let old = ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1::from_wire_v1(
+        observation.selected.to_wire_v1(),
+        &observation.exact,
+    )
+    .unwrap();
+    assert!(matches!(
+        imported
+            .snapshot
+            .predict_selected_wave(&observation.exact, &old, 21),
+        Err(ModelUnknown::Evidence(
+            StatisticalEvidenceUnknown::MissingProducer
+        ))
+    ));
+    fixture.config.predictor = ferrum_types::SloCostPredictor::SelectedWholeWaveV1;
+    assert!(runtime
+        .load_calibration_profile(&fixture.config, &cut)
+        .is_err());
+    assert_eq!(
+        fs::read(&cut.source).unwrap(),
+        raw,
+        "heldout and incompatible import do not rewrite the sealed source"
+    );
+}
+
+#[test]
 fn selected_live_phases_freeze_then_reload_the_real_completed_cut() {
     let fixture = Fixture::new();
     let mut capture = fixture.begin();

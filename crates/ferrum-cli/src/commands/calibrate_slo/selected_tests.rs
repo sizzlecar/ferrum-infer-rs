@@ -27,6 +27,72 @@ fn selected_manifest() -> manifest::Manifest {
 }
 
 #[test]
+fn independent_attention_v2_manifest_requires_matching_product_version_and_residual() {
+    let Command::CalibrateSlo(mut cmd) = Cli::try_parse_from([
+        "ferrum",
+        "calibrate-slo",
+        "model",
+        "--manifest",
+        "inputs.json",
+        "--slo-config",
+        "slo.toml",
+        "--out",
+        "report.json",
+        "--observations",
+        "raw.jsonl",
+        "--startup-usage",
+        "serve",
+    ])
+    .unwrap()
+    .command;
+    let directory = tempfile::tempdir().unwrap();
+    cmd.out = directory.path().join("report.json");
+    cmd.observations = directory.path().join("raw.jsonl");
+    let mut manifest = selected_manifest();
+    let original_budget = manifest.prompts[0].sampling.max_tokens;
+    let manifest::ValidationSource::SelectedWholeWaveV1 {
+        mut export,
+        residual,
+    } = manifest.validation_model
+    else {
+        unreachable!()
+    };
+    export.path = directory.path().join("profile7.json");
+    export.observations_path = directory.path().join("source2.jsonl");
+    manifest.validation_model =
+        manifest::ValidationSource::SelectedIndependentAttentionV2 { export, residual };
+    manifest.validate().unwrap();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let decoded: manifest::Manifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        decoded.validation_model.selected_kind(),
+        Some("selected_independent_attention_v2")
+    );
+    assert_eq!(decoded.prompts[0].sampling.max_tokens, original_budget);
+    let mut policy = ferrum_types::SloConfig::default();
+    policy.cost_observation = SloCostObservationConfig::selected_whole_wave_v1();
+    policy
+        .cost_observation
+        .profile_import
+        .declared_local_clock_max_error_ns = Some(0);
+    assert!(startup::validate_export_configuration(&cmd, &decoded, &policy).is_err());
+    policy.cost_observation.predictor =
+        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2;
+    policy.validate().unwrap();
+    startup::validate_export_configuration(&cmd, &decoded, &policy).unwrap();
+    let mut low = policy.clone();
+    low.cost_observation.model.min_samples = std::num::NonZeroUsize::new(7).unwrap();
+    assert!(low.validate().is_err());
+    let manifest::ValidationSource::SelectedIndependentAttentionV2 { residual, .. } =
+        &mut manifest.validation_model
+    else {
+        unreachable!()
+    };
+    residual.clear();
+    assert!(manifest.validate().is_err());
+}
+
+#[test]
 fn selected_calibration_manifest_preserves_output_and_resolves_both_artifacts() {
     let value = selected_manifest();
     let maximum = value.prompts[0].sampling.max_tokens;

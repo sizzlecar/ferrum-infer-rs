@@ -257,3 +257,55 @@ fn evidence_binding_propagates_budget_failure_without_legacy_fallback() {
     );
     assert_eq!(result, Err(PlanningUnknownReason::ComputeBudgetExhausted));
 }
+
+#[test]
+fn independent_attention_v2_future_binding_consumes_explicit_family_and_rejects_legacy_sidecar() {
+    use crate::implementations::continuous::cost_model::statistical::model::FittedWholeWaveModelV1;
+    let (fit, residual) = samples::populations();
+    let model = SelectedModel(
+        FittedWholeWaveModelV1::fit_independent_attention_v2(
+            samples::fingerprint(),
+            samples::settings(),
+            samples::partition(),
+            &fit,
+            120,
+        )
+        .unwrap()
+        .calibrate(&residual, 120)
+        .unwrap(),
+    );
+    let (s, work) = scenario();
+    let sample = samples::sample(17, 12, 130);
+    let wave = project(&s, &work, &exact(sample.clone()));
+    assert_eq!(cost(&s, &model, &wave, 120).unwrap().planning_ns, 125);
+    let mut old = sample.clone();
+    old.selected =
+        StatisticalWaveEvidenceV1::from_wire_v1(old.selected.to_wire_v1(), &old.exact).unwrap();
+    let legacy = project(&s, &work, &exact(old));
+    assert_eq!(
+        wave, legacy,
+        "statistical family does not change canonical execution identity"
+    );
+    assert_eq!(
+        cost(&s, &model, &legacy, 120),
+        Err(PlanningUnknownReason::CostUnavailable)
+    );
+    assert_eq!(
+        cost(&s, &model, &wave, 30_000),
+        Err(PlanningUnknownReason::CostUnavailable)
+    );
+    let mut wrong = sample.exact.clone();
+    wrong.recurrent_state_bytes += 1;
+    let ctx = State {
+        canonical: PlanningShapeDomain::Exact(wrong),
+        statistics: Some(PlanningShapeDomain::Exact(sample.selected)),
+    };
+    assert!(execution::bind_statistics(
+        &ctx.canonical,
+        &PlanningShapeDomain::Exact(canonical_cost_shape(ctx.canonical.exact().unwrap()).unwrap()),
+        ctx.statistics.as_ref(),
+        &mut || Ok(())
+    )
+    .unwrap()
+    .is_none());
+}

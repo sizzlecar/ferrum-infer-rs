@@ -298,7 +298,7 @@ impl Artifacts {
             "manifest":self.manifest,"provenance":provenance,"summary":summary,
             "raw_bytes":self.bytes,"raw_sha256":format!("{:x}",self.hash.clone().finalize()),
             "validation_scope":"held-out actual-shape retrospective cost check; not pre-submission route validation or serving SLO compliance",
-            "profile_scope":"exported_profile identifies the imported training artifact; selected_whole_wave_v1 freezes fit before independent residual capture and reloads schema6 before heldout; live_frozen has no deployable artifact; legacy shutdown export may include validation observations",
+            "profile_scope":"exported_profile identifies the imported training artifact; selected_whole_wave_v1/profile6 and selected_independent_attention_v2/profile7 freeze fit before independent residual capture and reload their explicit version before heldout; live_frozen has no deployable artifact; legacy shutdown export may include validation observations",
             "reference_scope":"optional singleton discovery -> persisted plan -> fresh trials -> original training-cut source join; target completion never shortens the request; only target_waves enter reference scoring, preparation proves the chain and after_target waves are not reference targets"});
         serde_json::to_writer_pretty(&mut self.report, &report).map_err(json_error)?;
         self.report.write_all(b"\n").map_err(io_error)?;

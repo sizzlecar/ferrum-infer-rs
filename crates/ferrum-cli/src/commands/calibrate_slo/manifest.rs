@@ -43,19 +43,56 @@ pub(super) enum ValidationSource {
         export: ferrum_types::SloCostProfileExportConfig,
         residual: Vec<Cohort>,
     },
+    /// New explicitly versioned profile7 protocol; no legacy evidence promotion.
+    SelectedIndependentAttentionV2 {
+        export: ferrum_types::SloCostProfileExportConfig,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
+    pub(super) fn selected(
+        &self,
+    ) -> Option<(
+        ferrum_types::SloCostPredictor,
+        &ferrum_types::SloCostProfileExportConfig,
+        &[Cohort],
+    )> {
+        match self {
+            Self::SelectedWholeWaveV1 { export, residual } => Some((
+                ferrum_types::SloCostPredictor::SelectedWholeWaveV1,
+                export,
+                residual,
+            )),
+            Self::SelectedIndependentAttentionV2 { export, residual } => Some((
+                ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2,
+                export,
+                residual,
+            )),
+            _ => None,
+        }
+    }
+    pub(super) fn selected_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::SelectedWholeWaveV1 { .. } => Some("selected_whole_wave_v1"),
+            Self::SelectedIndependentAttentionV2 { .. } => {
+                Some("selected_independent_attention_v2")
+            }
+            _ => None,
+        }
+    }
     pub(super) fn residual(&self) -> &[Cohort] {
         match self {
-            Self::SelectedWholeWaveV1 { residual, .. } => residual,
+            Self::SelectedWholeWaveV1 { residual, .. }
+            | Self::SelectedIndependentAttentionV2 { residual, .. } => residual,
             _ => &[],
         }
     }
     pub(super) fn destinations(&self) -> Option<(&std::path::Path, &std::path::Path)> {
         match self {
             Self::ExportedProfile { profile, source } => Some((profile, source)),
-            Self::SelectedWholeWaveV1 { export, .. } => {
+            Self::SelectedWholeWaveV1 { export, .. }
+            | Self::SelectedIndependentAttentionV2 { export, .. } => {
                 Some((&export.path, &export.observations_path))
             }
             Self::LiveFrozen => None,
@@ -151,7 +188,8 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
     }
     let destinations = match &mut manifest.validation_model {
         ValidationSource::ExportedProfile { profile, source } => Some((profile, source)),
-        ValidationSource::SelectedWholeWaveV1 { export, .. } => {
+        ValidationSource::SelectedWholeWaveV1 { export, .. }
+        | ValidationSource::SelectedIndependentAttentionV2 { export, .. } => {
             Some((&mut export.path, &mut export.observations_path))
         }
         ValidationSource::LiveFrozen => None,
@@ -185,7 +223,7 @@ impl Manifest {
                 );
             }
         }
-        if let ValidationSource::SelectedWholeWaveV1 { export, residual } = &self.validation_model {
+        if let Some((_, export, residual)) = self.validation_model.selected() {
             export.validate().map_err(FerrumError::config)?;
             if residual.is_empty() || residual.len() > 256 {
                 return invalid(

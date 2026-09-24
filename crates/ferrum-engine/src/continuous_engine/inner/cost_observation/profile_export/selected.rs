@@ -4,7 +4,9 @@ use super::*;
 use model::statistical::model::{
     CalibrationPartitionV1, FittedWholeWaveModelV1, WholeWaveObservationV1, WholeWaveSettingsV1,
 };
+use model::statistical::SelectedStatisticalFamily;
 use profile::statistical_v6::{CostProfileFileV6, WholeWaveProfileShapeV6};
+use profile::statistical_v7::CostProfileFileV7;
 mod raw;
 use raw::RawSource;
 
@@ -22,6 +24,7 @@ pub struct SelectedFitFreezeReceipt {
 pub(in crate::continuous_engine::inner) struct SelectedCalibrationCapture {
     options: SloCostProfileExportConfig,
     settings: WholeWaveSettingsV1,
+    family: SelectedStatisticalFamily,
     fingerprint: model::ExecutionFingerprint,
     identity: [u8; 32],
     protocol: [u8; 32],
@@ -99,13 +102,20 @@ impl SelectedCalibrationCapture {
                 "export clock declaration exceeds product import policy",
             ));
         }
-        if protocol == [0; 32]
-            || config.predictor != ferrum_types::SloCostPredictor::SelectedWholeWaveV1
-        {
+        if protocol == [0; 32] || !config.predictor.is_selected() {
             return Err(ExportError::Source(
                 "explicit selected predictor and nonzero protocol are required",
             ));
         }
+        let family = match config.predictor {
+            ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => {
+                SelectedStatisticalFamily::OrderedV1
+            }
+            ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => {
+                SelectedStatisticalFamily::IndependentAttentionV2
+            }
+            _ => unreachable!("selected checked above"),
+        };
         let settings = WholeWaveSettingsV1::from_policy_limits(
             &super::super::profile::model_settings(&config.model),
         );
@@ -125,14 +135,20 @@ impl SelectedCalibrationCapture {
         let identity = hash.finalize().into();
         let opening = ExportClockReading::opening(clock.as_ref())?;
         let mut source = RawSource::create(&source_path, options.max_file_bytes.get() as u64)?;
-        source.record(&serde_json::json!({"artifact_type":"ferrum.selected-whole-wave-source", "schema_version":1,
+        let mut header = serde_json::json!({"artifact_type":"ferrum.selected-whole-wave-source", "schema_version":1,
             "capture_identity_sha256":identity, "protocol_sha256":protocol, "producer":producer,
             "fingerprint":profile::ProfileFingerprint::from(&fingerprint),
             "settings":profile::statistical_v6::WholeWaveProfileSettingsV6::from(&settings),
-            "opening":opening,"declared_clock_max_error_ns":options.declared_clock_max_error_ns}))?;
+            "opening":opening,"declared_clock_max_error_ns":options.declared_clock_max_error_ns});
+        if family == SelectedStatisticalFamily::IndependentAttentionV2 {
+            header["schema_version"] = 2.into();
+            header["model_revision"] = family.model_revision().into();
+        }
+        source.record(&header)?;
         Ok(Self {
             options,
             settings,
+            family,
             fingerprint,
             identity,
             protocol,
@@ -177,6 +193,7 @@ impl SelectedCalibrationCapture {
             if sample.accepted_ordinal <= self.last_ordinal {
                 Err(model::statistical::model::ModelUnknown::DuplicateRecord)
             } else {
+                selected_family(&sample.selected, self.family)?;
                 Ok(sample)
             }
         });
@@ -185,7 +202,7 @@ impl SelectedCalibrationCapture {
         } else {
             "fit"
         };
-        let raw = match &observed {
+        let mut raw = match &observed {
             Ok(sample) => {
                 serde_json::json!({"kind":"observation", "phase":phase,"accepted_ordinal":sample.accepted_ordinal,
                 "call_id":sample.call_id,"observed_at_ns":sample.observed_at_ns,"wall_ns":sample.wall_ns,
@@ -196,6 +213,18 @@ impl SelectedCalibrationCapture {
                 serde_json::json!({"kind":"unavailable","phase":phase,"reason":format!("{reason:?}"),"queue":queue,"host_stages":stages.as_deref()})
             }
         };
+        if self.family == SelectedStatisticalFamily::IndependentAttentionV2 {
+            if let Ok(sample) = &observed {
+                raw["independent_attention"] = serde_json::to_value(
+                    sample
+                        .selected
+                        .independent_attention_v2()
+                        .expect("validated above")
+                        .to_wire_v2(),
+                )
+                .map_err(|_| ExportError::Source("encode independent-attention evidence"))?;
+            }
+        }
         self.source.record(&raw)?;
         let sample = match observed {
             Ok(sample) => sample,
@@ -262,7 +291,13 @@ impl SelectedCalibrationCapture {
             fit_through_ordinal: cut,
             residual_through_ordinal: u64::MAX,
         };
-        let fitted = FittedWholeWaveModelV1::fit(
+        let fit = match self.family {
+            SelectedStatisticalFamily::OrderedV1 => FittedWholeWaveModelV1::fit,
+            SelectedStatisticalFamily::IndependentAttentionV2 => {
+                FittedWholeWaveModelV1::fit_independent_attention_v2
+            }
+        };
+        let fitted = fit(
             self.fingerprint.clone(),
             self.settings.clone(),
             partition,
@@ -334,7 +369,11 @@ impl SelectedCalibrationCapture {
         ] {
             for sample in samples {
                 let family = families
-                    .entry(*sample.selected.family_signature())
+                    .entry(
+                        *selected_family(&sample.selected, self.family).map_err(|_| {
+                            ExportError::Source("retained sample lost its versioned evidence")
+                        })?,
+                    )
                     .or_default();
                 if residual {
                     family.1 += 1;
@@ -369,27 +408,52 @@ impl SelectedCalibrationCapture {
             fit_through_ordinal: freeze.accepted_ordinal,
             residual_through_ordinal: cut,
         };
-        let file = CostProfileFileV6::from_capture_observations(
-            &self.fingerprint,
-            &self.settings,
-            partition,
-            profile::ProfileSource {
-                generator: "ferrum.calibrate-slo".into(),
-                generator_revision: env!("CARGO_PKG_VERSION").into(),
-                measurement_protocol: "selected-whole-wave-fit-residual-v1".into(),
-                observation_artifact_sha256: source.digest,
-            },
-            closing.monotonic_ns,
-            closing.wall_unix_ns,
-            self.options.declared_clock_max_error_ns.unwrap(),
-            freeze.fit_parameters_sha256,
-            &self.fit,
-            &self.residual,
-        )
-        .map_err(|e| ExportError::Config(e.to_string()))?;
+        let profile_source = profile::ProfileSource {
+            generator: "ferrum.calibrate-slo".into(),
+            generator_revision: env!("CARGO_PKG_VERSION").into(),
+            measurement_protocol: match self.family {
+                SelectedStatisticalFamily::OrderedV1 => "selected-whole-wave-fit-residual-v1",
+                SelectedStatisticalFamily::IndependentAttentionV2 => {
+                    "selected-independent-attention-fit-residual-v2"
+                }
+            }
+            .into(),
+            observation_artifact_sha256: source.digest,
+        };
         let mut output =
             StagedFile::create(&self.options.path, self.options.max_file_bytes.get() as u64)?;
-        output.json(&file)?;
+        match self.family {
+            SelectedStatisticalFamily::OrderedV1 => output.json(
+                &CostProfileFileV6::from_capture_observations(
+                    &self.fingerprint,
+                    &self.settings,
+                    partition,
+                    profile_source,
+                    closing.monotonic_ns,
+                    closing.wall_unix_ns,
+                    self.options.declared_clock_max_error_ns.unwrap(),
+                    freeze.fit_parameters_sha256,
+                    &self.fit,
+                    &self.residual,
+                )
+                .map_err(|e| ExportError::Config(e.to_string()))?,
+            )?,
+            SelectedStatisticalFamily::IndependentAttentionV2 => output.json(
+                &CostProfileFileV7::from_capture_observations(
+                    &self.fingerprint,
+                    &self.settings,
+                    partition,
+                    profile_source,
+                    closing.monotonic_ns,
+                    closing.wall_unix_ns,
+                    self.options.declared_clock_max_error_ns.unwrap(),
+                    freeze.fit_parameters_sha256,
+                    &self.fit,
+                    &self.residual,
+                )
+                .map_err(|e| ExportError::Config(e.to_string()))?,
+            )?,
+        }
         let published = output.publish()?;
         Ok((
             CostProfileCutReceipt {
@@ -406,5 +470,20 @@ impl SelectedCalibrationCapture {
             },
             summary,
         ))
+    }
+}
+
+fn selected_family(
+    evidence: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+    family: SelectedStatisticalFamily,
+) -> Result<&[u8; 32], model::statistical::model::ModelUnknown> {
+    match family {
+        SelectedStatisticalFamily::OrderedV1 => Ok(evidence.family_signature()),
+        SelectedStatisticalFamily::IndependentAttentionV2 => evidence
+            .independent_attention_v2()
+            .map(|v| v.family_signature())
+            .ok_or(model::statistical::model::ModelUnknown::Evidence(
+                StatisticalEvidenceUnknown::MissingProducer,
+            )),
     }
 }

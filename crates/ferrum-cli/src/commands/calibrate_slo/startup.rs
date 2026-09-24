@@ -150,19 +150,19 @@ pub(super) fn validate_export_configuration(
     policy: &ferrum_types::SloConfig,
 ) -> Result<()> {
     paths::distinct(paths::outputs(cmd, manifest))?;
-    let selected = matches!(
-        manifest.validation_model,
-        manifest::ValidationSource::SelectedWholeWaveV1 { .. }
-    );
-    if selected
-        != (policy.cost_observation.predictor
-            == ferrum_types::SloCostPredictor::SelectedWholeWaveV1)
+    let selected = manifest.validation_model.selected();
+    if selected.map(|(predictor, _, _)| predictor)
+        != policy
+            .cost_observation
+            .predictor
+            .is_selected()
+            .then_some(policy.cost_observation.predictor)
     {
-        return Err(FerrumError::config("selected whole-wave predictor and independent residual calibration must be selected together"));
+        return Err(FerrumError::config(
+            "selected predictor version and independent calibration protocol must match exactly",
+        ));
     }
-    if let manifest::ValidationSource::SelectedWholeWaveV1 { export, .. } =
-        &manifest.validation_model
-    {
+    if let Some((_, export, _)) = selected {
         export.validate().map_err(FerrumError::config)?;
         if policy.cost_observation.profile_export.is_some() {
             return Err(FerrumError::config(

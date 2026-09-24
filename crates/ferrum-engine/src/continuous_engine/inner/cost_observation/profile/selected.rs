@@ -1,8 +1,12 @@
-//! Explicit schema-6 startup import. Ordinary observation and heldout consumption
+//! Explicit schema-6/7 startup import. Ordinary observation and heldout consumption
 //! cannot change fit/residual/support/TTL. Explicit feedback has a separate epoch.
 use super::*;
 use file::statistical_v6::{load_whole_wave_profile_v6, ImportedWholeWaveModelV1};
-use model::statistical::model::{ModelUnknown, WholeWaveSettingsV1, MODEL_REVISION};
+use file::statistical_v7::load_whole_wave_profile_v7;
+use model::statistical::{
+    model::{ModelUnknown, WholeWaveSettingsV1},
+    SelectedStatisticalFamily,
+};
 
 pub(super) fn load_seed(
     fingerprint: model::ExecutionFingerprint,
@@ -11,7 +15,7 @@ pub(super) fn load_seed(
     clock: Option<file::ProfileLoadClock>,
 ) -> Result<TrainingSeed, FerrumError> {
     // Never route new-mode capture through the old online trainer/export format.
-    // The independent three-phase capture protocol owns schema-6 publication.
+    // The independent three-phase capture protocol owns explicitly versioned publication.
     if config.profile_export.is_some() {
         return Err(FerrumError::config(
             "selected whole-wave calibration requires its independent fit/residual capture protocol, not legacy profile_export",
@@ -40,7 +44,21 @@ pub(super) fn load_seed(
             "cost profile clock differs from declared policy",
         ));
     }
-    let imported = load_whole_wave_profile_v6(
+    type Loader = fn(
+        &Path,
+        &model::ExecutionFingerprint,
+        &WholeWaveSettingsV1,
+        &file::CostProfileLoadLimits,
+        file::ProfileLoadClock,
+    ) -> Result<ImportedWholeWaveModelV1, file::CostProfileError>;
+    let (schema, loader): (u32, Loader) = match config.predictor {
+        ferrum_types::SloCostPredictor::SelectedWholeWaveV1 => (6, load_whole_wave_profile_v6),
+        ferrum_types::SloCostPredictor::SelectedIndependentAttentionV2 => {
+            (7, load_whole_wave_profile_v7)
+        }
+        _ => return Err(FerrumError::config("not a selected predictor")),
+    };
+    let imported = loader(
         path,
         &fingerprint,
         &settings,
@@ -53,14 +71,14 @@ pub(super) fn load_seed(
         selected_whole_wave: Some(ferrum_types::SloSelectedWholeWaveReceiptV1 {
             capture_identity_sha256: imported.capture_identity_sha256,
             fit_parameters_sha256: imported.fit_parameters_sha256,
-            model_revision: MODEL_REVISION.to_owned(),
+            model_revision: imported.selected_family().model_revision().to_owned(),
             protocol_sha256: imported.protocol_sha256,
             fit_through_ordinal: p.fit_through_ordinal,
             residual_through_ordinal: p.residual_through_ordinal,
             fit_records: imported.fit_records,
             residual_records: imported.residual_records,
         }),
-        schema_version: 6,
+        schema_version: schema,
         path: p
             .loaded_from
             .clone()
@@ -119,7 +137,10 @@ pub(super) fn predict(
         ))
         .and_then(|input| {
             let value = snapshot.model.predict_input(fingerprint, input, now_ns)?;
-            snapshot.apply(value, input.family_signature())
+            snapshot.apply(
+                value,
+                input.family_signature_for(snapshot.model.selected_family())?,
+            )
         });
     match result {
         Ok(value) => Some(PlanningCost {
@@ -145,6 +166,20 @@ pub(super) struct SelectedSnapshot {
     pub feedback: Option<Arc<super::super::selected_feedback::View>>,
 }
 impl SelectedSnapshot {
+    pub fn family_signature<'a>(
+        &self,
+        evidence: &'a ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+    ) -> Result<&'a [u8; 32], ModelUnknown> {
+        match self.model.selected_family() {
+            SelectedStatisticalFamily::OrderedV1 => Ok(evidence.family_signature()),
+            SelectedStatisticalFamily::IndependentAttentionV2 => evidence
+                .independent_attention_v2()
+                .map(|v| v.family_signature())
+                .ok_or(ModelUnknown::Evidence(
+                    ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown::MissingProducer,
+                )),
+        }
+    }
     pub fn apply(
         &self,
         mut value: model::statistical::model::WholeWavePredictionV1,

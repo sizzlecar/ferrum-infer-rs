@@ -54,7 +54,7 @@ pub(super) fn evaluate(
         let compared = SelectedServingComparison {
             accepted_ordinal,
             call_id: actual.call_id,
-            family_signature: *actual.selected.family_signature(),
+            family_signature: *model.selected_family_signature(&actual.selected)?,
             terminal,
             observed_at_ns: actual.observed_at_ns,
             consumed_at_ns: now,

@@ -64,7 +64,7 @@ impl SloSelectedFeedbackPolicy {
         let Self::RetrospectiveFamilyMarginV1 { policy: p, storage } = self else {
             return Ok(());
         };
-        if config.predictor != SloCostPredictor::SelectedWholeWaveV1 {
+        if !config.predictor.is_selected() {
             return Err(
                 "selected feedback requires the explicit selected whole-wave predictor".into(),
             );
