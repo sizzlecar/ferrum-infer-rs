@@ -173,6 +173,7 @@ impl ExecutionCostRouteState {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionCostRouteProjection {
+    pub statistical_evidence: Option<crate::execution_cost::StatisticalWaveEvidenceV1>,
     pub shape: CanonicalWaveCostShape,
     pub state: ExecutionCostRouteState,
 }

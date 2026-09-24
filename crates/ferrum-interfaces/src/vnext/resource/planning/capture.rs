@@ -164,7 +164,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     .work_shape()
                     .fit_tokens(),
                 retired_frames: active.retired_frames,
-                pending_zero_commands: pending_zero_commands(
+                pending_zero_transfer_bytes: pending_zero_transfer_bytes(
                     backing.backing_slices(),
                     limits.maximum_free_extents,
                     poll_budget,
@@ -313,11 +313,11 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     }
 }
 
-fn pending_zero_commands(
+fn pending_zero_transfer_bytes(
     slices: &[LogicalBackingSliceAuthority],
     maximum_segments: usize,
     budget: &mut dyn ResourcePlanningBudget,
-) -> Result<Option<u32>, ResourcePlanningUnknown> {
+) -> Result<Option<Arc<[u64]>>, ResourcePlanningUnknown> {
     let mut unique = BTreeSet::new();
     let mut visited = 0_usize;
     for slice in slices {
@@ -350,7 +350,14 @@ fn pending_zero_commands(
             ));
         }
     }
-    Ok(Some(
-        u32::try_from(unique.len()).map_err(|_| ResourcePlanningUnknown::LimitExceeded)?,
-    ))
+    u32::try_from(unique.len()).map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(unique.len())
+        .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
+    for (_, _, _, _, length) in unique {
+        poll(budget)?;
+        bytes.push(length);
+    }
+    Ok(Some(bytes.into()))
 }

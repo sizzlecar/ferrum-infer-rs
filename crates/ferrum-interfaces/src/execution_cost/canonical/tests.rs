@@ -2,6 +2,7 @@ use super::*;
 
 fn command(index: u32) -> CostPhysicalCommand<'static> {
     CostPhysicalCommand {
+        statistical_evidence: None,
         native_op_id: "test.compute",
         command_index: index,
         node_index: Some(0),

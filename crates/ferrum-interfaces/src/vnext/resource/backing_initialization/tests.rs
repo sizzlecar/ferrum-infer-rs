@@ -374,3 +374,89 @@ fn restore_initialization_encode_rejects_other_runtime_and_replaced_reservation(
     drop(replacement);
     harness.close();
 }
+
+#[test]
+fn planning_pending_zero_spans_match_real_extent_encoding_and_disappear_after_success() {
+    use crate::vnext::{ResourcePlanningAvailability, ResourcePlanningLimits};
+    let harness = RestoreHarness::new(checkpoint_fixture::Spec::default());
+    let capture = || match harness.root.resource_planning_view(
+        &[harness.session.as_ref()],
+        ResourcePlanningLimits::default(),
+        &mut || true,
+    ) {
+        ResourcePlanningAvailability::Known(view) => view,
+        other => panic!("real idle initialization snapshot: {other:?}"),
+    };
+    assert!(
+        harness
+            .runtime
+            .cost_core_transfer_evidence(
+                crate::execution_cost::StatisticalTransferKindV1::Fill,
+                16,
+                0
+            )
+            .is_none(),
+        "unimplemented runtimes do not inherit Metal evidence"
+    );
+    let initial = capture();
+    let lengths = initial.participants()[0]
+        .pending_zero_transfer_bytes()
+        .unwrap()
+        .to_vec();
+    assert!(!lengths.is_empty());
+    let guard = harness.reserve();
+    let (mut prepared, _) = prepare(&harness, &guard, 1);
+    let mut actual_lengths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for authority in guard.backing().backing_slices() {
+        if authority.evidence().initialization() != StateInitialization::Zero {
+            continue;
+        }
+        let cell = authority.initialization_cell().unwrap();
+        let view = harness.root.dynamic_pools.view(authority).unwrap();
+        for binding in view.segment_bindings() {
+            let segment = binding.segment();
+            if seen.insert((
+                cell.target_fingerprint(),
+                segment.chunk_ordinal(),
+                segment.chunk_generation(),
+                segment.offset_bytes(),
+                segment.length_bytes(),
+            )) {
+                actual_lengths.push(segment.length_bytes());
+            }
+        }
+    }
+    let mut sorted_expected = lengths.clone();
+    sorted_expected.sort_unstable();
+    actual_lengths.sort_unstable();
+    assert_eq!(
+        sorted_expected, actual_lengths,
+        "must retain real physical extents, not logical request bytes"
+    );
+    let mut commands = DeviceCommandBatch::with_capacity(0);
+    assert_eq!(
+        prepared
+            .encode_restore(&guard, harness.runtime.as_ref(), &mut commands)
+            .unwrap(),
+        lengths.len()
+    );
+    prepared.mark_in_flight().unwrap();
+    prepared.finish(true).unwrap();
+    drop(prepared);
+    drop(guard);
+    assert_eq!(
+        capture().participants()[0].pending_zero_transfer_bytes(),
+        Some([].as_slice())
+    );
+    // A numeric view does not pin or authorize initialization and remains a
+    // snapshot; successful terminal reconciliation changes the fresh capture.
+    assert_eq!(
+        initial.participants()[0]
+            .pending_zero_transfer_bytes()
+            .unwrap(),
+        lengths
+    );
+    drop(initial);
+    harness.close();
+}

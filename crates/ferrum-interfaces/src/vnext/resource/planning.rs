@@ -146,7 +146,7 @@ pub struct ResourcePlanningParticipant {
     covered: DynamicResourceShape,
     maximum_tokens: u64,
     retired_frames: u64,
-    pending_zero_commands: Option<u32>,
+    pending_zero_transfer_bytes: Option<Arc<[u64]>>,
 }
 
 impl ResourcePlanningParticipant {
@@ -168,7 +168,15 @@ impl ResourcePlanningParticipant {
         self.maximum_tokens
     }
     pub(crate) fn pending_zero_commands(&self) -> Option<u32> {
-        self.pending_zero_commands
+        self.pending_zero_transfer_bytes
+            .as_ref()
+            .and_then(|spans| u32::try_from(spans.len()).ok())
+    }
+    /// One length per unique pending physical zero extent. All entries are
+    /// the same Fill path; order among lengths cannot alter their class chain
+    /// or checked byte sum. This is copied numeric evidence, not a lease.
+    pub(crate) fn pending_zero_transfer_bytes(&self) -> Option<&[u64]> {
+        self.pending_zero_transfer_bytes.as_deref()
     }
 }
 

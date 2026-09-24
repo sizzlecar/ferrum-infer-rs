@@ -14,6 +14,8 @@ mod recorder;
 pub use recorder::*;
 mod context;
 pub use context::*;
+mod statistical;
+pub use statistical::*;
 mod canonical;
 pub use canonical::*;
 mod features;
@@ -171,7 +173,7 @@ pub struct ActualWaveRow {
     pub work: ActualRowWork,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ActualWaveShape {
     pub kind: ActualWaveKind,
     pub path: ActualWavePath,
@@ -182,12 +184,35 @@ pub struct ActualWaveShape {
     pub numeric_features: Option<CanonicalWaveCostFeatures>,
     pub host_content_features: Option<HostContentCostFeaturesV1>,
     pub row_multiset_features: Option<HostRowMultisetCostFeaturesV2>,
+    /// Passive sidecar from the same completed canonical receipt.
+    pub statistical_evidence: Option<StatisticalWaveEvidenceV1>,
     pub rows: Vec<ActualWaveRow>,
     pub recurrent_state_bytes: u64,
     pub restore_bytes: u64,
     pub maintenance_bytes: u64,
     pub maintenance_units: u32,
 }
+// Equality retains the legacy exact contract. Passive statistics must be
+// compared explicitly and can never alter an execution/route equality gate.
+impl PartialEq for ActualWaveShape {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.path == other.path
+            && self.graph == other.graph
+            && self.row_order == other.row_order
+            && self.provider_signature == other.provider_signature
+            && self.output_policy_signature == other.output_policy_signature
+            && self.numeric_features == other.numeric_features
+            && self.host_content_features == other.host_content_features
+            && self.row_multiset_features == other.row_multiset_features
+            && self.rows == other.rows
+            && self.recurrent_state_bytes == other.recurrent_state_bytes
+            && self.restore_bytes == other.restore_bytes
+            && self.maintenance_bytes == other.maintenance_bytes
+            && self.maintenance_units == other.maintenance_units
+    }
+}
+impl Eq for ActualWaveShape {}
 
 impl ActualWaveShape {
     pub fn validate(&self, max_rows: usize) -> Result<(), CostRecorderError> {

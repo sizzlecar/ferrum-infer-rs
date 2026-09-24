@@ -2551,7 +2551,7 @@ pub const DEVICE_ZERO_NATIVE_OPERATION_ID: DeviceNativeOperationId =
 /// index is issued by core and binds backend work back to the immutable plan;
 /// backend labels and counters carry observation only and grant no execution
 /// authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceNativeWorkAttribution {
     command_index: u32,
     node_index: Option<u32>,
@@ -2565,7 +2565,28 @@ pub struct DeviceNativeWorkAttribution {
     compute_dispatch_count: u64,
     transfer_command_count: u64,
     reusable_graph_node_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistical_evidence: Option<crate::execution_cost::SelectedCommandCostEvidenceV1>,
 }
+// Equality retains the legacy exact contract. Passive statistics must be
+// compared explicitly and can never alter an execution/route equality gate.
+impl PartialEq for DeviceNativeWorkAttribution {
+    fn eq(&self, other: &Self) -> bool {
+        self.command_index == other.command_index
+            && self.node_index == other.node_index
+            && self.command_phase == other.command_phase
+            && self.native_op_id == other.native_op_id
+            && self.execution_path == other.execution_path
+            && self.batching_form == other.batching_form
+            && self.participant_start == other.participant_start
+            && self.participant_count == other.participant_count
+            && self.token_count == other.token_count
+            && self.compute_dispatch_count == other.compute_dispatch_count
+            && self.transfer_command_count == other.transfer_command_count
+            && self.reusable_graph_node_count == other.reusable_graph_node_count
+    }
+}
+impl Eq for DeviceNativeWorkAttribution {}
 
 impl DeviceNativeWorkAttribution {
     #[allow(clippy::too_many_arguments)]
@@ -2635,7 +2656,33 @@ impl DeviceNativeWorkAttribution {
             compute_dispatch_count,
             transfer_command_count,
             reusable_graph_node_count,
+            statistical_evidence: None,
         })
+    }
+
+    /// Attach only after the encoder's actual dispatch/transfer counts are known.
+    /// This adds observation, never permission or a graph compatibility claim.
+    pub fn with_statistical_evidence(
+        mut self,
+        evidence: crate::execution_cost::SelectedCommandCostEvidenceV1,
+    ) -> Result<Self, crate::execution_cost::StatisticalEvidenceUnknown> {
+        evidence.validate_command(
+            self.token_count,
+            self.compute_dispatch_count,
+            self.transfer_command_count,
+        )?;
+        if self.execution_path != DeviceExecutionPath::Eager
+            || self.reusable_graph_node_count.is_some()
+        {
+            return Err(crate::execution_cost::StatisticalEvidenceUnknown::UnsupportedReplay);
+        }
+        self.statistical_evidence = Some(evidence);
+        Ok(self)
+    }
+    pub fn statistical_evidence(
+        &self,
+    ) -> Option<&crate::execution_cost::SelectedCommandCostEvidenceV1> {
+        self.statistical_evidence.as_ref()
     }
 
     pub const fn command_index(&self) -> u32 {
@@ -3492,6 +3539,19 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// Describes the actual eager core encoder without encoding or submitting
     /// anything. It grants neither buffer nor readback-staging permission.
     fn cost_core_execution_capabilities(&self) -> Option<super::DeviceCoreCostCapabilities> {
+        None
+    }
+
+    /// Passive selected evidence for one real core transfer. The byte count
+    /// comes from a proven physical span or merged contiguous upload, never
+    /// command cardinality. None keeps the statistical domain unavailable;
+    /// this grants no transfer or allocation authority.
+    fn cost_core_transfer_evidence(
+        &self,
+        _kind: crate::execution_cost::StatisticalTransferKindV1,
+        _bytes: u64,
+        _tokens: u64,
+    ) -> Option<crate::execution_cost::SelectedCommandCostEvidenceV1> {
         None
     }
 

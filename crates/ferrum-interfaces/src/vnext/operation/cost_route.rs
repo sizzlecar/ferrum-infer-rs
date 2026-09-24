@@ -302,7 +302,7 @@ fn validate_work_rows(rows: &[OperationCostWorkRow]) -> Result<u64, VNextError> 
 
 /// One physical encoder command in an eager route. Host-only bindings are
 /// retained as zero-work slots so later physical command indices stay exact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OperationCostCommand {
     native_operation: &'static str,
     phase: DeviceCommandPhase,
@@ -312,7 +312,23 @@ pub struct OperationCostCommand {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
+    statistical_evidence: Option<crate::execution_cost::SelectedCommandCostEvidenceV1>,
 }
+// Equality retains the legacy exact contract. Passive statistics must be
+// compared explicitly and can never alter an execution/route equality gate.
+impl PartialEq for OperationCostCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.native_operation == other.native_operation
+            && self.phase == other.phase
+            && self.batching == other.batching
+            && self.participant_start == other.participant_start
+            && self.participant_count == other.participant_count
+            && self.token_count == other.token_count
+            && self.compute_dispatch_count == other.compute_dispatch_count
+            && self.transfer_command_count == other.transfer_command_count
+    }
+}
+impl Eq for OperationCostCommand {}
 
 impl OperationCostCommand {
     #[allow(clippy::too_many_arguments)]
@@ -344,7 +360,26 @@ impl OperationCostCommand {
             token_count,
             compute_dispatch_count,
             transfer_command_count,
+            statistical_evidence: None,
         })
+    }
+    /// Provider declaration from the same selected launch used by the encoder.
+    pub fn with_statistical_evidence(
+        mut self,
+        evidence: crate::execution_cost::SelectedCommandCostEvidenceV1,
+    ) -> Result<Self, crate::execution_cost::StatisticalEvidenceUnknown> {
+        evidence.validate_command(
+            self.token_count,
+            self.compute_dispatch_count,
+            self.transfer_command_count,
+        )?;
+        self.statistical_evidence = Some(evidence);
+        Ok(self)
+    }
+    pub fn statistical_evidence(
+        &self,
+    ) -> Option<&crate::execution_cost::SelectedCommandCostEvidenceV1> {
+        self.statistical_evidence.as_ref()
     }
     pub fn native_operation(&self) -> &'static str {
         self.native_operation
@@ -376,7 +411,7 @@ impl OperationCostCommand {
     /// None is precisely a host-only slot; callers must still advance the
     /// physical command index. This is a declaration, not observed evidence.
     pub fn canonical_command<'a>(
-        &self,
+        &'a self,
         command_index: u32,
         node_index: u32,
         provider: CostProviderIdentity<'a>,
@@ -395,6 +430,7 @@ impl OperationCostCommand {
             compute_dispatch_count: self.compute_dispatch_count,
             transfer_command_count: self.transfer_command_count,
             reusable_graph_node_count: None,
+            statistical_evidence: self.statistical_evidence.as_ref(),
         })
     }
 }

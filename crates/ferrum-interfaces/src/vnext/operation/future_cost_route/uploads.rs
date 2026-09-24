@@ -24,13 +24,16 @@ pub struct EagerCoreReadback<'a> {
     pub layout: HostTransferLayout,
 }
 
-pub(super) fn input_commands(
+pub(super) fn input_transfer_bytes(
     resolved: &dyn ExecutablePlanView,
     rows: &[OperationCostWorkRow],
     uploads: &[EagerCoreInputUpload<'_>],
     budget: &mut dyn ResourcePlanningBudget,
-) -> Result<usize, U> {
-    let mut commands = 0_usize;
+) -> Result<Vec<u64>, U> {
+    let mut commands = Vec::new();
+    commands
+        .try_reserve_exact(uploads.len())
+        .map_err(|_| U::Capacity)?;
     let mut cursor = 0;
     while cursor < uploads.len() {
         super::core::poll(budget)?;
@@ -101,10 +104,9 @@ pub(super) fn input_commands(
         let mut range_cursor = 0;
         while range_cursor < ranges.len() {
             super::core::poll(budget)?;
-            range_cursor = contiguous_upload_run_end(ranges.len(), range_cursor, true, |index| {
-                ranges[index].clone()
-            });
-            commands = commands.checked_add(1).ok_or(U::Capacity)?;
+            let (next_cursor, bytes) = merged_transfer_span(&ranges, range_cursor)?;
+            range_cursor = next_cursor;
+            commands.push(bytes);
         }
         cursor = end;
     }
@@ -220,4 +222,42 @@ fn project_range(
         return Err(U::CoreLayout);
     }
     Ok(translated)
+}
+
+/// Same actual upload run selection, retaining its exact byte extent.
+fn merged_transfer_span(ranges: &[Range<u64>], cursor: usize) -> Result<(usize, u64), U> {
+    let first = ranges.get(cursor).ok_or(U::InvalidInput)?;
+    let end = contiguous_upload_run_end(ranges.len(), cursor, true, |index| ranges[index].clone());
+    let last = ranges
+        .get(end.checked_sub(1).ok_or(U::InvalidInput)?)
+        .ok_or(U::InvalidInput)?;
+    let bytes = last
+        .end
+        .checked_sub(first.start)
+        .filter(|&bytes| bytes > 0)
+        .ok_or(U::InvalidInput)?;
+    Ok((end, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn transfer_spans_follow_actual_contiguous_run_boundaries_without_count_times_size() {
+        let ranges = [7..11, 11..19, 24..29, 28..34, 34..39];
+        let mut cursor = 0;
+        let mut bytes = Vec::new();
+        while cursor < ranges.len() {
+            let (end, size) = merged_transfer_span(&ranges, cursor).unwrap();
+            bytes.push(size);
+            cursor = end;
+        }
+        assert_eq!(bytes, vec![12, 5, 11]);
+        assert_eq!(merged_transfer_span(&[3..3], 0), Err(U::InvalidInput));
+        assert_eq!(merged_transfer_span(&[], 0), Err(U::InvalidInput));
+        assert_eq!(
+            merged_transfer_span(&[u64::MAX - 3..u64::MAX], 0),
+            Ok((1, 3))
+        );
+    }
 }

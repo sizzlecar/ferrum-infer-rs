@@ -95,6 +95,7 @@ fn command_readback_exact_fit_matches_actual_scalar_result_binding_attribution()
     for index in 7..9 {
         actual
             .physical_command(CostPhysicalCommand {
+                statistical_evidence: None,
                 native_op_id: "host.submission_readback",
                 command_index: index,
                 node_index: None,

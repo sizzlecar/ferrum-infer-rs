@@ -14,6 +14,7 @@ fn recorder(waves: usize) -> BoundedWaveRecorder {
 
 fn decode() -> ActualWaveShape {
     ActualWaveShape {
+        statistical_evidence: None,
         kind: ActualWaveKind::Decode,
         path: ActualWavePath::PlanRuntime,
         graph: ActualWaveGraphState::Disabled,

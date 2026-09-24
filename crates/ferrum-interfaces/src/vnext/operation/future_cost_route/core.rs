@@ -85,7 +85,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         .try_reserve_exact(query.rows.len())
         .map_err(|_| U::Capacity)?;
     let mut total_tokens = 0_u64;
-    let mut zeros = 0_u32;
+    let mut zeros = Vec::new();
     let mut next = state.clone();
     let mut previous_authority = None;
     for (row, &index) in query.rows.iter().zip(query.participant_indices) {
@@ -111,13 +111,23 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             .checked_add(row.count.get())
             .ok_or(U::InvalidInput)?;
         if !next.initialized[index] {
-            zeros = zeros
-                .checked_add(
-                    view.resources.participants()[index]
-                        .pending_zero_commands()
-                        .ok_or(U::InitializationState)?,
-                )
-                .ok_or(U::Capacity)?;
+            let spans = view.resources.participants()[index]
+                .pending_zero_transfer_bytes()
+                .ok_or(U::InitializationState)?;
+            if zeros
+                .len()
+                .checked_add(spans.len())
+                .is_none_or(|n| n > MAX_COST_COMMANDS)
+            {
+                return Err(U::Capacity);
+            }
+            zeros
+                .try_reserve_exact(spans.len())
+                .map_err(|_| U::Capacity)?;
+            for &bytes in spans {
+                poll(budget)?;
+                zeros.push(bytes);
+            }
             next.initialized[index] = true;
         }
         // New zero-initialized growth requires its own physical-piece proof.
@@ -172,8 +182,13 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     let selected_step = projection.step_slot;
     next.resources = projection.state;
     let mut command_index = 0_u32;
-    for _ in 0..zeros {
+    for bytes in zeros {
         poll(budget)?;
+        let evidence = runtime.cost_core_transfer_evidence(
+            crate::execution_cost::StatisticalTransferKindV1::Fill,
+            bytes,
+            0,
+        );
         append_transfer(
             canonical,
             &mut command_index,
@@ -182,6 +197,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             None,
             0,
             0,
+            evidence.as_ref(),
         )?;
     }
     let shape = DynamicResourceShape::from_validated(query.rows.len() as u32, total_tokens, 0);
@@ -211,12 +227,10 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             .iter()
             .find(|descriptor| descriptor.base_resource_id() == resource_id)
             .ok_or(U::CoreLayout)?;
-        if descriptor.storage().profile().view() != DynamicStorageView::Contiguous
-            || requirement
-                .evaluate_shape_bytes(shape)
-                .map_err(|_| U::CoreLayout)?
-                == 0
-        {
+        let bytes = requirement
+            .evaluate_shape_bytes(shape)
+            .map_err(|_| U::CoreLayout)?;
+        if descriptor.storage().profile().view() != DynamicStorageView::Contiguous || bytes == 0 {
             return Err(U::CoreLayout);
         }
         let provider = providers
@@ -229,6 +243,11 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             implementation_fingerprint: provider.provider_implementation_fingerprint(),
             operation_fingerprint: provider.operation_fingerprint(),
         };
+        let evidence = runtime.cost_core_transfer_evidence(
+            crate::execution_cost::StatisticalTransferKindV1::Fill,
+            bytes,
+            total_tokens,
+        );
         append_transfer(
             canonical,
             &mut command_index,
@@ -237,10 +256,11 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             Some((index as u32, identity)),
             query.rows.len() as u32,
             total_tokens,
+            evidence.as_ref(),
         )?;
     }
     let mut input_commands =
-        super::uploads::input_commands(resolved, query.rows, query.uploads, budget)?;
+        super::uploads::input_transfer_bytes(resolved, query.rows, query.uploads, budget)?;
     next.last_token_mask_uploads = None;
     if let Some(mask) = query.token_mask_input {
         if mask.contents.len() != query.rows.len() {
@@ -292,12 +312,17 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                 }
             }
             input_commands =
-                super::uploads::input_commands(resolved, query.rows, &filtered, budget)?;
+                super::uploads::input_transfer_bytes(resolved, query.rows, &filtered, budget)?;
         }
         next.last_token_mask_uploads = Some(uploads);
     }
-    for _ in 0..input_commands {
+    for bytes in input_commands {
         poll(budget)?;
+        let evidence = runtime.cost_core_transfer_evidence(
+            crate::execution_cost::StatisticalTransferKindV1::HostToDevice,
+            bytes,
+            0,
+        );
         append_transfer(
             canonical,
             &mut command_index,
@@ -306,6 +331,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             None,
             0,
             0,
+            evidence.as_ref(),
         )?;
     }
     let route = providers
@@ -451,6 +477,7 @@ fn append_readback_route(
                     None,
                     0,
                     0,
+                    None, // This backend's per-readback transfer producer is not declared here.
                 )?;
             }
         }
@@ -528,6 +555,7 @@ fn append_transfer<'a>(
     provider: Option<(u32, CostProviderIdentity<'a>)>,
     participants: u32,
     tokens: u64,
+    statistical_evidence: Option<&crate::execution_cost::SelectedCommandCostEvidenceV1>,
 ) -> Result<(), U> {
     if *index as usize >= MAX_COST_COMMANDS {
         return Err(U::Capacity);
@@ -551,6 +579,7 @@ fn append_transfer<'a>(
             compute_dispatch_count: 0,
             transfer_command_count: 1,
             reusable_graph_node_count: None,
+            statistical_evidence,
         })
         .map_err(|_| U::InvalidInput)?;
     *index = index.checked_add(1).ok_or(U::Capacity)?;

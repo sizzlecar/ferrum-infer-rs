@@ -50,6 +50,7 @@ fn shape_product(
     let mut builder = CanonicalWaveCostBuilder::new(0, product);
     builder
         .physical_command(CostPhysicalCommand {
+            statistical_evidence: None,
             native_op_id: "fixture.operation",
             command_index: 0,
             node_index: Some(0),

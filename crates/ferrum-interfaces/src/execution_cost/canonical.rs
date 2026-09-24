@@ -46,7 +46,7 @@ pub struct CostProviderIdentity<'a> {
     pub implementation_fingerprint: &'a str,
     pub operation_fingerprint: &'a str,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct CostPhysicalCommand<'a> {
     pub native_op_id: &'a str,
     pub command_index: u32,
@@ -61,7 +61,29 @@ pub struct CostPhysicalCommand<'a> {
     pub compute_dispatch_count: u64,
     pub transfer_command_count: u64,
     pub reusable_graph_node_count: Option<u64>,
+    pub statistical_evidence: Option<&'a super::SelectedCommandCostEvidenceV1>,
 }
+// Equality retains the legacy exact contract. Passive statistics must be
+// compared explicitly and can never alter an execution/route equality gate.
+impl PartialEq for CostPhysicalCommand<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.native_op_id == other.native_op_id
+            && self.command_index == other.command_index
+            && self.node_index == other.node_index
+            && self.command_phase == other.command_phase
+            && self.provider == other.provider
+            && self.path == other.path
+            && self.participant_start == other.participant_start
+            && self.participant_count == other.participant_count
+            && self.token_count == other.token_count
+            && self.batching_form == other.batching_form
+            && self.compute_dispatch_count == other.compute_dispatch_count
+            && self.transfer_command_count == other.transfer_command_count
+            && self.reusable_graph_node_count == other.reusable_graph_node_count
+    }
+}
+impl Eq for CostPhysicalCommand<'_> {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostLogicalCommand<'a> {
     pub native_op_id: &'a str,
@@ -98,6 +120,7 @@ impl<'a> CostPhysicalCommand<'a> {
             compute_dispatch_count: command.compute_dispatch_count(),
             transfer_command_count: command.transfer_command_count(),
             reusable_graph_node_count: command.reusable_graph_node_count(),
+            statistical_evidence: command.statistical_evidence(),
         }
     }
 }
@@ -161,6 +184,7 @@ pub struct CanonicalWaveCostShape {
 /// Incremental bounded hashing avoids building a second large command/JSON
 /// representation on the actual observation path. All errors are sticky.
 pub struct CanonicalWaveCostBuilder {
+    statistical: super::statistical::StatisticalWaveAccumulator,
     provider: Sha256,
     output: Sha256,
     numeric_output: Sha256,
@@ -255,6 +279,7 @@ impl CanonicalWaveCostBuilder {
             },
         );
         Self {
+            statistical: super::statistical::StatisticalWaveAccumulator::new(),
             provider,
             output,
             numeric_output,
@@ -383,6 +408,8 @@ impl CanonicalWaveCostBuilder {
                 }
                 None => number(&mut this.provider, 0),
             }
+            // Passive evidence never changes exact validation or authorization.
+            this.statistical.observe(command);
             this.commands += 1;
             this.last_command_index = Some(command.command_index);
             Ok(())
@@ -644,6 +671,25 @@ impl CanonicalWaveCostBuilder {
             Ok(())
         })
     }
+    /// Completes both views from one receipt; invalid or missing producer data
+    /// never changes the legacy exact shape or its validation result.
+    pub fn finish_with_statistics(
+        mut self,
+        kind: ActualWaveKind,
+        path: ActualWavePath,
+        graph: ActualWaveGraphState,
+        row_order: ActualWaveRowOrder,
+        recurrent_state_bytes: u64,
+    ) -> Result<super::CanonicalStatisticalWave, CanonicalCostError> {
+        let accumulator = std::mem::replace(
+            &mut self.statistical,
+            super::statistical::StatisticalWaveAccumulator::new(),
+        );
+        let exact = self.finish(kind, path, graph, row_order, recurrent_state_bytes)?;
+        let statistical = accumulator.finish(&exact);
+        Ok(super::CanonicalStatisticalWave { exact, statistical })
+    }
+
     pub fn finish(
         mut self,
         kind: ActualWaveKind,
