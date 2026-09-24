@@ -92,6 +92,24 @@ Observe/Enforce 要求显式 `default_service_class`，且该 ID 必须存在于
 queued 与 projection 份额，终态保留必须小于每请求 queued 字节预算。
 这些有界默认值没有通过同硬件容量验收。
 
+### 每波 prefill 工作量
+
+`ferrum.toml` 的 `runtime.scheduler_active_decode_prefill_chunk` 限制有可运行
+decode 请求时每个 prefill 请求的块大小；
+`runtime.scheduler_active_decode_prefill_token_budget` 限制同一物理波内所有
+prefill 请求的 token 总量，`0` 表示禁用该总量限制。两者同时受模型分块粒度、
+剩余 prompt 和实际资源容量约束，不能用不合法的短块满足配置。
+
+SLO 规划、Unknown 下的请求完成路径和最终提交重验使用同一组工作量限制。
+`runtime.prefill_decode_execution = "split"` 时，每次物理提交只含一个阶段；
+prefill-only 波仍按当前可运行的 decode 请求计算限制。规划中的后继状态也重新
+计算这些条件，包括最后一块 prefill 产生首 token 后转入 decode 的情况。
+共享引擎中的 `run` 与 `serve` 使用相同规则；手动校准继续执行 manifest 声明的
+精确 cohort，不将服务策略悄悄施加到校准样本。
+
+token 上限不是毫秒上限，也不证明端到端 SLO 达标。尤其当总量限制为 `0` 时，
+多个合法 prefill 块的总执行时间仍可能很长；应结合完整波成本预测和真实并发测量。
+
 ### 请求完成与时间承诺
 
 默认 `admission.time_policy = "complete-requests"`。预测延迟超标、已经失约或成本
