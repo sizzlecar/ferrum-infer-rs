@@ -1,6 +1,6 @@
 # Ferrum SLO 核心算法：研究结论与设计取舍
 
-状态：设计与迁移记录，2026-09-24。A0 独立枚举器及 A1 统一转移已落源码；A2–A5 仍在实施，性能结论尚未建立。
+状态：设计与迁移记录，2026-09-24。A0 独立枚举器、A1 统一转移及 A2 共同计划构造已落源码；A2 的实测控制开销和收益尚待验证，A3–A5 仍在实施。
 承接原 RFC v2、[完整实施与验收清单](slo-implementation-plan.zh.md)及交接中的执行/资源基础。
 本轮代码审查基点为 `88dc391b` 加现存工作树，不能仅用提交号重现全部代码。
 第三方源码只阅读，未引入依赖或复制实现。本文的算法组合是 Ferrum 的待验证设计，不声称学术首创。
@@ -342,6 +342,10 @@ A5 沿用[完整清单](slo-implementation-plan.zh.md)：工程默认六项延�
 
 A1–A3 保留原 chunk prefill、vNext、mixed、prefix/recurrent 和资源 authority；共享更改同时覆盖 `run` 与 `serve`。
 A1/A2 首先固定现有成本模型与校准输入，只验证状态转移与规划结构；状态支配合并、跨轮提示和新预测器分别后置消融，避免多个变量同时变化。
+A2 当前实现按需生成合法前沿，先构造满足固定范围内共同义务的见证，再用同一预算改善；
+所有参与排序的候选按同一实际时刻重新评分，包含已消耗的规划时间。
+最终仍从当前时刻独立重放并检查提交，有限见证不等于递归可行性或整请求保证。
+新增 8 项构造边界测试已通过；这不证明真实工作负载下能在 2ms 内产生有效计划或改善性能。
 主要改造边界是 scheduler 的 `slo_planner/{search,simulation,shape,types}.rs` 与 engine 的
 `inner/slo_controller/{snapshot,shape,resources}.rs`：前者消费统一纯转移，后者提供后端投影。
 `submit`、guarded executor、native guard 和资源提交 authority 继续独立；不把搜索结果转成可绕过这些检查的 permit。
