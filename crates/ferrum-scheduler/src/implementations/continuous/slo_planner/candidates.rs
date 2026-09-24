@@ -63,6 +63,7 @@ fn prefill_work(
     caps: &BackendPlanningCapabilities,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<Vec<CandidateWork>>, PlanningUnknownReason> {
+    let envelope = work_envelope(caps, requests, poll_budget)?;
     let mut work = Vec::new();
     for &index in indices {
         poll_budget()?;
@@ -71,10 +72,19 @@ fn prefill_work(
             continue;
         };
         let remaining = progress.total_prompt_tokens.get() - progress.offset;
-        let count = if remaining < chunk.get() && caps.allow_final_short_chunk {
+        let chunk = u64::from(chunk.get())
+            .min(envelope.maximum_prefill_chunk.unwrap_or(u64::MAX))
+            .min(envelope.maximum_prefill_tokens.unwrap_or(u64::MAX));
+        let Ok(chunk) = u32::try_from(chunk) else {
+            continue;
+        };
+        if chunk == 0 {
+            continue;
+        }
+        let count = if remaining < chunk && caps.allow_final_short_chunk {
             remaining
         } else {
-            chunk.get()
+            chunk
         };
         let Some(end) = progress.offset.checked_add(count) else {
             continue;
@@ -161,4 +171,41 @@ pub(super) fn enumerate(
     }
     result.truncated |= cursor.truncated;
     Ok(result)
+}
+
+/// Only policy arithmetic. The execution provider still owns route/resources.
+pub(super) fn work_envelope(
+    caps: &BackendPlanningCapabilities,
+    requests: &[RequestSchedulingView],
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<super::super::work_policy::WaveWorkEnvelope, PlanningUnknownReason> {
+    let mut decoders = 0;
+    for request in requests {
+        poll()?;
+        if runnable(request) && matches!(request.phase, RequestPhaseView::Decode) {
+            decoders += 1;
+        }
+    }
+    Ok(caps.work_policy.for_ready_decoders(decoders))
+}
+
+pub(super) fn within_work_envelope(
+    caps: &BackendPlanningCapabilities,
+    requests: &[RequestSchedulingView],
+    work: &[CandidateWork],
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<bool, PlanningUnknownReason> {
+    let envelope = work_envelope(caps, requests, poll)?;
+    let mut used = super::super::work_policy::WaveWorkUsage::default();
+    for row in work {
+        poll()?;
+        let prefill = match row.action {
+            WaveAction::Decode => None,
+            WaveAction::Prefill { count, .. } => std::num::NonZeroU64::new(u64::from(count.get())),
+        };
+        if !envelope.include(&mut used, prefill) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

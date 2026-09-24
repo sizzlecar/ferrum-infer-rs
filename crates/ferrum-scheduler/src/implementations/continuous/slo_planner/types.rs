@@ -339,6 +339,8 @@ pub struct RequestSchedulingView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendPlanningCapabilities {
+    /// Product proposal bounds, re-evaluated on every successor ready domain.
+    pub work_policy: super::super::work_policy::PlanningWorkPolicy,
     pub path: WaveExecutionPath,
     pub graph_state: WaveGraphState,
     pub order: BatchOrderSemantics,

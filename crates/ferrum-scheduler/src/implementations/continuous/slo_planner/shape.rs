@@ -303,6 +303,10 @@ pub(super) fn legal_rows<'a>(
                     || (count.get() % caps.prefill_alignment.get() != 0
                         && !(is_final && caps.allow_final_short_chunk))
                     || (!caps.prefill_chunk_sizes.contains(count)
+                        && !caps
+                            .work_policy
+                            .declared_prefill_chunks()
+                            .any(|size| size == u64::from(count.get()))
                         && !(is_final
                             && caps.allow_final_short_chunk
                             && caps.prefill_chunk_sizes.iter().any(|size| size > count)))

@@ -162,7 +162,11 @@ impl FrontierCursor {
     ) -> Result<Option<Vec<CandidateWork>>, PlanningUnknownReason> {
         loop {
             poll()?;
-            let Some(action) = self.action(snapshot.capabilities.native_mixed, poll)? else {
+            let Some(action) = self.action(
+                snapshot.capabilities.native_mixed && snapshot.capabilities.work_policy.allow_mixed,
+                poll,
+            )?
+            else {
                 return Ok(None);
             };
             if self.attempts >= self.attempt_limit || *global_attempts >= global_limit {
@@ -216,6 +220,9 @@ impl FrontierCursor {
                 }
             };
             let Some(work) = work else { continue };
+            if !within_work_envelope(caps, requests, &work, poll)? {
+                continue;
+            }
             let prefill_tokens: u64 = work
                 .iter()
                 .map(|row| match row.action {

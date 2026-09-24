@@ -299,6 +299,9 @@ impl EngineInner {
         {
             publication_idle!(rejection_reason);
         }
+        if !self.planned_work_policy_matches(&captured, &selected_work, hint) {
+            publication_idle!("product_work_policy_changed_or_exceeded");
+        }
         let publication = self.scheduler.try_select_planned_wave(
             &captured.queue,
             &selected_work,

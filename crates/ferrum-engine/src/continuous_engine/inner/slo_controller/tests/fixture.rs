@@ -860,12 +860,26 @@ pub(in crate::continuous_engine::inner) async fn fixture_with_width(
     Arc<ContinuousBatchScheduler>,
     Arc<ControlledExecutor>,
 ) {
+    fixture_with_custom_config(width, |_| {}).await
+}
+
+async fn fixture_with_custom_config(
+    width: usize,
+    configure: impl FnOnce(&mut ferrum_types::EngineConfig),
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<ControlledExecutor>,
+) {
     let (tokenizer, executor) = startup_components(width).await;
     let mut config = ferrum_types::EngineConfig::default();
+    // This fixture exercises mixed guards explicitly; the product default is Split.
+    config.batching.prefill_decode_execution = ferrum_types::PrefillDecodeExecution::Mixed;
     config.scheduler.slo.output.max_queued_events_per_request = NonZeroUsize::new(2).unwrap();
     // Functional branch tests have no wall-clock performance threshold. The
     // dedicated virtual-clock tests exercise actual planning budget exhaustion.
     config.scheduler.slo.planner.max_planning_us = NonZeroU64::new(30_000_000).unwrap();
+    configure(&mut config);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let mut engine = ContinuousBatchEngine::new_plan_runtime(
         config,
@@ -909,7 +923,18 @@ pub(super) async fn completion_fixture(
     Arc<ContinuousBatchScheduler>,
     Arc<ControlledExecutor>,
 ) {
-    let (mut engine, scheduler, executor) = fixture_with_width(width).await;
+    completion_fixture_with_config(width, |_| {}).await
+}
+
+pub(super) async fn completion_fixture_with_config(
+    width: usize,
+    configure: impl FnOnce(&mut ferrum_types::EngineConfig),
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<ControlledExecutor>,
+) {
+    let (mut engine, scheduler, executor) = fixture_with_custom_config(width, configure).await;
     let inner = Arc::get_mut(&mut engine.inner).unwrap();
     inner.config.scheduler.slo.mode = ferrum_types::SloMode::Enforce;
     inner.config.scheduler.slo.admission.time_policy =

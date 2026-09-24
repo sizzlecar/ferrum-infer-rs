@@ -344,6 +344,7 @@ fn snapshot(observed_at_ns: u64) -> SchedulerSnapshot {
         fingerprint: fingerprint(),
         requests: vec![],
         capabilities: BackendPlanningCapabilities {
+            work_policy: Default::default(),
             path: WaveExecutionPath::PlanRuntime,
             graph_state: WaveGraphState::Disabled,
             order: BatchOrderSemantics::Ordered,

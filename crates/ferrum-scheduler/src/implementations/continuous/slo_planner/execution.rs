@@ -171,6 +171,9 @@ pub(super) fn project<'epoch>(
     collect_statistics: bool,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
+    if !super::candidates::within_work_envelope(&snapshot.capabilities, requests, work, poll)? {
+        return Ok(None);
+    }
     let mut failure = None;
     let prepared = shape::legal_rows(snapshot, requests, work, &mut || match poll() {
         Ok(()) => true,

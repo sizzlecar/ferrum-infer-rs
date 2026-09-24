@@ -14,6 +14,7 @@ pub mod cost_profile;
 pub mod planning_state;
 mod prefill_output;
 pub mod prefill_reference;
+pub mod work_policy;
 pub use prefill_output::{PrefillOutputPublication, PrefillOutputPublicationOutcome};
 mod prefix_rendezvous;
 mod prefix_restore;

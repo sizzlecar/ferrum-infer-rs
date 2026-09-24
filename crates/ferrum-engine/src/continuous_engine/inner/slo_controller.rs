@@ -28,6 +28,7 @@ mod snapshot;
 mod submit;
 #[cfg(test)]
 pub(in crate::continuous_engine) mod tests;
+mod work_envelope;
 
 pub(in crate::continuous_engine) enum SloIterationPlan {
     Legacy,

@@ -435,6 +435,7 @@ impl EngineInner {
             fingerprint: model.fingerprint().clone(),
             requests,
             capabilities: BackendPlanningCapabilities {
+                work_policy: self.controller_work_policy(hint, &queue),
                 path: WaveExecutionPath::PlanRuntime,
                 graph_state: WaveGraphState::Disabled,
                 order: BatchOrderSemantics::Ordered,

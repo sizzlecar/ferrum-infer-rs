@@ -173,6 +173,7 @@ fn snapshot(requests: Vec<RequestSchedulingView>) -> SchedulerSnapshot {
         },
         requests,
         capabilities: BackendPlanningCapabilities {
+            work_policy: Default::default(),
             path: WaveExecutionPath::NativeUnified,
             graph_state: WaveGraphState::Warm,
             order: BatchOrderSemantics::Ordered,
