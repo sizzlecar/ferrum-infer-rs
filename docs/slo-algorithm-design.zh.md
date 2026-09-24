@@ -370,10 +370,30 @@ A2 首轮 Qwen3.5-9B 原始 8 请求 C8 Enforce 诊断中，8 请求完整完成
 `ferrum-efficiency-evidence-20260920/slo-goal-20260922/` 同名目录，三臂汇总在
 `slo-a3-replay-reserve-metal-first8-comparison-r1`。它们不替代 A5 的完整请求集和配对重复。
 
+随后同一冻结版本完成原 32 预热、32 测量请求的 C8 三臂诊断
+`slo-a3-primary-c8-three-arm-r1`。完整服务器日志中 16 次 full 和 1 次 partial
+实际提交全部位于预热阶段，正式测量期间两者均为 0，且原延迟门未通过。
+不能把预热子集的见证率外推到整个工作负载。保留的实际执行窗口确认：split 模式下
+单请求 prefill 与其余请求 decode 交替，长 prefill 波会阻塞其他请求的可见输出。
+成本族和数值支持域覆盖不足也有独立 query 证据；它不等同于每个长停顿的因果归属。
+原始记录、完整表格和按请求前沿关联的分析均保留于上述仓库外目录。
+
 当前动态控制消费逐请求内部 commit deadline、实际执行形状、资源和输出 credit，
 每波重选 batch/chunk；在线客户端 P99、联合达标率和队列漂移尚未接入策略更新。
-selected 成本模型已有普通执行的事后误差审计，自动余量反馈仍在独立实现与验证，
-不能将审计计数、静态 margin 或 TTL 失效写成已经闭合的漂移控制。
+selected 成本模型现提供显式、默认关闭的
+[事后余量反馈策略](../crates/ferrum-types/src/slo/cost/feedback.rs)。
+独立 worker 按声明的样本窗口、连续低估和误差阈值增加相对冻结基础模型的余量，
+先关闭旧 epoch，再持久化回执并发布新快照；异常、存储失败或容量越界保持失效。
+它不重新拟合、续期 TTL、用 heldout 训练，或把未知执行视为零误差。
+真实持久化、进程互斥、失效后的资源释放及最后提交门测试已通过；实际服务收益仍待新构建验证。
+
+另有显式 `selected_independent_attention_v2` 与
+[profile7](../crates/ferrum-scheduler/src/implementations/continuous/cost_profile/statistical_v7.rs)
+消费链，用于归并已证明独立的完整 attention 行子段的统计族。
+原有 exact canonical、实际算子顺序和 native guard 不变；这是统计建模假设，
+不是耗时不变的证明。旧 profile6 不会自动升级或补造新旁证。
+真实 Metal 路径、三阶段采集到产品加载、同族反馈和旧版本拒绝测试已通过；
+仍需用新二进制重新采集 fit/residual/heldout，核实控制开销及完整域 Enforce 表现。
 
 目前仍需通过实验决定：合法动作目录的粒度、简单构造覆盖率、规划预算分配、里程碑保守性和残差校准分桶。
 这些是有明确对照的开放参数；不能在看完正式结果后移动验收标准。
