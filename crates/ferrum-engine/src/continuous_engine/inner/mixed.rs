@@ -18,6 +18,7 @@ impl EngineInner {
         prefill_ids: &[RequestId],
         decode_ids: &[RequestId],
     ) -> Result<MixedBatchDisposition> {
+        let mut preparation = self.prepare_cost_observation();
         let mut prefills = Vec::with_capacity(prefill_ids.len());
         for rid in prefill_ids {
             let scheduled = batch
@@ -30,11 +31,11 @@ impl EngineInner {
                         batch.batch_id
                     ))
                 })?;
-            if let Some(input) = self.prepare_plan_runtime_prefill(scheduled)? {
+            if let Some(input) = self.prepare_plan_runtime_prefill(scheduled, &mut preparation)? {
                 prefills.push(input);
             }
         }
-        let decodes = self.prepare_plan_runtime_decodes(decode_ids);
+        let decodes = self.prepare_plan_runtime_decodes(decode_ids, &mut preparation);
         let prefill_ids = prefills
             .iter()
             .map(|input| input.request_id.clone())
@@ -58,9 +59,9 @@ impl EngineInner {
             .profile_detail
             .captures_engine_token_timing()
             .then(Instant::now);
+        let mut cost = preparation.and_then(EngineCostPreparation::begin);
         let (prefill_outputs, decode_outputs) = match self
-            .model_executor
-            .plan_runtime_mixed_batch_with_capacity(&prefills, &decodes)
+            .cost_mixed(&prefills, &decodes, &mut cost)
             .await?
         {
             PlanRuntimeMixedBatchOutcome::Completed { prefills, decodes } => (prefills, decodes),
@@ -166,7 +167,12 @@ impl EngineInner {
 
         // Stream the already completed decode tokens before prefill sampling.
         if let Err(error) = self
-            .commit_plan_runtime_decode_outputs(&decode_ids, decode_outputs, completed_at)
+            .commit_plan_runtime_decode_outputs(
+                &decode_ids,
+                decode_outputs,
+                completed_at,
+                &mut cost,
+            )
             .await
         {
             if let Err(cleanup) = self.discard_plan_runtime_prefill_completions(prefill_outputs) {
@@ -187,6 +193,7 @@ impl EngineInner {
                     input.input_tokens.len(),
                     input.chunk,
                     output,
+                    &mut cost,
                 )
                 .await
             {

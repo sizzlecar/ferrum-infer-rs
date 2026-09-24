@@ -237,13 +237,22 @@ impl SequenceSamplingHistory {
 /// State of a running sequence in the continuous batch.
 #[derive(Debug)]
 pub struct SequenceState {
+    /// Fixed admission scoring state; never execution or resource authority.
+    pub(super) prefill_reference:
+        Option<inner::prefill_reference_runtime::SequencePrefillReference>,
     /// Passive cost evidence only. Never used as scheduler or physical authority.
     pub(super) cost_frontier: Option<inner::cost_observation::CostFrontier>,
+    pub(super) cost_policy_signature: Option<[u8; 32]>,
+    pub(super) cost_numeric_policy: Option<ferrum_interfaces::execution_cost::HostCostPolicyV2>,
     pub request_id: RequestId,
     /// Original request — kept for re-submission after preemption.
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
+    /// Local output-projection incarnation. Snapshots retain this allocation
+    /// while decoding outside the sequence lock, preventing RequestId reuse
+    /// from accepting an earlier request's text. This is not executor authority.
+    pub(super) stream_projection_identity: Arc<()>,
     pub(super) model_kv: Option<SequenceModelKvState>,
     pub(super) recurrent_state: Option<SequenceRecurrentState>,
     pub(super) sampling_params: SamplingParams,
@@ -259,21 +268,26 @@ pub struct SequenceState {
     pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     pub(super) request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
+    /// Constant-size SLO controller state anchored at trusted product ingress.
+    /// Separate from the legacy opt-in detailed timing evidence below.
+    pub(super) slo: Option<ferrum_interfaces::RequestSloState>,
+    /// Acceptance is independent of a finite, guarded time witness.
+    pub(super) time_admission: Option<inner::slo_controller::admission::SequenceTimeAdmission>,
     /// Present only for callers that explicitly request the latency preset.
     /// One entry is recorded after each generated token becomes committed
     /// engine state, independent of text decoding or stream flushing.
     token_timing: Option<SequenceTokenTiming>,
-    /// Wall-clock `Instant` at which the first SSE chunk was actually
-    /// sent to the client stream. Populated lazily by `send_stream_update`
-    /// the first time a non-empty delta is emitted (multi-byte UTF-8
+    /// Monotonic time at which the engine prepared its first nonempty text
+    /// delta, before waiting for the response channel. This is neither HTTP
+    /// transmission nor client receipt. Multi-byte UTF-8
     /// buffering can defer that past the first scheduler-completed token).
     /// Used to record `ferrum.engine.ttft_seconds` and as the start point
     /// of the TPOT window.
     pub first_emit_at: Option<Instant>,
-    /// Wall-clock `Instant` at the most recent successfully-sent chunk.
-    /// Used to compute per-token ITL deltas (`ferrum.engine.itl_seconds`).
+    /// Monotonic time at the most recent prepared nonempty engine text delta.
+    /// Used by the legacy engine text-event gap metric, not strict token ITL.
     pub last_emit_at: Option<Instant>,
-    /// Count of stream chunks successfully sent to the client. Lags
+    /// Count of nonempty text deltas prepared for the stream. Lags
     /// `generated_tokens.len()` by the number of tokens currently buffered
     /// for a multi-byte UTF-8 sequence (so a Chinese char split across
     /// 2 BPE tokens emits once, increments the count by 1).
@@ -336,6 +350,9 @@ pub struct SequenceState {
     /// Stable decoded bytes examined by the output-quality filter. This can
     /// exceed `streamed_text_len` while a possible stop-string prefix is held.
     pub decoded_text_len: usize,
+    /// Drop last: the transport owner keeps projection credit until this port
+    /// is gone, after all engine-owned output history and scratch are dropped.
+    pub(super) credited_output: Option<super::credited_output::CreditedSequenceOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +650,13 @@ pub(super) struct ModelCacheRefUpdate {
 }
 
 impl SequenceState {
+    fn advance_cost_frontier(&mut self) {
+        // Checked exhaustion invalidates evidence instead of reusing an old generation.
+        self.cost_frontier = self
+            .cost_frontier
+            .and_then(|frontier| frontier.advanced().ok());
+    }
+
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
     }
@@ -670,6 +694,26 @@ impl SequenceState {
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
         shared_structured_factory: Option<&StructuredOutputFactory>,
+    ) -> Result<Self> {
+        Self::try_new_with_completion_plan(
+            request,
+            input_tokens,
+            tokenizer,
+            model_vocab_size,
+            shared_structured_factory,
+            None,
+        )
+    }
+
+    /// A supplied completion plan must be backed by the caller's live output
+    /// budget before this constructor allocates its exact matcher storage.
+    pub(super) fn try_new_with_completion_plan(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+        model_vocab_size: Option<usize>,
+        shared_structured_factory: Option<&StructuredOutputFactory>,
+        completion_plan: Option<&ferrum_interfaces::output_flow::ResponseCompletionPlan>,
     ) -> Result<Self> {
         request.sampling_params.validate()?;
         if request.sampling_params.tfs.is_some()
@@ -716,12 +760,21 @@ impl SequenceState {
             user_stop_token_ids,
             stop_text_seqs,
         } = resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
-        let response_completion_state = ResponseCompletionState::compile(
-            &request.sampling_params.response_completion_boundary,
-            tokenizer.as_deref(),
-            &model_eos_token_ids,
-            request.sampling_params.max_tokens,
-        )?;
+        let response_completion_state = match completion_plan {
+            Some(plan) => ResponseCompletionState::compile_prepared(
+                plan,
+                &request.sampling_params.response_completion_boundary,
+                tokenizer.as_deref(),
+                &model_eos_token_ids,
+                request.sampling_params.max_tokens,
+            )?,
+            None => ResponseCompletionState::compile(
+                &request.sampling_params.response_completion_boundary,
+                tokenizer.as_deref(),
+                &model_eos_token_ids,
+                request.sampling_params.max_tokens,
+            )?,
+        };
         let completion_boundary_open = !response_completion_state.allows_model_eos();
         let structured_output_processor = shared_structured_factory
             .or(local_structured_factory.as_ref())
@@ -822,11 +875,12 @@ impl SequenceState {
             (Instant::now(), None)
         };
         Ok(Self {
-            cost_frontier: None,
+            prefill_reference: None,
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
+            stream_projection_identity: Arc::new(()),
             model_kv: None,
             recurrent_state: None,
             sampling_params: request.sampling_params,
@@ -839,11 +893,16 @@ impl SequenceState {
             response_sender: None,
             request_slot: None,
             start_time,
+            slo: None,
+            time_admission: None,
             token_timing,
             first_emit_at: None,
             last_emit_at: None,
             emitted_chunks: 0,
             tokens_this_iteration: 0,
+            cost_frontier: None,
+            cost_policy_signature: None,
+            cost_numeric_policy: None,
             preemption_count: 0,
             structured_output_processor,
             draft_kv: None,
@@ -863,6 +922,7 @@ impl SequenceState {
             pending_decoded_utf8_bytes: Vec::new(),
             streamed_text_len: 0,
             decoded_text_len: 0,
+            credited_output: None,
         })
     }
 
@@ -871,8 +931,27 @@ impl SequenceState {
     }
 
     pub(super) fn record_generated_token_commit(&mut self) {
+        if self.token_timing.is_none() && self.slo.is_none() {
+            return;
+        }
+        let committed_at = inner::slo_clock_now();
+        self.record_slo_commit(committed_at);
         if let Some(timing) = &mut self.token_timing {
-            timing.record_commit(self.start_time, Instant::now());
+            timing.record_commit(self.start_time, committed_at);
+        }
+    }
+
+    fn record_slo_commit(&mut self, committed_at: Instant) {
+        if let Some(state) = &mut self.time_admission {
+            state.record_recovery_progress();
+        }
+        if let Some(slo) = &mut self.slo {
+            if let Err(error) = slo.record_commit(committed_at) {
+                // Observe must not change execution or turn clock evidence into
+                // a physical failure. The state is permanently untrusted so a
+                // later planner cannot interpret this as a successful sample.
+                warn!(request_id = %self.request_id, %error, "invalid SLO token timing observation");
+            }
         }
     }
 
@@ -907,10 +986,14 @@ impl SequenceState {
         &mut self,
         postprocess_started_at: Option<Instant>,
     ) {
+        if self.token_timing.is_none() && self.slo.is_none() {
+            return;
+        }
+        let committed_at = inner::slo_clock_now();
+        self.record_slo_commit(committed_at);
         let Some(timing) = &mut self.token_timing else {
             return;
         };
-        let committed_at = Instant::now();
         if let Some(started_at) = postprocess_started_at {
             timing.record_decode_stage_interval(
                 self.start_time,
@@ -1022,6 +1105,7 @@ impl SequenceState {
     }
 
     pub(super) fn take_physical_resources_for_recompute(&mut self) -> SequencePhysicalResources {
+        self.advance_cost_frontier();
         let resources = self.take_physical_resources();
         self.prefill_complete = false;
         self.prefill_tokens_processed = 0;
@@ -1116,6 +1200,12 @@ impl SequenceState {
         prefill_tokens_processed: usize,
         is_final_chunk: bool,
     ) -> ModelCacheRefUpdate {
+        self.advance_cost_frontier();
+        if prefill_tokens_processed > self.prefill_tokens_processed {
+            if let Some(state) = &mut self.time_admission {
+                state.record_recovery_progress();
+            }
+        }
         let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
         self.recurrent_state = None;
         self.prefill_tokens_processed = prefill_tokens_processed;
@@ -1266,6 +1356,7 @@ impl SequenceState {
                 FerrumError::internal("decode completed without an active model KV lease")
             })?
             .replace_cache_handle(kv_cache)?;
+        self.advance_cost_frontier();
         self.tokens_this_iteration += 1;
         Ok(())
     }
@@ -1416,9 +1507,12 @@ impl SequenceState {
                 token.get()
             )));
         }
-        let model_eos_availability =
-            self.response_completion_state
-                .observe(&self.generated_tokens, token, tokenizer)?;
+        let model_eos_availability = self.response_completion_state.observe(
+            &self.generated_tokens,
+            token,
+            tokenizer,
+            self.credited_output.as_ref().map(|output| output.decoder),
+        )?;
         if let Some(allows_model_eos) = model_eos_availability {
             if let Some(mask) = &mut self.argmax_token_mask {
                 mask.set_tokens_validity(&self.model_eos_token_ids, allows_model_eos);
@@ -1488,7 +1582,9 @@ impl SequenceState {
         token: TokenId,
     ) -> Result<()> {
         let next_pending_utf8_bytes = tokenizer
-            .and_then(|tokenizer| tokenizer.token_bytes(token))
+            .map(|tokenizer| self.token_bytes_for_output(tokenizer, token))
+            .transpose()?
+            .flatten()
             .map(|bytes| advance_pending_utf8_fragment(&self.pending_decoded_utf8_bytes, &bytes));
         if next_pending_utf8_bytes
             .as_ref()
@@ -1511,8 +1607,7 @@ impl SequenceState {
             None => {
                 self.pending_decoded_utf8_bytes.clear();
                 self.pending_decoded_utf8_fragment = tokenizer.is_some_and(|tokenizer| {
-                    tokenizer
-                        .decode(&self.generated_tokens, true)
+                    self.decode_owned_output(tokenizer, &self.generated_tokens)
                         .map(|text| {
                             self.decoded_text_len <= text.len()
                                 && text.is_char_boundary(self.decoded_text_len)
@@ -1531,6 +1626,17 @@ impl SequenceState {
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         token: TokenId,
     ) -> String {
+        if self.credited_output.is_some() {
+            // Error diagnostics must not allocate another decoded history or
+            // populate a legacy incremental cache outside output ownership.
+            return format!(
+                "token_id={}, generated_tokens={}, forbidden_count={}, initial_forbidden_count={}",
+                token.get(),
+                self.generated_tokens.len(),
+                self.forbidden_token_ids.len(),
+                self.initial_forbidden_token_ids.len(),
+            );
+        }
         let token_text = tokenizer
             .and_then(|tokenizer| tokenizer.token_text(token))
             .map(|text| format!("{text:?}"))
@@ -1630,7 +1736,7 @@ impl SequenceState {
         }
         if !self.stop_text_seqs.is_empty() {
             if let Some(tok) = tokenizer {
-                if let Ok(text) = tok.decode(&self.generated_tokens, true) {
+                if let Ok(text) = self.decode_owned_output(tok, &self.generated_tokens) {
                     if self
                         .stop_text_seqs
                         .iter()
@@ -1905,15 +2011,18 @@ impl SequenceState {
         let candidate_is_stop = self.stop_token_ids.contains(&token.get());
         let candidate_is_non_stop_control =
             self.allowed_extended_token_ids.contains(&token.get()) && !candidate_is_stop;
-        if let Some(bytes) = tokenizer.token_bytes(token) {
+        let candidate_bytes = match self.token_bytes_for_output(tokenizer, token) {
+            Ok(bytes) => bytes,
+            Err(_) => return true,
+        };
+        if let Some(bytes) = candidate_bytes {
             match advance_pending_utf8_fragment(&self.pending_decoded_utf8_bytes, &bytes) {
                 Ok(pending) if candidate_is_stop && !pending.is_empty() => return true,
                 Ok(_) => {}
                 Err(()) => return true,
             }
         }
-        tokenizer
-            .decode(&tokens, true)
+        self.decode_owned_output(tokenizer, &tokens)
             .map(|text| {
                 decoded_delta_has_forbidden_quality(
                     &text,
@@ -1931,6 +2040,32 @@ impl SequenceState {
         previous_streamed_text_len: usize,
         rejected_tokens: &[TokenId],
     ) {
+        if self.credited_output.is_some() {
+            // Keep failure reporting bounded independently of vocabulary
+            // spellings and output length; no decoder is needed for IDs.
+            let mut generated_tail = [0u32; 8];
+            let mut rejected = [0u32; 8];
+            let tail_len = self.generated_tokens.len().min(generated_tail.len());
+            let rejected_len = rejected_tokens.len().min(rejected.len());
+            for (out, token) in generated_tail[..tail_len]
+                .iter_mut()
+                .zip(self.generated_tokens[self.generated_tokens.len() - tail_len..].iter())
+            {
+                *out = token.get();
+            }
+            for (out, token) in rejected[..rejected_len].iter_mut().zip(rejected_tokens) {
+                *out = token.get();
+            }
+            warn!(
+                request_id = %self.request_id,
+                generated_len = self.generated_tokens.len(),
+                previous_streamed_text_len,
+                generated_tail = ?&generated_tail[..tail_len],
+                rejected_candidates = ?&rejected[..rejected_len],
+                "credited sampling candidates decoded to forbidden output"
+            );
+            return;
+        }
         let generated_tail: Vec<String> = self
             .generated_tokens
             .iter()

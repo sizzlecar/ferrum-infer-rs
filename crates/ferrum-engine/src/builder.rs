@@ -232,6 +232,33 @@ impl EngineBuilder {
 
     /// Build the inference engine
     pub async fn build(self) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
+        self.build_continuous()
+            .await
+            .map(|engine| Box::new(engine) as Box<dyn LlmInferenceEngine + Send + Sync>)
+    }
+
+    /// Build an exclusive manual calibration session using the same product
+    /// composition and startup boundary as ordinary inference.
+    pub async fn build_calibration(
+        self,
+        limits: crate::continuous_engine::CalibrationLimits,
+    ) -> Result<crate::continuous_engine::CalibrationSession> {
+        limits.validate()?;
+        if self.config.scheduler.slo.mode != ferrum_types::SloMode::Observe
+            || self.config.scheduler.slo.admission.time_policy
+                != ferrum_types::SloTimeAdmissionPolicy::CompleteRequests
+        {
+            return Err(FerrumError::config(
+                "calibration uses explicit Observe/CompleteRequests configuration",
+            ));
+        }
+        crate::continuous_engine::CalibrationSession::from_fresh_engine(
+            self.build_continuous().await?,
+            limits,
+        )
+    }
+
+    pub(crate) async fn build_continuous(self) -> Result<crate::ContinuousBatchEngine> {
         info!(
             "Building inference engine for model: {}",
             self.config.model.model_id
@@ -503,7 +530,7 @@ impl EngineBuilder {
             }
             return Err(startup_error);
         }
-        Ok(Box::new(engine))
+        Ok(engine)
     }
 }
 

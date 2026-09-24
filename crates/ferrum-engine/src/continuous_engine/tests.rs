@@ -43,6 +43,8 @@ mod metrics_only_tests;
 mod mixed_batch_tests;
 #[path = "prefix_prompt_tail_tests.rs"]
 mod prefix_prompt_tail_tests;
+#[path = "slo_runtime_tests.rs"]
+mod slo_runtime_tests;
 
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
@@ -3925,6 +3927,9 @@ async fn install_plan_runtime_decode_frontiers(
         let request_id = request.id.clone();
         let token = TokenId::new(5 + index as u32);
         let cache_id = format!("plan-runtime-batch-cache-{index}");
+        let publication = scheduler
+            .prepare_prefill_output_publication(&request_id, 1, 0)
+            .unwrap();
         scheduler.mark_prefill_complete(&request_id, 1);
         let kv_cache = engine
             .inner
@@ -3940,6 +3945,11 @@ async fn install_plan_runtime_decode_frontiers(
         sequence.prefill_tokens_processed = 1;
         sequence.install_runtime_managed_model_kv(kv_cache);
         sequence.phase = RequestPhase::Decoding;
+        // This fixture installs a sampled prefill output, not a decode step:
+        // publishing it must leave the real one-token KV frontier unchanged.
+        scheduler
+            .publish_prefill_output_commit(&publication, sequence.generated_tokens.len())
+            .unwrap();
         engine
             .inner
             .sequences
@@ -3971,6 +3981,9 @@ async fn install_profiled_plan_runtime_decode_frontier(
         .await
         .expect("profiled decode request must first schedule as prefill");
     assert_eq!(initial_batch.requests.len(), 1);
+    let publication = scheduler
+        .prepare_prefill_output_publication(&request_id, 1, 0)
+        .unwrap();
     scheduler.mark_prefill_complete(&request_id, 1);
 
     let token = TokenId::new(5);
@@ -3990,6 +4003,9 @@ async fn install_profiled_plan_runtime_decode_frontier(
     sequence.record_decode_ready();
     sequence.generated_tokens.push(token);
     sequence.record_generated_token_commit();
+    scheduler
+        .publish_prefill_output_commit(&publication, sequence.generated_tokens.len())
+        .unwrap();
     engine
         .inner
         .sequences
@@ -4135,7 +4151,68 @@ async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_relea
         .await
         .unwrap());
     assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
-    scheduler.update_decode_progress(&progress_owner_id, 1);
+    let owner_cache_id = engine.inner.sequences.read()[&progress_owner_id]
+        .kv_cache_handle()
+        .unwrap()
+        .cache_id();
+    // The initial sampled output is already committed. Exercise an actual
+    // engine decode/commit, including history and scheduler logical progress,
+    // before claiming progress beyond the first handoff's baseline. This fake
+    // executor reuses an opaque KV handle; it does not simulate device KV growth.
+    // Mirror the production resumption branch after a successful release:
+    // adaptive decode retries exactly the transaction's owner. A fresh legacy
+    // next_batch tick has no typed wake snapshot for the installed deferral.
+    engine
+        .inner
+        .run_plan_runtime_batch_decode_adaptive(std::slice::from_ref(&progress_owner_id))
+        .await
+        .unwrap();
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Acquire), 1);
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+    let owner_committed_tokens = {
+        let sequences = engine.inner.sequences.read();
+        let owner = &sequences[&progress_owner_id];
+        assert_eq!(owner.generated_tokens.len(), 2);
+        assert_eq!(owner.model_cache_id(), Some(owner_cache_id.as_str()));
+        owner.generated_tokens.clone()
+    };
+    let mut availability = Vec::new();
+    let epochs = executor
+        .write_execution_capacity_snapshot(&mut availability)
+        .unwrap()
+        .unwrap();
+    let progressed = scheduler
+        .planning_state(
+            std::num::NonZeroUsize::new(8).unwrap(),
+            AdmissionWakeSnapshot::new(
+                AdmissionWakeEpochs::new(
+                    epochs.coordinator_id,
+                    epochs.release_epoch,
+                    epochs.capacity_epoch,
+                    0,
+                ),
+                &availability,
+            ),
+        )
+        .unwrap();
+    let owner = progressed
+        .requests()
+        .iter()
+        .find(|row| row.key.request_id == progress_owner_id)
+        .unwrap();
+    assert_eq!(
+        (
+            owner.computed_tokens,
+            owner.resident_tokens,
+            owner.scheduled_tokens,
+            owner.committed_output_tokens
+        ),
+        (2, 2, 2, 2),
+    );
+    assert_eq!(
+        owner.key.generation.get(),
+        first_transaction.progress_baseline().get() + 1
+    );
 
     let second_availability =
         ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 2).unwrap();
@@ -4203,9 +4280,15 @@ async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_relea
             .get(request_id)
             .expect("both pressure participants remain queued for recompute");
         assert_eq!(
-            sequence.generated_tokens,
-            vec![initial_tokens_by_request[request_id]]
+            sequence.generated_tokens[0],
+            initial_tokens_by_request[request_id]
         );
+        let expected_tokens = if request_id == &progress_owner_id {
+            owner_committed_tokens.as_slice()
+        } else {
+            std::slice::from_ref(&initial_tokens_by_request[request_id])
+        };
+        assert_eq!(sequence.generated_tokens, expected_tokens);
         assert_eq!(sequence.phase, RequestPhase::Waiting);
         assert!(sequence.model_cache_id().is_none());
         assert_eq!(sequence.preemption_count, 1);
@@ -4355,6 +4438,34 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     );
     let (request_ids, initial_tokens, _) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let frontier = |id: &RequestId| {
+        scheduler
+            .planning_state(
+                std::num::NonZeroUsize::new(8).unwrap(),
+                AdmissionWakeSnapshot::new(
+                    AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0),
+                    &[],
+                ),
+            )
+            .unwrap()
+            .requests()
+            .iter()
+            .find(|row| &row.key.request_id == id)
+            .unwrap()
+            .clone()
+    };
+    for id in &request_ids {
+        let initial = frontier(id);
+        assert_eq!(
+            (
+                initial.computed_tokens,
+                initial.resident_tokens,
+                initial.scheduled_tokens,
+                initial.committed_output_tokens
+            ),
+            (1, 1, 1, 1)
+        );
+    }
     let initial_tokens_by_request = request_ids
         .iter()
         .cloned()
@@ -4368,6 +4479,8 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     let progress_owner_id = decode_batch.requests[0].request.id.clone();
     let victim_id = decode_batch.requests[1].request.id.clone();
     let victim_initial_token = initial_tokens_by_request[&victim_id];
+    let victim_initial_generation = frontier(&victim_id).key.generation;
+    let owner_initial_generation = frontier(&progress_owner_id).key.generation;
     engine
         .inner
         .sequences
@@ -4459,6 +4572,28 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         );
         assert_eq!(recompute_batch.requests[0].tokens_to_process, Some(1));
         engine.inner.process_batch(&recompute_batch).await.unwrap();
+        let recomputed = frontier(&victim_id);
+        let final_chunk = expected_offset == 1;
+        assert_eq!(
+            (
+                recomputed.computed_tokens,
+                recomputed.resident_tokens,
+                recomputed.scheduled_tokens
+            ),
+            (
+                expected_offset + 1,
+                expected_offset + 1,
+                expected_offset + 1
+            )
+        );
+        assert_eq!(
+            recomputed.committed_output_tokens,
+            if final_chunk { 2 } else { 1 }
+        );
+        assert_eq!(
+            recomputed.key.generation.get(),
+            victim_initial_generation.get() + u64::from(final_chunk)
+        );
     }
 
     let sequences = engine.inner.sequences.read();
@@ -4597,7 +4732,9 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     );
     assert_eq!(
         recompute_event.attributes.get("progress_baseline"),
-        Some(&serde_json::json!(1))
+        // The pressure hold records its selected owner's logical generation,
+        // which already includes both prefill compute and the sampled output.
+        Some(&serde_json::json!(owner_initial_generation.get()))
     );
     for event in &deferred_events {
         assert_eq!(
@@ -13846,3 +13983,6 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
 }
 
 mod auto_tools_json;
+
+#[path = "credited_output_tests.rs"]
+mod credited_output_tests;

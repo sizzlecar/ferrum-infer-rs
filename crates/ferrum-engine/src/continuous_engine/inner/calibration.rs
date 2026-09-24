@@ -7,25 +7,20 @@ use ferrum_interfaces::output_flow::{CreditedOutputSession, OutputProjectionCont
 use ferrum_interfaces::InferenceRequestContext;
 
 mod artifact;
+mod selected;
+pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
 mod checkpoint;
 mod evidence;
 mod observation;
-mod reference;
 mod token_policy_residency;
 pub use artifact::{CalibrationProfileArtifact, CalibrationProfilePaths, ImportedCalibrationModel};
 pub use checkpoint::FrozenCalibrationModel;
 pub use evidence::CalibrationRequestEvidence;
-pub use reference::{
-    CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
-    CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
-};
 mod types;
 pub use observation::{
     CalibrationCommittedRow, CalibrationCommittedWork, CalibrationObservation,
     CalibrationQueueDisposition,
 };
-#[cfg(test)]
-mod tests;
 pub(super) use types::CalibrationWaveReceipt;
 pub use types::{
     CalibrationAction, CalibrationBlockReason, CalibrationDecodeRoute, CalibrationFrontier,
@@ -34,6 +29,8 @@ pub use types::{
 };
 
 pub struct CalibrationSession {
+    selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
+    selected_capture_identity: Option<[u8; 32]>,
     engine: ContinuousBatchEngine,
     identity: Arc<()>,
     limits: CalibrationLimits,
@@ -71,6 +68,8 @@ impl CalibrationSession {
         }
         inner.manual_calibration_driver = true;
         Ok(Self {
+            selected_capture: None,
+            selected_capture_identity: None,
             engine,
             identity: Arc::new(()),
             limits,
@@ -201,8 +200,9 @@ impl CalibrationSession {
         if let Some(receipt) = self.pending.as_ref().cloned() {
             let result = self.engine.inner.drain_slo_execution().await;
             self.pending.take();
-            let report = receipt.report(result.err());
+            let mut report = receipt.report(result.err());
             self.indeterminate |= report.submission == CalibrationSubmissionState::InFlightUnknown;
+            self.record_selected_capture(&receipt, &mut report)?;
             return Ok(CalibrationTurn::Reaped(report));
         }
         if self.indeterminate {
@@ -272,9 +272,10 @@ impl CalibrationSession {
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;
                 self.pending.take();
-                let report = receipt.report(result.err());
+                let mut report = receipt.report(result.err());
                 self.indeterminate |=
                     report.submission == CalibrationSubmissionState::InFlightUnknown;
+                self.record_selected_capture(&receipt, &mut report)?;
                 Ok(CalibrationTurn::Wave(report))
             }
         }

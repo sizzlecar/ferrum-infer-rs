@@ -357,9 +357,58 @@ pub struct PerformanceBreakdown {
     pub tokenization_time_ms: f64,
     pub model_execution_time_ms: f64,
     pub sampling_time_ms: f64,
+    /// Legacy scheduling interval average; excludes SLO controller transactions.
     pub scheduling_time_ms: f64,
     pub memory_operations_time_ms: f64,
     pub other_overhead_time_ms: f64,
+    /// Cumulative finalized controller transactions, independently of optional
+    /// device profiling. None means no controller audit has been finalized.
+    #[serde(default)]
+    pub controller_timing: Option<ControllerTimingMetrics>,
+}
+
+/// Monotonic elapsed wall time, not thread CPU time. Totals/calls saturate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WallTimingAggregate {
+    pub wall_ns_total: u64,
+    pub calls: u64,
+}
+
+/// Completed SLO/manual-calibration transactions only; in-flight work is not
+/// partially added. Named stages are inclusive and can overlap: planning
+/// contains capture/search/publication; executor_await contains native host
+/// guard callbacks and device waiting. Never sum these into CPU or GPU time.
+/// Resource admission/maintenance before the planning transaction is excluded.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ControllerTimingMetrics {
+    pub finalized_transactions: u64,
+    pub planning: WallTimingAggregate,
+    pub transaction: WallTimingAggregate,
+    pub release: WallTimingAggregate,
+    pub capture: WallTimingAggregate,
+    pub search_replay: WallTimingAggregate,
+    pub publication: WallTimingAggregate,
+    pub ready_queue: WallTimingAggregate,
+    pub iteration_lock_wait: WallTimingAggregate,
+    pub input_preparation: WallTimingAggregate,
+    /// All actual callback invocations, including failures. Native callbacks
+    /// are nested inside executor_await; the initial host check precedes it.
+    pub host_guard: WallTimingAggregate,
+    /// Model preparation/encoding/submission/wait/readback, not pure GPU time.
+    pub executor_await: WallTimingAggregate,
+    pub reconciliation: WallTimingAggregate,
+    pub submitted: u64,
+    pub observed: u64,
+    pub idle: u64,
+    pub failed: u64,
+    pub withdrawn: u64,
+    pub calibration_blocked: u64,
+    pub unknown_decisions: u64,
+    pub planner_phase_exhaustions: u64,
+    pub hard_budget_exhaustions: u64,
+    pub invalid_clock_transactions: u64,
+    /// A missing finish_planning boundary is not reported as elapsed time.
+    pub unfinished_planning_transactions: u64,
 }
 
 /// Health check status

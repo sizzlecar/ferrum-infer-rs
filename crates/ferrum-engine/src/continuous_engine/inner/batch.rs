@@ -1,5 +1,8 @@
 use super::*;
 
+pub(in crate::continuous_engine) mod bounded_wave;
+pub(in crate::continuous_engine) mod legacy_prefill;
+
 impl EngineInner {
     // ── batch processing ───────────────────────────────────────────────
 
@@ -7,6 +10,25 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
+        if !self.reserve_batch_output(batch)? {
+            return Ok(());
+        }
+        let result = self.process_batch_with_output_ready(batch).await;
+        self.finish_batch_output(batch, result.is_ok());
+        self.wake_cost_trainer();
+        result
+    }
+
+    async fn process_batch_with_output_ready(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
+        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
+            && self.model_executor.execution_resource_authority()
+                != ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
+        {
+            return self.process_one_legacy_prefill_wave(batch).await;
+        }
         if self.model_executor.execution_resource_authority()
             == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
         {
@@ -76,12 +98,13 @@ impl EngineInner {
         };
         for request in missing_requests {
             let input_tokens = self.tokenizer.encode(&request.prompt, true)?;
-            let sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
                 request.clone(),
                 input_tokens,
                 Some(self.tokenizer.clone()),
                 Some(self.model_executor.info().vocab_size),
             );
+            self.initialize_sequence_cost(&mut sequence);
             self.sequences.write().entry(request.id).or_insert(sequence);
         }
         Ok(())
@@ -111,6 +134,9 @@ impl EngineInner {
     /// the preceding step. Resource pressure therefore has one authority and
     /// is surfaced to the scheduler before another request is dispatched.
     async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
+        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce {
+            return self.process_one_plan_runtime_wave(batch).await;
+        }
         let (mut prefill_ids, mut decode_ids) = self.classify_published_batch_sequences(batch)?;
         if self.config.batching.prefill_decode_execution
             == ferrum_types::PrefillDecodeExecution::Mixed
@@ -402,6 +428,11 @@ impl EngineInner {
                         let Some(seq) = sequences.get_mut(rid) else {
                             return Ok(None);
                         };
+                        let publication = self.scheduler.prepare_prefill_output_publication(
+                            rid,
+                            num_tokens,
+                            seq.generated_tokens.len(),
+                        )?;
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
                         let token = seq.sample_and_commit_with_processors_and_tokenizer(
@@ -411,6 +442,7 @@ impl EngineInner {
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         seq.record_generated_token_commit();
+                        self.finish_sampled_prefill(seq, &publication, num_tokens, None)?;
                         Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                             token,
                             model_cache_update,
@@ -431,7 +463,6 @@ impl EngineInner {
                         continue;
                     };
                     self.apply_model_cache_ref_update(rid, model_cache_update);
-                    self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
                     let stop_reason = self.stop_reason_for_request(rid);
@@ -847,6 +878,11 @@ impl EngineInner {
                 let Some(seq) = sequences.get_mut(&work.rid) else {
                     return Ok(None);
                 };
+                let publication = self.scheduler.prepare_prefill_output_publication(
+                    &work.rid,
+                    num_tokens,
+                    seq.generated_tokens.len(),
+                )?;
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
@@ -870,6 +906,7 @@ impl EngineInner {
                     true,
                 );
                 seq.record_generated_token_commit();
+                self.finish_sampled_prefill(seq, &publication, num_tokens, None)?;
                 Ok::<Option<(TokenId, u64, ModelCacheRefUpdate)>, FerrumError>(Some((
                     token,
                     seq.start_time.elapsed().as_micros() as u64,
@@ -899,7 +936,6 @@ impl EngineInner {
                 };
             self.apply_model_cache_ref_update(&work.rid, model_cache_update);
             std::mem::take(&mut work.owned_resources).commit();
-            self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);

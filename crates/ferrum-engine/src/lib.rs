@@ -80,7 +80,14 @@ pub use ferrum_types::{
 pub use ferrum_scheduler::BatchPlan;
 
 // Re-exports of engine implementation
-pub use continuous_engine::{ContinuousBatchEngine, SequenceState};
+pub use continuous_engine::{
+    CalibrationAction, CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
+    CalibrationFrontier, CalibrationLimits, CalibrationObservation, CalibrationProfileArtifact,
+    CalibrationProfilePaths, CalibrationQueueDisposition, CalibrationRequestEvidence,
+    CalibrationSession, CalibrationSubmissionState, CalibrationTurn, CalibrationWaveReport,
+    CalibrationWork, ContinuousBatchEngine, FrozenCalibrationModel, ImportedCalibrationModel,
+    SequenceState,
+};
 
 // Re-exports of pipeline
 pub use pipeline::{

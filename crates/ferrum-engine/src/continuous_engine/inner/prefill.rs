@@ -1,6 +1,63 @@
 use super::*;
 
+fn validate_prefill_commit_fence(
+    sequence: &SequenceState,
+    chunk: ferrum_interfaces::model_executor::PrefillChunk,
+    fence: Option<slo_controller::ControllerCommitFence<'_>>,
+) -> Result<()> {
+    use ferrum_interfaces::execution_cost::ExpectedWaveInput;
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    let valid = fence.matches(sequence)
+        && matches!(fence.input(), ExpectedWaveInput::Prefill { chunk: expected } if *expected == chunk)
+        && !sequence.prefill_complete
+        && sequence.prefill_tokens_processed == chunk.tokens_processed()
+        && sequence.prefill_context_len() == chunk.total_prompt_tokens();
+    if valid {
+        Ok(())
+    } else {
+        Err(FerrumError::cancelled(
+            "guarded prefill commit frontier changed",
+        ))
+    }
+}
+
 impl EngineInner {
+    /// Product prefill callers hold iteration_lock across execution. Admission
+    /// (including RequestId reuse) takes that same lock. Capture before sampling
+    /// and publish synchronously under the sequence write lock, so neither owner
+    /// nor sampled history can be replaced between these two operations.
+    pub(super) fn finish_sampled_prefill(
+        &self,
+        sequence: &SequenceState,
+        publication: &ferrum_scheduler::implementations::continuous::PrefillOutputPublication,
+        context_tokens: usize,
+        chunk: Option<(usize, usize)>,
+    ) -> Result<()> {
+        if let Some((planned, completed)) = chunk {
+            if !self
+                .scheduler
+                .mark_prefill_chunk_processed_with_capacity_feedback(
+                    &sequence.request_id,
+                    context_tokens,
+                    planned,
+                    completed,
+                )?
+            {
+                return Err(FerrumError::scheduler(
+                    "final prefill did not promote its owner",
+                ));
+            }
+        } else {
+            self.scheduler
+                .mark_prefill_complete(&sequence.request_id, context_tokens);
+        }
+        self.scheduler
+            .publish_prefill_output_commit(publication, sequence.generated_tokens.len())?;
+        Ok(())
+    }
+
     // ── prefill ────────────────────────────────────────────────────────
 
     pub(super) async fn run_prefill(&self, request_id: &RequestId) -> Result<()> {
@@ -83,6 +140,11 @@ impl EngineInner {
                     let seq = sequences
                         .get_mut(request_id)
                         .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+                    let publication = self.scheduler.prepare_prefill_output_publication(
+                        request_id,
+                        num_tokens,
+                        seq.generated_tokens.len(),
+                    )?;
                     seq.reset_guided_processors()?;
                     let mut logits = cached_logits;
                     let token = seq.sample_and_commit_with_processors_and_tokenizer(
@@ -92,6 +154,7 @@ impl EngineInner {
                     let model_cache_update =
                         seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                     seq.record_generated_token_commit();
+                    self.finish_sampled_prefill(seq, &publication, num_tokens, None)?;
                     Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
                 })();
                 let (first_token, model_cache_update) = match prefix_hit_result {
@@ -107,7 +170,6 @@ impl EngineInner {
                 };
                 self.apply_model_cache_ref_update(request_id, model_cache_update);
 
-                self.scheduler.mark_prefill_complete(request_id, num_tokens);
                 self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                 counter!("ferrum.engine.prefix_cache_hits").increment(1);
 
@@ -311,6 +373,11 @@ impl EngineInner {
             let seq = sequences
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
+            let publication = self.scheduler.prepare_prefill_output_publication(
+                request_id,
+                num_tokens,
+                seq.generated_tokens.len(),
+            )?;
             seq.reset_guided_processors()?;
             let mut logits = logits_vec;
             let token = seq.sample_and_commit_with_processors_and_tokenizer(
@@ -328,6 +395,7 @@ impl EngineInner {
                 recurrent_admission.fresh_slots(),
             );
             seq.record_generated_token_commit();
+            self.finish_sampled_prefill(seq, &publication, num_tokens, None)?;
             Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
         })();
         let (first_token, model_cache_update) = match first_token_result {
@@ -344,7 +412,6 @@ impl EngineInner {
         debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
         recurrent_admission.commit_fresh();
 
-        self.scheduler.mark_prefill_complete(request_id, num_tokens);
         self.total_prefill_tokens
             .fetch_add(num_tokens as u64, Ordering::Relaxed);
         counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
@@ -435,6 +502,27 @@ impl EngineInner {
     pub(super) fn prepare_plan_runtime_prefill(
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
+        cost: &mut Option<EngineCostPreparation>,
+    ) -> Result<Option<PlanRuntimePrefillInput>> {
+        self.prepare_plan_runtime_prefill_input(scheduled, None, cost)
+    }
+
+    /// A controller selection is an exact logical wave. Unlike the adaptive
+    /// caller, this preparation cannot replace its chunk with a prefix boundary.
+    pub(super) fn prepare_guarded_plan_runtime_prefill(
+        &self,
+        scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
+        expected: ferrum_interfaces::model_executor::PrefillChunk,
+        cost: &mut Option<EngineCostPreparation>,
+    ) -> Result<Option<PlanRuntimePrefillInput>> {
+        self.prepare_plan_runtime_prefill_input(scheduled, Some(expected), cost)
+    }
+
+    fn prepare_plan_runtime_prefill_input(
+        &self,
+        scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
+        exact: Option<ferrum_interfaces::model_executor::PrefillChunk>,
+        cost: &mut Option<EngineCostPreparation>,
     ) -> Result<Option<PlanRuntimePrefillInput>> {
         use ferrum_interfaces::model_executor::PrefillChunk;
 
@@ -442,6 +530,9 @@ impl EngineInner {
 
         let Some((input_tokens, maximum_sequence_tokens, original_prompt)) =
             self.sequences.read().get(request_id).map(|seq| {
+                if let Some(cost) = cost {
+                    cost.capture(seq);
+                }
                 (
                     seq.prefill_context_tokens(),
                     seq.model_maximum_sequence_tokens(),
@@ -460,7 +551,15 @@ impl EngineInner {
             })?,
             input_tokens.len(),
         )?;
-        let chunk = self.plan_prompt_tail_prefill_chunk(request_id, chunk, original_prompt)?;
+        let chunk = match exact {
+            Some(expected) if chunk == expected => chunk,
+            Some(_) => {
+                return Err(FerrumError::scheduler(
+                    "guarded prefill input differs from selected chunk",
+                ))
+            }
+            None => self.plan_prompt_tail_prefill_chunk(request_id, chunk, original_prompt)?,
+        };
         PlanRuntimePrefillInput::new(
             request_id.clone(),
             input_tokens,
@@ -474,18 +573,16 @@ impl EngineInner {
         &self,
         scheduled: &ferrum_interfaces::scheduler::ScheduledRequest,
     ) -> Result<()> {
-        let Some(input) = self.prepare_plan_runtime_prefill(scheduled)? else {
+        let mut preparation = self.prepare_cost_observation();
+        let Some(input) = self.prepare_plan_runtime_prefill(scheduled, &mut preparation)? else {
             return Ok(());
         };
         let request_id = &input.request_id;
         let input_token_count = input.input_tokens.len();
         let chunk = input.chunk;
+        let mut cost = preparation.and_then(EngineCostPreparation::begin);
 
-        match self
-            .model_executor
-            .plan_runtime_prefill_with_capacity(&input)
-            .await?
-        {
+        match self.cost_prefill(&input, &mut cost).await? {
             PlanRuntimePrefillOutcome::Completed(completion) => {
                 return self
                     .commit_plan_runtime_prefill_completion(
@@ -493,6 +590,7 @@ impl EngineInner {
                         input_token_count,
                         chunk,
                         completion,
+                        &mut cost,
                     )
                     .await;
             }
@@ -632,7 +730,40 @@ impl EngineInner {
         input_token_count: usize,
         planned_chunk: ferrum_interfaces::model_executor::PrefillChunk,
         completion: ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
+        cost: &mut Option<ObservedCostCall>,
     ) -> Result<()> {
+        self.commit_plan_runtime_prefill_completion_fenced(
+            request_id,
+            input_token_count,
+            planned_chunk,
+            completion,
+            cost,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn commit_plan_runtime_prefill_completion_fenced(
+        &self,
+        request_id: &RequestId,
+        input_token_count: usize,
+        planned_chunk: ferrum_interfaces::model_executor::PrefillChunk,
+        completion: ferrum_interfaces::model_executor::PlanRuntimePrefillCompletion,
+        cost: &mut Option<ObservedCostCall>,
+        fence: Option<slo_controller::ControllerCommitFence<'_>>,
+    ) -> Result<()> {
+        if let Some(call) = cost.as_deref_mut() {
+            call.begin_host_row(request_id);
+        }
+        if fence.is_some()
+            && (completion.completed_chunk() != planned_chunk
+                || completion.capacity_probe_count() != 0)
+        {
+            self.discard_plan_runtime_prefill_completion(completion)?;
+            return Err(FerrumError::backend(
+                "guarded prefill completion narrowed selected work",
+            ));
+        }
         if let Err(error) = completion.validate_for(
             request_id,
             planned_chunk,
@@ -659,19 +790,53 @@ impl EngineInner {
         let (authority, product) = output.into_parts();
         if !chunk.is_final() {
             debug_assert!(matches!(product, PlanRuntimePrefillProduct::Intermediate));
-            let model_cache_update = {
+            let committed = {
                 let mut sequences = self.sequences.write();
-                sequences.get_mut(request_id).map(|seq| {
-                    seq.commit_plan_runtime_prefill_chunk_resources(
-                        Arc::clone(authority.kv_cache()),
-                        chunk.end(),
-                        false,
-                    )
-                })
+                sequences
+                    .get_mut(request_id)
+                    .map(|seq| {
+                        validate_prefill_commit_fence(seq, planned_chunk, fence)?;
+                        let reference_commit = seq.prepare_prefill_reference_commit(chunk);
+                        let start = cost
+                            .as_deref()
+                            .map(|call| CostHostCommitStart::capture(seq, call));
+                        let update = seq.commit_plan_runtime_prefill_chunk_resources(
+                            Arc::clone(authority.kv_cache()),
+                            chunk.end(),
+                            false,
+                        );
+                        let evidence = start.and_then(|start| {
+                            start.prefill(
+                                cost.as_deref_mut().expect("observed start"),
+                                seq,
+                                chunk.tokens_processed(),
+                                input_token_count,
+                            )
+                        });
+                        Ok::<_, FerrumError>((update, evidence, reference_commit))
+                    })
+                    .transpose()
             };
-            let Some(model_cache_update) = model_cache_update else {
+            let committed = match committed {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(call) = cost.as_deref_mut() {
+                        call.host_failed(request_id);
+                    }
+                    self.model_executor
+                        .discard_plan_runtime_prefill(authority)?;
+                    return Err(error);
+                }
+            };
+            let Some((model_cache_update, evidence, reference_commit)) = committed else {
+                if let Some(call) = cost.as_deref_mut() {
+                    call.host_cancelled(request_id);
+                }
                 self.model_executor
                     .discard_plan_runtime_prefill(authority)?;
+                if fence.is_some() {
+                    return Err(FerrumError::cancelled("guarded prefill owner disappeared"));
+                }
                 return Ok(());
             };
             self.apply_model_cache_ref_update(request_id, model_cache_update);
@@ -691,16 +856,31 @@ impl EngineInner {
                 Err(error) => Some(error),
             };
             if let Some(error) = scheduler_error {
+                if let Some(call) = cost.as_deref_mut() {
+                    call.host_failed(request_id);
+                }
                 self.model_executor
                     .discard_plan_runtime_prefill(authority)?;
+                if fence.is_some() {
+                    return Err(error);
+                }
                 self.complete_request_with_error(request_id, error).await?;
                 return Ok(());
+            }
+            if reference_commit.is_some() {
+                if let Some(sequence) = self.sequences.write().get_mut(request_id) {
+                    sequence.publish_prefill_reference_commit(reference_commit);
+                }
             }
             self.total_prefill_tokens
                 .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total")
                 .increment(chunk.tokens_to_process() as u64);
             self.trace_plan_runtime_prefill_completion(request_id, chunk);
+            if let (Some(call), Some(evidence)) = (cost.as_deref_mut(), evidence.as_ref()) {
+                call.note_host_token_commit(evidence);
+            }
+            self.publish_cost_host_commit(cost, evidence, false, false);
             return Ok(());
         }
 
@@ -714,6 +894,16 @@ impl EngineInner {
             let Some(seq) = sequences.get_mut(request_id) else {
                 return Ok(None);
             };
+            validate_prefill_commit_fence(seq, planned_chunk, fence)?;
+            let publication = self.scheduler.prepare_prefill_output_publication(
+                request_id,
+                input_token_count,
+                seq.generated_tokens.len(),
+            )?;
+            let start = cost
+                .as_deref()
+                .map(|call| CostHostCommitStart::capture(seq, call));
+            let reference_commit = seq.prepare_prefill_reference_commit(chunk);
             seq.reset_guided_processors()?;
             let token = seq.sample_and_commit_with_processors_and_tokenizer(
                 &mut logits,
@@ -725,43 +915,52 @@ impl EngineInner {
                 true,
             );
             seq.record_generated_token_commit();
-            Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((token, update)))
+            self.finish_sampled_prefill(
+                seq,
+                &publication,
+                input_token_count,
+                Some((planned_chunk.tokens_to_process(), chunk.tokens_to_process())),
+            )?;
+            seq.publish_prefill_reference_commit(reference_commit);
+            let evidence = start.and_then(|start| {
+                start.prefill(
+                    cost.as_deref_mut().expect("observed start"),
+                    seq,
+                    chunk.tokens_processed(),
+                    input_token_count,
+                )
+            });
+            Ok::<_, FerrumError>(Some((token, update, evidence)))
         })();
-        let Some((first_token, model_cache_update)) = (match commit_result {
+        let Some((first_token, model_cache_update, evidence)) = (match commit_result {
             Ok(value) => value,
             Err(error) => {
+                if let Some(call) = cost.as_deref_mut() {
+                    call.host_failed(request_id);
+                }
                 self.model_executor
                     .discard_plan_runtime_prefill(authority)?;
+                if fence.is_some() {
+                    return Err(error);
+                }
                 self.complete_request_with_error(request_id, error).await?;
                 return Ok(());
             }
         }) else {
+            if let Some(call) = cost.as_deref_mut() {
+                call.host_cancelled(request_id);
+            }
             self.model_executor
                 .discard_plan_runtime_prefill(authority)?;
+            if fence.is_some() {
+                return Err(FerrumError::cancelled("guarded prefill owner disappeared"));
+            }
             return Ok(());
         };
 
         self.apply_model_cache_ref_update(request_id, model_cache_update);
-        let scheduler_result = self
-            .scheduler
-            .mark_prefill_chunk_processed_with_capacity_feedback(
-                request_id,
-                input_token_count,
-                planned_chunk.tokens_to_process(),
-                chunk.tokens_to_process(),
-            );
-        let scheduler_error = match scheduler_result {
-            Ok(true) => None,
-            Ok(false) => Some(FerrumError::scheduler(format!(
-                "final PlanRuntime prefill chunk did not promote {request_id} to decode"
-            ))),
-            Err(error) => Some(error),
-        };
-        if let Some(error) = scheduler_error {
-            self.model_executor
-                .discard_plan_runtime_prefill(authority)?;
-            self.complete_request_with_error(request_id, error).await?;
-            return Ok(());
+        if let (Some(call), Some(evidence)) = (cost.as_deref_mut(), evidence.as_ref()) {
+            call.note_host_token_commit(evidence);
         }
         self.total_prefill_tokens
             .fetch_add(chunk.tokens_to_process() as u64, Ordering::Relaxed);
@@ -773,8 +972,10 @@ impl EngineInner {
         if self.should_stream_generated_token(request_id, first_token, stop_reason) {
             self.send_stream_update(request_id, first_token).await;
         }
+        let pending = self.publish_cost_host_commit(cost, evidence, true, stop_reason.is_some());
         if let Some(reason) = stop_reason {
-            self.complete_request(request_id, reason).await?;
+            self.complete_request_with_cost(request_id, reason, pending, cost)
+                .await?;
         }
         Ok(())
     }
@@ -864,10 +1065,12 @@ impl EngineInner {
             planned_chunk: PrefillChunk,
         }
 
+        let mut preparation = self.prepare_cost_observation();
         let mut work = Vec::with_capacity(scheduled.len());
         let mut inputs = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
-            let Some(input) = self.prepare_plan_runtime_prefill(scheduled)? else {
+            let Some(input) = self.prepare_plan_runtime_prefill(scheduled, &mut preparation)?
+            else {
                 continue;
             };
             work.push(Work {
@@ -883,11 +1086,8 @@ impl EngineInner {
             ));
         }
 
-        let completions = match self
-            .model_executor
-            .plan_runtime_batch_prefill_with_capacity(&inputs)
-            .await?
-        {
+        let mut cost = preparation.and_then(EngineCostPreparation::begin);
+        let completions = match self.cost_batch_prefill(&inputs, &mut cost).await? {
             PlanRuntimeBatchPrefillOutcome::Completed(completions) => completions,
             PlanRuntimeBatchPrefillOutcome::NotSubmitted(
                 ExecutorExecutionDeferral::RequestState(deferral),
@@ -1022,6 +1222,7 @@ impl EngineInner {
                     item.input_token_count,
                     item.planned_chunk,
                     completion,
+                    &mut cost,
                 )
                 .await
             {
@@ -1116,6 +1317,11 @@ impl EngineInner {
                         let Some(seq) = sequences.get_mut(rid) else {
                             return Ok(None);
                         };
+                        let publication = self.scheduler.prepare_prefill_output_publication(
+                            rid,
+                            num_tokens,
+                            seq.generated_tokens.len(),
+                        )?;
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
                         let token = seq.sample_and_commit_with_processors_and_tokenizer(
@@ -1125,6 +1331,7 @@ impl EngineInner {
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         seq.record_generated_token_commit();
+                        self.finish_sampled_prefill(seq, &publication, num_tokens, None)?;
                         Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                             token,
                             model_cache_update,
@@ -1145,7 +1352,6 @@ impl EngineInner {
                         continue;
                     };
                     self.apply_model_cache_ref_update(rid, model_cache_update);
-                    self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
                     let stop_reason = self.stop_reason_for_request(rid);
@@ -1298,6 +1504,11 @@ impl EngineInner {
                 let Some(seq) = sequences.get_mut(&rid) else {
                     return Ok(None);
                 };
+                let publication = self.scheduler.prepare_prefill_output_publication(
+                    &rid,
+                    pending.input_tokens.len(),
+                    seq.generated_tokens.len(),
+                )?;
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
                 let token = seq.sample_and_commit_with_processors_and_tokenizer(
@@ -1315,6 +1526,7 @@ impl EngineInner {
                     pending.recurrent_state.fresh_slots(),
                 );
                 seq.record_generated_token_commit();
+                self.finish_sampled_prefill(seq, &publication, pending.input_tokens.len(), None)?;
                 Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
                     token,
                     model_cache_update,
@@ -1338,7 +1550,6 @@ impl EngineInner {
             debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
             pending.recurrent_state.commit_fresh();
             let num_tokens = pending.input_tokens.len();
-            self.scheduler.mark_prefill_complete(&rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);

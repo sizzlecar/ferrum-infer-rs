@@ -3,14 +3,22 @@
 use super::*;
 use ferrum_interfaces::vnext::DynamicBackingPressure;
 
-mod batch;
+pub(super) mod batch;
 mod completion;
 pub(super) mod cost_observation;
+use cost_observation::{CostHostCommitStart, EngineCostPreparation, ObservedCostCall};
 mod decode;
 mod mixed;
+mod output_projection;
 mod prefill;
+pub(super) mod prefill_reference_runtime;
 pub(super) mod prefix_rendezvous;
 pub(super) mod prefix_restore;
+pub(super) mod slo_controller;
+mod slo_observation;
+mod slo_wait;
+pub(super) use slo_wait::slo_clock_now;
+pub(super) mod calibration;
 
 #[derive(Debug)]
 pub(super) enum PlanRuntimeBatchPrefillDisposition {
@@ -1234,6 +1242,16 @@ impl EngineInner {
         &self,
         maximum_admissions: usize,
     ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>)> {
+        let (admitted, maintenance, _) =
+            self.prepare_dynamic_admission_round_with_time_gate(maximum_admissions, false)?;
+        Ok((admitted, maintenance))
+    }
+
+    fn prepare_dynamic_admission_round_with_time_gate(
+        &self,
+        maximum_admissions: usize,
+        time_gate: bool,
+    ) -> Result<(usize, Vec<ExecutorPrefillMaintenanceDeferral>, bool)> {
         let mut maintenance = Vec::new();
         let mut availability = self.dynamic_admission_availability.lock();
         let epochs = self
@@ -1249,11 +1267,17 @@ impl EngineInner {
             0,
         );
         let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
+        let gate = (time_gate && self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce)
+            .then(|| self.prepare_time_activation(maximum_admissions, wake));
+        let mut time_activated = Vec::new();
         let capture_trace = self.scheduler_trace_jsonl.is_some();
         let records = std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new());
         let mut prefix_pressure = false;
         let mut probe = |request: &InferenceRequest| {
             let result = self.probe_executor_prefill_admission(request, capture_trace);
+            if gate.is_some() && matches!(&result.outcome, AdmissionProbeOutcome::Admitted(_)) {
+                time_activated.push(request.id.clone());
+            }
             if (self
                 .config
                 .scheduler
@@ -1275,9 +1299,11 @@ impl EngineInner {
             }
             result.outcome
         };
-        let prepared =
-            self.scheduler.prepare_dynamic_admission_observed(
-                maximum_admissions,
+        let prepared = self
+            .scheduler
+            .prepare_dynamic_admission_observed_with_eligibility(
+                gate.as_ref()
+                    .map_or(maximum_admissions, |gate| gate.maximum),
                 wake,
                 &mut probe,
                 &mut |observation| {
@@ -1285,6 +1311,7 @@ impl EngineInner {
                         ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
                     )
                 },
+                &|request| gate.as_ref().is_none_or(|gate| gate.eligible(request)),
             );
         drop(probe);
         drop(availability);
@@ -1303,7 +1330,21 @@ impl EngineInner {
             }
         }
         match prepared {
-            Ok(receipt) => Ok((receipt.admitted(), maintenance)),
+            Ok(receipt) => {
+                // The queue and availability locks have been released. The
+                // common ingress/iteration lock still binds these actual
+                // admissions to their original engine owners.
+                if let Some(gate) = &gate {
+                    for request_id in time_activated {
+                        self.record_time_activation(&request_id, gate);
+                    }
+                }
+                Ok((
+                    receipt.admitted(),
+                    maintenance,
+                    gate.is_some() && receipt.probed() != 0,
+                ))
+            }
             Err(error) => {
                 for deferral in &maintenance {
                     self.model_executor
@@ -1312,6 +1353,24 @@ impl EngineInner {
                 Err(error)
             }
         }
+    }
+
+    /// One independent physical-admission/maintenance turn before taking a
+    /// controller snapshot. It cannot construct a batch or submit model work.
+    /// A maintained request is re-probed only in a subsequent iteration.
+    async fn prepare_slo_admission_turn(&self, maximum: usize) -> Result<bool> {
+        if maximum == 0 || self.scheduler.waiting_count() == 0 {
+            return Ok(false);
+        }
+        let (admitted, maintenance, probed) =
+            self.prepare_dynamic_admission_round_with_time_gate(maximum.min(256), true)?;
+        let maintained = !maintenance.is_empty();
+        self.execute_executor_prefill_maintenance(maintenance);
+        self.complete_typed_admission_failures().await?;
+        // A real first/changed-source probe may defer without admitting. One
+        // more iteration can examine the next eligible owner. Unchanged epoch
+        // skips and time holds are not progress, so this cannot busy-spin.
+        Ok(admitted != 0 || maintained || probed)
     }
 
     /// Fill-first is allowed to delay decode until its active target, so form
@@ -1624,11 +1683,17 @@ impl EngineInner {
     // ── iteration loop ─────────────────────────────────────────────────
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
-    pub(super) async fn run_iteration(&self) -> Result<EngineIterationOutcome> {
+    pub(super) async fn run_iteration(self: &Arc<Self>) -> Result<EngineIterationOutcome> {
+        if let Some(outcome) = self.drain_slo_execution().await? {
+            return Ok(outcome);
+        }
         let lock_wait_start = Instant::now();
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
+        let _ = self.observe_slo_waits(slo_clock_now);
         self.cancel_abandoned_requests().await?;
+        self.complete_credited_output_failures().await?;
+        self.refresh_credited_output_readiness();
         self.complete_execution_readiness_failures().await?;
         self.prepare_prefix_rendezvous()?;
 
@@ -1664,6 +1729,27 @@ impl EngineInner {
         };
         let hint_max_batch_size = hint.max_batch_size;
         let hint_max_tokens = hint.max_tokens;
+
+        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce {
+            if let Some(outcome) = self.prepare_slo_maintenance_turn().await? {
+                return Ok(outcome);
+            }
+        }
+        if self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
+            && self.model_executor.execution_resource_authority()
+                == ExecutionResourceAuthority::PlanRuntime
+            && self.prepare_slo_admission_turn(hint.max_batch_size).await?
+        {
+            return Ok(EngineIterationOutcome::Progressed);
+        }
+        match self.prepare_slo_controller(&hint)? {
+            slo_controller::SloIterationPlan::Legacy => {}
+            slo_controller::SloIterationPlan::Idle => return self.slo_controller_idle_outcome(),
+            slo_controller::SloIterationPlan::Selected(wave) => {
+                drop(iteration_guard);
+                return self.execute_slo_controller_wave(wave).await;
+            }
+        }
 
         // FERRUM_NEXT_BATCH_PROF=1: count Some/None returns to root-cause
         // the apples HTTP-serve 17 ms inter-batch-iter gap. Prints every

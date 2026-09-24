@@ -149,6 +149,10 @@ impl PlanningQueueSnapshot {
     pub fn wake_epochs(&self) -> AdmissionWakeEpochs {
         self.seal.wake
     }
+    /// Captured numeric wake evidence, without resource or admission authority.
+    pub fn capacity_availability(&self) -> &[CapacityAvailabilityEpoch] {
+        &self.seal.availability
+    }
     /// Captured logical width ceilings. These are not physical permits.
     pub fn decode_wave_limit(&self) -> usize {
         self.seal.decode_limit

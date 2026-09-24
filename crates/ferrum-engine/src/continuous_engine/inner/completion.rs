@@ -1,7 +1,9 @@
 use super::*;
 
+mod credited;
+
 impl SequencePhysicalResources {
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::continuous_engine) fn is_empty(&self) -> bool {
         self.legacy_kv_allocation.is_none()
             && self.legacy_draft_kv_allocation.is_none()
             && self.recurrent_state_allocation.is_none()
@@ -13,31 +15,7 @@ impl SequenceState {
     /// Return the first matched stop, or hold the longest suffix that could
     /// still become a stop. Character boundaries keep Unicode stops safe.
     fn visible_text_end(&self, text: &str, terminal: bool) -> usize {
-        if let Some(end) = self
-            .stop_text_seqs
-            .iter()
-            .filter(|stop| !stop.is_empty())
-            .filter_map(|stop| text.find(stop.as_str()))
-            .min()
-        {
-            return end;
-        }
-        if terminal {
-            return text.len();
-        }
-        let held = self
-            .stop_text_seqs
-            .iter()
-            .flat_map(|stop| {
-                stop.char_indices()
-                    .skip(1)
-                    .map(move |(len, _)| &stop[..len])
-            })
-            .filter(|prefix| text.ends_with(prefix))
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
-        text.len() - held
+        super::output_projection::visible_text_end(&self.stop_text_seqs, text, terminal)
     }
 
     fn decoded_output_text(
@@ -45,7 +23,7 @@ impl SequenceState {
         tokenizer: &(dyn Tokenizer + Send + Sync),
         terminal: Option<FinishReason>,
     ) -> Result<String> {
-        let mut text = tokenizer.decode(&self.generated_tokens, true)?;
+        let mut text = self.decode_owned_output(tokenizer, &self.generated_tokens)?;
         let end = self.visible_text_end(&text, terminal.is_some());
         if end < text.len() {
             text.truncate(end);
@@ -55,9 +33,9 @@ impl SequenceState {
             if self.stop_token_ids.contains(&last.get())
                 && !self.should_stream_generated_token(Some(tokenizer), last, Some(reason))
             {
-                text = tokenizer.decode(
+                text = self.decode_owned_output(
+                    tokenizer,
                     &self.generated_tokens[..self.generated_tokens.len() - 1],
-                    true,
                 )?;
             }
         }
@@ -130,9 +108,13 @@ impl SequenceState {
     }
 
     pub(in crate::continuous_engine) fn client_receiver_closed(&self) -> bool {
-        self.response_sender
+        self.credited_output
             .as_ref()
-            .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+            .is_some_and(|output| output.port.consumer_closed())
+            || self
+                .response_sender
+                .as_ref()
+                .is_some_and(tokio::sync::oneshot::Sender::is_closed)
             || self
                 .stream_sender
                 .as_ref()
@@ -298,6 +280,9 @@ impl EngineInner {
         token: Option<TokenId>,
         terminal: Option<FinishReason>,
     ) {
+        if self.send_credited_text(request_id, token, terminal) {
+            return;
+        }
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
         // the delta that hasn't been streamed yet. Per-token decode is
@@ -307,49 +292,28 @@ impl EngineInner {
         // returns a `\u{FFFD}` replacement char that renders as a square /
         // `?` glyph in the terminal.
         //
-        // Algorithm: hold the write lock once to (a) clone sender, (b)
-        // decode current full history, (c) if the decoded text ends in
-        // `\u{FFFD}` defer the emit (a later token will complete the
-        // multi-byte sequence), (d) otherwise carve off the substring
-        // past `streamed_text_len` and bump the watermark. Possible stop
-        // prefixes are held until they match, diverge, or generation ends.
+        // Copy only immutable projection inputs, release the global sequence
+        // lock for tokenizer/stop processing, then validate the incarnation,
+        // full token frontier and watermark before publishing any progress.
+        let snapshot = {
+            let sequences = self.sequences.read();
+            let Some(sequence) = sequences.get(request_id) else {
+                return;
+            };
+            super::output_projection::StreamProjectionSnapshot::capture(sequence)
+        };
+        let Ok(Some(projection)) = snapshot.project(self.tokenizer.as_ref(), terminal) else {
+            return;
+        };
         let (sender, delta, ttft_s, itl_s, first_emit_prof) = {
             let mut sequences = self.sequences.write();
             let Some(seq) = sequences.get_mut(request_id) else {
                 return;
             };
+            let Some(delta) = projection.commit(seq) else {
+                return;
+            };
             let sender = seq.stream_sender.clone();
-            let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
-                return;
-            };
-            let incomplete_utf8 = full.ends_with('\u{FFFD}');
-            if incomplete_utf8 && terminal.is_none() {
-                // Partial multi-byte UTF-8 at the tail; wait for the next
-                // token. Do NOT advance streamed_text_len so the bytes get
-                // re-considered once the sequence completes.
-                return;
-            }
-            if !incomplete_utf8 {
-                seq.decoded_text_len = full.len();
-            }
-            let visible = if terminal.is_some() {
-                let Ok(text) = seq.decoded_output_text(self.tokenizer.as_ref(), terminal) else {
-                    return;
-                };
-                text
-            } else {
-                let end = seq.visible_text_end(&full, false);
-                full.truncate(end);
-                full
-            };
-            if visible.ends_with('\u{FFFD}') {
-                return;
-            }
-            let Some(delta) = visible.get(seq.streamed_text_len..) else {
-                return;
-            };
-            let delta = delta.to_string();
-            seq.streamed_text_len = visible.len();
 
             // Latency-metric tracking (PLAYBOOK § 7 definitions).
             // We capture timestamps in the critical section so the
@@ -464,14 +428,24 @@ impl EngineInner {
     async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
         self.discard_pending_prefix_restore(request_id);
         let detected_scheduler_iteration = self.scheduler.trace_snapshot().current_iteration;
-        let (completion_resources, terminal_token_trace) = {
+        let (completion_resources, terminal_token_trace, slo_observation) = {
             let mut sequences = self.sequences.write();
             let Some(mut sequence) = sequences.remove(request_id) else {
                 return Ok(());
             };
             let terminal_token_trace = self.capture_sequence_terminal_token_trace(&sequence);
-            (sequence.take_completion_resources(), terminal_token_trace)
+            let slo_observation = super::slo_observation::SloTerminalObservation::capture(
+                &sequence,
+                FinishReason::Cancelled,
+                super::slo_clock_now(),
+            );
+            (
+                sequence.take_completion_resources(),
+                terminal_token_trace,
+                slo_observation,
+            )
         };
+        self.record_slo_terminal(request_id, slo_observation);
         self.write_sequence_terminal_token_trace(
             request_id,
             "client_disconnected",
@@ -632,12 +606,42 @@ impl EngineInner {
             .await
     }
 
+    pub(super) async fn complete_request_with_cost(
+        &self,
+        request_id: &RequestId,
+        reason: FinishReason,
+        pending: Option<cost_observation::PendingHostRow>,
+        cost: &mut Option<ObservedCostCall>,
+    ) -> Result<()> {
+        if let Some(pending) = pending {
+            let (result, receipt) = self
+                .complete_credited_request_inner(request_id, reason, None, Some(pending))
+                .await;
+            if let (Some(call), Some(receipt)) = (cost.as_deref_mut(), receipt) {
+                call.record_settled(receipt);
+            }
+            result
+        } else {
+            self.complete_request(request_id, reason).await
+        }
+    }
+
     async fn complete_request_inner(
         &self,
         request_id: &RequestId,
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
+        if self
+            .sequences
+            .read()
+            .get(request_id)
+            .is_some_and(|sequence| sequence.credited_output.is_some())
+        {
+            return self
+                .complete_credited_request(request_id, finish_reason, explicit_terminal_error)
+                .await;
+        }
         self.discard_pending_prefix_restore(request_id);
         let mut classified_api_response = None;
         if explicit_terminal_error.is_none() {
@@ -672,6 +676,7 @@ impl EngineInner {
             completion_resources,
             terminal_error,
             terminal_token_trace,
+            slo_observation,
         ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
@@ -682,6 +687,11 @@ impl EngineInner {
                     finish_reason
                 };
                 let terminal_token_trace = self.capture_sequence_terminal_token_trace(&seq);
+                let slo_observation = super::slo_observation::SloTerminalObservation::capture(
+                    &seq,
+                    finish_reason,
+                    super::slo_clock_now(),
+                );
                 let text = seq
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
@@ -731,11 +741,13 @@ impl EngineInner {
                     completion_resources,
                     terminal_error,
                     terminal_token_trace,
+                    slo_observation,
                 )
             } else {
                 return Ok(());
             }
         };
+        self.record_slo_terminal(request_id, slo_observation);
         self.write_sequence_terminal_token_trace(
             request_id,
             "completed",

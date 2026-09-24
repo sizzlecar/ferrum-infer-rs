@@ -15,7 +15,13 @@ pub(in super::super) struct PendingPrefixRestore {
 
 impl EngineInner {
     pub(super) fn discard_pending_prefix_restore(&self, request_id: &RequestId) {
+        self.discard_pending_prefix_restore_observed(request_id);
+    }
+
+    /// The result describes the owner actually removed by this operation.
+    pub(super) fn discard_pending_prefix_restore_observed(&self, request_id: &RequestId) -> bool {
         let pending = self.prefix_restore_pending.lock().remove(request_id);
+        let removed = pending.is_some();
         if let Some(pending) = pending {
             if let Err(error) = self
                 .scheduler
@@ -26,6 +32,7 @@ impl EngineInner {
             // Drop the immutable device pin outside the container lock.
             drop(pending);
         }
+        removed
     }
 
     pub(super) fn release_pending_prefix_restores_for_capacity_pressure(&self) {
@@ -211,6 +218,13 @@ impl EngineInner {
                 }
                 self.scheduler
                     .commit_prefix_restored(prepared, restored_tokens)?;
+                let reference_commit = sequence.prepare_prefill_reference_commit(
+                    ferrum_interfaces::model_executor::PrefillChunk::new(
+                        0,
+                        restored_tokens,
+                        prompt_tokens,
+                    )?,
+                );
                 let update = sequence.commit_plan_runtime_prefill_chunk_resources(
                     Arc::clone(output.kv_cache()),
                     restored_tokens,
@@ -219,7 +233,11 @@ impl EngineInner {
                 // Both outer owners now agree. Only the native publication
                 // may open the target execution gate. The closure also drops
                 // that owner before error cleanup awaits request release.
-                Ok((update, output.acknowledge()))
+                let acknowledged = output.acknowledge();
+                if acknowledged.is_ok() {
+                    sequence.publish_prefill_reference_commit(reference_commit);
+                }
+                Ok((update, acknowledged))
             })();
             let (update, acknowledged) = match committed {
                 Ok(value) => value,

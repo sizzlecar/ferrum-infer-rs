@@ -988,6 +988,16 @@ impl ContinuousBatchScheduler {
     pub fn passive_capacity_wait_condition(
         &self,
     ) -> Result<Option<ferrum_interfaces::vnext::CapacityWaitCondition>> {
+        self.passive_capacity_wait_condition_with_eligibility(&|_| true)
+    }
+
+    /// A separate time-policy hold is not a physical capacity failure. Only
+    /// exclude waiting owners for which the caller retains an independent wake.
+    /// Active work and every retained physical deferral keep their usual checks.
+    pub fn passive_capacity_wait_condition_with_eligibility(
+        &self,
+        eligible: &dyn Fn(&InferenceRequest) -> bool,
+    ) -> Result<Option<ferrum_interfaces::vnext::CapacityWaitCondition>> {
         let mut conditions = Vec::new();
         {
             let prefill = self.prefill_queue.read();
@@ -1033,10 +1043,12 @@ impl ContinuousBatchScheduler {
         };
         let waiting_count = waiting_queue
             .iter()
-            .filter(|request| !pressure_hold_is_active(request))
+            .filter(|request| eligible(&request.inner.request) && !pressure_hold_is_active(request))
             .count();
         let waiting = waiting_queue
-            .passive_wait_condition_for(|request| !pressure_hold_is_active(request))
+            .passive_wait_condition_for(|request| {
+                eligible(&request.inner.request) && !pressure_hold_is_active(request)
+            })
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
         drop(waiting_queue);
         if waiting_count > 0 && waiting.is_none() {
@@ -1443,6 +1455,7 @@ impl ContinuousBatchScheduler {
         maximum_probes: usize,
         maximum_admissions: usize,
         waiting_admission: &mut WaitingAdmissionMode<'_>,
+        eligible: &dyn Fn(&InferenceRequest) -> bool,
     ) -> Result<AdmissionTickReceipt> {
         let WaitingAdmissionMode::Dynamic {
             wake,
@@ -1467,6 +1480,9 @@ impl ContinuousBatchScheduler {
                 maximum_admissions,
                 &mut events,
                 |request, ticket| {
+                    if !eligible(&request.inner.request) {
+                        return AdmissionQueueEligibility::Held;
+                    }
                     if request.prefix_rendezvous.held() {
                         return AdmissionQueueEligibility::Held;
                     }
@@ -1689,6 +1705,25 @@ impl ContinuousBatchScheduler {
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
     ) -> Result<AdmissionTickReceipt> {
+        self.prepare_dynamic_admission_observed_with_eligibility(
+            maximum_admissions,
+            wake,
+            probe,
+            observer,
+            &|_| true,
+        )
+    }
+
+    /// Apply a caller-owned time hold without replacing any physical readiness,
+    /// prefix, pressure or epoch predicate. The caller must supply its own wake.
+    pub fn prepare_dynamic_admission_observed_with_eligibility(
+        &self,
+        maximum_admissions: usize,
+        wake: AdmissionWakeSnapshot<'_>,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+        eligible: &dyn Fn(&InferenceRequest) -> bool,
+    ) -> Result<AdmissionTickReceipt> {
         let active_capacity = self
             .config
             .max_running_requests
@@ -1708,7 +1743,7 @@ impl ContinuousBatchScheduler {
             probe,
             observer: Some(observer),
         };
-        self.admit_waiting_dynamically(available_slots, available_slots, &mut mode)
+        self.admit_waiting_dynamically(available_slots, available_slots, &mut mode, eligible)
     }
 
     /// Maximum waiting-prefix width that can join the next fill-first prefill
@@ -3763,7 +3798,12 @@ impl ContinuousBatchScheduler {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
             }
         } else if matches!(&waiting_admission, WaitingAdmissionMode::Dynamic { .. }) {
-            self.admit_waiting_dynamically(usize::MAX, available_slots, &mut waiting_admission)?;
+            self.admit_waiting_dynamically(
+                usize::MAX,
+                available_slots,
+                &mut waiting_admission,
+                &|_| true,
+            )?;
         }
 
         // vLLM's scheduler spends the remaining per-step token budget on

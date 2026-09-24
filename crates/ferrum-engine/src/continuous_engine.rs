@@ -460,6 +460,7 @@ impl DelimitedPayloadCompletionState {
         token: TokenId,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         envelope_prefix: EnvelopePrefixEffect,
+        credited_decoder: Option<credited_output::CreditedDecodePolicy>,
     ) -> Result<bool> {
         match self {
             Self::AwaitingDelimiter(matcher) => {
@@ -477,6 +478,9 @@ impl DelimitedPayloadCompletionState {
                 let tokenizer = tokenizer.ok_or_else(|| {
                     FerrumError::config("response completion boundary lost its tokenizer")
                 })?;
+                if let Some(decoder) = credited_decoder {
+                    return decoder.incremental_has_payload(tokenizer, previous_tokens, token);
+                }
                 let delta = tokenizer.decode_incremental(previous_tokens, token)?;
                 Ok(delta
                     .chars()
@@ -592,6 +596,22 @@ impl ResponseCompletionState {
         model_eos_token_ids: &[u32],
         max_tokens: usize,
     ) -> Result<Self> {
+        Self::compile_with_tokens(boundary, model_eos_token_ids, max_tokens, |text, label| {
+            let tokenizer = tokenizer.ok_or_else(|| {
+                FerrumError::config("response completion boundary requires a tokenizer")
+            })?;
+            Self::compile_token_sequence(text, label, tokenizer, model_eos_token_ids)
+        })
+    }
+
+    /// Shared validation and state construction. Only the token source differs
+    /// between the legacy encoder and a credited immutable cold marker table.
+    fn compile_with_tokens(
+        boundary: &ResponseCompletionBoundary,
+        model_eos_token_ids: &[u32],
+        max_tokens: usize,
+        mut compile_tokens: impl FnMut(&str, &str) -> Result<Vec<u32>>,
+    ) -> Result<Self> {
         let ResponseCompletionBoundary::AfterDelimiterAndPayload {
             delimiter,
             alternate_envelope,
@@ -602,15 +622,7 @@ impl ResponseCompletionState {
         if model_eos_token_ids.is_empty() {
             return Ok(Self::Satisfied);
         }
-        let tokenizer = tokenizer.ok_or_else(|| {
-            FerrumError::config("response completion boundary requires a tokenizer")
-        })?;
-        let delimiter_tokens = Self::compile_token_sequence(
-            delimiter,
-            "response completion delimiter",
-            tokenizer,
-            model_eos_token_ids,
-        )?;
+        let delimiter_tokens = compile_tokens(delimiter, "response completion delimiter")?;
         if max_tokens <= delimiter_tokens.len() {
             return Err(FerrumError::invalid_request(format!(
                 "response completion requires max_tokens greater than its {}-token delimiter",
@@ -627,20 +639,16 @@ impl ResponseCompletionState {
                 }
                 Ok(ResponseEnvelopeCompletionState {
                     open: TokenSequenceMatcher::new(
-                        Self::compile_token_sequence(
+                        compile_tokens(
                             &envelope.open_token_text,
                             "response completion envelope opener",
-                            tokenizer,
-                            model_eos_token_ids,
                         )?,
                         "response completion envelope opener",
                     )?,
                     close: TokenSequenceMatcher::new(
-                        Self::compile_token_sequence(
+                        compile_tokens(
                             &envelope.close_token_text,
                             "response completion envelope closer",
-                            tokenizer,
-                            model_eos_token_ids,
                         )?,
                         "response completion envelope closer",
                     )?,
@@ -676,6 +684,7 @@ impl ResponseCompletionState {
         previous_tokens: &[TokenId],
         token: TokenId,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        credited_decoder: Option<credited_output::CreditedDecodePolicy>,
     ) -> Result<Option<bool>> {
         let allowed_before = self.allows_model_eos();
         let payload_completed = match self {
@@ -706,6 +715,7 @@ impl ResponseCompletionState {
                             token,
                             tokenizer,
                             envelope_prefix,
+                            credited_decoder,
                         )?
                     }
                 } else {
@@ -714,6 +724,7 @@ impl ResponseCompletionState {
                         token,
                         tokenizer,
                         EnvelopePrefixEffect::Clear,
+                        credited_decoder,
                     )?
                 }
             }
@@ -1203,12 +1214,16 @@ impl SequenceTokenTraceEvidence {
 }
 
 fn token_ids_sha256(tokens: &[TokenId]) -> String {
+    format!("sha256:{:x}", token_ids_digest(tokens))
+}
+
+fn token_ids_digest(tokens: &[TokenId]) -> sha2::digest::Output<Sha256> {
     let mut digest = Sha256::new();
     digest.update(b"ferrum-token-ids:u32-le-v1\0");
     for token in tokens {
         digest.update(token.get().to_le_bytes());
     }
-    format!("sha256:{:x}", digest.finalize())
+    digest.finalize()
 }
 
 fn token_id_prefix(tokens: &[TokenId], limit: usize) -> Vec<u32> {
@@ -1221,6 +1236,18 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
 }
 
 mod sequence;
+pub use inner::calibration::{
+    CalibrationAction, CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
+    CalibrationDecodeRoute, CalibrationFrontier, CalibrationLimits, CalibrationObservation,
+    CalibrationProfileArtifact, CalibrationProfilePaths, CalibrationQueueDisposition,
+    CalibrationRequestEvidence, CalibrationSession, CalibrationSubmissionState, CalibrationTurn,
+    CalibrationWaveReport, CalibrationWork, FrozenCalibrationModel, ImportedCalibrationModel,
+    SelectedCalibrationOptions, SelectedFitFreezeReceipt,
+};
+pub use inner::cost_observation::{
+    HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,
+    HostStageQueueReceipt, HostStageWork, HostTerminalStageV1,
+};
 pub use sequence::SequenceState;
 use sequence::*;
 
@@ -1402,6 +1429,10 @@ impl EngineResourceComposition {
 }
 
 struct EngineInner {
+    prefill_reference_runtime:
+        Option<Arc<inner::prefill_reference_runtime::EnginePrefillReferenceRuntime>>,
+    cost_runtime: Option<Arc<inner::cost_observation::EngineCostRuntime>>,
+    slo_controller: Mutex<inner::slo_controller::SloControllerState>,
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
@@ -1420,6 +1451,8 @@ struct EngineInner {
     spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     tensor_factory: Arc<dyn TensorFactory>,
     sequences: RwLock<HashMap<RequestId, SequenceState>>,
+    output_credit_pool:
+        OnceLock<std::result::Result<ferrum_interfaces::output_credit::OutputCreditPool, String>>,
     is_running: AtomicBool,
     shutdown_notify: Arc<Notify>,
     /// Serializes request publication with cancellation and BatchPlan
@@ -1458,6 +1491,9 @@ struct EngineInner {
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+    /// Only a freshly constructed exclusive CalibrationSession can set this.
+    /// Ordinary Observe and the public Enforce startup gate are unchanged.
+    manual_calibration_driver: bool,
     shutdown_started: AtomicBool,
     shutdown_lock: tokio::sync::Mutex<()>,
     background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -2403,9 +2439,27 @@ impl EngineInner {
     async fn complete_sequence_physical_resources(
         &self,
         request_id: &RequestId,
-        mut resources: SequencePhysicalResources,
+        resources: SequencePhysicalResources,
         usage: &TokenUsage,
     ) -> Result<()> {
+        self.complete_sequence_physical_resources_inner(request_id, resources, usage, false)
+            .await
+            .0
+    }
+
+    async fn complete_sequence_physical_resources_inner(
+        &self,
+        request_id: &RequestId,
+        mut resources: SequencePhysicalResources,
+        usage: &TokenUsage,
+        observed: bool,
+    ) -> (
+        Result<()>,
+        ferrum_interfaces::model_executor::ExecutorCompletionWork,
+        bool,
+    ) {
+        use ferrum_interfaces::model_executor::ExecutorCompletionWork;
+        let mut work = ExecutorCompletionWork::Unknown;
         let completion_result = if let Some(cache_id) = resources.model_cache_id.take() {
             let completion = ExecutorSequenceCompletion::new(
                 request_id.clone(),
@@ -2414,6 +2468,14 @@ impl EngineInner {
                 usage.completion_tokens,
             );
             let result = match completion {
+                Ok(completion) if observed => {
+                    let observed = self
+                        .model_executor
+                        .complete_cache_observed(completion)
+                        .await;
+                    work = observed.work;
+                    observed.result
+                }
                 Ok(completion) => self.model_executor.complete_cache(completion).await,
                 Err(error) => {
                     self.model_executor.release_cache(&cache_id);
@@ -2426,9 +2488,10 @@ impl EngineInner {
             Ok(())
         };
 
+        let other_physical_resources = !resources.is_empty();
         self.release_sequence_physical_resources(request_id, resources)
             .await;
-        completion_result
+        (completion_result, work, other_physical_resources)
     }
 
     fn trace_recurrent_allocate(
@@ -2588,6 +2651,7 @@ impl EngineInner {
 
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
         ferrum_types::PerformanceBreakdown {
+            controller_timing: self.controller_timing_snapshot(),
             scheduling_time_ms: avg_duration_ms(
                 self.total_scheduling_time_us.load(Ordering::Relaxed),
                 self.scheduling_time_samples.load(Ordering::Relaxed),
@@ -2620,8 +2684,10 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
 mod profile;
 use profile::*;
 
+mod credited_output;
 mod inner;
 mod output_flow_runtime;
+mod slo_startup;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public engine wrapper
@@ -2746,7 +2812,7 @@ impl ContinuousBatchEngine {
 
     #[allow(clippy::too_many_arguments)]
     fn new_with_resource_composition(
-        config: EngineConfig,
+        mut config: EngineConfig,
         scheduler: Arc<ContinuousBatchScheduler>,
         tokenizer: Arc<dyn Tokenizer + Send + Sync>,
         sampler: Arc<dyn Sampler + Send + Sync>,
@@ -2756,7 +2822,20 @@ impl ContinuousBatchEngine {
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     ) -> Result<Self> {
+        // A prior serialized/programmatic engine config is not evidence that
+        // this executor loaded a profile. Rebuild the receipt after validation.
+        config.slo_cost_profile_receipt = None;
         let executor_authority = model_executor.execution_resource_authority();
+        config
+            .scheduler
+            .slo
+            .validate()
+            .map_err(FerrumError::config)?;
+        slo_startup::validate_execution(
+            &config,
+            model_executor.as_ref(),
+            draft_executor.is_some() || spec_config.is_some(),
+        )?;
         if draft_executor.is_some() != spec_config.is_some() {
             return Err(FerrumError::config(
                 "speculative decoding requires both a draft executor and its configuration",
@@ -2843,8 +2922,34 @@ impl ContinuousBatchEngine {
             }
         }
 
+        let prefill_reference_runtime =
+            inner::prefill_reference_runtime::EnginePrefillReferenceRuntime::load(
+                config.scheduler.slo.prefill_reference.as_ref(),
+                || model_executor.execution_cost_identity(),
+            )
+            .map_err(|error| FerrumError::config(error.to_string()))?;
+        let cost_runtime = if config.scheduler.slo.mode == ferrum_types::SloMode::Off {
+            None
+        } else {
+            Some(Arc::new(inner::cost_observation::EngineCostRuntime::new(
+                model_executor.execution_cost_identity(),
+                &config.scheduler.slo.cost_observation,
+                config.scheduler.slo.cost_profile.as_deref(),
+            )?))
+        };
+        slo_startup::validate_loaded(
+            &config,
+            cost_runtime.as_deref(),
+            prefill_reference_runtime.as_deref(),
+        )?;
+        config.slo_cost_profile_receipt = cost_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.profile_receipt().cloned());
         Ok(Self {
             inner: Arc::new(EngineInner {
+                prefill_reference_runtime,
+                cost_runtime,
+                slo_controller: Mutex::new(inner::slo_controller::SloControllerState::default()),
                 config,
                 scheduler,
                 tokenizer,
@@ -2856,6 +2961,7 @@ impl ContinuousBatchEngine {
                 spec_config,
                 tensor_factory,
                 sequences: RwLock::new(HashMap::new()),
+                output_credit_pool: OnceLock::new(),
                 is_running: AtomicBool::new(false),
                 shutdown_notify: Arc::new(Notify::new()),
                 iteration_lock: tokio::sync::Mutex::new(()),
@@ -2884,6 +2990,7 @@ impl ContinuousBatchEngine {
                 total_model_execution_time_us: AtomicU64::new(0),
                 model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
+                manual_calibration_driver: false,
                 shutdown_started: AtomicBool::new(false),
                 shutdown_lock: tokio::sync::Mutex::new(()),
                 background_loop: Mutex::new(None),
@@ -2898,6 +3005,9 @@ impl ContinuousBatchEngine {
     /// per-iter tokio scheduling overhead at c=16). With one bg loop +
     /// per-request tasks just consuming their channel, lock is uncontested.
     fn ensure_bg_loop(&self) {
+        if self.inner.manual_calibration_driver {
+            return;
+        }
         if self.inner.bg_loop_spawned.load(Ordering::Acquire) {
             return;
         }
@@ -2965,6 +3075,9 @@ impl ContinuousBatchEngine {
                     EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
                     EngineIterationOutcome::Idle => {
                         tokio::select! {
+                            _ = inner.wait_for_slo_time_admission() => {}
+                            _ = inner.wait_for_slo_controller_retry() => {}
+                            _ = inner.wait_for_slo_deadline() => {}
                             _ = inner.wait_for_prefix_deadline() => {}
                             _ = inner.shutdown_notify.notified() => {}
                             _ = inner.work_notify.notified() => {}
@@ -2972,6 +3085,9 @@ impl ContinuousBatchEngine {
                     }
                     EngineIterationOutcome::CapacityBlocked(registration) => {
                         tokio::select! {
+                            _ = inner.wait_for_slo_time_admission() => {}
+                            _ = inner.wait_for_slo_controller_retry() => {}
+                            _ = inner.wait_for_slo_deadline() => {}
                             _ = inner.wait_for_prefix_deadline() => {}
                             _ = inner.shutdown_notify.notified() => {}
                             _ = inner.work_notify.notified() => {}
@@ -2991,6 +3107,16 @@ impl ContinuousBatchEngine {
 
 #[async_trait]
 impl LlmInferenceEngine for ContinuousBatchEngine {
+    async fn infer_credited_stream(
+        &self,
+        request: InferenceRequest,
+        context: ferrum_interfaces::InferenceRequestContext,
+        contract: Arc<ferrum_interfaces::output_flow::OutputProjectionContract>,
+    ) -> Result<ferrum_interfaces::output_flow::CreditedOutputSession> {
+        self.submit_credited_stream(request, context, contract)
+            .await
+    }
+
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         self.inner.resource_composition.authority()
     }
@@ -3003,7 +3129,21 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         )
     }
 
-    async fn infer(&self, mut request: InferenceRequest) -> Result<InferenceResponse> {
+    async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
+        self.infer_with_context(
+            request,
+            ferrum_interfaces::InferenceRequestContext::capture(),
+        )
+        .await
+    }
+
+    async fn infer_with_context(
+        &self,
+        mut request: InferenceRequest,
+        context: ferrum_interfaces::InferenceRequestContext,
+    ) -> Result<InferenceResponse> {
+        slo_startup::validate_legacy_entry(&self.inner.config)?;
+        let slo = context.resolve_slo(&self.inner.config.scheduler.slo)?;
         let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
@@ -3047,10 +3187,12 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 Some(self.inner.model_executor.info().vocab_size),
                 structured_factory.as_deref(),
             )?;
+        seq_state.slo = slo;
         gauge!("ferrum.engine.active_requests").increment(1.0);
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         seq_state.response_sender = Some(resp_tx);
         seq_state.request_slot = Some(request_slot);
+        self.inner.initialize_sequence_cost(&mut seq_state);
         {
             let _iteration = self.inner.iteration_lock.lock().await;
             {
@@ -3081,11 +3223,15 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 gauge!("ferrum.engine.active_requests").decrement(1.0);
                 return Err(error);
             }
-            self.inner
-                .sequences
-                .write()
+            let mut sequences = self.inner.sequences.write();
+            let sequence = sequences
                 .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence remains published");
+            self.inner.initialize_sequence_prefill_reference(sequence);
+            self.inner.initialize_sequence_time_admission(sequence);
+            sequence
+                .request_slot
+                .as_mut()
                 .expect("submitted sequence retains its request slot")
                 .admit(&self.inner);
         }
@@ -3123,8 +3269,22 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
     async fn infer_stream(
         &self,
-        mut request: InferenceRequest,
+        request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        self.infer_stream_with_context(
+            request,
+            ferrum_interfaces::InferenceRequestContext::capture(),
+        )
+        .await
+    }
+
+    async fn infer_stream_with_context(
+        &self,
+        mut request: InferenceRequest,
+        context: ferrum_interfaces::InferenceRequestContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
+        slo_startup::validate_legacy_entry(&self.inner.config)?;
+        let slo = context.resolve_slo(&self.inner.config.scheduler.slo)?;
         let (tx, rx) = mpsc::channel(100);
         let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_id = request.id.clone();
@@ -3165,8 +3325,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 structured_factory.as_deref(),
             )?;
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
+        seq_state.slo = slo;
         seq_state.stream_sender = Some(tx);
         seq_state.request_slot = Some(request_slot);
+        self.inner.initialize_sequence_cost(&mut seq_state);
         {
             let _iteration = self.inner.iteration_lock.lock().await;
             {
@@ -3195,11 +3357,15 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
                 }
                 return Err(error);
             }
-            self.inner
-                .sequences
-                .write()
+            let mut sequences = self.inner.sequences.write();
+            let sequence = sequences
                 .get_mut(&request_id)
-                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence remains published");
+            self.inner.initialize_sequence_prefill_reference(sequence);
+            self.inner.initialize_sequence_time_admission(sequence);
+            sequence
+                .request_slot
+                .as_mut()
                 .expect("submitted sequence retains its request slot")
                 .admit(&self.inner);
         }
@@ -3305,11 +3471,18 @@ impl InferenceEngine for ContinuousBatchEngine {
             }),
             None => Ok(()),
         };
+        let controller_result = self.inner.drain_slo_execution().await;
+        self.inner.clear_controller_maintenance();
         let readiness_result = self
             .inner
             .execution_readiness_waiters
             .abort_and_join()
             .await;
+        let output_result = self.inner.shutdown_credited_outputs().await;
+        let cost_result = match &self.inner.cost_runtime {
+            Some(runtime) => runtime.shutdown().await,
+            None => Ok(()),
+        };
         // Drop immutable checkpoint pins outside the cohort mutex before native
         // resource shutdown. No pending dependency survives engine shutdown.
         let prefix_cohorts = std::mem::take(&mut *self.inner.prefix_rendezvous.lock());
@@ -3341,14 +3514,19 @@ impl InferenceEngine for ContinuousBatchEngine {
             .await
             .map_err(|error| {
                 FerrumError::internal(format!("scheduler trace close task failed: {error}"))
-            })?
-            .map_err(|error| {
-                FerrumError::internal(format!("scheduler trace close failed: {error}"))
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    FerrumError::internal(format!("scheduler trace close failed: {error}"))
+                })
             })
         };
 
         loop_result?;
+        controller_result?;
         readiness_result?;
+        output_result?;
+        cost_result?;
         trace_result
     }
 

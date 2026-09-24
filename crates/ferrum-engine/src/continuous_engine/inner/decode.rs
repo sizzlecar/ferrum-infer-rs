@@ -72,6 +72,7 @@ impl EngineInner {
     pub(super) fn prepare_plan_runtime_decodes(
         &self,
         request_ids: &[RequestId],
+        cost: &mut Option<EngineCostPreparation>,
     ) -> Vec<PlanRuntimeDecodeInput> {
         let mut inputs = Vec::with_capacity(request_ids.len());
         {
@@ -89,6 +90,9 @@ impl EngineInner {
                     resources.kv_cache,
                 )
                 .with_logits_policy(sequence.model_decode_logits_policy());
+                if let Some(cost) = cost {
+                    cost.capture(sequence);
+                }
                 inputs.push(input);
             }
         }
@@ -102,7 +106,8 @@ impl EngineInner {
         &self,
         request_ids: &[RequestId],
     ) -> Result<PlanRuntimeDecodeBatchOutcome> {
-        let inputs = self.prepare_plan_runtime_decodes(request_ids);
+        let mut preparation = self.prepare_cost_observation();
+        let inputs = self.prepare_plan_runtime_decodes(request_ids, &mut preparation);
         if inputs.is_empty() {
             return Ok(PlanRuntimeDecodeBatchOutcome::Completed { submitted_width: 0 });
         }
@@ -112,30 +117,28 @@ impl EngineInner {
             .map(|input| input.request_id.clone())
             .collect::<Vec<_>>();
         let decode_execution_started_at = self.close_plan_runtime_decode_scheduling(&rids);
-        let (outputs, postprocess_started_at) = match self
-            .model_executor
-            .plan_runtime_batch_decode_with_capacity(&inputs)
-            .await
-        {
-            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
-                let completed_at = decode_execution_started_at.map(|_| Instant::now());
-                if let (Some(started_at), Some(ended_at)) =
-                    (decode_execution_started_at, completed_at)
-                {
-                    self.record_plan_runtime_decode_execution(&rids, started_at, ended_at);
+        let mut cost = preparation.and_then(EngineCostPreparation::begin);
+        let (outputs, postprocess_started_at) =
+            match self.cost_batch_decode(&inputs, &mut cost).await {
+                Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
+                    let completed_at = decode_execution_started_at.map(|_| Instant::now());
+                    if let (Some(started_at), Some(ended_at)) =
+                        (decode_execution_started_at, completed_at)
+                    {
+                        self.record_plan_runtime_decode_execution(&rids, started_at, ended_at);
+                    }
+                    (outputs, completed_at)
                 }
-                (outputs, completed_at)
-            }
-            Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
-                return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
-                    request_ids: rids,
-                    deferral,
-                });
-            }
-            Err(error) => return Err(error),
-        };
+                Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
+                    return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
+                        request_ids: rids,
+                        deferral,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         self.validate_plan_runtime_decode_outputs(&inputs, &outputs)?;
-        self.commit_plan_runtime_decode_outputs(&rids, outputs, postprocess_started_at)
+        self.commit_plan_runtime_decode_outputs(&rids, outputs, postprocess_started_at, &mut cost)
             .await?;
         Ok(PlanRuntimeDecodeBatchOutcome::Completed {
             submitted_width: rids.len(),
@@ -174,38 +177,87 @@ impl EngineInner {
         rids: &[RequestId],
         outputs: Vec<ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput>,
         postprocess_started_at: Option<Instant>,
+        cost: &mut Option<ObservedCostCall>,
     ) -> Result<()> {
-        for (rid, output) in rids.iter().zip(outputs) {
+        self.commit_plan_runtime_decode_outputs_fenced(
+            rids,
+            outputs,
+            postprocess_started_at,
+            cost,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn commit_plan_runtime_decode_outputs_fenced(
+        &self,
+        rids: &[RequestId],
+        outputs: Vec<ferrum_interfaces::model_executor::PlanRuntimeDecodeOutput>,
+        postprocess_started_at: Option<Instant>,
+        cost: &mut Option<ObservedCostCall>,
+        expected: Option<&[slo_controller::ControllerCommitFence<'_>]>,
+    ) -> Result<()> {
+        if expected.is_some_and(|rows| rows.len() != rids.len()) {
+            return Err(FerrumError::internal(
+                "guarded decode receipt row count changed",
+            ));
+        }
+        for (index, (rid, output)) in rids.iter().zip(outputs).enumerate() {
+            if let Some(call) = cost.as_deref_mut() {
+                call.begin_host_row(rid);
+            }
             let next_token_result = {
                 let mut sequences = self.sequences.write();
-                sequences.get_mut(rid).map(|sequence| {
-                    let token = match output.sampling_output {
-                        ExecutorSamplingOutput::GreedyToken(token) => {
-                            sequence.validate_and_commit_model_greedy_argmax_token(
-                                Some(self.tokenizer.as_ref()),
-                                token,
-                            )?;
-                            token
-                        }
-                        ExecutorSamplingOutput::FullLogits(mut logits) => sequence
-                            .sample_and_commit_with_processors_and_tokenizer(
-                                &mut logits,
-                                Some(self.tokenizer.as_ref()),
-                            )?,
-                    };
-                    sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
-                    sequence.record_generated_token_commit_with_decode_postprocess(
-                        postprocess_started_at,
-                    );
-                    Ok::<TokenId, FerrumError>(token)
-                })
+                sequences
+                    .get_mut(rid)
+                    .filter(|sequence| {
+                        expected.is_none_or(|rows| {
+                            let row = &rows[index];
+                            row.matches(sequence)
+                                && matches!(row.input(), ferrum_interfaces::execution_cost::ExpectedWaveInput::Decode { cache_id }
+                                    if sequence.model_cache_id() == Some(cache_id.as_str()))
+                        })
+                    })
+                    .map(|sequence| {
+                        let start = cost
+                            .as_deref()
+                            .map(|call| CostHostCommitStart::capture(sequence, call));
+                        let token = match output.sampling_output {
+                            ExecutorSamplingOutput::GreedyToken(token) => {
+                                sequence.validate_and_commit_model_greedy_argmax_token(
+                                    Some(self.tokenizer.as_ref()),
+                                    token,
+                                )?;
+                                token
+                            }
+                            ExecutorSamplingOutput::FullLogits(mut logits) => sequence
+                                .sample_and_commit_with_processors_and_tokenizer(
+                                    &mut logits,
+                                    Some(self.tokenizer.as_ref()),
+                                )?,
+                        };
+                        sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
+                        sequence.record_generated_token_commit_with_decode_postprocess(
+                            postprocess_started_at,
+                        );
+                        let evidence = start.and_then(|start| {
+                            start.decode(cost.as_deref_mut().expect("observed start"), sequence)
+                        });
+                        Ok::<_, FerrumError>((token, evidence))
+                    })
             };
             let Some(next_token_result) = next_token_result else {
+                if let Some(call) = cost.as_deref_mut() {
+                    call.host_cancelled(rid);
+                }
                 continue;
             };
-            let next_token = match next_token_result {
-                Ok(token) => token,
+            let (next_token, evidence) = match next_token_result {
+                Ok(result) => result,
                 Err(error) => {
+                    if let Some(call) = cost.as_deref_mut() {
+                        call.host_failed(rid);
+                    }
                     warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
                     self.complete_request_with_error(rid, error).await?;
                     continue;
@@ -219,6 +271,9 @@ impl EngineInner {
                 .map(|sequence| sequence.generated_tokens.len())
                 .unwrap_or(0);
             self.scheduler.update_decode_progress(rid, generated_count);
+            if let (Some(call), Some(evidence)) = (cost.as_deref_mut(), evidence.as_ref()) {
+                call.note_host_token_commit(evidence);
+            }
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
@@ -226,8 +281,11 @@ impl EngineInner {
             if self.should_stream_generated_token(rid, next_token, stop_reason) {
                 self.send_stream_update(rid, next_token).await;
             }
+            let pending =
+                self.publish_cost_host_commit(cost, evidence, true, stop_reason.is_some());
             if let Some(reason) = stop_reason {
-                self.complete_request(rid, reason).await?;
+                self.complete_request_with_cost(rid, reason, pending, cost)
+                    .await?;
             }
         }
         Ok(())

@@ -1,6 +1,11 @@
 use super::*;
 use ferrum_interfaces::model_executor::PlanRuntimeMixedBatchOutcome;
 
+#[path = "bounded_legacy_prefill_tests.rs"]
+mod bounded_legacy_prefill_tests;
+#[path = "bounded_wave_tests.rs"]
+mod bounded_wave_tests;
+
 #[derive(Clone, Copy)]
 pub(super) enum MixedBehavior {
     Exact,
@@ -8,6 +13,8 @@ pub(super) enum MixedBehavior {
     SubmittedError,
     WrongDecodeCache,
     ShortPrefill,
+    NarrowPrefill,
+    YieldBeforeCompletion,
 }
 
 impl PlanRuntimeBatchDecodeTestExecutor {
@@ -21,6 +28,10 @@ impl PlanRuntimeBatchDecodeTestExecutor {
         let Some(behavior) = behavior else {
             return Ok(PlanRuntimeMixedBatchOutcome::Unsupported);
         };
+        if matches!(behavior, MixedBehavior::YieldBeforeCompletion) {
+            // Model a completion that is not yet terminal on the first poll.
+            tokio::task::yield_now().await;
+        }
         match behavior {
             MixedBehavior::NotSubmitted => {
                 let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
@@ -51,28 +62,38 @@ impl PlanRuntimeBatchDecodeTestExecutor {
         }
         let mut prefill_outputs = Vec::new();
         for input in prefills {
+            let completed_chunk = if matches!(behavior, MixedBehavior::NarrowPrefill) {
+                PrefillChunk::new(input.chunk.tokens_processed(), 1, input.input_tokens.len())?
+            } else {
+                input.chunk
+            };
             let cache: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
                 input.request_id.clone(),
                 1,
-                input.chunk.end(),
+                completed_chunk.end(),
             ));
-            let output = if input.chunk.is_final() {
+            let output = if completed_chunk.is_final() {
                 let mut logits = vec![0.0; self.info().vocab_size];
                 logits[6] = 1.0;
                 PlanRuntimePrefillOutput::final_logits(
                     input.request_id.clone(),
-                    input.chunk.end(),
+                    completed_chunk.end(),
                     logits,
                     cache,
                 )?
             } else {
                 PlanRuntimePrefillOutput::intermediate(
                     input.request_id.clone(),
-                    input.chunk.end(),
+                    completed_chunk.end(),
                     cache,
                 )
             };
-            prefill_outputs.push(PlanRuntimePrefillCompletion::exact(output, input.chunk));
+            prefill_outputs.push(PlanRuntimePrefillCompletion::new(
+                output,
+                input.chunk,
+                completed_chunk,
+                u32::from(matches!(behavior, MixedBehavior::NarrowPrefill)),
+            )?);
         }
         let mut decode_outputs = decodes
             .iter()
@@ -109,6 +130,29 @@ type MixedFixture = (
     RequestId,
     RequestId,
 );
+
+fn prefill_test_frontier(
+    engine: &ContinuousBatchEngine,
+    id: &RequestId,
+) -> ferrum_scheduler::implementations::continuous::planning_state::PlanningRequestState {
+    use ferrum_scheduler::vnext::{AdmissionWakeEpochs, AdmissionWakeSnapshot};
+    engine
+        .inner
+        .scheduler
+        .planning_state(
+            std::num::NonZeroUsize::new(32).unwrap(),
+            AdmissionWakeSnapshot::new(
+                AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0),
+                &[],
+            ),
+        )
+        .unwrap()
+        .requests()
+        .iter()
+        .find(|row| &row.key.request_id == id)
+        .unwrap()
+        .clone()
+}
 
 async fn mixed_fixture(behavior: Option<MixedBehavior>, final_prefill: bool) -> MixedFixture {
     mixed_fixture_with_execution(
@@ -210,6 +254,11 @@ async fn mixed_batch_commits_both_phases_and_preserves_nonfinal_prefill() {
         assert_eq!(sequences[&decode_id].generated_tokens.len(), 2);
         assert_eq!(executor.mixed_calls.load(Ordering::Relaxed), 1);
         assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 0);
+        let row = prefill_test_frontier(&engine, &prefill_id);
+        assert_eq!(row.committed_output_tokens, usize::from(final_prefill));
+        assert_eq!(row.computed_tokens, if final_prefill { 4 } else { 2 });
+        assert_eq!(row.resident_tokens, row.computed_tokens);
+        assert_eq!(row.scheduled_tokens, row.computed_tokens);
     }
 }
 
