@@ -88,6 +88,19 @@ pub(crate) fn hardware_for_request(
 }
 
 pub(crate) fn apply_engine_plan(resolved: &mut ResolvedFerrumConfig, engine_config: &EngineConfig) {
+    // This diagnostic is supplied only by an actual engine import. Discard
+    // any prior snapshot entry, including when the current policy is Off.
+    resolved
+        .runtime_config
+        .entries
+        .retain(|entry| entry.key != ferrum_types::SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY);
+    if let Some(receipt) = &engine_config.slo_cost_profile_receipt {
+        resolved.runtime_config.upsert(
+            ferrum_types::SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
+            serde_json::to_string(receipt).expect("cost profile receipt contains scalar metadata"),
+            RuntimeConfigSource::ConfigFile,
+        );
+    }
     if let Some(plan) = engine_config.runtime.startup_memory_plan.as_ref() {
         resolved.apply_startup_memory_plan(plan);
         eprintln!(
@@ -107,6 +120,96 @@ pub(crate) fn apply_engine_plan(resolved: &mut ResolvedFerrumConfig, engine_conf
 mod tests {
     use super::*;
     use ferrum_types::{DeviceMemorySnapshot, RuntimeConfigEntry};
+
+    #[test]
+    fn cost_profile_receipt_comes_from_engine_for_both_product_usages() {
+        for usage in [StartupUsage::SingleRequest, StartupUsage::PersistentServing] {
+            let key = ferrum_types::SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY;
+            let original_policy =
+                serde_json::to_string(&ferrum_types::SloConfig::default()).unwrap();
+            let policy_digest = format!("sha256:{}", "01".repeat(32));
+            let mut resolved = resolve_config(
+                RuntimeConfigSnapshot::from_entries([
+                    RuntimeConfigEntry::new(key, "caller supplied claim", RuntimeConfigSource::Cli),
+                    RuntimeConfigEntry::new(
+                        ferrum_types::SLO_CONFIG_RUNTIME_KEY,
+                        &original_policy,
+                        RuntimeConfigSource::ConfigFile,
+                    ),
+                    RuntimeConfigEntry::new(
+                        ferrum_types::SLO_CONFIG_DIGEST_RUNTIME_KEY,
+                        &policy_digest,
+                        RuntimeConfigSource::ConfigFile,
+                    ),
+                ]),
+                model(),
+                hardware(),
+                WorkloadProfile::serving_default(),
+                ExecutionResourceAuthority::PlanRuntime,
+                usage,
+            )
+            .unwrap();
+            let mut engine = EngineConfig::default();
+            apply_engine_plan(&mut resolved, &engine);
+            assert!(resolved
+                .runtime_config
+                .entries
+                .iter()
+                .all(|entry| entry.key != key));
+            let receipt = ferrum_types::SloCostProfileReceipt {
+                selected_whole_wave: None,
+                schema_version: 1,
+                path: "/profile/imported.json".into(),
+                file_sha256: format!("sha256:{}", "ab".repeat(32)),
+                file_bytes: 1024,
+                generated_unix_ns: 900,
+                loaded_unix_ns: 1000,
+                conservative_clock_error_ns: 20,
+                declared_local_clock_max_error_ns: 10,
+                oldest_imported_age_ns: Some(120),
+                newest_imported_age_ns: Some(100),
+                offered_samples: 3,
+                recorded_samples: 2,
+                stale_samples: 1,
+                skipped_samples: Default::default(),
+                model_version: 1,
+                bucket_count: 1,
+                source_generator: "test acquisition".into(),
+                source_generator_revision: "fixture".into(),
+                source_measurement_protocol: "host preparation to commit".into(),
+                source_observation_artifact_sha256: [7; 32],
+            };
+            engine.slo_cost_profile_receipt = Some(receipt.clone());
+            apply_engine_plan(&mut resolved, &engine);
+            let actual = resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual.effective_value).unwrap(),
+                serde_json::to_value(receipt).unwrap()
+            );
+            assert_eq!(actual.source, RuntimeConfigSource::ConfigFile);
+            for (key, value) in [
+                (ferrum_types::SLO_CONFIG_RUNTIME_KEY, original_policy),
+                (ferrum_types::SLO_CONFIG_DIGEST_RUNTIME_KEY, policy_digest),
+            ] {
+                assert_eq!(
+                    resolved
+                        .runtime_config
+                        .entries
+                        .iter()
+                        .find(|entry| entry.key == key)
+                        .unwrap()
+                        .effective_value,
+                    value,
+                    "actual receipt must not replace the original policy or its hash"
+                );
+            }
+        }
+    }
 
     fn hardware() -> HardwareCapabilities {
         HardwareCapabilities {

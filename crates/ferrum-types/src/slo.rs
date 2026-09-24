@@ -16,9 +16,9 @@ use std::{
 mod cost;
 mod reference;
 pub use cost::{
-    SloCostFeatureModel, SloCostModelConfig, SloCostObservationConfig, SloCostProfileExportConfig,
-    SloCostProfileImportConfig, SloCostProfileReceipt, SloCostShapeLimits,
-    SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
+    SloCostFeatureModel, SloCostModelConfig, SloCostObservationConfig, SloCostPredictor,
+    SloCostProfileExportConfig, SloCostProfileImportConfig, SloCostProfileReceipt,
+    SloCostShapeLimits, SloSelectedWholeWaveReceiptV1, SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
 };
 pub use reference::*;
 

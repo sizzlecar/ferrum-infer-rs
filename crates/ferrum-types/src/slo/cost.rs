@@ -10,6 +10,9 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SloCostObservationConfig {
+    /// Selects a predictor protocol; profile schemas 1–5 remain legacy-only.
+    #[serde(skip_serializing_if = "SloCostPredictor::is_legacy")]
+    pub predictor: SloCostPredictor,
     pub max_queued_samples: NonZeroUsize,
     /// Sum of allocated row capacities in the pending sample queue.
     pub max_queued_shape_rows: NonZeroUsize,
@@ -27,6 +30,7 @@ pub struct SloCostObservationConfig {
 impl Default for SloCostObservationConfig {
     fn default() -> Self {
         Self {
+            predictor: SloCostPredictor::default(),
             max_queued_samples: NonZeroUsize::new(256).unwrap(),
             max_queued_shape_rows: NonZeroUsize::new(8192).unwrap(),
             max_samples_per_update: NonZeroUsize::new(256).unwrap(),
@@ -40,9 +44,46 @@ impl Default for SloCostObservationConfig {
     }
 }
 
+/// The new predictor consumes actual selected-algorithm receipts and schema 6.
+/// This is independent of the legacy feature-model enum and its wire protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloCostPredictor {
+    #[default]
+    LegacyFeatureModel,
+    SelectedWholeWaveV1,
+}
+impl SloCostPredictor {
+    fn is_legacy(&self) -> bool {
+        *self == Self::LegacyFeatureModel
+    }
+}
+
 impl SloCostObservationConfig {
+    /// Explicit preset; resource/error limits retain their existing defaults.
+    pub fn selected_whole_wave_v1() -> Self {
+        Self {
+            predictor: SloCostPredictor::SelectedWholeWaveV1,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
+        if self.predictor == SloCostPredictor::SelectedWholeWaveV1 {
+            if self.model.feature_model != SloCostFeatureModel::default()
+                || self.model.context_bucket_tokens.get() != 1
+                || self.model.prefill_offset_bucket_tokens.get() != 1
+            {
+                return Err("selected whole-wave predictor does not reinterpret legacy feature/bucket settings".into());
+            }
+            if self.model.min_samples.get() < 8
+                || self.model.residual_quantile < 0.99
+                || self.model.max_wave_ns.get() > (1u64 << 53)
+            {
+                return Err("selected whole-wave predictor requires min_samples >= 8, residual_quantile >= .99 and bounded numerical costs".into());
+            }
+        }
         self.profile_import.validate()?;
         if let Some(export) = &self.profile_export {
             export.validate()?;
@@ -256,6 +297,8 @@ impl SloCostProfileImportConfig {
 /// recorded samples do not imply coverage of a subsequent execution shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloCostProfileReceipt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_whole_wave: Option<SloSelectedWholeWaveReceiptV1>,
     pub schema_version: u32,
     pub path: PathBuf,
     pub file_sha256: String,
@@ -276,6 +319,20 @@ pub struct SloCostProfileReceipt {
     pub source_generator_revision: String,
     pub source_measurement_protocol: String,
     pub source_observation_artifact_sha256: [u8; 32],
+}
+
+/// Actual schema-6 import provenance. Fit and residual records are disjoint;
+/// these counts alone do not prove query coverage or heldout quality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SloSelectedWholeWaveReceiptV1 {
+    pub capture_identity_sha256: [u8; 32],
+    pub fit_parameters_sha256: [u8; 32],
+    pub model_revision: String,
+    pub protocol_sha256: [u8; 32],
+    pub fit_through_ordinal: u64,
+    pub residual_through_ordinal: u64,
+    pub fit_records: usize,
+    pub residual_records: usize,
 }
 
 pub const SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY: &str = "slo_cost_profile_receipt";
@@ -515,5 +572,38 @@ mod tests {
                 .unwrap(),
             mode
         );
+    }
+}
+
+#[cfg(test)]
+mod selected_predictor_tests {
+    use super::*;
+    #[test]
+    fn selected_predictor_is_explicit_and_does_not_relabel_legacy_settings() {
+        let legacy: SloCostObservationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.predictor, SloCostPredictor::LegacyFeatureModel);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("predictor")
+            .is_none());
+        let selected = SloCostObservationConfig::selected_whole_wave_v1();
+        selected.validate().unwrap();
+        let round: SloCostObservationConfig =
+            serde_json::from_value(serde_json::to_value(&selected).unwrap()).unwrap();
+        assert_eq!(round, selected);
+        for change in 0..4 {
+            let mut invalid = selected.clone();
+            match change {
+                0 => invalid.model.min_samples = NonZeroUsize::new(7).unwrap(),
+                1 => invalid.model.residual_quantile = 0.98,
+                2 => {
+                    invalid.model.feature_model = SloCostFeatureModel::EmpiricalPromptRangeV3 {
+                        host_history_bucket_tokens: NonZeroU32::new(1).unwrap(),
+                    }
+                }
+                _ => invalid.model.context_bucket_tokens = NonZeroU32::new(2).unwrap(),
+            }
+            assert!(invalid.validate().is_err());
+        }
     }
 }
