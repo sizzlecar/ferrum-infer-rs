@@ -1,5 +1,7 @@
 //! Native Metal provider for the standard recurrent gated-delta operation.
 
+mod cost_route;
+
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -12,13 +14,13 @@ use ferrum_interfaces::vnext::{
     DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
     EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
     GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    ProviderCheckpointCapability, ProviderCheckpointContract, ProviderCheckpointStateLayout,
-    ProviderCheckpointStatePort, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    OperationCostRoute, OperationCostRouteRequest, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
+    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -352,6 +354,7 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
             super::linear::ALL_LINEAR_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("gated_delta_attention.rs").as_bytes(),
+                include_str!("gated_delta_attention/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 super::linear::FINGERPRINT_SOURCE.as_bytes(),
                 super::native_blocks::FINGERPRINT_SOURCE.as_bytes(),
@@ -440,6 +443,19 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttentionProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(
+            request,
+            self.operation_id,
+            self.hidden_type,
+            self.execution_capabilities,
+            self.execution_cost_model,
+        )
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -507,18 +523,8 @@ fn reusable_attention_topology(
     digest.update(request.work_shape().immediate_tokens().to_le_bytes());
     for range in ranges {
         let tokens = range.immediate_tokens();
-        shape.validate_launch_extents(tokens)?;
-        let participant_capabilities = if shape.supports_chunked_scan_c64()? {
-            execution_capabilities
-        } else {
-            GatedDeltaExecutionCapabilities::recurrent_only()
-        };
-        let execution_form = participant_capabilities
-            .select(tokens, execution_cost_model.preference(shape, tokens))
-            .map_err(|error| error.to_string())?;
-        if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
-            shape.validate_chunked_launch_extents(tokens)?;
-        }
+        let execution_form =
+            shape.execution_form(tokens, execution_capabilities, execution_cost_model)?;
         digest.update(tokens.to_le_bytes());
         digest.update(range.source_token_range().start.to_le_bytes());
         digest.update((execution_form.as_str().len() as u64).to_le_bytes());
@@ -691,6 +697,27 @@ impl AttentionShape {
                 GatedDeltaValueHeadMapping::InterleavedByKeyHead => 1,
             },
         })
+    }
+
+    fn execution_form(
+        self,
+        tokens: u64,
+        capabilities: GatedDeltaExecutionCapabilities,
+        cost_model: MetalGatedDeltaExecutionCostModel,
+    ) -> Result<GatedDeltaExecutionForm, String> {
+        self.validate_launch_extents(tokens)?;
+        let capabilities = if self.supports_chunked_scan_c64()? {
+            capabilities
+        } else {
+            GatedDeltaExecutionCapabilities::recurrent_only()
+        };
+        let form = capabilities
+            .select(tokens, cost_model.preference(self, tokens))
+            .map_err(|error| error.to_string())?;
+        if matches!(form, GatedDeltaExecutionForm::ChunkedScan(_)) {
+            self.validate_chunked_launch_extents(tokens)?;
+        }
+        Ok(form)
     }
 
     fn validate_launch_extents(self, tokens: u64) -> Result<(), String> {
@@ -1068,18 +1095,8 @@ fn encode_attention(
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
         let tokens = token_range.immediate_tokens();
-        shape.validate_launch_extents(tokens)?;
-        let participant_capabilities = if shape.supports_chunked_scan_c64()? {
-            execution_capabilities
-        } else {
-            GatedDeltaExecutionCapabilities::recurrent_only()
-        };
-        let execution_form = participant_capabilities
-            .select(tokens, execution_cost_model.preference(shape, tokens))
-            .map_err(|error| error.to_string())?;
-        if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
-            shape.validate_chunked_launch_extents(tokens)?;
-        }
+        let execution_form =
+            shape.execution_form(tokens, execution_capabilities, execution_cost_model)?;
         let packed_start = token_range.immediate_token_range().start;
         let input_start = if input_packed {
             packed_start
@@ -1332,74 +1349,58 @@ fn encode_attention(
         }
         None
     };
-    let participant_count = checked_u32(
-        invocation.participants().len() as u64,
-        "Metal gated-delta participant count",
+    let projection_dispatches = |projections: &[LinearLaunch], workspace| {
+        staged_prefill::projection_steps(projections, &regions).try_fold(0_u64, |count, step| {
+            count
+                .checked_add(step.dispatch_count(workspace))
+                .ok_or_else(|| "Metal GDN input dispatch count overflows".to_owned())
+        })
+    };
+    let packed_projection = packed
+        .as_ref()
+        .map(|packed| {
+            Ok::<_, String>(cost_route::ProjectionDispatches {
+                input: projection_dispatches(
+                    &packed.input_projections,
+                    packed.input_projection_workspace,
+                )?,
+                output: packed.output_projection.dispatch_count(),
+            })
+        })
+        .transpose()?;
+    let route = cost_route::command(
+        hidden_type,
+        invocation.work_shape().immediate_tokens(),
+        packed_projection,
+        launches.iter().map(|launch| {
+            Ok(cost_route::RowDispatches {
+                projections: cost_route::ProjectionDispatches {
+                    input: if packed_projection.is_some() {
+                        0
+                    } else {
+                        projection_dispatches(
+                            &launch.input_projections,
+                            launch.input_projection_workspace,
+                        )?
+                    },
+                    output: launch.output_projection.dispatch_count(),
+                },
+                delta: delta_dispatch_count(launch.execution_form, &launch.params),
+                chunked: matches!(
+                    launch.execution_form,
+                    GatedDeltaExecutionForm::ChunkedScan(_)
+                ),
+            })
+        }),
     )?;
-    let token_count = invocation.work_shape().immediate_tokens();
-    let packed_enabled = packed.is_some();
-    let dispatch_count = if let Some(packed) = &packed {
-        let shared_projection_dispatches =
-            staged_prefill::projection_steps(&packed.input_projections, &regions)
-                .map(|step| step.dispatch_count(packed.input_projection_workspace))
-                .sum::<u64>();
-        launches.iter().fold(
-            5_u64 + packed.output_projection.dispatch_count() + shared_projection_dispatches,
-            |total, launch| {
-                total
-                    .saturating_add(3)
-                    .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
-            },
-        )
-    } else {
-        launches.iter().fold(0_u64, |total, launch| {
-            total
-                .saturating_add(8 + launch.output_projection.dispatch_count())
-                .saturating_add(
-                    staged_prefill::projection_steps(&launch.input_projections, &regions)
-                        .map(|step| step.dispatch_count(launch.input_projection_workspace))
-                        .sum::<u64>(),
-                )
-                .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
-        })
-    };
-    let chunked_count = launches
-        .iter()
-        .filter(|launch| {
-            matches!(
-                launch.execution_form,
-                GatedDeltaExecutionForm::ChunkedScan(_)
-            )
-        })
-        .count();
-    let operation_label = match (hidden_type, chunked_count, launches.len()) {
-        (ElementType::F32, count, total) if count == total => {
-            "vnext_gated_delta_chunked_attention_f32_master"
-        }
-        (ElementType::F32, 0, _) => "vnext_gated_delta_recurrent_attention_f32_master",
-        (ElementType::F32, _, _) => "vnext_gated_delta_mixed_attention_f32_master",
-        (_, count, total) if count == total => "vnext_gated_delta_chunked_attention",
-        (_, 0, _) => "vnext_gated_delta_recurrent_attention",
-        _ => "vnext_gated_delta_mixed_attention",
-    };
-    MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(dispatch_count);
-        if let Some(packed) = packed.as_ref() {
-            enqueue_packed_attention(
-                &attention,
-                &linear,
-                &primitives,
-                hidden_type,
-                encoder,
-                regions,
-                shared,
-                layout,
-                packed,
-                &launches,
-            );
-        } else {
-            for launch in &launches {
-                enqueue_attention(
+    let dispatch_count = route.compute_dispatch_count();
+    MetalDeviceCommand::operation(
+        route.native_operation(),
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
+            if let Some(packed) = packed.as_ref() {
+                enqueue_packed_attention(
                     &attention,
                     &linear,
                     &primitives,
@@ -1408,23 +1409,32 @@ fn encode_attention(
                     regions,
                     shared,
                     layout,
-                    launch,
+                    packed,
+                    &launches,
                 );
+            } else {
+                for launch in &launches {
+                    enqueue_attention(
+                        &attention,
+                        &linear,
+                        &primitives,
+                        hidden_type,
+                        encoder,
+                        regions,
+                        shared,
+                        layout,
+                        launch,
+                    );
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .map_err(|error| error.to_string())?
     .with_work_shape(
-        if packed_enabled {
-            DeviceBatchingForm::Packed
-        } else if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::ParticipantLoop
-        },
-        participant_count,
-        token_count,
+        route.batching(),
+        route.participant_count(),
+        route.token_count(),
     )
     .map_err(|error| error.to_string())
 }
@@ -2153,9 +2163,17 @@ fn validate_signature(
     shape: AttentionShape,
     hidden_type: ElementType,
 ) -> Result<(), String> {
-    let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
+    validate_bindings(participant.bindings(), shape, hidden_type)
+}
+
+fn validate_bindings(
+    bindings: &[ResolvedValueBinding],
+    shape: AttentionShape,
+    hidden_type: ElementType,
+) -> Result<(), String> {
+    let value = |ordinal| binding(bindings, ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
     let [tokens, hidden_width] = hidden.tensor().dimensions() else {
         return Err("Metal gated-delta hidden input is not two-dimensional".to_owned());
     };

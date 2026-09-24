@@ -1,5 +1,7 @@
 //! Native Metal provider for the standard fixed-page causal attention operation.
 
+mod cost_route;
+
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,14 +13,14 @@ use ferrum_interfaces::vnext::{
     CheckpointCompletedInputCapture, CheckpointInputDependency, CheckpointPartitionNumerics,
     DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProviderCheckpointCapability,
-    ProviderCheckpointContract, ProviderCheckpointStateLayout, ProviderCheckpointStatePort,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    EncodedDeviceOperation, OperationBufferStorageKind, OperationCostRoute,
+    OperationCostRouteRequest, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProviderCheckpointCapability, ProviderCheckpointContract,
+    ProviderCheckpointStateLayout, ProviderCheckpointStatePort, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
@@ -404,9 +406,9 @@ impl MetalCausalAttentionPipelines {
         })
     }
 
+    #[cfg(test)]
     fn attention_simdgroups_for_context(&self, context_positions: u64) -> u32 {
-        let context_limit = u32::try_from(context_positions).unwrap_or(u32::MAX).max(1);
-        self.maximum_attention_simdgroups.min(context_limit)
+        cost_route::Capabilities::from(self).simdgroups(context_positions)
     }
 
     fn binding_slot_bytes(&self) -> Result<u64, String> {
@@ -425,18 +427,7 @@ impl MetalCausalAttentionPipelines {
     }
 
     fn dispatch_plan(&self, params: &CausalAttentionParams) -> AttentionDispatchPlan {
-        if self.kv_type == ElementType::I8 {
-            int8_attention_dispatch_plan(
-                params,
-                self.maximum_threadgroup_memory_length,
-                self.supports_gqa_tiled_prefill,
-            )
-        } else {
-            attention_dispatch_plan_with_memory_limit(
-                params,
-                self.maximum_threadgroup_memory_length,
-            )
-        }
+        cost_route::Capabilities::from(self).dispatch_plan(params)
     }
 
     /// Reflection is immutable, but setting the destination is not. Only CPU
@@ -613,6 +604,7 @@ impl MetalCausalPagedAttentionProvider {
             super::linear::ALL_LINEAR_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("causal_attention.rs").as_bytes(),
+                include_str!("causal_attention/cost_route.rs").as_bytes(),
                 include_str!("causal_attention/head_dim_specialization.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 INT8_SHADER_SOURCE.as_bytes(),
@@ -735,6 +727,18 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(
+            request,
+            self.operation_id,
+            self.hidden_type,
+            &self.attention,
+        )
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -792,11 +796,11 @@ fn reusable_attention_topology(
     digest.update(request.work_shape().immediate_tokens().to_le_bytes());
     for range in ranges {
         let source = range.source_token_range();
-        if source.end > range.full_input_tokens()
-            || range.full_input_tokens() > shape.maximum_context_tokens
-        {
-            return Err("Metal causal topology exceeds its admitted context".to_owned());
-        }
+        shape.context_end(
+            range.immediate_tokens(),
+            source.start,
+            range.full_input_tokens(),
+        )?;
         digest.update(range.immediate_tokens().to_le_bytes());
         digest.update(source.start.to_le_bytes());
         digest.update(source.end.to_le_bytes());
@@ -824,6 +828,16 @@ struct CausalAttentionShape {
 }
 
 impl CausalAttentionShape {
+    fn context_end(self, tokens: u64, offset: u64, full_input: u64) -> Result<u64, String> {
+        let end = offset
+            .checked_add(tokens)
+            .ok_or("Metal causal context extent overflows")?;
+        if tokens == 0 || end > full_input || full_input > self.maximum_context_tokens {
+            return Err("Metal causal token range exceeds its admitted context".into());
+        }
+        Ok(end)
+    }
+
     fn from_attributes(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
         let shape = Self {
             hidden_size: unsigned_attribute(attributes, "hidden_size")?,
@@ -1382,13 +1396,7 @@ fn encode_attention(
         let tokens = token_range.immediate_tokens();
         let source = token_range.source_token_range();
         let packed_start = token_range.immediate_token_range().start;
-        if source.end > token_range.full_input_tokens()
-            || token_range.full_input_tokens() > shape.maximum_context_tokens
-        {
-            return Err(
-                "Metal causal-attention token range exceeds its admitted context".to_owned(),
-            );
-        }
+        shape.context_end(tokens, source.start, token_range.full_input_tokens())?;
         let input = regions.len();
         regions.push(super::contiguous_token_region(
             participant,
@@ -1448,8 +1456,16 @@ fn encode_attention(
         } else {
             0
         };
-        let page_count_u64 = u64::try_from(page_count)
-            .map_err(|_| "Metal causal-attention page count exceeds u64".to_owned())?;
+        let params = cost_route::row_params(
+            shape,
+            tokens,
+            source.start,
+            token_range.full_input_tokens(),
+            cost_route::Capabilities::from(attention.as_ref()),
+        )?;
+        if params.page_count as usize != page_count {
+            return Err("Metal causal page count differs from its numerical projection".into());
+        }
         let binding_offset = binding_layout.offset(participant_index)?;
         page_bindings.push(PageBinding {
             first_page_region: binding_first_page,
@@ -1493,23 +1509,7 @@ fn encode_attention(
                 })?,
                 "Metal causal-attention residual elements",
             )?,
-            params: {
-                let mut params = shape.params(
-                    tokens,
-                    source.start,
-                    page_count_u64,
-                    attention.attention_simdgroups_for_context(
-                        source.start.checked_add(tokens).ok_or_else(|| {
-                            "Metal causal-attention context extent overflowed".to_owned()
-                        })?,
-                    ),
-                )?;
-                params.page_elements = checked_u32(
-                    VNEXT_KV_PAGE_BYTES / kv_type.size_bytes(),
-                    "Metal causal KV page elements",
-                )?;
-                params
-            },
+            params,
             query_projection: linear_launch(
                 query_weight,
                 shared.scratch,
@@ -1681,23 +1681,6 @@ fn encode_attention(
         None
     };
 
-    let binding_pipelines = Arc::clone(&attention);
-    let binding_command = MetalDeviceCommand::operation(
-        "vnext_causal_paged_attention_bindings",
-        binding_regions,
-        move |_encoder, regions| {
-            binding_pipelines.with_binding_encoder(|argument_encoder| {
-                encode_page_bindings(argument_encoder, binding_layout, &page_bindings, regions)
-            })
-        },
-    )
-    .map_err(|error| error.to_string())?;
-
-    let participant_count = checked_u32(
-        invocation.participants().len() as u64,
-        "Metal causal-attention participant count",
-    )?;
-    let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
     let batched_grouped = packed_enabled
         && can_batch_grouped_decode(
@@ -1720,50 +1703,53 @@ fn encode_attention(
     // The base count includes one dispatch per projection. Bound linear plans
     // can add a Hadamard transform and a split-prefill projection tail.
     let extra_projection_dispatches = if let Some(packed) = &packed {
-        [
+        cost_route::projection_extra([
             packed.query_projection,
             packed.key_projection,
             packed.value_projection,
             packed.output_projection,
-        ]
-        .iter()
-        .map(|projection| projection.dispatch_count() - 1)
-        .sum::<u64>()
+        ])?
     } else {
-        launches
-            .iter()
-            .map(|launch| {
-                [
-                    launch.query_projection,
-                    launch.key_projection,
-                    launch.value_projection,
-                    launch.output_projection,
-                ]
-                .iter()
-                .map(|projection| projection.dispatch_count() - 1)
-                .sum::<u64>()
+        launches.iter().try_fold(0_u64, |count, launch| {
+            let extra = cost_route::projection_extra([
+                launch.query_projection,
+                launch.key_projection,
+                launch.value_projection,
+                launch.output_projection,
+            ])?;
+            count
+                .checked_add(extra)
+                .ok_or_else(|| "Metal causal projection dispatch count overflows".to_owned())
+        })?
+    };
+    let [binding_route, compute_route] = cost_route::commands(
+        hidden_type,
+        kv_type,
+        launches.len(),
+        invocation.work_shape().immediate_tokens(),
+        packed_enabled,
+        grouped_decode_reductions,
+        batched_grouped,
+        extra_projection_dispatches,
+    )?;
+    let dispatch_count = compute_route.compute_dispatch_count();
+    let binding_pipelines = Arc::clone(&attention);
+    let binding_command = MetalDeviceCommand::operation(
+        binding_route.native_operation(),
+        binding_regions,
+        move |_encoder, regions| {
+            binding_pipelines.with_binding_encoder(|argument_encoder| {
+                encode_page_bindings(argument_encoder, binding_layout, &page_bindings, regions)
             })
-            .sum()
-    };
-    let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
-        .saturating_add(grouped_decode_reductions)
-        .saturating_sub(if batched_grouped {
-            2 * launches.len() as u64 - 2 * launches.len().div_ceil(GROUPED_BATCH_ROWS) as u64
-        } else {
-            0
-        })
-        .saturating_add(extra_projection_dispatches);
-    let operation_label = if kv_type == ElementType::I8 {
-        if hidden_type == ElementType::F32 {
-            "vnext_causal_paged_attention_f32_master_int8_kv"
-        } else {
-            "vnext_causal_paged_attention_int8_kv"
-        }
-    } else if hidden_type == ElementType::F32 {
-        "vnext_causal_paged_attention_f32_master"
-    } else {
-        "vnext_causal_paged_attention"
-    };
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        binding_route.batching(),
+        binding_route.participant_count(),
+        binding_route.token_count(),
+    )
+    .map_err(|error| error.to_string())?;
     let completion_offsets = if kv_type == ElementType::I8 {
         let flag_offset = attention.error_flag_offset()?;
         launches
@@ -1779,8 +1765,10 @@ fn encode_attention(
         Vec::new()
     };
     let reset_offsets = completion_offsets.clone();
-    let mut compute_command =
-        MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
+    let mut compute_command = MetalDeviceCommand::operation(
+        compute_route.native_operation(),
+        regions,
+        move |encoder, regions| {
             // Binding slots are non-overlapping for the complete submission and
             // retained through its fence. Reset on the device on every invocation,
             // including a reused execution topology, before any quantization writes.
@@ -1825,20 +1813,15 @@ fn encode_attention(
                 }
             }
             Ok(())
-        })
-        .map_err(|error| error.to_string())?
-        .with_work_shape(
-            if packed_enabled {
-                DeviceBatchingForm::Packed
-            } else if participant_count == 1 {
-                DeviceBatchingForm::Scalar
-            } else {
-                DeviceBatchingForm::ParticipantLoop
-            },
-            participant_count,
-            token_count,
-        )
-        .map_err(|error| error.to_string())?;
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        compute_route.batching(),
+        compute_route.participant_count(),
+        compute_route.token_count(),
+    )
+    .map_err(|error| error.to_string())?;
     for offset in completion_offsets {
         compute_command = compute_command
             .with_completed_u32_zero_check(
@@ -2213,29 +2196,17 @@ fn compute_subwork<'a>(
 
 fn can_batch_grouped_decode<'a>(
     pipelines: &MetalCausalAttentionPipelines,
-    mut participants: impl ExactSizeIterator<
-        Item = (&'a CausalAttentionParams, &'a [MetalBufferRegion], usize),
-    >,
+    participants: impl ExactSizeIterator<Item = (&'a CausalAttentionParams, &'a [MetalBufferRegion], usize)>
+        + Clone,
 ) -> bool {
-    if participants.len() < 2 {
-        return false;
-    }
-    let first = participants.next().expect("nonempty participants");
-    if !pipelines
-        .specialization(first.0)
-        .is_some_and(|p| p.grouped.is_some() && p.batched_grouped.is_some())
+    if !cost_route::Capabilities::from(pipelines)
+        .may_batch_grouped(participants.clone().map(|(params, _, _)| params))
     {
         return false;
     }
     let mut pages = Vec::new();
-    for (params, participant_pages, scale_page_count) in std::iter::once(first).chain(participants)
-    {
-        if scale_page_count != 0
-            || pipelines.dispatch_plan(params).kind != AttentionDispatchKind::GroupedDecode
-            || params.head_dim != first.0.head_dim
-            || params.query_heads != first.0.query_heads
-            || params.key_value_heads != first.0.key_value_heads
-        {
+    for (_, participant_pages, scale_page_count) in participants {
+        if scale_page_count != 0 {
             return false;
         }
         pages.extend(participant_pages);
@@ -2863,9 +2834,18 @@ fn validate_signature(
     hidden_type: ElementType,
     kv_type: ElementType,
 ) -> Result<(), String> {
-    let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
+    validate_bindings(participant.bindings(), shape, hidden_type, kv_type)
+}
+
+fn validate_bindings(
+    bindings: &[ResolvedValueBinding],
+    shape: CausalAttentionShape,
+    hidden_type: ElementType,
+    kv_type: ElementType,
+) -> Result<(), String> {
+    let value = |ordinal| binding(bindings, ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
     let [tokens, hidden_width] = hidden.tensor().dimensions() else {
         return Err("Metal causal-attention hidden input is not two-dimensional".to_owned());
     };

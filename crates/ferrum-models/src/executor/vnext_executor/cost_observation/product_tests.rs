@@ -8,6 +8,7 @@ use ferrum_kernels::backend::metal::{
 use ferrum_types::ModelId;
 use std::num::NonZeroU64;
 mod fixture;
+mod parity;
 mod resolver;
 mod weights;
 use fixture::{assert_prefill_same, prompt, Fixture};

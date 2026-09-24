@@ -8,8 +8,8 @@ use ferrum_interfaces::vnext::{
     residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, token_embedding_f32_master_contract,
     BatchedOperationInvocation, CheckpointBoundaryConstraint, CheckpointCompletedInputCapture,
-    CheckpointInputDependency, CheckpointPartitionNumerics, DeviceBatchingForm,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    CheckpointInputDependency, CheckpointPartitionNumerics, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationCostRoute, OperationCostRouteRequest, OperationFailure,
     OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
     ProviderCheckpointCapability, ProviderCheckpointContract, ProviderWorkspaceRequirement,
@@ -47,6 +47,9 @@ use super::{
     GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP,
     VALUE_ALIGNMENT_BYTES,
 };
+
+mod cost_route;
+use cost_route::PrimitiveRoute;
 
 const SHADER_SOURCE: &str = include_str!("primitives.metal");
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.metal.token_embedding.f16";
@@ -211,6 +214,7 @@ impl MetalTokenEmbeddingProvider {
             TOKEN_EMBEDDING_QUANTIZATION_FORMATS,
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 hadamard::FINGERPRINT_SOURCE.as_bytes(),
                 TOKEN_EMBEDDING_PROVIDER_ID.as_bytes(),
@@ -245,6 +249,13 @@ impl OperationResourceEstimator for MetalTokenEmbeddingProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalTokenEmbeddingProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(request, &self.pipelines)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -287,6 +298,7 @@ impl MetalRmsNormProvider {
             &[],
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RMS_NORM_PROVIDER_ID.as_bytes(),
             ]),
@@ -312,6 +324,13 @@ impl OperationResourceEstimator for MetalRmsNormProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalRmsNormProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(request, &self.pipelines)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -354,6 +373,7 @@ impl MetalResidualAddProvider {
             &[],
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 RESIDUAL_ADD_PROVIDER_ID.as_bytes(),
             ]),
@@ -379,6 +399,13 @@ impl OperationResourceEstimator for MetalResidualAddProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalResidualAddProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(request, &self.pipelines)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -421,6 +448,7 @@ impl MetalLastTokenMaskedArgmaxProvider {
             &[],
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID.as_bytes(),
             ]),
@@ -451,6 +479,13 @@ impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxProvider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(request, &self.pipelines)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -510,6 +545,7 @@ macro_rules! no_workspace_primitive_provider {
                     $quantization_formats,
                     implementation_fingerprint(&[
                         include_str!("primitives.rs").as_bytes(),
+                        include_str!("primitives/cost_route.rs").as_bytes(),
                         SHADER_SOURCE.as_bytes(),
                         hadamard::FINGERPRINT_SOURCE.as_bytes(),
                         $provider_id.as_bytes(),
@@ -541,6 +577,13 @@ macro_rules! no_workspace_primitive_provider {
         }
 
         impl OperationProvider<MetalDeviceRuntime> for $provider {
+            fn eager_cost_route(
+                &self,
+                request: OperationCostRouteRequest<'_>,
+            ) -> Result<Option<OperationCostRoute>, VNextError> {
+                cost_route::eager_route(request, &self.pipelines)
+            }
+
             fn reusable_execution_topology(
                 &self,
                 _request: ReusableExecutionTopologyRequest<'_>,
@@ -670,6 +713,7 @@ impl MetalLastTokenMaskedArgmaxF32Provider {
             &[],
             implementation_fingerprint(&[
                 include_str!("primitives.rs").as_bytes(),
+                include_str!("primitives/cost_route.rs").as_bytes(),
                 SHADER_SOURCE.as_bytes(),
                 LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID.as_bytes(),
             ]),
@@ -711,6 +755,13 @@ impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxF32Provider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxF32Provider {
+    fn eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        cost_route::eager_route(request, &self.pipelines)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -834,15 +885,11 @@ fn encode_token_embedding_typed(
                 ElementType::F32,
                 output_type,
             )?;
-            let bytes_per_row = hidden_size
-                .checked_mul(4)
-                .and_then(|bytes| bytes.checked_add(15))
-                .map(|bytes| bytes & !15)
-                .ok_or_else(|| "Metal embedding inverse workspace row size overflows".to_owned())?;
-            scratch_bytes = bytes_per_row
-                .checked_mul(token_range.immediate_tokens())
-                .and_then(|bytes| scratch_bytes.checked_add(bytes))
-                .ok_or_else(|| "Metal embedding inverse workspace size overflows".to_owned())?;
+            scratch_bytes = cost_route::embedding_scratch_bytes(
+                scratch_bytes,
+                token_range.immediate_tokens(),
+                hidden_size,
+            )?;
         }
         regions.append(&mut table_regions);
         let tokens_region = regions.len();
@@ -872,14 +919,11 @@ fn encode_token_embedding_typed(
             transform,
             scratch_offset_bytes,
             format,
-            params: EmbeddingParams {
-                token_count: checked_u32(
-                    token_range.immediate_tokens(),
-                    "Metal embedding token count",
-                )?,
-                hidden_size: checked_u32(hidden_size, "Metal embedding hidden size")?,
-                vocabulary_size: checked_u32(vocabulary_size, "Metal embedding vocabulary size")?,
-            },
+            params: cost_route::embedding_params(
+                token_range.immediate_tokens(),
+                hidden_size,
+                vocabulary_size,
+            )?,
         });
     }
     let participant_count = checked_u32(
@@ -894,67 +938,73 @@ fn encode_token_embedding_typed(
         regions.push(shared_scratch_region(&invocation, scratch_bytes)?);
         Some(index)
     };
-    let dispatch_count = launches
+    let transformed_participants = launches
         .iter()
-        .map(|launch| 1 + u64::from(launch.transform.is_some()))
-        .sum();
-    MetalDeviceCommand::operation("vnext_token_embedding", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(dispatch_count);
-        let compute = encoder.compute_encoder();
-        for launch in &launches {
-            let output = &regions[launch.output_region];
-            if let Some(transform) = launch.transform {
-                let scratch =
-                    &regions[scratch_region.expect("validated embedding inverse workspace")];
-                dispatch_embedding_at(
-                    &pipelines,
-                    compute,
-                    launch.format,
-                    &regions[launch.table_region],
-                    &regions[launch.tokens_region],
-                    scratch,
-                    launch.scratch_offset_bytes,
-                    launch.params,
-                    ElementType::F32,
-                );
-                pipelines.hadamard.dispatch(
-                    compute,
-                    transform,
-                    scratch,
-                    launch.scratch_offset_bytes,
-                    ElementType::F32,
-                    output,
-                    0,
-                    output_type,
-                    regions,
-                    launch.params.token_count,
-                    launch.params.hidden_size,
-                );
-            } else {
-                dispatch_embedding(
-                    &pipelines,
-                    compute,
-                    launch.format,
-                    &regions[launch.table_region],
-                    &regions[launch.tokens_region],
-                    output,
-                    launch.params,
-                    output_type,
-                );
-            }
-        }
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::ParticipantLoop
+        .filter(|launch| launch.transform.is_some())
+        .count() as u32;
+    let route = cost_route::compute_command(
+        PrimitiveRoute::TokenEmbedding {
+            transformed_participants,
         },
         participant_count,
         token_count,
     )
+    .map_err(|error| error.to_string())?;
+    let dispatch_count = route.compute_dispatch_count();
+    let batching = route.batching();
+    MetalDeviceCommand::operation(
+        route.native_operation(),
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
+            let compute = encoder.compute_encoder();
+            for launch in &launches {
+                let output = &regions[launch.output_region];
+                if let Some(transform) = launch.transform {
+                    let scratch =
+                        &regions[scratch_region.expect("validated embedding inverse workspace")];
+                    dispatch_embedding_at(
+                        &pipelines,
+                        compute,
+                        launch.format,
+                        &regions[launch.table_region],
+                        &regions[launch.tokens_region],
+                        scratch,
+                        launch.scratch_offset_bytes,
+                        launch.params,
+                        ElementType::F32,
+                    );
+                    pipelines.hadamard.dispatch(
+                        compute,
+                        transform,
+                        scratch,
+                        launch.scratch_offset_bytes,
+                        ElementType::F32,
+                        output,
+                        0,
+                        output_type,
+                        regions,
+                        launch.params.token_count,
+                        launch.params.hidden_size,
+                    );
+                } else {
+                    dispatch_embedding(
+                        &pipelines,
+                        compute,
+                        launch.format,
+                        &regions[launch.table_region],
+                        &regions[launch.tokens_region],
+                        output,
+                        launch.params,
+                        output_type,
+                    );
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(batching, participant_count, token_count)
     .map_err(|error| error.to_string())
 }
 
@@ -1167,39 +1217,35 @@ fn encode_rms_norm_typed(
             tokens,
         )?,
     ];
-    let params = RmsNormParams {
-        rows: checked_u32(tokens, "Metal RMSNorm row count")?,
-        hidden_size: checked_u32(hidden_size, "Metal RMSNorm hidden size")?,
-        epsilon,
-    };
+    let params = cost_route::rms_norm_params(tokens, hidden_size, epsilon)?;
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal RMSNorm participant count",
     )?;
-    MetalDeviceCommand::operation("vnext_rms_norm", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(1);
-        dispatch_rms_norm_typed(
-            &pipelines,
-            encoder.compute_encoder(),
-            &regions[0],
-            &regions[1],
-            &regions[2],
-            params,
-            input_type,
-            output_type,
-        );
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::Packed
+    let route = cost_route::compute_command(PrimitiveRoute::RmsNorm, participant_count, tokens)
+        .map_err(|error| error.to_string())?;
+    let batching = route.batching();
+    let dispatches = route.compute_dispatch_count();
+    MetalDeviceCommand::operation(
+        route.native_operation(),
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatches);
+            dispatch_rms_norm_typed(
+                &pipelines,
+                encoder.compute_encoder(),
+                &regions[0],
+                &regions[1],
+                &regions[2],
+                params,
+                input_type,
+                output_type,
+            );
+            Ok(())
         },
-        participant_count,
-        tokens,
     )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
 
@@ -1288,9 +1334,7 @@ fn encode_residual_add_typed(
         }
     }
     let tokens = invocation.work_shape().immediate_tokens();
-    let elements = tokens
-        .checked_mul(hidden_size)
-        .ok_or_else(|| "Metal residual-add element count overflows".to_owned())?;
+    let params = cost_route::residual_add_params(tokens, hidden_size)?;
     let regions = vec![
         shared_token_region(&invocation, ResolvedValueRole::Input, 0, left_type, tokens)?,
         shared_token_region(&invocation, ResolvedValueRole::Input, 1, right_type, tokens)?,
@@ -1302,38 +1346,35 @@ fn encode_residual_add_typed(
             tokens,
         )?,
     ];
-    let params = ResidualAddParams {
-        elements: checked_u32(elements, "Metal residual-add element count")?,
-    };
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal residual-add participant count",
     )?;
-    MetalDeviceCommand::operation("vnext_residual_add", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(1);
-        dispatch_residual_add_typed(
-            &pipelines,
-            encoder.compute_encoder(),
-            &regions[0],
-            &regions[1],
-            &regions[2],
-            params,
-            left_type,
-            right_type,
-            output_type,
-        );
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::Packed
+    let route = cost_route::compute_command(PrimitiveRoute::ResidualAdd, participant_count, tokens)
+        .map_err(|error| error.to_string())?;
+    let batching = route.batching();
+    let dispatches = route.compute_dispatch_count();
+    MetalDeviceCommand::operation(
+        route.native_operation(),
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatches);
+            dispatch_residual_add_typed(
+                &pipelines,
+                encoder.compute_encoder(),
+                &regions[0],
+                &regions[1],
+                &regions[2],
+                params,
+                left_type,
+                right_type,
+                output_type,
+            );
+            Ok(())
         },
-        participant_count,
-        tokens,
     )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(batching, participant_count, tokens)
     .map_err(|error| error.to_string())
 }
 
@@ -1462,13 +1503,7 @@ fn encode_last_token_masked_argmax_typed(
             scratch_offset_bytes: scratch_stride
                 .checked_mul(participant_index as u64)
                 .ok_or_else(|| "Metal masked argmax scratch offset overflows".to_owned())?,
-            params: LastTokenMaskedArgmaxParams {
-                vocabulary_size: checked_u32(
-                    vocabulary_size,
-                    "Metal masked argmax vocabulary size",
-                )?,
-                repetition_capacity,
-            },
+            params: cost_route::masked_argmax_params(vocabulary_size, repetition_capacity)?,
         });
     }
     let scratch_region = regions.len();
@@ -1477,10 +1512,18 @@ fn encode_last_token_masked_argmax_typed(
         invocation.participants().len() as u64,
         "Metal masked argmax participant count",
     )?;
-    let dispatch_count =
-        launches.len() as u64 * masked_argmax_dispatch_count(launches[0].params.vocabulary_size);
+    let route = cost_route::compute_command(
+        PrimitiveRoute::MaskedArgmax {
+            vocabulary_size: launches[0].params.vocabulary_size,
+        },
+        participant_count,
+        invocation.work_shape().immediate_tokens(),
+    )
+    .map_err(|error| error.to_string())?;
+    let dispatch_count = route.compute_dispatch_count();
+    let batching = route.batching();
     MetalDeviceCommand::operation(
-        "vnext_last_token_masked_argmax",
+        route.native_operation(),
         regions,
         move |encoder, regions| {
             encoder.record_compute_dispatches(dispatch_count);
@@ -1504,15 +1547,7 @@ fn encode_last_token_masked_argmax_typed(
         },
     )
     .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::ParticipantLoop
-        },
-        participant_count,
-        u64::from(participant_count),
-    )
+    .with_work_shape(batching, participant_count, u64::from(participant_count))
     .map_err(|error| error.to_string())
 }
 

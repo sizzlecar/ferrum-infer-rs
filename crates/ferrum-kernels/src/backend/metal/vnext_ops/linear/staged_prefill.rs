@@ -572,7 +572,16 @@ impl Workspace {
 }
 
 pub(in super::super) fn dispatch_count(launch: LinearLaunch, workspace: Option<Workspace>) -> u64 {
-    if workspace.is_some_and(|workspace| selected_for(launch, workspace.policy)) {
+    policy_dispatch_count(launch, workspace.map(|workspace| workspace.policy))
+}
+
+/// The workspace owner proves capacity and disjointness separately. Both
+/// prediction and encoding select this same pure staging branch.
+pub(in super::super) fn policy_dispatch_count(
+    launch: LinearLaunch,
+    policy: Option<StagingPolicy>,
+) -> u64 {
+    if policy.is_some_and(|policy| selected_for(launch, policy)) {
         // Staging bypasses the plain projection plan: one dequantization and
         // one GEMM cover the entire matrix, including any partial token tile.
         2

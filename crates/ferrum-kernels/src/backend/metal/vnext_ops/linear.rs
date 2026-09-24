@@ -1,4 +1,6 @@
 //! Native Metal linear providers over typed physical weight layouts.
+mod cost_route;
+mod head_cost_route;
 
 use std::ffi::c_void;
 use std::ops::Range;
@@ -54,6 +56,9 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/small_batch.rs"),
     include_str!("linear/small_batch.metal"),
     include_str!("linear/plain_prefill.rs"),
+    include_str!("linear/cost_route.rs"),
+    include_str!("linear/head_cost_route.rs"),
+    include_str!("weights.rs"),
     include_str!("linear/staged_prefill.rs"),
     include_str!("linear/transformed_prefill.rs"),
     include_str!("hadamard.rs"),
@@ -609,6 +614,13 @@ impl OperationResourceEstimator for MetalDenseLinearProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseLinearProvider {
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::dense_route(request)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -728,6 +740,13 @@ impl OperationResourceEstimator for MetalDenseSwiGluProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalDenseSwiGluProvider {
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::swiglu_route(request)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -898,6 +917,13 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
 }
 
 impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider {
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        head_cost_route::route(request, self.operation_id, self.activation_type)
+    }
+
     fn reusable_execution_topology(
         &self,
         _request: ReusableExecutionTopologyRequest<'_>,
@@ -1043,6 +1069,19 @@ pub(super) struct LinearLaunch {
 }
 
 impl LinearLaunch {
+    pub(super) fn activation_bytes(self) -> Result<(u64, u64), String> {
+        let bytes = |width, name| {
+            u64::from(self.params.rows)
+                .checked_mul(u64::from(width))
+                .and_then(|elements| elements.checked_mul(self.activation_type.size_bytes()))
+                .ok_or_else(|| format!("Metal linear {name} byte size overflows"))
+        };
+        Ok((
+            bytes(self.params.in_features, "input")?,
+            bytes(self.params.output_stride, "output")?,
+        ))
+    }
+
     pub(super) fn dispatch_count(self) -> u64 {
         if self.transform.is_some() {
             self.transformed_plan.projection_dispatch_count() + 1
@@ -1242,27 +1281,22 @@ fn encode_dense_linear(
         "Metal dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let single_launch = launches.len() == 1;
-    let dispatch_count = launches.iter().map(|launch| launch.dispatch_count()).sum();
-    MetalDeviceCommand::operation("vnext_dense_linear", regions, move |encoder, regions| {
-        encoder.record_compute_dispatches(dispatch_count);
-        for launch in &launches {
-            dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
-        }
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else if single_launch {
-            DeviceBatchingForm::Packed
-        } else {
-            DeviceBatchingForm::ParticipantLoop
+    let route = cost_route::dense_command(participant_count, token_count, &launches)
+        .map_err(|error| error.to_string())?;
+    let dispatch_count = route.compute_dispatch_count();
+    MetalDeviceCommand::operation(
+        route.native_operation(),
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(dispatch_count);
+            for launch in &launches {
+                dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
+            }
+            Ok(())
         },
-        participant_count,
-        token_count,
     )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(route.batching(), participant_count, token_count)
     .map_err(|error| error.to_string())
 }
 
@@ -1337,10 +1371,7 @@ fn encode_last_token_dense_linear(
             .map(|token_range| token_range.immediate_token_range()),
     );
 
-    if participant_count > 1
-        && scratch_layout.input_row_bytes % METAL_BLIT_ALIGNMENT_BYTES == 0
-        && scratch_layout.output_row_bytes % METAL_BLIT_ALIGNMENT_BYTES == 0
-    {
+    if head_cost_route::packed_eligible(participant_count, scratch_layout) {
         let packed_inputs = if shared_packed_input {
             Vec::new()
         } else {
@@ -1919,16 +1950,7 @@ pub(super) fn validate_launch_regions_with_raw_workspace(
         let output = regions
             .get(launch.output_region)
             .ok_or_else(|| "Metal linear output region index is invalid".to_owned())?;
-        let input_bytes = u64::from(launch.params.rows)
-            .checked_mul(u64::from(launch.params.in_features))
-            .and_then(|elements| elements.checked_mul(launch.activation_type.size_bytes()))
-            .ok_or_else(|| "Metal linear input byte size overflows".to_owned())?;
-        let output_elements = u64::from(launch.params.rows)
-            .checked_mul(u64::from(launch.params.output_stride))
-            .ok_or_else(|| "Metal linear output byte size overflows".to_owned())?;
-        let output_bytes = output_elements
-            .checked_mul(launch.activation_type.size_bytes())
-            .ok_or_else(|| "Metal linear output byte size overflows".to_owned())?;
+        let (input_bytes, output_bytes) = launch.activation_bytes()?;
         validate_region_span(
             input,
             launch.input_offset_bytes,
@@ -2367,7 +2389,24 @@ fn prepare_partitioned_matrix_weight(
         return Err("Metal partitioned linear logical weight differs from its contract".to_owned());
     }
     let (regions, components, layout) = weight.into_command_parts();
-    let mut parts = match &layout {
+    let parts = prepare_matrix_partition(
+        &layout,
+        out_features,
+        in_features,
+        |layout, width, offset| {
+            prepare_leaf_part(&regions, &components, layout, width, in_features, 1, offset)
+        },
+    )?;
+    Ok(PreparedLinearWeight { regions, parts })
+}
+
+pub(super) fn prepare_matrix_partition(
+    layout: &MetalResolvedWeightLayout,
+    out_features: u64,
+    in_features: u64,
+    mut prepare: impl FnMut(&MetalResolvedWeightLayout, u64, u64) -> Result<PreparedLinearPart, String>,
+) -> Result<Vec<PreparedLinearPart>, String> {
+    let mut parts = match layout {
         MetalResolvedWeightLayout::Composite { parts } => {
             let mut prepared = Vec::with_capacity(parts.len());
             for part in parts {
@@ -2380,27 +2419,15 @@ fn prepare_partitioned_matrix_weight(
                         "Metal partitioned linear composite has invalid row placement".to_owned(),
                     );
                 }
-                prepared.push(prepare_leaf_part(
-                    &regions,
-                    &components,
+                prepared.push(prepare(
                     &part.layout,
                     part.extents[0],
-                    in_features,
-                    1,
                     part.logical_offsets[0],
                 )?);
             }
             prepared
         }
-        _ => vec![prepare_leaf_part(
-            &regions,
-            &components,
-            &layout,
-            out_features,
-            in_features,
-            1,
-            0,
-        )?],
+        _ => vec![prepare(layout, out_features, 0)?],
     };
     parts.sort_by_key(|part| part.output_offset);
     let mut next_output = 0_u64;
@@ -2419,7 +2446,7 @@ fn prepare_partitioned_matrix_weight(
             "Metal partitioned linear composite does not cover its output width".to_owned(),
         );
     }
-    Ok(PreparedLinearWeight { regions, parts })
+    Ok(parts)
 }
 
 pub(super) fn append_shared_gate_up_weight(
@@ -2498,6 +2525,30 @@ fn prepare_gate_up_composite(
     intermediate_size: u64,
     hidden_size: u64,
 ) -> Result<Vec<PreparedLinearPart>, String> {
+    prepare_gate_up_partition(
+        parts,
+        intermediate_size,
+        hidden_size,
+        |layout, output_offset| {
+            prepare_leaf_part(
+                regions,
+                components,
+                layout,
+                intermediate_size,
+                hidden_size,
+                2,
+                output_offset,
+            )
+        },
+    )
+}
+
+fn prepare_gate_up_partition(
+    parts: &[MetalResolvedCompositePart],
+    intermediate_size: u64,
+    hidden_size: u64,
+    mut prepare: impl FnMut(&MetalResolvedWeightLayout, u64) -> Result<PreparedLinearPart, String>,
+) -> Result<Vec<PreparedLinearPart>, String> {
     if parts.len() != 2 {
         return Err("Metal dense SwiGLU gate/up composite must have two parts".to_owned());
     }
@@ -2513,15 +2564,7 @@ fn prepare_gate_up_composite(
         let output_offset = part.logical_offsets[0]
             .checked_mul(intermediate_size)
             .ok_or_else(|| "Metal dense SwiGLU partition offset overflows".to_owned())?;
-        prepared.push(prepare_leaf_part(
-            regions,
-            components,
-            &part.layout,
-            intermediate_size,
-            hidden_size,
-            2,
-            output_offset,
-        )?);
+        prepared.push(prepare(&part.layout, output_offset)?);
     }
     prepared.sort_by_key(|part| part.output_offset);
     let expected_second = checked_u32(
@@ -2554,6 +2597,31 @@ fn prepare_leaf_part(
         }
         layout => (layout, None),
     };
+    let mut part = prepare_leaf_encoding(
+        components,
+        layout,
+        out_features,
+        in_features,
+        expected_block_axis,
+        output_offset,
+    )?;
+    if part.region >= regions.len() {
+        return Err("Metal linear physical component is absent".to_owned());
+    }
+    part.transform = transform;
+    Ok(part)
+}
+
+/// Pure physical ABI selection shared with read-only route projection. It
+/// never certifies retained regions, live aliases, or transform workspace.
+pub(super) fn prepare_leaf_encoding(
+    components: &[MetalResolvedWeightComponent],
+    layout: &MetalResolvedWeightLayout,
+    out_features: u64,
+    in_features: u64,
+    expected_block_axis: u32,
+    output_offset: u64,
+) -> Result<PreparedLinearPart, String> {
     let (component, format) = match layout {
         MetalResolvedWeightLayout::Dense { component }
         | MetalResolvedWeightLayout::Stored { component } => {
@@ -2606,13 +2674,10 @@ fn prepare_leaf_part(
         }
         _ => return Err("Metal linear weight is not one matrix leaf".to_owned()),
     };
-    if component >= regions.len() {
-        return Err("Metal linear physical component is absent".to_owned());
-    }
     Ok(PreparedLinearPart {
         region: component,
         format,
-        transform,
+        transform: None,
         output_offset: checked_u32(output_offset, "Metal linear output offset")?,
         out_features: checked_u32(out_features, "Metal linear output width")?,
     })
@@ -2656,9 +2721,17 @@ fn validate_dense_linear_participant(
     in_features: u64,
     out_features: u64,
 ) -> Result<(), String> {
-    let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-    let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    validate_dense_linear_bindings(participant.bindings(), in_features, out_features)
+}
+
+fn validate_dense_linear_bindings(
+    bindings: &[ferrum_interfaces::vnext::ResolvedValueBinding],
+    in_features: u64,
+    out_features: u64,
+) -> Result<(), String> {
+    let input = binding(bindings, ResolvedValueRole::Input, 0)?;
+    let weight = binding(bindings, ResolvedValueRole::Input, 1)?;
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
     let dimensions = input.tensor().dimensions();
     if dimensions.len() != 2
         || dimensions[1] != in_features
@@ -2679,9 +2752,23 @@ fn validate_last_token_participant(
     out_features: u64,
     activation_type: ElementType,
 ) -> Result<(), String> {
-    let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-    let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    validate_last_token_bindings(
+        participant.bindings(),
+        hidden_size,
+        out_features,
+        activation_type,
+    )
+}
+
+fn validate_last_token_bindings(
+    bindings: &[ferrum_interfaces::vnext::ResolvedValueBinding],
+    hidden_size: u64,
+    out_features: u64,
+    activation_type: ElementType,
+) -> Result<(), String> {
+    let input = binding(bindings, ResolvedValueRole::Input, 0)?;
+    let weight = binding(bindings, ResolvedValueRole::Input, 1)?;
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
     let dimensions = input.tensor().dimensions();
     if dimensions.len() != 2
         || dimensions[0] == 0
@@ -2704,10 +2791,18 @@ fn validate_swiglu_participant(
     hidden_size: u64,
     intermediate_size: u64,
 ) -> Result<(), String> {
-    let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-    let gate_up = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-    let down = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    validate_swiglu_bindings(participant.bindings(), hidden_size, intermediate_size)
+}
+
+fn validate_swiglu_bindings(
+    bindings: &[ferrum_interfaces::vnext::ResolvedValueBinding],
+    hidden_size: u64,
+    intermediate_size: u64,
+) -> Result<(), String> {
+    let input = binding(bindings, ResolvedValueRole::Input, 0)?;
+    let gate_up = binding(bindings, ResolvedValueRole::Input, 1)?;
+    let down = binding(bindings, ResolvedValueRole::Input, 2)?;
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
     let dimensions = input.tensor().dimensions();
     if dimensions.len() != 2
         || dimensions[1] != hidden_size

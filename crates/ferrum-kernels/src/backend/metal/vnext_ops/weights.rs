@@ -252,14 +252,18 @@ pub(crate) fn resolve_weight(
     })
 }
 
-fn component_metadata(component: &ResolvedWeightComponentLayout) -> MetalResolvedWeightComponent {
+pub(super) fn component_metadata(
+    component: &ResolvedWeightComponentLayout,
+) -> MetalResolvedWeightComponent {
     MetalResolvedWeightComponent {
         physical_dimensions: component.physical_dimensions().to_vec(),
         encoding: component.encoding().clone(),
     }
 }
 
-fn resolve_layout(weight: &ResolvedWeightBinding) -> Result<MetalResolvedWeightLayout, String> {
+pub(super) fn resolve_layout(
+    weight: &ResolvedWeightBinding,
+) -> Result<MetalResolvedWeightLayout, String> {
     resolve_layout_node(weight.physical_layout(), weight)
 }
 
