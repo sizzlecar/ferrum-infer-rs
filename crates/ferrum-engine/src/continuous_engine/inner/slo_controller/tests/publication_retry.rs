@@ -22,6 +22,7 @@ async fn expired_publication_idle_reserves_a_fresh_completion_turn() {
         .capture_slo_controller_snapshot(&hint, Arc::clone(&budget))
         .unwrap();
     let selected = SelectedWave {
+        final_replay_first_wave: None,
         protection: None,
         candidate: WaveCandidate {
             work: vec![CandidateWork {

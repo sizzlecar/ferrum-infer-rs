@@ -10,6 +10,8 @@ pub(super) struct PlanningState<'epoch> {
     logical: SimulatedSequence,
     execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
     depth: usize,
+    pub first_wave_canonical:
+        Option<Arc<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>>,
 }
 
 impl Deref for PlanningState<'_> {
@@ -68,6 +70,7 @@ pub(super) fn begin<'epoch>(
     Ok(PlanningState {
         execution,
         depth: 0,
+        first_wave_canonical: None,
         logical: SimulatedSequence {
             requests: snapshot.requests.clone(),
             now_ns: started_at_ns,
@@ -101,6 +104,7 @@ pub(super) fn advance<'epoch>(
         &parent.requests,
         work,
         parent.execution.as_ref(),
+        parent.depth == 0,
         poll,
     )
     .map_err(|reason| TransitionFailure {
@@ -133,6 +137,11 @@ pub(super) fn advance<'epoch>(
             logical,
             execution: projected.successor,
             depth: parent.depth + 1,
+            first_wave_canonical: if parent.depth == 0 {
+                projected.first_canonical
+            } else {
+                parent.first_wave_canonical.clone()
+            },
         },
     })
 }

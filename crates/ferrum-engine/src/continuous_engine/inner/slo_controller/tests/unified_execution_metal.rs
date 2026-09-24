@@ -20,6 +20,66 @@ mod fixture;
 mod weights;
 use fixture::{add, admit, fixture, frontier, ready, wave};
 
+/// This artificial cost is used only to exercise certificate delivery. The
+/// actual min-eight-samples model above remains unqualified; native canonical
+/// shapes and physical resource projections still come from the real backend.
+fn selected_partial_proof(inner: &EngineInner, captured: &mut ControllerSnapshot) -> SelectedWave {
+    use ferrum_scheduler::implementations::continuous::cost_model::{
+        ExecutionFingerprint, WaveExecutionShape,
+    };
+    struct WiringCost(u64);
+    impl PlanningCostModel for WiringCost {
+        fn model_version(&self) -> u64 {
+            self.0
+        }
+        fn predict(
+            &self,
+            _: &ExecutionFingerprint,
+            _: &WaveExecutionShape,
+            _: u64,
+        ) -> Option<PlanningCost> {
+            Some(PlanningCost {
+                typical_ns: 1,
+                planning_ns: 1,
+                model_version: self.0,
+                valid_for_ns: u64::MAX,
+            })
+        }
+    }
+    struct FixedClock(u64);
+    impl PlanningClock for FixedClock {
+        fn now_ns(&mut self) -> u64 {
+            self.0
+        }
+    }
+    // This tiny fixture has a 30-second TTFT and a four-token prompt. Limit
+    // this wiring check to its legal one-token partial edge and finite horizon,
+    // without pretending unknown post-first-token content/cost is supported.
+    captured.snapshot.capabilities.prefill_chunk_sizes = vec![n32(1)];
+    captured.snapshot.scope.horizon_end_ns = captured.snapshot.observed_at_ns + 1_000_000_000;
+    let mut config = inner.config.scheduler.slo.planner.clone();
+    config.lookahead_waves = NonZeroUsize::new(1).unwrap();
+    config.candidate_limit = NonZeroUsize::new(1).unwrap();
+    config.beam_width = NonZeroUsize::new(1).unwrap();
+    let planner = BoundedSloPlanner {
+        settings: BoundedPlannerSettings { search: config },
+    };
+    let context = shape::ExecutorShape {
+        engine: inner,
+        captured,
+    };
+    let decision = planner.propose_with_execution(
+        &captured.snapshot,
+        &WiringCost(captured.snapshot.cost_model_version),
+        &context,
+        &mut FixedClock(captured.snapshot.observed_at_ns),
+    );
+    match decision {
+        PlanningDecision::FeasibleWithinHorizon { first_wave, .. } => first_wave,
+        other => panic!("real native first-canonical delivery with test-only cost: {other:?}"),
+    }
+}
+
 fn n32(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).unwrap()
 }
@@ -207,7 +267,25 @@ async fn unified_execution_metal_partial_final_successor_and_recaptured_decode_m
         8
     );
 
-    let captured = capture(&inner);
+    let mut captured = capture(&inner);
+    let replayed = selected_partial_proof(&inner, &mut captured);
+    let valid_until = captured
+        .origin
+        .instant_at_ns(replayed.planning_observed_at_ns + replayed.witness_valid_for_ns)
+        .unwrap();
+    let delivered = inner
+        .controller_first_wave_shape(&captured, &replayed, valid_until)
+        .expect("consume the real final-replay first canonical without a third projection");
+    let mut absent = replayed.clone();
+    absent.final_replay_first_wave = None;
+    assert!(inner
+        .controller_first_wave_shape(&captured, &absent, valid_until)
+        .is_none());
+    let mut changed = replayed;
+    changed.candidate.work[0].key.incarnation += 1;
+    assert!(inner
+        .controller_first_wave_shape(&captured, &changed, valid_until)
+        .is_none());
     let original = captured.snapshot.requests.clone();
     let counters = inner.model_executor.cache_metrics_snapshot().unwrap()["counters"].clone();
     let context = shape::ExecutorShape {
@@ -224,6 +302,10 @@ async fn unified_execution_metal_partial_final_successor_and_recaptured_decode_m
     }];
     let partial = project(parent.as_ref(), &original, &work).expect("real partial route");
     let partial_shape = partial.canonical_domain.exact().unwrap().clone();
+    assert_eq!(
+        delivered, partial_shape,
+        "selected replay edge equals the real native route"
+    );
     // A sibling reads the unchanged parent, not the preceding successor.
     assert_eq!(
         project(parent.as_ref(), &original, &work)
@@ -276,7 +358,7 @@ async fn unified_execution_metal_partial_final_successor_and_recaptured_decode_m
     drop(captured);
 
     let selected = frontier(&session, &id).prefill_work(n32(1)).unwrap();
-    assert_actual(&partial_shape, &wave(&mut session, vec![selected]).await);
+    assert_actual(&delivered, &wave(&mut session, vec![selected]).await);
     let selected = frontier(&session, &id).prefill_work(n32(2)).unwrap();
     assert_actual(&final_shape, &wave(&mut session, vec![selected]).await);
     ready(&inner, &id).await;

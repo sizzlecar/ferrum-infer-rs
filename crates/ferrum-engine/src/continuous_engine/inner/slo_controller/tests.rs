@@ -435,6 +435,7 @@ async fn controller_publication_cannot_reset_an_expired_capture_budget() {
         .capture_slo_controller_snapshot(&hint, budget.clone())
         .unwrap();
     let selected = SelectedWave {
+        final_replay_first_wave: None,
         protection: None,
         candidate: WaveCandidate {
             work: vec![CandidateWork {

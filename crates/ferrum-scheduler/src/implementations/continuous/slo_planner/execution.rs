@@ -42,6 +42,7 @@ pub struct ProjectedExecution<'epoch> {
 
 pub(super) struct VerifiedExecution<'epoch> {
     pub wave: WaveCandidate,
+    pub first_canonical: Option<Arc<CanonicalWaveCostShape>>,
     pub successor: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
 }
 
@@ -162,6 +163,7 @@ pub(super) fn project<'epoch>(
     requests: &[RequestSchedulingView],
     work: &[CandidateWork],
     state: &dyn PlanningExecutionState<'epoch>,
+    retain_first_canonical: bool,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
     let mut failure = None;
@@ -207,10 +209,21 @@ pub(super) fn project<'epoch>(
         kind,
         &ordered_rows,
         recurrent_state_bytes,
-        projected.canonical_domain,
+        &projected.canonical_domain,
         poll,
     )?;
+    // Retain only the first exact edge, not every future alternative. Moving
+    // its validated value preserves the provider result without cloning vectors.
+    let first_canonical = if retain_first_canonical {
+        match projected.canonical_domain {
+            PlanningShapeDomain::Exact(canonical) => Some(Arc::new(canonical)),
+            PlanningShapeDomain::HostContentAlternatives(_) => None,
+        }
+    } else {
+        None
+    };
     Ok(Some(VerifiedExecution {
+        first_canonical,
         wave: WaveCandidate {
             work: projected.ordered_work,
             execution_shape,
@@ -294,7 +307,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
             input.kind,
             &rows,
             input.recurrent_state_bytes,
-            canonical_domain.clone(),
+            &canonical_domain,
             poll,
         )?;
         let wave = WaveCandidate {

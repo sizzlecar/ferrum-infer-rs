@@ -26,33 +26,21 @@ impl EngineInner {
     pub(super) fn controller_first_wave_shape(
         &self,
         captured: &ControllerSnapshot,
-        candidate: &WaveCandidate,
+        selected: &SelectedWave,
         valid_until: Instant,
     ) -> Option<CanonicalWaveCostShape> {
-        let resolver = ExecutorShape {
-            engine: self,
-            captured,
-        };
-        let mut poll = || {
-            if captured.budget.poll() && slo_clock_now() <= valid_until {
-                Ok(())
-            } else {
-                Err(PlanningUnknownReason::ComputeBudgetExhausted)
-            }
-        };
-        let frontiers = resolver.initial_frontiers(&mut poll).ok()?;
-        let work = frontiers.prepare(&candidate.work, &mut poll).ok()?;
-        let projection = resolver
-            .project(
-                &captured.route.initial_state(),
-                frontiers.requests(),
-                &work.rows,
-                FutureHostMode::Exact,
-                &mut poll,
-            )
-            .ok()??;
-        (candidate.execution_shape.exact()? == &canonical_cost_shape(&projection.shape).ok()?)
-            .then_some(projection.shape)
+        if !captured.budget.poll() || slo_clock_now() > valid_until {
+            return None;
+        }
+        let canonical = selected.replayed_first_wave(&captured.snapshot)?;
+        if selected.candidate.execution_shape.exact()? != &canonical_cost_shape(canonical).ok()? {
+            return None;
+        }
+        // Final replay already proved physical order and all canonical fields.
+        // This copy crosses the owned ExpectedExecutionCostWave boundary only;
+        // it does not re-run the provider, acquire authority or reset time.
+        let canonical = canonical.clone();
+        (captured.budget.poll() && slo_clock_now() <= valid_until).then_some(canonical)
     }
 
     pub(super) fn propose_slo_controller(&self, captured: &ControllerSnapshot) -> PlanningDecision {

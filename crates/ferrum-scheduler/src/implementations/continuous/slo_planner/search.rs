@@ -644,7 +644,15 @@ impl BoundedSloPlanner {
             let Some(completion_at_ns) = state.now_ns.checked_add(final_delay) else {
                 return unknown(PlanningUnknownReason::ArithmeticOverflow, stats);
             };
+            let Some(canonical) = state.first_wave_canonical.clone() else {
+                return unknown(PlanningUnknownReason::InvalidShapeEvidence, stats);
+            };
             let first_wave = SelectedWave {
+                final_replay_first_wave: Some(Arc::new(FinalReplayFirstWave::from_replay(
+                    snapshot,
+                    solution.waves[0].clone(),
+                    canonical,
+                ))),
                 protection: protection.clone(),
                 candidate: solution.waves[0].clone(),
                 predicted_wall_ns: state.first_wave_cost_ns,

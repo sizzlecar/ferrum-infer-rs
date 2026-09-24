@@ -199,7 +199,7 @@ pub(super) fn resolve(
         kind,
         &rows,
         recurrent_state_bytes,
-        domain,
+        &domain,
         poll_budget,
     )
     .map(Some)
@@ -210,7 +210,7 @@ pub(super) fn validate_domain(
     kind: ActualWaveKind,
     rows: &[PlanningShapeRow<'_>],
     recurrent_state_bytes: u64,
-    domain: PlanningShapeDomain<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>,
+    domain: &PlanningShapeDomain<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<PlanningShapeDomain<WaveExecutionShape>, PlanningUnknownReason> {
     if domain.shapes().is_empty() || domain.shapes().len() > 256 {

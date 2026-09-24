@@ -656,8 +656,35 @@ pub trait PlanningClock {
     }
 }
 
+/// Exact first edge of the successful independent replay. Private fields and
+/// construction prevent callers from relabeling a search projection as replay
+/// evidence. This is immutable numeric evidence, never a submission permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalReplayFirstWave {
+    candidate: WaveCandidate,
+    canonical: Arc<CanonicalWaveCostShape>,
+    snapshot_observed_at_ns: u64,
+}
+
+impl FinalReplayFirstWave {
+    pub(super) fn from_replay(
+        snapshot: &SchedulerSnapshot,
+        candidate: WaveCandidate,
+        canonical: Arc<CanonicalWaveCostShape>,
+    ) -> Self {
+        Self {
+            candidate,
+            canonical,
+            snapshot_observed_at_ns: snapshot.observed_at_ns,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedWave {
+    /// Missing evidence is rejected by production publication; no re-projection
+    /// fallback. None remains available to legacy construction/negative tests.
+    pub final_replay_first_wave: Option<Arc<FinalReplayFirstWave>>,
     /// Immutable partial-protection scope; never an all-request admission proof.
     pub protection: Option<Arc<super::obligations::PlanningObligationSet>>,
     pub candidate: WaveCandidate,
@@ -669,6 +696,26 @@ pub struct SelectedWave {
     /// Remaining inclusive start delay supported by the complete witness's
     /// deadlines and cost evidence. Final execution still requires authority.
     pub witness_valid_for_ns: u64,
+}
+
+impl SelectedWave {
+    /// Validate immutable candidate and snapshot identity before borrowing the
+    /// canonical edge. Live route/resource/frontier/credit/time guards remain
+    /// the publisher's responsibility. The canonical is never mutable here.
+    pub fn replayed_first_wave(
+        &self,
+        snapshot: &SchedulerSnapshot,
+    ) -> Option<&CanonicalWaveCostShape> {
+        let proof = self.final_replay_first_wave.as_ref()?;
+        (self.candidate == proof.candidate
+            && self.snapshot_generation == snapshot.generation
+            && self.candidate.based_on_generation == snapshot.generation
+            && self.cost_model_version == snapshot.cost_model_version
+            && self.candidate.cost_model_version == snapshot.cost_model_version
+            && self.snapshot_observed_at_ns == snapshot.observed_at_ns
+            && proof.snapshot_observed_at_ns == snapshot.observed_at_ns)
+            .then_some(proof.canonical.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
