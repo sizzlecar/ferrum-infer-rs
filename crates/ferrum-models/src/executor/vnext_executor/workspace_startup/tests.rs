@@ -38,6 +38,43 @@ fn workspace_startup_declared_buckets_cover_widths_without_expanding_programs() 
 }
 
 #[test]
+fn workspace_startup_resource_buckets_do_not_depend_on_program_capture_lifecycle() {
+    let chunks = [PrefillChunk::new(0, 8, 8).unwrap()];
+    let resource_only = resolve_reusable_execution_policy(
+        8,
+        64,
+        512,
+        &chunks,
+        &ReusableExecutionCaptureConfig::default(),
+        false,
+    )
+    .unwrap();
+    let expected =
+        declared_cases(resource_only.policy.buckets().iter().cloned(), 8, 64, 512).unwrap();
+    for preparation in [
+        ReusableExecutionPreparationMode::OnDemand,
+        ReusableExecutionPreparationMode::Startup,
+    ] {
+        let capture = ReusableExecutionCaptureConfig {
+            preparation,
+            exact_decode_widths: Some(vec![1, 2, 4, 8]),
+            ..Default::default()
+        };
+        let policy =
+            resolve_reusable_execution_policy(8, 64, 512, &chunks, &capture, true).unwrap();
+        assert!(policy.policy.program_policy().is_some());
+        let actual = declared_cases(policy.policy.buckets().iter().cloned(), 8, 64, 512).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual.bucket, expected.bucket);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.sequences, expected.sequences);
+            assert_eq!(actual.tokens_per_sequence, expected.tokens_per_sequence);
+        }
+    }
+}
+
+#[test]
 fn workspace_startup_rejects_unknown_duplicate_and_over_capacity_cases() {
     assert!(declared_cases([], 32, 2048, 4096).is_err());
     assert!(declared_cases([bucket("unrecognized", 1, 1)], 32, 2048, 4096).is_err());
@@ -85,6 +122,9 @@ fn workspace_startup_real_prepared_wave_aborts_owners_and_reuses_slots_without_e
     let fixture =
         contract::fixture_with_provider_behavior(false, contract::ProviderBehavior::ProgramBinding);
     let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    // This runtime does not expose graph-state evidence. A passive inspection
+    // must preserve Unknown and leave the lane usable for real resource work.
+    assert_eq!(lane.cost_graph_stream_state().unwrap(), None);
     let sequence = contract::logical_resources(
         &fixture.plan_resources,
         "run.workspace-a",

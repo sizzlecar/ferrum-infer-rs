@@ -164,14 +164,31 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "workspace startup is unsupported without a reusable memory plan",
                 )
             })?;
-        if memory.program_policy().is_some() {
-            return Err(FerrumError::config("resource-only workspace startup requires no device-program policy; reusable-program startup is a separate mode"));
-        }
+        // A device-program policy adds lane-stable binding resources to the
+        // same prepared wave. Claim them through the ordinary plan, then abort
+        // without encoding. Actual program configuration/capture still belongs
+        // to prepare_reusable_execution_startup, after this resource-only phase.
         if self.sequences.lock().total_len() != 0 {
             return Err(FerrumError::internal(
                 "workspace startup requires an empty product registry",
             ));
         }
+        let program_preparation = memory
+            .program_policy()
+            .map(|_| {
+                let state = self
+                    .lane
+                    .cost_graph_stream_state()
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+                state
+                    .filter(|state| state.is_unconfigured_empty())
+                    .ok_or_else(|| {
+                        FerrumError::config(
+                        "workspace startup requires an observed empty, unconfigured program cache",
+                    )
+                    })
+            })
+            .transpose()?;
         let cases = declared_cases(
             memory
                 .buckets()
@@ -199,6 +216,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Err(FerrumError::internal(
                 "resource-only workspace startup unexpectedly submitted model work",
             ));
+        }
+        if let Some(before) = program_preparation {
+            // Both program preparation receipts and the catalog require prior
+            // configuration. Read the actual cache's unconfigured state; this
+            // resource-only phase must leave it unchanged.
+            let after = self
+                .lane
+                .cost_graph_stream_state()
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            if after != Some(before) {
+                return Err(FerrumError::internal(
+                    "resource-only workspace startup unexpectedly prepared device programs",
+                ));
+            }
         }
         Ok(Some(WorkspacePreparationReport {
             mode: self.workspace_preparation,
@@ -316,3 +347,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests;

@@ -1015,8 +1015,12 @@ those owners. Idle lane slots remain resident. It neither captures/replays a
 device program nor executes token generation, initialization uploads, sampling,
 observations or training. It does not warm all GPU/driver caches.
 
-This initial mode requires a reusable workspace plan with no device-program
-policy. Unsupported policies, capacity exhaustion, or incomplete cleanup fail
+This mode requires a reusable workspace plan and also supports plans with a
+device-program policy. Resource preparation runs before the separately configured
+program preparation: on-demand capture still starts with an empty program catalog;
+startup capture still performs its real warmup, capture and validation. Resource
+preparation alone cannot establish a warm Graph route or a known execution cost.
+Unsupported buckets, capacity exhaustion, or incomplete cleanup fail
 startup; the mode never shrinks the configured request capacity, skips a bucket,
 or changes the memory budget to fit. It prepares declared capacity classes,
 not every future request's KV backing or every provider route. Runtime guards,

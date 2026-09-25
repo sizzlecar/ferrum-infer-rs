@@ -4,6 +4,17 @@ use crate::vnext::{
     DeviceCostGraphStreamState, ResourcePlanningReadStage, ResourcePlanningUnknown,
 };
 impl<R: DeviceRuntime> ExecutionLane<R> {
+    /// Inspect this lane's actual graph configuration without configuring it.
+    /// Unknown backend evidence stays `None`; inspection still requires the
+    /// same stable, quiescent lane as other reusable-execution queries.
+    pub fn cost_graph_stream_state(
+        &self,
+    ) -> Result<Option<DeviceCostGraphStreamState>, VNextError> {
+        self.with_quiescent_stream("inspect graph stream state", |runtime, stream| {
+            Ok(runtime.cost_graph_stream_state(stream))
+        })
+    }
+
     pub(crate) fn try_with_resource_planning_lane<T>(
         &self,
         capture: impl FnOnce(
