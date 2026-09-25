@@ -1,6 +1,7 @@
 //! Native Metal linear providers over typed physical weight layouts.
 mod cost_route;
 mod head_cost_route;
+mod head_selected;
 #[cfg(test)]
 mod m8_tests;
 mod selected;
@@ -63,6 +64,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("linear/plain_prefill.rs"),
     include_str!("linear/cost_route.rs"),
     include_str!("linear/head_cost_route.rs"),
+    include_str!("linear/head_selected.rs"),
     include_str!("linear/selected.rs"),
     include_str!("weights.rs"),
     include_str!("linear/staged_prefill.rs"),
@@ -943,7 +945,12 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
     ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
-        head_cost_route::route(request, self.operation_id, self.activation_type)
+        head_cost_route::route(
+            request,
+            self.operation_id,
+            self.activation_type,
+            &self.pipelines,
+        )
     }
 
     fn reusable_execution_topology(
@@ -1495,6 +1502,12 @@ fn encode_last_token_dense_linear(
             } else {
                 "vnext_last_token_dense_linear"
             };
+            let statistical = head_selected::evidence(
+                &pipelines,
+                &[launch],
+                token_count,
+                Some((scratch_layout, participant_count_u32, shared_packed_input)),
+            );
             return MetalDeviceCommand::operation(
                 operation_label,
                 regions,
@@ -1537,6 +1550,7 @@ fn encode_last_token_dense_linear(
                 participant_count_u32,
                 token_count,
             )
+            .map(|command| command.with_statistical_evidence(statistical))
             .map_err(|error| error.to_string());
         }
     }
@@ -1594,6 +1608,7 @@ fn encode_last_token_dense_linear(
     } else {
         "vnext_last_token_dense_linear"
     };
+    let statistical = head_selected::evidence(&pipelines, &launches, token_count, None);
     MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
         for launch in &launches {
@@ -1611,6 +1626,7 @@ fn encode_last_token_dense_linear(
         participant_count_u32,
         token_count,
     )
+    .map(|command| command.with_statistical_evidence(statistical))
     .map_err(|error| error.to_string())
 }
 

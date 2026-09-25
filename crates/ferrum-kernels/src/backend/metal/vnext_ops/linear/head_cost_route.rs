@@ -15,6 +15,7 @@ pub(super) fn route(
     request: OperationCostRouteRequest<'_>,
     operation_id: &str,
     dtype: ElementType,
+    pipelines: &MetalLinearPipelines,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != operation_id {
         return Ok(None);
@@ -95,7 +96,7 @@ pub(super) fn route(
             end.checked_mul(scratch.input_row_bytes)
                 .ok_or("last-token source byte range overflows")?;
         }
-        command(
+        let mut command = command(
             dtype,
             part,
             hidden,
@@ -104,8 +105,34 @@ pub(super) fn route(
             request.immediate_tokens(),
             packed,
             shared_input,
-        )
-        .map(Some)
+        )?;
+        let launch = linear_launch_typed(
+            part,
+            0,
+            0,
+            if packed { participants as u64 } else { 1 },
+            hidden,
+            outputs,
+            0,
+            if packed {
+                scratch.output_offset_bytes
+            } else {
+                0
+            },
+            dtype,
+        )?;
+        let launches = vec![launch; if packed { 1 } else { participants }];
+        if let Some(evidence) = head_selected::evidence(
+            pipelines,
+            &launches,
+            request.immediate_tokens(),
+            packed.then_some((scratch, participants as u32, shared_input)),
+        ) {
+            if let Ok(checked) = command.clone().with_statistical_evidence(evidence) {
+                command = checked;
+            }
+        }
+        Ok(Some(command))
     };
     calculate()
         .map_err(invalid_plan)?
