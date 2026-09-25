@@ -3505,11 +3505,40 @@ impl<'request, 'source, B> StaticWeightTransformRequest<'request, 'source, B> {
     }
 }
 
+/// Diagnostic memory samples with an explicit source and scope. The native Metal
+/// sampler queries actual process device-resource allocations. Sampled peaks can
+/// miss shorter peaks and are neither RSS nor total physical device residency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMemoryTelemetrySnapshot {
+    pub schema_version: u32,
+    pub record_type: String,
+    pub source: String,
+    pub scope: String,
+    pub phase: String,
+    pub pid: u32,
+    /// Native device identity preserved as text, including the Metal registry ID.
+    pub device_registry_id: String,
+    pub device_name: String,
+    /// Unix anchor; elapsed_ns uses a monotonic clock.
+    pub started_unix_ns: String,
+    pub elapsed_ns: u64,
+    pub current_allocated_bytes: u64,
+    pub peak_allocated_bytes: u64,
+    pub sample_count: u64,
+    pub interval_ms: u64,
+    pub max_sample_gap_ns: u64,
+    pub error_count: u64,
+    pub last_error: Option<String>,
+    /// Sampling reached an explicit finish with no query/write errors. Model
+    /// startup, request correctness and process success require separate evidence.
+    pub complete: bool,
+    pub end_reason: Option<String>,
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
-/// type safety. Every operation is required; unsupported work cannot inherit a
-/// success-returning default implementation.
+/// type safety. Required operations cannot inherit a success-returning default.
 pub trait DeviceRuntime: Send + Sync + 'static {
     type Buffer: Send + Sync + 'static;
     type Stream: Send + 'static;
@@ -3572,6 +3601,17 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         _poll: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Option<Result<super::OperationCostCommand, Self::Error>> {
         None
+    }
+
+    /// An explicitly enabled diagnostic sampler; unsupported/disabled is None.
+    fn device_memory_snapshot(&self) -> Option<DeviceMemoryTelemetrySnapshot> {
+        None
+    }
+
+    /// Flushes the final sample and summary after product work has drained.
+    /// Must be idempotent and must not synchronize the GPU for measurement.
+    fn finish_device_memory_sampling(&self) -> Result<(), Self::Error> {
+        Ok(())
     }
 
     /// Resolved attention provider-family policy installed by this runtime

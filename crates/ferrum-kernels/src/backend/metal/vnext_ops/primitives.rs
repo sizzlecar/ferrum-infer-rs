@@ -104,6 +104,7 @@ const MASKED_ARGMAX_PARTITIONS: u64 = 32;
 const MASKED_ARGMAX_PARALLEL_MIN_VOCAB: u32 = 8192;
 
 pub(super) struct MetalPrimitivePipelines {
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     hadamard: MetalHadamardPipelines,
     embedding_dense: ComputePipelineState,
     embedding_q4_k: ComputePipelineState,
@@ -128,6 +129,18 @@ pub(super) struct MetalPrimitivePipelines {
 }
 
 impl MetalPrimitivePipelines {
+    pub(super) fn with_structured_capture(
+        mut self,
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
+        self.structured_capture = capture;
+        self
+    }
+
+    pub(super) fn structured_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        self.structured_capture
+    }
+
     pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
         let library = device
             .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
@@ -165,6 +178,7 @@ impl MetalPrimitivePipelines {
         };
         let pipeline = |name: &str| specialized_pipeline(name, false);
         Ok(Self {
+            structured_capture: ferrum_types::SloStructuredCostCapture::Disabled,
             hadamard: MetalHadamardPipelines::new(device)?,
             embedding_dense: pipeline(EMBEDDING_DENSE_KERNEL)?,
             embedding_q4_k: pipeline(EMBEDDING_Q4_K_KERNEL)?,

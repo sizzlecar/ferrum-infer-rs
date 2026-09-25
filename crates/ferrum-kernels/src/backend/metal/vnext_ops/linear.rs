@@ -161,6 +161,7 @@ fn pq2_mixed_prefill_m64_supported(
 }
 
 pub(super) struct MetalLinearPipelines {
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     hadamard: MetalHadamardPipelines,
     dense: ComputePipelineState,
     dense_narrow: Option<ComputePipelineState>,
@@ -192,6 +193,18 @@ enum LinearDispatchKind {
 }
 
 impl MetalLinearPipelines {
+    pub(super) fn with_structured_capture(
+        mut self,
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
+        self.structured_capture = capture;
+        self
+    }
+
+    pub(super) fn structured_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        self.structured_capture
+    }
+
     pub(super) fn new(device: &Device) -> Result<Self, MetalDeviceRuntimeError> {
         let library = device
             .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())
@@ -231,6 +244,7 @@ impl MetalLinearPipelines {
             None
         };
         Ok(Self {
+            structured_capture: ferrum_types::SloStructuredCostCapture::Disabled,
             hadamard: MetalHadamardPipelines::new(device)?,
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
             dense_narrow,

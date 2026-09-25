@@ -48,6 +48,7 @@ impl VNextDiagnosticFaultArg {
 pub mod bench;
 pub mod bench_serve;
 pub mod calibrate_slo;
+mod device_memory;
 pub mod doctor;
 pub mod embed;
 pub mod list;

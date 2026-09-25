@@ -976,6 +976,10 @@ pub struct RunCommand {
     #[arg(long, value_name = "PATH")]
     pub memory_profile_jsonl: Option<PathBuf>,
 
+    #[arg(long, value_name = "PATH", help = super::device_memory::HELP,
+        conflicts_with = "observability_vertical_slice_out")]
+    pub device_memory_jsonl: Option<PathBuf>,
+
     /// Write scheduler/admission trace events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub scheduler_trace_jsonl: Option<PathBuf>,
@@ -1014,6 +1018,28 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             ));
         }
     }
+    super::device_memory::validate_output_paths(
+        cmd.device_memory_jsonl.as_deref(),
+        [
+            ("--profile-jsonl", cmd.profile_jsonl.as_deref()),
+            (
+                "--memory-profile-jsonl",
+                cmd.memory_profile_jsonl.as_deref(),
+            ),
+            (
+                "--scheduler-trace-jsonl",
+                cmd.scheduler_trace_jsonl.as_deref(),
+            ),
+            (
+                "--effective-config-json",
+                cmd.effective_config_json.as_deref(),
+            ),
+            (
+                "--decision-trace-jsonl",
+                cmd.decision_trace_jsonl.as_deref(),
+            ),
+        ],
+    )?;
     if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
@@ -1056,6 +1082,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        if cmd.device_memory_jsonl.is_some() {
+            return Err(FerrumError::unsupported(
+                "--device-memory-jsonl requires a real native Metal runtime, not synthetic observability",
+            ));
+        }
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
         )?;
@@ -1084,6 +1115,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             selection.selected_distributed_strategy
         );
     }
+    let device_memory_sampling =
+        super::device_memory::resolve(cmd.device_memory_jsonl.as_deref(), &device)?;
     let backend_initialized_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -1197,6 +1230,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     } else {
         ferrum_types::ExecutionResourceAuthority::LegacyEngine
     };
+    super::device_memory::validate_authority(
+        device_memory_sampling.as_ref(),
+        execution_resource_authority,
+    )?;
     if let Some(slo) = &loaded_slo {
         slo.validate_authority(execution_resource_authority)?;
     }
@@ -1271,6 +1308,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
     engine_config.runtime.startup_memory_request = startup_memory_request;
+    engine_config.runtime.device_memory_sampling = device_memory_sampling;
     let vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
     validate_teacher_forced_checkpoint_run(&cmd, vnext_checkpoint_capture.as_ref())?;
     let teacher_forcing = vnext_checkpoint_capture
@@ -3004,6 +3042,7 @@ mod tests {
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
             vnext_diagnostic_fault: None,
             memory_profile_jsonl: None,
+            device_memory_jsonl: None,
             scheduler_trace_jsonl: None,
             request_dump_dir: None,
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),

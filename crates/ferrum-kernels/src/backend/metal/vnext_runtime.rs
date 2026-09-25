@@ -53,6 +53,8 @@ mod counter_readback;
 use counter_readback::CounterReadbackStats;
 mod core_cost_route;
 mod cost_identity;
+mod device_memory;
+use device_memory::DeviceMemorySampler;
 #[cfg(test)]
 mod submission_guard_tests;
 mod submission_readback;
@@ -2004,9 +2006,28 @@ impl Drop for MetalDeviceFence {
     }
 }
 
+/// One selected recipe builder per physical command. Disabled preserves the
+/// original allocation-free aggregate path; capture does not select kernels.
+pub(crate) fn selected_cost_builder(
+    capture: ferrum_types::SloStructuredCostCapture,
+    tokens: u64,
+) -> ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1 {
+    use ferrum_interfaces::execution_cost::SelectedCommandCostBuilderV1;
+    match capture {
+        ferrum_types::SloStructuredCostCapture::Disabled => {
+            SelectedCommandCostBuilderV1::new(tokens)
+        }
+        ferrum_types::SloStructuredCostCapture::HostSettledV1 => {
+            SelectedCommandCostBuilderV1::new_with_algorithm_work(tokens)
+        }
+    }
+}
+
 /// Concrete Metal primitive runtime consumed by the shared vNext resource and
 /// operation dispatch layers.
 pub struct MetalDeviceRuntime {
+    // Immutable per-engine observation policy; never stored in shared PSOs.
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     descriptor: DeviceDescriptor,
     cost_hardware_identity: ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability,
     runtime_instance: u64,
@@ -2014,6 +2035,7 @@ pub struct MetalDeviceRuntime {
     timestamp_counter_support: OnceLock<MetalTimestampCounterSupport>,
     counter_readback_stats: Arc<CounterReadbackStats>,
     static_weight_import_gate: Mutex<()>,
+    device_memory_sampler: OnceLock<DeviceMemorySampler>,
 }
 
 impl fmt::Debug for MetalDeviceRuntime {
@@ -2028,6 +2050,13 @@ impl fmt::Debug for MetalDeviceRuntime {
 
 impl MetalDeviceRuntime {
     pub fn new(config: MetalDeviceRuntimeConfig) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::new_with_structured_capture(config, ferrum_types::SloStructuredCostCapture::Disabled)
+    }
+
+    pub fn new_with_structured_capture(
+        config: MetalDeviceRuntimeConfig,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
         let device = st().pipes.device.clone();
         let descriptor = DeviceDescriptor {
             id: config.device_id,
@@ -2051,6 +2080,7 @@ impl MetalDeviceRuntime {
         let cost_hardware_identity =
             cost_identity::capture(&device, &descriptor.runtime_implementation_fingerprint);
         Ok(Self {
+            structured_capture,
             descriptor,
             cost_hardware_identity,
             runtime_instance,
@@ -2058,11 +2088,33 @@ impl MetalDeviceRuntime {
             timestamp_counter_support: OnceLock::new(),
             counter_readback_stats,
             static_weight_import_gate: Mutex::new(()),
+            device_memory_sampler: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn structured_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        self.structured_capture
     }
 
     pub(crate) fn device(&self) -> &metal::Device {
         &self.device
+    }
+
+    /// Called by composition before provider construction and weight import.
+    /// The cloned handle is the exact device used for all runtime allocations.
+    pub(crate) fn enable_device_memory_sampling(
+        &self,
+        config: &ferrum_types::DeviceMemorySamplingConfig,
+    ) -> Result<(), MetalDeviceRuntimeError> {
+        if self.device_memory_sampler.get().is_some() {
+            return Err(MetalDeviceRuntimeError::contract(
+                "device-memory sampling is already enabled",
+            ));
+        }
+        let sampler = DeviceMemorySampler::start(self.device.clone(), config)?;
+        self.device_memory_sampler.set(sampler).map_err(|_| {
+            MetalDeviceRuntimeError::contract("device-memory sampling is already enabled")
+        })
     }
 
     #[cfg(test)]
@@ -2486,6 +2538,21 @@ impl DeviceRuntime for MetalDeviceRuntime {
         &self,
     ) -> ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability {
         self.cost_hardware_identity.clone()
+    }
+
+    fn device_memory_snapshot(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceMemoryTelemetrySnapshot> {
+        self.device_memory_sampler
+            .get()
+            .map(DeviceMemorySampler::snapshot)
+    }
+
+    fn finish_device_memory_sampling(&self) -> Result<(), Self::Error> {
+        self.device_memory_sampler
+            .get()
+            .map(DeviceMemorySampler::finish)
+            .unwrap_or(Ok(()))
     }
 
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
@@ -2994,6 +3061,49 @@ mod tests {
         WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightId,
     };
     use std::ptr::NonNull;
+
+    #[test]
+    fn structured_observation_builder_is_local_and_preserves_selected_wire() {
+        use ferrum_interfaces::execution_cost::{
+            SelectedAlgorithmClassV1, StatisticalTransferKindV1,
+        };
+        use ferrum_types::SloStructuredCostCapture::{Disabled, HostSettledV1};
+
+        // No Metal device is constructed. Observation enriches one command's
+        // sidecar without changing its exact route identity or aggregate work.
+        let build = |mode| {
+            let mut builder = selected_cost_builder(mode, 7);
+            builder
+                .transfer(
+                    SelectedAlgorithmClassV1::new(
+                        "MTLBlit.observation.fixture",
+                        1,
+                        [1; 32],
+                        [2; 32],
+                    )
+                    .unwrap(),
+                    StatisticalTransferKindV1::HostToDevice,
+                    129,
+                )
+                .unwrap();
+            builder.finish().unwrap()
+        };
+        let off = build(Disabled);
+        let on = build(HostSettledV1);
+        let off_again = build(Disabled);
+        assert_eq!(off, on);
+        assert_eq!(off, off_again);
+        assert_eq!(
+            serde_json::to_vec(&off).unwrap(),
+            serde_json::to_vec(&on).unwrap()
+        );
+        assert!(off.algorithm_work().is_none());
+        assert!(off_again.algorithm_work().is_none());
+        let algorithms = on.algorithm_work().unwrap().unwrap();
+        algorithms.validate_command(&on).unwrap();
+        assert_eq!(algorithms.entries().len(), 1);
+        assert_eq!(algorithms.entries()[0].work().host_to_device_bytes, 129);
+    }
 
     pub(super) fn runtime() -> MetalDeviceRuntime {
         MetalDeviceRuntime::new(MetalDeviceRuntimeConfig {

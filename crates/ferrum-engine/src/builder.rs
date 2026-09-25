@@ -269,6 +269,11 @@ impl EngineBuilder {
                 "EngineBuilder scheduler component overrides are no longer accepted; configure the typed EngineConfig.scheduler used by ContinuousBatchScheduler",
             ));
         }
+        if self.custom_executor.is_some() && self.config.runtime.device_memory_sampling.is_some() {
+            return Err(FerrumError::unsupported(
+                "device-memory sampling cannot be enabled through a custom executor; use the registered native Metal runtime factory",
+            ));
+        }
 
         // Pre-compute all component names before consuming self
         let tokenizer_name = self.resolve_tokenizer_name();
@@ -1150,6 +1155,34 @@ mod tests {
 
         // Should succeed with stub components
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn device_memory_sampling_custom_executor_rejects_unconsumed_config_before_startup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            calls: Arc::clone(&calls),
+            fail: false,
+        });
+        let mut config = EngineConfig::default();
+        config.runtime.device_memory_sampling = Some(ferrum_types::DeviceMemorySamplingConfig {
+            jsonl_path: "unused-device-memory.jsonl".into(),
+        });
+        let plan_executor: Arc<dyn ModelExecutor + Send + Sync> =
+            Arc::new(PlanRuntimeBuilderExecutor {
+                inner: ferrum_testkit::MockModelExecutor::instant(128),
+            });
+        for executor in [executor, plan_executor] {
+            let error = EngineBuilder::new(config.clone())
+                .with_custom_executor(executor)
+                .build()
+                .await
+                .err()
+                .expect("a custom executor cannot silently ignore the sampling path");
+            assert!(error.to_string().contains("custom executor"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

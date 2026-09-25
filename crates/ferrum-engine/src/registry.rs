@@ -505,6 +505,7 @@ impl ComponentRegistry {
         name: &str,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+        validate_device_memory_sampling_config(&config.engine_config, &config.device)?;
         let factory = self.get_executor_factory(name).ok_or_else(|| {
             FerrumError::model(format!(
                 "Executor '{}' not found. Available: {:?}",
@@ -512,8 +513,56 @@ impl ComponentRegistry {
                 self.list_executors()
             ))
         })?;
-        factory.create(config).await
+        let executor = factory.create(config).await?;
+        if config
+            .engine_config
+            .runtime
+            .device_memory_sampling
+            .is_some()
+            && executor.device_memory_snapshot().is_none()
+        {
+            return Err(FerrumError::unsupported(
+                "the selected executor does not expose the requested device-memory sampler",
+            ));
+        }
+        Ok(executor)
     }
+}
+
+pub(crate) fn validate_device_memory_sampling_config(
+    config: &EngineConfig,
+    device: &Device,
+) -> Result<()> {
+    if let Some(sampling) = &config.runtime.device_memory_sampling {
+        sampling
+            .validate_output_paths(
+                [
+                    (
+                        "runtime.profile_jsonl",
+                        config.runtime.profile_jsonl.as_deref(),
+                    ),
+                    (
+                        "runtime.scheduler_trace_jsonl",
+                        config.runtime.scheduler_trace_jsonl.as_deref(),
+                    ),
+                    (
+                        "runtime.legacy_scheduler_trace_jsonl",
+                        config.runtime.legacy_scheduler_trace_jsonl.as_deref(),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(label, path)| path.map(|path| (label, path))),
+            )
+            .map_err(FerrumError::config)?;
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        if matches!(device, Device::Metal) {
+            return Ok(());
+        }
+        return Err(FerrumError::unsupported(
+            format!("device-memory sampling requires a native Metal runtime enabled in this build; selected device is {device}"),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for ComponentRegistry {
@@ -898,6 +947,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
         &self,
         config: &ComponentConfig,
     ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+        if config
+            .engine_config
+            .runtime
+            .device_memory_sampling
+            .is_some()
+        {
+            return Err(FerrumError::unsupported(
+                "device-memory sampling is unavailable on a stub executor",
+            ));
+        }
         let vocab_size = config
             .engine_config
             .model
@@ -1290,8 +1349,10 @@ fn create_registered_vnext_executor(
             let device_id = ferrum_interfaces::vnext::DeviceId::new("device.metal.0")
                 .map_err(|error| FerrumError::device(error.to_string()))?;
             let composition =
-                ferrum_kernels::backend::metal::vnext_ops::MetalVNextComposition::create(
+                ferrum_kernels::backend::metal::vnext_ops::MetalVNextComposition::create_with_observation(
                     device_id,
+                    config.engine_config.runtime.device_memory_sampling.as_ref(),
+                    config.engine_config.scheduler.slo.cost_observation.structured_capture,
                 )
                 .map_err(|error| {
                     FerrumError::device(format!("create vNext Metal runtime: {error}"))
@@ -1371,6 +1432,8 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use candle_core::{DType, Device as CandleDevice};
         use ferrum_models::weight_format::WeightFormat;
 
+        validate_device_memory_sampling_config(&config.engine_config, &config.device)?;
+
         // Try to load model from path
         let checkpoint_capture_enabled = config
             .engine_config
@@ -1388,6 +1451,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         let model_path = match model_path {
             Some(path) => path,
             None => {
+                if config
+                    .engine_config
+                    .runtime
+                    .device_memory_sampling
+                    .is_some()
+                {
+                    return Err(FerrumError::unsupported(
+                        "device-memory sampling requires a registered native Metal model source",
+                    ));
+                }
                 if checkpoint_capture_enabled {
                     return Err(FerrumError::unsupported(
                         "vNext checkpoint capture requires a registered model source",
@@ -1457,6 +1530,16 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         if checkpoint_capture_enabled {
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
+            ));
+        }
+        if config
+            .engine_config
+            .runtime
+            .device_memory_sampling
+            .is_some()
+        {
+            return Err(FerrumError::unsupported(
+                "device-memory sampling requires a registered native Metal model package",
             ));
         }
 
@@ -1929,6 +2012,40 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     mod mixed_batch_tests;
+
+    #[tokio::test]
+    async fn device_memory_sampling_direct_engine_config_rejects_unavailable_backend_before_loading(
+    ) {
+        let mut devices = vec![Device::CPU, Device::ROCm(0), Device::CUDA(0)];
+        if !cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        )) {
+            devices.push(Device::Metal);
+        }
+        for device in devices {
+            let mut engine_config = EngineConfig::default();
+            engine_config.backend.device = device;
+            engine_config.runtime.device_memory_sampling =
+                Some(ferrum_types::DeviceMemorySamplingConfig {
+                    jsonl_path: PathBuf::from("must-not-be-created.jsonl"),
+                });
+            let config = ComponentConfig::from_engine_config(&engine_config);
+            // Both the registry entrypoint and direct built-in factory must
+            // reject rather than creating a stub or attempting to load a model.
+            let registry = ComponentRegistry::with_defaults();
+            let error = registry
+                .create_executor("llm", &config)
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, FerrumError::Unsupported { .. }), "{error}");
+            assert!(error.to_string().contains("device-memory sampling"));
+            let error = LlmExecutorFactory.create(&config).await.err().unwrap();
+            assert!(matches!(error, FerrumError::Unsupported { .. }), "{error}");
+            assert!(error.to_string().contains("device-memory sampling"));
+        }
+    }
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

@@ -10176,6 +10176,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let fields = snapshot
             .as_object_mut()
             .expect("vNext executor snapshot is an object");
+        if let Some(memory) = self.runtime.device_memory_snapshot() {
+            fields.insert("device_memory".to_owned(), serde_json::json!(memory));
+        }
         // Cache health consumes these top-level fields. Always publish native
         // values, including disabled/zero, so text-LCP fallback cannot stand in
         // for sequence checkpoint reuse on this executor.
@@ -11255,6 +11258,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         Some(self.metrics_snapshot())
+    }
+
+    fn finish_device_memory_sampling(&self) -> Result<()> {
+        self.runtime
+            .finish_device_memory_sampling()
+            .map_err(|error| FerrumError::device(format!("finish device-memory sampling: {error}")))
+    }
+
+    fn device_memory_snapshot(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceMemoryTelemetrySnapshot> {
+        self.runtime.device_memory_snapshot()
     }
 
     fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {

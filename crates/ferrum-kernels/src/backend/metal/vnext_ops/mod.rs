@@ -115,6 +115,7 @@ pub fn metal_vnext_runtime_config(
             include_str!("../vnext_runtime.rs").as_bytes(),
             include_str!("../vnext_runtime/core_cost_route.rs").as_bytes(),
             include_str!("../vnext_runtime/counter_readback.rs").as_bytes(),
+            include_str!("../vnext_runtime/device_memory.rs").as_bytes(),
             include_str!("mod.rs").as_bytes(),
             include_str!("weights.rs").as_bytes(),
             hadamard::FINGERPRINT_SOURCE.as_bytes(),
@@ -152,8 +153,14 @@ pub fn metal_vnext_runtime_config(
 pub fn metal_vnext_operation_registry(
     runtime: &MetalDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<MetalDeviceRuntime>, MetalDeviceRuntimeError> {
-    let pipelines = Arc::new(MetalPrimitivePipelines::new(runtime.device())?);
-    let linear_pipelines = Arc::new(MetalLinearPipelines::new(runtime.device())?);
+    let pipelines = Arc::new(
+        MetalPrimitivePipelines::new(runtime.device())?
+            .with_structured_capture(runtime.structured_capture()),
+    );
+    let linear_pipelines = Arc::new(
+        MetalLinearPipelines::new(runtime.device())?
+            .with_structured_capture(runtime.structured_capture()),
+    );
     let moe_pipelines = Arc::new(MetalMoePipelines::new(runtime.device())?);
     let gated_delta_pipelines = Arc::new(MetalGatedDeltaPipelines::new(runtime.device())?);
     let causal_attention_pipelines =
@@ -296,8 +303,35 @@ pub struct MetalVNextComposition {
 
 impl MetalVNextComposition {
     pub fn create(device_id: DeviceId) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::create_with_memory_sampling(device_id, None)
+    }
+
+    pub fn create_with_memory_sampling(
+        device_id: DeviceId,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::create_with_observation(
+            device_id,
+            memory_sampling,
+            ferrum_types::SloStructuredCostCapture::Disabled,
+        )
+    }
+
+    /// Immutable observation mode shared by native encoders and future routes.
+    /// Pipeline objects remain engine-local even when the device caches PSOs.
+    pub fn create_with_observation(
+        device_id: DeviceId,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
         let config = metal_vnext_runtime_config(device_id).map_err(contract_error)?;
-        let runtime = Arc::new(MetalDeviceRuntime::new(config)?);
+        let runtime = Arc::new(MetalDeviceRuntime::new_with_structured_capture(
+            config,
+            structured_capture,
+        )?);
+        if let Some(config) = memory_sampling {
+            runtime.enable_device_memory_sampling(config)?;
+        }
         let registry = metal_vnext_operation_registry(&runtime)?;
         let weight_materializers =
             WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
@@ -311,6 +345,7 @@ impl MetalVNextComposition {
                 include_str!("../vnext_runtime.rs").as_bytes(),
                 include_str!("../vnext_runtime/core_cost_route.rs").as_bytes(),
                 include_str!("../vnext_runtime/counter_readback.rs").as_bytes(),
+                include_str!("../vnext_runtime/device_memory.rs").as_bytes(),
                 METAL_ENGINE_PROVIDER_ID.as_bytes(),
             ]),
             runtime.descriptor().id.clone(),

@@ -3870,6 +3870,17 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Finish an explicitly enabled device-memory diagnostic after work drains.
+    /// This neither changes resource accounting nor synchronizes GPU work.
+    fn finish_device_memory_sampling(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observations from an explicitly enabled sampler on the actual runtime.
+    fn device_memory_snapshot(&self) -> Option<crate::vnext::DeviceMemoryTelemetrySnapshot> {
+        None
+    }
+
     /// Optional compact provider-attribution witness emitted by executors
     /// whose immutable plan can bind quantized source tensors to selected
     /// operation providers without exposing per-tensor logs.

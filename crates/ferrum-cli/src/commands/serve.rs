@@ -282,6 +282,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub memory_profile_jsonl: Option<PathBuf>,
 
+    #[arg(long, value_name = "PATH", help = super::device_memory::HELP,
+        conflicts_with = "observability_vertical_slice_out")]
+    pub device_memory_jsonl: Option<PathBuf>,
+
     /// Write scheduler iteration trace events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub scheduler_trace_jsonl: Option<PathBuf>,
@@ -446,6 +450,7 @@ async fn execute_with_compatibility(
         profile_detail,
         vnext_diagnostic_fault,
         memory_profile_jsonl,
+        device_memory_jsonl,
         scheduler_trace_jsonl,
         request_dump_dir,
         profile_sample_rate,
@@ -463,6 +468,17 @@ async fn execute_with_compatibility(
     let loaded_slo =
         super::slo::load(slo_config.as_deref(), config.runtime.slo_config.as_deref()).await?;
     let pid_file = std::env::temp_dir().join("ferrum.pid");
+    super::device_memory::validate_output_paths(
+        device_memory_jsonl.as_deref(),
+        [
+            ("--profile-jsonl", profile_jsonl.as_deref()),
+            ("--memory-profile-jsonl", memory_profile_jsonl.as_deref()),
+            ("--scheduler-trace-jsonl", scheduler_trace_jsonl.as_deref()),
+            ("--effective-config-json", effective_config_json.as_deref()),
+            ("--decision-trace-jsonl", decision_trace_jsonl.as_deref()),
+            ("server PID file", Some(pid_file.as_path())),
+        ],
+    )?;
 
     let default_enable_thinking = if enable_thinking {
         Some(true)
@@ -534,6 +550,11 @@ async fn execute_with_compatibility(
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        if device_memory_jsonl.is_some() {
+            return Err(FerrumError::unsupported(
+                "--device-memory-jsonl requires a real native Metal runtime, not synthetic observability",
+            ));
+        }
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
         )?;
@@ -563,6 +584,8 @@ async fn execute_with_compatibility(
             selection.selected_distributed_strategy
         );
     }
+    let device_memory_sampling =
+        super::device_memory::resolve(device_memory_jsonl.as_deref(), &device)?;
     let backend_initialized_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -937,6 +960,10 @@ async fn execute_with_compatibility(
     } else {
         ferrum_types::ExecutionResourceAuthority::LegacyEngine
     };
+    super::device_memory::validate_authority(
+        device_memory_sampling.as_ref(),
+        execution_resource_authority,
+    )?;
     if let Some(slo) = &loaded_slo {
         slo.validate_authority(execution_resource_authority)?;
     }
@@ -1008,6 +1035,11 @@ async fn execute_with_compatibility(
     {
         return Err(FerrumError::unsupported(
             "enabled SLO policy requires a language-model runtime",
+        ));
+    }
+    if device_memory_sampling.is_some() && served_model_kind != ServedModelKind::Llm {
+        return Err(FerrumError::unsupported(
+            "--device-memory-jsonl requires a Metal language-model runtime",
         ));
     }
     if vnext_checkpoint.teacher_token_file.is_some() {
@@ -1122,6 +1154,7 @@ async fn execute_with_compatibility(
                     .map_err(ferrum_types::FerrumError::config)?;
                 engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
                 engine_config.runtime.startup_memory_request = startup_memory_request;
+                engine_config.runtime.device_memory_sampling = device_memory_sampling;
                 engine_config.backend.backend_options.insert(
                     "model_path".to_string(),
                     serde_json::Value::String(engine_model_path.clone()),

@@ -2838,6 +2838,15 @@ impl ContinuousBatchEngine {
             model_executor.as_ref(),
             draft_executor.is_some() || spec_config.is_some(),
         )?;
+        crate::registry::validate_device_memory_sampling_config(&config, &config.backend.device)?;
+        if config.runtime.device_memory_sampling.is_some()
+            && (executor_authority != ExecutionResourceAuthority::PlanRuntime
+                || model_executor.device_memory_snapshot().is_none())
+        {
+            return Err(FerrumError::unsupported(
+                "the selected executor does not expose the requested native device-memory sampler",
+            ));
+        }
         if draft_executor.is_some() != spec_config.is_some() {
             return Err(FerrumError::config(
                 "speculative decoding requires both a draft executor and its configuration",
@@ -3524,12 +3533,23 @@ impl InferenceEngine for ContinuousBatchEngine {
             })
         };
 
+        // Always finalize enabled diagnostics, including when another shutdown
+        // step failed. The sampler owns no inference resources or GPU waits.
+        let memory_result = self.inner.model_executor.finish_device_memory_sampling();
+        let draft_memory_result = self
+            .inner
+            .draft_executor
+            .as_ref()
+            .map(|executor| executor.finish_device_memory_sampling())
+            .unwrap_or(Ok(()));
         loop_result?;
         controller_result?;
         readiness_result?;
         output_result?;
         cost_result?;
-        trace_result
+        trace_result?;
+        memory_result?;
+        draft_memory_result
     }
 
     fn config(&self) -> &EngineConfig {
