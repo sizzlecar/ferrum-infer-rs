@@ -138,6 +138,7 @@ fn reference_limits_apply_to_all_phases_and_strict_schema() {
         execution: manifest::Execution::Mixed,
         decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
         token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
+        rolling_window: None,
     });
     assert!(value
         .validate(&manifest, &inputs::PreparedInputs::Rendered)
@@ -291,6 +292,7 @@ fn optional_reference_manifest_resolves_outputs_and_validates_full_declaration()
             execution: manifest::Execution::Split,
             decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
             token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
+            rolling_window: None,
         });
     assert!(invalid.validate().is_err());
 }

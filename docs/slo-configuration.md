@@ -359,6 +359,24 @@ profile 验证。导入模型不要求等于原在线模型，二者的发布历
 需要与部署固定资源预算匹配时，显式传入 `--runtime-memory-budget-bytes`；该值进入
 共享产品启动解析及报告中的有效配置，不要求设置环境变量。
 
+每个 cohort 还可显式设置 `"rolling_window":{"maximum_in_flight":8}`。
+此时 `prompts` 是有限、有序的请求索引列表；最多保留指定数量的在途请求，
+一个请求的终态输出与成功 completion 都消费完后，才补入下一个索引。
+例如，64 个原请求可以在固定窗口 8 下持续补位，无需等最慢的同批请求结束。
+省略该字段或设为 `null` 时仍按原整组方式运行，上一组全部结束后才开始下一组。
+
+窗口必须非零且不超过 `protocol.maximum_requests`。它不扩大引擎容量、输出额度
+或资源许可；所有请求仍使用原 prompt、采样策略和完整输出预算。遇到消费失败或
+取消时中止采集并执行原关闭流程，不以失败请求空出的槽继续收集。
+每个 cohort 的 chunk、split/mixed 和 decode route 仍固定；滚动入场不代表覆盖了
+所有执行形状。此选项只影响校准命令，普通 `run` / `serve` 的行为不变。
+
+该字段进入完整 manifest 的协议摘要，因此滚动与整组采集具有不同身份。
+fit→冻结→独立 residual→导出/重新导入→heldout 的阶段隔离不变。采集前须按完整
+输出工作量声明有界 timeout；窗口不延长 profile TTL，也不改变残差分位数或样本门槛。
+原始记录新增 `rolling_admission`、`rolling_completion` 和
+`rolling_cohort_drained`，保留实际 request ID、输入序号和在途数量。
+
 每个显式 cohort 可选 `"token_policy_residency":"invalidate_before_cohort"`，
 在每次 repetition 添加请求前，清除上一次真实 token-policy 上传的 residency 记录。
 省略或设为 `"preserve"` 保持原行为，普通 `run` / `serve` 不调用此校准操作。

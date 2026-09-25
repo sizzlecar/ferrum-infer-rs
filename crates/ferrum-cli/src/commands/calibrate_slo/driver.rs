@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+mod admission;
+use admission::AdmissionWindow;
+
 pub(super) async fn collect(
     session: &mut CalibrationSession,
     manifest: &manifest::Manifest,
@@ -171,47 +174,71 @@ pub(super) async fn cohort(
             }
         }
     }
-    let mut consumers = JoinSet::new();
-    let mut owners = Vec::with_capacity(case.prompts.len());
-    let mut source_indices = Vec::with_capacity(case.prompts.len());
-    let mut evidenced_owners = std::collections::HashSet::new();
-    for &prompt_index in &case.prompts {
-        let context = InferenceRequestContext::capture();
-        let (request, input_evidence) = inputs.request_for_phase(
-            manifest,
-            prompt_index,
-            &session.configuration().model.model_id,
-            session
-                .configuration()
-                .sampling
-                .default_params
-                .model_output_protocol,
-            phase,
-        )?;
-        let maximum_output_tokens = request.sampling_params.max_tokens;
-        let id = request.id.clone();
-        let contract = inputs.output_contract(manifest.protocol.output, &request);
-        let output = session
-            .add_request(request, context, Arc::new(contract))
-            .await?;
-        artifacts.record(
-            &serde_json::json!({"schema_version":1,"event":"request","phase":phase,
-            "case":index,"repetition":repetition,"request_id":id,"prompt_index":prompt_index,
-            "input":input_evidence,"maximum_output_tokens":maximum_output_tokens}),
-        )?;
-        owners.push(id.clone());
-        source_indices.push(prompt_index);
-        consumers.spawn(async move { consume(id, output).await });
-        totals.request(phase);
-    }
-    while !consumers.is_empty() {
+    let mut consumers = JoinSet::<Result<(ferrum_types::RequestId, serde_json::Value)>>::new();
+    let mut window =
+        AdmissionWindow::<ferrum_types::RequestId>::new(&case.prompts, case.maximum_in_flight())?;
+    while !window.drained() {
+        // Completion means both terminal wire and the retained completion lease
+        // were consumed successfully. GPU completion or an early terminal
+        // frontier alone cannot open an arrival slot.
         while let Some(joined) = consumers.try_join_next() {
-            let output = joined.map_err(|error| {
+            let (id, output) = joined.map_err(|error| {
                 FerrumError::internal(format!("calibration output task: {error}"))
             })??;
             artifacts.record(&output)?;
+            let completed = window.completed(&id)?;
+            if case.rolling_window.is_some() {
+                artifacts.record(&serde_json::json!({
+                    "schema_version": 1, "event": "rolling_completion",
+                    "phase": phase, "case": index, "repetition": repetition,
+                    "request_id": id, "cohort_request_ordinal": completed.ordinal,
+                    "in_flight": window.active().len(),
+                }))?;
+            }
         }
-        if consumers.is_empty() {
+        // Initial fill and later refill share the exact same product request
+        // conversion and add_request path. No sample or output budget changes.
+        while let Some((ordinal, prompt_index)) = window.next_prompt() {
+            let context = InferenceRequestContext::capture();
+            let (request, input_evidence) = inputs.request_for_phase(
+                manifest,
+                prompt_index,
+                &session.configuration().model.model_id,
+                session
+                    .configuration()
+                    .sampling
+                    .default_params
+                    .model_output_protocol,
+                phase,
+            )?;
+            let maximum_output_tokens = request.sampling_params.max_tokens;
+            let id = request.id.clone();
+            let contract = inputs.output_contract(manifest.protocol.output, &request);
+            let output = session
+                .add_request(request, context, Arc::new(contract))
+                .await?;
+            window.admitted(ordinal, id.clone())?;
+            artifacts.record(
+                &serde_json::json!({"schema_version":1,"event":"request","phase":phase,
+                "case":index,"repetition":repetition,"request_id":id,"prompt_index":prompt_index,
+                "input":input_evidence,"maximum_output_tokens":maximum_output_tokens}),
+            )?;
+            if case.rolling_window.is_some() {
+                artifacts.record(&serde_json::json!({
+                    "schema_version": 1, "event": "rolling_admission",
+                    "phase": phase, "case": index, "repetition": repetition,
+                    "request_id": id, "cohort_request_ordinal": ordinal,
+                    "prompt_index": prompt_index, "in_flight": window.active().len(),
+                    "maximum_in_flight": case.maximum_in_flight(),
+                }))?;
+            }
+            consumers.spawn(async move {
+                let record = consume(id.clone(), output).await?;
+                Ok::<_, FerrumError>((id, record))
+            });
+            totals.request(phase);
+        }
+        if window.drained() {
             break;
         }
         // A guarded wave can return a one-use backing-maintenance ticket.
@@ -237,20 +264,14 @@ pub(super) async fn cohort(
                 "phase":phase,"case":index,"repetition":repetition,"outcome":format!("{admission:?}")}))?;
         }
         let frontiers = session.frontiers()?;
-        for frontier in frontiers
-            .iter()
-            .filter(|frontier| owners.contains(frontier.request_id()))
-        {
-            if evidenced_owners.insert(frontier.request_id().clone()) {
+        for frontier in &frontiers {
+            let Some(owner) = window.owner_mut(frontier.request_id()) else {
+                continue;
+            };
+            if !owner.evidenced {
+                owner.evidenced = true;
                 if let Some(identities) = &mut totals.reference_input_identities {
-                    let source_index = owners
-                        .iter()
-                        .position(|id| id == frontier.request_id())
-                        .and_then(|index| source_indices.get(index))
-                        .copied()
-                        .ok_or_else(|| {
-                            FerrumError::internal("source identity correlation missing")
-                        })?;
+                    let source_index = owner.source_index;
                     let independent = manifest
                         .reference
                         .as_ref()
@@ -266,9 +287,10 @@ pub(super) async fn cohort(
                     "input":frontier.request_evidence()}))?;
             }
         }
-        let ordered = owners
+        let ordered = window
+            .active()
             .iter()
-            .filter_map(|id| frontiers.iter().find(|row| row.request_id() == id));
+            .filter_map(|owner| frontiers.iter().find(|row| row.request_id() == &owner.id));
         let mut prefills = Vec::new();
         let mut decodes = Vec::new();
         for frontier in ordered {
@@ -318,6 +340,13 @@ pub(super) async fn cohort(
         // Output consumers release real credits. Bounded retries never spin or
         // shorten max_tokens to force a particular calibration shape.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    if case.rolling_window.is_some() {
+        artifacts.record(&serde_json::json!({
+            "schema_version": 1, "event": "rolling_cohort_drained",
+            "phase": phase, "case": index, "repetition": repetition,
+            "completed_requests": case.prompts.len(), "in_flight": 0,
+        }))?;
     }
     Ok(())
 }

@@ -146,6 +146,10 @@ pub(super) struct Prompt {
 pub(super) struct Cohort {
     /// Ordered indices into prompts; duplicates represent distinct real owners.
     pub prompts: Vec<usize>,
+    /// Refill only after a real credited consumer has observed terminal wire
+    /// and successful completion. None preserves the original cohort barrier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_window: Option<RollingWindow>,
     pub repetitions: NonZeroUsize,
     pub prefill_chunk_tokens: NonZeroU32,
     pub execution: Execution,
@@ -157,6 +161,21 @@ pub(super) struct Cohort {
     /// It is not a device/driver cache reset or a full cold-start claim.
     #[serde(default)]
     pub token_policy_residency: TokenPolicyResidencyPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RollingWindow {
+    /// Bounds requests whose terminal output and completion have not both been
+    /// consumed. Engine admission, allocator and output credits remain separate.
+    pub maximum_in_flight: NonZeroUsize,
+}
+
+impl Cohort {
+    pub(super) fn maximum_in_flight(&self) -> usize {
+        self.rolling_window
+            .map_or(self.prompts.len(), |window| window.maximum_in_flight.get())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,13 +315,14 @@ impl Manifest {
         let mut owners = 0usize;
         for case in self.cohorts() {
             if case.prompts.is_empty()
-                || case.prompts.len() > p.maximum_requests.get()
+                || case.prompts.len() > 65_536
+                || case.maximum_in_flight() > p.maximum_requests.get()
                 || case.repetitions.get() > 64
                 || case.prefill_chunk_tokens.get() > 1_048_576
                 || case.prompts.iter().any(|index| *index >= prompt_count)
             {
                 return invalid(
-                    "invalid exact cohort width, prompt index, repetition or chunk bound",
+                    "invalid cohort arrival width, prompt index, repetition or chunk bound",
                 );
             }
             owners = owners

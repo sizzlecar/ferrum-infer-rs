@@ -90,7 +90,8 @@ impl ReferenceConfig {
             .chain(&self.warmup)
         {
             if case.prompts.is_empty()
-                || case.prompts.len() > manifest.protocol.maximum_requests.get()
+                || case.prompts.len() > 65_536
+                || case.maximum_in_flight() > manifest.protocol.maximum_requests.get()
                 || case.repetitions.get() > 64
                 || case.prefill_chunk_tokens.get() > 1_048_576
                 || case.prompts.iter().any(|&index| index >= count)
@@ -139,6 +140,7 @@ impl ReferenceConfig {
             execution: manifest::Execution::Split,
             decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
             token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
+            rolling_window: None,
         })
     }
 }

@@ -74,6 +74,7 @@ pub(super) fn manifest() -> manifest::Manifest {
         execution: manifest::Execution::Mixed,
         decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
         token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
+        rolling_window: None,
     };
     manifest::Manifest {
         schema_version: 1,
@@ -379,3 +380,6 @@ fn collection_and_shutdown_failures_remain_independently_visible() {
     assert!(summary.collection_error.is_none());
     assert!(summary.shutdown.as_ref().unwrap().completed);
 }
+
+#[path = "rolling_window_tests.rs"]
+mod rolling_window_tests;
