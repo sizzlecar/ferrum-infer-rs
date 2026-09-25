@@ -2,6 +2,8 @@
 //! profile import, latency target or prospective per-class work is manufactured.
 use super::*;
 
+#[path = "structured/calibration_v2.rs"]
+mod calibration_v2;
 #[path = "structured/prepared.rs"]
 mod prepared;
 

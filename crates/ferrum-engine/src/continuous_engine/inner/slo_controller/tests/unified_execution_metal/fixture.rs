@@ -21,12 +21,19 @@ pub(super) async fn fixture() -> (CalibrationSession, ModelDirectory) {
 pub(super) async fn fixture_with_structured_capture(
     enabled: bool,
 ) -> (CalibrationSession, ModelDirectory) {
+    fixture_with_structured_geometry(enabled, weights::CausalGeometry::TINY).await
+}
+
+pub(super) async fn fixture_with_structured_geometry(
+    enabled: bool,
+    geometry: weights::CausalGeometry,
+) -> (CalibrationSession, ModelDirectory) {
     let directory = ModelDirectory(
         std::env::temp_dir().join(format!("ferrum-unified-metal-{}", uuid::Uuid::new_v4())),
     );
     std::fs::create_dir(&directory.0).unwrap();
-    weights::write_config(&directory.0, weights::CausalGeometry::TINY);
-    weights::write_weights(&directory.0, weights::CausalGeometry::TINY);
+    weights::write_config(&directory.0, geometry);
+    weights::write_weights(&directory.0, geometry);
     std::fs::write(directory.0.join("tokenizer.json"), br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1,"<eos>":2},"unk_token":"<unk>"}}"#).unwrap();
     std::fs::write(directory.0.join("tokenizer_config.json"), br#"{"chat_template":"{% for message in messages %}{{ message['content'] }}{% endfor %}","eos_token_id":2,"unk_token":"<unk>"}"#).unwrap();
     let mut raw = tokenizers::Tokenizer::from_file(directory.0.join("tokenizer.json")).unwrap();

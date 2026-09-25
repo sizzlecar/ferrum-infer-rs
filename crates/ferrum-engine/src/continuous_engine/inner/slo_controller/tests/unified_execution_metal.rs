@@ -62,7 +62,10 @@ fn selected_partial_proof(inner: &EngineInner, captured: &mut ControllerSnapshot
     config.candidate_limit = NonZeroUsize::new(1).unwrap();
     config.beam_width = NonZeroUsize::new(1).unwrap();
     let planner = BoundedSloPlanner {
-        settings: BoundedPlannerSettings { search: config },
+        settings: BoundedPlannerSettings {
+            search: config,
+            ..Default::default()
+        },
     };
     let context = shape::ExecutorShape {
         engine: inner,
