@@ -234,7 +234,13 @@ pub(super) fn project_decode<'epoch>(
             action: WaveAction::Decode,
         })
         .collect();
-    execution::project(snapshot, requests, &work, state, false, false, &mut || {
-        Ok(())
-    })
+    execution::project(
+        snapshot,
+        requests,
+        &work,
+        state,
+        false,
+        PlanningCostEvidenceRequirement::None,
+        &mut || Ok(()),
+    )
 }

@@ -3,6 +3,45 @@
 //! retained. These counters do not train, publish, or authorize execution.
 use ferrum_interfaces::execution_cost::StatisticalEvidenceUnknown as Evidence;
 use ferrum_scheduler::implementations::continuous::cost_model::statistical::model::ModelUnknown;
+use ferrum_scheduler::implementations::continuous::cost_model::structured::StructuredUnknown;
+
+pub(super) fn record_structured<T>(result: &Result<T, StructuredUnknown>) {
+    let (status, reason) = match result {
+        Ok(_) => ("known", "none"),
+        Err(reason) => ("unknown", structured_label(*reason)),
+    };
+    metrics::counter!("ferrum.engine.structured_cost_queries_total",
+        "scope" => "candidate", "result" => status, "reason" => reason)
+    .increment(1);
+}
+
+fn structured_label(reason: StructuredUnknown) -> &'static str {
+    match reason {
+        StructuredUnknown::MissingEvidence => "missing_evidence",
+        StructuredUnknown::UnsupportedScope => "unsupported_scope",
+        StructuredUnknown::InvalidInput => "invalid_input",
+        StructuredUnknown::InvalidSettings => "invalid_settings",
+        StructuredUnknown::WrongDomain => "wrong_domain",
+        StructuredUnknown::WrongSource => "wrong_source",
+        StructuredUnknown::WrongProtocol => "wrong_protocol",
+        StructuredUnknown::WrongFingerprint => "wrong_fingerprint",
+        StructuredUnknown::PhaseLeakage => "phase_leakage",
+        StructuredUnknown::DuplicateRecord => "duplicate_record",
+        StructuredUnknown::InvalidSample => "invalid_sample",
+        StructuredUnknown::Capacity => "capacity",
+        StructuredUnknown::Clock => "clock",
+        StructuredUnknown::Stale => "stale",
+        StructuredUnknown::InsufficientSamples => "insufficient_samples",
+        StructuredUnknown::InsufficientRedundancy => "insufficient_redundancy",
+        StructuredUnknown::IncompletePhasePopulation => "incomplete_phase_population",
+        StructuredUnknown::JointSupport => "joint_support",
+        StructuredUnknown::UnidentifiedDirection => "unidentified_direction",
+        StructuredUnknown::IllConditioned => "ill_conditioned",
+        StructuredUnknown::Numerical => "numerical",
+        StructuredUnknown::QualificationCoverage => "qualification_coverage",
+        StructuredUnknown::QualificationUnderestimate => "qualification_underestimate",
+    }
+}
 
 pub(super) enum QueryScope {
     Candidate,

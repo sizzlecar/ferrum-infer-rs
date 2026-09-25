@@ -49,6 +49,45 @@ fn load_clock() -> file::ProfileLoadClock {
     }
 }
 
+#[test]
+fn structured_observe_without_artifact_never_starts_legacy_training() {
+    let config = SloCostObservationConfig::structured_whole_wave_v1();
+    let seed = load_seed(&identity(), &config, None, None).unwrap();
+    assert!(seed.trainer.is_none());
+    assert!(seed.snapshot.is_none());
+    assert!(seed.receipt.is_none());
+}
+
+#[test]
+fn structured_import_rejects_legacy_artifact_and_undeclared_clock() {
+    let fixture = Fixture::new();
+    let mut config = SloCostObservationConfig::structured_whole_wave_v1();
+    assert!(load_seed(
+        &identity(),
+        &config,
+        Some(&fixture.path),
+        Some(load_clock())
+    )
+    .is_err());
+    config.profile_import.declared_local_clock_max_error_ns = Some(0);
+    assert!(load_seed(
+        &identity(),
+        &config,
+        Some(&fixture.path),
+        Some(load_clock())
+    )
+    .is_err());
+    let mut inconsistent = load_clock();
+    inconsistent.wall_max_error_ns = Some(1);
+    assert!(load_seed(
+        &identity(),
+        &config,
+        Some(&fixture.path),
+        Some(inconsistent)
+    )
+    .is_err());
+}
+
 impl Fixture {
     fn new() -> Self {
         let mut config = SloCostObservationConfig::default();

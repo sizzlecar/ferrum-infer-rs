@@ -1,8 +1,9 @@
 # Structured whole-wave cost model
 
-Status: staged implementation. Optional capture connects future route projection,
-actual execution, and receipt-qualified host settlement. It does not enable a new
-predictor, import a new profile, or qualify a performance result.
+Status: initial scope implementation. Optional capture connects future route
+projection, actual execution, and receipt-qualified host settlement. Explicit
+profile schema 9 imports a qualified ordinary-decode model into the planner.
+This does not establish complete serving coverage or a performance result.
 
 ## Problem and choice
 
@@ -12,7 +13,7 @@ in terminal position or host row pattern split otherwise reusable device work
 into separate calibration populations. Requiring independent fit and residual
 samples for every such combination makes coverage expensive.
 
-The next model will describe device execution and host work separately while
+The structured model describes device execution and host work separately while
 retaining a single whole-wave time target. A shared statistical population is an
 explicit empirical hypothesis, not permission to reorder execution. Improving
 coverage and controlling underestimation are separate requirements.
@@ -96,8 +97,9 @@ assignment in that same command. Its default path does not collect the sparse
 table. Complete-wave aggregation retains a bounded sparse table and an ordered
 binding to the original command assignments. Missing producers, overflow, or
 capacity exhaustion leave the table unavailable; partial tables are not training
-inputs. Retention accounts for allocated backing capacity. Complete provider
-opt-in remains a separate integration step. Features must be available from both
+inputs. Retention accounts for allocated backing capacity. Metal producer opt-in
+covers the existing proven dense, SwiGLU, attention, primitive and core-transfer
+routes. Other routes still need explicit producers. Features must be available from both
 actual and prospective execution, without using future durations or actual EOS
 outcomes as inputs.
 
@@ -134,9 +136,9 @@ requires coverage of every declared physical termination position and the
 nonterminal case, with no unknown or underestimated heldout point. This finite
 challenge does not establish a distribution-free p99 guarantee.
 
-The core does not deserialize qualified receipts, import a profile, install a
-production predictor, or authorize execution. Independent full-model calibration,
-drift handling, and serving measurements remain separate completion requirements.
+The core does not deserialize qualified receipts or authorize execution. The
+separate schema-9 adapter below owns startup import. Independent full-model
+calibration, drift handling, and serving measurements remain completion requirements.
 
 ## Live calibration collection
 
@@ -170,6 +172,57 @@ failed footer and no model; an incomplete file cannot receive a successful sourc
 receipt. This API does not install a serving predictor or load a model from JSON.
 Real backend calibration and heldout measurements are still required.
 
+## Explicit schema-9 predictor
+
+Select the predictor and its required future-route evidence together in the
+shared policy file:
+
+```toml
+cost_profile = "/absolute/path/to/structured-profile.json"
+
+[cost_observation]
+predictor = "structured_whole_wave_v1"
+structured_capture = "host_settled_v1"
+
+[cost_observation.profile_import]
+declared_local_clock_max_error_ns = 1000000
+```
+
+The clock-error value must describe the actual host clock; it is not an inferred
+accuracy guarantee. Schema 9 limits the combined declared source and local error.
+The source freezes its own model settings. Legacy `cost_observation.model`
+overrides, legacy `profile_export`, and selected-family feedback are incompatible
+with this predictor. Observe calibration may run without an installed artifact;
+it does not start a legacy online trainer.
+
+Export and load verify the entire original source, including offered attempts,
+reserved members, FIFO order, the three phase cuts and prefix hashes, exact
+receipts and algorithm work, and the independently recomputed numerical payload.
+They replay fit, residual calibration and qualification at their original freeze
+times and compare parameter hashes. JSON produces replay-only numbers, never a
+live qualified settlement receipt. The source file must remain available with
+the exported envelope. Source schema 2 includes the independent-attention
+sidecar needed to reproduce the original host-stage binding.
+
+An immutable imported model retains the original capture epoch and TTL. Every
+candidate projects a typed input from its attached selected route once; queries
+perform no file IO or fitting. Unsupported scopes, missing evidence, stale
+samples and unsupported numerical combinations remain Unknown. There is no
+fallback to an older profile. Every host-content alternative must be covered;
+the planner uses their largest planning cost and shortest remaining validity,
+including the time needed to finish the wave.
+
+`ferrum.engine.structured_cost_queries_total` reports bounded Known/Unknown
+reason labels separately from selected-profile counters. The startup receipt
+records source and profile hashes, domain, parameters, original phase cutoffs and
+clock ages. These are diagnostic provenance, not proof of a feasible plan.
+
+The initial artifact covers one fixed ordinary-decode width/domain. Prefill,
+first decode, multiple simultaneous length terminations, other widths and UTF-8
+branches need independently qualified scopes before a complete concurrent
+horizon can be established. The ordinary PlainTextGreedy scope excludes active
+model EOS, explicit stops and structured completion under the installed policy.
+
 ## Feedback and acceptance
 
 The existing explicit `RetrospectiveFamilyMarginV1` policy can adjust margins for
@@ -179,11 +232,15 @@ refit the frozen model, or extend TTL. Its settings and persistence policy must
 be declared for an experiment; enabling it does not retroactively qualify a
 failed heldout evaluation.
 
+That feedback protocol belongs to selected profiles 6–8 and is not applied to
+schema 9. Structured-model drift feedback remains a separate implementation step;
+the imported snapshot does not refit or refresh itself from serving observations.
+
 The Metal tiny-model test exercises projected and actual partial/final prefill,
 decode, and real terminal settlement. This verifies that capture path, not the
-Qwen3.5-9B performance target. The remaining sequence is complete per-algorithm
-producer wiring, justified numerical features and model identity, fresh
-independent calibration, and service validation. Backend tests must exercise the
+Qwen3.5-9B performance target. Remaining work includes complete workload scope
+coverage, fresh independent calibration, drift handling, and service validation.
+Backend tests must exercise the
 real selected routes. Final acceptance remains concurrent TTFT, TPOT, visible-text ITL,
 throughput, errors, and memory measurements. See
 [SLO configuration](slo-configuration.md) for the current explicit controls.

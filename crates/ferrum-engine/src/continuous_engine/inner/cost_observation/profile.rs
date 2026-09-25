@@ -4,7 +4,9 @@ use super::audit::TrainingErrorReason;
 use super::*;
 use ferrum_scheduler::implementations::continuous::{
     cost_model as model, cost_profile as file,
-    slo_planner::{PlanningCost, PlanningCostEvidence, PlanningCostModel},
+    slo_planner::{
+        PlanningCost, PlanningCostEvidence, PlanningCostEvidenceRequirement, PlanningCostModel,
+    },
 };
 use ferrum_types::{
     FerrumError, SloCostModelConfig, SloCostObservationConfig, SloCostProfileImportConfig,
@@ -12,6 +14,7 @@ use ferrum_types::{
 };
 use std::path::Path;
 mod selected;
+mod structured;
 
 pub(super) fn model_settings(config: &SloCostModelConfig) -> model::CostModelSettings {
     model::CostModelSettings {
@@ -120,6 +123,9 @@ pub(super) fn load_seed(
     if config.predictor.is_selected() {
         return selected::load_seed(fingerprint, config, path, clock);
     }
+    if config.predictor == ferrum_types::SloCostPredictor::StructuredWholeWaveV1 {
+        return structured::load_seed(fingerprint, config, path, clock);
+    }
     let Some(path) = path else {
         return Ok(TrainingSeed {
             trainer: Some(CostTrainer {
@@ -194,6 +200,7 @@ fn import_receipt(
         .collect();
     Ok(SloCostProfileReceipt {
         selected_whole_wave: None,
+        structured_whole_wave: None,
         schema_version: p.schema_version,
         path: p
             .loaded_from
@@ -263,6 +270,7 @@ impl CostTrainer {
 
 enum Snapshot {
     Selected(selected::SelectedSnapshot),
+    Structured(file::structured_v9::ImportedStructuredModelV1),
     Live(Arc<model::CostModelSnapshot>),
     Imported(file::ImportedCostSnapshot),
 }
@@ -381,7 +389,9 @@ impl EngineCostSnapshot {
 
     pub fn planning_boundary(&self) -> model::CostBoundary {
         match &self.inner {
-            Snapshot::Selected(_) => model::CostBoundary::PreparationToHostSettledV1,
+            Snapshot::Selected(_) | Snapshot::Structured(_) => {
+                model::CostBoundary::PreparationToHostSettledV1
+            }
             Snapshot::Live(snapshot) => snapshot.planning_boundary(),
             Snapshot::Imported(snapshot) => snapshot.planning_boundary(),
         }
@@ -389,6 +399,7 @@ impl EngineCostSnapshot {
     pub fn model_version(&self) -> u64 {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.feedback.as_ref().map_or(1, |v| v.epoch),
+            Snapshot::Structured(_) => 1,
             Snapshot::Live(snapshot) => snapshot.model_version(),
             Snapshot::Imported(snapshot) => snapshot.model_version(),
         }
@@ -396,6 +407,7 @@ impl EngineCostSnapshot {
     pub fn bucket_count(&self) -> usize {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.model.segment_count(),
+            Snapshot::Structured(_) => 1,
             Snapshot::Live(snapshot) => snapshot.bucket_count(),
             Snapshot::Imported(snapshot) => snapshot.bucket_count(),
         }
@@ -415,7 +427,7 @@ impl EngineCostSnapshot {
             return model::CostPrediction::Unknown(model::CostUnknownReason::FingerprintMismatch);
         }
         match &self.inner {
-            Snapshot::Selected(_) => {
+            Snapshot::Selected(_) | Snapshot::Structured(_) => {
                 model::CostPrediction::Unknown(model::CostUnknownReason::NumericFeaturesMissing)
             }
             Snapshot::Live(snapshot) => {
@@ -429,8 +441,15 @@ impl EngineCostSnapshot {
 }
 
 impl PlanningCostModel for EngineCostSnapshot {
+    fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
+        match &self.inner {
+            Snapshot::Selected(_) => PlanningCostEvidenceRequirement::Selected,
+            Snapshot::Structured(_) => PlanningCostEvidenceRequirement::Structured,
+            _ => PlanningCostEvidenceRequirement::None,
+        }
+    }
     fn requires_statistical_evidence(&self) -> bool {
-        matches!(&self.inner, Snapshot::Selected(_))
+        self.evidence_requirement() != PlanningCostEvidenceRequirement::None
     }
     fn predict_with_evidence(
         &self,
@@ -441,6 +460,14 @@ impl PlanningCostModel for EngineCostSnapshot {
     ) -> Option<PlanningCost> {
         match &self.inner {
             Snapshot::Selected(snapshot) => selected::predict(
+                snapshot,
+                fingerprint,
+                shape,
+                evidence,
+                now_ns,
+                self.model_version(),
+            ),
+            Snapshot::Structured(snapshot) => structured::predict(
                 snapshot,
                 fingerprint,
                 shape,

@@ -430,24 +430,50 @@ impl Eq for WaveCandidate {}
 
 /// Privately bound to one validated canonical alternative. The expected shape
 /// prevents a caller from rejoining a valid sidecar to different logical work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PlanningCostEvidence {
     expected: WaveExecutionShape,
-    input: super::super::cost_model::statistical::StatisticalModelInputV1,
+    input: BoundCostInput,
+}
+#[derive(Debug, Clone)]
+enum BoundCostInput {
+    Selected(super::super::cost_model::statistical::StatisticalModelInputV1),
+    Structured(Result<structured::StructuredInputV1, structured::StructuredUnknown>),
 }
 impl PlanningCostEvidence {
     pub(super) fn bind(
         exact: &CanonicalWaveCostShape,
         expected: &WaveExecutionShape,
         selected: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+        requirement: PlanningCostEvidenceRequirement,
     ) -> Option<Self> {
         if super::cost_shape::canonical_cost_shape(exact).ok().as_ref() != Some(expected) {
             return None;
         }
-        let input = super::super::cost_model::statistical::StatisticalModelInputV1::from_future(
-            exact, selected,
-        )
-        .ok()?;
+        let input = match requirement {
+            PlanningCostEvidenceRequirement::None => return None,
+            PlanningCostEvidenceRequirement::Selected => BoundCostInput::Selected(
+                super::super::cost_model::statistical::StatisticalModelInputV1::from_future(
+                    exact, selected,
+                )
+                .ok()?,
+            ),
+            PlanningCostEvidenceRequirement::Structured => {
+                // Cache the projection of this exact selected route once. A
+                // missing/unsupported sidecar remains an explicit failed query;
+                // it cannot fall back to a different cost protocol.
+                let input = selected
+                    .structured_capture()
+                    .ok_or(structured::StructuredUnknown::MissingEvidence)
+                    .and_then(|value| {
+                        value.map_err(|_| structured::StructuredUnknown::MissingEvidence)
+                    })
+                    .and_then(|value| {
+                        structured::StructuredInputV1::from_future(exact, selected, value)
+                    });
+                BoundCostInput::Structured(input)
+            }
+        };
         Some(Self {
             expected: expected.clone(),
             input,
@@ -457,7 +483,22 @@ impl PlanningCostEvidence {
         &self,
         shape: &WaveExecutionShape,
     ) -> Option<&super::super::cost_model::statistical::StatisticalModelInputV1> {
-        (shape == &self.expected).then_some(&self.input)
+        match &self.input {
+            BoundCostInput::Selected(input) if shape == &self.expected => Some(input),
+            _ => None,
+        }
+    }
+    pub fn structured_input_for(
+        &self,
+        shape: &WaveExecutionShape,
+    ) -> Result<&structured::StructuredInputV1, structured::StructuredUnknown> {
+        if shape != &self.expected {
+            return Err(structured::StructuredUnknown::MissingEvidence);
+        }
+        match &self.input {
+            BoundCostInput::Structured(input) => input.as_ref().map_err(|reason| *reason),
+            BoundCostInput::Selected(_) => Err(structured::StructuredUnknown::MissingEvidence),
+        }
     }
 }
 
@@ -617,11 +658,27 @@ pub struct PlanningCost {
     pub valid_for_ns: u64,
 }
 
+/// The model's input protocol is fixed before projecting any candidate.
+/// Unknown evidence never changes this selection or shrinks its alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningCostEvidenceRequirement {
+    None,
+    Selected,
+    Structured,
+}
+
 pub trait PlanningCostModel {
     /// New predictors explicitly require producer-bound selected statistics.
     /// The legacy callback remains unchanged for all existing implementations.
     fn requires_statistical_evidence(&self) -> bool {
         false
+    }
+    fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
+        if self.requires_statistical_evidence() {
+            PlanningCostEvidenceRequirement::Selected
+        } else {
+            PlanningCostEvidenceRequirement::None
+        }
     }
     fn predict_with_evidence(
         &self,
@@ -630,7 +687,7 @@ pub trait PlanningCostModel {
         _evidence: Option<&PlanningCostEvidence>,
         now_ns: u64,
     ) -> Option<PlanningCost> {
-        if self.requires_statistical_evidence() {
+        if self.evidence_requirement() != PlanningCostEvidenceRequirement::None {
             None
         } else {
             self.predict(fingerprint, shape, now_ns)

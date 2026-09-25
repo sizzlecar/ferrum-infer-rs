@@ -137,7 +137,7 @@ fn project(s: &SchedulerSnapshot, work: &[CandidateWork], context: &State) -> Wa
         work,
         state.as_ref(),
         true,
-        true,
+        PlanningCostEvidenceRequirement::Selected,
         &mut || Ok(()),
     )
     .unwrap()
@@ -253,9 +253,13 @@ fn evidence_binding_propagates_budget_failure_without_legacy_fallback() {
         &PlanningShapeDomain::Exact(sample.exact),
         &PlanningShapeDomain::Exact(shape),
         Some(&PlanningShapeDomain::Exact(sample.selected)),
+        PlanningCostEvidenceRequirement::Selected,
         &mut || Err(PlanningUnknownReason::ComputeBudgetExhausted),
     );
-    assert_eq!(result, Err(PlanningUnknownReason::ComputeBudgetExhausted));
+    assert!(matches!(
+        result,
+        Err(PlanningUnknownReason::ComputeBudgetExhausted)
+    ));
 }
 
 #[test]
@@ -304,6 +308,7 @@ fn independent_attention_v2_future_binding_consumes_explicit_family_and_rejects_
         &ctx.canonical,
         &PlanningShapeDomain::Exact(canonical_cost_shape(ctx.canonical.exact().unwrap()).unwrap()),
         ctx.statistics.as_ref(),
+        PlanningCostEvidenceRequirement::Selected,
         &mut || Ok(())
     )
     .unwrap()

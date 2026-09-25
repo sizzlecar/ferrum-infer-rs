@@ -70,6 +70,7 @@ pub(super) fn load_seed(
     .map_err(profile_error)?;
     let p = &imported.provenance;
     let receipt = SloCostProfileReceipt {
+        structured_whole_wave: None,
         selected_whole_wave: Some(ferrum_types::SloSelectedWholeWaveReceiptV1 {
             capture_identity_sha256: imported.capture_identity_sha256,
             fit_parameters_sha256: imported.fit_parameters_sha256,

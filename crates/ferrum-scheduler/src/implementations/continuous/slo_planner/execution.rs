@@ -176,7 +176,7 @@ pub(super) fn project<'epoch>(
     work: &[CandidateWork],
     state: &dyn PlanningExecutionState<'epoch>,
     retain_first_canonical: bool,
-    collect_statistics: bool,
+    evidence_requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
     if !super::candidates::within_work_envelope(&snapshot.capabilities, requests, work, poll)? {
@@ -229,11 +229,12 @@ pub(super) fn project<'epoch>(
         state.graph_domain()?,
         poll,
     )?;
-    let cost_evidence = if collect_statistics {
+    let cost_evidence = if evidence_requirement != PlanningCostEvidenceRequirement::None {
         bind_statistics(
             &projected.canonical_domain,
             &execution_shape,
             projected.statistical_evidence.as_ref(),
+            evidence_requirement,
             poll,
         )?
     } else {
@@ -394,6 +395,7 @@ pub(super) fn bind_statistics(
     statistics: Option<
         &PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
     >,
+    requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<PlanningShapeDomain<PlanningCostEvidence>>, PlanningUnknownReason> {
     let Some(statistics) = statistics else {
@@ -430,7 +432,7 @@ pub(super) fn bind_statistics(
         .zip(statistics.shapes())
     {
         poll()?;
-        let Some(bound) = PlanningCostEvidence::bind(exact, shape, selected) else {
+        let Some(bound) = PlanningCostEvidence::bind(exact, shape, selected, requirement) else {
             return Ok(None);
         };
         evidence.push(bound);

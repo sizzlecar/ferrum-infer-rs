@@ -105,7 +105,7 @@ pub(super) fn advance<'epoch>(
         work,
         parent.execution.as_ref(),
         parent.depth == 0,
-        model.requires_statistical_evidence(),
+        model.evidence_requirement(),
         poll,
     )
     .map_err(|reason| TransitionFailure {

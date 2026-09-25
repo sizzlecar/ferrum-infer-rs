@@ -613,6 +613,9 @@ impl<'a> AnchoredPlanningCostModel<'a> {
 }
 
 impl PlanningCostModel for AnchoredPlanningCostModel<'_> {
+    fn evidence_requirement(&self) -> PlanningCostEvidenceRequirement {
+        self.model.evidence_requirement()
+    }
     fn requires_statistical_evidence(&self) -> bool {
         self.model.requires_statistical_evidence()
     }

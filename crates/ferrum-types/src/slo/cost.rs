@@ -81,6 +81,9 @@ pub enum SloCostPredictor {
     SelectedIndependentAttentionV2,
     /// Profile8: same V2 families; output budget remains authority metadata, not work support.
     SelectedWorkSupportV1,
+    /// Profile9: qualified structured whole-wave row-space model. Its original
+    /// source owns fit, residual, qualification, support and clock settings.
+    StructuredWholeWaveV1,
 }
 impl SloCostPredictor {
     pub const fn is_selected(self) -> bool {
@@ -119,9 +122,28 @@ impl SloCostObservationConfig {
         }
     }
 
+    pub fn structured_whole_wave_v1() -> Self {
+        Self {
+            predictor: SloCostPredictor::StructuredWholeWaveV1,
+            structured_capture: SloStructuredCostCapture::HostSettledV1,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
         self.selected_feedback.validate(self)?;
+        if self.predictor == SloCostPredictor::StructuredWholeWaveV1 {
+            if self.structured_capture != SloStructuredCostCapture::HostSettledV1 {
+                return Err("structured predictor requires host_settled_v1 route evidence".into());
+            }
+            if self.profile_export.is_some() {
+                return Err("structured calibration requires its three-phase source protocol, not legacy profile_export".into());
+            }
+            if self.model != SloCostModelConfig::default() {
+                return Err("structured predictor uses source-frozen model settings; legacy model overrides are not reinterpreted".into());
+            }
+        }
         if self.predictor.is_selected() {
             if self.model.feature_model != SloCostFeatureModel::default()
                 || self.model.context_bucket_tokens.get() != 1
@@ -351,6 +373,8 @@ impl SloCostProfileImportConfig {
 pub struct SloCostProfileReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_whole_wave: Option<SloSelectedWholeWaveReceiptV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_whole_wave: Option<SloStructuredWholeWaveReceiptV1>,
     pub schema_version: u32,
     pub path: PathBuf,
     pub file_sha256: String,
@@ -371,6 +395,41 @@ pub struct SloCostProfileReceipt {
     pub source_generator_revision: String,
     pub source_measurement_protocol: String,
     pub source_observation_artifact_sha256: [u8; 32],
+}
+
+/// Replay-verified structured import provenance, not a live settlement receipt
+/// or proof that a future workload lies inside the measured support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SloStructuredWholeWaveReceiptV1 {
+    pub model_revision: String,
+    pub domain_signature: [u8; 32],
+    pub capture_identity_sha256: [u8; 32],
+    pub protocol_sha256: [u8; 32],
+    pub rule_signature: [u8; 32],
+    pub parameters_sha256: [u8; 32],
+    pub source_path: PathBuf,
+    pub source_bytes: u64,
+    pub phases: [SloStructuredPhaseReceiptV1; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloStructuredProfilePhaseV1 {
+    Fit,
+    Residual,
+    Qualification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SloStructuredPhaseReceiptV1 {
+    pub phase: SloStructuredProfilePhaseV1,
+    pub members: usize,
+    pub member_cutoff: u64,
+    pub accepted_fifo_cutoff: u64,
+    pub frozen_at_ns: u64,
+    pub source_prefix_bytes: u64,
+    pub source_prefix_sha256: [u8; 32],
+    pub parameters_sha256: [u8; 32],
 }
 
 /// Actual selected profile import provenance (explicit schema 6 or 7). Fit and residual records are disjoint;
@@ -683,6 +742,28 @@ mod selected_predictor_tests {
 #[cfg(test)]
 mod structured_capture_tests {
     use super::*;
+    #[test]
+    fn structured_predictor_preserves_legacy_protocol_and_requires_its_own_evidence() {
+        let policy = SloCostObservationConfig::structured_whole_wave_v1();
+        policy.validate().unwrap();
+        assert!(!policy.predictor.is_selected());
+        let wire = serde_json::to_value(&policy).unwrap();
+        assert_eq!(wire["predictor"], "structured_whole_wave_v1");
+        assert_eq!(wire["structured_capture"], "host_settled_v1");
+        assert_eq!(
+            serde_json::from_value::<SloCostObservationConfig>(wire).unwrap(),
+            policy
+        );
+        let mut missing = policy.clone();
+        missing.structured_capture = SloStructuredCostCapture::Disabled;
+        assert!(missing.validate().is_err());
+        let mut reinterpreted = policy.clone();
+        reinterpreted.model.drift_margin_ns += 1;
+        assert!(reinterpreted.validate().is_err());
+        let mut old_export = policy;
+        old_export.profile_export = Some(SloCostProfileExportConfig::default());
+        assert!(old_export.validate().is_err());
+    }
     #[test]
     fn structured_capture_is_explicit_and_does_not_select_a_predictor() {
         let old: SloCostObservationConfig = serde_json::from_str("{}").unwrap();
