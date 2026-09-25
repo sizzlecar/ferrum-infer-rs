@@ -20,6 +20,10 @@ pub const LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID: &str =
 pub const LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID: &str = "operation.last_token_dense_linear.f32";
 pub const LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID: &str =
     "capability.operation.last_token_dense_linear.f32";
+pub const LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID: &str =
+    "operation.last_token_dense_linear.f32.f16-operands";
+pub const LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID: &str =
+    "capability.operation.last_token_dense_linear.f32.f16-operands";
 pub const LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID: &str = "operation.last_token_masked_argmax";
 pub const LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID: &str =
     "capability.operation.last_token_masked_argmax.f16";
@@ -399,6 +403,28 @@ pub fn last_token_dense_linear_f32_contract() -> Result<StandardOperationContrac
         LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
         ElementType::F32,
     )
+}
+
+/// Projects the final F32 activation row using explicitly rounded F16 operands.
+/// Each selected activation and each decoded weight is rounded to nearest-even
+/// F16 before multiplication. Products accumulate in F32 and logits are stored
+/// directly as F32, without an intermediate F16 output rounding. These operand
+/// boundaries apply to every batch size, including single-row and tail work.
+/// The registered oracle uses the rounded operands and their reduction width
+/// to validate F32 accumulation error, including cancellation. A fixed relative
+/// tolerance to a differently grouped F32 sum does not define this operation.
+/// This is a distinct numerical operation, never a fallback for the F32 head.
+pub fn last_token_dense_linear_f32_f16_operands_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    let mut contract = last_token_dense_linear_contract_with_activation(
+        LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
+        ElementType::F32,
+    )?;
+    contract.descriptor.oracle = OracleSpec::OperationDefined;
+    contract.descriptor.validate()?;
+    Ok(contract)
 }
 
 fn last_token_dense_linear_contract_with_activation(
@@ -2178,6 +2204,53 @@ mod tests {
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
             .unwrap();
+    }
+
+    #[test]
+    fn half_operand_head_has_distinct_identity_and_preserves_f32_ports() {
+        let original = last_token_dense_linear_f32_contract().unwrap();
+        let candidate = last_token_dense_linear_f32_f16_operands_contract().unwrap();
+        let old = original.descriptor();
+        let new = candidate.descriptor();
+        assert_eq!(
+            new.id.as_str(),
+            LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID
+        );
+        assert_eq!(new.version, ContractVersion::new(1, 0));
+        assert_eq!(new.inputs, old.inputs);
+        assert_eq!(new.outputs, old.outputs);
+        assert_eq!(new.attributes, old.attributes);
+        assert_eq!(new.resources, old.resources);
+        assert_eq!(
+            new.inputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        assert_eq!(
+            new.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        assert_eq!(
+            new.inputs[1].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        assert_eq!(new.oracle, OracleSpec::OperationDefined);
+        assert_eq!(old.oracle, f16_reference_tolerance().unwrap());
+        assert_eq!(
+            new.provider,
+            provider_requirement(
+                LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
+                ContractVersion::new(1, 0)
+            )
+            .unwrap()
+        );
+        assert_ne!(new.fingerprint().unwrap(), old.fingerprint().unwrap());
+        candidate
+            .validate_signature(&new.inputs, &new.outputs)
+            .unwrap();
+        let f16 = last_token_dense_linear_contract().unwrap();
+        assert!(candidate
+            .validate_signature(&f16.descriptor().inputs, &f16.descriptor().outputs)
+            .is_err());
     }
 
     #[test]

@@ -324,7 +324,7 @@ fn contiguous_region(
         .map_err(|error| error.to_string())
 }
 
-fn contiguous_token_region(
+pub(super) fn contiguous_token_region(
     participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
@@ -379,7 +379,7 @@ fn contiguous_token_region(
     contiguous_region_range(participant, binding, element_type, offset, length)
 }
 
-fn contiguous_region_range(
+pub(super) fn contiguous_region_range(
     participant: &ferrum_interfaces::vnext::OperationInvocation<'_, ReferenceDeviceBuffer>,
     binding: &ResolvedValueBinding,
     element_type: ElementType,
@@ -463,7 +463,7 @@ fn token_binding_is_packed(
         .map_err(|error| error.to_string())
 }
 
-fn binding(
+pub(super) fn binding(
     bindings: &[ResolvedValueBinding],
     role: ResolvedValueRole,
     ordinal: u32,
@@ -474,7 +474,7 @@ fn binding(
         .ok_or_else(|| format!("reference operation lacks {role:?} binding {ordinal}"))
 }
 
-fn dimension(
+pub(super) fn dimension(
     attributes: &BTreeMap<AttributeId, SemanticValue>,
     name: &str,
 ) -> Result<usize, String> {
@@ -491,7 +491,7 @@ fn dimension(
     }
 }
 
-fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
+pub(super) fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
     (0..input_count)
         .map(|ordinal| {
             ProviderStorageBindingRequirement::new(

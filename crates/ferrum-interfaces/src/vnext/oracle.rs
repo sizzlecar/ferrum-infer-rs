@@ -635,6 +635,21 @@ pub trait OperationOracle: Send + Sync {
 
     fn invoke(&self, request: &OperationOracleRequest)
         -> Result<OperationOracleResult, VNextError>;
+
+    /// Implements an `OperationDefined` comparison using the same validated
+    /// request passed to `invoke`. The registry validates both result layouts
+    /// before calling this method. Existing oracles cannot accidentally claim
+    /// an input-dependent comparison simply by changing their descriptor.
+    fn compare(
+        &self,
+        _request: &OperationOracleRequest,
+        _actual: &OperationOracleResult,
+        _reference: &OperationOracleResult,
+    ) -> Result<bool, VNextError> {
+        Err(invalid_oracle(
+            "operation-defined comparison is not implemented by this registered oracle",
+        ))
+    }
 }
 
 /// Composition-root registration that independently anchors the expected
@@ -924,7 +939,7 @@ impl BoundOperationOracle<'_> {
         attributes: BTreeMap<AttributeId, SemanticValue>,
     ) -> Result<OperationOracleResult, VNextError> {
         self.invoke_internal(inputs, attributes)
-            .map(|(result, _)| result)
+            .map(|(result, _, _)| result)
     }
 
     pub fn invoke_and_compare(
@@ -933,21 +948,38 @@ impl BoundOperationOracle<'_> {
         attributes: BTreeMap<AttributeId, SemanticValue>,
         actual: &OperationOracleResult,
     ) -> Result<bool, VNextError> {
-        let (reference, mut symbols) = self.invoke_internal(inputs, attributes)?;
+        let (reference, mut symbols, request) = self.invoke_internal(inputs, attributes)?;
         validate_tensors_against_contracts(
             "actual oracle comparison outputs",
             actual.outputs(),
             &self.requested_operation.outputs,
             &mut symbols,
         )?;
-        compare_oracle_results(self.comparison_policy(), actual, &reference)
+        if matches!(self.comparison_policy(), OracleSpec::OperationDefined) {
+            let comparison = self.registered.oracle.compare(&request, actual, &reference);
+            if self.registered.oracle.descriptor() != &self.registered.descriptor {
+                return Err(invalid_oracle(
+                    "registered oracle descriptor changed during comparison",
+                ));
+            }
+            comparison
+        } else {
+            compare_oracle_results(self.comparison_policy(), actual, &reference)
+        }
     }
 
     fn invoke_internal(
         &self,
         inputs: Vec<OracleTensor>,
         attributes: BTreeMap<AttributeId, SemanticValue>,
-    ) -> Result<(OperationOracleResult, BTreeMap<String, u64>), VNextError> {
+    ) -> Result<
+        (
+            OperationOracleResult,
+            BTreeMap<String, u64>,
+            OperationOracleRequest,
+        ),
+        VNextError,
+    > {
         if self.registered.oracle.descriptor() != &self.registered.descriptor {
             return Err(invalid_oracle(
                 "registered oracle descriptor changed before invocation",
@@ -979,7 +1011,7 @@ impl BoundOperationOracle<'_> {
             &self.terminal_operation.outputs,
             &mut symbols,
         )?;
-        Ok((result, symbols))
+        Ok((result, symbols, request))
     }
 }
 
@@ -1069,6 +1101,9 @@ pub fn compare_oracle_results(
         OracleSpec::RelativeTolerance { tolerance } => {
             compare_with_tolerance(actual, reference, rational_to_f64(*tolerance)?, true)
         }
+        OracleSpec::OperationDefined => Err(invalid_oracle(
+            "operation-defined comparison requires a registry-bound oracle and validated request",
+        )),
         OracleSpec::ReferenceOperation { .. } => Err(invalid_oracle(
             "reference operation policy must be resolved to a terminal oracle before comparison",
         )),

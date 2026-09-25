@@ -55,6 +55,9 @@ pub enum OracleSpec {
     RelativeTolerance {
         tolerance: CanonicalRational,
     },
+    /// The registered operation oracle compares using its validated request
+    /// and versioned implementation. A result-only comparison is insufficient.
+    OperationDefined,
     ReferenceOperation {
         operation_id: OperationId,
         version: ContractVersion,

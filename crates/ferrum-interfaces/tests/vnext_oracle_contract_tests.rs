@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "vnext_oracle_contract_tests/operation_defined.rs"]
+mod operation_defined;
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String, Error = VNextError>,

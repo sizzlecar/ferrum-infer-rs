@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -6,16 +5,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ferrum_interfaces::vnext::{
-    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
+    BufferDescriptor, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionPath, DeviceNativeOperationId, DeviceNativeWorkAttribution,
     DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMode, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState,
-    VNextError, DENSE_LINEAR_F16_CAPABILITY_ID, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    VNextError, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use half::f16;
+
+use super::last_token_f16_operands::ReferenceHalfHeadLaunch;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -171,12 +172,12 @@ impl ReferenceBufferRegion {
         Ok(())
     }
 
-    fn read(&self) -> Vec<u8> {
+    pub(super) fn read(&self) -> Vec<u8> {
         let bytes = self.allocation.lock();
         bytes[self.offset_bytes..self.offset_bytes + self.length_bytes].to_vec()
     }
 
-    fn write(&self, source: &[u8]) {
+    pub(super) fn write(&self, source: &[u8]) {
         assert_eq!(source.len(), self.length_bytes);
         let mut bytes = self.allocation.lock();
         bytes[self.offset_bytes..self.offset_bytes + self.length_bytes].copy_from_slice(source);
@@ -212,6 +213,9 @@ enum ReferenceCommandKind {
     DenseLinear {
         launches: Box<[ReferenceDenseLinearLaunch]>,
     },
+    HalfOperandsHead {
+        launches: Box<[ReferenceHalfHeadLaunch]>,
+    },
 }
 
 /// An owned, fully validated command for the synchronous reference runtime.
@@ -233,6 +237,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             ReferenceCommandKind::Upload { .. } => "upload",
             ReferenceCommandKind::Zero { .. } => "zero",
             ReferenceCommandKind::DenseLinear { .. } => "dense_linear",
+            ReferenceCommandKind::HalfOperandsHead { .. } => "half_operands_head",
         };
         formatter
             .debug_struct("ReferenceDeviceCommand")
@@ -247,6 +252,34 @@ impl fmt::Debug for ReferenceDeviceCommand {
 }
 
 impl ReferenceDeviceCommand {
+    pub(super) fn half_operands_head(
+        launches: Vec<ReferenceHalfHeadLaunch>,
+        batching_form: DeviceBatchingForm,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, ReferenceDeviceRuntimeError> {
+        if launches.len() != participant_count as usize
+            || participant_count == 0
+            || token_count == 0
+        {
+            return Err(ReferenceDeviceRuntimeError::contract(
+                "reference half-operands head attribution differs from its work",
+            ));
+        }
+        Ok(Self {
+            operation: "vnext_last_token_dense_linear_f32_f16_operands",
+            batching_form,
+            participant_start: 0,
+            participant_count,
+            token_count,
+            compute_dispatch_count: u64::from(participant_count),
+            transfer_command_count: 0,
+            kind: ReferenceCommandKind::HalfOperandsHead {
+                launches: launches.into_boxed_slice(),
+            },
+        })
+    }
+
     pub(crate) fn dense_linear(
         launches: Vec<ReferenceDenseLinearLaunch>,
         batching_form: DeviceBatchingForm,
@@ -359,6 +392,14 @@ impl ReferenceDeviceCommand {
                 }
                 Ok(())
             }
+            ReferenceCommandKind::HalfOperandsHead { launches } => {
+                for launch in launches {
+                    launch.input.validate_runtime(runtime_instance)?;
+                    launch.weight.validate_runtime(runtime_instance)?;
+                    launch.output.validate_runtime(runtime_instance)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -385,6 +426,11 @@ impl ReferenceDeviceCommand {
                     counters
                         .dense_linear_launches
                         .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            ReferenceCommandKind::HalfOperandsHead { launches } => {
+                for launch in launches {
+                    launch.execute();
                 }
             }
         }
@@ -521,9 +567,8 @@ impl ReferenceDeviceRuntime {
             .descriptor
             .validate()
             .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
-        let supported_capabilities =
-            BTreeSet::from([CapabilityId::new(DENSE_LINEAR_F16_CAPABILITY_ID)
-                .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?]);
+        let supported_capabilities = super::composition::reference_vnext_capabilities()
+            .map_err(|error| ReferenceDeviceRuntimeError::contract(error.to_string()))?;
         if config.descriptor.class != DeviceClass::Reference
             || config.descriptor.capabilities != supported_capabilities
         {
@@ -936,19 +981,23 @@ fn validate_submission_requirements(
 }
 
 #[cfg(test)]
+#[path = "last_token_f16_operands_tests.rs"]
+mod last_token_f16_operands_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::reference::composition::reference_vnext_runtime_config;
-    use ferrum_interfaces::vnext::{BufferUsage, DeviceId, ResourceId};
+    use ferrum_interfaces::vnext::{BufferUsage, CapabilityId, DeviceId, ResourceId};
 
-    fn config() -> ReferenceDeviceRuntimeConfig {
+    pub(super) fn config() -> ReferenceDeviceRuntimeConfig {
         reference_vnext_runtime_config(
             DeviceId::new("device.reference.runtime-test").expect("valid device id"),
         )
         .expect("valid reference config")
     }
 
-    fn buffer(
+    pub(super) fn buffer(
         runtime: &ReferenceDeviceRuntime,
         resource_id: &str,
         contents: &[u8],
