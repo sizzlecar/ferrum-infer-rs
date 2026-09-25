@@ -11,6 +11,7 @@ mod command;
 mod independent_rows;
 mod structure;
 mod wave;
+mod wave_algorithm_work;
 mod wire;
 pub use algorithm_work::{
     AlgorithmNumericWorkV1, AlgorithmWorkKindV1, SelectedAlgorithmWorkEvidenceV1,
@@ -22,6 +23,7 @@ pub(in crate::execution_cost) use wave::StatisticalWaveAccumulator;
 pub use wave::{
     CanonicalStatisticalWave, IndependentAttentionWaveEvidenceV2, StatisticalWaveEvidenceV1,
 };
+pub use wave_algorithm_work::{DeviceAlgorithmWorkEvidenceV1, WaveAlgorithmNumericWorkV1};
 pub use wire::{IndependentAttentionWaveEvidenceWireV2, StatisticalWaveEvidenceWireV1};
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 //! Passive, opt-in inputs for a future structured model, NOT a qualified sample.
 //! No profile loader/predictor consumes this protocol. Host settlement and
-//! per-algorithm numeric work are deliberately not invented here.
+//! per-algorithm numeric work are never invented from aggregate work.
 use super::*;
 
 pub const STRUCTURED_COST_INPUT_PROTOCOL_V1: &str = "ferrum.structured-cost-input.v1";
@@ -65,6 +65,7 @@ pub struct DeviceRouteTemplateV1 {
     retries: u32,
     /// Existing total launch work; this is NOT per-algorithm regression work.
     aggregate_work: DeviceNumericWorkV1,
+    algorithm_work: Result<DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>,
 }
 impl DeviceRouteTemplateV1 {
     pub fn ordered_template(&self) -> &[u8; 32] {
@@ -85,6 +86,12 @@ impl DeviceRouteTemplateV1 {
     pub fn retries(&self) -> u32 {
         self.retries
     }
+    /// Complete command-bound inputs, or explicit missing/partial evidence.
+    pub fn algorithm_work(
+        &self,
+    ) -> Result<&DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown> {
+        self.algorithm_work.as_ref().map_err(|error| *error)
+    }
     pub fn aggregate_work(&self) -> DeviceNumericWorkV1 {
         self.aggregate_work
     }
@@ -97,6 +104,7 @@ impl DeviceRouteTemplateV1 {
         product: CostProductOutput,
         readback: Option<CoreReadbackRoute>,
         retries: u32,
+        algorithm_work: Result<DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>,
     ) -> Result<Self, StatisticalEvidenceUnknown> {
         if physical_commands == 0 || physical_commands > MAX_COST_COMMANDS {
             return Err(StatisticalEvidenceUnknown::MissingProducer);
@@ -143,6 +151,7 @@ impl DeviceRouteTemplateV1 {
             readback,
             retries,
             aggregate_work: work,
+            algorithm_work,
         })
     }
 }
@@ -159,9 +168,52 @@ pub struct UnsettledStructuredWaveEvidenceV1 {
     physical_host_rows: Vec<StructuredHostRowV1>,
 }
 impl UnsettledStructuredWaveEvidenceV1 {
-    /// Allocated capacity, not the number of occupied physical rows.
-    pub fn retained_rows(&self) -> usize {
+    /// Actual physical-host Vec capacity; independent of retention accounting units.
+    pub fn physical_host_capacity(&self) -> usize {
         self.physical_host_rows.capacity()
+    }
+    /// Conservative row-equivalent retention units, NOT actual host rows.
+    /// Auxiliary bytes round up by CostRowNumericFeatures, a row size already
+    /// covered by recorder/FIFO/export accounting. The existing outer recipe Arc
+    /// is conservatively charged for each retained reference by its consumers.
+    pub fn retained_rows(&self) -> usize {
+        self.retained_units().unwrap_or(usize::MAX)
+    }
+    pub fn retained_units(&self) -> Result<usize, StatisticalEvidenceUnknown> {
+        let bytes = self
+            .device
+            .algorithm_work
+            .as_ref()
+            .map_or(Ok(0), |work| work.retained_dynamic_bytes())?;
+        let unit = std::mem::size_of::<CostRowNumericFeatures>();
+        let units = bytes
+            .checked_add(unit - 1)
+            .ok_or(StatisticalEvidenceUnknown::Overflow)?
+            / unit;
+        self.physical_host_capacity()
+            .checked_add(units)
+            .ok_or(StatisticalEvidenceUnknown::Overflow)
+    }
+    /// Backing allocation of one retained recipe Arc, including unused Vec
+    /// capacity and both Arc counters. Shared references may conservatively
+    /// charge this amount more than once. No per-command Arc is retained here.
+    pub fn retained_bytes(&self) -> Result<usize, StatisticalEvidenceUnknown> {
+        let auxiliary = self
+            .device
+            .algorithm_work
+            .as_ref()
+            .map_or(Ok(0), |work| work.retained_dynamic_bytes())?;
+        self.physical_host_capacity()
+            .checked_mul(std::mem::size_of::<StructuredHostRowV1>())
+            .and_then(|bytes| bytes.checked_add(auxiliary))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .ok_or(StatisticalEvidenceUnknown::Overflow)
+    }
+    pub fn algorithm_work(
+        &self,
+    ) -> Result<&DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown> {
+        self.device.algorithm_work()
     }
     pub fn validate_actual(
         &self,
@@ -186,9 +238,13 @@ impl UnsettledStructuredWaveEvidenceV1 {
         if self.protocol != STRUCTURED_COST_INPUT_PROTOCOL_V1
             || self.exact_binding != digest
             || self.physical_host_rows.len() != shape.rows.len()
-            || self.retained_rows() > MAX_COST_ROWS
+            || self.physical_host_capacity() > MAX_COST_ROWS
         {
             return Err(StatisticalEvidenceUnknown::ExactBindingMismatch);
+        }
+        self.retained_units()?;
+        if let Ok(work) = self.algorithm_work() {
+            work.validate_binding(digest)?;
         }
         Ok(())
     }
@@ -208,6 +264,10 @@ impl UnsettledStructuredWaveEvidenceV1 {
             || self.exact_binding != super::wave::exact_binding(shape)?
         {
             return Err(StatisticalEvidenceUnknown::ExactBindingMismatch);
+        }
+        self.retained_units()?;
+        if let Ok(work) = self.algorithm_work() {
+            work.validate_binding(self.exact_binding)?;
         }
         Ok(())
     }

@@ -99,6 +99,13 @@ impl StatisticalWaveEvidenceV1 {
             .as_ref()
             .map(|value| value.as_ref().map_err(|error| *error))
     }
+    pub fn structured_physical_host_capacity(&self) -> usize {
+        self.structured_capture()
+            .and_then(Result::ok)
+            .map_or(0, |value| value.physical_host_capacity())
+    }
+    /// Conservative retention units, including opt-in auxiliary table bytes.
+    /// Use structured_physical_host_capacity for physical-row limits.
     pub fn structured_retained_rows(&self) -> usize {
         self.structured_capture()
             .and_then(Result::ok)
@@ -175,6 +182,7 @@ pub(in crate::execution_cost) struct StatisticalWaveAccumulator {
     count: usize,
     work: DeviceNumericWorkV1,
     failure: Option<StatisticalEvidenceUnknown>,
+    algorithm_work: Option<super::wave_algorithm_work::WaveAlgorithmAccumulator>,
 }
 impl StatisticalWaveAccumulator {
     pub(in crate::execution_cost) fn new() -> Self {
@@ -191,7 +199,11 @@ impl StatisticalWaveAccumulator {
             count: 0,
             work: Default::default(),
             failure: None,
+            algorithm_work: None,
         }
+    }
+    pub(in crate::execution_cost) fn capture_algorithm_work(&mut self) {
+        self.algorithm_work = Some(super::wave_algorithm_work::WaveAlgorithmAccumulator::new());
     }
     pub(in crate::execution_cost) fn observe(&mut self, command: CostPhysicalCommand<'_>) {
         if self.failure.is_some() {
@@ -222,6 +234,9 @@ impl StatisticalWaveAccumulator {
             command.transfer_command_count,
         )?;
         let next = self.work.checked_add(evidence.work())?;
+        if let Some(capture) = &mut self.algorithm_work {
+            capture.observe(command);
+        }
         append_command_identity(&mut self.family, command);
         self.family.update(evidence.family_signature());
         match (
@@ -324,7 +339,7 @@ impl StatisticalWaveAccumulator {
 
 impl StatisticalWaveAccumulator {
     pub(in crate::execution_cost) fn structured_device(
-        &self,
+        &mut self,
         shape: &CanonicalWaveCostShape,
         product: CostProductOutput,
         readback: Option<CoreReadbackRoute>,
@@ -346,6 +361,10 @@ impl StatisticalWaveAccumulator {
             product,
             readback,
             retries,
+            self.algorithm_work
+                .take()
+                .ok_or(StatisticalEvidenceUnknown::MissingProducer)
+                .and_then(|capture| capture.finish(shape, self.count, self.work)),
         )
     }
 }
@@ -475,7 +494,7 @@ pub(super) fn exact_binding_parts(
     Ok(hash.finalize().into())
 }
 
-fn append_command_identity(hash: &mut Sha256, command: CostPhysicalCommand<'_>) {
+pub(super) fn append_command_identity(hash: &mut Sha256, command: CostPhysicalCommand<'_>) {
     number(hash, u64::from(command.command_index));
     number(hash, command.node_index.map_or(u64::MAX, u64::from));
     number(hash, command.command_phase as u64);

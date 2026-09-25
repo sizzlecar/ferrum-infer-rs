@@ -311,6 +311,7 @@ impl CanonicalWaveCostBuilder {
     pub fn new_with_structured_statistics(retries: u32, product: CostProductOutput) -> Self {
         let mut value = Self::new(retries, product);
         value.structured_host = Some(super::statistical::StructuredHostAccumulator::new(retries));
+        value.statistical.capture_algorithm_work();
         value
     }
     /// Must describe the real complete-wave disposition (including a staging
@@ -746,7 +747,7 @@ impl CanonicalWaveCostBuilder {
         let host = self.structured_host.take();
         let product = self.row_multiset_product;
         let readback = self.core_readback;
-        let accumulator = std::mem::replace(
+        let mut accumulator = std::mem::replace(
             &mut self.statistical,
             super::statistical::StatisticalWaveAccumulator::new(),
         );

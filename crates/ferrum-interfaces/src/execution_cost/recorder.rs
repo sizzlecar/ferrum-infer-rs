@@ -3,7 +3,10 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostRecorderLimits {
     pub max_waves: usize,
+    /// Physical row-vector capacities, not auxiliary statistical inputs.
     pub max_rows_per_wave: usize,
+    /// Conservative retention units; structured auxiliary bytes are rounded
+    /// up to CostRowNumericFeatures-sized units in addition to physical rows.
     pub max_retained_rows: usize,
 }
 
@@ -145,7 +148,12 @@ impl BoundedWaveRecorder {
             .statistical_evidence
             .as_ref()
             .map_or(0, |evidence| evidence.structured_retained_rows());
-        if structured_rows > self.limits.max_rows_per_wave {
+        if shape
+            .statistical_evidence
+            .as_ref()
+            .map_or(0, |evidence| evidence.structured_physical_host_capacity())
+            > self.limits.max_rows_per_wave
+        {
             return self.reject_begin(CostRecorderError::RowCapacity);
         }
         let Some(rows) = shape
