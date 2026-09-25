@@ -23,6 +23,7 @@ pub const COST_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub mod statistical_v6;
 pub mod statistical_v7;
 pub mod statistical_v8;
+pub mod structured_v9;
 pub mod v2;
 pub mod v3;
 pub mod v4;

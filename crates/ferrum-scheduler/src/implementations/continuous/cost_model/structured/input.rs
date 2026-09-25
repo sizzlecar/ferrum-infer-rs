@@ -23,7 +23,7 @@ impl StructuredScopeV1 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructuredInputV1 {
     pub(super) domain: [u8; 32],
     pub(super) scope: StructuredScopeV1,
@@ -75,20 +75,56 @@ impl StructuredInputV1 {
         algorithms
             .validate_structure(structured)
             .map_err(|_| StructuredUnknown::MissingEvidence)?;
-        let rows = structured.physical_host_rows();
+        Self::project_numeric(
+            &old,
+            *structured.device().ordered_template(),
+            structured.device().provider_grouped_template().copied(),
+            structured.physical_host_rows(),
+            algorithms.entries().iter().map(|entry| {
+                (
+                    *entry.algorithm().signature(),
+                    entry.kind(),
+                    entry.commands(),
+                    entry.work(),
+                )
+            }),
+        )
+    }
+
+    /// Numerical replay only. Its caller validates the versioned wire/source;
+    /// this cannot construct any live settlement or execution authority.
+    pub(in crate::implementations::continuous) fn from_replay_parts(
+        exact: &CanonicalWaveCostShape,
+        selected: &StatisticalWaveEvidenceV1,
+        ordered: [u8; 32],
+        grouped: Option<[u8; 32]>,
+        rows: &[StructuredHostRowV1],
+        algorithms: impl Iterator<Item = ([u8; 32], AlgorithmWorkKindV1, u64, DeviceNumericWorkV1)>,
+    ) -> Result<Self> {
+        let old = StatisticalModelInputV1::from_future(exact, selected)
+            .map_err(|_| StructuredUnknown::MissingEvidence)?;
+        Self::project_numeric(&old, ordered, grouped, rows, algorithms)
+    }
+
+    fn project_numeric(
+        old: &StatisticalModelInputV1,
+        ordered: [u8; 32],
+        grouped: Option<[u8; 32]>,
+        rows: &[StructuredHostRowV1],
+        algorithms: impl Iterator<Item = ([u8; 32], AlgorithmWorkKindV1, u64, DeviceNumericWorkV1)>,
+    ) -> Result<Self> {
         let terminal_position = ordinary_decode_position(rows)?;
         let scope = StructuredScopeV1::OrdinaryDecodeSingleLength { rows: rows.len() };
-        let device = structured.device();
         let mut domain = Sha256::new();
         domain.update(MODEL_REVISION.as_bytes());
         // This normalization is provider-proved for the device subgroups only;
         // it neither reorders host rows nor grants exact execution permission.
-        if let Some(grouped) = device.provider_grouped_template() {
+        if let Some(grouped) = grouped {
             domain.update([1]);
             domain.update(grouped);
         } else {
             domain.update([0]);
-            domain.update(device.ordered_template());
+            domain.update(ordered);
         }
         number(&mut domain, rows.len() as u64);
         let policy = rows[0].installed_policy;
@@ -104,22 +140,21 @@ impl StructuredInputV1 {
         }
         let mut basis = vec![1.0];
         let mut support = Vec::new();
-        for entry in algorithms.entries() {
-            domain.update(entry.algorithm().signature());
-            domain.update([match entry.kind() {
+        for (algorithm, kind, commands, work) in algorithms {
+            domain.update(algorithm);
+            domain.update([match kind {
                 AlgorithmWorkKindV1::Kernel => 0,
                 AlgorithmWorkKindV1::HostToDevice => 1,
                 AlgorithmWorkKindV1::DeviceToHost => 2,
                 AlgorithmWorkKindV1::DeviceToDevice => 3,
                 AlgorithmWorkKindV1::Fill => 4,
             }]);
-            let work = entry.work();
-            support.push(entry.commands());
+            support.push(commands);
             support.extend(device_coordinates(work));
             // A small per-algorithm basis, not one coefficient per raw row or
             // per-position bit. All omitted raw work remains in joint support.
-            basis.push(entry.commands() as f64);
-            if entry.kind() == AlgorithmWorkKindV1::Kernel {
+            basis.push(commands as f64);
+            if kind == AlgorithmWorkKindV1::Kernel {
                 basis.extend([
                     work.inner_work_units as f64,
                     work.padded_units as f64,

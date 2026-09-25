@@ -209,7 +209,7 @@ impl StructuredCalibrationCollector {
         let mut source =
             StructuredSource::create(&options.observations_path, options.maximum_file_bytes.get())?;
         let header=source.record(&serde_json::json!({
-            "artifact_type":"ferrum.structured-live-source", "schema_version":1,
+            "artifact_type":"ferrum.structured-live-source", "schema_version":2,
             "model_revision":MODEL_REVISION, "population_revision":POPULATION_REVISION,
             "capture_identity":binding.identity(),"protocol":binding.protocol(),
             "declared_protocol":options.protocol_sha256,"rule_signature":options.rule_signature(),
@@ -352,6 +352,8 @@ impl StructuredCalibrationCollector {
             &serde_json::json!({"kind":"completed","offered":reserved.offered,
             "member":reserved.member,"phase":reserved.phase,"queue":queue,"reconciled":reconciled,
             "host_stages":stages.as_ref().map(|value|value.structured_diagnostic_view()),
+            "selected_independent_attention_v2":stages.as_ref().and_then(|value|value.statistical_evidence.as_ref())
+                .and_then(|value|value.independent_attention_v2()),
             "selected_structured_capture":stages.as_ref().and_then(|value|value.statistical_evidence.as_ref())
                 .and_then(|value|value.structured_capture()).map(|value|value.map(AsRef::as_ref)),
             "numeric":converted.as_ref().ok().map(|s|serde_json::json!({"fifo":s.ordinal,
