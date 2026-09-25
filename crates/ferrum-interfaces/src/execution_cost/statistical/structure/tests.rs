@@ -1,4 +1,6 @@
 use super::*;
+
+mod forecast;
 use crate::vnext::{
     DeviceBatchingForm, DeviceCommandPhase, DeviceExecutionPath, DeviceNativeOperationId,
     DeviceNativeWorkAttribution, OperationCostCommand,

@@ -3,6 +3,9 @@
 //! per-algorithm numeric work are never invented from aggregate work.
 use super::*;
 
+mod forecast;
+pub use forecast::{HostContentForecastV2, HostPendingConstraintV2, HostPendingSetV2};
+
 pub const STRUCTURED_COST_INPUT_PROTOCOL_V1: &str = "ferrum.structured-cost-input.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
