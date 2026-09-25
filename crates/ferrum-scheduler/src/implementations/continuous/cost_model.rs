@@ -30,6 +30,8 @@ mod numeric_tests;
 #[cfg(test)]
 pub(super) mod prompt_range_tests;
 pub mod statistical;
+// Experimental numerical core only. No profile/serving consumer is wired yet.
+pub mod structured;
 
 #[cfg(test)]
 #[path = "cost_model/expiry_tests.rs"]

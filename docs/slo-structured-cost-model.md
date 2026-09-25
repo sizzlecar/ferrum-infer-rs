@@ -93,15 +93,50 @@ different allocations of work to different algorithms. The first contract does
 not claim to resolve that ambiguity. An optional selected-command builder now
 records work by algorithm and transfer kind, with a binding to the numeric
 assignment in that same command. Its default path does not collect the sparse
-table. Provider opt-in and complete-wave retention of these inputs are still
-pending. New features must be available from both actual and prospective
-execution, without using future durations or actual EOS outcomes as inputs.
+table. Complete-wave aggregation retains a bounded sparse table and an ordered
+binding to the original command assignments. Missing producers, overflow, or
+capacity exhaustion leave the table unavailable; partial tables are not training
+inputs. Retention accounts for allocated backing capacity. Complete provider
+opt-in remains a separate integration step. Features must be available from both
+actual and prospective execution, without using future durations or actual EOS
+outcomes as inputs.
 
 The model must retain independent fit, residual calibration, and heldout phases.
 Residuals apply to the complete prediction and complete measured wave. Old
 profiles or raw records cannot acquire missing structure by changing a version
 header. A minimum sample count is an eligibility floor, not proof of statistical
 sufficiency or end-to-end SLO compliance.
+
+## Numerical core and initial scope
+
+The separately versioned Rust numerical core implements normalized row-space
+identification and QR fitting. It rejects ill-conditioned or unidentified
+directions instead of inventing coefficients for unobserved work. The initial
+scope is ordinary decode with a fixed row count, an established output history,
+and at most one expected length termination. Prefill, first decode, multiple
+terminations, pending UTF-8, masks, and EOS/stop cleanup require additional scope
+design and qualification. This is not the complete serving predictor.
+
+Per-algorithm work and host work share one whole-wave target. Terminal count and
+physical-position moments are numerical features; positions do not each create
+a new calibration family. All raw work coordinates still participate in joint
+support checks. Each accepted query must be supported by a complete fit sample
+and a complete residual sample, with observed lower bounds; coordinate-wise
+maxima from different samples cannot manufacture a supported combination.
+
+Fit, residual calibration, and qualification consume complete declared
+populations with source/protocol identities, unique call IDs, original clock
+boundaries, and a fixed TTL. The initial dense-ordinal interface cannot represent
+a filtered multi-domain FIFO; that needs an explicit population adapter. Residual
+calibration uses an empirical whole-wave q99 plus a declared margin. Qualification
+requires coverage of every declared physical termination position and the
+nonterminal case, with no unknown or underestimated heldout point. This finite
+challenge does not establish a distribution-free p99 guarantee.
+
+The core does not deserialize qualified receipts, import a profile, install a
+production predictor, or authorize execution. The live collector, independent
+full-model calibration, drift handling, and serving measurements remain separate
+completion requirements.
 
 ## Feedback and acceptance
 
