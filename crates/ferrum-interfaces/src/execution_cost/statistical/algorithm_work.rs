@@ -10,6 +10,53 @@ pub enum AlgorithmWorkKindV1 {
     DeviceToHost,
     DeviceToDevice,
     Fill,
+    /// One documented device-library API call, not one native kernel.
+    /// Appended to preserve the existing wire/digest discriminants 0..=4.
+    LibraryCall,
+}
+impl AlgorithmWorkKindV1 {
+    pub fn is_compute(self) -> bool {
+        matches!(self, Self::Kernel | Self::LibraryCall)
+    }
+
+    /// Kind-specific numeric validation shared with numerical source replay.
+    /// A library call supplies no claim about its private native launch grid.
+    pub fn validate_work(
+        self,
+        work: DeviceNumericWorkV1,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        if work.padded_units < work.logical_units {
+            return Err(StatisticalEvidenceUnknown::InvalidWork);
+        }
+        let valid = match self {
+            Self::Kernel => {
+                work.logical_units > 0 && work.inner_work_units > 0 && work.grid_blocks > 0
+            }
+            Self::LibraryCall => {
+                work.logical_units > 0
+                    && work.padded_units == work.logical_units
+                    && work.inner_work_units > 0
+                    && work.grid_blocks == 0
+                    && work.peak_scratch_bytes == 0
+                    && work.staged_weight_bytes == 0
+                    && work.host_to_device_bytes == 0
+                    && work.device_to_host_bytes == 0
+                    && work.device_to_device_bytes == 0
+                    && work.fill_bytes == 0
+            }
+            _ => {
+                work.logical_units == 0
+                    && work.padded_units == 0
+                    && work.inner_work_units == 0
+                    && work.grid_blocks == 0
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(StatisticalEvidenceUnknown::InvalidWork)
+        }
+    }
 }
 impl From<StatisticalTransferKindV1> for AlgorithmWorkKindV1 {
     fn from(value: StatisticalTransferKindV1) -> Self {
@@ -81,8 +128,9 @@ impl SelectedAlgorithmWorkEvidenceV1 {
                 return Err(StatisticalEvidenceUnknown::InvalidWork);
             }
             prior = Some(entry.key());
+            entry.kind.validate_work(entry.work)?;
             aggregate = aggregate.checked_add(entry.work)?;
-            let count = if entry.kind == AlgorithmWorkKindV1::Kernel {
+            let count = if entry.kind.is_compute() {
                 &mut compute
             } else {
                 &mut transfers

@@ -148,6 +148,9 @@ impl StructuredInputV1 {
                 AlgorithmWorkKindV1::DeviceToHost => 2,
                 AlgorithmWorkKindV1::DeviceToDevice => 3,
                 AlgorithmWorkKindV1::Fill => 4,
+                AlgorithmWorkKindV1::LibraryCall => {
+                    return Err(StructuredUnknown::UnsupportedScope)
+                }
             }]);
             support.push(commands);
             support.extend(device_coordinates(work));

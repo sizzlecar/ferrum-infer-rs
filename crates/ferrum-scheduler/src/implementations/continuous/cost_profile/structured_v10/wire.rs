@@ -471,6 +471,7 @@ pub(super) enum Kind {
     DeviceToHost,
     DeviceToDevice,
     Fill,
+    LibraryCall,
 }
 impl Kind {
     pub fn native(self) -> AlgorithmWorkKindV1 {
@@ -480,7 +481,30 @@ impl Kind {
             Self::DeviceToHost => AlgorithmWorkKindV1::DeviceToHost,
             Self::DeviceToDevice => AlgorithmWorkKindV1::DeviceToDevice,
             Self::Fill => AlgorithmWorkKindV1::Fill,
+            Self::LibraryCall => AlgorithmWorkKindV1::LibraryCall,
         }
+    }
+}
+
+#[cfg(test)]
+mod library_api_tests {
+    use super::*;
+
+    #[test]
+    fn library_api_wire_is_distinct_and_cannot_claim_a_native_grid() {
+        let kind: Kind = serde_json::from_str("\"library_call\"").unwrap();
+        assert_eq!(kind.native(), AlgorithmWorkKindV1::LibraryCall);
+        let mut work = DeviceNumericWorkV1 {
+            logical_units: 4 * 64,
+            padded_units: 4 * 64,
+            inner_work_units: 4 * 64 * 32,
+            ..Default::default()
+        };
+        kind.native().validate_work(work).unwrap();
+        assert!(Kind::Kernel.native().validate_work(work).is_err());
+        work.grid_blocks = 1;
+        assert!(kind.native().validate_work(work).is_err());
+        Kind::Kernel.native().validate_work(work).unwrap();
     }
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

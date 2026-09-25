@@ -166,6 +166,8 @@ impl StructuredInputV2 {
         let mut basis = vec![1.0];
         let mut support = Vec::new();
         for (kind, commands, work) in algorithms {
+            kind.validate_work(work)
+                .map_err(|_| StructuredUnknown::InvalidInput)?;
             support.push(commands);
             support.extend(device_coordinates(work));
             basis.push(commands as f64);
@@ -175,6 +177,9 @@ impl StructuredInputV2 {
                     work.padded_units as f64,
                     work.grid_blocks as f64,
                 ]);
+            } else if kind == AlgorithmWorkKindV1::LibraryCall {
+                // API output elements and reduction work, never a native grid.
+                basis.extend([work.logical_units as f64, work.inner_work_units as f64]);
             } else {
                 let bytes = work
                     .host_to_device_bytes

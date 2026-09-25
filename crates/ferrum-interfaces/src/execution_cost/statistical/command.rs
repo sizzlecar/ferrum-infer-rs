@@ -1,5 +1,8 @@
 use super::*;
 
+mod library;
+pub use library::{LibraryApiNumericWorkV1, LibraryReplayParametersV1};
+
 /// Complete selected sub-work of ONE actual or projected physical command.
 /// Private fields prevent independent mutation of its family/work/counts.
 /// Only serialization is provided: old profiles cannot deserialize/invent it.

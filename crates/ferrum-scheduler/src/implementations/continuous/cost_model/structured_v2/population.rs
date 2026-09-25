@@ -202,6 +202,7 @@ impl StructuredOwnerFactsV2 {
                 AlgorithmWorkKindV1::DeviceToHost => 2,
                 AlgorithmWorkKindV1::DeviceToDevice => 3,
                 AlgorithmWorkKindV1::Fill => 4,
+                AlgorithmWorkKindV1::LibraryCall => 5,
             }]);
         }
         Ok(StructuredOwnerKeyV2 {

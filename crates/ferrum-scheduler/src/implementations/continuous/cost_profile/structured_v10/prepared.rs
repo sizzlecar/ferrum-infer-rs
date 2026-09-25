@@ -253,11 +253,11 @@ fn validate_recipe(
         prior = Some(key);
         commands = commands.checked_add(entry.commands).ok_or_else(fail)?;
         let w = entry.work;
-        if w.padded_units < w.logical_units
-            || (w.logical_units > 0 && (w.inner_work_units == 0 || w.grid_blocks == 0))
-        {
-            return Err(fail());
-        }
+        entry
+            .kind
+            .native()
+            .validate_work(w.native())
+            .map_err(|_| fail())?;
         macro_rules! add {($($f:ident),*)=>{$(total.$f=total.$f.checked_add(w.$f).ok_or_else(fail)?;)*};}
         add!(
             logical_units,

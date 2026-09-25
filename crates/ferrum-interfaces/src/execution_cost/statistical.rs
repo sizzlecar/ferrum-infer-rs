@@ -63,6 +63,30 @@ fn text_valid(text: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SelectedAlgorithmClassV1([u8; 32]);
 impl SelectedAlgorithmClassV1 {
+    /// A documented library API selection contract. This identity must bind
+    /// the observed library version/effective handle policy and fixed layout;
+    /// it does not identify the library's private selected kernel algorithm.
+    pub fn library_api(
+        api: &str,
+        abi_revision: u32,
+        runtime_policy_signature: [u8; 32],
+        numerical_layout_signature: [u8; 32],
+    ) -> Result<Self, StatisticalEvidenceUnknown> {
+        if !text_valid(api)
+            || abi_revision == 0
+            || runtime_policy_signature == [0; 32]
+            || numerical_layout_signature == [0; 32]
+        {
+            return Err(StatisticalEvidenceUnknown::InvalidAlgorithm);
+        }
+        let mut hash = Sha256::new();
+        bytes(&mut hash, b"ferrum.selected-library-api-class.v1");
+        bytes(&mut hash, api.as_bytes());
+        number(&mut hash, u64::from(abi_revision));
+        hash.update(runtime_policy_signature);
+        hash.update(numerical_layout_signature);
+        Ok(Self(hash.finalize().into()))
+    }
     pub fn new(
         kernel_entry: &str,
         abi_revision: u32,
