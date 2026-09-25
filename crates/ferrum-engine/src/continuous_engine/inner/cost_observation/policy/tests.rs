@@ -3,6 +3,53 @@ use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use ferrum_types::{InferenceRequest, ResponseFormat, SamplingParams, TokenId};
 use std::sync::Arc;
 
+#[tokio::test]
+async fn host_algorithm_revision_invalidates_old_exact_and_numeric_cost_policy() {
+    let tokenizer = tokenizer().await;
+    let (state, _session) = credited_sequence_from_request(
+        tokenizer.clone(),
+        fixed_output_request(SamplingParams::greedy()),
+    );
+    for numeric in [false, true] {
+        let old = policy_signature_with_algorithm(&state, tokenizer.as_ref(), numeric, None)
+            .expect("same admitted policy under the historical digest");
+        let current = policy_signature(&state, tokenizer.as_ref(), numeric).unwrap();
+        assert_ne!(
+            old, current,
+            "host algorithm changed without request parameters changing"
+        );
+        assert_eq!(
+            Some(current),
+            policy_signature_with_algorithm(
+                &state,
+                tokenizer.as_ref(),
+                numeric,
+                Some(HOST_OUTPUT_ALGORITHM_REVISION),
+            ),
+        );
+        assert_ne!(
+            Some(current),
+            policy_signature_with_algorithm(
+                &state,
+                tokenizer.as_ref(),
+                numeric,
+                Some("other-host-algorithm")
+            ),
+        );
+    }
+    assert_eq!(
+        host_numeric_policy(&state, tokenizer.as_ref())
+            .unwrap()
+            .categorical_signature,
+        policy_signature(&state, tokenizer.as_ref(), true).unwrap(),
+    );
+    let legacy = sequence(tokenizer.clone(), SamplingParams::greedy());
+    assert_ne!(
+        host_policy_signature(&legacy, tokenizer.as_ref()),
+        policy_signature_with_algorithm(&legacy, tokenizer.as_ref(), false, None),
+    );
+}
+
 async fn tokenizer() -> Arc<HuggingFaceTokenizer> {
     let vocabulary: tokenizers::models::bpe::Vocab =
         ["a", "b", "{", "}", "\"", ":", "0", "true", "</s>"]

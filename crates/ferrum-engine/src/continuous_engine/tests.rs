@@ -12283,6 +12283,7 @@ fn token_policy_cache_rejects_an_expired_tokenizer_identity() {
             tokenizer: expired_identity,
             forbidden: HashSet::from([u32::MAX]),
             model_greedy_forbidden: HashSet::from([u32::MAX]),
+            utf8_transitions: None,
         },
     );
 
@@ -13994,3 +13995,80 @@ mod auto_tools_json;
 
 #[path = "credited_output_tests.rs"]
 mod credited_output_tests;
+
+// Regression fixture only: controlled logits, not evidence of the 9B logits rank.
+#[test]
+fn unicode_pending_legal_tail_survives_more_than_64_incompatible_candidates() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
+    );
+    state
+        .validate_and_commit_model_greedy_argmax_token(
+            Some(tokenizer.as_ref()),
+            TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_HEAD),
+        )
+        .unwrap();
+    assert_eq!(state.pending_decoded_utf8_bytes, [0xf0, 0x9f]);
+    let mut logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    // Every ASCII candidate is legal in isolation, but cannot continue f0 9f.
+    for (rank, token) in (32usize..96).enumerate() {
+        logits[token] = 100.0 - rank as f32;
+    }
+    logits[FragmentedUtf8PolicyTokenizer::FIRE_TAIL as usize] = 1.0;
+    let token = state
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .expect("the finite legal continuation must survive UTF-8 filtering");
+    assert_eq!(token.get(), FragmentedUtf8PolicyTokenizer::FIRE_TAIL);
+    assert!(state.pending_decoded_utf8_bytes.is_empty());
+    assert_eq!(
+        tokenizer.decode(&state.generated_tokens, true).unwrap(),
+        "🔥"
+    );
+}
+
+#[test]
+fn unicode_pending_constraint_precedes_top_k() {
+    unicode_pending_constraint_before_probability_truncation(Some(1), 1.0);
+}
+
+#[test]
+fn unicode_pending_constraint_precedes_top_p() {
+    unicode_pending_constraint_before_probability_truncation(None, 0.5);
+}
+
+fn unicode_pending_constraint_before_probability_truncation(top_k: Option<usize>, top_p: f32) {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let mut request = policy_request();
+    request.sampling_params.temperature = 1.0;
+    request.sampling_params.top_k = top_k;
+    request.sampling_params.top_p = top_p;
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
+    );
+    state
+        .commit_generated_token(
+            Some(tokenizer.as_ref()),
+            TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_HEAD),
+        )
+        .unwrap();
+    let mut logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    logits[b'x' as usize] = 100.0;
+    logits[FragmentedUtf8PolicyTokenizer::FIRE_TAIL as usize] = 1.0;
+    let token = state
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .expect("probability truncation must operate on byte-compatible candidates");
+    assert_eq!(token.get(), FragmentedUtf8PolicyTokenizer::FIRE_TAIL);
+    assert!(state.pending_decoded_utf8_bytes.is_empty());
+    assert_eq!(state.sampling_params.top_k, top_k);
+    assert_eq!(state.sampling_params.top_p, top_p);
+    assert_eq!(state.sampling_params.temperature, 1.0);
+}

@@ -3,6 +3,100 @@ use super::*;
 use ferrum_interfaces::output_flow::OutputCodecDescriptor;
 use ferrum_interfaces::tokenizer::{BoundedDecodeBound, BoundedIncrementalDecodePolicy};
 
+/// Close a real incomplete byte suffix without emitting the decoder's lossy
+/// replacement. This is not a text sanitizer: literal U+FFFD in the complete
+/// prefix is retained, and a decoder/byte mismatch is an error. With no tracked
+/// pending bytes, a trailing U+FFFD still needs proof that it is literal. False
+/// leaves that legacy/unknown output withheld; it is not permission to emit it.
+pub(in crate::continuous_engine) fn finish_incomplete_utf8(
+    tokenizer: &dyn Tokenizer,
+    tokens: &[TokenId],
+    pending: &[u8],
+    decoder: Option<CreditedDecodePolicy>,
+    text: &mut String,
+) -> Result<bool> {
+    if pending.is_empty() && !text.ends_with('\u{FFFD}') {
+        return Ok(true);
+    }
+    let incomplete = std::str::from_utf8(pending)
+        .is_err_and(|error| error.valid_up_to() == 0 && error.error_len().is_none());
+    if pending.len() > 3 || (!pending.is_empty() && !incomplete) {
+        return Err(FerrumError::internal(
+            "invalid terminal UTF-8 pending proof",
+        ));
+    }
+    let prefix = if pending.is_empty() {
+        text.as_str()
+    } else {
+        text.strip_suffix('\u{FFFD}').ok_or_else(|| {
+            FerrumError::tokenizer("terminal decoder does not expose its incomplete UTF-8 suffix")
+        })?
+    };
+    let prefix_len = prefix.len();
+    // Compare the original bytes to the entire decoded prefix plus the actual
+    // pending suffix, not merely to the final character. At most one admitted
+    // token-byte buffer is live, regardless of the generated history length.
+    let proof = (|| -> Result<()> {
+        let mut expected = prefix.as_bytes().iter().chain(pending).copied();
+        let mut compare = |bytes: &[u8]| -> Result<()> {
+            for &byte in bytes {
+                if expected.next() != Some(byte) {
+                    return Err(FerrumError::tokenizer(
+                        "terminal token bytes do not match the decoded UTF-8 prefix",
+                    ));
+                }
+            }
+            Ok(())
+        };
+        if let Some(policy) = decoder {
+            if tokens.len() > policy.max_tokens
+                || tokenizer.bounded_decode_bound() != Some(policy.bound)
+                || tokenizer.bounded_token_bytes_bound().map(NonZeroUsize::get)
+                    != Some(policy.token_bytes_bound)
+            {
+                return Err(FerrumError::internal(
+                    "terminal byte proof exceeds its admitted policy",
+                ));
+            }
+            let mut scratch = vec![0; policy.token_bytes_bound];
+            if scratch.capacity() != policy.token_bytes_bound {
+                return Err(FerrumError::internal(
+                    "terminal byte proof exceeded its scratch grant",
+                ));
+            }
+            for &token in tokens {
+                let length = tokenizer
+                    .token_bytes_bounded_into(token, &mut scratch)
+                    .map_err(|error| FerrumError::tokenizer(error.to_string()))?
+                    .filter(|length| *length <= scratch.len())
+                    .ok_or_else(|| FerrumError::tokenizer("terminal byte proof is unavailable"))?;
+                compare(&scratch[..length])?;
+            }
+        } else {
+            for &token in tokens {
+                let bytes = tokenizer
+                    .token_bytes(token)
+                    .ok_or_else(|| FerrumError::tokenizer("terminal byte proof is unavailable"))?;
+                compare(&bytes)?;
+            }
+        }
+        if expected.next().is_some() {
+            return Err(FerrumError::tokenizer(
+                "terminal byte proof has an unmatched suffix",
+            ));
+        }
+        Ok(())
+    })();
+    match proof {
+        Ok(()) => {
+            text.truncate(prefix_len);
+            Ok(true)
+        }
+        Err(_) if pending.is_empty() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::continuous_engine) struct CreditedDecodePolicy {
     bound: BoundedDecodeBound,

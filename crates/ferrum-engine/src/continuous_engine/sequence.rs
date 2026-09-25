@@ -351,6 +351,7 @@ pub struct SequenceState {
     /// they are explicitly whitelisted in `allowed_extended_token_ids`.
     pub tokenizer_base_vocab_size: Option<usize>,
     pub allowed_extended_token_ids: HashSet<u32>,
+    utf8_transitions: Option<Arc<utf8_constraints::CachedTransitions>>,
     /// User stop strings, including single-token encodings. Checked against
     /// accumulated decoded text to preserve stop boundaries inside tokens.
     pub stop_text_seqs: Vec<String>,
@@ -847,6 +848,7 @@ impl SequenceState {
             &stop_token_ids,
             &request_generated_control_token_texts,
         );
+        let utf8_transitions = tokenizer.as_ref().and_then(cached_utf8_transitions);
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request
             .metadata
@@ -941,6 +943,7 @@ impl SequenceState {
             initial_forbidden_token_ids,
             tokenizer_base_vocab_size,
             allowed_extended_token_ids,
+            utf8_transitions,
             stop_text_seqs,
             argmax_token_mask,
             initial_argmax_token_mask,
@@ -2021,8 +2024,21 @@ impl SequenceState {
             }
         }
 
+        // Raw byte compatibility is a hard constraint, before top-k/top-p can
+        // remove the only legal continuation. Cached finite-state summaries
+        // avoid allocating or decoding the history for every vocab candidate.
+        if let (Some(table), Some(tokenizer)) = (&self.utf8_transitions, tokenizer) {
+            table.apply(
+                tokenizer,
+                &self.pending_decoded_utf8_bytes,
+                &self.stop_token_ids,
+                required_structured_delimiter_token_id,
+                logits,
+            )?;
+        }
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
+
         let previous_streamed_text_len = self.decoded_text_len;
         let token = {
             let previous_tokens = self

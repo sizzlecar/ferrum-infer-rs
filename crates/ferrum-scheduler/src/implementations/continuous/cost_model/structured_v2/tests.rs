@@ -13,6 +13,20 @@ fn wave(
     algorithm: &str,
     pending: [bool; 2],
 ) -> CanonicalStructuredWave {
+    wave_with_host_policy(
+        terminal, capture, work_a, algorithm, pending, [3; 32], [4; 32],
+    )
+}
+
+fn wave_with_host_policy(
+    terminal: usize,
+    capture: bool,
+    work_a: u64,
+    algorithm: &str,
+    pending: [bool; 2],
+    exact_policy: [u8; 32],
+    numeric_policy: [u8; 32],
+) -> CanonicalStructuredWave {
     let mut command = if capture {
         SelectedCommandCostBuilderV1::new_with_algorithm_work(2)
     } else {
@@ -67,12 +81,12 @@ fn wave(
                 repetition_tokens: 2,
                 repetition_penalty_bits: 1f32.to_bits(),
             },
-            host_policy_signature: [3; 32],
+            host_policy_signature: exact_policy,
             mask_upload_required: false,
             host_features: Some(HostCostFeaturesV1 {
                 policy: HostCostPolicyV2 {
                     empirical_content_domain: Some(HostContentDomainV1::PlainTextGreedyV1),
-                    categorical_signature: [4; 32],
+                    categorical_signature: numeric_policy,
                     decoder_text_bytes_per_token: 4,
                     decoder_scratch_bytes_per_token: 8,
                     raw_token_bytes_bound: 4,

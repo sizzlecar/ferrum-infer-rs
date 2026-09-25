@@ -13,6 +13,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io};
 
+// The tokenizer and sampling parameters do not identify the engine algorithm.
+// Change this revision when host sampling/projection/terminal work changes;
+// historical observations must not acquire a new algorithm's cost authority.
+const HOST_OUTPUT_ALGORITHM_REVISION: &str =
+    "utf8-pretruncation-fsm.v1/terminal-byte-proof.v1/unsubmitted-output-grant.v1";
+
 /// Call only after installing the real legacy sender or credited owner, and
 /// before the sequence starts executing. Unknown/mismatched policy sources
 /// disable training instead of inventing a broadly reusable cost key.
@@ -91,6 +97,22 @@ fn policy_signature(
     tokenizer: &dyn Tokenizer,
     numeric: bool,
 ) -> Option<[u8; 32]> {
+    policy_signature_with_algorithm(
+        sequence,
+        tokenizer,
+        numeric,
+        Some(HOST_OUTPUT_ALGORITHM_REVISION),
+    )
+}
+
+// Private factorization also lets tests reconstruct the exact pre-revision
+// digest (None), without deserializing or granting authority to old receipts.
+fn policy_signature_with_algorithm(
+    sequence: &SequenceState,
+    tokenizer: &dyn Tokenizer,
+    numeric: bool,
+    algorithm_revision: Option<&str>,
+) -> Option<[u8; 32]> {
     let tokenizer_identity = tokenizer.host_output_policy_identity()?;
     let params = &sequence.sampling_params;
     params.validate().ok()?;
@@ -119,6 +141,9 @@ fn policy_signature(
     } else {
         b"ferrum.engine.host-policy.v1\0"
     });
+    if let Some(revision) = algorithm_revision {
+        digest.field(&revision)?;
+    }
     digest.0.update(tokenizer_identity);
     // Keep every numerical/structured sampling field, while explicitly
     // excluding the stochastic realization from the host execution contract.

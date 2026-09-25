@@ -201,7 +201,11 @@ impl EngineInner {
         }
         let output = sequence.credited_output.as_mut().expect("credited route");
         if let Some(grant) = output.grant.take() {
-            if failure.is_none()
+            if sequence.generated_tokens.len() == output.tokens_before_grant {
+                // A sampling failure has not committed an output token. Return
+                // its untouched grant so abandonment cannot replace the cause.
+                grant.return_unsubmitted();
+            } else if failure.is_none()
                 && output.tokens_before_grant.checked_add(1)
                     == Some(sequence.generated_tokens.len())
             {
@@ -213,10 +217,6 @@ impl EngineInner {
                     generated_tokens: sequence.generated_tokens.len(),
                     created: created_seconds(),
                 });
-            } else if failure.is_none()
-                && sequence.generated_tokens.len() == output.tokens_before_grant
-            {
-                grant.return_unsubmitted();
             } else {
                 drop(grant);
                 failure.get_or_insert_with(|| {

@@ -24,6 +24,23 @@ impl SequenceState {
         terminal: Option<FinishReason>,
     ) -> Result<String> {
         let mut text = self.decode_owned_output(tokenizer, &self.generated_tokens)?;
+        if matches!(
+            terminal,
+            Some(FinishReason::Length | FinishReason::Cancelled)
+        ) {
+            let proven = crate::continuous_engine::credited_output::finish_incomplete_utf8(
+                tokenizer,
+                &self.generated_tokens,
+                &self.pending_decoded_utf8_bytes,
+                self.credited_output.as_ref().map(|output| output.decoder),
+                &mut text,
+            )?;
+            if !proven {
+                return Err(FerrumError::tokenizer(
+                    "terminal replacement has no complete UTF-8 byte proof",
+                ));
+            }
+        }
         let end = self.visible_text_end(&text, terminal.is_some());
         if end < text.len() {
             text.truncate(end);

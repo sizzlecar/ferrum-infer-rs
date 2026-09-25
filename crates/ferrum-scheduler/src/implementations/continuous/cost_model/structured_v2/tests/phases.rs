@@ -99,6 +99,54 @@ fn qualified() -> QualifiedStructuredModelV2 {
         .qualify(&phase(StructuredPhaseV2::Qualification), 490)
         .unwrap()
 }
+
+#[test]
+fn structured_v2_old_host_algorithm_model_rejects_new_policy_query() {
+    let model = qualified();
+    let old = wave(9, true, 8, "fixture.first", [false, false]);
+    let selected = old.statistical.as_ref().unwrap();
+    let old_query = StructuredQueryV2::from_future(
+        &old.exact,
+        selected,
+        selected.structured_capture().unwrap().unwrap(),
+        &HostContentForecastV2::Exact,
+    )
+    .unwrap();
+    assert!(model.predict_query(&fp(), &old_query, 500).is_ok());
+
+    // Same device work, geometry, output, counters and clock. Only the two
+    // host policy keys differ, as after an engine algorithm revision.
+    let changed = wave_with_host_policy(
+        9,
+        true,
+        8,
+        "fixture.first",
+        [false, false],
+        [7; 32],
+        [8; 32],
+    );
+    let selected = changed.statistical.as_ref().unwrap();
+    let changed_query = StructuredQueryV2::from_future(
+        &changed.exact,
+        selected,
+        selected.structured_capture().unwrap().unwrap(),
+        &HostContentForecastV2::Exact,
+    )
+    .unwrap();
+    assert_eq!(
+        old_query.input.regression_axes(),
+        changed_query.input.regression_axes()
+    );
+    assert_ne!(old_query.owner(), changed_query.owner());
+    assert_ne!(
+        old_query.domain_signature(),
+        changed_query.domain_signature()
+    );
+    assert!(matches!(
+        model.predict_query(&fp(), &changed_query, 500),
+        Err(StructuredUnknown::WrongDomain)
+    ));
+}
 #[test]
 fn structured_v2_three_complete_phases_freeze_one_model_and_future_envelope() {
     let model = qualified();

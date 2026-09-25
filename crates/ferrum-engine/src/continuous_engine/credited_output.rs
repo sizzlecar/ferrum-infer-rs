@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 
 mod completion;
 mod decode;
-pub(super) use decode::CreditedDecodePolicy;
+pub(super) use decode::{finish_incomplete_utf8, CreditedDecodePolicy};
 
 use super::output_flow_runtime::{
     spawn_output_flow_runtime, OutputDelta, OutputFlowPort, OutputFlowRuntimeOptions,

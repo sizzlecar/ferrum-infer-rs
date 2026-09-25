@@ -16,6 +16,8 @@ pub(super) struct StreamProjectionSnapshot {
     protocol: ferrum_types::ModelOutputProtocol,
     last_token_is_stop: bool,
     streamed_text_len: usize,
+    pending_utf8: [u8; 3],
+    pending_utf8_len: usize,
     decoder: Option<CreditedDecodePolicy>,
     // Last: all detached token/stop storage must die before its lifetime guard.
     _projection_lifetime: Option<OutputProjectionGuard>,
@@ -33,6 +35,13 @@ impl StreamProjectionSnapshot {
                 .last()
                 .is_some_and(|token| sequence.stop_token_ids.contains(&token.get())),
             streamed_text_len: sequence.streamed_text_len,
+            pending_utf8: {
+                let mut bytes = [0; 3];
+                let len = sequence.pending_decoded_utf8_bytes.len().min(bytes.len());
+                bytes[..len].copy_from_slice(&sequence.pending_decoded_utf8_bytes[..len]);
+                bytes
+            },
+            pending_utf8_len: sequence.pending_decoded_utf8_bytes.len(),
             decoder: sequence
                 .credited_output
                 .as_ref()
@@ -79,7 +88,29 @@ impl StreamProjectionSnapshot {
         terminal: Option<FinishReason>,
     ) -> Result<Option<ProjectedText>> {
         let mut visible = self.decode(tokenizer, &self.tokens)?;
-        let incomplete_utf8 = visible.ends_with('\u{FFFD}');
+        let mut terminal_utf8_proven = false;
+        if matches!(
+            terminal,
+            Some(FinishReason::Length | FinishReason::Cancelled)
+        ) {
+            let proof_required = self.pending_utf8_len != 0 || visible.ends_with('\u{FFFD}');
+            let proven = crate::continuous_engine::credited_output::finish_incomplete_utf8(
+                tokenizer,
+                &self.tokens,
+                self.pending_utf8
+                    .get(..self.pending_utf8_len)
+                    .ok_or_else(|| {
+                        FerrumError::internal("terminal UTF-8 pending proof exceeds three bytes")
+                    })?,
+                self.decoder,
+                &mut visible,
+            )?;
+            if !proven {
+                return Ok(None);
+            }
+            terminal_utf8_proven = proof_required;
+        }
+        let incomplete_utf8 = visible.ends_with('\u{FFFD}') && !terminal_utf8_proven;
         if incomplete_utf8 && terminal.is_none() {
             return Ok(None);
         }
@@ -107,7 +138,7 @@ impl StreamProjectionSnapshot {
                 visible = self.decode(tokenizer, &self.tokens[..self.tokens.len() - 1])?;
             }
         }
-        if visible.ends_with('\u{FFFD}') {
+        if visible.ends_with('\u{FFFD}') && !terminal_utf8_proven {
             return Ok(None);
         }
         Ok(Some(ProjectedText {

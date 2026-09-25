@@ -38,6 +38,8 @@ impl ProjectionTokenizer {
             7 => b"<|return|>",
             8 => b"<|call|>",
             9 => b"<eos>",
+            10 => b"ok\xe4",
+            11 => b"ok\xef\xbf\xbd",
             _ => b"",
         }
     }
@@ -71,6 +73,8 @@ impl Tokenizer for ProjectionTokenizer {
                     7 => b"<|return|>",
                     8 => b"<|call|>",
                     9 => b"<eos>",
+                    10 => b"ok\xe4",
+                    11 => b"ok\xef\xbf\xbd",
                     _ => b"",
                 };
                 piece.iter().copied()
@@ -98,6 +102,11 @@ impl Tokenizer for ProjectionTokenizer {
     }
     fn token_text(&self, token: TokenId) -> Option<&str> {
         self.base.token_text(token)
+    }
+    fn token_bytes(&self, token: TokenId) -> Option<Vec<u8>> {
+        (1..=11)
+            .contains(&token.get())
+            .then(|| Self::piece(token).to_vec())
     }
     fn info(&self) -> TokenizerInfo {
         self.base.info()
@@ -128,7 +137,7 @@ impl Tokenizer for ProjectionTokenizer {
                 available: output.len(),
             });
         }
-        if !(1..=9).contains(&token.get()) {
+        if !(1..=11).contains(&token.get()) {
             return Ok(None);
         }
         // Preserve the incomplete e4 / b8 ad pieces; decoding a token here
@@ -688,4 +697,174 @@ async fn output_projection_inflight_decode_retains_credit_after_sequence_cancel(
         .unwrap();
     drop(completion);
     assert_eq!(pool.snapshot().retained_accounts, 0);
+}
+
+#[tokio::test]
+async fn unicode_credited_length_preserves_complete_prefix_without_lossy_tail() {
+    use ferrum_interfaces::output_flow::OutputCompletion;
+    use futures::StreamExt;
+    let tokenizer = Arc::new(ProjectionTokenizer::new());
+    let mut request = InferenceRequest::new("prompt", "projection-test");
+    request.sampling_params.max_tokens = 1;
+    let id = request.id.clone();
+    let (engine, mut session) = credited_projection_fixture(tokenizer.clone(), request, &[]).await;
+    // This fixture disables the background engine loop. Drive real scheduler
+    // admission and prefill completion before testing terminal projection.
+    let batch = engine
+        .inner
+        .scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .expect("credited request must enter the actual prefill queue");
+    assert_eq!(batch.requests.len(), 1);
+    assert_eq!(batch.requests[0].request.id, id);
+    let prompt_tokens = engine.inner.sequences.read()[&id].input_tokens.len();
+    engine
+        .inner
+        .scheduler
+        .mark_prefill_complete(&id, prompt_tokens);
+    assert_eq!(engine.inner.scheduler.decoding_count(), 1);
+    {
+        let mut states = engine.inner.sequences.write();
+        let sequence = states.get_mut(&id).unwrap();
+        sequence
+            .commit_generated_token(Some(tokenizer.as_ref()), TokenId::new(10))
+            .unwrap();
+        assert_eq!(sequence.pending_decoded_utf8_bytes, [0xe4]);
+        assert_eq!(sequence.generated_tokens, [TokenId::new(10)]);
+    }
+    engine.inner.send_stream_update(&id, TokenId::new(10)).await;
+    engine
+        .inner
+        .complete_request(&id, FinishReason::Length)
+        .await
+        .unwrap();
+    let wire = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut wire = Vec::new();
+        loop {
+            let frame = session.frames.next().await.expect("terminal frame");
+            wire.extend_from_slice(frame.wire().payload());
+            if frame.metadata().terminal {
+                return wire;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(3), session.completion)
+        .await
+        .unwrap()
+        .unwrap();
+    match completion.payload() {
+        OutputCompletion::Succeeded { reason, usage, .. } => {
+            assert_eq!(*reason, FinishReason::Length);
+            assert_eq!(usage.completion_tokens, 1);
+        }
+        OutputCompletion::Failed(error) => panic!("unexpected failure: {}", error.message()),
+    }
+    assert_eq!(String::from_utf8(wire).unwrap(), "ok");
+    assert!(!engine.inner.sequences.read().contains_key(&id));
+}
+
+#[test]
+fn unicode_terminal_projection_retains_literal_replacement_and_complete_characters() {
+    let tokenizer = ProjectionTokenizer::new();
+    // Terminal projection has no authority to rewrite a literal U+FFFD,
+    // regardless of whether an upstream generation policy permits that text.
+    for terminal in [FinishReason::Length, FinishReason::Cancelled] {
+        let mut state = sequence(InferenceRequest::new("prompt", "projection-test"), &[11, 2]);
+        state.pending_decoded_utf8_fragment = true;
+        state.pending_decoded_utf8_bytes = vec![0xe4];
+        // Exercise the production snapshot/project/commit entrypoint here;
+        // the credited Length test above reaches final completion through its
+        // real scheduler and output actor rather than a private sibling method.
+        let projected = project(&state, &tokenizer, Some(terminal));
+        assert_eq!(projected.commit(&mut state).as_deref(), Some("ok\u{FFFD}"));
+        assert_eq!(state.generated_tokens, [TokenId::new(11), TokenId::new(2)]);
+
+        let mut complete = sequence(
+            InferenceRequest::new("prompt", "projection-test"),
+            &[11, 2, 3],
+        );
+        assert_eq!(
+            project(&complete, &tokenizer, Some(terminal))
+                .commit(&mut complete)
+                .as_deref(),
+            Some("ok\u{FFFD}中")
+        );
+
+        let mut literal = sequence(InferenceRequest::new("prompt", "projection-test"), &[11]);
+        assert_eq!(
+            project(&literal, &tokenizer, Some(terminal))
+                .commit(&mut literal)
+                .as_deref(),
+            Some("ok\u{FFFD}")
+        );
+    }
+}
+
+#[test]
+fn unicode_terminal_projection_rejects_unproven_or_mismatched_pending_bytes() {
+    let tokenizer = ProjectionTokenizer::new();
+    let mut state = sequence(InferenceRequest::new("prompt", "projection-test"), &[11]);
+    // A trailing literal replacement is not proof of an incomplete raw suffix.
+    for pending in [vec![0xe4], vec![0x80], vec![0xf0, 0x9f, 0x94, 0xa5]] {
+        state.pending_decoded_utf8_bytes = pending;
+        assert!(StreamProjectionSnapshot::capture(&state)
+            .project(&tokenizer, Some(FinishReason::Length))
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn unicode_failed_sampling_returns_uncommitted_grant_and_preserves_original_error() {
+    use ferrum_interfaces::output_flow::OutputCompletion;
+    use futures::StreamExt;
+    let tokenizer = Arc::new(ProjectionTokenizer::new());
+    let request = InferenceRequest::new("prompt", "projection-test");
+    let id = request.id.clone();
+    let (engine, mut session) = credited_projection_fixture(tokenizer, request, &[]).await;
+    let batch = engine
+        .inner
+        .scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .unwrap();
+    assert_eq!(batch.requests[0].request.id, id);
+    let prompt_tokens = engine.inner.sequences.read()[&id].input_tokens.len();
+    engine
+        .inner
+        .scheduler
+        .mark_prefill_complete(&id, prompt_tokens);
+    let cause = "original sampling failure before output commit";
+    engine
+        .inner
+        .complete_request_with_error(&id, FerrumError::model(cause))
+        .await
+        .unwrap();
+    // Drain the actual actor path, not a synthetic completion footer.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(frame) = session.frames.next().await {
+            if frame.metadata().terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(3), session.completion)
+        .await
+        .unwrap()
+        .unwrap();
+    match completion.payload() {
+        OutputCompletion::Failed(error) => {
+            assert!(error.message().contains(cause), "{}", error.message());
+            assert!(!error.message().contains("abandoned"));
+        }
+        OutputCompletion::Succeeded { .. } => {
+            panic!("failed sampling must not manufacture success")
+        }
+    }
+    assert!(!engine.inner.sequences.read().contains_key(&id));
+    assert_eq!(engine.inner.scheduler.trace_phase(&id), None);
 }

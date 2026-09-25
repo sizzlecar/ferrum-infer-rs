@@ -123,6 +123,7 @@ struct TokenPolicyCacheEntry {
     tokenizer: Weak<dyn Tokenizer + Send + Sync>,
     forbidden: HashSet<u32>,
     model_greedy_forbidden: HashSet<u32>,
+    utf8_transitions: Option<Arc<utf8_constraints::CachedTransitions>>,
 }
 
 static TOKEN_POLICY_CACHE: OnceLock<
@@ -866,6 +867,7 @@ fn cached_forbidden_generation_tokens(
     let mut forbidden = HashSet::new();
     let mut model_greedy_forbidden = HashSet::new();
     let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
+    let mut utf8_transitions = Vec::with_capacity(scan_limit);
     let has_reverse_vocab =
         (0..scan_limit).any(|token_id| tok.token_text(TokenId::new(token_id as u32)).is_some());
     let special = tok.special_tokens();
@@ -908,9 +910,12 @@ fn cached_forbidden_generation_tokens(
             .decode(&[token], true)
             .map(|text| decoded_token_is_statically_forbidden(tok.as_ref(), token, &text))
             .unwrap_or(true);
-        let context_free_bytes_invalid = tok
-            .token_bytes(token)
-            .is_none_or(|bytes| advance_pending_utf8_fragment(&[], &bytes).is_err());
+        let token_bytes = tok.token_bytes(token);
+        utf8_transitions.push(utf8_constraints::TokenTransition::new(
+            token_bytes.as_deref(),
+        ));
+        let context_free_bytes_invalid =
+            token_bytes.is_none_or(|bytes| advance_pending_utf8_fragment(&[], &bytes).is_err());
         if context_free_bytes_invalid {
             model_greedy_forbidden.insert(id);
         }
@@ -927,6 +932,10 @@ fn cached_forbidden_generation_tokens(
             tokenizer: tokenizer_identity,
             forbidden: forbidden.clone(),
             model_greedy_forbidden,
+            utf8_transitions: Some(Arc::new(utf8_constraints::CachedTransitions {
+                tokenizer: Arc::downgrade(tok),
+                tokens: utf8_transitions.into_boxed_slice(),
+            })),
         },
     );
     drop(cache);
@@ -946,6 +955,20 @@ fn cached_model_greedy_forbidden_tokens(tok: &Arc<dyn Tokenizer + Send + Sync>) 
         })
         .map(|entry| entry.model_greedy_forbidden.clone())
         .unwrap_or_default()
+}
+
+fn cached_utf8_transitions(
+    tok: &Arc<dyn Tokenizer + Send + Sync>,
+) -> Option<Arc<utf8_constraints::CachedTransitions>> {
+    TOKEN_POLICY_CACHE
+        .get()?
+        .lock()
+        .expect("token policy cache poisoned")
+        .get(&(tokenizer_cache_key(tok), tok.vocab_size()))
+        .filter(|entry| {
+            entry.tokenizer.ptr_eq(&Arc::downgrade(tok)) && entry.tokenizer.strong_count() > 0
+        })
+        .and_then(|entry| entry.utf8_transitions.clone())
 }
 
 fn tokenizer_cache_key(tok: &Arc<dyn Tokenizer + Send + Sync>) -> usize {
@@ -2693,6 +2716,7 @@ mod credited_output;
 mod inner;
 mod output_flow_runtime;
 mod slo_startup;
+mod utf8_constraints;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public engine wrapper
