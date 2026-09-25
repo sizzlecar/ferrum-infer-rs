@@ -39,6 +39,8 @@ pub(super) struct Summary {
     pub selected_validation_unknown_reasons: std::collections::BTreeMap<String, u64>,
     pub selected_fit_freeze: Option<serde_json::Value>,
     pub validation_model: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_calibration: Option<structured::StructuredReport>,
     pub phases: PhaseCounts,
     pub reference_frozen_plan: Option<serde_json::Value>,
     pub reference: Option<reference::ReferenceReceipt>,
@@ -56,6 +58,7 @@ pub(super) enum Phase {
     Reference,
     Training,
     Residual,
+    Qualification,
     #[serde(rename = "validation")]
     Heldout,
 }
@@ -68,6 +71,8 @@ pub(super) struct PhaseCounts {
     pub training: PhaseCount,
     pub residual: PhaseCount,
     pub heldout: PhaseCount,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<PhaseCount>,
 }
 
 #[derive(Default, Serialize)]
@@ -90,6 +95,7 @@ impl PhaseCounts {
             Phase::Training => &mut self.training,
             Phase::Residual => &mut self.residual,
             Phase::Heldout => &mut self.heldout,
+            Phase::Qualification => self.qualification.get_or_insert_with(PhaseCount::default),
         }
     }
 }
@@ -293,12 +299,19 @@ impl Artifacts {
         error: Option<&FerrumError>,
     ) -> Result<()> {
         self.raw.flush().map_err(io_error)?;
+        let validation_scope = if self.manifest["validation_model"]["kind"]
+            == "structured_whole_wave_v1"
+        {
+            "manifest validation cohorts are the third independent live qualification population; no fourth heldout, p99 guarantee, complete future horizon or serving SLO compliance is established"
+        } else {
+            "held-out actual-shape retrospective cost check; not pre-submission route validation or serving SLO compliance"
+        };
         let report = serde_json::json!({"schema_version":1,"kind":"real_manual_calibration",
             "status":if error.is_some(){"failed"}else{"collected"},"error":error.map(ToString::to_string),
             "manifest":self.manifest,"provenance":provenance,"summary":summary,
             "raw_bytes":self.bytes,"raw_sha256":format!("{:x}",self.hash.clone().finalize()),
-            "validation_scope":"held-out actual-shape retrospective cost check; not pre-submission route validation or serving SLO compliance",
-            "profile_scope":"exported_profile identifies the imported training artifact; selected_whole_wave_v1/profile6/source1, selected_independent_attention_v2/profile7/source2 and selected_work_support_v1/profile8/source3 freeze fit before independent residual capture and reload their explicit version before heldout; work-support retains family schema2 with a distinct model revision and excludes only output_budget_sum from statistical support, preserving request authority and terminal categories; fresh completed phases are required, old headers cannot be relabeled, defaults/min_samples/residual quantile/TTL are unchanged; live_frozen has no deployable artifact; legacy shutdown export may include validation observations",
+            "validation_scope":validation_scope,
+            "profile_scope":"exported_profile identifies the imported training artifact; selected_whole_wave_v1/profile6/source1, selected_independent_attention_v2/profile7/source2 and selected_work_support_v1/profile8/source3 freeze fit before independent residual capture and reload their explicit version before heldout; work-support retains family schema2 with a distinct model revision and excludes only output_budget_sum from statistical support, preserving request authority and terminal categories; fresh completed phases are required, old headers cannot be relabeled, defaults/min_samples/residual quantile/TTL are unchanged; live_frozen has no deployable artifact; legacy shutdown export may include validation observations; structured_whole_wave_v1/profile9 uses three complete live fit/residual/qualification populations and only exports after qualification plus original source replay, with no additional heldout or serving SLO claim",
             "reference_scope":"optional singleton discovery -> persisted plan -> fresh trials -> original training-cut source join; target completion never shortens the request; only target_waves enter reference scoring, preparation proves the chain and after_target waves are not reference targets"});
         serde_json::to_writer_pretty(&mut self.report, &report).map_err(json_error)?;
         self.report.write_all(b"\n").map_err(io_error)?;

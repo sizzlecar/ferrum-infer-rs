@@ -38,6 +38,9 @@ impl ValidationModel {
         source: &manifest::ValidationSource,
     ) -> Result<Self> {
         match source {
+            manifest::ValidationSource::StructuredWholeWaveV1 { .. } => Err(FerrumError::internal(
+                "structured calibration must use its real three-phase session driver",
+            )),
             manifest::ValidationSource::LiveFrozen => {
                 session.freeze_cost_model().await.map(Self::LiveFrozen)
             }

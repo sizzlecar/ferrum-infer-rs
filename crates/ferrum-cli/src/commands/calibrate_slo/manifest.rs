@@ -53,9 +53,20 @@ pub(super) enum ValidationSource {
         export: ferrum_types::SloCostProfileExportConfig,
         residual: Vec<Cohort>,
     },
+    /// Live, independently frozen fit/residual/qualification; exports schema 9.
+    StructuredWholeWaveV1 {
+        capture: structured::CaptureConfig,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
+    pub(super) fn structured(&self) -> Option<&structured::CaptureConfig> {
+        match self {
+            Self::StructuredWholeWaveV1 { capture, .. } => Some(capture),
+            _ => None,
+        }
+    }
     pub(super) fn selected(
         &self,
     ) -> Option<(
@@ -96,7 +107,8 @@ impl ValidationSource {
         match self {
             Self::SelectedWholeWaveV1 { residual, .. }
             | Self::SelectedIndependentAttentionV2 { residual, .. }
-            | Self::SelectedWorkSupportV1 { residual, .. } => residual,
+            | Self::SelectedWorkSupportV1 { residual, .. }
+            | Self::StructuredWholeWaveV1 { residual, .. } => residual,
             _ => &[],
         }
     }
@@ -107,6 +119,9 @@ impl ValidationSource {
             | Self::SelectedIndependentAttentionV2 { export, .. }
             | Self::SelectedWorkSupportV1 { export, .. } => {
                 Some((&export.path, &export.observations_path))
+            }
+            Self::StructuredWholeWaveV1 { capture, .. } => {
+                Some((&capture.profile, &capture.source))
             }
             Self::LiveFrozen => None,
         }
@@ -260,6 +275,9 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
         | ValidationSource::SelectedWorkSupportV1 { export, .. } => {
             Some((&mut export.path, &mut export.observations_path))
         }
+        ValidationSource::StructuredWholeWaveV1 { capture, .. } => {
+            Some((&mut capture.profile, &mut capture.source))
+        }
         ValidationSource::LiveFrozen => None,
     };
     if let Some((profile, source)) = destinations {
@@ -301,6 +319,9 @@ impl Manifest {
             if self.reference.is_some() {
                 return invalid("collect the reference separately before selected whole-wave calibration; its source must not be relabeled as the later fit/residual capture");
             }
+        }
+        if let Some(capture) = self.validation_model.structured() {
+            capture.validate(self)?;
         }
         if self.input_preprocessing_sha256 == [0; 32] {
             return invalid("calibration requires a nonzero preprocessing digest");

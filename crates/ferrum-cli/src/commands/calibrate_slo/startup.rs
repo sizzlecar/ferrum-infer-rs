@@ -150,6 +150,40 @@ pub(super) fn validate_export_configuration(
     policy: &ferrum_types::SloConfig,
 ) -> Result<()> {
     paths::distinct(paths::outputs(cmd, manifest))?;
+    let structured = manifest.validation_model.structured();
+    if structured.is_some()
+        != (policy.cost_observation.predictor
+            == ferrum_types::SloCostPredictor::StructuredWholeWaveV1)
+    {
+        return Err(FerrumError::config(
+            "structured predictor and live three-phase calibration protocol must match exactly",
+        ));
+    }
+    if let Some(capture) = structured {
+        capture.validate(manifest)?;
+        let observation = &policy.cost_observation;
+        let limits = &observation.profile_import;
+        if observation.structured_capture != ferrum_types::SloStructuredCostCapture::HostSettledV1
+            || observation.profile_export.is_some()
+            || policy.cost_profile.is_some()
+        {
+            return Err(FerrumError::config(
+                "structured calibration requires HostSettledV1 and a fresh live session without an imported profile or legacy export",
+            ));
+        }
+        limits.validate().map_err(FerrumError::config)?;
+        if capture.declared_source_clock_error_ns > limits.max_clock_error_ns
+            || capture.maximum_file_bytes.get() >= limits.max_file_bytes.get() as u64
+            || capture.fit_members.get()
+                + capture.residual_members.get()
+                + capture.qualification_members.get()
+                > limits.max_samples.get()
+        {
+            return Err(FerrumError::config(
+                "structured capture must fit import population/clock limits and leave byte capacity for its schema-9 envelope",
+            ));
+        }
+    }
     let selected = manifest.validation_model.selected();
     if selected.map(|(predictor, _, _)| predictor)
         != policy

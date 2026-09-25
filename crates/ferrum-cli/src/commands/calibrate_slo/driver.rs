@@ -23,6 +23,9 @@ pub(super) async fn collect(
     artifacts: &mut report::Artifacts,
     summary: &mut report::Summary,
 ) -> Result<()> {
+    if manifest.validation_model.structured().is_some() {
+        return structured::collect(session, manifest, inputs, artifacts, summary).await;
+    }
     if manifest.reference.is_some() {
         summary.reference_input_identities =
             Some(reference::InputIdentityLedger::new(inputs.count(manifest))?);
