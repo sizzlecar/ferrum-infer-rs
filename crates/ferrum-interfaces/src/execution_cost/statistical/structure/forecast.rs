@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// Constraint on the selected subset of eligible positions. NonEmptySubset
 /// applies only when unknown pending text is the reason for FullLogits; a fixed
 /// FullLogits peer already covers the empty subset and must use AnySubset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostPendingConstraintV2 {
     AnySubset,
