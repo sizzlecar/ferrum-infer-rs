@@ -69,6 +69,9 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("weights.rs"),
     include_str!("linear/staged_prefill.rs"),
     include_str!("linear/transformed_prefill.rs"),
+    include_str!("linear/half_head.rs"),
+    include_str!("linear/half_head.metal"),
+    include_str!("linear/half_head_tiled.metal"),
     include_str!("hadamard.rs"),
     include_str!("hadamard.metal"),
     include_str!("../q4_k_gemv_v2.metal"),
@@ -103,10 +106,13 @@ const SHARED_WEIGHT_GEMV_MIN_OUTPUT_FEATURES: u32 = 1024;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
 const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
+mod half_head;
 mod plain_prefill;
 mod small_batch;
 pub(super) mod staged_prefill;
 mod transformed_prefill;
+use half_head::LastTokenProjection;
+pub(super) use half_head::MetalHalfHeadProvider;
 use plain_prefill::PlainLinearPlan;
 use transformed_prefill::TransformedLinearPlan;
 
@@ -875,7 +881,7 @@ impl MetalLastTokenDenseLinearProvider {
             _ => {
                 return Err(MetalDeviceRuntimeError::contract(
                     "Metal last-token linear activation ABI supports only F16 or F32",
-                ))
+                ));
             }
         };
         let descriptor = linear_provider_descriptor(
@@ -963,7 +969,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider
             request,
             self.operation_id,
             self.activation_type,
-            &self.pipelines,
+            &LastTokenProjection::Strict(Arc::clone(&self.pipelines)),
         )
     }
 
@@ -982,7 +988,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider
     ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_last_token_dense_linear(
-            Arc::clone(&self.pipelines),
+            LastTokenProjection::Strict(Arc::clone(&self.pipelines)),
             self.operation_id,
             self.activation_type,
             invocation,
@@ -1346,7 +1352,7 @@ fn encode_dense_linear(
 }
 
 fn encode_last_token_dense_linear(
-    pipelines: Arc<MetalLinearPipelines>,
+    pipelines: LastTokenProjection,
     operation_id: &'static str,
     activation_type: ElementType,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
@@ -1380,6 +1386,7 @@ fn encode_last_token_dense_linear(
         return Err("Metal last-token linear requires one physical matrix".to_owned());
     };
     let part = *part;
+    pipelines.validate_part(part)?;
     let mut regions = prepared.regions;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -1498,30 +1505,27 @@ fn encode_last_token_dense_linear(
                 scratch_layout.output_offset_bytes,
                 activation_type,
             )?;
-            launch.bind_hadamard_workspace(
-                &pipelines,
+            pipelines.bind_hadamard_workspace(
+                &mut launch,
                 &regions,
                 scratch_region,
                 transform_offset,
             )?;
             validate_launch_regions_with_raw_workspace(&regions, &[launch], &[scratch_region])?;
+            pipelines.validate_launch(&regions, launch, &[scratch_region])?;
             validate_region_span(
                 &regions[scratch_region],
                 0,
                 scratch_layout.required_bytes,
                 "Metal packed last-token scratch",
             )?;
-            let operation_label = if activation_type == ElementType::F32 {
-                "vnext_last_token_dense_linear_f32"
-            } else {
-                "vnext_last_token_dense_linear"
-            };
             let statistical = head_selected::evidence(
                 &pipelines,
                 &[launch],
                 token_count,
                 Some((scratch_layout, participant_count_u32, shared_packed_input)),
             );
+            let operation_label = pipelines.operation_label(activation_type);
             return MetalDeviceCommand::operation(
                 operation_label,
                 regions,
@@ -1540,8 +1544,8 @@ fn encode_last_token_dense_linear(
                             }
                         });
                     }
-                    encoder.record_compute_dispatches(launch.dispatch_count());
-                    dispatch_linear(&pipelines, encoder.compute_encoder(), regions, launch);
+                    encoder.record_compute_dispatches(pipelines.dispatch_count(launch));
+                    pipelines.dispatch(encoder.compute_encoder(), regions, launch);
                     encoder.with_blit_commands(participant_count as u64, |blit| {
                         for participant_index in 0..participant_count {
                             blit.copy_from_buffer(
@@ -1559,12 +1563,12 @@ fn encode_last_token_dense_linear(
                 },
             )
             .map_err(|error| error.to_string())?
+            .with_statistical_evidence(statistical)
             .with_work_shape(
                 DeviceBatchingForm::Packed,
                 participant_count_u32,
                 token_count,
             )
-            .map(|command| command.with_statistical_evidence(statistical))
             .map_err(|error| error.to_string());
         }
     }
@@ -1612,25 +1616,28 @@ fn encode_last_token_dense_linear(
         let index = regions.len();
         regions.push(shared_scratch_region(&invocation, bytes)?);
         for launch in &mut launches {
-            launch.bind_hadamard_workspace(&pipelines, &regions, index, 0)?;
+            pipelines.bind_hadamard_workspace(launch, &regions, index, 0)?;
         }
     }
     validate_launch_regions(&regions, &launches)?;
-    let dispatch_count = launches.iter().map(|launch| launch.dispatch_count()).sum();
-    let operation_label = if activation_type == ElementType::F32 {
-        "vnext_last_token_dense_linear_f32"
-    } else {
-        "vnext_last_token_dense_linear"
-    };
+    for launch in &launches {
+        pipelines.validate_launch(&regions, *launch, &[])?;
+    }
+    let dispatch_count = launches
+        .iter()
+        .map(|launch| pipelines.dispatch_count(*launch))
+        .sum();
     let statistical = head_selected::evidence(&pipelines, &launches, token_count, None);
+    let operation_label = pipelines.operation_label(activation_type);
     MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
         for launch in &launches {
-            dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
+            pipelines.dispatch(encoder.compute_encoder(), regions, *launch);
         }
         Ok(())
     })
     .map_err(|error| error.to_string())?
+    .with_statistical_evidence(statistical)
     .with_work_shape(
         if participant_count_u32 == 1 {
             DeviceBatchingForm::Scalar
@@ -1640,7 +1647,6 @@ fn encode_last_token_dense_linear(
         participant_count_u32,
         token_count,
     )
-    .map(|command| command.with_statistical_evidence(statistical))
     .map_err(|error| error.to_string())
 }
 

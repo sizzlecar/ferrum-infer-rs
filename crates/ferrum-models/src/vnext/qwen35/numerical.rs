@@ -11,6 +11,7 @@ use ferrum_interfaces::vnext::{
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
+pub const F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.f16-head";
 pub const F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.q8-swiglu";
 pub const F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.q8-swiglu-gdn-projections";
@@ -25,6 +26,9 @@ pub(super) fn profiles(
     let (states, kv_storage) = states(&text, config.max_position_embeddings, KvStorageFormat::F16)?;
     let f16 = profile(family_id, &text, &states, &kv_storage, false, false)?;
     let f32 = profile(family_id, &text, &states, &kv_storage, true, false)?;
+    let f16_head = f16_head_eligible(config, &text)
+        .then(|| f16_head_profile(&f32))
+        .transpose()?;
     let q8_swiglu = q8_swiglu_eligible(config, &text)
         .then(|| q8_swiglu_profile(&f32))
         .transpose()?;
@@ -73,7 +77,60 @@ pub(super) fn profiles(
     // preference lists unchanged when suitable K-block leaves are present.
     profiles.extend(q8_swiglu);
     profiles.extend(q8_gdn_projections);
-    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 3), profiles, automatic)
+    profiles.extend(f16_head);
+    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 4), profiles, automatic)
+}
+
+pub(super) fn f16_head_eligible(config: &Qwen35FamilyConfig, text: &Qwen35TextConfig) -> bool {
+    config.gguf_hadamard.is_none()
+        && config.recurrent_weight_abi == RecurrentWeightAbi::NegativeRateInterleaved
+        && config.weights.iter().all(|weight| {
+            matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::Dense { .. }
+                    | FamilyWeightSourceEncoding::BlockQuantized(_)
+            )
+        })
+        && output_projection_weight(config).is_ok_and(|weight| {
+            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+                return false;
+            };
+            spec.format_id.as_str() == "quantization.gguf.q6-k"
+                && spec.logical_values_per_block == 256
+                && spec.bytes_per_block == 210
+                && matches!(weight.dimensions.as_slice(), [rows, columns]
+                    if *rows == config.vocab_size && *rows > 0
+                        && *columns == text.hidden_size as u64
+                        && *columns > 0 && *columns % 256 == 0)
+        })
+}
+
+fn f16_head_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = master.clone();
+    profile.id = NumericalProfileId::new(F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let head = profile
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.operation_id.as_str() == LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID
+        })
+        .ok_or_else(|| {
+            invalid_config(
+                "numerical_profile.operations",
+                "F32 output head contract is missing",
+            )
+        })?;
+    head.operation_id = operation_id(LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID)?;
+    head.version = ContractVersion::new(1, 0);
+    head.multiplication_type = Some(ElementType::F16);
+    head.accumulation_type = Some(ElementType::F32);
+    profile
+        .operations
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(profile)
 }
 
 pub(super) fn q8_swiglu_eligible(config: &Qwen35FamilyConfig, text: &Qwen35TextConfig) -> bool {

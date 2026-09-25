@@ -26,7 +26,7 @@ fn blit(builder: &mut SelectedCommandCostBuilderV1, bytes: u64, gather: bool) ->
         .ok()
 }
 pub(super) fn evidence(
-    pipelines: &MetalLinearPipelines,
+    projection: &LastTokenProjection,
     launches: &[LinearLaunch],
     tokens: u64,
     packed: Option<(LastTokenPackedScratchLayout, u32, bool)>,
@@ -37,7 +37,10 @@ pub(super) fn evidence(
     if packed.is_none() && launches.iter().any(|launch| launch.params.rows != 1) {
         return None;
     }
-    let mut builder = SelectedCommandCostBuilderV1::new(tokens);
+    let mut builder = crate::backend::metal::vnext_runtime::selected_cost_builder(
+        projection.structured_capture(),
+        tokens,
+    );
     let scratch = packed.map_or(0, |(layout, _, _)| layout.required_bytes);
     if let Some((layout, count, shared_input)) = packed {
         if launches.len() != 1 || count == 0 || launches[0].params.rows != count {
@@ -50,7 +53,12 @@ pub(super) fn evidence(
         }
     }
     for &launch in launches {
-        selected::projection(&mut builder, pipelines, launch, None, scratch)?;
+        match projection {
+            LastTokenProjection::Strict(p) => {
+                selected::projection(&mut builder, p, launch, None, scratch)?
+            }
+            LastTokenProjection::Half(p) => p.append_statistical(&mut builder, launch, scratch)?,
+        }
     }
     if let Some((layout, count, _)) = packed {
         for _ in 0..count {
@@ -63,11 +71,176 @@ pub(super) fn evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_head_tracks_real_small_split_tiled_and_gather_scatter_work() {
+        check_selected_head(ferrum_types::SloStructuredCostCapture::Disabled);
+    }
+
+    #[test]
+    fn selected_head_algorithm_capture_covers_strict_half_and_real_transfer_geometry() {
+        check_selected_head(ferrum_types::SloStructuredCostCapture::HostSettledV1);
+    }
+
+    fn check_selected_head(capture: ferrum_types::SloStructuredCostCapture) {
+        let device = Device::system_default().expect("real Metal head pipeline catalog");
+        let strict = LastTokenProjection::Strict(Arc::new(
+            MetalLinearPipelines::new(&device)
+                .unwrap()
+                .with_structured_capture(capture),
+        ));
+        let half = LastTokenProjection::Half(Arc::new(
+            half_head::HalfHeadPipelines::new(&device)
+                .unwrap()
+                .with_structured_capture(capture),
+        ));
+        for projection in [&strict, &half] {
+            let part = PreparedLinearPart {
+                region: 0,
+                format: LinearPhysicalFormat::Q6K,
+                out_features: 64,
+                output_offset: 0,
+                transform: None,
+            };
+            for count in [2, 5, 7, 8, 16] {
+                let layout =
+                    LastTokenPackedScratchLayout::new(count, 256, 64, ElementType::F32).unwrap();
+                let launch = linear_launch_typed(
+                    part,
+                    0,
+                    0,
+                    count,
+                    256,
+                    64,
+                    0,
+                    layout.output_offset_bytes,
+                    ElementType::F32,
+                )
+                .unwrap();
+                let tokens = count + 3;
+                let shared = evidence(
+                    projection,
+                    &[launch],
+                    tokens,
+                    Some((layout, count as u32, true)),
+                )
+                .unwrap();
+                let gathered = evidence(
+                    projection,
+                    &[launch],
+                    tokens,
+                    Some((layout, count as u32, false)),
+                )
+                .unwrap();
+                shared
+                    .validate_command(tokens, projection.dispatch_count(launch), count)
+                    .unwrap();
+                gathered
+                    .validate_command(tokens, projection.dispatch_count(launch), count * 2)
+                    .unwrap();
+                for command in [&shared, &gathered] {
+                    if capture.is_disabled() {
+                        assert!(command.algorithm_work().is_none());
+                    } else {
+                        let work = command.algorithm_work().unwrap().unwrap();
+                        work.validate_command(command).unwrap();
+                        assert!(work.entries().iter().any(|entry| entry.kind()
+                            == ferrum_interfaces::execution_cost::AlgorithmWorkKindV1::Kernel));
+                        assert!(work.entries().iter().any(|entry| entry.kind() == ferrum_interfaces::execution_cost::AlgorithmWorkKindV1::DeviceToDevice));
+                    }
+                }
+                assert_eq!(shared.work().device_to_device_bytes, count * 64 * 4);
+                assert_eq!(
+                    gathered.work().device_to_device_bytes,
+                    count * (256 + 64) * 4
+                );
+                assert_ne!(shared.family_signature(), gathered.family_signature());
+                assert_eq!(shared.work().peak_scratch_bytes, layout.required_bytes);
+                assert_eq!(shared.work().inner_work_units, count * 64 * 256);
+            }
+        }
+        let a = LinearParams {
+            rows: 7,
+            in_features: 256,
+            out_features: 64,
+            output_stride: 64,
+            output_column_offset: 0,
+        };
+        let mut launch = linear_launch_typed(
+            PreparedLinearPart {
+                region: 0,
+                format: LinearPhysicalFormat::Q6K,
+                out_features: 64,
+                output_offset: 0,
+                transform: None,
+            },
+            0,
+            0,
+            7,
+            256,
+            64,
+            0,
+            0,
+            ElementType::F32,
+        )
+        .unwrap();
+        let seven = evidence(
+            &half,
+            &[launch],
+            7,
+            Some((
+                LastTokenPackedScratchLayout::new(7, 256, 64, ElementType::F32).unwrap(),
+                7,
+                true,
+            )),
+        )
+        .unwrap();
+        launch.params = LinearParams { rows: 8, ..a };
+        let eight = evidence(
+            &half,
+            &[launch],
+            8,
+            Some((
+                LastTokenPackedScratchLayout::new(8, 256, 64, ElementType::F32).unwrap(),
+                8,
+                true,
+            )),
+        )
+        .unwrap();
+        seven.validate_command(7, 2, 7).unwrap();
+        eight.validate_command(8, 1, 8).unwrap();
+        assert_ne!(seven.family_signature(), eight.family_signature());
+        assert_eq!(
+            eight.work().padded_units,
+            32 * 64,
+            "actual half-head M32 tile remains unchanged"
+        );
+        launch.activation_type = ElementType::F16;
+        assert!(
+            evidence(
+                &half,
+                &[launch],
+                8,
+                Some((
+                    LastTokenPackedScratchLayout::new(8, 256, 64, ElementType::F32).unwrap(),
+                    8,
+                    true
+                ))
+            )
+            .is_none(),
+            "no strict profile substitution for unsupported half-head ABI"
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_regression {
+    use super::*;
 
     #[test]
     fn selected_head_accounts_actual_packed_gather_compute_and_scatter() {
         let device = Device::system_default().expect("actual Metal PSO catalog");
-        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let pipelines =
+            LastTokenProjection::Strict(Arc::new(MetalLinearPipelines::new(&device).unwrap()));
         let part = PreparedLinearPart {
             region: 0,
             format: LinearPhysicalFormat::Q6K,
@@ -136,7 +309,8 @@ mod tests {
     #[test]
     fn selected_head_scalar_and_participant_loop_have_no_invented_transfers() {
         let device = Device::system_default().expect("actual Metal PSO catalog");
-        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let pipelines =
+            LastTokenProjection::Strict(Arc::new(MetalLinearPipelines::new(&device).unwrap()));
         let part = PreparedLinearPart {
             region: 0,
             format: LinearPhysicalFormat::Q6K,

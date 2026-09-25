@@ -34,6 +34,10 @@ use ferrum_interfaces::vnext::{
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
+use ferrum_interfaces::vnext::{
+    last_token_dense_linear_f32_f16_operands_contract,
+    LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
+};
 use sha2::{Digest, Sha256};
 
 use super::vnext_runtime::{
@@ -54,6 +58,7 @@ mod weights;
 
 use causal_attention::{MetalCausalAttentionPipelines, MetalCausalPagedAttentionProvider};
 use gated_delta_attention::{MetalGatedDeltaPipelines, MetalGatedDeltaRecurrentAttentionProvider};
+use linear::MetalHalfHeadProvider;
 use linear::{
     MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalLastTokenDenseLinearProvider,
     MetalLinearPipelines,
@@ -95,6 +100,7 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         RMS_NORM_F32_CAPABILITY_ID,
         RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+        LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
@@ -184,6 +190,7 @@ pub fn metal_vnext_operation_registry(
         Box::new(rms_norm_f32_contract().map_err(contract_error)?),
         Box::new(residual_add_f32_f16_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_f32_contract().map_err(contract_error)?),
+        Box::new(last_token_dense_linear_f32_f16_operands_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
@@ -258,6 +265,7 @@ pub fn metal_vnext_operation_registry(
             runtime,
             Arc::clone(&linear_pipelines),
         )?),
+        Box::new(MetalHalfHeadProvider::new(runtime)?),
         Box::new(MetalLastTokenMaskedArgmaxF32Provider::new(
             runtime,
             Arc::clone(&pipelines),
@@ -896,6 +904,7 @@ mod tests {
             RMS_NORM_F32_OPERATION_ID,
             RESIDUAL_ADD_F32_F16_OPERATION_ID,
             LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID,
             LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,

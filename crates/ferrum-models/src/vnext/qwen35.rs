@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 
+use ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID;
 use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
     ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, GatedDeltaDecayParameterization,
@@ -65,6 +66,9 @@ use super::{
 pub const FAMILY_ID: &str = "family.qwen3_5.hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 pub const MOE_EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5MoeForConditionalGeneration";
+#[cfg(test)]
+#[path = "qwen35/f16_head_tests.rs"]
+mod f16_head_tests;
 mod hadamard;
 mod numerical;
 #[cfg(test)]
@@ -75,8 +79,8 @@ mod q8_gdn_projections_tests;
 mod q8_swiglu_tests;
 pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
-    F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID,
-    F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID,
+    F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID, F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID,
+    F32_MASTER_NUMERICAL_PROFILE_ID, F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID,
     F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID,
 };
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
@@ -320,6 +324,15 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER
     };
 
+    const F32_MASTER_F16_HEAD: Self = Self {
+        logits: OperationSelection::new(
+            LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER
+    };
+
     const F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS: Self = Self {
         linear_attention: OperationSelection::new(
             GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID,
@@ -350,6 +363,7 @@ impl Qwen35OperationProfile {
         match profile.id.as_str() {
             F16_NUMERICAL_PROFILE_ID => Ok(Self::F16),
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
+            F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_F16_HEAD),
             F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER_Q8_SWIGLU),
             F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS)
@@ -810,6 +824,15 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             return Err(invalid_config("numerical_profile.kv_storage", "Hadamard weight execution currently requires F16 KV; INT8 KV must be qualified as a separate combination"));
         }
         let text = Self::text_config(config)?;
+        if profile.id.as_str() == F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID
+            && (!numerical::f16_head_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16))
+        {
+            return Err(invalid_config("numerical_profile", "F16 head operands require the selected native Q6_K K256 output weight, non-Hadamard execution, negative-rate recurrent ABI, and F16 KV"));
+        }
         if profile.id.as_str() == F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID
             && (!numerical::q8_swiglu_eligible(config, &text)
                 || profile
@@ -1180,11 +1203,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         }
 
         let final_norm = required_weight(config, None, "final_norm")?;
-        let projection = config
-            .weights
-            .iter()
-            .find(|weight| weight.layer_index.is_none() && weight.role == "lm_head")
-            .unwrap_or(embedding);
+        let projection = output_projection_weight(config)?;
         let final_hidden = value_id("value.output.final_hidden")?;
         nodes.push(ProgramNode {
             id: node_id("node.final_norm")?,
@@ -4011,6 +4030,15 @@ fn layer_weights(
         weight.layer_index == Some(layer_index)
             && (weight.role == "post_attention_layernorm" || weight.role.starts_with("mlp_")) == mlp
     })
+}
+
+fn output_projection_weight(config: &Qwen35FamilyConfig) -> Result<&FamilyWeight, VNextError> {
+    config
+        .weights
+        .iter()
+        .find(|weight| weight.layer_index.is_none() && weight.role == "lm_head")
+        .map(Ok)
+        .unwrap_or_else(|| required_weight(config, None, "embed_tokens"))
 }
 
 fn required_weight<'a>(

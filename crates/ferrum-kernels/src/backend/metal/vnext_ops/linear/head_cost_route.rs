@@ -1,5 +1,6 @@
 //! Last-row projection including gather/scatter. Layout evidence comes from
 //! the compiled resource contract; no backing claim or device work is created.
+use super::half_head::LastTokenProjectionKind;
 use super::*;
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, OperationCostCommand, OperationCostRoute, OperationCostRouteRequest,
@@ -15,11 +16,12 @@ pub(super) fn route(
     request: OperationCostRouteRequest<'_>,
     operation_id: &str,
     dtype: ElementType,
-    pipelines: &MetalLinearPipelines,
+    projection: &LastTokenProjection,
 ) -> Result<Option<OperationCostRoute>, VNextError> {
     if request.operation_id().as_str() != operation_id {
         return Ok(None);
     }
+    let policy = projection.kind();
     let calculate = || -> Result<Option<OperationCostCommand>, String> {
         let hidden = unsigned_attribute(request.attributes(), "hidden_size")?;
         let outputs = unsigned_attribute(request.attributes(), "out_features")?;
@@ -32,6 +34,7 @@ pub(super) fn route(
             return Ok(None);
         };
         let part = prepare_leaf_encoding(&metadata, &layout, outputs, hidden, 1, 0)?;
+        policy.validate_part(part)?;
         let participants = request.rows().len();
         let scratch =
             LastTokenPackedScratchLayout::new(participants as u64, hidden, outputs, dtype)?;
@@ -97,6 +100,7 @@ pub(super) fn route(
                 .ok_or("last-token source byte range overflows")?;
         }
         let mut command = command(
+            policy,
             dtype,
             part,
             hidden,
@@ -106,11 +110,12 @@ pub(super) fn route(
             packed,
             shared_input,
         )?;
+        let rows = if packed { participants as u64 } else { 1 };
         let launch = linear_launch_typed(
             part,
             0,
             0,
-            if packed { participants as u64 } else { 1 },
+            rows,
             hidden,
             outputs,
             0,
@@ -123,7 +128,7 @@ pub(super) fn route(
         )?;
         let launches = vec![launch; if packed { 1 } else { participants }];
         if let Some(evidence) = head_selected::evidence(
-            pipelines,
+            projection,
             &launches,
             request.immediate_tokens(),
             packed.then_some((scratch, participants as u32, shared_input)),
@@ -142,6 +147,7 @@ pub(super) fn route(
 
 #[allow(clippy::too_many_arguments)]
 fn command(
+    policy: LastTokenProjectionKind,
     dtype: ElementType,
     part: PreparedLinearPart,
     hidden: u64,
@@ -157,9 +163,9 @@ fn command(
     }
     let rows = if packed { participants as u64 } else { 1 };
     let launch = linear_launch_typed(part, 0, 0, rows, hidden, outputs, 0, 0, dtype)?;
-    launch.activation_bytes()?;
-    let dispatches = launch
-        .dispatch_count()
+    policy.validate_numeric_launch(launch)?;
+    let dispatches = policy
+        .dispatch_count(launch)
         .checked_mul(if packed { 1 } else { participants as u64 })
         .ok_or("last-token cost dispatch count overflows")?;
     let transfers = if packed {
@@ -170,11 +176,7 @@ fn command(
         0
     };
     OperationCostCommand::new(
-        if dtype == ElementType::F32 {
-            "vnext_last_token_dense_linear_f32"
-        } else {
-            "vnext_last_token_dense_linear"
-        },
+        policy.operation_label(dtype),
         DeviceCommandPhase::Compute,
         if packed {
             DeviceBatchingForm::Packed
@@ -207,9 +209,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
-        for (count, dispatches) in [(2, 1), (5, 1), (7, 1), (8, 2), (17, 5), (33, 1)] {
+    fn half_packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
+        for (count, dispatches) in [(2, 1), (5, 2), (7, 2), (8, 1), (17, 1), (33, 1)] {
             let route = command(
+                LastTokenProjectionKind::Half,
                 ElementType::F32,
                 part(),
                 256,
@@ -224,6 +227,100 @@ mod tests {
             assert_eq!(route.compute_dispatch_count(), dispatches);
             assert_eq!(route.batching(), DeviceBatchingForm::Packed);
             let gathered = command(
+                LastTokenProjectionKind::Half,
+                ElementType::F32,
+                part(),
+                256,
+                1024,
+                count,
+                count as u64 + 2,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(gathered.transfer_command_count(), 2 * count as u64);
+            assert_eq!(
+                gathered.compute_dispatch_count(),
+                route.compute_dispatch_count()
+            );
+        }
+    }
+
+    #[test]
+    fn half_head_checks_kernel_integer_boundaries_before_submission() {
+        assert!(command(
+            LastTokenProjectionKind::Half,
+            ElementType::F32,
+            part(),
+            256,
+            i32::MAX as u64 + 1,
+            2,
+            2,
+            true,
+            true
+        )
+        .is_err());
+        assert!(command(
+            LastTokenProjectionKind::Half,
+            ElementType::F16,
+            part(),
+            256,
+            1024,
+            2,
+            2,
+            true,
+            true
+        )
+        .is_err());
+        assert!(command(
+            LastTokenProjectionKind::Strict,
+            ElementType::F32,
+            part(),
+            256,
+            1024,
+            0,
+            0,
+            false,
+            false
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod strict_regression {
+    use super::*;
+
+    fn part() -> PreparedLinearPart {
+        PreparedLinearPart {
+            region: 0,
+            format: LinearPhysicalFormat::Q6K,
+            out_features: 1024,
+            output_offset: 0,
+            transform: None,
+        }
+    }
+
+    #[test]
+    fn packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
+        for (count, dispatches) in [(2, 1), (5, 1), (7, 1), (8, 2), (17, 5), (33, 1)] {
+            let route = command(
+                LastTokenProjectionKind::Strict,
+                ElementType::F32,
+                part(),
+                256,
+                1024,
+                count,
+                count as u64,
+                true,
+                true,
+            )
+            .unwrap();
+            assert_eq!(route.transfer_command_count(), count as u64);
+            assert_eq!(route.compute_dispatch_count(), dispatches);
+            assert_eq!(route.batching(), DeviceBatchingForm::Packed);
+            let gathered = command(
+                LastTokenProjectionKind::Strict,
                 ElementType::F32,
                 part(),
                 256,
@@ -245,8 +342,18 @@ mod tests {
     #[test]
     fn scalar_and_unaligned_row_loop_have_no_gather_scatter() {
         for count in [1, 3] {
-            let route =
-                command(ElementType::F16, part(), 256, 1024, count, 7, false, false).unwrap();
+            let route = command(
+                LastTokenProjectionKind::Strict,
+                ElementType::F16,
+                part(),
+                256,
+                1024,
+                count,
+                7,
+                false,
+                false,
+            )
+            .unwrap();
             assert_eq!(route.compute_dispatch_count(), count as u64);
             assert_eq!(route.transfer_command_count(), 0);
         }
@@ -260,6 +367,7 @@ mod tests {
     fn strict_head_rejects_empty_and_shader_width_overflow() {
         for (outputs, participants, tokens) in [(1024, 0, 0), (u32::MAX as u64 + 1, 2, 2)] {
             assert!(command(
+                LastTokenProjectionKind::Strict,
                 ElementType::F32,
                 part(),
                 256,
