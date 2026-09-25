@@ -85,7 +85,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         .try_reserve_exact(query.rows.len())
         .map_err(|_| U::Capacity)?;
     let mut total_tokens = 0_u64;
-    let mut zeros = Vec::new();
+    let mut pending_initializations = Vec::new();
     let mut next = state.clone();
     let mut previous_authority = None;
     for (row, &index) in query.rows.iter().zip(query.participant_indices) {
@@ -111,23 +111,10 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             .checked_add(row.count.get())
             .ok_or(U::InvalidInput)?;
         if !next.initialized[index] {
-            let spans = view.resources.participants()[index]
-                .pending_zero_transfer_bytes()
-                .ok_or(U::InitializationState)?;
-            if zeros
-                .len()
-                .checked_add(spans.len())
-                .is_none_or(|n| n > MAX_COST_COMMANDS)
-            {
-                return Err(U::Capacity);
-            }
-            zeros
-                .try_reserve_exact(spans.len())
+            pending_initializations
+                .try_reserve_exact(1)
                 .map_err(|_| U::Capacity)?;
-            for &bytes in spans {
-                poll(budget)?;
-                zeros.push(bytes);
-            }
+            pending_initializations.push(index);
             next.initialized[index] = true;
         }
         // New zero-initialized growth requires its own physical-piece proof.
@@ -182,6 +169,11 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     let selected_step = projection.step_slot;
     next.resources = projection.state;
     let mut command_index = 0_u32;
+    let zeros = view
+        .resources
+        .pending_zero_transfer_bytes(&pending_initializations, budget)
+        .map_err(U::Resource)?
+        .ok_or(U::InitializationState)?;
     for bytes in zeros {
         poll(budget)?;
         let evidence = runtime.cost_core_transfer_evidence(

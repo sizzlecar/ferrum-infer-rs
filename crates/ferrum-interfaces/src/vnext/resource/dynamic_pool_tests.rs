@@ -128,6 +128,7 @@ struct TestRuntime {
     timing_queries: AtomicU64,
     submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
     encoded_copy_regions: Mutex<Vec<CopyRegion>>,
+    encoded_zero_bytes: Mutex<Vec<u64>>,
 }
 
 struct TestFence {
@@ -193,6 +194,7 @@ impl TestRuntime {
             timing_queries: AtomicU64::new(0),
             submitted_timing_modes: Mutex::new(Vec::new()),
             encoded_copy_regions: Mutex::new(Vec::new()),
+            encoded_zero_bytes: Mutex::new(Vec::new()),
         }
     }
 
@@ -384,8 +386,9 @@ impl DeviceRuntime for TestRuntime {
         &self,
         _destination: &Self::Buffer,
         _destination_offset_bytes: u64,
-        _length_bytes: u64,
+        length_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
+        self.encoded_zero_bytes.lock().unwrap().push(length_bytes);
         Ok(())
     }
 
@@ -1016,7 +1019,16 @@ fn admitted_sequence_with_ceiling(
     suffix: &str,
     maximum_tokens: usize,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
-    let work = work_with_ceiling(1, maximum_tokens);
+    admitted_sequence_with_initial_tokens(root, suffix, 1, maximum_tokens)
+}
+
+fn admitted_sequence_with_initial_tokens(
+    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    suffix: &str,
+    initial_tokens: usize,
+    maximum_tokens: usize,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    let work = work_with_ceiling(initial_tokens, maximum_tokens);
     let binding = root.trusted_runtime_binding().unwrap();
     let request = match binding
         .try_admit_request(

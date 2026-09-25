@@ -164,7 +164,11 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
                     .work_shape()
                     .fit_tokens(),
                 retired_frames: active.retired_frames,
-                pending_zero_transfer_bytes: pending_zero_transfer_bytes(
+                pending_zero_initializations: pending_zero_initializations(
+                    BatchParticipantAuthority::new(
+                        session.sequence_authority(),
+                        session.request_authority(),
+                    ),
                     backing.backing_slices(),
                     limits.maximum_free_extents,
                     poll_budget,
@@ -313,12 +317,14 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
     }
 }
 
-fn pending_zero_transfer_bytes(
+fn pending_zero_initializations(
+    owner: BatchParticipantAuthority,
     slices: &[LogicalBackingSliceAuthority],
     maximum_segments: usize,
     budget: &mut dyn ResourcePlanningBudget,
-) -> Result<Option<Arc<[u64]>>, ResourcePlanningUnknown> {
-    let mut unique = BTreeSet::new();
+) -> Result<Option<Arc<[PendingZeroInitialization]>>, ResourcePlanningUnknown> {
+    use super::super::backing_initialization::order::{InitializationOrder, InitializationRanges};
+    let mut ordering = InitializationOrder::new();
     let mut visited = 0_usize;
     for slice in slices {
         poll(budget)?;
@@ -333,7 +339,7 @@ fn pending_zero_transfer_bytes(
             Ok(BackingInitializationStatus::Pending) => {}
             _ => return Ok(None),
         }
-        for segment in &slice.evidence().segments {
+        for _ in &slice.evidence().segments {
             poll(budget)?;
             visited = visited
                 .checked_add(1)
@@ -341,23 +347,34 @@ fn pending_zero_transfer_bytes(
             if visited > maximum_segments {
                 return Err(ResourcePlanningUnknown::LimitExceeded);
             }
-            unique.insert((
-                cell.target_fingerprint(),
-                segment.chunk_ordinal(),
-                segment.chunk_generation(),
-                segment.offset_bytes(),
-                segment.length_bytes(),
-            ));
         }
+        ordering
+            .insert(owner, slice)
+            .map_err(|_| ResourcePlanningUnknown::InvalidDemand)?;
     }
-    u32::try_from(unique.len()).map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(unique.len())
-        .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
-    for (_, _, _, _, length) in unique {
+    let mut claims = Vec::new();
+    for (_, cell, ordered_slices) in ordering.finish() {
         poll(budget)?;
-        bytes.push(length);
+        let mut seen = InitializationRanges::new();
+        let mut bytes = Vec::new();
+        for slice in ordered_slices {
+            for segment in slice.evidence().segments() {
+                poll(budget)?;
+                if seen.insert(segment) {
+                    bytes
+                        .try_reserve(1)
+                        .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
+                    bytes.push(segment.length_bytes());
+                }
+            }
+        }
+        claims
+            .try_reserve(1)
+            .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
+        claims.push(PendingZeroInitialization {
+            target_fingerprint: Arc::from(cell.target_fingerprint()),
+            transfer_bytes: bytes.into(),
+        });
     }
-    Ok(Some(bytes.into()))
+    Ok(Some(claims.into()))
 }

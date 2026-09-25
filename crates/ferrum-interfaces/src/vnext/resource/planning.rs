@@ -138,6 +138,13 @@ pub struct ResourcePlanningRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingZeroInitialization {
+    // Exact ordering key only. It never enters a statistical algorithm class.
+    target_fingerprint: Arc<str>,
+    transfer_bytes: Arc<[u64]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourcePlanningParticipant {
     authority: SequenceAuthorityId,
     epoch: SequenceSessionEpoch,
@@ -146,7 +153,7 @@ pub struct ResourcePlanningParticipant {
     covered: DynamicResourceShape,
     maximum_tokens: u64,
     retired_frames: u64,
-    pending_zero_transfer_bytes: Option<Arc<[u64]>>,
+    pending_zero_initializations: Option<Arc<[PendingZeroInitialization]>>,
 }
 
 impl ResourcePlanningParticipant {
@@ -168,15 +175,13 @@ impl ResourcePlanningParticipant {
         self.maximum_tokens
     }
     pub(crate) fn pending_zero_commands(&self) -> Option<u32> {
-        self.pending_zero_transfer_bytes
+        self.pending_zero_initializations
             .as_ref()
-            .and_then(|spans| u32::try_from(spans.len()).ok())
-    }
-    /// One length per unique pending physical zero extent. All entries are
-    /// the same Fill path; order among lengths cannot alter their class chain
-    /// or checked byte sum. This is copied numeric evidence, not a lease.
-    pub(crate) fn pending_zero_transfer_bytes(&self) -> Option<&[u64]> {
-        self.pending_zero_transfer_bytes.as_deref()
+            .and_then(|claims| {
+                claims.iter().try_fold(0_u32, |n, claim| {
+                    n.checked_add(u32::try_from(claim.transfer_bytes.len()).ok()?)
+                })
+            })
     }
 }
 
@@ -231,6 +236,56 @@ pub struct ResourcePlanningView {
 }
 
 impl ResourcePlanningView {
+    /// Match actual whole-wave cell order, then its ordered/deduplicated
+    /// physical extents. Selecting a subset never changes relative cell order.
+    /// The snapshot owns only numbers/keys, not cells, buffers or permissions.
+    pub(crate) fn pending_zero_transfer_bytes(
+        &self,
+        participant_indices: &[usize],
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<Option<Vec<u64>>, ResourcePlanningUnknown> {
+        let mut claims = BTreeMap::new();
+        let mut count = 0_usize;
+        for &index in participant_indices {
+            poll(budget)?;
+            let participant = self
+                .participants
+                .get(index)
+                .ok_or(ResourcePlanningUnknown::InvalidInput)?;
+            let Some(pending) = participant.pending_zero_initializations.as_deref() else {
+                return Ok(None);
+            };
+            for claim in pending {
+                poll(budget)?;
+                // Actual prepare rejects a shared target under distinct owners.
+                // Duplicate participant indices are likewise never valid work.
+                if claims
+                    .insert(claim.target_fingerprint.as_ref(), claim)
+                    .is_some()
+                {
+                    return Err(ResourcePlanningUnknown::InvalidDemand);
+                }
+                count = count
+                    .checked_add(claim.transfer_bytes.len())
+                    .ok_or(ResourcePlanningUnknown::LimitExceeded)?;
+                if count > crate::execution_cost::MAX_COST_COMMANDS {
+                    return Err(ResourcePlanningUnknown::LimitExceeded);
+                }
+            }
+        }
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(count)
+            .map_err(|_| ResourcePlanningUnknown::LimitExceeded)?;
+        for claim in claims.into_values() {
+            for &bytes in claim.transfer_bytes.iter() {
+                poll(budget)?;
+                result.push(bytes);
+            }
+        }
+        Ok(Some(result))
+    }
+
     pub fn plan_hash(&self) -> &PlanHash {
         &self.plan_hash
     }

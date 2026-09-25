@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_RESTORE_INITIALIZATION_OWNER: AtomicU64 = AtomicU64::new(1);
 
+pub(super) mod order;
+use order::{InitializationOrder, InitializationRanges};
+
 #[derive(Debug)]
 pub(crate) enum BackingInitializationEncodeError<E> {
     Contract(VNextError),
@@ -200,14 +203,7 @@ impl PreparedBackingInitializations {
         wave_fingerprint: &str,
         restore_target: Option<RestoreInitializationTarget>,
     ) -> Result<Self, VNextError> {
-        let mut grouped = BTreeMap::<
-            String,
-            (
-                BatchParticipantAuthority,
-                Arc<BackingInitializationCell>,
-                Vec<LogicalBackingSliceAuthority>,
-            ),
-        >::new();
+        let mut ordering = InitializationOrder::new();
         for (owner, slices) in participants {
             for authority in slices.iter().filter(|authority| {
                 authority.evidence().initialization() == StateInitialization::Zero
@@ -235,26 +231,23 @@ impl PreparedBackingInitializations {
                     | BackingInitializationStatus::Prepared
                     | BackingInitializationStatus::InFlight => {}
                 }
-                let entry = grouped
-                    .entry(cell.target_fingerprint().to_owned())
-                    .or_insert_with(|| (owner, Arc::clone(cell), Vec::new()));
-                if !Arc::ptr_eq(&entry.1, cell) || entry.0 != owner {
-                    return Err(invalid_resource(
-                        "distinct backing initialization authorities share a target fingerprint",
-                    ));
-                }
-                if !entry
-                    .2
-                    .iter()
-                    .any(|existing| existing.evidence() == authority.evidence())
-                {
-                    entry.2.push(authority.retained());
-                }
+                ordering.insert(owner, authority)?;
             }
         }
 
+        let grouped: Vec<_> = ordering
+            .finish()
+            .map(|(owner, cell, slices)| {
+                (
+                    owner,
+                    Arc::clone(cell),
+                    slices.into_iter().map(|s| s.retained()).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
         if restore_target.is_some() {
-            for (_, (_, _, slices)) in &grouped {
+            for (_, _, slices) in &grouped {
                 validate_complete_cell_capacity(slices)?;
             }
         }
@@ -279,14 +272,7 @@ impl PreparedBackingInitializations {
             phase: PreparedBackingInitializationPhase::Prepared,
             restore_target,
         };
-        for (_, (participant, cell, mut slices)) in grouped {
-            slices.sort_by(|left, right| {
-                left.resource_id().cmp(right.resource_id()).then_with(|| {
-                    left.evidence()
-                        .physical_offset_bytes()
-                        .cmp(&right.evidence().physical_offset_bytes())
-                })
-            });
+        for (participant, cell, slices) in grouped {
             if cell.prepare(&cell_fingerprint)? {
                 // Install ownership before another preparation can fail, so
                 // Drop always rolls back every cell already claimed here.
@@ -379,7 +365,7 @@ impl PreparedBackingInitializations {
         }
         let mut command_count = 0_usize;
         for claim in &self.claims {
-            let mut encoded_ranges = BTreeSet::new();
+            let mut encoded_ranges = InitializationRanges::new();
             for authority in &claim.slices {
                 if authority.evidence().initialization() != StateInitialization::Zero
                     || authority
@@ -397,13 +383,7 @@ impl PreparedBackingInitializations {
                     .map_err(BackingInitializationEncodeError::Contract)?;
                 for binding in view.segment_bindings() {
                     let segment = binding.segment();
-                    let range = (
-                        segment.chunk_ordinal(),
-                        segment.chunk_generation(),
-                        segment.offset_bytes(),
-                        segment.length_bytes(),
-                    );
-                    if !encoded_ranges.insert(range) {
+                    if !encoded_ranges.insert(segment) {
                         continue;
                     }
                     let actual = runtime.buffer_descriptor(binding.buffer());
