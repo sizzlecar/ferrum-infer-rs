@@ -14,6 +14,7 @@ mod boundaries;
 mod budget_phases;
 mod candidate_ranking;
 mod constructive;
+mod controller_time;
 mod graph_domain;
 mod host_domain;
 mod joint_execution;
@@ -210,6 +211,9 @@ fn snapshot(requests: Vec<RequestSchedulingView>) -> SchedulerSnapshot {
 fn planner(depth: usize) -> BoundedSloPlanner {
     BoundedSloPlanner {
         settings: BoundedPlannerSettings {
+            // These nanosecond fixtures isolate execution scheduling. Product
+            // defaults and rolling-controller behavior have separate tests.
+            future_controller_time: FutureControllerTimeV1::InstantaneousVirtualController,
             search: SloPlannerConfig {
                 lookahead_waves: nz(depth),
                 beam_width: nz(16),

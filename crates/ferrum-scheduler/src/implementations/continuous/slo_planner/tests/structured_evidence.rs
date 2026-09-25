@@ -3,6 +3,7 @@
 use super::*;
 use crate::implementations::continuous::cost_model::structured::StructuredUnknown;
 mod fixture;
+mod v2;
 
 #[derive(Clone)]
 struct Route;
@@ -25,6 +26,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for Route {
         poll()?;
         let wave = fixture::wave(0, true, 8, "fixture.first");
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             ordered_work: input.work.to_vec(),
             canonical_domain: PlanningShapeDomain::Exact(wave.exact),
             statistical_evidence: Some(PlanningShapeDomain::Exact(wave.statistical.unwrap())),

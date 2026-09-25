@@ -79,6 +79,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for State<'epoch> {
             canonical.provider_signature[0] ^= 1;
         }
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             ordered_work: input.work.to_vec(),
             canonical_domain: PlanningShapeDomain::Exact(canonical),
             statistical_evidence: None,

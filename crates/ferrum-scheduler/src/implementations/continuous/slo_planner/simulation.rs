@@ -10,6 +10,7 @@ pub(super) struct PlanningState<'epoch> {
     logical: SimulatedSequence,
     execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
     depth: usize,
+    future_controller_ns: u64,
     pub first_wave_canonical:
         Option<Arc<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>>,
 }
@@ -60,16 +61,18 @@ impl From<PlanningUnknownReason> for SimulationFailure {
     }
 }
 
-pub(super) fn begin<'epoch>(
+pub(super) fn begin_with_controller_time<'epoch>(
     snapshot: &'epoch SchedulerSnapshot,
     context: &'epoch dyn PlanningExecutionContext,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     started_at_ns: u64,
+    future_controller_ns: u64,
 ) -> Result<PlanningState<'epoch>, SimulationFailure> {
     let execution = execution::checked(poll, |poll| context.begin(snapshot, poll))?;
     Ok(PlanningState {
         execution,
         depth: 0,
+        future_controller_ns,
         first_wave_canonical: None,
         logical: SimulatedSequence {
             requests: snapshot.requests.clone(),
@@ -85,6 +88,18 @@ pub(super) fn begin<'epoch>(
             minimum_cost_freshness_slack_ns: u64::MAX,
         },
     })
+}
+
+/// Existing abstract execution tests explicitly use an instantaneous controller.
+/// Product search and replay must supply the configured nonzero reservation.
+#[cfg(test)]
+pub(super) fn begin<'epoch>(
+    snapshot: &'epoch SchedulerSnapshot,
+    context: &'epoch dyn PlanningExecutionContext,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+    started_at_ns: u64,
+) -> Result<PlanningState<'epoch>, SimulationFailure> {
+    begin_with_controller_time(snapshot, context, poll, started_at_ns, 0)
 }
 
 /// Expand only this edge. The parent's logical and execution states are never
@@ -117,6 +132,18 @@ pub(super) fn advance<'epoch>(
         projected: false,
     })?;
     let mut logical = parent.logical.clone();
+    // Only subsequent waves incur another controller transaction. Do this
+    // before the model lookup so its age/TTL and every obligation use the same
+    // delayed timeline. Current real planning elapsed is handled by replay.
+    if parent.depth > 0 {
+        logical.now_ns = logical
+            .now_ns
+            .checked_add(parent.future_controller_ns)
+            .ok_or(TransitionFailure {
+                cause: PlanningUnknownReason::ArithmeticOverflow.into(),
+                projected: true,
+            })?;
+    }
     apply(
         snapshot,
         &mut logical,
@@ -138,6 +165,7 @@ pub(super) fn advance<'epoch>(
             logical,
             execution: projected.successor,
             depth: parent.depth + 1,
+            future_controller_ns: parent.future_controller_ns,
             first_wave_canonical: if parent.depth == 0 {
                 projected.first_canonical
             } else {
@@ -157,10 +185,12 @@ pub(super) fn replay<'epoch>(
     complete_resources: bool,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
     started_at_ns: u64,
+    future_controller_ns: u64,
     milestones_enabled: bool,
     protection: Option<&PlanningObligationSet>,
 ) -> Result<PlanningState<'epoch>, SimulationFailure> {
-    let mut state = begin(snapshot, context, poll, started_at_ns)?;
+    let mut state =
+        begin_with_controller_time(snapshot, context, poll, started_at_ns, future_controller_ns)?;
     for wave in waves {
         let transition = advance(
             snapshot,
@@ -205,6 +235,9 @@ pub(super) fn simulate(
         resources.is_some(),
         poll_budget,
         started_at_ns,
+        // This helper exercises abstract execution schedules, not the product
+        // rolling controller. Controller-time tests use the explicit entrypoint.
+        0,
         milestones_enabled,
         protection,
     )
@@ -613,7 +646,8 @@ pub(super) fn score_at(
     if ranking_now_ns < state.started_at_ns {
         return Err(PlanningUnknownReason::ClockMovedBackwards);
     }
-    let execution_ns = state
+    // Includes both physical execution and reserved future controller cycles.
+    let sequence_ns = state
         .now_ns
         .checked_sub(state.started_at_ns)
         .ok_or(PlanningUnknownReason::ClockMovedBackwards)?;
@@ -621,11 +655,11 @@ pub(super) fn score_at(
         .checked_sub(transaction_started_at_ns)
         .ok_or(PlanningUnknownReason::ClockMovedBackwards)?;
     let occupied_ns = cpu_ns
-        .checked_add(execution_ns)
+        .checked_add(sequence_ns)
         .filter(|&value| value > 0)
         .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
     let completion_ns = ranking_now_ns
-        .checked_add(execution_ns)
+        .checked_add(sequence_ns)
         .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
     let mut debt = 0_u64;
     for (initial, current) in snapshot.requests.iter().zip(&state.requests) {

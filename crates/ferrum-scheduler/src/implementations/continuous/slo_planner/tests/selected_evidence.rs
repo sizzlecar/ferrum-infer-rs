@@ -75,6 +75,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for State {
     ) -> Result<Option<ProjectedExecution<'epoch>>, PlanningUnknownReason> {
         poll()?;
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             ordered_work: input.work.to_vec(),
             canonical_domain: self.canonical.clone(),
             statistical_evidence: self.statistics.clone(),

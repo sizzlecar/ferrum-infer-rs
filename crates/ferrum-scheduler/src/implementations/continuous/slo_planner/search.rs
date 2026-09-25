@@ -316,15 +316,24 @@ impl BoundedSloPlanner {
         let execution_session = ExecutionSession::new(context, &self.settings);
         let context: &dyn PlanningExecutionContext = &execution_session;
         let milestones = self.settings.search.enable_prefill_milestones;
+        let future_controller_ns = match self
+            .settings
+            .future_controller_time
+            .reserved_ns(&self.settings.search)
+        {
+            Ok(value) => value,
+            Err(reason) => return unknown(reason, stats),
+        };
         let begin_started = match budget.read(clock) {
             Ok(now) => now,
             Err(reason) => return unknown(reason, stats),
         };
-        let initial = match simulation::begin(
+        let initial = match simulation::begin_with_controller_time(
             snapshot,
             context,
             &mut || budget.read(clock).map(|_| ()),
             start_ns,
+            future_controller_ns,
         ) {
             Ok(state) => state,
             Err(error) => return unknown(simulation_reason(error), stats),
@@ -474,8 +483,9 @@ impl BoundedSloPlanner {
                 preferred_depth = Some(depth + 1);
             }
             // All search nodes use one execution-time origin. CPU time is
-            // charged by the shared real budget and fresh final replay; extending
-            // a node never shifts its ancestors or replays their physical work.
+            // charged by the shared real budget and fresh final replay. Each
+            // future edge also reserves its own controller transaction, without
+            // shifting ancestors or replaying their physical work.
             let advance_started = match budget.read(clock) {
                 Ok(now) => now,
                 Err(reason) => stop_or_unknown!(reason, 'exploration),
@@ -676,6 +686,7 @@ impl BoundedSloPlanner {
                 complete_resources,
                 &mut || budget.read(clock).map(|_| ()),
                 now_ns,
+                future_controller_ns,
                 milestones,
                 protection.as_deref(),
             ) {

@@ -93,6 +93,7 @@ impl EngineInner {
         let planner = BoundedSloPlanner {
             settings: BoundedPlannerSettings {
                 search: self.config.scheduler.slo.planner.clone(),
+                ..Default::default()
             },
         };
         let cost = AnchoredPlanningCostModel::new(captured.model.as_ref(), captured.anchor);

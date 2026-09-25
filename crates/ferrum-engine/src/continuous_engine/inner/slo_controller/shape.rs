@@ -2,10 +2,12 @@ use super::*;
 use ferrum_interfaces::{
     execution_cost::{
         host_history_cost_signature, ActualRowWork, ActualWaveKind, CanonicalWaveCostShape,
+        HostContentForecastV2, HostPendingConstraintV2,
     },
     vnext::{
         ExecutionCostRouteAvailability, ExecutionCostRouteState, ExecutionCostRouteUnknown,
-        FutureCostOutput, FutureWaveCostQuery, FutureWaveCostRow,
+        FutureCostOutput, FutureHostPendingQueryV2, FutureHostPendingRowV2, FutureWaveCostQuery,
+        FutureWaveCostRow,
     },
 };
 
@@ -47,6 +49,7 @@ impl EngineInner {
         let planner = BoundedSloPlanner {
             settings: BoundedPlannerSettings {
                 search: self.config.scheduler.slo.planner.clone(),
+                ..Default::default()
             },
         };
         let cost = AnchoredPlanningCostModel::new(captured.model.as_ref(), captured.anchor);
@@ -133,7 +136,10 @@ impl ExecutorShape<'_> {
         mode: FutureHostMode,
         poll: &mut dyn FnMut() -> std::result::Result<(), PlanningUnknownReason>,
     ) -> std::result::Result<
-        Option<ferrum_interfaces::vnext::ExecutionCostRouteProjection>,
+        Option<(
+            ferrum_interfaces::vnext::ExecutionCostRouteProjection,
+            Option<HostContentForecastV2>,
+        )>,
         PlanningUnknownReason,
     > {
         let mut rows = Vec::with_capacity(prepared.len());
@@ -216,19 +222,97 @@ impl ExecutorShape<'_> {
             _ => return Err(PlanningUnknownReason::InvalidSnapshot),
         };
         let mut failure = None;
-        let projection = self.engine.model_executor.project_execution_cost_wave(
-            &self.captured.route,
-            state,
-            &FutureWaveCostQuery { kind, rows: &rows },
-            &mut || match poll() {
+        let needs_forecast = self.captured.model.evidence_requirement()
+            == ferrum_scheduler::implementations::continuous::slo_planner::PlanningCostEvidenceRequirement::StructuredV2;
+        let mut eligible = Vec::new();
+        let mut fixed_full = kind == ActualWaveKind::Prefill;
+        if needs_forecast && mode != FutureHostMode::Exact {
+            eligible
+                .try_reserve_exact(prepared.len())
+                .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
+            for (position, selected) in prepared.iter().enumerate() {
+                poll()?;
+                let request = &frontiers[selected.index];
+                match rows[position].output {
+                    FutureCostOutput::Decode { policy } if !request.host_content_changed => {
+                        fixed_full |= policy.requires_full_logits();
+                    }
+                    FutureCostOutput::Decode { .. } if mode == FutureHostMode::FullLogits => {
+                        let Some(clean_policy) = self.captured.fences[selected.index]
+                            .future_greedy_policy
+                            .as_ref()
+                        else {
+                            return Ok(None);
+                        };
+                        eligible.push(FutureHostPendingRowV2 {
+                            physical_position: u32::try_from(position)
+                                .map_err(|_| PlanningUnknownReason::ShapeCapacity)?,
+                            clean_policy,
+                        });
+                    }
+                    FutureCostOutput::Prefill { final_logits } => fixed_full |= final_logits,
+                    _ => {}
+                }
+            }
+        }
+        let projection = {
+            let mut budget = || match poll() {
                 Ok(()) if failure.is_none() => true,
                 Ok(()) => false,
                 Err(reason) => {
                     failure.get_or_insert(reason);
                     false
                 }
-            },
-        );
+            };
+            let query = FutureWaveCostQuery { kind, rows: &rows };
+            if needs_forecast && mode != FutureHostMode::Exact {
+                let host = FutureHostPendingQueryV2 {
+                    eligible_rows: &eligible,
+                    constraint: if mode == FutureHostMode::Greedy || fixed_full {
+                        HostPendingConstraintV2::AnySubset
+                    } else {
+                        HostPendingConstraintV2::NonEmptySubset
+                    },
+                };
+                match self
+                    .engine
+                    .model_executor
+                    .project_execution_cost_wave_with_host_content(
+                        &self.captured.route,
+                        state,
+                        &query,
+                        &host,
+                        &mut budget,
+                    ) {
+                    ExecutionCostRouteAvailability::Known(value) => {
+                        ExecutionCostRouteAvailability::Known((
+                            value.projection,
+                            Some(value.host_content),
+                        ))
+                    }
+                    ExecutionCostRouteAvailability::Unknown(reason) => {
+                        ExecutionCostRouteAvailability::Unknown(reason)
+                    }
+                }
+            } else {
+                match self.engine.model_executor.project_execution_cost_wave(
+                    &self.captured.route,
+                    state,
+                    &query,
+                    &mut budget,
+                ) {
+                    ExecutionCostRouteAvailability::Known(value) => {
+                        ExecutionCostRouteAvailability::Known((
+                            value,
+                            needs_forecast.then_some(HostContentForecastV2::Exact),
+                        ))
+                    }
+                    ExecutionCostRouteAvailability::Unknown(reason) => {
+                        ExecutionCostRouteAvailability::Unknown(reason)
+                    }
+                }
+            }
+        };
         let after = poll();
         if let Some(reason) = failure {
             return Err(reason);
@@ -323,7 +407,7 @@ impl PlanningShapeResolver for ExecutorShape<'_> {
                 return Err(PlanningUnknownReason::InvalidShapeEvidence);
             }
             let prepared = frontiers.prepare(&prior.work, poll)?;
-            let Some((shapes, _, next)) =
+            let Some((shapes, _, _, next)) =
                 self.project_domain(&state, frontiers.requests(), &prepared.rows, poll)?
             else {
                 return Ok(None);
@@ -362,7 +446,7 @@ impl PlanningShapeResolver for ExecutorShape<'_> {
         }
         let projected = self.project_domain(&state, frontiers.requests(), &prepared.rows, poll)?;
         match projected {
-            Some((shapes, _, _))
+            Some((shapes, _, _, _))
                 if shapes.shapes().iter().all(|shape| shape.kind == query.kind) =>
             {
                 Ok(Some(shapes))

@@ -128,6 +128,7 @@ impl ExecutorShape<'_> {
         Option<(
             PlanningShapeDomain<CanonicalWaveCostShape>,
             Option<PlanningShapeDomain<StatisticalWaveEvidenceV1>>,
+            Option<PlanningShapeDomain<HostContentForecastV2>>,
             RouteDomain,
         )>,
         PlanningUnknownReason,
@@ -155,6 +156,15 @@ impl ExecutorShape<'_> {
             != PlanningCostEvidenceRequirement::None
             || self.captured.route.structured_capture_enabled();
         let mut selected = Vec::new();
+        let mut forecasts = Vec::new();
+        let collect_forecasts = self.captured.model.evidence_requirement()
+            == PlanningCostEvidenceRequirement::StructuredV2;
+        let mut forecasts_complete = collect_forecasts;
+        if collect_forecasts {
+            forecasts
+                .try_reserve_exact(count)
+                .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
+        }
         let mut statistics_complete = collect_statistics;
         if collect_statistics {
             selected
@@ -174,12 +184,19 @@ impl ExecutorShape<'_> {
         for previous in &state.states {
             for &mode in &modes {
                 poll()?;
-                let Some(projected) = self.project(previous, frontiers, prepared, mode, poll)?
+                let Some((projected, forecast)) =
+                    self.project(previous, frontiers, prepared, mode, poll)?
                 else {
                     return Ok(None);
                 };
                 if empirical && projected.shape.host_content_features.is_none() {
                     return Ok(None);
+                }
+                if collect_forecasts {
+                    match forecast {
+                        Some(forecast) => forecasts.push(forecast),
+                        None => forecasts_complete = false,
+                    }
                 }
                 if collect_statistics {
                     match projected.statistical_evidence {
@@ -216,6 +233,19 @@ impl ExecutorShape<'_> {
         Ok(Some((
             domain,
             statistics,
+            if forecasts_complete {
+                Some(if empirical {
+                    PlanningShapeDomain::HostContentAlternatives(forecasts)
+                } else {
+                    PlanningShapeDomain::Exact(
+                        forecasts
+                            .pop()
+                            .ok_or(PlanningUnknownReason::InvalidShapeEvidence)?,
+                    )
+                })
+            } else {
+                None
+            },
             RouteDomain { states, empirical },
         )))
     }

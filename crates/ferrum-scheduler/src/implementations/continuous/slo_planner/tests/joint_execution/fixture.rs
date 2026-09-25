@@ -199,6 +199,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for JointState<'epoch> {
             Returned::BadRecurrent => canonical.recurrent_state_bytes += 1,
         }
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             statistical_evidence: None,
             ordered_work,
             canonical_domain: PlanningShapeDomain::Exact(canonical),

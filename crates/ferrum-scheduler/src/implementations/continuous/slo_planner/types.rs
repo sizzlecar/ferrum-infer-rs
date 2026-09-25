@@ -439,6 +439,7 @@ pub struct PlanningCostEvidence {
 enum BoundCostInput {
     Selected(super::super::cost_model::statistical::StatisticalModelInputV1),
     Structured(Result<structured::StructuredInputV1, structured::StructuredUnknown>),
+    StructuredV2(Result<structured_v2::StructuredQueryV2, structured_v2::StructuredUnknownV2>),
 }
 impl PlanningCostEvidence {
     pub(super) fn bind(
@@ -446,6 +447,15 @@ impl PlanningCostEvidence {
         expected: &WaveExecutionShape,
         selected: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
         requirement: PlanningCostEvidenceRequirement,
+    ) -> Option<Self> {
+        Self::bind_with_forecast(exact, expected, selected, requirement, None)
+    }
+    pub(super) fn bind_with_forecast(
+        exact: &CanonicalWaveCostShape,
+        expected: &WaveExecutionShape,
+        selected: &ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1,
+        requirement: PlanningCostEvidenceRequirement,
+        forecast: Option<&ferrum_interfaces::execution_cost::HostContentForecastV2>,
     ) -> Option<Self> {
         if super::cost_shape::canonical_cost_shape(exact).ok().as_ref() != Some(expected) {
             return None;
@@ -473,6 +483,20 @@ impl PlanningCostEvidence {
                     });
                 BoundCostInput::Structured(input)
             }
+            PlanningCostEvidenceRequirement::StructuredV2 => {
+                let input = forecast
+                    .ok_or(structured_v2::StructuredUnknownV2::MissingEvidence)
+                    .and_then(|forecast| {
+                        let recipe = selected
+                            .structured_capture()
+                            .ok_or(structured_v2::StructuredUnknownV2::MissingEvidence)?
+                            .map_err(|_| structured_v2::StructuredUnknownV2::MissingEvidence)?;
+                        structured_v2::StructuredQueryV2::from_future(
+                            exact, selected, recipe, forecast,
+                        )
+                    });
+                BoundCostInput::StructuredV2(input)
+            }
         };
         Some(Self {
             expected: expected.clone(),
@@ -497,7 +521,19 @@ impl PlanningCostEvidence {
         }
         match &self.input {
             BoundCostInput::Structured(input) => input.as_ref().map_err(|reason| *reason),
-            BoundCostInput::Selected(_) => Err(structured::StructuredUnknown::MissingEvidence),
+            _ => Err(structured::StructuredUnknown::MissingEvidence),
+        }
+    }
+    pub fn structured_query_v2_for(
+        &self,
+        shape: &WaveExecutionShape,
+    ) -> Result<&structured_v2::StructuredQueryV2, structured_v2::StructuredUnknownV2> {
+        if shape != &self.expected {
+            return Err(structured_v2::StructuredUnknownV2::MissingEvidence);
+        }
+        match &self.input {
+            BoundCostInput::StructuredV2(query) => query.as_ref().map_err(|reason| *reason),
+            _ => Err(structured_v2::StructuredUnknownV2::MissingEvidence),
         }
     }
 }
@@ -665,6 +701,8 @@ pub enum PlanningCostEvidenceRequirement {
     None,
     Selected,
     Structured,
+    /// Whole-wave V2 with provider-bound uncertainty for every future branch.
+    StructuredV2,
 }
 
 pub trait PlanningCostModel {
@@ -986,12 +1024,45 @@ pub enum PlanningDecision {
 #[derive(Debug, Clone)]
 pub struct BoundedPlannerSettings {
     pub search: SloPlannerConfig,
+    /// Time reserved between physical waves for the next controller transaction.
+    /// The current transaction is accounted from its real clock separately.
+    pub future_controller_time: FutureControllerTimeV1,
+}
+
+/// Prospective synchronous controller time, separate from execution-model labels.
+/// This is a planning reservation, not a hard bound on queueing or failed retries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FutureControllerTimeV1 {
+    /// Reserve the full configured budget for each later controller transaction.
+    #[default]
+    PlanningBudget,
+    /// Explicit conservative estimate supplied by an integrating controller.
+    ReservedNs(NonZeroU64),
+    /// An ideal controller used only by abstract virtual-time unit fixtures.
+    #[cfg(test)]
+    InstantaneousVirtualController,
+}
+
+impl FutureControllerTimeV1 {
+    pub fn reserved_ns(self, search: &SloPlannerConfig) -> Result<u64, PlanningUnknownReason> {
+        match self {
+            Self::PlanningBudget => search
+                .max_planning_us
+                .get()
+                .checked_mul(1000)
+                .ok_or(PlanningUnknownReason::ArithmeticOverflow),
+            Self::ReservedNs(value) => Ok(value.get()),
+            #[cfg(test)]
+            Self::InstantaneousVirtualController => Ok(0),
+        }
+    }
 }
 
 impl Default for BoundedPlannerSettings {
     fn default() -> Self {
         Self {
             search: SloPlannerConfig::default(),
+            future_controller_time: FutureControllerTimeV1::default(),
         }
     }
 }

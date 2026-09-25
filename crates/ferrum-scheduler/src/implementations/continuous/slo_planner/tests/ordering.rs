@@ -190,6 +190,7 @@ fn physical_order_and_resolution_share_the_total_invocation_bound() {
             lookahead_waves: nz(1),
             ..Default::default()
         },
+        ..Default::default()
     };
     let resolver = Order(OrderBehavior::Reverse);
     let session = shape::ResolutionSession::new(&resolver, &settings);

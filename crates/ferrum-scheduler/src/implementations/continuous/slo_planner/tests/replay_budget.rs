@@ -90,6 +90,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for TimedState<'epoch> {
         }
         // checked() must catch a fault even if this callback returns a shape.
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             statistical_evidence: None,
             ordered_work: input.work.to_vec(),
             canonical_domain: PlanningShapeDomain::Exact(canonical),

@@ -38,6 +38,10 @@ pub trait PlanningExecutionState<'epoch> {
 }
 
 pub struct ProjectedExecution<'epoch> {
+    /// Explicit V2 host domains in the identical physical alternative order.
+    /// Absence is unknown; it cannot imply Exact for a future content branch.
+    pub host_content_forecasts:
+        Option<PlanningShapeDomain<ferrum_interfaces::execution_cost::HostContentForecastV2>>,
     /// Same ordered alternatives as canonical_domain; absence never implies legacy statistics.
     pub statistical_evidence:
         Option<PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
@@ -158,6 +162,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for BoundedState<'epoch> {
             return Err(PlanningUnknownReason::ShapeCapacity);
         }
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: projected.host_content_forecasts,
             statistical_evidence: projected.statistical_evidence,
             ordered_work: projected.ordered_work,
             canonical_domain: projected.canonical_domain,
@@ -230,10 +235,11 @@ pub(super) fn project<'epoch>(
         poll,
     )?;
     let cost_evidence = if evidence_requirement != PlanningCostEvidenceRequirement::None {
-        bind_statistics(
+        bind_statistics_with_forecasts(
             &projected.canonical_domain,
             &execution_shape,
             projected.statistical_evidence.as_ref(),
+            projected.host_content_forecasts.as_ref(),
             evidence_requirement,
             poll,
         )?
@@ -377,6 +383,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
         let mut prefix = self.prefix.clone();
         prefix.push((wave, input.requests.to_vec()));
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             statistical_evidence: None,
             ordered_work: work,
             canonical_domain,
@@ -389,11 +396,27 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn bind_statistics(
     canonical: &PlanningShapeDomain<CanonicalWaveCostShape>,
     shapes: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
     statistics: Option<
         &PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    >,
+    requirement: PlanningCostEvidenceRequirement,
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<Option<PlanningShapeDomain<PlanningCostEvidence>>, PlanningUnknownReason> {
+    bind_statistics_with_forecasts(canonical, shapes, statistics, None, requirement, poll)
+}
+
+pub(super) fn bind_statistics_with_forecasts(
+    canonical: &PlanningShapeDomain<CanonicalWaveCostShape>,
+    shapes: &PlanningShapeDomain<super::super::cost_model::WaveExecutionShape>,
+    statistics: Option<
+        &PlanningShapeDomain<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    >,
+    forecasts: Option<
+        &PlanningShapeDomain<ferrum_interfaces::execution_cost::HostContentForecastV2>,
     >,
     requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
@@ -421,18 +444,53 @@ pub(super) fn bind_statistics(
     {
         return Ok(None);
     }
+    if requirement == PlanningCostEvidenceRequirement::StructuredV2 {
+        let Some(forecasts) = forecasts else {
+            return Ok(None);
+        };
+        if forecasts.shapes().len() != canonical.shapes().len()
+            || !matches!(
+                (canonical, forecasts),
+                (PlanningShapeDomain::Exact(_), PlanningShapeDomain::Exact(_))
+                    | (
+                        PlanningShapeDomain::HostContentAlternatives(_),
+                        PlanningShapeDomain::HostContentAlternatives(_)
+                    )
+            )
+        {
+            return Ok(None);
+        }
+        for forecast in forecasts.shapes() {
+            poll()?;
+            if matches!(canonical, PlanningShapeDomain::Exact(_))
+                && !matches!(
+                    forecast,
+                    ferrum_interfaces::execution_cost::HostContentForecastV2::Exact
+                )
+            {
+                return Ok(None);
+            }
+        }
+    }
     let mut evidence = Vec::new();
     evidence
         .try_reserve_exact(shapes.shapes().len())
         .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
-    for ((exact, shape), selected) in canonical
+    for (index, ((exact, shape), selected)) in canonical
         .shapes()
         .iter()
         .zip(shapes.shapes())
         .zip(statistics.shapes())
+        .enumerate()
     {
         poll()?;
-        let Some(bound) = PlanningCostEvidence::bind(exact, shape, selected, requirement) else {
+        let Some(bound) = PlanningCostEvidence::bind_with_forecast(
+            exact,
+            shape,
+            selected,
+            requirement,
+            forecasts.and_then(|domain| domain.shapes().get(index)),
+        ) else {
             return Ok(None);
         };
         evidence.push(bound);

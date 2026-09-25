@@ -61,6 +61,7 @@ impl<'a> PlanningExecutionState<'a> for State<'a> {
             self.source.now.set(10_000_000);
         }
         Ok(Some(ProjectedExecution {
+            host_content_forecasts: None,
             statistical_evidence: None,
             ordered_work: input.work.to_vec(),
             canonical_domain: PlanningShapeDomain::Exact(canonical),
