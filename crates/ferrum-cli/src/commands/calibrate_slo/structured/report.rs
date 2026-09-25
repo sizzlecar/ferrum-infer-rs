@@ -27,7 +27,7 @@ impl StructuredReport {
 }
 
 #[derive(Serialize)]
-pub(super) struct SourceReceipt {
+pub(crate) struct SourceReceipt {
     pub source_path: PathBuf,
     pub source_sha256: [u8; 32],
     pub source_bytes: u64,
