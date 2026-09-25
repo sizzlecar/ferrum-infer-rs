@@ -1,7 +1,7 @@
 //! Public counters consume the existing once-only audit. No new clock reads or
 //! device timing mode changes are needed to observe controller execution.
 use super::*;
-use ferrum_types::{ControllerTimingMetrics, WallTimingAggregate};
+use ferrum_types::{ControllerTimingMetrics, ControllerWitnessAggregate, WallTimingAggregate};
 
 fn add(target: &mut u64, value: u64) {
     *target = target.saturating_add(value);
@@ -10,6 +10,39 @@ fn add(target: &mut u64, value: u64) {
 fn timing(target: &mut WallTimingAggregate, wall_ns: u64, calls: u64) {
     add(&mut target.wall_ns_total, wall_ns);
     add(&mut target.calls, calls);
+}
+
+fn witness(
+    target: &mut ControllerWitnessAggregate,
+    value: ControllerWitnessAudit,
+    audit: &ControllerAudit,
+) {
+    add(&mut target.samples, 1);
+    add(&mut target.waves_total, value.waves);
+    add(&mut target.tail_waves_total, value.tail_waves);
+    add(
+        &mut target.nonempty_tail_samples,
+        u64::from(value.tail_waves > 0),
+    );
+    add(
+        &mut target.enumeration_attempts,
+        audit.search.enumeration_attempts as u64,
+    );
+    add(
+        &mut target.generated_candidates,
+        audit.search.generated_candidates as u64,
+    );
+    add(
+        &mut target.expanded_candidates,
+        audit.search.expanded_candidates as u64,
+    );
+    if !audit.clock_invalid {
+        if audit.planning_wall_ns != u64::MAX {
+            timing(&mut target.planning, audit.planning_wall_ns, 1);
+        }
+        let search = audit.stages[ControllerStage::SearchReplay as usize];
+        timing(&mut target.search_replay, search.wall_ns, search.calls);
+    }
 }
 
 pub(super) fn accumulate(totals: &mut ControllerTimingMetrics, audit: &ControllerAudit) {
@@ -30,6 +63,23 @@ pub(super) fn accumulate(totals: &mut ControllerTimingMetrics, audit: &Controlle
         &mut totals.hard_budget_exhaustions,
         u64::from(audit.budget_exhausted),
     );
+    add(
+        &mut totals.backend_submitted,
+        u64::from(audit.backend_submitted),
+    );
+    add(
+        &mut totals.host_reconciled,
+        u64::from(audit.host_reconciled),
+    );
+    if let Some(value) = audit.witness {
+        witness(&mut totals.witnesses.decisions, value, audit);
+        if audit.backend_submitted {
+            witness(&mut totals.witnesses.backend_submitted, value, audit);
+        }
+        if audit.host_reconciled {
+            witness(&mut totals.witnesses.host_reconciled, value, audit);
+        }
+    }
     match audit.outcome {
         "submitted" => add(&mut totals.submitted, 1),
         "observed" => add(&mut totals.observed, 1),

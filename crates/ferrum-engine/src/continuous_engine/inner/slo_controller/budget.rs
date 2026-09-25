@@ -54,6 +54,13 @@ pub(in crate::continuous_engine) struct ControllerStageAudit {
     pub calls: u64,
 }
 
+/// The selected finite plan, not a count of physically executed waves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::continuous_engine) struct ControllerWitnessAudit {
+    pub waves: u64,
+    pub tail_waves: u64,
+}
+
 /// Wall times, never thread CPU cycles. ExecutorAwait contains native guard
 /// callbacks and device waiting, so these diagnostic stages must not be summed.
 /// No value here is a cost-model training sample.
@@ -63,6 +70,9 @@ pub(in crate::continuous_engine) struct ControllerAudit {
     pub transaction_wall_ns: u64,
     pub stages: [ControllerStageAudit; 10],
     pub search: PlanningSearchStats,
+    pub witness: Option<ControllerWitnessAudit>,
+    pub backend_submitted: bool,
+    pub host_reconciled: bool,
     pub budget_ns: u64,
     pub budget_polls: u64,
     /// Search/replay returned a budget stop, including its reserved-phase end.
@@ -89,6 +99,9 @@ pub(super) struct ControllerBudget {
     clock_invalid: AtomicBool,
     emitted: AtomicBool,
     search: Mutex<PlanningSearchStats>,
+    witness: Mutex<Option<ControllerWitnessAudit>>,
+    backend_submitted: AtomicBool,
+    host_reconciled: AtomicBool,
     decision: Mutex<(&'static str, &'static str)>,
 }
 
@@ -112,6 +125,9 @@ impl ControllerBudget {
             clock_invalid: AtomicBool::new(false),
             emitted: AtomicBool::new(false),
             search: Mutex::new(PlanningSearchStats::default()),
+            witness: Mutex::new(None),
+            backend_submitted: AtomicBool::new(false),
+            host_reconciled: AtomicBool::new(false),
             decision: Mutex::new(("unknown", "not_evaluated")),
         }))
     }
@@ -154,6 +170,17 @@ impl ControllerBudget {
         *self.decision.lock() = ("unknown", reason);
     }
     pub fn record_search(&self, decision: &PlanningDecision) {
+        *self.witness.lock() = match decision {
+            PlanningDecision::FeasibleWithinHorizon { witness, .. }
+            | PlanningDecision::ProtectedWithinHorizon { witness, .. } => {
+                u64::try_from(witness.waves).ok().and_then(|waves| {
+                    waves
+                        .checked_sub(1)
+                        .map(|tail_waves| ControllerWitnessAudit { waves, tail_waves })
+                })
+            }
+            _ => None,
+        };
         let search = match decision {
             PlanningDecision::FeasibleWithinHorizon { search, .. }
             | PlanningDecision::ProtectedWithinHorizon { search, .. }
@@ -188,6 +215,15 @@ impl ControllerBudget {
             // still has time. A reason alone cannot certify hard exhaustion.
             let _ = self.poll();
         }
+    }
+    /// Called only for GuardedDispatchOutcome::Submitted, even when its result
+    /// fails. A decision or scheduler publication cannot set this fact.
+    pub fn record_backend_submitted(&self) {
+        self.backend_submitted.store(true, Ordering::Release);
+    }
+    /// Called after the submitted wave's real fenced commits and output cleanup.
+    pub fn record_host_reconciled(&self) {
+        self.host_reconciled.store(true, Ordering::Release);
     }
     pub fn stage(&self, stage: ControllerStage) -> ControllerStageTimer<'_> {
         ControllerStageTimer {
@@ -238,6 +274,9 @@ impl ControllerBudget {
                 calls: self.calls[i].load(Ordering::Acquire),
             }),
             search: *self.search.lock(),
+            witness: *self.witness.lock(),
+            backend_submitted: self.backend_submitted.load(Ordering::Acquire),
+            host_reconciled: self.host_reconciled.load(Ordering::Acquire),
             budget_ns: self.budget_ns,
             budget_polls: self.polls.load(Ordering::Acquire),
             planner_budget_exhausted: self.planner_exhausted.load(Ordering::Acquire),
@@ -295,6 +334,29 @@ impl EngineInner {
             .increment(u64::from(audit.budget_exhausted));
         counter!("ferrum.engine.slo_controller_planner_budget_exhausted_total")
             .increment(u64::from(audit.planner_budget_exhausted));
+        counter!("ferrum.engine.slo_controller_backend_submitted_total")
+            .increment(u64::from(audit.backend_submitted));
+        counter!("ferrum.engine.slo_controller_host_reconciled_total")
+            .increment(u64::from(audit.host_reconciled));
+        if let Some(witness) = audit.witness {
+            for (stage, reached) in [
+                ("decision", true),
+                ("backend_submitted", audit.backend_submitted),
+                ("host_reconciled", audit.host_reconciled),
+            ] {
+                if !reached {
+                    continue;
+                }
+                counter!("ferrum.engine.slo_controller_witness_samples_total", "stage" => stage)
+                    .increment(1);
+                histogram!("ferrum.engine.slo_controller_witness_waves", "stage" => stage)
+                    .record(witness.waves as f64);
+                counter!("ferrum.engine.slo_controller_witness_tail_waves_total", "stage" => stage)
+                    .increment(witness.tail_waves);
+                counter!("ferrum.engine.slo_controller_witness_nonempty_tail_total", "stage" => stage)
+                    .increment(u64::from(witness.tail_waves > 0));
+            }
+        }
         for (kind, value) in [
             ("enumeration_attempts", audit.search.enumeration_attempts),
             ("generated_candidates", audit.search.generated_candidates),

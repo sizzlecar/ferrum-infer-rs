@@ -49,6 +49,13 @@ async fn controller_timing_selected_early_return_exposes_executor_wait_separatel
     let breakdown = engine.metrics().performance_breakdown;
     let timing = breakdown.controller_timing.unwrap();
     assert_eq!(timing.submitted, 1);
+    assert_eq!(timing.backend_submitted, 1);
+    assert_eq!(timing.host_reconciled, 1);
+    // This fixture uses completion authority, not a feasible SLO decision.
+    assert_eq!(
+        timing.witnesses,
+        ferrum_types::ControllerWitnessMetrics::default()
+    );
     assert_eq!(timing.executor_await.calls, 1);
     assert!(timing.executor_await.wall_ns_total >= 31_000_000);
     assert!(timing.transaction.wall_ns_total >= 31_000_000);
@@ -102,6 +109,9 @@ async fn controller_timing_observe_does_not_double_count_legacy_and_off_has_none
             assert_eq!(timing.unknown_decisions, 1);
             assert_eq!(timing.capture.calls, 1);
             assert_eq!(timing.executor_await.calls, 0);
+            assert_eq!(timing.backend_submitted, 0);
+            assert_eq!(timing.host_reconciled, 0);
+            assert_eq!(timing.witnesses.decisions.samples, 0);
         }
         engine.shutdown().await.unwrap();
     }
@@ -122,6 +132,10 @@ async fn controller_timing_failed_submission_remains_visible_without_replay() {
         .controller_timing
         .unwrap();
     assert_eq!(timing.failed, 1);
+    // A real Submitted(Err) must survive cleanup as submitted, not reconciled.
+    assert_eq!(timing.backend_submitted, 1);
+    assert_eq!(timing.host_reconciled, 0);
+    assert_eq!(timing.witnesses.decisions.samples, 0);
     assert_eq!(timing.executor_await.calls, 1);
     assert!(timing.host_guard.calls >= 2);
     assert_eq!(
@@ -173,6 +187,10 @@ async fn controller_timing_nested_wall_intervals_are_not_added_or_reemitted() {
     assert_eq!(timing.host_guard.wall_ns_total, 1_000_000);
     assert_eq!(timing.transaction.wall_ns_total, 52_000_000);
     assert_eq!(timing.hard_budget_exhaustions, 0);
+    // Outcome text cannot manufacture either execution receipt or a witness.
+    assert_eq!(timing.backend_submitted, 0);
+    assert_eq!(timing.host_reconciled, 0);
+    assert_eq!(timing.witnesses.decisions.samples, 0);
     engine.shutdown().await.unwrap();
 }
 

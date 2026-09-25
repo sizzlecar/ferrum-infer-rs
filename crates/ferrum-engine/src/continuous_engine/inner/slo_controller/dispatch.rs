@@ -139,6 +139,7 @@ impl EngineInner {
             .await
         };
         if matches!(&outcome, GuardedDispatchOutcome::Submitted(_)) {
+            work.proof.budget.record_backend_submitted();
             self.record_recovery_submission(work);
             if let owner::ControllerTimingCommitment::Witness {
                 admission: Some(admission),
@@ -335,6 +336,7 @@ impl EngineInner {
                     }
                 }
                 self.finish_controller_output(work);
+                work.proof.budget.record_host_reconciled();
                 if let Some(receipt) = &flight.calibration {
                     receipt.record(CalibrationSubmissionState::HostReconciled);
                 }

@@ -21,6 +21,8 @@ async fn controller_budget_charges_capture_search_and_publication_to_one_deadlin
     }
     assert!(!budget.finish_planning());
     let audit = budget.take_audit("idle").unwrap();
+    assert!(audit.witness.is_none());
+    assert!(!audit.backend_submitted && !audit.host_reconciled);
     assert_eq!(audit.planning_wall_ns, 10_000_000);
     assert_eq!(audit.transaction_wall_ns, 10_000_000);
     assert_eq!(
@@ -57,6 +59,9 @@ async fn controller_audit_keeps_execution_and_guard_time_outside_planning_budget
         tokio::time::advance(Duration::from_millis(30)).await;
     }
     let audit = budget.take_audit("submitted").unwrap();
+    // The label alone is not a backend or host-reconciliation receipt.
+    assert!(!audit.backend_submitted && !audit.host_reconciled);
+    assert!(audit.witness.is_none());
     assert_eq!(audit.planning_wall_ns, 1_000_000);
     assert_eq!(audit.transaction_wall_ns, 52_000_000);
     assert_eq!(
@@ -101,6 +106,7 @@ async fn controller_unknown_audit_retains_search_work_and_clock_failure_is_stick
     );
     assert_eq!(audit.search.enumeration_attempts, 17);
     assert_eq!(audit.search.generated_candidates, 3);
+    assert!(audit.witness.is_none());
     assert_eq!(audit.reason, "compute_budget_exhausted");
 }
 

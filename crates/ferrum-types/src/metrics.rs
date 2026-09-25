@@ -374,6 +374,35 @@ pub struct WallTimingAggregate {
     pub calls: u64,
 }
 
+/// One population of returned feasible/protected decisions, joined to the same
+/// finalized controller audit. Counts are plans, never executed future waves.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ControllerWitnessAggregate {
+    pub samples: u64,
+    pub waves_total: u64,
+    pub tail_waves_total: u64,
+    pub nonempty_tail_samples: u64,
+    /// Only valid-clock, completed planning intervals in this population.
+    pub planning: WallTimingAggregate,
+    /// Inclusive search/replay wall time from those same valid-clock audits.
+    pub search_replay: WallTimingAggregate,
+    pub enumeration_attempts: u64,
+    pub generated_candidates: u64,
+    pub expanded_candidates: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ControllerWitnessMetrics {
+    /// Returned feasible/protected decisions, including Observe and withdrawal.
+    pub decisions: ControllerWitnessAggregate,
+    /// Subset with a backend Submitted receipt, including later failure.
+    pub backend_submitted: ControllerWitnessAggregate,
+    /// Subset after actual fenced commits and host output reconciliation.
+    pub host_reconciled: ControllerWitnessAggregate,
+}
+
 /// Completed SLO/manual-calibration transactions only; in-flight work is not
 /// partially added. Named stages are inclusive and can overlap: planning
 /// contains capture/search/publication; executor_await contains native host
@@ -398,6 +427,15 @@ pub struct ControllerTimingMetrics {
     pub executor_await: WallTimingAggregate,
     pub reconciliation: WallTimingAggregate,
     pub submitted: u64,
+    /// Actual backend Submitted receipts; unlike `submitted`, includes failures
+    /// after submission. Finalized transactions only, with no partial emission.
+    #[serde(default)]
+    pub backend_submitted: u64,
+    #[serde(default)]
+    pub host_reconciled: u64,
+    /// Missing witness evidence contributes no wave sample, not a zero-wave plan.
+    #[serde(default)]
+    pub witnesses: ControllerWitnessMetrics,
     pub observed: u64,
     pub idle: u64,
     pub failed: u64,

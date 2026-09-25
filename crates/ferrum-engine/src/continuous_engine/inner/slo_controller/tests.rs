@@ -458,6 +458,26 @@ async fn controller_publication_cannot_reset_an_expired_capture_budget() {
         cost_model_version: captured.snapshot.cost_model_version,
         witness_valid_for_ns: 1_000_000_000,
     };
+    // A returned finite decision is only a diagnostic sample: the expired
+    // publication below must not promote it to submitted/reconciled evidence.
+    budget.record_search(&PlanningDecision::FeasibleWithinHorizon {
+        first_wave: selected.clone(),
+        witness: PlanningWitnessSummary {
+            waves: 3,
+            completion_at_ns: captured.snapshot.observed_at_ns + 3,
+            validated_through_ns: captured.snapshot.scope.horizon_end_ns,
+            predicted_output_tokens: 3,
+            net_prefill_reference_work_ns: 0,
+            terminal_prefill_debt_ns: 0,
+            proxy_score: 1.0,
+            requests_with_obligations_beyond_horizon: 0,
+        },
+        search: PlanningSearchStats {
+            generated_candidates: 3,
+            expanded_candidates: 3,
+            ..Default::default()
+        },
+    });
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(matches!(
         engine
@@ -476,6 +496,17 @@ async fn controller_publication_cannot_reset_an_expired_capture_budget() {
         .is_none());
     assert!(!budget.finish_planning());
     engine.inner.finish_controller_audit(&budget, "idle");
+    let once = engine.inner.controller_timing_snapshot().unwrap();
+    assert_eq!(once.witnesses.decisions.samples, 1);
+    assert_eq!(once.witnesses.decisions.waves_total, 3);
+    assert_eq!(once.witnesses.decisions.tail_waves_total, 2);
+    assert_eq!(once.witnesses.decisions.nonempty_tail_samples, 1);
+    assert_eq!(once.witnesses.decisions.generated_candidates, 3);
+    assert_eq!(once.witnesses.decisions.planning.wall_ns_total, 1_000_000);
+    assert_eq!(once.witnesses.backend_submitted.samples, 0);
+    assert_eq!(once.witnesses.host_reconciled.samples, 0);
+    engine.inner.finish_controller_audit(&budget, "submitted");
+    assert_eq!(engine.inner.controller_timing_snapshot(), Some(once));
     assert!(
         engine
             .inner
