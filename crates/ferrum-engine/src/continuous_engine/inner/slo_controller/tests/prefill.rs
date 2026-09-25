@@ -183,6 +183,9 @@ pub(in crate::continuous_engine::inner::slo_controller) async fn selected_after_
     loop {
         *executor.cost_route_unknown.lock() = None;
         *executor.resource_planning_unknown.lock() = None;
+        executor
+            .resource_revalidation_changed
+            .store(false, Ordering::Release);
         let previous = engine.inner.slo_controller.lock().observations;
         let plan = prepare().unwrap();
         before.assert_unchanged(engine, executor);
@@ -200,23 +203,33 @@ pub(in crate::continuous_engine::inner::slo_controller) async fn selected_after_
                 };
                 let route = *executor.cost_route_unknown.lock();
                 let resource = *executor.resource_planning_unknown.lock();
+                let changed = executor
+                    .resource_revalidation_changed
+                    .load(Ordering::Acquire);
                 assert!(retry, "Idle without an independent retry: {observation:?}; route={route:?}; resource={resource:?}");
                 if route.is_some() || resource.is_some() {
                     assert!(transient_route_read(executor),
                         "permanent resource failure must not be retried: {observation:?}; route={route:?}; resource={resource:?}");
-                } else if let Some(observation) = observation {
-                    assert!(
-                        matches!(
-                            observation.reason,
-                            "capacity_snapshot_busy"
-                                | "sequence_snapshot_busy"
-                                | "controller_busy"
-                                | "scheduler_snapshot_unavailable"
-                                | "publication_release_busy"
-                                | "compute_budget_exhausted"
-                        ),
-                        "non-transient completion selection: {observation:?}"
-                    );
+                } else if !changed {
+                    // An earlier branch in this same preparation may have
+                    // recorded missing-reference/Unknown before real fallback
+                    // publication detected changed evidence. The actual
+                    // comparison and armed retry authorize that retry, not an
+                    // unrelated last-observation string.
+                    if let Some(observation) = observation {
+                        assert!(
+                            matches!(
+                                observation.reason,
+                                "capacity_snapshot_busy"
+                                    | "sequence_snapshot_busy"
+                                    | "controller_busy"
+                                    | "scheduler_snapshot_unavailable"
+                                    | "publication_release_busy"
+                                    | "compute_budget_exhausted"
+                            ),
+                            "non-transient completion selection: {observation:?}"
+                        );
+                    }
                 }
                 tokio::time::timeout_at(deadline, engine.inner.wait_for_slo_controller_retry())
                     .await

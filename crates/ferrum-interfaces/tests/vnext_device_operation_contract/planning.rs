@@ -880,6 +880,21 @@ pub(crate) fn fixture() -> Fixture {
     fixture_with_zero_state(false)
 }
 
+/// All contracts, providers, runtime descriptors and plan resources bind this
+/// device before provisioning. Callers may isolate accounts or deliberately
+/// share one; this never edits a descriptor after the plan has been resolved.
+pub(crate) fn fixture_with_device_id(device_id: DeviceId) -> Fixture {
+    fixture_on_device(
+        TestStateProfile::none(),
+        ProviderBehavior::Success,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+        ContractVersion::new(1, 0),
+        device_id,
+    )
+}
+
 pub(crate) fn fixture_tokens() -> Fixture {
     fixture_with_provider_behavior_execution_semantics_retention_storage_and_operation_version(
         TestStateProfile::tokens(),
@@ -1012,6 +1027,26 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
     retain_determinism_outputs: bool,
     operation_version: ContractVersion,
 ) -> Fixture {
+    fixture_on_device(
+        state_profile,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+        operation_version,
+        id("device.device-operation.0"),
+    )
+}
+
+fn fixture_on_device(
+    state_profile: TestStateProfile,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+    operation_version: ContractVersion,
+    device_id: DeviceId,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ProgramBindingWithScratchTail
@@ -1022,11 +1057,12 @@ fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_oper
     } else {
         ResourcePresenceRequirement::Forbidden
     };
-    let catalog = catalog_with_resource_options_execution_semantics_storage_and_operation_version(
+    let catalog = catalog_on_device(
         state_profile,
         scratch,
         execution_semantics,
         operation_version,
+        device_id,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let (_, bucket) = reusable_policy();

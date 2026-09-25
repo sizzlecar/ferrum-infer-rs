@@ -648,10 +648,25 @@ fn catalog_with_resource_options_execution_semantics_storage_and_operation_versi
     execution_semantics: ProviderExecutionSemantics,
     operation_version: ContractVersion,
 ) -> CapabilityCatalog {
+    catalog_on_device(
+        state_profile,
+        scratch,
+        execution_semantics,
+        operation_version,
+        id("device.device-operation.0"),
+    )
+}
+
+fn catalog_on_device(
+    state_profile: TestStateProfile,
+    scratch: ResourcePresenceRequirement,
+    execution_semantics: ProviderExecutionSemantics,
+    operation_version: ContractVersion,
+    device_id: DeviceId,
+) -> CapabilityCatalog {
     let mut operation = operation_with_resource_profile(state_profile, scratch);
     operation.version = operation_version;
     operation.validate().unwrap();
-    let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
         id("provider.operation.device-operation"),

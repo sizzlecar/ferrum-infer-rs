@@ -6,6 +6,7 @@ use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 mod deferral;
+mod revalidation_retry;
 mod snapshot_epoch;
 mod structured;
 
@@ -19,7 +20,16 @@ struct CoreEvidence {
 }
 impl CoreEvidence {
     fn new(width: usize) -> Self {
-        let fixture = contract::fixture();
+        // These fixtures test one controller's behavior. Unrelated parallel
+        // tests must not change its process-wide device capacity evidence.
+        // Shared-account resource tests continue to declare a shared DeviceId.
+        static NEXT_DEVICE: AtomicU64 = AtomicU64::new(0);
+        let instance = NEXT_DEVICE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("controller fixture device identities exhausted");
+        let fixture = contract::fixture_with_device_id(
+            vnext::DeviceId::new(format!("device.controller-fixture.{instance}")).unwrap(),
+        );
         let sessions = (0..width)
             .map(|index| {
                 let sequence = contract::logical_resources_with_work(
@@ -105,6 +115,7 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     session_bindings: Mutex<Vec<RequestId>>,
     pub submitted_requests: Mutex<Vec<Vec<RequestId>>>,
     pub before_prefill_discard: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    pub before_resource_revalidation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub after_resource_revalidation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub resource_planning_unknown: Mutex<Option<ResourcePlanningUnknown>>,
     /// Last real route result, cleared by each capture attempt. This is
@@ -221,6 +232,9 @@ impl ModelExecutor for ControlledExecutor {
     ) -> ResourcePlanningAvailability<bool> {
         // Preserve the real resource comparison; the one-shot hook only lets
         // tests race a real owner/epoch change between capture and publication.
+        if let Some(hook) = self.before_resource_revalidation.lock().take() {
+            hook();
+        }
         let result = match self.execution_resource_planning_view(requests, view.limits(), budget) {
             ResourcePlanningAvailability::Known(current) => {
                 ResourcePlanningAvailability::Known(view.same_live_evidence(&current))
@@ -879,6 +893,7 @@ pub(in crate::continuous_engine) async fn startup_components(
         session_bindings: Mutex::new(Vec::new()),
         submitted_requests: Mutex::new(Vec::new()),
         before_prefill_discard: Mutex::new(None),
+        before_resource_revalidation: Mutex::new(None),
         after_resource_revalidation: Mutex::new(None),
         resource_planning_unknown: Mutex::new(None),
         cost_route_unknown: Mutex::new(None),
