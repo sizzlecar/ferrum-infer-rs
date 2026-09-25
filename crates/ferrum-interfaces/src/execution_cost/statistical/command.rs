@@ -120,6 +120,16 @@ pub struct KernelReplayGeometryV1<'a> {
     pub fixed_parameters: &'a [u64],
 }
 
+/// Exact transfer parameters, separate from the statistical algorithm family.
+/// Dynamic binding preludes are still validated against their real arena and
+/// retained storage by the encoder; this digest cannot authorize execution.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferReplayGeometryV1 {
+    pub row_bytes: u64,
+    pub rows: u64,
+    pub destination_stride_bytes: u64,
+}
+
 /// Every push denotes a selected real dispatch/copy. Partial evidence may not
 /// be completed by defaulting unknown kernels to zero work. Errors are sticky.
 pub struct SelectedCommandCostBuilderV1 {
@@ -307,10 +317,50 @@ impl SelectedCommandCostBuilderV1 {
         kind: StatisticalTransferKindV1,
         count_bytes: u64,
     ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.transfer_inner(algorithm, kind, count_bytes, None)
+    }
+    /// Preserve fixed copy geometry without making each byte extent a new
+    /// statistical algorithm. A sealed template must match these parameters.
+    pub fn transfer_with_replay_geometry(
+        &mut self,
+        algorithm: SelectedAlgorithmClassV1,
+        kind: StatisticalTransferKindV1,
+        count_bytes: u64,
+        geometry: TransferReplayGeometryV1,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.transfer_inner(algorithm, kind, count_bytes, Some(geometry))
+    }
+    fn transfer_inner(
+        &mut self,
+        algorithm: SelectedAlgorithmClassV1,
+        kind: StatisticalTransferKindV1,
+        count_bytes: u64,
+        geometry: Option<TransferReplayGeometryV1>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
         self.guard(|this| {
             this.check_limit()?;
             if count_bytes == 0 {
                 return Err(StatisticalEvidenceUnknown::InvalidWork);
+            }
+            if let Some(geometry) = geometry {
+                if geometry.row_bytes == 0
+                    || geometry.rows == 0
+                    || geometry.destination_stride_bytes < geometry.row_bytes
+                {
+                    return Err(StatisticalEvidenceUnknown::InvalidWork);
+                }
+                let bytes = geometry
+                    .row_bytes
+                    .checked_mul(geometry.rows)
+                    .ok_or(StatisticalEvidenceUnknown::Overflow)?;
+                if bytes != count_bytes {
+                    return Err(StatisticalEvidenceUnknown::InvalidWork);
+                }
+                geometry
+                    .destination_stride_bytes
+                    .checked_mul(geometry.rows - 1)
+                    .and_then(|span| span.checked_add(geometry.row_bytes))
+                    .ok_or(StatisticalEvidenceUnknown::Overflow)?;
             }
             let mut work = DeviceNumericWorkV1::default();
             let tag = match kind {
@@ -341,6 +391,12 @@ impl SelectedCommandCostBuilderV1 {
                 fixed.update(algorithm.0);
                 number(fixed, tag);
                 number(fixed, count_bytes);
+                if let Some(geometry) = geometry {
+                    bytes(fixed, b"ferrum.selected-transfer-fixed-geometry.v1");
+                    number(fixed, geometry.row_bytes);
+                    number(fixed, geometry.rows);
+                    number(fixed, geometry.destination_stride_bytes);
+                }
             }
             this.transfers += 1;
             this.work = next;
@@ -382,3 +438,7 @@ impl SelectedCommandCostBuilderV1 {
         Ok(value)
     }
 }
+
+#[cfg(test)]
+#[path = "command/transfer_geometry_tests.rs"]
+mod transfer_geometry_tests;
