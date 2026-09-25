@@ -114,6 +114,9 @@ impl ExportPlan {
                 std::mem::size_of::<Retained>()
                     + std::mem::size_of::<profile_v2::ProfileSampleV2>()
                     + std::mem::size_of::<HostStageEvidenceV1>()
+                    + 2 * (std::mem::size_of::<
+                        ferrum_interfaces::execution_cost::UnsettledStructuredWaveEvidenceV1,
+                    >() + 2 * std::mem::size_of::<usize>())
                     + 2 * std::mem::size_of::<RetainedHostSample>()
                     + 2 * std::mem::size_of::<usize>(),
             )

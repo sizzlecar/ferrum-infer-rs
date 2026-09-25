@@ -280,7 +280,7 @@ impl Artifacts {
             &serde_json::json!({"schema_version":1,"event":"wave", "phase":phase,
             "case":case,"repetition":repetition,"submission":format!("{:?}",report.submission),
             "error":report.error.as_ref().map(ToString::to_string),"evidence":evidence,
-            "host_stages":report.host_stages.as_deref(),"host_stage_queue":report.host_stage_queue,
+            "host_stages":report.host_stages.as_deref().map(|stages| stages.structured_diagnostic_view()),"host_stage_queue":report.host_stage_queue,
             "host_content_frozen_prediction":host_prediction,
             "selected_whole_wave_frozen_prediction":selected_prediction}),
         )

@@ -255,7 +255,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             VNextProductOutputMode::FullLogits => CostProductOutput::FullLogits,
             VNextProductOutputMode::GreedyToken => CostProductOutput::GreedyToken,
         };
-        let mut canonical = CanonicalWaveCostBuilder::new(0, product);
+        let mut canonical = if view.structured_capture_enabled() {
+            CanonicalWaveCostBuilder::new_with_structured_statistics(0, product)
+        } else {
+            CanonicalWaveCostBuilder::new(0, product)
+        };
         let uploads = uploads::input_uploads(&self.io, &work)?;
         let readbacks = uploads::readbacks(&self.io, work.len(), output_mode)?;
         let total_tokens = work
@@ -333,7 +337,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .checked_mul(query.rows.len() as u64)
             .ok_or(U::Capacity)?;
         let shape = canonical
-            .finish_with_statistics(
+            .finish_with_captured_structure(
                 query.kind,
                 ActualWavePath::PlanRuntime,
                 ActualWaveGraphState::Disabled,

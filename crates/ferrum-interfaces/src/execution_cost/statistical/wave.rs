@@ -11,6 +11,10 @@ pub struct StatisticalWaveEvidenceV1 {
     pub(super) work: DeviceNumericWorkV1,
     #[serde(skip)]
     pub(super) independent_attention_v2: Option<IndependentAttentionWaveEvidenceV2>,
+    #[serde(skip)]
+    pub(super) structured_capture: Option<
+        Result<std::sync::Arc<UnsettledStructuredWaveEvidenceV1>, StatisticalEvidenceUnknown>,
+    >,
 }
 impl PartialEq for StatisticalWaveEvidenceV1 {
     fn eq(&self, other: &Self) -> bool {
@@ -86,6 +90,37 @@ impl IndependentAttentionWaveEvidenceV2 {
     }
 }
 impl StatisticalWaveEvidenceV1 {
+    pub fn structured_capture(
+        &self,
+    ) -> Option<
+        Result<&std::sync::Arc<UnsettledStructuredWaveEvidenceV1>, StatisticalEvidenceUnknown>,
+    > {
+        self.structured_capture
+            .as_ref()
+            .map(|value| value.as_ref().map_err(|error| *error))
+    }
+    pub fn structured_retained_rows(&self) -> usize {
+        self.structured_capture()
+            .and_then(Result::ok)
+            .map_or(0, |value| value.retained_rows())
+    }
+    pub(in crate::execution_cost) fn attach_structured_capture(
+        mut self,
+        value: Result<UnsettledStructuredWaveEvidenceV1, StatisticalEvidenceUnknown>,
+        exact: &CanonicalWaveCostShape,
+    ) -> Self {
+        self.structured_capture = Some(value.and_then(|value| {
+            self.validate_exact(exact)?;
+            value.validate_exact(exact)?;
+            if self.physical_commands != value.device().physical_commands()
+                || self.work != value.device().aggregate_work()
+            {
+                return Err(StatisticalEvidenceUnknown::CommandMismatch);
+            }
+            Ok(std::sync::Arc::new(value))
+        }));
+        self
+    }
     /// Explicit new-profile import only. Both independently serialized records
     /// must bind the same exact shape and identical actual numeric work/counts.
     /// The old V1 import never calls this and never gains a V2 family implicitly.
@@ -280,6 +315,7 @@ impl StatisticalWaveAccumulator {
             exact_binding,
             family_signature,
             independent_attention_v2,
+            structured_capture: None,
             physical_commands: self.count as u32,
             work: self.work,
         })
@@ -366,7 +402,7 @@ impl StatisticalWaveEvidenceV1 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exact_binding_parts(
+pub(super) fn exact_binding_parts(
     kind: ActualWaveKind,
     path: ActualWavePath,
     graph: ActualWaveGraphState,

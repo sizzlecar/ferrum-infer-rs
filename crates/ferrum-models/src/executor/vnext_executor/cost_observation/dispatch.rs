@@ -15,7 +15,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape<R: DeviceRuntime>(
     retries: u32,
     core_readback_route: CoreReadbackRoute,
 ) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
-    actual_shape_from_device(
+    actual_shape_from_device_with_capture(
         executor,
         participants,
         kind,
@@ -24,6 +24,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape<R: DeviceRuntime>(
         attribution.map(BoundDeviceSubmissionAttribution::device),
         retries,
         core_readback_route,
+        context.structured_capture_enabled(),
         |request_id| context.participant(request_id),
     )
 }
@@ -42,6 +43,35 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
     attribution: Option<&DeviceSubmissionAttribution>,
     retries: u32,
     core_readback_route: CoreReadbackRoute,
+    correlate: impl FnMut(&ferrum_types::RequestId) -> Option<&'h CostObservationParticipant>,
+) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
+    actual_shape_from_device_with_capture(
+        executor,
+        participants,
+        kind,
+        output_mode,
+        token_masks,
+        attribution,
+        retries,
+        core_readback_route,
+        false,
+        correlate,
+    )
+}
+
+pub(in crate::executor::vnext_executor) fn actual_shape_from_device_with_capture<
+    'h,
+    R: DeviceRuntime,
+>(
+    executor: &VNextModelExecutor<R>,
+    participants: &[VNextExecutionParticipant<'_, R>],
+    kind: VNextExecutionWaveKind,
+    output_mode: VNextProductOutputMode,
+    token_masks: &[VNextProductTokenMaskSubmissionPlan],
+    attribution: Option<&DeviceSubmissionAttribution>,
+    retries: u32,
+    core_readback_route: CoreReadbackRoute,
+    structured_capture: bool,
     mut correlate: impl FnMut(&ferrum_types::RequestId) -> Option<&'h CostObservationParticipant>,
 ) -> std::result::Result<ActualWaveShape, ActualWaveEvidenceUnknown> {
     if participants.is_empty()
@@ -56,7 +86,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
     let route::ObservedRoute {
         mut canonical,
         graph,
-    } = route::actual_route(
+    } = route::actual_route_with_capture(
         attribution,
         |index| {
             executor
@@ -79,6 +109,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
             VNextProductOutputMode::GreedyToken => CostProductOutput::GreedyToken,
         },
         retries,
+        structured_capture,
     )?;
     canonical
         .core_readback_route(core_readback_route)
@@ -167,7 +198,7 @@ pub(in crate::executor::vnext_executor) fn actual_shape_from_device<'h, R: Devic
         ActualWavePath::PlanRuntime
     };
     let canonical = canonical
-        .finish_with_statistics(
+        .finish_with_captured_structure(
             kind,
             path,
             graph,

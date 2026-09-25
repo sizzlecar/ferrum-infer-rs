@@ -19,7 +19,7 @@ pub use cost::{
     SloCostFeatureModel, SloCostModelConfig, SloCostObservationConfig, SloCostPredictor,
     SloCostProfileExportConfig, SloCostProfileImportConfig, SloCostProfileReceipt,
     SloCostShapeLimits, SloSelectedFeedbackPolicy, SloSelectedFeedbackSettingsV1,
-    SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1,
+    SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1, SloStructuredCostCapture,
     SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
 };
 pub use reference::*;

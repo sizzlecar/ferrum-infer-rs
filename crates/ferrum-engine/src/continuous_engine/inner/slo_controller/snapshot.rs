@@ -387,6 +387,7 @@ impl EngineInner {
         // evidence; a second capture has a different private state fence even
         // when its public counters happen to match. This is numeric evidence,
         // not a resource reservation. Publication still revalidates both views.
+        let route = route.with_structured_capture(runtime.structured_capture);
         let resources = route.resource_view().clone();
         if !budget() {
             return Err(unavailable("compute_budget_exhausted"));

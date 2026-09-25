@@ -58,6 +58,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         A::Known(ExecutionCostRouteView {
             fence: Arc::new(()),
             resources,
+            structured_capture: false,
             initial_frontiers: frontiers.to_vec(),
             readback_available_bytes,
             lane_id: lane.id(),

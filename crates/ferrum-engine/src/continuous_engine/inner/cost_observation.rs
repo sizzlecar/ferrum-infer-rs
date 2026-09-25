@@ -160,6 +160,7 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     recorder: BoundedWaveRecorder,
     dispatch: DispatchSummary,
     context_created: bool,
+    structured_capture: bool,
     host: Vec<Option<HostCommitEvidence>>,
     host_fence: Arc<()>,
     host_stages: Vec<host_stages::HostRowProgress>,
@@ -264,6 +265,7 @@ impl EngineCostCall {
             recorder,
             dispatch: DispatchSummary::default(),
             context_created: false,
+            structured_capture: false,
             host,
             host_fence: Arc::new(()),
             host_stages,
@@ -274,6 +276,11 @@ impl EngineCostCall {
             calibration_capture: None,
             presubmit_prediction: None,
         })
+    }
+
+    pub fn with_structured_capture(mut self, enabled: bool) -> Self {
+        self.structured_capture = enabled;
+        self
     }
 
     pub fn now_ns(&self) -> Option<u64> {
@@ -293,7 +300,8 @@ impl EngineCostCall {
                 &self.participants,
                 self.prepare_started_at_ns,
                 self.boundary,
-            ),
+            )
+            .with_structured_capture(self.structured_capture),
             summary: &mut self.dispatch,
         })
     }

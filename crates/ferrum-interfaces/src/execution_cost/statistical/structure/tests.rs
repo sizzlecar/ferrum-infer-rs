@@ -549,3 +549,47 @@ fn structured_recipe_host_prefill_mask_policy_and_capacity_are_explicit() {
     h.observe(partial);
     assert_eq!(h.failure, Some(StatisticalEvidenceUnknown::Capacity));
 }
+
+#[test]
+fn structured_recipe_transport_keeps_legacy_wire_and_import_empty() {
+    let declared = command(1, "selected.kernel");
+    let physical = declared.canonical_command(0, 0, provider()).unwrap();
+    let build = |enabled| {
+        builder(
+            &[physical],
+            &[row(false)],
+            CostProductOutput::FullLogits,
+            CoreReadbackRoute::HostSynchronized,
+            0,
+            enabled,
+        )
+        .finish_with_captured_structure(
+            ActualWaveKind::Decode,
+            ActualWavePath::PlanRuntime,
+            ActualWaveGraphState::Disabled,
+            ActualWaveRowOrder::Ordered,
+            64,
+        )
+        .unwrap()
+    };
+    let old = build(false);
+    let new = build(true);
+    assert_eq!(old.exact, new.exact);
+    let exact = new.exact.clone();
+    let old = old.statistical.unwrap();
+    let new = new.statistical.unwrap();
+    assert_eq!(old, new);
+    assert_eq!(
+        serde_json::to_vec(&old).unwrap(),
+        serde_json::to_vec(&new).unwrap()
+    );
+    assert!(old.structured_capture().is_none());
+    let recipe = new.structured_capture().unwrap().unwrap();
+    assert!(recipe.retained_rows() >= recipe.physical_host_rows().len());
+    assert!(std::sync::Arc::ptr_eq(
+        recipe,
+        new.clone().structured_capture().unwrap().unwrap()
+    ));
+    let imported = StatisticalWaveEvidenceV1::from_wire_v1(new.to_wire_v1(), &exact).unwrap();
+    assert!(imported.structured_capture().is_none());
+}

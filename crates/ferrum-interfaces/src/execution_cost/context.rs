@@ -67,6 +67,7 @@ pub struct PlanRuntimeCostObservationContext<'a> {
     outcome: Option<ObservedCallOutcome>,
     unknown: Option<ActualWaveEvidenceUnknown>,
     terminal_recorded: bool,
+    structured_capture: bool,
 }
 
 impl<'a> PlanRuntimeCostObservationContext<'a> {
@@ -88,7 +89,17 @@ impl<'a> PlanRuntimeCostObservationContext<'a> {
             outcome: None,
             unknown: None,
             terminal_recorded: false,
+            structured_capture: false,
         }
+    }
+
+    /// Passive evidence only; execution and cost-model policy are unchanged.
+    pub fn with_structured_capture(mut self, enabled: bool) -> Self {
+        self.structured_capture = enabled;
+        self
+    }
+    pub fn structured_capture_enabled(&self) -> bool {
+        self.structured_capture
     }
 
     pub fn now_ns(&self) -> Option<u64> {

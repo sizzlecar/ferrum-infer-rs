@@ -88,12 +88,19 @@ impl CostEvidenceEntry {
         // Every variable allocation is a row Vec; charge its full capacity at
         // the largest row size. Shared Arcs are conservatively charged per entry.
         let row_bytes = std::mem::size_of::<HostRowStageV1>()
+            .max(std::mem::size_of::<
+                ferrum_interfaces::execution_cost::StructuredHostRowV1,
+            >())
             .max(std::mem::size_of::<CostRowNumericFeatures>())
             .max(std::mem::size_of::<HostRowStaticCostFeaturesV2>())
             .max(std::mem::size_of::<
                 ferrum_scheduler::implementations::continuous::cost_model::PrefillShape,
             >());
         rows.checked_mul(row_bytes)?
+            .checked_add(
+                self.stages()
+                    .map_or(0, |stages| stages.structured_retained_overhead_bytes()),
+            )?
             .checked_add(std::mem::size_of::<Self>())?
             .checked_add(if self.stages().is_some() {
                 std::mem::size_of::<HostStageEvidenceV1>() + 2 * std::mem::size_of::<usize>()

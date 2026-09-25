@@ -16,6 +16,11 @@ impl Drop for ModelDirectory {
 }
 
 pub(super) async fn fixture() -> (CalibrationSession, ModelDirectory) {
+    fixture_with_structured_capture(false).await
+}
+pub(super) async fn fixture_with_structured_capture(
+    enabled: bool,
+) -> (CalibrationSession, ModelDirectory) {
     let directory = ModelDirectory(
         std::env::temp_dir().join(format!("ferrum-unified-metal-{}", uuid::Uuid::new_v4())),
     );
@@ -38,6 +43,10 @@ pub(super) async fn fixture() -> (CalibrationSession, ModelDirectory) {
     config.batching.max_num_batched_tokens = 8;
     config.memory.usable_capacity_bytes = Some(64 << 20);
     config.scheduler.slo.mode = ferrum_types::SloMode::Observe;
+    if enabled {
+        config.scheduler.slo.cost_observation.structured_capture =
+            ferrum_types::SloStructuredCostCapture::HostSettledV1;
+    }
     config.scheduler.slo.default_service_class = Some("native-transition-test".into());
     config
         .scheduler

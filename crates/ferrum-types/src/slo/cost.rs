@@ -18,6 +18,9 @@ pub struct SloCostObservationConfig {
     pub predictor: SloCostPredictor,
     #[serde(skip_serializing_if = "SloSelectedFeedbackPolicy::is_disabled")]
     pub selected_feedback: SloSelectedFeedbackPolicy,
+    /// Passive structural capture only; never changes the predictor/profile.
+    #[serde(skip_serializing_if = "SloStructuredCostCapture::is_disabled")]
+    pub structured_capture: SloStructuredCostCapture,
     pub max_queued_samples: NonZeroUsize,
     /// Sum of allocated row capacities in the pending sample queue.
     pub max_queued_shape_rows: NonZeroUsize,
@@ -37,6 +40,7 @@ impl Default for SloCostObservationConfig {
         Self {
             predictor: SloCostPredictor::default(),
             selected_feedback: SloSelectedFeedbackPolicy::Disabled,
+            structured_capture: SloStructuredCostCapture::Disabled,
             max_queued_samples: NonZeroUsize::new(256).unwrap(),
             max_queued_shape_rows: NonZeroUsize::new(8192).unwrap(),
             max_samples_per_update: NonZeroUsize::new(256).unwrap(),
@@ -47,6 +51,21 @@ impl Default for SloCostObservationConfig {
             profile_import: SloCostProfileImportConfig::default(),
             profile_export: None,
         }
+    }
+}
+
+/// Explicit capture-only opt-in shared by run, serve and calibration.
+/// This does not qualify a regression model or enable a new profile schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloStructuredCostCapture {
+    #[default]
+    Disabled,
+    HostSettledV1,
+}
+impl SloStructuredCostCapture {
+    pub fn is_disabled(&self) -> bool {
+        *self == Self::Disabled
     }
 }
 
@@ -658,5 +677,32 @@ mod selected_predictor_tests {
             }
             assert!(invalid.validate().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_capture_tests {
+    use super::*;
+    #[test]
+    fn structured_capture_is_explicit_and_does_not_select_a_predictor() {
+        let old: SloCostObservationConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.structured_capture, SloStructuredCostCapture::Disabled);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("structured_capture")
+            .is_none());
+        let enabled: SloCostObservationConfig =
+            serde_json::from_str(r#"{"structured_capture":"host_settled_v1"}"#).unwrap();
+        enabled.validate().unwrap();
+        assert_eq!(
+            enabled.structured_capture,
+            SloStructuredCostCapture::HostSettledV1
+        );
+        assert_eq!(enabled.predictor, old.predictor);
+        assert_eq!(enabled.model, old.model);
+        assert!(serde_json::from_str::<SloCostObservationConfig>(
+            r#"{"structured_capture":"train"}"#
+        )
+        .is_err());
     }
 }

@@ -86,6 +86,7 @@ pub struct FutureWaveCostQuery<'a> {
 pub struct ExecutionCostRouteView {
     pub(crate) fence: Arc<()>,
     pub(crate) resources: ResourcePlanningView,
+    pub(crate) structured_capture: bool,
     pub(crate) initial_frontiers: Vec<u64>,
     pub(crate) readback_available_bytes: u64,
     pub(crate) lane_id: crate::vnext::ExecutionLaneId,
@@ -94,6 +95,16 @@ pub struct ExecutionCostRouteView {
 }
 
 impl ExecutionCostRouteView {
+    /// Passive capture mode shares the same numeric epoch and resource authority.
+    /// It is intentionally not part of same_live_evidence or execution identity.
+    pub fn with_structured_capture(mut self, enabled: bool) -> Self {
+        self.structured_capture = enabled;
+        self
+    }
+    pub fn structured_capture_enabled(&self) -> bool {
+        self.structured_capture
+    }
+
     pub const fn graph_stream_state(&self) -> Option<crate::vnext::DeviceCostGraphStreamState> {
         self.graph_stream_state
     }

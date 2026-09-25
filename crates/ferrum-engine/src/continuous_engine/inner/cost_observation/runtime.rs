@@ -15,6 +15,7 @@ pub(in crate::continuous_engine) struct EngineCostRuntime {
     pub sink: Arc<BoundedCostSampleSink>,
     pub identity: ExecutorCostIdentityAvailability,
     pub recorder_limits: CostRecorderLimits,
+    pub structured_capture: bool,
     // The worker owns another training Arc, but never an EngineCostRuntime.
     // Thus no self-cycle or join-from-worker is possible during Drop.
     training: Arc<CostTrainingState>,
@@ -114,6 +115,7 @@ impl EngineCostRuntime {
             sink: training.sink.clone(),
             identity,
             recorder_limits,
+            structured_capture: !config.structured_capture.is_disabled(),
             training,
             worker,
         })

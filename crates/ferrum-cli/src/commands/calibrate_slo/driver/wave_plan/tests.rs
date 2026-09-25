@@ -56,6 +56,7 @@ fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostStageEvidenceV1) {
         fingerprint: None,
         actual_shape: None,
         statistical_evidence: None,
+        structured_evidence: None,
         prepare_started_at_ns: Some(1),
         executor_returned_at_ns: Some(2),
         rows: attempt

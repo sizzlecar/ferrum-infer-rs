@@ -8,7 +8,9 @@ use ferrum_scheduler::implementations::continuous::cost_model::{
 };
 use ferrum_types::FinishReason;
 use serde::Serialize;
+mod structured;
 mod wire;
+pub use structured::{QualifiedStructuredWaveEvidenceV1, StructuredSettlementUnknown};
 pub(super) use wire::ExportEvidence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -105,6 +107,10 @@ pub struct HostStageEvidenceV1 {
     /// eligible for legacy profile 1--5 training or inference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statistical_evidence: Option<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+    /// Capture-only qualification. Never imported by the current model/profile.
+    #[serde(skip)]
+    pub structured_evidence:
+        Option<Result<QualifiedStructuredWaveEvidenceV1, StructuredSettlementUnknown>>,
     pub prepare_started_at_ns: Option<u64>,
     pub executor_returned_at_ns: Option<u64>,
     pub rows: Vec<HostRowStageV1>,
@@ -124,9 +130,50 @@ fn serialize_fingerprint<S: serde::Serializer>(
 }
 
 impl HostStageEvidenceV1 {
+    /// Explicit calibration/raw-only borrowed view. Legacy source/profile
+    /// serialization intentionally omits the capture-only field.
+    pub fn structured_diagnostic_view(&self) -> impl Serialize + '_ {
+        #[derive(Serialize)]
+        struct View<'a> {
+            #[serde(flatten)]
+            stages: &'a HostStageEvidenceV1,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            structured_evidence:
+                &'a Option<Result<QualifiedStructuredWaveEvidenceV1, StructuredSettlementUnknown>>,
+        }
+        View {
+            stages: self,
+            structured_evidence: &self.structured_evidence,
+        }
+    }
+    pub(super) fn structured_retained_overhead_bytes(&self) -> usize {
+        let copies = usize::from(
+            self.statistical_evidence
+                .as_ref()
+                .is_some_and(|value| value.structured_retained_rows() != 0),
+        ) + usize::from(self.structured_evidence.as_ref().is_some_and(Result::is_ok));
+        copies
+            * (std::mem::size_of::<
+                ferrum_interfaces::execution_cost::UnsettledStructuredWaveEvidenceV1,
+            >() + 2 * std::mem::size_of::<usize>())
+    }
+
     /// Actual retained capacities, shared with the existing bounded FIFO.
     pub(in crate::continuous_engine) fn retained_rows(&self) -> Option<usize> {
         let mut rows = self.rows.capacity();
+        // These Arcs may share storage, but charge each retained reference
+        // conservatively so FIFO/export bounds cannot miss a backing Vec.
+        rows = rows.checked_add(
+            self.statistical_evidence
+                .as_ref()
+                .map_or(0, |value| value.structured_retained_rows()),
+        )?;
+        rows = rows.checked_add(
+            self.structured_evidence
+                .as_ref()
+                .and_then(|value| value.as_ref().ok())
+                .map_or(0, |value| value.retained_rows()),
+        )?;
         if let Some(shape) = &self.actual_shape {
             rows = rows.checked_add(shape.decode_kv_tokens.capacity())?;
             rows = rows.checked_add(shape.prefill_chunks.capacity())?;
@@ -588,7 +635,7 @@ impl EngineCostCall {
             }),
             _ => None,
         };
-        Some(Arc::new(HostStageEvidenceV1 {
+        let mut stages = HostStageEvidenceV1 {
             schema_version: 1,
             call_id: self.call_id.get(),
             presubmit_prediction: self.presubmit_prediction.as_ref().map(|p| p.receipt(shape)),
@@ -599,12 +646,17 @@ impl EngineCostCall {
                 .as_ref()
                 .filter(|evidence| evidence.validate_actual(shape).is_ok())
                 .cloned(),
+            structured_evidence: None,
             prepare_started_at_ns: self.prepare_started_at_ns,
             executor_returned_at_ns: self.dispatch.returned_at_ns,
             rows,
             finalized_at_ns: finalized,
             full_wall_ns,
             completeness,
-        }))
+        };
+        if self.structured_capture {
+            stages.structured_evidence = Some(structured::qualify(self, shape, &stages));
+        }
+        Some(Arc::new(stages))
     }
 }

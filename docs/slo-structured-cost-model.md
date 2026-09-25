@@ -1,8 +1,8 @@
 # Structured whole-wave cost model
 
-Status: staged implementation. The first contract collects optional, unsettled
-structure. It does not enable a predictor, import a new profile, or qualify a
-performance result.
+Status: staged implementation. Optional capture connects future route projection,
+actual execution, and receipt-qualified host settlement. It does not enable a new
+predictor, import a new profile, or qualify a performance result.
 
 ## Problem and choice
 
@@ -53,12 +53,29 @@ explicitly unavailable.
 
 ## Settlement and modeling boundary
 
-The unsettled type is not a training sample. A later engine adapter must bind it
-to actual completion evidence from the same call and request incarnations,
-generations, work ranges, and physical rows. Actual host processing order comes
+The unsettled type is not a training sample. The engine adapter binds it to actual
+completion evidence from the same call and request incarnations, generations,
+work ranges, and physical rows. Actual host processing order comes
 from the completion receipt, not from physical row position. Failed, cancelled,
 partial, or unmodeled additional work cannot become successful settlement through
-a caller-supplied boolean.
+a caller-supplied boolean. `QualifiedStructuredWaveEvidenceV1` has no public
+constructor or deserializer. Its binding also detects changes to the enclosing
+diagnostic shape, identities, clocks, and host receipts.
+
+Enable capture explicitly in the SLO policy file shared by `run`, `serve`, and
+`calibrate-slo`:
+
+```toml
+[cost_observation]
+structured_capture = "host_settled_v1"
+```
+
+The default is `"disabled"`. Enabling capture does not select a predictor or
+create observation hooks when the configured execution path does not collect
+cost observations. The calibration raw wave record exposes `structured_evidence`
+through its explicit diagnostic view. Existing source/profile serialization
+omits this field. Queue and export limits account for retained backing capacity;
+the export size estimate reserves a conservative fixed structural overhead.
 
 The time target remains:
 
@@ -73,8 +90,12 @@ count overlapping work.
 The new fit and joint support need sufficient numerical detail for the proposed
 sharing. Aggregate kernel work is not per-algorithm work: equal totals can hide
 different allocations of work to different algorithms. The first contract does
-not claim to resolve that ambiguity. New features must be available from both
-actual and prospective execution, without using future durations as inputs.
+not claim to resolve that ambiguity. An optional selected-command builder now
+records work by algorithm and transfer kind, with a binding to the numeric
+assignment in that same command. Its default path does not collect the sparse
+table. Provider opt-in and complete-wave retention of these inputs are still
+pending. New features must be available from both actual and prospective
+execution, without using future durations or actual EOS outcomes as inputs.
 
 The model must retain independent fit, residual calibration, and heldout phases.
 Residuals apply to the complete prediction and complete measured wave. Old
@@ -91,9 +112,11 @@ refit the frozen model, or extend TTL. Its settings and persistence policy must
 be declared for an experiment; enabling it does not retroactively qualify a
 failed heldout evaluation.
 
-The remaining sequence is actual/future producer wiring, private settlement
-qualification, justified numerical features and model identity, fresh independent
-calibration, and service validation. Backend tests must exercise the real selected
-routes. Final acceptance remains the concurrent TTFT, TPOT, visible-text ITL,
+The Metal tiny-model test exercises projected and actual partial/final prefill,
+decode, and real terminal settlement. This verifies that capture path, not the
+Qwen3.5-9B performance target. The remaining sequence is complete per-algorithm
+producer wiring, justified numerical features and model identity, fresh
+independent calibration, and service validation. Backend tests must exercise the
+real selected routes. Final acceptance remains concurrent TTFT, TPOT, visible-text ITL,
 throughput, errors, and memory measurements. See
 [SLO configuration](slo-configuration.md) for the current explicit controls.

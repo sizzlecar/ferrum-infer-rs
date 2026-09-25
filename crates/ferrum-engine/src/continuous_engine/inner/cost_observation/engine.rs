@@ -143,6 +143,7 @@ impl EngineCostPreparation {
             },
         )
         .ok()
+        .map(|call| call.with_structured_capture(self.runtime.structured_capture))
         .map(ObservedCostCall::new)
     }
 }

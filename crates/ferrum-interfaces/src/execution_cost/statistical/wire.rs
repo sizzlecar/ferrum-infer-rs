@@ -85,6 +85,7 @@ impl StatisticalWaveEvidenceV1 {
             physical_commands: wire.physical_commands,
             work: wire.work.into(),
             independent_attention_v2: None,
+            structured_capture: None,
         };
         value.validate_exact(exact)?;
         Ok(value)

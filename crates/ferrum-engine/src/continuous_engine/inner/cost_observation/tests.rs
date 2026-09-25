@@ -2,6 +2,7 @@ use super::*;
 mod calibration_capture;
 mod host_stages;
 pub(in crate::continuous_engine::inner) mod statistical_model;
+mod structured_settlement;
 use ferrum_scheduler::implementations::continuous::cost_model as model;
 use std::{
     num::NonZeroUsize,

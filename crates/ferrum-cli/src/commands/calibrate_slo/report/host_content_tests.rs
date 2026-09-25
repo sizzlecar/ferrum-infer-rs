@@ -47,6 +47,7 @@ fn terminal() -> HostStageEvidenceV1 {
     HostStageEvidenceV1 {
         presubmit_prediction: None,
         statistical_evidence: None,
+        structured_evidence: None,
         schema_version: 1,
         call_id: 1,
         fingerprint: Some(ExecutionFingerprint {

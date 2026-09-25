@@ -7,6 +7,7 @@ pub(super) struct ObservedRoute {
     pub graph: ActualWaveGraphState,
 }
 
+#[cfg(test)]
 pub(super) fn actual_route<'a>(
     attribution: Option<&DeviceSubmissionAttribution>,
     provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
@@ -14,12 +15,34 @@ pub(super) fn actual_route<'a>(
     product: CostProductOutput,
     retries: u32,
 ) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
+    actual_route_with_capture(
+        attribution,
+        provider_at,
+        graph_capability,
+        product,
+        retries,
+        false,
+    )
+}
+
+pub(super) fn actual_route_with_capture<'a>(
+    attribution: Option<&DeviceSubmissionAttribution>,
+    provider_at: impl Fn(u32) -> Option<CostProviderIdentity<'a>>,
+    graph_capability: DeviceCostGraphCaptureCapability,
+    product: CostProductOutput,
+    retries: u32,
+    structured_capture: bool,
+) -> std::result::Result<ObservedRoute, ActualWaveEvidenceUnknown> {
     let attribution = attribution.ok_or(ActualWaveEvidenceUnknown::GraphPath)?;
     let commands = attribution.commands();
     if commands.is_empty() || commands.len() > MAX_COST_COMMANDS {
         return Err(ActualWaveEvidenceUnknown::ProviderPath);
     }
-    let mut canonical = CanonicalWaveCostBuilder::new(retries, product);
+    let mut canonical = if structured_capture {
+        CanonicalWaveCostBuilder::new_with_structured_statistics(retries, product)
+    } else {
+        CanonicalWaveCostBuilder::new(retries, product)
+    };
     let mut replayed = false;
     for command in commands {
         let provider = command

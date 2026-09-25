@@ -141,11 +141,19 @@ impl BoundedWaveRecorder {
         if static_rows > self.limits.max_rows_per_wave {
             return self.reject_begin(CostRecorderError::RowCapacity);
         }
+        let structured_rows = shape
+            .statistical_evidence
+            .as_ref()
+            .map_or(0, |evidence| evidence.structured_retained_rows());
+        if structured_rows > self.limits.max_rows_per_wave {
+            return self.reject_begin(CostRecorderError::RowCapacity);
+        }
         let Some(rows) = shape
             .rows
             .capacity()
             .checked_add(numeric_rows)
             .and_then(|rows| rows.checked_add(static_rows))
+            .and_then(|rows| rows.checked_add(structured_rows))
             .and_then(|rows| self.retained_rows.checked_add(rows))
         else {
             return self.reject_begin(CostRecorderError::RowCapacity);

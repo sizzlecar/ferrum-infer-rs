@@ -702,6 +702,36 @@ impl CanonicalWaveCostBuilder {
         Ok(super::CanonicalStatisticalWave { exact, statistical })
     }
 
+    /// Transport opt-in structure beside existing statistics. Default builders
+    /// take the original path without allocating structured rows or hashing them.
+    pub fn finish_with_captured_structure(
+        self,
+        kind: ActualWaveKind,
+        path: ActualWavePath,
+        graph: ActualWaveGraphState,
+        row_order: ActualWaveRowOrder,
+        recurrent_state_bytes: u64,
+    ) -> Result<super::CanonicalStatisticalWave, CanonicalCostError> {
+        if self.structured_host.is_none() {
+            return self.finish_with_statistics(
+                kind,
+                path,
+                graph,
+                row_order,
+                recurrent_state_bytes,
+            );
+        }
+        let result =
+            self.finish_with_structure(kind, path, graph, row_order, recurrent_state_bytes)?;
+        let statistical = result
+            .statistical
+            .map(|value| value.attach_structured_capture(result.structured, &result.exact));
+        Ok(super::CanonicalStatisticalWave {
+            exact: result.exact,
+            statistical,
+        })
+    }
+
     /// Completes an opt-in, pre-host-settlement structural recipe. All legacy
     /// canonical validation still runs. Missing structure cannot turn invalid
     /// execution into valid execution or produce a trainable observation.

@@ -150,7 +150,8 @@ impl ExecutorShape<'_> {
         if empirical && !self.captured.model.supports_empirical_host_content() {
             return Ok(None);
         }
-        let collect_statistics = self.captured.model.requires_statistical_evidence();
+        let collect_statistics = self.captured.model.requires_statistical_evidence()
+            || self.captured.route.structured_capture_enabled();
         let mut selected = Vec::new();
         let mut statistics_complete = collect_statistics;
         if collect_statistics {

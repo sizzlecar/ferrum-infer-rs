@@ -159,6 +159,39 @@ pub struct UnsettledStructuredWaveEvidenceV1 {
     physical_host_rows: Vec<StructuredHostRowV1>,
 }
 impl UnsettledStructuredWaveEvidenceV1 {
+    /// Allocated capacity, not the number of occupied physical rows.
+    pub fn retained_rows(&self) -> usize {
+        self.physical_host_rows.capacity()
+    }
+    pub fn validate_actual(
+        &self,
+        shape: &ActualWaveShape,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        if shape.restore_bytes != 0 || shape.maintenance_bytes != 0 || shape.maintenance_units != 0
+        {
+            return Err(StatisticalEvidenceUnknown::UnsupportedWave);
+        }
+        let digest = super::wave::exact_binding_parts(
+            shape.kind,
+            shape.path,
+            shape.graph,
+            shape.row_order,
+            shape.provider_signature,
+            shape.output_policy_signature,
+            shape.recurrent_state_bytes,
+            shape.numeric_features.as_ref(),
+            shape.row_multiset_features.as_ref(),
+            shape.rows.iter().map(|row| row.work),
+        )?;
+        if self.protocol != STRUCTURED_COST_INPUT_PROTOCOL_V1
+            || self.exact_binding != digest
+            || self.physical_host_rows.len() != shape.rows.len()
+            || self.retained_rows() > MAX_COST_ROWS
+        {
+            return Err(StatisticalEvidenceUnknown::ExactBindingMismatch);
+        }
+        Ok(())
+    }
     pub fn device(&self) -> &DeviceRouteTemplateV1 {
         &self.device
     }

@@ -506,3 +506,6 @@ async fn unified_execution_metal_partial_final_successor_and_recaptured_decode_m
     drop(inner);
     drop(directory);
 }
+
+#[path = "unified_execution_metal/structured.rs"]
+mod structured;
