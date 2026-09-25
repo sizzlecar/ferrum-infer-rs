@@ -11,6 +11,7 @@ use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 mod host_content;
 mod selected;
+pub(super) mod structured;
 pub(super) use host_content::statistical::whole_wave_observation;
 
 pub(super) struct CostTrainingState {

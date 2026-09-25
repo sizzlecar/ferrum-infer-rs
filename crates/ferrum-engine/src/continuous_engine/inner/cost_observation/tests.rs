@@ -81,6 +81,14 @@ fn begin(
     shape: &ActualWaveShape,
     sink: &Arc<BoundedCostSampleSink>,
 ) -> (EngineCostCall, Arc<VirtualClock>) {
+    begin_with_retained_capacity(shape, sink, 32)
+}
+
+fn begin_with_retained_capacity(
+    shape: &ActualWaveShape,
+    sink: &Arc<BoundedCostSampleSink>,
+    max_retained_rows: usize,
+) -> (EngineCostCall, Arc<VirtualClock>) {
     let clock = Arc::new(VirtualClock(AtomicU64::new(2)));
     let participants = shape
         .rows
@@ -106,7 +114,7 @@ fn begin(
             recorder_limits: CostRecorderLimits {
                 max_waves: 4,
                 max_rows_per_wave: 8,
-                max_retained_rows: 32,
+                max_retained_rows,
             },
         },
     )

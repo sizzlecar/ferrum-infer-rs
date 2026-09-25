@@ -2,6 +2,7 @@ use super::super::host_stages::StructuredSettlementUnknown;
 use super::*;
 use ferrum_interfaces::{model_executor::ExecutorCompletionWork, vnext::DeviceCommandPhase};
 use ferrum_types::{FinishReason, InferenceRequest, TokenId};
+mod model_bridge;
 
 fn selected_shape(maxima: &[u64]) -> (ActualWaveShape, Vec<HostCostFeaturesV1>) {
     let mut selected = SelectedCommandCostBuilderV1::new(maxima.len() as u64);

@@ -7,6 +7,9 @@ use std::sync::{
     OnceLock,
 };
 
+mod structured_session;
+pub(in crate::continuous_engine::inner) use structured_session::StructuredCaptureSessionBinding;
+
 #[derive(Debug)]
 pub(in crate::continuous_engine) enum CostCalibrationResult {
     Observed {
@@ -35,6 +38,9 @@ pub(in crate::continuous_engine) struct CostCalibrationCapture {
     host_stage_queue: OnceLock<HostStageQueueReceipt>,
     claimed: AtomicBool,
     conflict: AtomicBool,
+    // Set only by construction, before attach/context/execute. Existing capture
+    // paths keep None and cannot be retroactively relabeled as this protocol.
+    structured_session: Option<Arc<StructuredCaptureSessionBinding>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +51,19 @@ pub(in crate::continuous_engine) enum CostCalibrationStatus {
 }
 
 impl CostCalibrationCapture {
+    pub(in crate::continuous_engine::inner) fn for_structured_session(
+        session: Arc<StructuredCaptureSessionBinding>,
+    ) -> Self {
+        Self {
+            structured_session: Some(session),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn structured_session(&self) -> Option<&StructuredCaptureSessionBinding> {
+        self.structured_session.as_deref()
+    }
+
     pub fn host_stage_queue(&self) -> Option<HostStageQueueReceipt> {
         if self.conflict.load(Ordering::Acquire) {
             None
