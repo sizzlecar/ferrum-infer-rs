@@ -2,6 +2,9 @@
 //! profile import, latency target or prospective per-class work is manufactured.
 use super::*;
 
+#[path = "structured/prepared.rs"]
+mod prepared;
+
 #[tokio::test]
 async fn structured_capture_metal_future_actual_and_real_terminal_settlement() {
     let (mut session, directory) = fixture::fixture_with_structured_capture(true).await;

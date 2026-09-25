@@ -7,6 +7,8 @@ use ferrum_interfaces::execution_cost::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+mod structured_prepared;
+
 const READY: u8 = 0;
 const DISPATCH_ENTERED: u8 = 1;
 const FINISHED: u8 = 2;

@@ -34,6 +34,9 @@ pub use profile_export::structured::{
     StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
     StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
+pub(in crate::continuous_engine::inner) use profile_export::structured_v2::{
+    PreparedRowBindingV2, PreparedStructuredFactsV2,
+};
 pub(in crate::continuous_engine) use profile_export::{CostProfileCutPaths, CostProfileCutReceipt};
 mod publication;
 mod query_metrics;
