@@ -368,14 +368,37 @@ profile 验证。导入模型不要求等于原在线模型，二者的发布历
 窗口必须非零且不超过 `protocol.maximum_requests`。它不扩大引擎容量、输出额度
 或资源许可；所有请求仍使用原 prompt、采样策略和完整输出预算。遇到消费失败或
 取消时中止采集并执行原关闭流程，不以失败请求空出的槽继续收集。
-每个 cohort 的 chunk、split/mixed 和 decode route 仍固定；滚动入场不代表覆盖了
-所有执行形状。此选项只影响校准命令，普通 `run` / `serve` 的行为不变。
+未设置下述 `wave_plan` 时，每个 cohort 的 chunk、split/mixed 和 decode route 仍固定。
+滚动入场不代表覆盖了所有执行形状。此选项只影响校准命令，普通 `run` / `serve` 的行为不变。
 
 该字段进入完整 manifest 的协议摘要，因此滚动与整组采集具有不同身份。
 fit→冻结→独立 residual→导出/重新导入→heldout 的阶段隔离不变。采集前须按完整
 输出工作量声明有界 timeout；窗口不延长 profile TTL，也不改变残差分位数或样本门槛。
 原始记录新增 `rolling_admission`、`rolling_completion` 和
 `rolling_cohort_drained`，保留实际 request ID、输入序号和在途数量。
+
+cohort 可另显式声明有界波次计划，例如：
+
+```json
+"wave_plan": {
+  "prefill_chunks": [16, 32, 64, 128],
+  "decode_routes": ["actual", "full_logits"]
+}
+```
+
+两条周期各为 1–16 个预声明选项，至少提供一条；省略的轴沿用原静态字段。
+每次 phase/case/repetition 从两个序号 0 开始。只有本次真实工作逐行成功提交并完成
+host reconciliation，且 owner/frontier/work 与尝试一致时，才推进对应轴一次；mixed
+波同时推进两轴。Prefill 末块按剩余输入裁短，但仍算一次成功 prefill 波。
+Blocked、NotSubmitted、维护和未执行重试不推进；失败、不可判定提交或缺少成功行证据
+终止采集并保留原关闭/清理流程，不靠再次执行猜测进度。它不依据预测 Known、入队成败、
+耗时或质量结果改选项。额外成功终态清理不一定有合格成本样本，也不会阻止已完成工作推进。
+
+计划及其顺序进入完整协议摘要。raw 的 `wave_plan_attempt` / `wave_plan_result`
+记录全局尝试序号、两轴成功波序号、周期索引、所选 chunk/route、请求及实际提交结果；
+并保留既有真实 wave/host 记录。Reference discovery/trials 和其 warmup 拒绝此计划，
+须使用独立静态 reference manifest。该选项不会改变 split/mixed 策略、输出预算、
+请求列表、阶段隔离、TTL、样本门槛或资源许可，也不保证每个实际族都获得足够样本。
 
 每个显式 cohort 可选 `"token_policy_residency":"invalidate_before_cohort"`，
 在每次 repetition 添加请求前，清除上一次真实 token-policy 上传的 residency 记录。

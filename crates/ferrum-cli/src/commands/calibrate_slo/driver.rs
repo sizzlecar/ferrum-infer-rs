@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 mod admission;
+mod wave_plan;
 use admission::AdmissionWindow;
 
 pub(super) async fn collect(
@@ -174,6 +175,8 @@ pub(super) async fn cohort(
             }
         }
     }
+    // Each invocation is one phase/case/repetition; no cursor crosses its drain.
+    let mut wave_plan = wave_plan::Cursor::new(case)?;
     let mut consumers = JoinSet::<Result<(ferrum_types::RequestId, serde_json::Value)>>::new();
     let mut window =
         AdmissionWindow::<ferrum_types::RequestId>::new(&case.prompts, case.maximum_in_flight())?;
@@ -291,6 +294,11 @@ pub(super) async fn cohort(
             .active()
             .iter()
             .filter_map(|owner| frontiers.iter().find(|row| row.request_id() == &owner.id));
+        let choice = wave_plan.as_ref().map(wave_plan::Cursor::choice);
+        let prefill_chunk = choice.map_or(case.prefill_chunk_tokens, |value| {
+            value.prefill_chunk_tokens
+        });
+        let decode_route = choice.map_or(case.decode_route, |value| value.decode_route);
         let mut prefills = Vec::new();
         let mut decodes = Vec::new();
         for frontier in ordered {
@@ -302,16 +310,20 @@ pub(super) async fn cohort(
                         .map_err(|_| FerrumError::invalid_request("calibration input overflow"))?,
                     u32::try_from(offset)
                         .map_err(|_| FerrumError::invalid_request("calibration offset overflow"))?,
-                    case.prefill_chunk_tokens,
+                    prefill_chunk,
                 )?;
                 prefills.push(frontier.prefill_work(count)?);
             } else {
-                decodes.push(frontier.decode_work_with_route(case.decode_route)?);
+                decodes.push(frontier.decode_work_with_route(decode_route)?);
             }
         }
         let rows = select_rows(prefills, decodes, case.execution);
         if !rows.is_empty() {
             let reference_rows = observer.as_ref().map(|_| rows.clone());
+            let planned = wave_plan
+                .as_ref()
+                .map(|plan| plan.begin(&rows))
+                .transpose()?;
             totals.wave_attempts = totals
                 .wave_attempts
                 .checked_add(1)
@@ -320,9 +332,28 @@ pub(super) async fn cohort(
                     FerrumError::resource_exhausted("calibration wave-attempt limit exceeded")
                 })?;
             totals.phases.get_mut(phase).wave_attempts += 1;
+            if let Some(attempt) = &planned {
+                artifacts.record(
+                    &serde_json::json!({"schema_version":1,"event":"wave_plan_attempt",
+                    "phase":phase,"case":index,"repetition":repetition,
+                    "wave_attempt":totals.wave_attempts,"plan":attempt}),
+                )?;
+            }
             match session.step(CalibrationAction::Wave(rows)).await? {
                 CalibrationTurn::Wave(wave) | CalibrationTurn::Reaped(wave) => {
                     artifacts.wave(phase, index, repetition, &wave, frozen, totals)?;
+                    if let (Some(cursor), Some(attempt)) = (wave_plan.as_mut(), planned.as_ref()) {
+                        let outcome = cursor.reconcile(attempt, &wave);
+                        artifacts.record(&serde_json::json!({"schema_version":1,"event":"wave_plan_result",
+                            "phase":phase,"case":index,"repetition":repetition,
+                            "wave_attempt":totals.wave_attempts,"selection":attempt.choice,
+                            "submission":format!("{:?}",wave.submission),
+                            "host_call_id":wave.host_stages.as_ref().map(|host| host.call_id),
+                            "advanced":outcome.as_ref().ok().copied(),
+                            "error":outcome.as_ref().err().map(ToString::to_string),
+                            "next":cursor.choice()}))?;
+                        outcome?;
+                    }
                     if let Some(observer) = observer.as_deref_mut() {
                         let progress = observer.observe_wave(session, reference_rows.as_deref().ok_or_else(|| FerrumError::internal("reference work correlation missing"))?, &wave)?;
                         totals.reference_progress(phase, progress)?;

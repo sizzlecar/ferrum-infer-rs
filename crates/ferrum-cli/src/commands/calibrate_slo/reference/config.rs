@@ -141,6 +141,7 @@ impl ReferenceConfig {
             decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
             token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
             rolling_window: None,
+            wave_plan: None,
         })
     }
 }

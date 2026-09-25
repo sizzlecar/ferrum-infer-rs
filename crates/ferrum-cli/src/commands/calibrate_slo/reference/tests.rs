@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn wave_plan_cannot_override_reference_discovery_or_warmup_rules() {
+    let mut value = manifest();
+    let plan = manifest::WavePlan {
+        prefill_chunks: Some(vec![NonZeroU32::MIN]),
+        decode_routes: None,
+    };
+    value.reference = Some(config());
+    value.training[0].wave_plan = Some(plan.clone());
+    assert!(value.validate().is_err());
+    value.training[0].wave_plan = None;
+    let mut warmup = value.training[0].clone();
+    warmup.wave_plan = Some(plan);
+    value.reference.as_mut().unwrap().warmup.push(warmup);
+    assert!(value.validate().is_err());
+}
+
+#[test]
 fn piecewise_partition_only_changes_reference_trials_and_preserves_service_output() {
     use super::super::report::Phase;
     let mut value = config();
@@ -139,6 +156,7 @@ fn reference_limits_apply_to_all_phases_and_strict_schema() {
         decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
         token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
         rolling_window: None,
+        wave_plan: None,
     });
     assert!(value
         .validate(&manifest, &inputs::PreparedInputs::Rendered)
@@ -293,6 +311,7 @@ fn optional_reference_manifest_resolves_outputs_and_validates_full_declaration()
             decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
             token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
             rolling_window: None,
+            wave_plan: None,
         });
     assert!(invalid.validate().is_err());
 }

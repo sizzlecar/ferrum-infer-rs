@@ -150,6 +150,10 @@ pub(super) struct Cohort {
     /// and successful completion. None preserves the original cohort barrier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling_window: Option<RollingWindow>,
+    /// Explicit calibration-only cycles, advanced by corresponding successfully
+    /// reconciled waves. Omission keeps the original static case choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_plan: Option<WavePlan>,
     pub repetitions: NonZeroUsize,
     pub prefill_chunk_tokens: NonZeroU32,
     pub execution: Execution,
@@ -161,6 +165,37 @@ pub(super) struct Cohort {
     /// It is not a device/driver cache reset or a full cold-start claim.
     #[serde(default)]
     pub token_policy_residency: TokenPolicyResidencyPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WavePlan {
+    /// Repeats by successful prefill-wave ordinal, never request or attempt count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_chunks: Option<Vec<NonZeroU32>>,
+    /// Repeats independently by successful decode-wave ordinal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_routes: Option<Vec<ferrum_engine::continuous_engine::CalibrationDecodeRoute>>,
+}
+
+impl WavePlan {
+    pub(super) fn validate(&self) -> Result<()> {
+        let bounded = |len| (1..=16).contains(&len);
+        if (self.prefill_chunks.is_none() && self.decode_routes.is_none())
+            || self.prefill_chunks.as_ref().is_some_and(|values| {
+                !bounded(values.len()) || values.iter().any(|value| value.get() > 1_048_576)
+            })
+            || self
+                .decode_routes
+                .as_ref()
+                .is_some_and(|values| !bounded(values.len()))
+        {
+            return Err(FerrumError::config(
+                "wave plan needs one or two nonempty cycles of at most 16 bounded choices",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +349,12 @@ impl Manifest {
         }
         let mut owners = 0usize;
         for case in self.cohorts() {
+            if let Some(plan) = &case.wave_plan {
+                plan.validate()?;
+                if self.reference.is_some() {
+                    return invalid("wave plans require a separate static reference manifest");
+                }
+            }
             if case.prompts.is_empty()
                 || case.prompts.len() > 65_536
                 || case.maximum_in_flight() > p.maximum_requests.get()
@@ -338,6 +379,9 @@ impl Manifest {
             return invalid("calibration exceeds 65536 fresh owners");
         }
         if let Some(reference) = &self.reference {
+            if reference.warmup.iter().any(|case| case.wave_plan.is_some()) {
+                return invalid("reference warmup does not support a wave plan");
+            }
             reference.validate_shape(self, prompt_count)?;
         }
         Ok(())

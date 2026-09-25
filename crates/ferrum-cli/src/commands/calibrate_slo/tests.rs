@@ -75,6 +75,7 @@ pub(super) fn manifest() -> manifest::Manifest {
         decode_route: ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual,
         token_policy_residency: manifest::TokenPolicyResidencyPolicy::Preserve,
         rolling_window: None,
+        wave_plan: None,
     };
     manifest::Manifest {
         schema_version: 1,
@@ -383,3 +384,57 @@ fn collection_and_shutdown_failures_remain_independently_visible() {
 
 #[path = "rolling_window_tests.rs"]
 mod rolling_window_tests;
+
+#[test]
+fn wave_plan_wire_binds_cycles_preserves_legacy_and_rejects_unbounded_choices() {
+    let legacy = manifest();
+    let old = serde_json::to_value(&legacy).unwrap();
+    assert!(old["training"][0].get("wave_plan").is_none());
+    let roundtrip: manifest::Manifest = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(serde_json::to_value(roundtrip).unwrap(), old);
+    let plan = serde_json::json!({"prefill_chunks":[16,32,64,128], "decode_routes":["actual","full_logits"]});
+    let mut wire = old.clone();
+    wire["training"][0]["wave_plan"] = plan.clone();
+    let scheduled: manifest::Manifest = serde_json::from_value(wire.clone()).unwrap();
+    scheduled.validate().unwrap();
+    assert_eq!(scheduled.training[0].prompts, legacy.training[0].prompts);
+    assert_eq!(
+        serde_json::to_value(&scheduled.prompts).unwrap(),
+        serde_json::to_value(&legacy.prompts).unwrap()
+    );
+    assert_ne!(
+        Sha256::digest(serde_json::to_vec(&scheduled).unwrap()),
+        Sha256::digest(serde_json::to_vec(&legacy).unwrap())
+    );
+    let mut reordered = wire.clone();
+    reordered["training"][0]["wave_plan"]["decode_routes"] =
+        serde_json::json!(["full_logits", "actual"]);
+    let reordered: manifest::Manifest = serde_json::from_value(reordered).unwrap();
+    assert_ne!(
+        Sha256::digest(serde_json::to_vec(&scheduled).unwrap()),
+        Sha256::digest(serde_json::to_vec(&reordered).unwrap())
+    );
+    for invalid in [
+        serde_json::json!({}),
+        serde_json::json!({"prefill_chunks":[]}),
+        serde_json::json!({"decode_routes":[]}),
+        serde_json::json!({"prefill_chunks":[1048577]}),
+        serde_json::json!({"prefill_chunks":vec![16;17]}),
+    ] {
+        let mut value = wire.clone();
+        value["training"][0]["wave_plan"] = invalid;
+        assert!(serde_json::from_value::<manifest::Manifest>(value)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+    for invalid in [
+        serde_json::json!({"prefill_chunks":[0]}),
+        serde_json::json!({"decode_routes":["guess_known"]}),
+        serde_json::json!({"prefill_chunks":[16],"adapt_to_timing":true}),
+    ] {
+        let mut value = wire.clone();
+        value["training"][0]["wave_plan"] = invalid;
+        assert!(serde_json::from_value::<manifest::Manifest>(value).is_err());
+    }
+}
