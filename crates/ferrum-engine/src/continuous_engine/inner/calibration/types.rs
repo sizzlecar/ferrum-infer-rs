@@ -205,16 +205,35 @@ pub enum CalibrationTurn {
 pub(in crate::continuous_engine::inner) struct CalibrationWaveReceipt {
     ordered_work: ExpectedWaveWork,
     state: std::sync::atomic::AtomicU8,
-    pub(in crate::continuous_engine::inner) capture:
-        Arc<super::super::cost_observation::CostCalibrationCapture>,
+    capture: std::sync::OnceLock<Arc<super::super::cost_observation::CostCalibrationCapture>>,
 }
 impl CalibrationWaveReceipt {
     pub(in crate::continuous_engine::inner) fn new(ordered_work: ExpectedWaveWork) -> Self {
         Self {
             ordered_work,
             state: std::sync::atomic::AtomicU8::new(0),
-            capture: Arc::new(Default::default()),
+            capture: std::sync::OnceLock::new(),
         }
+    }
+    pub(in crate::continuous_engine::inner) fn capture(
+        &self,
+    ) -> &Arc<super::super::cost_observation::CostCalibrationCapture> {
+        self.capture.get_or_init(|| Arc::new(Default::default()))
+    }
+    pub(in crate::continuous_engine::inner) fn bind_structured_capture(
+        &self,
+        capture: Arc<super::super::cost_observation::CostCalibrationCapture>,
+    ) -> Result<()> {
+        if self.state() != CalibrationSubmissionState::NotSubmitted {
+            return Err(FerrumError::invalid_request(
+                "structured capture must bind before execution",
+            ));
+        }
+        self.capture.set(capture).map_err(|_| {
+            FerrumError::invalid_request(
+                "calibration capture was already fixed before structured binding",
+            )
+        })
     }
     pub(in crate::continuous_engine::inner) fn record(&self, state: CalibrationSubmissionState) {
         self.state.store(state as u8, Ordering::Release);
@@ -234,9 +253,9 @@ impl CalibrationWaveReceipt {
             ordered_work: self.ordered_work.clone(),
             submission: self.state(),
             error,
-            observation: super::observation::project_capture(&self.capture),
-            host_stages: self.capture.host_stages(),
-            host_stage_queue: self.capture.host_stage_queue(),
+            observation: super::observation::project_capture(self.capture()),
+            host_stages: self.capture().host_stages(),
+            host_stage_queue: self.capture().host_stage_queue(),
         }
     }
 }

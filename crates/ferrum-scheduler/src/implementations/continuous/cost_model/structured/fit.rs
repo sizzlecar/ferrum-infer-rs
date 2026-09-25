@@ -14,6 +14,20 @@ pub(super) struct RowSpaceFit {
     coefficients: Vec<f64>,
 }
 impl RowSpaceFit {
+    pub(super) fn bind_parameters(&self, digest: &mut sha2::Sha256) {
+        use sha2::Digest;
+        digest.update(b"row-space-parameters-v1\0");
+        digest.update((self.basis.len() as u64).to_le_bytes());
+        for values in std::iter::once(&self.scale)
+            .chain(self.basis.iter())
+            .chain(std::iter::once(&self.coefficients))
+        {
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+        }
+    }
     pub(super) fn rank(&self) -> usize {
         self.basis.len()
     }

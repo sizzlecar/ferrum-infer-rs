@@ -119,7 +119,7 @@ impl EngineInner {
             );
         }
         if let (Some(call), Some(receipt)) = (cost.as_deref_mut(), &flight.calibration) {
-            call.attach_calibration_capture(Arc::clone(&receipt.capture));
+            call.attach_calibration_capture(Arc::clone(receipt.capture()));
         }
         let started_at = self.close_plan_runtime_decode_scheduling(&decode_ids);
         drop(preparation_timing);

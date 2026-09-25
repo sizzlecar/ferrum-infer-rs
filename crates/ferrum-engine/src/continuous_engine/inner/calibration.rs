@@ -9,6 +9,11 @@ use ferrum_interfaces::InferenceRequestContext;
 mod artifact;
 mod selected;
 pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
+mod structured;
+pub use structured::{
+    StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
+    StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
+};
 mod checkpoint;
 mod evidence;
 mod observation;
@@ -38,6 +43,7 @@ pub use types::{
 pub struct CalibrationSession {
     selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
     selected_capture_identity: Option<[u8; 32]>,
+    structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
     engine: ContinuousBatchEngine,
     identity: Arc<()>,
     limits: CalibrationLimits,
@@ -77,6 +83,7 @@ impl CalibrationSession {
         Ok(Self {
             selected_capture: None,
             selected_capture_identity: None,
+            structured_capture: None,
             engine,
             identity: Arc::new(()),
             limits,
@@ -210,6 +217,7 @@ impl CalibrationSession {
             let mut report = receipt.report(result.err());
             self.indeterminate |= report.submission == CalibrationSubmissionState::InFlightUnknown;
             self.record_selected_capture(&receipt, &mut report)?;
+            self.record_structured_capture(&receipt, &report);
             return Ok(CalibrationTurn::Reaped(report));
         }
         if self.indeterminate {
@@ -263,18 +271,48 @@ impl CalibrationSession {
                         "calibration wave has invalid width or another session's frontier",
                     ));
                 }
-                let prepared =
-                    match inner.prepare_calibration_wave(&rows, self.limits.maximum_requests())? {
+                if let Some(collector) = &mut self.structured_capture {
+                    if let Err(error) = collector.offer(&rows) {
+                        collector.invalidate(error.to_string());
+                    }
+                }
+                let preparation =
+                    inner.prepare_calibration_wave(&rows, self.limits.maximum_requests());
+                let prepared = match preparation {
+                    Err(error) => {
+                        self.record_structured_unsubmitted(&format!("preparation error: {error}"));
+                        return Err(error);
+                    }
+                    Ok(preparation) => match preparation {
                         slo_controller::calibration::CalibrationPreparation::Blocked(reason) => {
-                            return Ok(CalibrationTurn::Blocked(reason))
+                            self.record_structured_unsubmitted(&format!("{reason:?}"));
+                            return Ok(CalibrationTurn::Blocked(reason));
                         }
                         slo_controller::calibration::CalibrationPreparation::Selected(prepared) => {
                             prepared
                         }
-                    };
+                    },
+                };
                 let receipt = prepared.calibration_receipt().ok_or_else(|| {
                     FerrumError::internal("manual calibration wave lost its submission receipt")
                 })?;
+                if let Some(collector) = &mut self.structured_capture {
+                    if collector.collecting() {
+                        if let Err(error) = collector.reserve_prepared() {
+                            collector.invalidate(error.to_string());
+                        }
+                    }
+                    if collector.collecting() {
+                        match collector.pending_capture() {
+                            Ok(capture) => {
+                                if let Err(error) = receipt.bind_structured_capture(capture) {
+                                    collector.invalidate(error.to_string());
+                                }
+                            }
+                            Err(error) => collector.invalidate(error.to_string()),
+                        }
+                    }
+                }
                 self.pending = Some(Arc::clone(&receipt));
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;
@@ -283,6 +321,7 @@ impl CalibrationSession {
                 self.indeterminate |=
                     report.submission == CalibrationSubmissionState::InFlightUnknown;
                 self.record_selected_capture(&receipt, &mut report)?;
+                self.record_structured_capture(&receipt, &report);
                 Ok(CalibrationTurn::Wave(report))
             }
         }

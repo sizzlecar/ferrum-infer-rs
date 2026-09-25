@@ -5,6 +5,17 @@ pub(super) struct JointSupport {
     points: Vec<Vec<u64>>,
 }
 impl JointSupport {
+    pub(super) fn bind_parameters(&self, digest: &mut sha2::Sha256) {
+        use sha2::Digest;
+        digest.update(b"joint-support-v1\0");
+        digest.update((self.points.len() as u64).to_le_bytes());
+        for values in std::iter::once(&self.minimum).chain(self.points.iter()) {
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                digest.update(value.to_le_bytes());
+            }
+        }
+    }
     pub(super) fn new<'a>(points: impl Iterator<Item = &'a [u64]>) -> Result<Self> {
         let points: Vec<Vec<u64>> = points.map(<[u64]>::to_vec).collect();
         let Some(first) = points.first() else {

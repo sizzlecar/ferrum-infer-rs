@@ -1244,7 +1244,9 @@ pub use inner::calibration::{
     CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
     CalibrationRequestEvidence, CalibrationSession, CalibrationSubmissionState, CalibrationTurn,
     CalibrationWaveReport, CalibrationWork, FrozenCalibrationModel, ImportedCalibrationModel,
-    SelectedCalibrationOptions, SelectedFitFreezeReceipt,
+    SelectedCalibrationOptions, SelectedFitFreezeReceipt, StructuredCalibrationArtifact,
+    StructuredCalibrationOptions, StructuredCalibrationProgress, StructuredCalibrationScopeV1,
+    StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
 pub use inner::cost_observation::{
     HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,

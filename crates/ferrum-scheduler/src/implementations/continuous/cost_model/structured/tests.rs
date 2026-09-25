@@ -23,6 +23,7 @@ fn partition() -> StructuredPartitionV1 {
     StructuredPartitionV1 {
         source: [7; 32],
         protocol: [8; 32],
+        population: StructuredPopulationV1::DenseFifo,
         fit_through: 16,
         residual_through: 32,
         qualification_through: 41,
@@ -84,6 +85,7 @@ fn observation(
         source: [7; 32],
         protocol: [8; 32],
         ordinal,
+        membership: None,
         call_id: ordinal,
         fingerprint: fingerprint(),
         input: input(work, terminal),
@@ -491,5 +493,83 @@ fn redundancy_settings_cannot_overflow_or_exceed_the_possible_population() {
     assert!(matches!(
         FittedStructuredModelV1::fit(fingerprint(), boundary, partition(), &fit_samples(), 16),
         Err(StructuredUnknown::InsufficientRedundancy)
+    ));
+}
+
+fn reserved_partition() -> StructuredPartitionV1 {
+    StructuredPartitionV1 {
+        population: StructuredPopulationV1::ReservedMembers {
+            rule_signature: [12; 32],
+        },
+        ..partition()
+    }
+}
+fn reserve_samples(
+    mut samples: Vec<StructuredNumericObservationV1>,
+) -> Vec<StructuredNumericObservationV1> {
+    for sample in &mut samples {
+        let member = sample.ordinal;
+        sample.membership =
+            Some(StructuredMemberBindingV1::new([12; 32], member * 2, member).unwrap());
+        sample.ordinal = 100 + member * 3; // Original FIFO; explicit outside members occupy gaps.
+    }
+    samples
+}
+#[test]
+fn structured_reserved_members_keep_original_fifo_across_all_three_phases() {
+    let fit = reserve_samples(fit_samples());
+    let residual = reserve_samples(residual_samples());
+    let qualification = reserve_samples(qualification_samples());
+    let fitted =
+        FittedStructuredModelV1::fit(fingerprint(), settings(), reserved_partition(), &fit, 16)
+            .unwrap();
+    assert_eq!(fit[0].ordinal, 103);
+    assert_eq!(fit[15].ordinal, 148);
+    let fit_signature = fitted.parameters_signature();
+    let calibrated = fitted.calibrate(&residual, 32).unwrap();
+    assert_ne!(fit_signature, calibrated.parameters_signature());
+    let qualified = calibrated.qualify(&qualification, 41).unwrap();
+    let signature = qualified.parameters_signature();
+    for position in 0..8 {
+        qualified
+            .predict(&fingerprint(), &input(96, Some(position)), 41)
+            .unwrap();
+    }
+    assert_eq!(signature, qualified.parameters_signature());
+}
+#[test]
+fn structured_reserved_missing_slow_member_is_not_a_complete_population() {
+    let mut fit = reserve_samples(fit_samples());
+    fit[4].wall_ns += 5000;
+    fit.remove(4);
+    assert!(matches!(
+        FittedStructuredModelV1::fit(fingerprint(), settings(), reserved_partition(), &fit, 16),
+        Err(StructuredUnknown::IncompletePhasePopulation)
+    ));
+}
+#[test]
+fn structured_reserved_rule_offer_and_fifo_bindings_cannot_be_swapped() {
+    let mut fit = reserve_samples(fit_samples());
+    fit[3].membership = Some(StructuredMemberBindingV1::new([13; 32], 8, 4).unwrap());
+    assert!(matches!(
+        FittedStructuredModelV1::fit(fingerprint(), settings(), reserved_partition(), &fit, 16),
+        Err(StructuredUnknown::WrongProtocol)
+    ));
+    let mut fit = reserve_samples(fit_samples());
+    fit[3].membership = Some(StructuredMemberBindingV1::new([12; 32], 6, 4).unwrap());
+    assert!(matches!(
+        FittedStructuredModelV1::fit(fingerprint(), settings(), reserved_partition(), &fit, 16),
+        Err(StructuredUnknown::DuplicateRecord)
+    ));
+    let mut fit = reserve_samples(fit_samples());
+    fit[3].ordinal = fit[2].ordinal;
+    assert!(matches!(
+        FittedStructuredModelV1::fit(fingerprint(), settings(), reserved_partition(), &fit, 16),
+        Err(StructuredUnknown::DuplicateRecord)
+    ));
+    let fit = reserve_samples(fit_samples());
+    assert!(matches!(
+        FittedStructuredModelV1::fit(fingerprint(), settings(), partition(), &fit, 16),
+        Err(StructuredUnknown::WrongProtocol)
     ));
 }

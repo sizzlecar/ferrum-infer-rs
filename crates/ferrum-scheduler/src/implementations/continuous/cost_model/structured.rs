@@ -12,9 +12,11 @@ use std::collections::BTreeSet;
 
 mod fit;
 mod input;
+mod population;
 mod support;
 use fit::RowSpaceFit;
 pub use input::{StructuredInputV1, StructuredScopeV1};
+pub use population::{StructuredMemberBindingV1, StructuredPopulationV1, POPULATION_REVISION};
 use support::JointSupport;
 #[cfg(test)]
 mod projection_tests;
@@ -79,7 +81,7 @@ impl Default for StructuredSettingsV1 {
     }
 }
 impl StructuredSettingsV1 {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.min_phase_samples < 8
             || self.min_fit_redundancy < 4
             || self.min_fit_redundancy >= self.max_phase_samples
@@ -101,17 +103,20 @@ impl StructuredSettingsV1 {
 }
 
 #[derive(Debug, Clone, Copy)]
-/// Dense accepted ordinals of one predeclared scope and one capture protocol.
-/// Multi-domain filtered/re-numbered populations are not this protocol.
+/// An explicit population coordinate for one predeclared scope and protocol.
+/// Reserved members retain independent original FIFO positions. Their live
+/// provenance requires the engine's pre-execution ledger, not numerical labels.
 pub struct StructuredPartitionV1 {
     pub source: [u8; 32],
     pub protocol: [u8; 32],
+    pub population: StructuredPopulationV1,
     pub fit_through: u64,
     pub residual_through: u64,
     pub qualification_through: u64,
 }
 impl StructuredPartitionV1 {
     fn validate(&self) -> Result<()> {
+        self.population.validate()?;
         if self.source == [0; 32]
             || self.protocol == [0; 32]
             || self.fit_through == 0
@@ -131,6 +136,9 @@ pub struct StructuredNumericObservationV1 {
     pub source: [u8; 32],
     pub protocol: [u8; 32],
     pub ordinal: u64,
+    /// A pre-execution reservation, separate from the original FIFO ordinal.
+    /// Numerical fields alone do not prove the engine's reservation ledger.
+    pub membership: Option<StructuredMemberBindingV1>,
     pub call_id: u64,
     pub fingerprint: ExecutionFingerprint,
     pub input: StructuredInputV1,
@@ -143,6 +151,10 @@ pub struct StructuredNumericObservationV1 {
 struct PhaseState {
     calls: BTreeSet<u64>,
     ordinals: BTreeSet<u64>,
+    offers: BTreeSet<u64>,
+    latest_fifo_ordinal: u64,
+    latest_member_ordinal: u64,
+    latest_offered_ordinal: u64,
     latest_observed_at_ns: u64,
     expires_at_ns: u64,
 }
@@ -151,6 +163,10 @@ impl PhaseState {
         Self {
             calls: BTreeSet::new(),
             ordinals: BTreeSet::new(),
+            offers: BTreeSet::new(),
+            latest_fifo_ordinal: 0,
+            latest_member_ordinal: 0,
+            latest_offered_ordinal: 0,
             latest_observed_at_ns: 0,
             expires_at_ns: u64::MAX,
         }
@@ -174,7 +190,7 @@ impl PhaseState {
         if &sample.fingerprint != fingerprint {
             return Err(StructuredUnknown::WrongFingerprint);
         }
-        if !range.contains(&sample.ordinal) {
+        if !range.contains(&sample.population_ordinal(partition.population)?) {
             return Err(StructuredUnknown::PhaseLeakage);
         }
         if sample.call_id == 0
@@ -185,7 +201,18 @@ impl PhaseState {
         {
             return Err(StructuredUnknown::InvalidSample);
         }
-        if !self.calls.insert(sample.call_id) || !self.ordinals.insert(sample.ordinal) {
+        let population_ordinal = sample.population_ordinal(partition.population)?;
+        if population_ordinal <= self.latest_member_ordinal
+            || sample
+                .membership
+                .is_some_and(|m| m.offered_ordinal() <= self.latest_offered_ordinal)
+            || sample.ordinal <= self.latest_fifo_ordinal
+            || !self.calls.insert(sample.call_id)
+            || !self.ordinals.insert(sample.ordinal)
+            || sample
+                .membership
+                .is_some_and(|m| !self.offers.insert(m.offered_ordinal()))
+        {
             return Err(StructuredUnknown::DuplicateRecord);
         }
         let age = now
@@ -204,6 +231,11 @@ impl PhaseState {
             .checked_add(settings.max_sample_age_ns)
             .ok_or(StructuredUnknown::Clock)?;
         self.latest_observed_at_ns = sample.observed_at_ns;
+        self.latest_fifo_ordinal = sample.ordinal;
+        self.latest_member_ordinal = population_ordinal;
+        if let Some(member) = sample.membership {
+            self.latest_offered_ordinal = member.offered_ordinal();
+        }
         self.expires_at_ns = self.expires_at_ns.min(expires);
         Ok(())
     }
@@ -221,6 +253,52 @@ pub struct FittedStructuredModelV1 {
     frozen_at_ns: u64,
 }
 impl FittedStructuredModelV1 {
+    /// Frozen numerical state identity for source-prefix receipts, not a loader.
+    pub fn parameters_signature(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"ferrum.structured-fit-state.v1\0");
+        digest.update(MODEL_REVISION.as_bytes());
+        for value in [
+            self.fingerprint.model_weights,
+            self.fingerprint.numerical_policy,
+            self.fingerprint.device_runtime,
+            self.fingerprint.execution_config,
+            self.partition.source,
+            self.partition.protocol,
+            self.exemplar.domain,
+        ] {
+            digest.update(value);
+        }
+        match self.partition.population {
+            StructuredPopulationV1::DenseFifo => digest.update([0]),
+            StructuredPopulationV1::ReservedMembers { rule_signature } => {
+                digest.update([1]);
+                digest.update(rule_signature);
+            }
+        }
+        for value in [
+            self.settings.min_phase_samples as u64,
+            self.settings.min_fit_redundancy as u64,
+            self.settings.max_phase_samples as u64,
+            self.settings.max_axes as u64,
+            self.settings.max_rank as u64,
+            self.settings.max_wave_ns,
+            self.settings.max_sample_age_ns,
+            self.settings.static_margin_ns,
+            self.partition.fit_through,
+            self.partition.residual_through,
+            self.partition.qualification_through,
+            self.fit_samples as u64,
+            self.frozen_at_ns,
+            self.state.expires_at_ns,
+        ] {
+            digest.update(value.to_le_bytes());
+        }
+        self.fit.bind_parameters(&mut digest);
+        self.fit_support.bind_parameters(&mut digest);
+        digest.finalize().into()
+    }
     /// `now` is the original live fit-freeze time in the observation clock.
     /// Offline replay must retain that time, not substitute its read time.
     pub fn fit(
@@ -233,7 +311,7 @@ impl FittedStructuredModelV1 {
         settings.validate()?;
         partition.validate()?;
         phase_count(samples, &settings)?;
-        complete_phase_population(samples, 1..=partition.fit_through)?;
+        complete_phase_population(samples, 1..=partition.fit_through, partition.population)?;
         let exemplar = samples[0].input.clone();
         exemplar.validate(&settings)?;
         let mut state = PhaseState::new();
@@ -275,6 +353,7 @@ impl FittedStructuredModelV1 {
         complete_phase_population(
             samples,
             self.partition.fit_through + 1..=self.partition.residual_through,
+            self.partition.population,
         )?;
         check_time(now, self.frozen_at_ns, self.state.expires_at_ns)?;
         let mut residuals = Vec::with_capacity(samples.len());
@@ -319,6 +398,16 @@ pub struct CalibratedStructuredModelV1 {
     residual_samples: usize,
 }
 impl CalibratedStructuredModelV1 {
+    pub fn parameters_signature(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"ferrum.structured-calibrated-state.v1\0");
+        digest.update(self.fitted.parameters_signature());
+        digest.update(self.residual_ns.to_le_bytes());
+        digest.update((self.residual_samples as u64).to_le_bytes());
+        self.residual_support.bind_parameters(&mut digest);
+        digest.finalize().into()
+    }
     fn predict_core(&self, input: &StructuredInputV1, now: u64) -> Result<StructuredPredictionV1> {
         let f = &self.fitted;
         check_time(now, f.frozen_at_ns, f.state.expires_at_ns)?;
@@ -359,6 +448,7 @@ impl CalibratedStructuredModelV1 {
             samples,
             self.fitted.partition.residual_through + 1
                 ..=self.fitted.partition.qualification_through,
+            self.fitted.partition.population,
         )?;
         let rows = self.fitted.exemplar.scope.rows();
         let mut covered = vec![false; rows + 1]; // 0: no boundary; p+1: physical p.
@@ -397,6 +487,14 @@ pub struct QualifiedStructuredModelV1 {
     pub qualification_samples: usize,
 }
 impl QualifiedStructuredModelV1 {
+    pub fn parameters_signature(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"ferrum.structured-qualified-state.v1\0");
+        digest.update(self.calibrated.parameters_signature());
+        digest.update((self.qualification_samples as u64).to_le_bytes());
+        digest.finalize().into()
+    }
     pub fn predict(
         &self,
         fingerprint: &ExecutionFingerprint,
@@ -432,22 +530,27 @@ fn phase_count(
     Ok(())
 }
 
-/// This first single-domain protocol declares dense global accepted ranges.
-/// A later multi-domain protocol needs an immutable population manifest; it
-/// must not filter failed/slow rows and then renumber the survivors.
+/// Each declared phase is dense in its explicit population coordinate. A
+/// reserved-member coordinate must be assigned before execution; changing a
+/// failed member into an exclusion is never a permitted population repair.
 fn complete_phase_population(
     samples: &[StructuredNumericObservationV1],
     range: std::ops::RangeInclusive<u64>,
+    population: StructuredPopulationV1,
 ) -> Result<()> {
     let expected = range
         .end()
         .checked_sub(*range.start())
         .and_then(|n| n.checked_add(1))
         .ok_or(StructuredUnknown::PhaseLeakage)?;
-    if samples.iter().any(|s| !range.contains(&s.ordinal)) {
+    let values: Vec<_> = samples
+        .iter()
+        .map(|s| s.population_ordinal(population))
+        .collect::<Result<_>>()?;
+    if values.iter().any(|ordinal| !range.contains(ordinal)) {
         return Err(StructuredUnknown::PhaseLeakage);
     }
-    let ordinals: BTreeSet<_> = samples.iter().map(|s| s.ordinal).collect();
+    let ordinals: BTreeSet<_> = values.into_iter().collect();
     if ordinals.len() != samples.len() {
         return Err(StructuredUnknown::DuplicateRecord);
     }

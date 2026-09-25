@@ -67,6 +67,7 @@ fn whole_wave_numeric_observation(
         source: session.identity(),
         protocol: session.protocol(),
         ordinal: accepted_ordinal,
+        membership: None,
         call_id: actual.call_id,
         fingerprint: actual.fingerprint,
         input,

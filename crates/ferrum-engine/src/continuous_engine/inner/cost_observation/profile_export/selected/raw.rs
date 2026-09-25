@@ -4,7 +4,7 @@
 use super::*;
 use std::fs::{File, OpenOptions};
 
-pub(super) struct RawSource {
+pub(in crate::continuous_engine::inner::cost_observation::profile_export) struct RawSource {
     file: File,
     path: PathBuf,
     bytes: u64,
@@ -33,6 +33,9 @@ impl RawSource {
     }
     pub fn prefix_digest(&self) -> [u8; 32] {
         self.hash.clone().finalize().into()
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
     pub fn finish(mut self) -> Result<PublishedFile, ExportError> {
         self.flush()?;

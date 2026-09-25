@@ -126,17 +126,49 @@ maxima from different samples cannot manufacture a supported combination.
 
 Fit, residual calibration, and qualification consume complete declared
 populations with source/protocol identities, unique call IDs, original clock
-boundaries, and a fixed TTL. The initial dense-ordinal interface cannot represent
-a filtered multi-domain FIFO; that needs an explicit population adapter. Residual
+boundaries, and a fixed TTL. Numerical callers explicitly choose dense FIFO
+ordinals or pre-execution reserved members; these coordinates cannot be mixed.
+Neither numerical input format proves live provenance on its own. Residual
 calibration uses an empirical whole-wave q99 plus a declared margin. Qualification
 requires coverage of every declared physical termination position and the
 nonterminal case, with no unknown or underestimated heldout point. This finite
 challenge does not establish a distribution-free p99 guarantee.
 
 The core does not deserialize qualified receipts, import a profile, install a
-production predictor, or authorize execution. The live collector, independent
-full-model calibration, drift handling, and serving measurements remain separate
-completion requirements.
+production predictor, or authorize execution. Independent full-model calibration,
+drift handling, and serving measurements remain separate completion requirements.
+
+## Live calibration collection
+
+`CalibrationSession::begin_structured_cost_calibration` opens an explicit
+diagnostic collector after independent scope discovery and resource warmup.
+`HostSettledV1` must be configured before engine creation. The caller declares
+one ordinary-decode row count and domain, fit/residual/qualification population
+sizes, numerical settings, and source/memory limits before collecting samples.
+Beginning collection drains the observation FIFO without resetting live request
+owners or their clocks.
+
+Each offered wave is recorded before preparation. Successful preparation reserves
+an eligible member and binds its capture before execution. A preparation that
+cannot produce a wave consumes an offered attempt without consuming a member.
+After reservation, failed execution, missing evidence, a domain mismatch, or an
+unexpected termination retains the failed member slot. It cannot be removed or
+replaced with a later successful sample. Source-record positions, offered
+attempts, member positions, and the original accepted FIFO ordinals remain
+separate. Reaping a cancelled waiter settles the original reservation.
+
+The caller uses `structured_cost_progress` and
+`freeze_structured_cost_phase` to close each complete declared population before
+collecting the next phase. A freeze receipt binds the original clock, FIFO and
+member cutoffs, source-prefix digest, protocol, and numerical parameters. Missing
+members or unaudited FIFO records fail the calibration. Source write or capacity
+errors also revoke eligibility while ordinary request execution can continue.
+
+`finish_structured_cost_calibration` returns a diagnostic artifact with a source
+digest and an optional in-memory qualified model. Incomplete qualification has a
+failed footer and no model; an incomplete file cannot receive a successful source
+receipt. This API does not install a serving predictor or load a model from JSON.
+Real backend calibration and heldout measurements are still required.
 
 ## Feedback and acceptance
 

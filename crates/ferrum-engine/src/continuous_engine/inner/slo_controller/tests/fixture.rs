@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 mod deferral;
 mod snapshot_epoch;
+mod structured;
 
 #[path = "../../../../../../ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs"]
 mod contract;
@@ -95,6 +96,7 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     /// Optional controlled-backend observation of the inputs actually executed.
     /// This is protocol evidence in tests, not a Metal timing/route claim.
     pub emit_cost_observations: AtomicBool,
+    pub emit_structured_cost_observations: AtomicBool,
     pub completion_work_known: AtomicBool,
     pub completion_fail: AtomicBool,
     pub completion_calls: AtomicUsize,
@@ -457,6 +459,13 @@ impl ControlledExecutor {
         let Some(context) = context else {
             return;
         };
+        if self
+            .emit_structured_cost_observations
+            .load(Ordering::Acquire)
+        {
+            structured::record(context, prefills, decodes);
+            return;
+        }
         if self.narrow_last_mixed_prefill.load(Ordering::Acquire) {
             context.mark_unknown(ActualWaveEvidenceUnknown::ProviderPath);
             return;
@@ -861,6 +870,7 @@ pub(in crate::continuous_engine) async fn startup_components(
         narrow_last_mixed_prefill: AtomicBool::new(false),
         replan_before_encode: AtomicBool::new(false),
         emit_cost_observations: AtomicBool::new(false),
+        emit_structured_cost_observations: AtomicBool::new(false),
         completion_work_known: AtomicBool::new(false),
         completion_fail: AtomicBool::new(false),
         completion_calls: AtomicUsize::new(0),
@@ -890,7 +900,7 @@ pub(in crate::continuous_engine::inner) async fn fixture_with_width(
     fixture_with_custom_config(width, |_| {}).await
 }
 
-async fn fixture_with_custom_config(
+pub(in crate::continuous_engine::inner) async fn fixture_with_custom_config(
     width: usize,
     configure: impl FnOnce(&mut ferrum_types::EngineConfig),
 ) -> (

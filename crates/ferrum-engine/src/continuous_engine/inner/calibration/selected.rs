@@ -32,7 +32,7 @@ impl CalibrationSession {
         options: SelectedCalibrationOptions,
     ) -> Result<()> {
         self.selected_phase_boundary()?;
-        if self.selected_capture_identity.is_some() {
+        if self.selected_capture_identity.is_some() || self.structured_capture.is_some() {
             return Err(FerrumError::invalid_request(
                 "selected calibration already started",
             ));
@@ -92,7 +92,7 @@ impl CalibrationSession {
             report.selected = Some(SelectedCalibrationEvidence {
                 session: Arc::clone(&self.identity),
                 observation: SelectedCalibrationCapture::observation(
-                    &receipt.capture,
+                    receipt.capture(),
                     reconciled,
                     identity,
                 ),
@@ -101,7 +101,7 @@ impl CalibrationSession {
         if let Some(capture) = &mut self.selected_capture {
             capture
                 .record(
-                    &receipt.capture,
+                    receipt.capture(),
                     report.submission == CalibrationSubmissionState::HostReconciled
                         && report.error.is_none(),
                 )

@@ -29,6 +29,11 @@ mod profile;
 mod profile_export;
 pub(in crate::continuous_engine::inner) use profile_export::selected::SelectedCalibrationCapture;
 pub use profile_export::selected::SelectedFitFreezeReceipt;
+pub(in crate::continuous_engine::inner) use profile_export::structured::StructuredCalibrationCollector;
+pub use profile_export::structured::{
+    StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
+    StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
+};
 pub(in crate::continuous_engine) use profile_export::{CostProfileCutPaths, CostProfileCutReceipt};
 mod publication;
 mod query_metrics;

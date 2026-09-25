@@ -24,6 +24,7 @@ mod host_content;
 mod retention;
 pub(in crate::continuous_engine::inner) mod selected;
 mod session;
+pub(in crate::continuous_engine::inner) mod structured;
 pub(in crate::continuous_engine) use cut::{CostProfileCutPaths, CostProfileCutReceipt};
 use files::{ProducerIdentity, PublishedFile, StagedFile};
 pub(super) use session::ExportSession;

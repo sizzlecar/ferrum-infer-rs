@@ -9,7 +9,7 @@ use model::statistical::SelectedStatisticalFamily;
 use profile::statistical_v6::{CostProfileFileV6, WholeWaveProfileShapeV6};
 use profile::statistical_v7::CostProfileFileV7;
 use profile::statistical_v8::CostProfileFileV8;
-mod raw;
+pub(super) mod raw;
 use raw::RawSource;
 
 #[derive(Debug, Clone, Serialize)]
