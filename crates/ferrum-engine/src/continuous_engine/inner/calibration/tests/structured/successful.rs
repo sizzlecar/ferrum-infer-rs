@@ -302,5 +302,110 @@ async fn structured_collector_real_driver_completes_three_frozen_populations_and
         executor.completion_calls.load(Ordering::Acquire),
         OWNER_SLOTS
     );
+    // Export must replay this actual producer/session source, including its
+    // original settlement hash and phase clocks. No synthetic observation is
+    // substituted for the independently discovered query above.
+    use ferrum_scheduler::implementations::continuous::{
+        cost_model::CostBoundary,
+        cost_profile::{
+            structured_v9::{export_structured_profile_v9, load_structured_profile_v9},
+            CostProfileLoadLimits, ProfileLoadClock,
+        },
+        slo_planner::{PlanningCostEvidenceRequirement, PlanningCostModel},
+    };
+    let profile_path = SourcePath::new();
+    let import_limits = CostProfileLoadLimits::default();
+    let exported = export_structured_profile_v9(
+        &artifact.source_path,
+        artifact.source_sha256,
+        &profile_path.0,
+        0,
+        &import_limits,
+    )
+    .unwrap();
+    assert_eq!(exported.source_sha256, artifact.source_sha256);
+    assert_eq!(
+        exported.parameters_sha256,
+        artifact.model.as_ref().unwrap().parameters_signature()
+    );
+    let fingerprint = warmup[1]
+        .host_stages
+        .as_ref()
+        .unwrap()
+        .fingerprint
+        .as_ref()
+        .unwrap();
+    let closing_wall = records.last().unwrap()["record"]["closing"]["wall_unix_ns"]
+        .as_u64()
+        .unwrap();
+    let imported = load_structured_profile_v9(
+        &profile_path.0,
+        fingerprint,
+        &import_limits,
+        ProfileLoadClock {
+            wall_unix_ns: Some(closing_wall),
+            wall_max_error_ns: Some(0),
+            monotonic_now_ns: 0,
+        },
+    )
+    .unwrap();
+    let predicted = imported
+        .predict_input(fingerprint, &independent, 0)
+        .unwrap();
+    assert!(predicted
+        .valid_until_ns
+        .checked_sub(imported.model_now_ns(0).unwrap())
+        .is_some());
+    assert_eq!(
+        imported.provenance().reserved_members,
+        artifact.scope_members
+    );
+    assert_eq!(
+        imported.provenance().offered_attempts,
+        artifact.offered_waves
+    );
+    for (original, replayed) in receipts.iter().zip(&imported.provenance().phases) {
+        assert_eq!(original.frozen_at_ns, replayed.frozen_at_ns);
+        assert_eq!(original.parameters_sha256, replayed.parameters_sha256);
+        assert_eq!(original.accepted_fifo_cutoff, replayed.accepted_fifo_cutoff);
+    }
+    // Also exercise the ordinary engine startup importer with its real paired
+    // load clock. Original virtual observation clocks are never reset/refit.
+    let identity = session
+        .engine
+        .inner
+        .cost_runtime
+        .as_ref()
+        .unwrap()
+        .identity
+        .clone();
+    let mut imported_config = ferrum_types::SloCostObservationConfig::structured_whole_wave_v1();
+    imported_config
+        .profile_import
+        .declared_local_clock_max_error_ns = Some(0);
+    let runtime =
+        EngineCostRuntime::new(identity, &imported_config, Some(&profile_path.0)).unwrap();
+    let receipt = runtime.profile_receipt().unwrap();
+    assert_eq!(receipt.schema_version, 9);
+    assert!(receipt.selected_whole_wave.is_none());
+    assert_eq!(
+        receipt
+            .structured_whole_wave
+            .as_ref()
+            .unwrap()
+            .parameters_sha256,
+        exported.parameters_sha256
+    );
+    let snapshot = runtime.snapshot().unwrap();
+    assert_eq!(
+        snapshot.evidence_requirement(),
+        PlanningCostEvidenceRequirement::Structured
+    );
+    assert_eq!(
+        snapshot.planning_boundary(),
+        CostBoundary::PreparationToHostSettledV1
+    );
+    assert_eq!(snapshot.fingerprint(), fingerprint);
+    bounded(runtime.shutdown()).await.unwrap();
     session.shutdown().await.unwrap();
 }
