@@ -38,10 +38,30 @@ fn algorithms(v: &Value) -> BTreeMap<String, Value> {
         .map(|row| (key(&json!([row["algorithm"], row["kind"]])), row.clone()))
         .collect()
 }
+fn actual_unknown_summary(v: &Value) -> Value {
+    let diagnostic = &v["actual_evidence_diagnostic"];
+    if diagnostic.is_null() {
+        return Value::Null;
+    }
+    let mut reasons = BTreeMap::new();
+    for wave in array(&diagnostic["waves"]) {
+        increment(&mut reasons, label(&wave["reason"]));
+    }
+    // Group failures by evidence, not call IDs or physical wave ordinals.
+    // Missing legacy diagnostics remain unknown; missing recorder slots must
+    // not be represented as complete observations with zero failures.
+    json!({"dispatch_unknown":diagnostic["dispatch_unknown"],
+        "physical_waves":diagnostic["physical_waves"],
+        "retained_waves":diagnostic["retained_waves"],
+        "lost_observations":diagnostic["lost_observations"],
+        "retained_wave_details_complete":diagnostic["retained_wave_details_complete"],
+        "wave_reasons":reasons})
+}
 fn context(v: &Value, line: usize) -> Value {
     json!({"line":line,"phase":v["phase"],"case":v["case"],"call_id":v["host_stages"]["call_id"],
         "submission":v["submission"],"evidence_kind":v["evidence"]["kind"],"evidence_reason":v["evidence"]["reason"],
-        "error":v["error"],"host_completeness":v["host_stages"]["completeness"],
+        "error":v["error"],"actual_evidence_diagnostic":v["actual_evidence_diagnostic"],
+        "host_completeness":v["host_stages"]["completeness"],
         "settlement_error":v["host_stages"]["structured_evidence"]["Err"],
         "graph":shape(v)["graph_state"],"kind":shape(v)["kind"],
         "decode_kv_tokens":shape(v)["decode_kv_tokens"],"prefill_chunks":shape(v)["prefill_chunks"],
@@ -194,7 +214,8 @@ fn audit(raw: &Path, report_path: &Path) -> Result<Value> {
             Some("unknown") => {
                 let detail = json!({"reason":d["reason"],"submission":v["submission"],"legacy":v["evidence"]["reason"],
                     "completeness":v["host_stages"]["completeness"],"settlement":v["host_stages"]["structured_evidence"]["Err"],
-                    "graph":shape(&v)["graph_state"],"kind":shape(&v)["kind"]});
+                    "graph":shape(&v)["graph_state"],"kind":shape(&v)["kind"],
+                    "actual_evidence":actual_unknown_summary(&v)});
                 let k = key(&detail);
                 increment(&mut unknown, k.clone());
                 unknown_examples.entry(k).or_insert_with(|| json!({"diagnostic":detail,"context":context(&v,line),"host_stages":v["host_stages"]}));
@@ -346,6 +367,31 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_diagnostics_preserve_losses_without_grouping_by_call_identity() {
+        let mut first = json!({"actual_evidence_diagnostic":{
+            "call_id":9,"physical_waves":3,"retained_waves":2,
+            "lost_observations":1,"dispatch_unknown":"RecorderOverflow",
+            "retained_wave_details_complete":true,
+            "waves":[{"physical_wave_ordinal":0,"reason":"ShapeUnavailable"},
+                {"physical_wave_ordinal":1,"reason":"ShapeUnavailable"}]}});
+        let mut second = first.clone();
+        second["actual_evidence_diagnostic"]["call_id"] = json!(12);
+        second["actual_evidence_diagnostic"]["waves"][0]["physical_wave_ordinal"] = json!(2);
+        let grouped = actual_unknown_summary(&first);
+        assert_eq!(grouped, actual_unknown_summary(&second));
+        assert_eq!(grouped["wave_reasons"]["ShapeUnavailable"], 2);
+        assert_eq!(grouped["lost_observations"], 1);
+        first["actual_evidence_diagnostic"]["retained_wave_details_complete"] = json!(false);
+        first["actual_evidence_diagnostic"]["waves"] = json!([]);
+        let partial = actual_unknown_summary(&first);
+        assert_ne!(partial, grouped);
+        assert_eq!(partial["lost_observations"], 1);
+        assert_eq!(partial["retained_wave_details_complete"], false);
+        assert_eq!(partial["wave_reasons"], json!({}));
+        assert_eq!(actual_unknown_summary(&json!({})), Value::Null);
+    }
+
     #[test]
     fn repeated_domains_still_update_after_new_domain_capacity_is_exhausted() {
         let mut s = SummaryReplay::default();
