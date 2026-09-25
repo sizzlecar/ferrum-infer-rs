@@ -177,11 +177,64 @@ fn guarded_cuda_core_program_binding_stays_eager_and_retries_after_rejection() {
     rejected_then_retry(Fixture::new_program_binding());
 }
 
+struct NoHostTiming;
+impl DeviceSubmissionTimingSink for NoHostTiming {
+    const ENABLED: bool = false;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        unreachable!("disabled fixture timing cannot record")
+    }
+}
+impl SubmissionWaveDispatchTimingSink for NoHostTiming {
+    fn record(&self, _: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        unreachable!("disabled fixture timing cannot record")
+    }
+}
+
+#[derive(Default)]
+struct HostTiming {
+    backend_stages: AtomicU64,
+    completion_arms: AtomicU64,
+}
+impl DeviceSubmissionTimingSink for HostTiming {
+    const ENABLED: bool = true;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: std::time::Duration) {
+        self.backend_stages.fetch_add(1, Ordering::Relaxed);
+    }
+}
+impl SubmissionWaveDispatchTimingSink for HostTiming {
+    fn record(&self, stage: SubmissionWaveDispatchStage, _: std::time::Duration) {
+        if stage == SubmissionWaveDispatchStage::CompletionArm {
+            self.completion_arms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device and installed native operator artifacts"]
+fn guarded_cuda_host_timing_preserves_eager_rejection_retry_and_output() {
+    for program_binding in [false, true] {
+        let fixture = if program_binding {
+            Fixture::new_program_binding()
+        } else {
+            Fixture::new()
+        };
+        let timing = HostTiming::default();
+        rejected_then_retry_with_timing(fixture, &timing);
+        assert!(timing.backend_stages.load(Ordering::Relaxed) > 0);
+        // Rejection never creates a completion; only the accepted retry arms one.
+        assert_eq!(timing.completion_arms.load(Ordering::Relaxed), 1);
+    }
+}
+
 fn rejected_then_retry(f: Fixture) {
+    rejected_then_retry_with_timing(f, &NoHostTiming);
+}
+
+fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(f: Fixture, timing: &S) {
     let lane_id = f.lane.id();
     let (step, wave) = f.prepare();
     let guard = Guard::new(&f, true);
-    let pending = match f.dispatch(wave, &guard) {
+    let pending = match f.dispatch_with_timing(wave, &guard, timing) {
         GuardedWaveSubmissionOutcome::NotSubmitted(value) => value,
         _ => panic!("expected actual backend rejection"),
     };
@@ -200,7 +253,7 @@ fn rejected_then_retry(f: Fixture) {
     );
     let (step, wave) = f.prepare();
     let guard = Guard::new(&f, false);
-    let handle = accepted(f.dispatch(wave, &guard));
+    let handle = accepted(f.dispatch_with_timing(wave, &guard, timing));
     assert_eq!(f.lane.id(), lane_id);
     assert_eq!(guard.calls.load(Ordering::Relaxed), 1);
     assert_eq!(f.enqueues.load(Ordering::Relaxed), 1);
@@ -208,6 +261,11 @@ fn rejected_then_retry(f: Fixture) {
         CompletionReadbackBatchObservation::Terminal(value) => value,
         _ => panic!("CUDA readback did not terminate"),
     };
+    assert!(matches!(
+        receipt.completion().submission_timing(),
+        DeviceTimingMeasurement::NotRequested
+    ));
+    assert!(receipt.readback_timings().is_none());
     let CompletionReadbackDisposition::Succeeded(output) = &receipt.dispositions()[0] else {
         panic!("scale output failed")
     };

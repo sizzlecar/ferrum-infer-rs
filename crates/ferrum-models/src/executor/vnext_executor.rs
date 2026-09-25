@@ -4610,6 +4610,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
+    host_dispatch_timing: AtomicBool,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
     metrics: VNextExecutorMetrics,
@@ -5189,6 +5190,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+            host_dispatch_timing: AtomicBool::new(false),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
             metrics: VNextExecutorMetrics::default(),
@@ -5893,7 +5895,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn host_dispatch_timing_enabled(&self) -> bool {
-        self.device_timing_mode() != DeviceTimingMode::Off
+        self.host_dispatch_timing.load(Ordering::Acquire)
     }
 
     fn token_mask_residency_eligible(
@@ -7666,17 +7668,33 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         output: output_mode,
                         masks: token_mask_plans,
                     };
-                    match OperationDispatch::encode_and_submit_guarded_wave(
-                        self.providers.providers(),
-                        &self.resolved_plan,
-                        &identity,
-                        active_bindings(),
-                        &uploads,
-                        &guard,
-                        wave,
-                        &self.lane,
-                        &self.reaper,
-                    ) {
+                    let outcome = if timing_enabled {
+                        OperationDispatch::encode_and_submit_guarded_wave_with_timing(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            &uploads,
+                            &guard,
+                            &timing_sink,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                    } else {
+                        OperationDispatch::encode_and_submit_guarded_wave(
+                            self.providers.providers(),
+                            &self.resolved_plan,
+                            &identity,
+                            active_bindings(),
+                            &uploads,
+                            &guard,
+                            wave,
+                            &self.lane,
+                            &self.reaper,
+                        )
+                    };
+                    match outcome {
                         GuardedWaveSubmissionOutcome::Dispatch(result) => {
                             result.map(ProfiledSubmissionHandle::into_parts)
                         }
@@ -10673,6 +10691,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
+        self.host_dispatch_timing
+            .store(sink.host_dispatch_timing_enabled(), Ordering::Release);
         *self.event_sink.write() = Some(sink);
     }
 

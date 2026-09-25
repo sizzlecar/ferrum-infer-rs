@@ -1378,6 +1378,40 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
+        Self::encode_and_submit_guarded_wave_with_timing(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            input_uploads,
+            guard,
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// The existing eager guarded path with host-only diagnostic counters.
+    /// Device timing stays Off; the guard and ownership are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave_with_timing<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        input_uploads: &[SubmissionWaveInputUpload],
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
         let mut rejection = None;
         let result = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
@@ -1391,7 +1425,7 @@ impl OperationDispatch {
             None,
             true,
             Some((guard, &mut rejection)),
-            &DisabledSubmissionWaveDispatchTimingSink,
+            timing_sink,
             wave,
             lane,
             reaper,
@@ -2134,7 +2168,7 @@ impl OperationDispatch {
                     identity: batch_identity,
                     readback: completion.core_readback_route(runtime),
                 };
-                lane_reservation.submit_guarded(commands, &device_guard)
+                lane_reservation.submit_guarded_with_timing(commands, &device_guard, timing_sink)
             }
             None => lane_reservation.submit_with_timing(commands, timing_sink),
         };

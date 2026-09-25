@@ -509,6 +509,15 @@ impl Fixture {
         wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
         guard: &Guard,
     ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
+        self.dispatch_with_timing(wave, guard, &NoHostTiming)
+    }
+
+    pub(super) fn dispatch_with_timing<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
+        guard: &Guard,
+        timing: &S,
+    ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
         let active = TrustedActiveSequenceBinding::from_session(&self.session).unwrap();
         let identity = OperationDispatch::bind_submission_wave_identity(
             self.compilation.executable(),
@@ -529,13 +538,14 @@ impl Fixture {
                 .collect(),
         )
         .unwrap();
-        OperationDispatch::encode_and_submit_guarded_wave(
+        OperationDispatch::encode_and_submit_guarded_wave_with_timing(
             self.providers.providers(),
             self.compilation.executable(),
             &identity,
             [&active].into_iter(),
             &[input],
             guard,
+            timing,
             wave,
             &self.lane,
             &self.reaper,

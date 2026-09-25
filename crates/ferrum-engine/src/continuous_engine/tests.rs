@@ -7675,6 +7675,11 @@ fn staged_vnext_profiles_separate_resource_latency_and_kernel_costs() {
 
         assert_eq!(sink.capture_policy(), expected_capture_policy);
         assert_eq!(sink.device_timing_mode(), expected_timing);
+        assert_eq!(
+            sink.host_dispatch_timing_enabled(),
+            detail == ObservabilityProfileDetail::Latency
+                || expected_timing != ferrum_interfaces::vnext::DeviceTimingMode::Off,
+        );
         let (_, _, accepted) = vnext_profile_test_event();
         let profile = sink.profile_event(&accepted).unwrap();
         assert_eq!(

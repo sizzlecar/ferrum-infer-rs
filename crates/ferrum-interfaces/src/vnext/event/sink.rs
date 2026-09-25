@@ -158,6 +158,13 @@ pub trait ExecutionEventSink: Send + Sync {
         super::super::DeviceTimingMode::Off
     }
 
+    /// Enables existing aggregate host dispatch timers independently of device
+    /// events. This grants no execution or device-attribution authority.
+    /// Frame capture remains a separate policy; these are bounded counters.
+    fn host_dispatch_timing_enabled(&self) -> bool {
+        self.device_timing_mode() != super::super::DeviceTimingMode::Off
+    }
+
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         ExecutionEventCapturePolicy::AllFrames
     }

@@ -3543,6 +3543,19 @@ impl DeviceRuntime for CudaDeviceRuntime {
         fence.attribution.clone()
     }
 
+    fn submit_guarded_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        guard: &dyn DeviceSubmissionGuard,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        self.submit_with_timing_and_guard(stream, commands, timing_sink, Some(guard))
+    }
+
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
         if let Err(error) = fence.event.context().bind_to_thread() {
             fence.stream_state.fail();

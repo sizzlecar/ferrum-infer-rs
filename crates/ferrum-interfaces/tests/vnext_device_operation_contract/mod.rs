@@ -2014,6 +2014,29 @@ impl DeviceRuntime for TestRuntime {
         fence.2.clone()
     }
 
+    fn submit_guarded_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        guard: &dyn DeviceSubmissionGuard,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        if !S::ENABLED {
+            return self.submit_guarded(stream, commands, guard);
+        }
+        // This fixture measures its real guarded transaction. It does not
+        // manufacture a device duration or report a successful enqueue on rejection.
+        assert_eq!(commands.timing_mode(), DeviceTimingMode::Off);
+        let started = Instant::now();
+        let result = self.submit_guarded(stream, commands, guard);
+        timing_sink
+            .record_device_submission(DeviceSubmissionStage::ValidateAndPrepare, started.elapsed());
+        result
+    }
+
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
         assert!(fence.0 > 0);
         let trace = self.trace.lock().unwrap();

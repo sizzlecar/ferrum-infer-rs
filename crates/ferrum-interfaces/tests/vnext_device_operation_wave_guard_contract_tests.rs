@@ -7,6 +7,40 @@ use ferrum_interfaces::execution_cost::{
 use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 
+struct NoHostTiming;
+impl DeviceSubmissionTimingSink for NoHostTiming {
+    const ENABLED: bool = false;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: Duration) {
+        panic!("disabled host timing was called");
+    }
+}
+impl SubmissionWaveDispatchTimingSink for NoHostTiming {
+    fn record(&self, _: SubmissionWaveDispatchStage, _: Duration) {
+        panic!("disabled host timing was called");
+    }
+}
+
+#[derive(Default)]
+struct HostTiming {
+    backend_calls: AtomicU64,
+    dispatch_calls: AtomicU64,
+    completion_arms: AtomicU64,
+}
+impl DeviceSubmissionTimingSink for HostTiming {
+    const ENABLED: bool = true;
+    fn record_device_submission(&self, _: DeviceSubmissionStage, _: Duration) {
+        self.backend_calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+impl SubmissionWaveDispatchTimingSink for HostTiming {
+    fn record(&self, stage: SubmissionWaveDispatchStage, _: Duration) {
+        self.dispatch_calls.fetch_add(1, Ordering::Relaxed);
+        if stage == SubmissionWaveDispatchStage::CompletionArm {
+            self.completion_arms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 struct Guard {
     rejection: Option<GuardedNotSubmittedReason>,
     calls: AtomicU64,
@@ -49,6 +83,17 @@ fn dispatch(
     reaper: &Arc<CompletionReaper<TestRuntime>>,
     guard: &Guard,
 ) -> GuardedWaveSubmissionOutcome<TestRuntime> {
+    dispatch_with_timing(fixture, session, step, reaper, guard, &NoHostTiming)
+}
+
+fn dispatch_with_timing<S: SubmissionWaveDispatchTimingSink>(
+    fixture: &Fixture,
+    session: &Arc<SequenceSession<TestRuntime>>,
+    step: &Arc<StepResourceLease<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+    guard: &Guard,
+    timing: &S,
+) -> GuardedWaveSubmissionOutcome<TestRuntime> {
     let lane = step.execution_lane();
     let mut wave = prepare_wave(&fixture.plan_resources, &fixture.plan, step);
     if guard.staging {
@@ -81,13 +126,14 @@ fn dispatch(
         lane,
     )
     .unwrap();
-    OperationDispatch::encode_and_submit_guarded_wave(
+    OperationDispatch::encode_and_submit_guarded_wave_with_timing(
         &providers,
         &fixture.resolved,
         &identity,
         active.iter(),
         &[],
         guard,
+        timing,
         wave,
         lane,
         reaper,
@@ -110,6 +156,13 @@ fn accepted(outcome: GuardedWaveSubmissionOutcome<TestRuntime>) -> CompletionHan
 }
 
 fn rejected_then_retry(missing_attribution: bool) {
+    rejected_then_retry_with_timing(missing_attribution, &NoHostTiming);
+}
+
+fn rejected_then_retry_with_timing<S: SubmissionWaveDispatchTimingSink>(
+    missing_attribution: bool,
+    timing: &S,
+) {
     let (fixture, sequence, session, batch, step) = setup();
     let lane = Arc::clone(step.execution_lane());
     lane.configure_submission_readback_staging(8).unwrap();
@@ -126,7 +179,7 @@ fn rejected_then_retry(missing_attribution: bool) {
         trace: Arc::clone(&fixture.runtime_trace),
     };
     let reaper = CompletionReaper::new();
-    let pending = match dispatch(&fixture, &session, &step, &reaper, &guard) {
+    let pending = match dispatch_with_timing(&fixture, &session, &step, &reaper, &guard, timing) {
         GuardedWaveSubmissionOutcome::NotSubmitted(pending) => pending,
         _ => panic!("prepared guard must reject without submitting"),
     };
@@ -172,7 +225,9 @@ fn rejected_then_retry(missing_attribution: bool) {
         staging: true,
         trace: Arc::clone(&fixture.runtime_trace),
     };
-    let handle = accepted(dispatch(&fixture, &session, &next, &reaper, &accept));
+    let handle = accepted(dispatch_with_timing(
+        &fixture, &session, &next, &reaper, &accept, timing,
+    ));
     assert!(matches!(
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)
@@ -201,6 +256,19 @@ fn guarded_core_rejection_releases_staging_and_retries_same_live_request() {
 #[test]
 fn guarded_core_missing_attribution_rejects_before_host_gate_and_submit() {
     rejected_then_retry(true);
+}
+
+#[test]
+fn guarded_host_timing_reaches_backend_without_authorizing_rejected_work() {
+    for missing_attribution in [false, true] {
+        let timing = HostTiming::default();
+        rejected_then_retry_with_timing(missing_attribution, &timing);
+        // One refused attempt followed by one successful use of the same live
+        // request/lane: both are observed, only the accepted fence is armed.
+        assert_eq!(timing.backend_calls.load(Ordering::Relaxed), 2);
+        assert!(timing.dispatch_calls.load(Ordering::Relaxed) > 0);
+        assert_eq!(timing.completion_arms.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[test]

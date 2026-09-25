@@ -844,10 +844,25 @@ impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
         commands: DeviceCommandBatch<R::Command>,
         guard: &dyn super::DeviceSubmissionGuard,
     ) -> LaneSubmitOutcome<R::Fence, R::Error> {
+        self.submit_guarded_with_timing(commands, guard, &super::DisabledDeviceSubmissionTimingSink)
+    }
+
+    pub(crate) fn submit_guarded_with_timing<S>(
+        &mut self,
+        commands: DeviceCommandBatch<R::Command>,
+        guard: &dyn super::DeviceSubmissionGuard,
+        timing_sink: &S,
+    ) -> LaneSubmitOutcome<R::Fence, R::Error>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            self.lane
-                .runtime
-                .submit_guarded(&mut self.state.stream, commands, guard)
+            self.lane.runtime.submit_guarded_with_timing(
+                &mut self.state.stream,
+                commands,
+                guard,
+                timing_sink,
+            )
         }));
         match result {
             Ok(Ok(fence)) => {

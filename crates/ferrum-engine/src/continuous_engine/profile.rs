@@ -1693,6 +1693,11 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         self.context.capture_policy
     }
 
+    fn host_dispatch_timing_enabled(&self) -> bool {
+        self.context.profile_detail == ObservabilityProfileDetail::Latency
+            || self.device_timing_mode() != ferrum_interfaces::vnext::DeviceTimingMode::Off
+    }
+
     fn capture_policy_for_request(
         &self,
         origin: ExecutorRequestOrigin,

@@ -3796,6 +3796,24 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         ))
     }
 
+    /// Host-only diagnostics for the same guarded transaction. The default
+    /// preserves the guarded implementation, including unsupported rejection;
+    /// it must never delegate to ordinary submission.
+    fn submit_guarded_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        guard: &dyn DeviceSubmissionGuard,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, GuardedDeviceSubmissionError<Self::Error>>
+    where
+        Self: Sized,
+        S: DeviceSubmissionTimingSink,
+    {
+        let _ = timing_sink;
+        self.submit_guarded(stream, commands, guard)
+    }
+
     /// Profile-attached submission entrypoint. Backends override this only
     /// when they can expose typed internal boundaries without changing
     /// submission ownership or error semantics.
