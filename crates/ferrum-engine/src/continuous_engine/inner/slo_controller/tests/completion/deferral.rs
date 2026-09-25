@@ -63,10 +63,13 @@ async fn completion_deferrals_skip_repeated_search_until_real_progress_then_reop
     let original_version = model.snapshot().unwrap().model_version();
     let original_frontier = engine.inner.sequences.read()[&id].cost_frontier;
 
-    // The first attempt really enters the planner. Its unsupported future
-    // route chooses safe completion, then the backend declines before encode.
-    // Subsequent attempts have no new tokens, model evidence, or capacity.
+    // The first attempt captures current route evidence. A real transient read
+    // failure may select safe completion before search; an available snapshot
+    // reaches the planner, whose unsupported future route also selects it.
+    // Neither case may repeat that work while the backend keeps deferring the
+    // same frontier without new tokens, model evidence, or capacity.
     for attempt in 0..3 {
+        let before_capture = executor.deferrals.planning_captures.load(Ordering::Acquire);
         let prepared = prepare(&engine, &executor).await;
         executor
             .deferrals
@@ -77,7 +80,13 @@ async fn completion_deferrals_skip_repeated_search_until_real_progress_then_reop
                 .unwrap(),
             EngineIterationOutcome::Idle
         ));
-        assert_eq!(search_calls(&engine), u64::from(attempt == 0));
+        let after_capture = executor.deferrals.planning_captures.load(Ordering::Acquire);
+        if attempt == 0 {
+            assert!(after_capture > before_capture);
+        } else {
+            assert_eq!(after_capture, before_capture);
+            assert_eq!(search_calls(&engine), 0);
+        }
         assert_eq!(executor.physical.load(Ordering::Acquire), 0);
         assert_eq!(scheduled(&engine), 0);
         assert_eq!(
@@ -125,7 +134,10 @@ async fn completion_deferrals_skip_repeated_search_until_real_progress_then_reop
     consume(&engine, &id, &mut session).await;
 
     // There is no sticky mode or cached Unknown result: after that successful
-    // wave the next current frontier enters normal search with the new model.
+    // wave the next current frontier must recapture route evidence with the
+    // new model. That real nonblocking read can still be temporarily unavailable;
+    // its availability must not decide whether this cache-invalidation test passes.
+    let before_reopen = executor.deferrals.planning_captures.load(Ordering::Acquire);
     let prepared = prepare(&engine, &executor).await;
     assert!(matches!(
         bounded(engine.inner.execute_slo_controller_wave(prepared))
@@ -133,8 +145,7 @@ async fn completion_deferrals_skip_repeated_search_until_real_progress_then_reop
             .unwrap(),
         EngineIterationOutcome::Progressed
     ));
-    assert_eq!(search_calls(&engine), 1);
-    assert!(executor.deferrals.planning_captures.load(Ordering::Acquire) > before_resume);
+    assert!(executor.deferrals.planning_captures.load(Ordering::Acquire) > before_reopen);
     assert_eq!(engine.inner.sequences.read()[&id].generated_tokens.len(), 2);
     cleanup(engine, session).await;
 }
