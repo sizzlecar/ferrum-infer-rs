@@ -419,6 +419,16 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         query.readbacks.len(),
         readback_bytes,
         view.readback_available_bytes,
+        &mut |index| {
+            // readback_bytes above validated every contiguous physical piece.
+            // Preserve each piece's own payload, including heterogeneous sizes.
+            let bytes = query.readbacks[index].layout.byte_len().ok()?;
+            runtime.cost_core_transfer_evidence(
+                crate::execution_cost::StatisticalTransferKindV1::DeviceToHost,
+                bytes,
+                0,
+            )
+        },
         canonical,
         &mut command_index,
         budget,
@@ -437,6 +447,11 @@ fn append_readback_route(
     count: usize,
     bytes: u64,
     available_bytes: u64,
+    transfer_evidence: &mut dyn FnMut(
+        usize,
+    ) -> Option<
+        crate::execution_cost::SelectedCommandCostEvidenceV1,
+    >,
     canonical: &mut CanonicalWaveCostBuilder,
     command_index: &mut u32,
     budget: &mut dyn ResourcePlanningBudget,
@@ -467,8 +482,9 @@ fn append_readback_route(
         if let Some(operation) = capability.staged_host_readback_native_operation {
             // readback_bytes proved contiguous Step storage and a valid single
             // participant range. Actual staging emits one physical piece each.
-            for _ in 0..count {
+            for index in 0..count {
                 poll(budget)?;
+                let evidence = transfer_evidence(index);
                 append_transfer(
                     canonical,
                     command_index,
@@ -477,7 +493,7 @@ fn append_readback_route(
                     None,
                     0,
                     0,
-                    None, // This backend's per-readback transfer producer is not declared here.
+                    evidence.as_ref(),
                 )?;
             }
         }
