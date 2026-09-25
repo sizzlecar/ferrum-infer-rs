@@ -14,6 +14,12 @@ pub struct SelectedCommandCostEvidenceV1 {
     /// The old wire never exports a new empirical family implicitly.
     #[serde(skip)]
     independent_attention_family_v2: Option<[u8; 32]>,
+    /// Same-push numeric assignment, unavailable from the old aggregate hash.
+    #[serde(skip)]
+    algorithm_assignment_signature: Option<[u8; 32]>,
+    #[serde(skip)]
+    algorithm_work:
+        Option<Result<std::sync::Arc<SelectedAlgorithmWorkEvidenceV1>, StatisticalEvidenceUnknown>>,
 }
 impl PartialEq for SelectedCommandCostEvidenceV1 {
     fn eq(&self, other: &Self) -> bool {
@@ -27,6 +33,44 @@ impl PartialEq for SelectedCommandCostEvidenceV1 {
 }
 impl Eq for SelectedCommandCostEvidenceV1 {}
 impl SelectedCommandCostEvidenceV1 {
+    pub fn algorithm_work(
+        &self,
+    ) -> Option<Result<&SelectedAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>> {
+        self.algorithm_work
+            .as_ref()
+            .map(|value| value.as_deref().map_err(|error| *error))
+    }
+    pub(super) fn token_count(&self) -> u64 {
+        self.token_count
+    }
+    pub(super) fn algorithm_work_binding(&self) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
+        let assignment = self
+            .algorithm_assignment_signature
+            .ok_or(StatisticalEvidenceUnknown::MissingProducer)?;
+        let mut hash = Sha256::new();
+        bytes(&mut hash, b"ferrum.algorithm-work-command-binding.v1");
+        hash.update(self.family_signature);
+        hash.update(assignment);
+        for n in [
+            u64::from(self.schema_version),
+            self.token_count,
+            self.compute_dispatches,
+            self.transfer_commands,
+            self.work.logical_units,
+            self.work.padded_units,
+            self.work.inner_work_units,
+            self.work.grid_blocks,
+            self.work.peak_scratch_bytes,
+            self.work.staged_weight_bytes,
+            self.work.host_to_device_bytes,
+            self.work.device_to_host_bytes,
+            self.work.device_to_device_bytes,
+            self.work.fill_bytes,
+        ] {
+            number(&mut hash, n);
+        }
+        Ok(hash.finalize().into())
+    }
     pub fn independent_attention_family_v2(&self) -> Option<&[u8; 32]> {
         self.independent_attention_family_v2.as_ref()
     }
@@ -64,6 +108,7 @@ pub struct SelectedCommandCostBuilderV1 {
     transfers: u64,
     work: DeviceNumericWorkV1,
     failure: Option<StatisticalEvidenceUnknown>,
+    algorithm_work: Option<super::algorithm_work::AlgorithmWorkAccumulator>,
 }
 impl SelectedCommandCostBuilderV1 {
     pub fn new(token_count: u64) -> Self {
@@ -77,7 +122,15 @@ impl SelectedCommandCostBuilderV1 {
             transfers: 0,
             work: DeviceNumericWorkV1::default(),
             failure: None,
+            algorithm_work: None,
         }
+    }
+    /// Collect sparse work by selected algorithm while retaining the legacy
+    /// evidence unchanged. The default constructor does not allocate this table.
+    pub fn new_with_algorithm_work(token_count: u64) -> Self {
+        let mut builder = Self::new(token_count);
+        builder.algorithm_work = Some(super::algorithm_work::AlgorithmWorkAccumulator::new());
+        builder
     }
     /// Declare one compute-only group of complete, independent attention row
     /// blocks. The provider must establish actual/future address independence
@@ -143,7 +196,7 @@ impl SelectedCommandCostBuilderV1 {
                 .iter()
                 .try_fold(1_u64, |a, &b| a.checked_mul(u64::from(b)))
                 .ok_or(StatisticalEvidenceUnknown::Overflow)?;
-            let next = this.work.checked_add(DeviceNumericWorkV1 {
+            let numeric = DeviceNumericWorkV1 {
                 logical_units: work.logical_units,
                 padded_units: work.padded_units,
                 inner_work_units,
@@ -151,12 +204,16 @@ impl SelectedCommandCostBuilderV1 {
                 peak_scratch_bytes: work.scratch_bytes,
                 staged_weight_bytes: work.staged_weight_bytes,
                 ..Default::default()
-            })?;
+            };
+            let next = this.work.checked_add(numeric)?;
             number(&mut this.family, 0);
             this.family.update(algorithm.0);
             this.independent.kernel(algorithm);
             this.compute += 1;
             this.work = next;
+            if let Some(capture) = &mut this.algorithm_work {
+                capture.observe(algorithm, AlgorithmWorkKindV1::Kernel, numeric);
+            }
             Ok(())
         })
     }
@@ -199,6 +256,9 @@ impl SelectedCommandCostBuilderV1 {
             this.independent.transfer(algorithm, tag);
             this.transfers += 1;
             this.work = next;
+            if let Some(capture) = &mut this.algorithm_work {
+                capture.observe(algorithm, kind.into(), work);
+            }
             Ok(())
         })
     }
@@ -211,7 +271,7 @@ impl SelectedCommandCostBuilderV1 {
         }
         let family_signature = self.family.finalize().into();
         let independent_attention_family_v2 = self.independent.finish(family_signature);
-        Ok(SelectedCommandCostEvidenceV1 {
+        let mut value = SelectedCommandCostEvidenceV1 {
             schema_version: STATISTICAL_ROUTE_WORK_SCHEMA_V1,
             family_signature,
             independent_attention_family_v2,
@@ -219,6 +279,15 @@ impl SelectedCommandCostBuilderV1 {
             compute_dispatches: self.compute,
             transfer_commands: self.transfers,
             work: self.work,
-        })
+            algorithm_assignment_signature: self
+                .algorithm_work
+                .as_ref()
+                .and_then(|capture| capture.assignment_signature()),
+            algorithm_work: None,
+        };
+        value.algorithm_work = self
+            .algorithm_work
+            .map(|capture| capture.finish(&value).map(std::sync::Arc::new));
+        Ok(value)
     }
 }

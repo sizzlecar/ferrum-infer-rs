@@ -1,15 +1,20 @@
 //! Versioned, passive selected-algorithm/work evidence beside exact canonical
 //! execution. No statistical identity authorizes work or implies a cost model.
-//! Builders retain bounded stack state, not a second command/row trace.
+//! Default builders retain bounded stack state. Explicit capture may retain a
+//! bounded sparse algorithm-work table, never a second execution trace.
 use super::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+mod algorithm_work;
 mod command;
 mod independent_rows;
 mod structure;
 mod wave;
 mod wire;
+pub use algorithm_work::{
+    AlgorithmNumericWorkV1, AlgorithmWorkKindV1, SelectedAlgorithmWorkEvidenceV1,
+};
 pub use command::*;
 pub(in crate::execution_cost) use structure::StructuredHostAccumulator;
 pub use structure::*;
