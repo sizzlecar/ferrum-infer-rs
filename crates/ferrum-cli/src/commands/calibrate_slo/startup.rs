@@ -184,6 +184,30 @@ pub(super) fn validate_export_configuration(
             ));
         }
     }
+    let structured_v2 = manifest.validation_model.structured_v2();
+    if structured_v2.is_some()
+        != (policy.cost_observation.predictor
+            == ferrum_types::SloCostPredictor::StructuredWholeWaveV2)
+    {
+        return Err(FerrumError::config(
+            "structured V2 predictor and source3/profile10 live protocol must match exactly",
+        ));
+    }
+    if let Some(capture) = structured_v2 {
+        capture.validate(manifest)?;
+        let observation = &policy.cost_observation;
+        let limits = &observation.profile_import;
+        limits.validate().map_err(FerrumError::config)?;
+        if observation.structured_capture != ferrum_types::SloStructuredCostCapture::HostSettledV1
+            || observation.profile_export.is_some()
+            || policy.cost_profile.is_some()
+            || capture.declared_source_clock_error_ns > limits.max_clock_error_ns
+            || capture.maximum_file_bytes.get() >= limits.max_file_bytes.get() as u64
+            || capture.phase_members.iter().sum::<usize>() > limits.max_samples.get()
+        {
+            return Err(FerrumError::config("V2 calibration needs fresh HostSettledV1 capture within clock/population limits and schema10 envelope capacity"));
+        }
+    }
     let selected = manifest.validation_model.selected();
     if selected.map(|(predictor, _, _)| predictor)
         != policy

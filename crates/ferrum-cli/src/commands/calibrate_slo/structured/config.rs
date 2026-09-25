@@ -59,7 +59,7 @@ impl Default for Settings {
     }
 }
 impl Settings {
-    fn core(&self) -> StructuredSettingsV1 {
+    pub(in crate::commands::calibrate_slo) fn core(&self) -> StructuredSettingsV1 {
         StructuredSettingsV1 {
             min_phase_samples: self.min_phase_samples,
             min_fit_redundancy: self.min_fit_redundancy,
@@ -139,7 +139,7 @@ impl CaptureConfig {
     }
 }
 
-pub(super) fn export_limits(
+pub(in crate::commands::calibrate_slo) fn export_limits(
     value: &ferrum_types::SloCostProfileImportConfig,
 ) -> CostProfileLoadLimits {
     CostProfileLoadLimits {

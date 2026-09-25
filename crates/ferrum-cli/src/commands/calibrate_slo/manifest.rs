@@ -58,9 +58,22 @@ pub(super) enum ValidationSource {
         capture: structured::CaptureConfig,
         residual: Vec<Cohort>,
     },
+    StructuredWholeWaveV2 {
+        capture: structured_v2::CaptureConfigV2,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
+    pub(super) fn structured_v2(&self) -> Option<&structured_v2::CaptureConfigV2> {
+        match self {
+            Self::StructuredWholeWaveV2 { capture, .. } => Some(capture),
+            _ => None,
+        }
+    }
+    pub(super) fn is_structured(&self) -> bool {
+        self.structured().is_some() || self.structured_v2().is_some()
+    }
     pub(super) fn structured(&self) -> Option<&structured::CaptureConfig> {
         match self {
             Self::StructuredWholeWaveV1 { capture, .. } => Some(capture),
@@ -108,7 +121,8 @@ impl ValidationSource {
             Self::SelectedWholeWaveV1 { residual, .. }
             | Self::SelectedIndependentAttentionV2 { residual, .. }
             | Self::SelectedWorkSupportV1 { residual, .. }
-            | Self::StructuredWholeWaveV1 { residual, .. } => residual,
+            | Self::StructuredWholeWaveV1 { residual, .. }
+            | Self::StructuredWholeWaveV2 { residual, .. } => residual,
             _ => &[],
         }
     }
@@ -121,6 +135,9 @@ impl ValidationSource {
                 Some((&export.path, &export.observations_path))
             }
             Self::StructuredWholeWaveV1 { capture, .. } => {
+                Some((&capture.profile, &capture.source))
+            }
+            Self::StructuredWholeWaveV2 { capture, .. } => {
                 Some((&capture.profile, &capture.source))
             }
             Self::LiveFrozen => None,
@@ -278,6 +295,9 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
         ValidationSource::StructuredWholeWaveV1 { capture, .. } => {
             Some((&mut capture.profile, &mut capture.source))
         }
+        ValidationSource::StructuredWholeWaveV2 { capture, .. } => {
+            Some((&mut capture.profile, &mut capture.source))
+        }
         ValidationSource::LiveFrozen => None,
     };
     if let Some((profile, source)) = destinations {
@@ -321,6 +341,9 @@ impl Manifest {
             }
         }
         if let Some(capture) = self.validation_model.structured() {
+            capture.validate(self)?;
+        }
+        if let Some(capture) = self.validation_model.structured_v2() {
             capture.validate(self)?;
         }
         if self.input_preprocessing_sha256 == [0; 32] {

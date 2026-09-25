@@ -1,6 +1,7 @@
 use super::*;
 
 mod structured_discovery;
+mod structured_discovery_v2;
 use ferrum_engine::continuous_engine::{
     CalibrationCommittedWork, CalibrationObservation, CalibrationWaveReport, HostStageCompleteness,
     HostStageEvidenceV1,
@@ -43,6 +44,8 @@ pub(super) struct Summary {
     pub validation_model: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_calibration: Option<structured::StructuredReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_calibration_v2: Option<structured_v2::StructuredReportV2>,
     pub phases: PhaseCounts,
     pub reference_frozen_plan: Option<serde_json::Value>,
     pub reference: Option<reference::ReferenceReceipt>,
@@ -302,6 +305,12 @@ impl Artifacts {
             report.structured_cost_input()
         }) {
             record["structured_cost_discovery"] =
+                serde_json::to_value(discovery).map_err(json_error)?;
+        }
+        if let Some(discovery) = structured_discovery_v2::inspect(self.structured_capture, || {
+            report.structured_cost_input_v2()
+        }) {
+            record["structured_cost_discovery_v2"] =
                 serde_json::to_value(discovery).map_err(json_error)?;
         }
         self.record(&record)

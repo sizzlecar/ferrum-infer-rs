@@ -8,6 +8,6 @@ mod report;
 #[cfg(test)]
 mod tests;
 
-pub(super) use config::CaptureConfig;
+pub(super) use config::{export_limits, CaptureConfig, Settings};
 pub(super) use driver::{collect, finish};
 pub(super) use report::StructuredReport;

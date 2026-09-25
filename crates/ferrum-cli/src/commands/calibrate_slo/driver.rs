@@ -31,6 +31,9 @@ pub(super) async fn collect(
             .cost_observation
             .structured_capture,
     );
+    if manifest.validation_model.structured_v2().is_some() {
+        return structured_v2::collect(session, manifest, inputs, artifacts, summary).await;
+    }
     if manifest.validation_model.structured().is_some() {
         return structured::collect(session, manifest, inputs, artifacts, summary).await;
     }
