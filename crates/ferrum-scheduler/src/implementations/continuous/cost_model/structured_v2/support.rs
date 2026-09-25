@@ -17,23 +17,29 @@ impl JointSupport {
         }
     }
     pub(super) fn new<'a>(points: impl Iterator<Item = &'a [u64]>) -> Result<Self> {
-        let points: Vec<Vec<u64>> = points.map(<[u64]>::to_vec).collect();
-        let Some(first) = points.first() else {
-            return Err(StructuredUnknown::InsufficientSamples);
-        };
-        if points.len() > 4096 || first.is_empty() || first.len() > 4096 {
-            return Err(StructuredUnknown::Capacity);
-        }
-        let mut minimum = first.clone();
-        for point in &points {
-            if point.len() != minimum.len() {
+        let mut stored = Vec::new();
+        let mut minimum: Vec<u64> = Vec::new();
+        for point in points {
+            if stored.len() == 4096 || point.is_empty() || point.len() > 4096 {
+                return Err(StructuredUnknown::Capacity);
+            }
+            if stored.is_empty() {
+                minimum = point.to_vec();
+            } else if point.len() != minimum.len() {
                 return Err(StructuredUnknown::InvalidInput);
             }
             for (low, value) in minimum.iter_mut().zip(point) {
                 *low = (*low).min(*value);
             }
+            stored.push(point.to_vec());
         }
-        Ok(Self { minimum, points })
+        if stored.is_empty() {
+            return Err(StructuredUnknown::InsufficientSamples);
+        }
+        Ok(Self {
+            minimum,
+            points: stored,
+        })
     }
     pub(super) fn contains(&self, query: &[u64]) -> bool {
         self.contains_envelope(query, query)
