@@ -17,6 +17,10 @@ pub struct SelectedCommandCostEvidenceV1 {
     /// Same-push numeric assignment, unavailable from the old aggregate hash.
     #[serde(skip)]
     algorithm_assignment_signature: Option<[u8; 32]>,
+    /// Captured fixed launch geometry. Dynamic inner work is intentionally
+    /// excluded; a resident graph cannot silently change its grid or buffers.
+    #[serde(skip)]
+    replay_fixed_launch_signature: Option<[u8; 32]>,
     #[serde(skip)]
     algorithm_work:
         Option<Result<std::sync::Arc<SelectedAlgorithmWorkEvidenceV1>, StatisticalEvidenceUnknown>>,
@@ -33,6 +37,13 @@ impl PartialEq for SelectedCommandCostEvidenceV1 {
 }
 impl Eq for SelectedCommandCostEvidenceV1 {}
 impl SelectedCommandCostEvidenceV1 {
+    pub(super) fn replay_fixed_launch_signature(
+        &self,
+    ) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
+        self.replay_fixed_launch_signature
+            .ok_or(StatisticalEvidenceUnknown::MissingProducer)
+    }
+
     pub fn algorithm_work(
         &self,
     ) -> Option<Result<&SelectedAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>> {
@@ -98,6 +109,17 @@ impl SelectedCommandCostEvidenceV1 {
     }
 }
 
+/// Fixed kernel launch facts supplied by the same actual/future selector.
+/// The borrowed scalar words are hashed immediately, never retained. List
+/// every scalar that the resident graph does not update. Dynamic values need
+/// an actual binding/update protocol; numeric work alone is not that proof.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelReplayGeometryV1<'a> {
+    pub block: [u32; 3],
+    pub dynamic_shared_bytes: u64,
+    pub fixed_parameters: &'a [u64],
+}
+
 /// Every push denotes a selected real dispatch/copy. Partial evidence may not
 /// be completed by defaulting unknown kernels to zero work. Errors are sticky.
 pub struct SelectedCommandCostBuilderV1 {
@@ -109,6 +131,7 @@ pub struct SelectedCommandCostBuilderV1 {
     work: DeviceNumericWorkV1,
     failure: Option<StatisticalEvidenceUnknown>,
     algorithm_work: Option<super::algorithm_work::AlgorithmWorkAccumulator>,
+    replay_fixed_launch: Option<Sha256>,
 }
 impl SelectedCommandCostBuilderV1 {
     pub fn new(token_count: u64) -> Self {
@@ -123,6 +146,7 @@ impl SelectedCommandCostBuilderV1 {
             work: DeviceNumericWorkV1::default(),
             failure: None,
             algorithm_work: None,
+            replay_fixed_launch: None,
         }
     }
     /// Collect sparse work by selected algorithm while retaining the legacy
@@ -130,6 +154,9 @@ impl SelectedCommandCostBuilderV1 {
     pub fn new_with_algorithm_work(token_count: u64) -> Self {
         let mut builder = Self::new(token_count);
         builder.algorithm_work = Some(super::algorithm_work::AlgorithmWorkAccumulator::new());
+        let mut fixed = Sha256::new();
+        bytes(&mut fixed, b"ferrum.selected-replay-fixed-launch.v1");
+        builder.replay_fixed_launch = Some(fixed);
         builder
     }
     /// Declare one compute-only group of complete, independent attention row
@@ -173,12 +200,42 @@ impl SelectedCommandCostBuilderV1 {
             Ok(())
         }
     }
+    /// Selected eager work without a complete fixed replay launch. One such
+    /// push makes replay-template evidence unavailable for the whole command.
     pub fn kernel(
         &mut self,
         algorithm: SelectedAlgorithmClassV1,
         work: KernelNumericWorkV1,
     ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.kernel_inner(algorithm, work, None)
+    }
+    pub fn kernel_with_replay_geometry(
+        &mut self,
+        algorithm: SelectedAlgorithmClassV1,
+        work: KernelNumericWorkV1,
+        geometry: KernelReplayGeometryV1<'_>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        self.kernel_inner(algorithm, work, Some(geometry))
+    }
+    fn kernel_inner(
+        &mut self,
+        algorithm: SelectedAlgorithmClassV1,
+        work: KernelNumericWorkV1,
+        geometry: Option<KernelReplayGeometryV1<'_>>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
         self.guard(|this| {
+            if let Some(geometry) = geometry {
+                if geometry.block.contains(&0) || geometry.fixed_parameters.len() > 128 {
+                    return Err(StatisticalEvidenceUnknown::InvalidWork);
+                }
+                geometry
+                    .block
+                    .iter()
+                    .try_fold(1_u64, |product, &size| product.checked_mul(u64::from(size)))
+                    .ok_or(StatisticalEvidenceUnknown::Overflow)?;
+            } else {
+                this.replay_fixed_launch = None;
+            }
             this.check_limit()?;
             if work.logical_units == 0
                 || work.padded_units < work.logical_units
@@ -209,6 +266,31 @@ impl SelectedCommandCostBuilderV1 {
             number(&mut this.family, 0);
             this.family.update(algorithm.0);
             this.independent.kernel(algorithm);
+            if let Some(fixed) = &mut this.replay_fixed_launch {
+                number(fixed, 0);
+                fixed.update(algorithm.0);
+                for dimension in work.grid {
+                    number(fixed, u64::from(dimension));
+                }
+                // Missing geometry cleared the digest before this block.
+                let geometry = geometry.ok_or(StatisticalEvidenceUnknown::MissingProducer)?;
+                for dimension in geometry.block {
+                    number(fixed, u64::from(dimension));
+                }
+                number(fixed, geometry.dynamic_shared_bytes);
+                number(fixed, geometry.fixed_parameters.len() as u64);
+                for &parameter in geometry.fixed_parameters {
+                    number(fixed, parameter);
+                }
+                for value in [
+                    work.logical_units,
+                    work.padded_units,
+                    work.scratch_bytes,
+                    work.staged_weight_bytes,
+                ] {
+                    number(fixed, value);
+                }
+            }
             this.compute += 1;
             this.work = next;
             if let Some(capture) = &mut this.algorithm_work {
@@ -254,6 +336,12 @@ impl SelectedCommandCostBuilderV1 {
             this.family.update(algorithm.0);
             number(&mut this.family, tag);
             this.independent.transfer(algorithm, tag);
+            if let Some(fixed) = &mut this.replay_fixed_launch {
+                number(fixed, 1);
+                fixed.update(algorithm.0);
+                number(fixed, tag);
+                number(fixed, count_bytes);
+            }
             this.transfers += 1;
             this.work = next;
             if let Some(capture) = &mut this.algorithm_work {
@@ -275,6 +363,9 @@ impl SelectedCommandCostBuilderV1 {
             schema_version: STATISTICAL_ROUTE_WORK_SCHEMA_V1,
             family_signature,
             independent_attention_family_v2,
+            replay_fixed_launch_signature: self
+                .replay_fixed_launch
+                .map(|value| value.finalize().into()),
             token_count: self.tokens,
             compute_dispatches: self.compute,
             transfer_commands: self.transfers,

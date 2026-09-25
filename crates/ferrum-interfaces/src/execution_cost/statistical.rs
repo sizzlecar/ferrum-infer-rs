@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 mod algorithm_work;
 mod command;
 mod independent_rows;
+mod replay;
 mod structure;
 mod wave;
 mod wave_algorithm_work;
@@ -17,6 +18,7 @@ pub use algorithm_work::{
     AlgorithmNumericWorkV1, AlgorithmWorkKindV1, SelectedAlgorithmWorkEvidenceV1,
 };
 pub use command::*;
+pub use replay::SelectedReplayAlgorithmTemplateV1;
 pub(in crate::execution_cost) use structure::StructuredHostAccumulator;
 pub use structure::*;
 pub(in crate::execution_cost) use wave::StatisticalWaveAccumulator;
