@@ -507,7 +507,37 @@ pub struct PlanningShapeQuery<'a> {
     pub recurrent_state_bytes: u64,
 }
 
+/// Validation domain of graph labels emitted by the same immutable execution
+/// projection. This is not graph residency or permission to capture/replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanningGraphDomain {
+    /// Preserve the backend's exact snapshot label (including old backends).
+    #[default]
+    SnapshotExact,
+    /// A captured configured catalog supports per-wave route selection.
+    /// Cold is only the core-proven configured eager route; Warm still requires
+    /// an exact uploaded-program match. Disabled is outside this domain.
+    ConfiguredPerWave,
+    /// StartupReady permits only independently matched resident replay.
+    ResidentReplayOnly,
+}
+impl PlanningGraphDomain {
+    pub(super) fn accepts(self, expected: WaveGraphState, actual: WaveGraphState) -> bool {
+        match self {
+            Self::SnapshotExact => expected == actual,
+            Self::ResidentReplayOnly => actual == WaveGraphState::Warm,
+            Self::ConfiguredPerWave => {
+                matches!(actual, WaveGraphState::Cold | WaveGraphState::Warm)
+            }
+        }
+    }
+}
+
 pub trait PlanningShapeResolver {
+    fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
+        Ok(PlanningGraphDomain::SnapshotExact)
+    }
+
     /// Pure physical ordering of an already chosen logical cohort. The caller
     /// verifies a full key+action permutation; this cannot add, remove, widen,
     /// or substitute work. It must obey the same bounded callback contract.

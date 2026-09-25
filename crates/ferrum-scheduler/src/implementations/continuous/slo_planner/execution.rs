@@ -23,6 +23,10 @@ pub trait PlanningExecutionContext {
 }
 
 pub trait PlanningExecutionState<'epoch> {
+    fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
+        Ok(PlanningGraphDomain::SnapshotExact)
+    }
+
     /// Pure branch expansion. Failure must leave the parent and siblings intact.
     /// The child borrows the epoch, never this temporary parent or input.
     /// All reachable physical branches must support the same logical action.
@@ -137,6 +141,10 @@ fn spend(remaining: &Cell<usize>) -> Result<(), PlanningUnknownReason> {
 }
 
 impl<'epoch> PlanningExecutionState<'epoch> for BoundedState<'epoch> {
+    fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
+        self.state.graph_domain()
+    }
+
     fn project(
         &self,
         input: &PlanningExecutionInput<'_>,
@@ -218,6 +226,7 @@ pub(super) fn project<'epoch>(
         &ordered_rows,
         recurrent_state_bytes,
         &projected.canonical_domain,
+        state.graph_domain()?,
         poll,
     )?;
     let cost_evidence = if collect_statistics {
@@ -285,6 +294,10 @@ impl PlanningExecutionContext for ReplayContext<'_> {
 }
 
 impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
+    fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
+        self.context.resolver.graph_domain()
+    }
+
     fn project(
         &self,
         input: &PlanningExecutionInput<'_>,
@@ -327,6 +340,7 @@ impl<'epoch> PlanningExecutionState<'epoch> for ReplayState<'epoch> {
             &rows,
             input.recurrent_state_bytes,
             &canonical_domain,
+            self.graph_domain()?,
             poll,
         )?;
         let wave = WaveCandidate {

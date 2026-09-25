@@ -14,6 +14,7 @@ mod boundaries;
 mod budget_phases;
 mod candidate_ranking;
 mod constructive;
+mod graph_domain;
 mod host_domain;
 mod joint_execution;
 mod lazy_search;

@@ -32,6 +32,10 @@ impl<'a> ResolutionSession<'a> {
 }
 #[cfg(test)]
 impl PlanningShapeResolver for ResolutionSession<'_> {
+    fn graph_domain(&self) -> Result<PlanningGraphDomain, PlanningUnknownReason> {
+        self.resolver.graph_domain()
+    }
+
     fn resolve_domain(
         &self,
         query: &PlanningShapeQuery<'_>,
@@ -200,6 +204,7 @@ pub(super) fn resolve(
         &rows,
         recurrent_state_bytes,
         &domain,
+        resolver.graph_domain()?,
         poll_budget,
     )
     .map(Some)
@@ -211,6 +216,7 @@ pub(super) fn validate_domain(
     rows: &[PlanningShapeRow<'_>],
     recurrent_state_bytes: u64,
     domain: &PlanningShapeDomain<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>,
+    graph_domain: PlanningGraphDomain,
     poll_budget: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<PlanningShapeDomain<WaveExecutionShape>, PlanningUnknownReason> {
     if domain.shapes().is_empty() || domain.shapes().len() > 256 {
@@ -240,7 +246,7 @@ pub(super) fn validate_domain(
         }
         let shape = canonical_cost_shape(canonical)?;
         if shape.path != snapshot.capabilities.path
-            || shape.graph_state != snapshot.capabilities.graph_state
+            || !graph_domain.accepts(snapshot.capabilities.graph_state, shape.graph_state)
             || shape.order != snapshot.capabilities.order
         {
             return Err(PlanningUnknownReason::InvalidShapeEvidence);
