@@ -41,6 +41,7 @@ fn manifest() -> manifest::Manifest {
     };
     value.validation_model = manifest::ValidationSource::StructuredWholeWaveV2 {
         capture: CaptureConfigV2 {
+            warmup: Vec::new(),
             profile: "profile10.json".into(),
             source: "source3.jsonl".into(),
             scope,
@@ -204,4 +205,55 @@ fn structured_v2_failed_source_cannot_authorize_export() {
     assert!(report::require_exportable(&source, true).is_err());
     // A report fixture has no live/private receipt; success here still requires
     // the independent source3 replay inside the actual profile10 exporter.
+}
+
+#[test]
+fn structured_v2_warmup_is_hashed_but_never_enters_three_phase_slots() {
+    let mut value = manifest();
+    let old_wire = serde_json::to_value(&value).unwrap();
+    assert!(old_wire["validation_model"]["capture"]
+        .get("warmup")
+        .is_none());
+    let loaded: manifest::Manifest = serde_json::from_value(old_wire).unwrap();
+    assert!(loaded.validation_model.warmup_v2().is_empty());
+    let before = config::cohort_plan(&value, |_, _| Ok(73)).unwrap();
+    let before_hash = before
+        .signature(&serde_json::to_value(&value).unwrap())
+        .unwrap();
+    let mut warmup = value.training[0].clone();
+    warmup.repetitions = NonZeroUsize::new(3).unwrap();
+    let manifest::ValidationSource::StructuredWholeWaveV2 { capture, .. } =
+        &mut value.validation_model
+    else {
+        unreachable!()
+    };
+    capture.warmup.push(warmup);
+    value.validate().unwrap();
+    let after = config::cohort_plan(&value, |_, phase| {
+        assert!(matches!(
+            phase,
+            super::super::report::Phase::Training
+                | super::super::report::Phase::Residual
+                | super::super::report::Phase::Qualification
+        ));
+        Ok(73)
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
+    assert_ne!(
+        before_hash,
+        after
+            .signature(&serde_json::to_value(&value).unwrap())
+            .unwrap()
+    );
+    let manifest::ValidationSource::StructuredWholeWaveV2 { capture, .. } =
+        &mut value.validation_model
+    else {
+        unreachable!()
+    };
+    capture.warmup[0].prompts[0] = 1;
+    assert!(value.validate().is_err());
 }

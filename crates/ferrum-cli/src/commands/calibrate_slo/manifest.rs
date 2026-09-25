@@ -58,6 +58,11 @@ pub(super) enum ValidationSource {
         capture: structured::CaptureConfig,
         residual: Vec<Cohort>,
     },
+    /// Independent observation only; no source members or model are created.
+    StructuredDiscoveryV2 {
+        #[serde(default)]
+        warmup: Vec<Cohort>,
+    },
     StructuredWholeWaveV2 {
         capture: structured_v2::CaptureConfigV2,
         residual: Vec<Cohort>,
@@ -65,6 +70,16 @@ pub(super) enum ValidationSource {
 }
 
 impl ValidationSource {
+    pub(super) fn is_discovery_v2(&self) -> bool {
+        matches!(self, Self::StructuredDiscoveryV2 { .. })
+    }
+    pub(super) fn warmup_v2(&self) -> &[Cohort] {
+        match self {
+            Self::StructuredDiscoveryV2 { warmup } => warmup,
+            Self::StructuredWholeWaveV2 { capture, .. } => &capture.warmup,
+            _ => &[],
+        }
+    }
     pub(super) fn structured_v2(&self) -> Option<&structured_v2::CaptureConfigV2> {
         match self {
             Self::StructuredWholeWaveV2 { capture, .. } => Some(capture),
@@ -140,7 +155,7 @@ impl ValidationSource {
             Self::StructuredWholeWaveV2 { capture, .. } => {
                 Some((&capture.profile, &capture.source))
             }
-            Self::LiveFrozen => None,
+            Self::LiveFrozen | Self::StructuredDiscoveryV2 { .. } => None,
         }
     }
 }
@@ -298,7 +313,7 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
         ValidationSource::StructuredWholeWaveV2 { capture, .. } => {
             Some((&mut capture.profile, &mut capture.source))
         }
-        ValidationSource::LiveFrozen => None,
+        ValidationSource::LiveFrozen | ValidationSource::StructuredDiscoveryV2 { .. } => None,
     };
     if let Some((profile, source)) = destinations {
         for target in [profile, source] {
@@ -316,6 +331,7 @@ impl Manifest {
             .iter()
             .chain(self.validation_model.residual())
             .chain(&self.validation)
+            .chain(self.validation_model.warmup_v2())
     }
 
     pub(super) fn validate(&self) -> Result<()> {
@@ -346,6 +362,13 @@ impl Manifest {
         if let Some(capture) = self.validation_model.structured_v2() {
             capture.validate(self)?;
         }
+        let discovery = self.validation_model.is_discovery_v2();
+        if discovery && (self.reference.is_some() || !self.validation.is_empty()) {
+            return invalid("structured discovery needs independent discovery cohorts without reference or validation populations");
+        }
+        if self.validation_model.warmup_v2().len() > 256 {
+            return invalid("structured warmup exceeds 256 cohorts");
+        }
         if self.input_preprocessing_sha256 == [0; 32] {
             return invalid("calibration requires a nonzero preprocessing digest");
         }
@@ -369,7 +392,7 @@ impl Manifest {
         if prompt_count == 0
             || prompt_count > 4096
             || self.training.is_empty()
-            || self.validation.is_empty()
+            || (!discovery && self.validation.is_empty())
             || self.training.len() > 256
             || self.validation.len() > 256
         {

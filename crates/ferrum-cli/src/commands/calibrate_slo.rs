@@ -181,7 +181,9 @@ pub async fn execute(cmd: CalibrateSloCommand, config: CliConfig) -> Result<()> 
     if let Some(error) = error {
         return Err(error);
     }
-    if manifest.validation_model.structured_v2().is_some() {
+    if manifest.validation_model.is_discovery_v2() {
+        println!("Independent structured discovery observations written; freeze the next capture scope in a separate manifest.");
+    } else if manifest.validation_model.structured_v2().is_some() {
         println!("Structured V2 complete-cohort source3 and profile10 written; pending/Length coverage is an empirical challenge, not a serving SLO certificate.");
     } else if manifest.validation_model.structured().is_some() {
         println!("Structured fit/residual/qualification source and schema-9 profile written. Qualification is not a p99 guarantee, serving SLO certificate or full future-route coverage claim.");

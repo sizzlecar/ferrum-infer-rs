@@ -185,13 +185,24 @@ pub(super) fn validate_export_configuration(
         }
     }
     let structured_v2 = manifest.validation_model.structured_v2();
-    if structured_v2.is_some()
+    let discovery_v2 = manifest.validation_model.is_discovery_v2();
+    if (structured_v2.is_some() || discovery_v2)
         != (policy.cost_observation.predictor
             == ferrum_types::SloCostPredictor::StructuredWholeWaveV2)
     {
         return Err(FerrumError::config(
             "structured V2 predictor and source3/profile10 live protocol must match exactly",
         ));
+    }
+    if discovery_v2 {
+        manifest.validate()?;
+        let observation = &policy.cost_observation;
+        if observation.structured_capture != ferrum_types::SloStructuredCostCapture::HostSettledV1
+            || observation.profile_export.is_some()
+            || policy.cost_profile.is_some()
+        {
+            return Err(FerrumError::config("structured discovery requires fresh HostSettledV1 observations without profile import or export"));
+        }
     }
     if let Some(capture) = structured_v2 {
         capture.validate(manifest)?;

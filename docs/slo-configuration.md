@@ -1028,3 +1028,42 @@ resident/free bytes, process-claimed bytes and the effective device ceiling.
 The zero model-wave counts describe this resource-only path. Ordinary startup
 and device-program preparation retain their separate existing report fields.
 The typed option is included in the effective runtime configuration snapshot.
+
+### 独立结构化 V2 发现与暖机
+
+`calibrate-slo` 可先执行独立发现，再用另一份事前冻结的 manifest 采集模型。
+发现模式不需要预先知道 owner/domain，仍使用实际 native executor、完整请求预算、
+credited 输出和原有 cohort driver。SLO 配置须显式选择 `observe`、`complete-requests`、
+`credited` transport、`structured_whole_wave_v2` predictor 与 `host_settled_v1` capture；
+不能导入已有 cost profile 或启用 legacy profile export。
+
+在原 manifest 中设置：
+
+```json
+"validation_model": {
+  "kind": "structured_discovery_v2",
+  "warmup": []
+},
+"validation": []
+```
+
+`training` 此时是独立发现 cohort 列表；`warmup` 接受相同的 cohort 结构。
+先完整执行并排空所有暖机请求，再完整执行发现请求。Reference 模式与发现模式互斥。
+重复数、输入索引、rolling window、wave plan、全部 fresh owner、超时及 raw 字节限制
+同时覆盖暖机与发现，达到目标波次后不会缩短请求。
+
+报告的 `summary.structured_discovery_v2` 只汇总 Discovery phase 中的原始 typed
+receipt，保留 owner/domain、pending/Length 计数和位置、同一波次的联合计数，以及
+与 raw 逐波数据同序的 basis/support 数值范围。范围端点不代表实际共同出现的输入；
+位置并集也不代表同时出现的 pending/Length 组合。Unknown 原因单独计数。
+清单最多保留 128 个域、65,536 个数值坐标、16,384 个联合计数项；达到限额后
+`inventory_truncated` 会保持为 true，原逐波 raw 仍受原字节上限约束。
+`collection_completed` 只表示完整 cohort driver 已成功返回；模型资格与 SLO 达标
+不能从此字段、样本最小数或发现清单推出。
+
+随后显式使用 `structured_whole_wave_v2` 采集模式，冻结实际发现的 owner、numeric
+membership windows、覆盖挑战及三阶段完整请求计划。其 `capture` 也接受可选
+`warmup` cohort 列表：完整 manifest 及采集 options 在暖机前固定，原 source 只在
+暖机排空后读取真实 opening clock/FIFO cut。暖机进入完整 manifest 摘要，但不成为
+fit/residual/qualification 的请求槽或成员。省略 `capture.warmup` 保持原行为。
+发现本身不会创建模型 source、训练成员或 profile10，不会授予未观测未来分支资格。

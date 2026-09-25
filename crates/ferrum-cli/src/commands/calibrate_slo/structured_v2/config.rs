@@ -11,6 +11,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CaptureConfigV2 {
+    /// Complete requests executed after options freeze and before source opening.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::commands::calibrate_slo) warmup: Vec<manifest::Cohort>,
     pub profile: PathBuf,
     pub source: PathBuf,
     pub scope: StructuredScopeV2,

@@ -16,6 +16,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
 };
+pub(super) use structured_discovery_v2::DiscoverySummaryV2;
 
 #[derive(Default, Serialize)]
 pub(super) struct Summary {
@@ -46,6 +47,8 @@ pub(super) struct Summary {
     pub structured_calibration: Option<structured::StructuredReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_calibration_v2: Option<structured_v2::StructuredReportV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_discovery_v2: Option<DiscoverySummaryV2>,
     pub phases: PhaseCounts,
     pub reference_frozen_plan: Option<serde_json::Value>,
     pub reference: Option<reference::ReferenceReceipt>,
@@ -310,6 +313,9 @@ impl Artifacts {
         if let Some(discovery) = structured_discovery_v2::inspect(self.structured_capture, || {
             report.structured_cost_input_v2()
         }) {
+            if let Some(inventory) = &mut totals.structured_discovery_v2 {
+                inventory.observe(phase, &discovery);
+            }
             record["structured_cost_discovery_v2"] =
                 serde_json::to_value(discovery).map_err(json_error)?;
         }
@@ -324,7 +330,11 @@ impl Artifacts {
     ) -> Result<()> {
         self.raw.flush().map_err(io_error)?;
         let validation_scope = if self.manifest["validation_model"]["kind"]
-            == "structured_whole_wave_v1"
+            == "structured_discovery_v2"
+        {
+            "independent complete-cohort discovery only; no source membership, trained model, qualification or future horizon authorization"
+        } else if self.manifest["validation_model"]["kind"] == "structured_whole_wave_v1"
+            || self.manifest["validation_model"]["kind"] == "structured_whole_wave_v2"
         {
             "manifest validation cohorts are the third independent live qualification population; no fourth heldout, p99 guarantee, complete future horizon or serving SLO compliance is established"
         } else {

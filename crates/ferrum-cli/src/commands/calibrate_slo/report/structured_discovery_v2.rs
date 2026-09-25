@@ -6,8 +6,10 @@ use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
 };
 use ferrum_types::SloStructuredCostCapture;
 use serde::{Serialize, Serializer};
+mod summary;
+pub(in crate::commands::calibrate_slo) use summary::DiscoverySummaryV2;
 #[derive(Serialize)]
-pub(super) struct DiscoveryReportV2 {
+pub(in crate::commands::calibrate_slo) struct DiscoveryReportV2 {
     model_revision: &'static str,
     #[serde(flatten)]
     input: DiscoveryInputV2,

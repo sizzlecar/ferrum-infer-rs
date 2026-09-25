@@ -14,7 +14,18 @@ pub(crate) async fn collect(
         .validation_model
         .structured_v2()
         .ok_or_else(|| FerrumError::internal("V2 driver needs its explicit manifest"))?;
+    // Freeze the full payload and scope before any warmup outcome is known.
     let options = capture.options(manifest, inputs, session)?;
+    discovery::complete_cases(
+        session,
+        manifest,
+        inputs,
+        &capture.warmup,
+        Phase::Warmup,
+        artifacts,
+        summary,
+    )
+    .await?;
     summary.structured_calibration_v2 = Some(StructuredReportV2::new(capture.scope.clone()));
     session
         .begin_structured_cost_calibration_v2(options)
