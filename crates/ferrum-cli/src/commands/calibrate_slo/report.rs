@@ -1,4 +1,6 @@
 use super::*;
+
+mod structured_discovery;
 use ferrum_engine::continuous_engine::{
     CalibrationCommittedWork, CalibrationObservation, CalibrationWaveReport, HostStageCompleteness,
     HostStageEvidenceV1,
@@ -145,6 +147,7 @@ pub(super) struct Artifacts {
     limit: u64,
     hash: Sha256,
     manifest: serde_json::Value,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl Artifacts {
@@ -173,7 +176,14 @@ impl Artifacts {
             limit: manifest.protocol.maximum_raw_bytes.get(),
             hash: Sha256::new(),
             manifest: serde_json::to_value(manifest).map_err(json_error)?,
+            structured_capture: ferrum_types::SloStructuredCostCapture::Disabled,
         })
+    }
+
+    /// Read once from the actual created session, never from raw JSON or the
+    /// requested manifest. Disabled capture must not evaluate discovery.
+    pub(super) fn set_structured_capture(&mut self, mode: ferrum_types::SloStructuredCostCapture) {
+        self.structured_capture = mode;
     }
 
     pub(super) fn record(&mut self, value: &serde_json::Value) -> Result<()> {
@@ -282,14 +292,19 @@ impl Artifacts {
         let selected_prediction = selected_model.map_or(serde_json::Value::Null, |model| {
             selected_prediction(model.evaluate_selected_wave(report), totals)
         });
-        self.record(
-            &serde_json::json!({"schema_version":1,"event":"wave", "phase":phase,
+        let mut record = serde_json::json!({"schema_version":1,"event":"wave", "phase":phase,
             "case":case,"repetition":repetition,"submission":format!("{:?}",report.submission),
             "error":report.error.as_ref().map(ToString::to_string),"evidence":evidence,
             "host_stages":report.host_stages.as_deref().map(|stages| stages.structured_diagnostic_view()),"host_stage_queue":report.host_stage_queue,
             "host_content_frozen_prediction":host_prediction,
-            "selected_whole_wave_frozen_prediction":selected_prediction}),
-        )
+            "selected_whole_wave_frozen_prediction":selected_prediction});
+        if let Some(discovery) = structured_discovery::inspect(self.structured_capture, || {
+            report.structured_cost_input()
+        }) {
+            record["structured_cost_discovery"] =
+                serde_json::to_value(discovery).map_err(json_error)?;
+        }
+        self.record(&record)
     }
 
     pub(super) fn finish(

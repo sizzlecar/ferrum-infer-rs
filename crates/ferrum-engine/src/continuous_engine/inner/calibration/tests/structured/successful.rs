@@ -5,7 +5,9 @@ use crate::continuous_engine::inner::cost_observation::EngineCostRuntime;
 use crate::continuous_engine::inner::slo_controller::tests::fixture::fixture_with_custom_config;
 use ferrum_interfaces::execution_cost::*;
 use ferrum_interfaces::output_flow::OutputCompletion;
-use ferrum_scheduler::implementations::continuous::cost_model::structured::StructuredInputV1;
+use ferrum_scheduler::implementations::continuous::cost_model::structured::{
+    StructuredScopeV1, StructuredUnknown,
+};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicU64;
 
@@ -137,42 +139,6 @@ async fn completed_request(
     reports
 }
 
-/// Independent discovery reads the real qualified shape. It does not forge a
-/// numeric observation or bypass the collector's later source/session binding.
-fn discovery_input(report: &CalibrationWaveReport) -> StructuredInputV1 {
-    let stages = report.host_stages.as_ref().unwrap();
-    let shape = stages.actual_shape.as_ref().unwrap();
-    let selected = stages.statistical_evidence.as_ref().unwrap();
-    let recipe = stages
-        .structured_evidence
-        .as_ref()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .recipe();
-    let exact = CanonicalWaveCostShape {
-        kind: ActualWaveKind::Decode,
-        path: ActualWavePath::PlanRuntime,
-        graph: ActualWaveGraphState::Disabled,
-        row_order: ActualWaveRowOrder::Ordered,
-        provider_signature: shape.provider_signature,
-        output_policy_signature: shape.output_policy_signature,
-        numeric_features: shape.numeric_features.clone(),
-        host_content_features: shape.host_content_features,
-        row_multiset_features: shape.row_multiset_features.clone(),
-        rows: stages
-            .rows
-            .iter()
-            .map(|row| match row.actual_work {
-                HostStageWork::Decode { kv_tokens } => ActualRowWork::Decode { kv_tokens },
-                _ => panic!("discovery scope must be actual decode"),
-            })
-            .collect(),
-        recurrent_state_bytes: shape.recurrent_state_bytes,
-    };
-    StructuredInputV1::from_future(&exact, selected, recipe).unwrap()
-}
-
 #[tokio::test]
 async fn structured_collector_real_driver_completes_three_frozen_populations_and_raw_recipe() {
     let (mut session, executor) = observed_session().await;
@@ -181,7 +147,7 @@ async fn structured_collector_real_driver_completes_three_frozen_populations_and
     // output policy are repeated, never selected from qualification outcomes.
     let protocol: [u8;32]=Sha256::digest(b"controlled-cpu/full-logits/plain-text/rows1/max5;warmup=one-complete-request;fit=4;residual=4;qualification=2").into();
     let warmup = completed_request(&mut session, &executor).await;
-    let independent = discovery_input(&warmup[1]);
+    let independent = warmup[1].structured_cost_input().unwrap();
     let mut config = options(&path.0);
     config.protocol_sha256 = protocol;
     config.scope.domain_signature = *independent.domain_signature();
@@ -408,4 +374,82 @@ async fn structured_collector_real_driver_completes_three_frozen_populations_and
     assert_eq!(snapshot.fingerprint(), fingerprint);
     bounded(runtime.shutdown()).await.unwrap();
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn structured_discovery_reads_real_completed_waves_without_opening_a_collector() {
+    let (mut session, executor) = observed_session().await;
+    let reports = completed_request(&mut session, &executor).await;
+    let before = bounded(session.freeze_cost_model())
+        .await
+        .unwrap()
+        .accepted_ordinal();
+    assert!(session.structured_cost_progress().is_none());
+    assert!(matches!(
+        reports[0].structured_cost_input(),
+        Err(StructuredUnknown::UnsupportedScope)
+    ));
+    let ordinary = reports[1].structured_cost_input().unwrap();
+    assert_eq!(
+        ordinary.scope(),
+        StructuredScopeV1::OrdinaryDecodeSingleLength { rows: 1 }
+    );
+    assert_ne!(*ordinary.domain_signature(), [0; 32]);
+    let terminal = reports.last().unwrap().structured_cost_input().unwrap();
+    assert_eq!(ordinary.domain_signature(), terminal.domain_signature());
+    assert_ne!(ordinary.regression_axes(), terminal.regression_axes());
+    let after = bounded(session.freeze_cost_model())
+        .await
+        .unwrap()
+        .accepted_ordinal();
+    assert_eq!(before, after, "discovery must not publish new FIFO entries");
+    assert!(session.structured_cost_progress().is_none());
+    bounded(session.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn structured_discovery_rejects_changed_outer_shape_and_still_ordered_clock() {
+    let (mut session, executor) = observed_session().await;
+    let mut reports = completed_request(&mut session, &executor).await;
+    let report = &mut reports[1];
+    let original = Arc::clone(report.host_stages.as_ref().unwrap());
+    report.structured_cost_input().unwrap();
+    Arc::make_mut(report.host_stages.as_mut().unwrap())
+        .actual_shape
+        .as_mut()
+        .unwrap()
+        .recurrent_state_bytes += 1;
+    assert!(matches!(
+        report.structured_cost_input(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    report.host_stages = Some(Arc::clone(&original));
+    // Still after settlement: chronology alone cannot catch this forged wall.
+    let stages = Arc::make_mut(report.host_stages.as_mut().unwrap());
+    stages.finalized_at_ns = Some(stages.finalized_at_ns.unwrap() + 1);
+    assert!(matches!(
+        report.structured_cost_input(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    report.host_stages = Some(Arc::clone(&original));
+    report.structured_cost_input().unwrap();
+    report.submission = CalibrationSubmissionState::Submitted;
+    assert!(matches!(
+        report.structured_cost_input(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    report.submission = CalibrationSubmissionState::HostReconciled;
+    report.host_stages = None;
+    assert!(matches!(
+        report.structured_cost_input(),
+        Err(StructuredUnknown::MissingEvidence)
+    ));
+    report.host_stages = Some(original);
+    report.error = Some(FerrumError::internal("failed physical wave"));
+    assert!(matches!(
+        report.structured_cost_input(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    assert!(session.structured_cost_progress().is_none());
+    bounded(session.shutdown()).await.unwrap();
 }

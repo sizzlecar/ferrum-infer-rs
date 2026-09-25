@@ -7,6 +7,8 @@ pub use super::super::cost_observation::{
 };
 use super::*;
 
+mod discovery;
+
 pub(super) fn capture_error(error: impl std::fmt::Display) -> FerrumError {
     FerrumError::config(format!("structured calibration: {error}"))
 }

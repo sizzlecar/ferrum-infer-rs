@@ -131,3 +131,51 @@ pub(in crate::continuous_engine::inner::cost_observation) fn inspect_numeric_obs
 ) -> Result<StructuredNumericObservationV1, StructuredUnknown> {
     whole_wave_numeric_observation(entry, accepted_ordinal, session)
 }
+
+/// Only returns a numerical input for independent discovery. In particular it
+/// never manufactures the original FIFO/session/member binding required above.
+pub(in crate::continuous_engine) fn structured_discovery_input(
+    stages: &Arc<HostStageEvidenceV1>,
+) -> Result<StructuredInputV1, StructuredUnknown> {
+    let qualified = stages
+        .structured_evidence
+        .as_ref()
+        .ok_or(StructuredUnknown::MissingEvidence)?
+        .as_ref()
+        .map_err(|_| StructuredUnknown::MissingEvidence)?;
+    qualified
+        .validate_host_stages(stages)
+        .map_err(|_| StructuredUnknown::InvalidSample)?;
+    // Composite is the converter's stages-only compatibility tag. It does not
+    // claim the legacy sample was rejected, or grant any training authority.
+    // All identity, chronology, row and selected-route checks still run against
+    // the original receipt and original stages inside complete_observation.
+    let entry = CostEvidenceEntry::StagesOnly {
+        stages: Arc::clone(stages),
+        legacy_rejection: CostCallRejection::Composite,
+    };
+    let actual = host_content::statistical::complete_observation(&entry)
+        .map_err(|_| StructuredUnknown::InvalidSample)?;
+    if actual.wall_ns != qualified.full_wall_ns() {
+        return Err(StructuredUnknown::InvalidSample);
+    }
+    let recipe = qualified.recipe();
+    if recipe.physical_host_rows().len() != stages.rows.len() {
+        return Err(StructuredUnknown::InvalidSample);
+    }
+    for (declared, observed) in recipe.physical_host_rows().iter().zip(&stages.rows) {
+        match (declared.terminal_expectation, observed.terminal.as_ref()) {
+            (HostTerminalExpectationV1::TokenMayTerminate, None) => {}
+            (HostTerminalExpectationV1::LengthBoundary, Some(terminal))
+                if terminal.finish_reason == FinishReason::Length => {}
+            _ => return Err(StructuredUnknown::UnsupportedScope),
+        }
+    }
+    let input = StructuredInputV1::from_future(&actual.exact, &actual.selected, recipe)?;
+    // Match the numerical core's hard settings ceiling. Discovery must not
+    // create an unbounded raw report even before settings are frozen.
+    if input.regression_axes().len() > 4096 || input.joint_support_coordinates().len() > 4096 {
+        return Err(StructuredUnknown::Capacity);
+    }
+    Ok(input)
+}

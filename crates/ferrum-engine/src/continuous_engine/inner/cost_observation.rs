@@ -42,6 +42,7 @@ mod trainer;
 mod worker;
 pub(in crate::continuous_engine) use engine::*;
 pub(in crate::continuous_engine) use runtime::*;
+pub(in crate::continuous_engine) use trainer::structured::structured_discovery_input;
 mod presubmit;
 mod sample;
 mod selected_feedback;

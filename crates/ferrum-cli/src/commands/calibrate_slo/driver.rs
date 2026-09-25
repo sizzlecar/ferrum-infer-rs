@@ -23,6 +23,14 @@ pub(super) async fn collect(
     artifacts: &mut report::Artifacts,
     summary: &mut report::Summary,
 ) -> Result<()> {
+    artifacts.set_structured_capture(
+        session
+            .configuration()
+            .scheduler
+            .slo
+            .cost_observation
+            .structured_capture,
+    );
     if manifest.validation_model.structured().is_some() {
         return structured::collect(session, manifest, inputs, artifacts, summary).await;
     }
