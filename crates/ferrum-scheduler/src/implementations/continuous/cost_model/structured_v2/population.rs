@@ -26,6 +26,49 @@ pub struct StructuredAlgorithmFactV2 {
     pub kind: AlgorithmWorkKindV1,
 }
 impl StructuredOwnerFactsV2 {
+    /// Numerical replay only. The importer validates the complete original
+    /// ledger; this helper cannot mint a live recipe or settlement receipt.
+    pub(in crate::implementations::continuous) fn from_replay_parts(
+        rows: &[StructuredHostRowV1],
+        product: StructuredProductV2,
+        readback: CoreReadbackRoute,
+        ordered: [u8; 32],
+        grouped: Option<[u8; 32]>,
+        algorithms: &[(
+            [u8; 32],
+            AlgorithmWorkKindV1,
+            u64,
+            ferrum_interfaces::execution_cost::DeviceNumericWorkV1,
+        )],
+    ) -> Result<Self> {
+        if rows.is_empty() || rows.len() > 128 || algorithms.is_empty() || algorithms.len() > 4096 {
+            return Err(StructuredUnknown::Capacity);
+        }
+        let value = Self {
+            rows: rows
+                .iter()
+                .map(|r| StructuredOwnerRowFactV2 {
+                    role: r.role,
+                    no_generated_history: r.no_generated_history,
+                    installed_policy: r.installed_policy,
+                })
+                .collect(),
+            product,
+            readback,
+            provider_template: grouped
+                .map(StructuredTemplateV2::ProviderGrouped)
+                .unwrap_or(StructuredTemplateV2::Ordered(ordered)),
+            algorithms: algorithms
+                .iter()
+                .map(|(signature, kind, _, _)| StructuredAlgorithmFactV2 {
+                    signature: *signature,
+                    kind: *kind,
+                })
+                .collect(),
+        };
+        value.owner_key()?;
+        Ok(value)
+    }
     pub fn from_prepared(
         exact: &CanonicalWaveCostShape,
         selected: &StatisticalWaveEvidenceV1,

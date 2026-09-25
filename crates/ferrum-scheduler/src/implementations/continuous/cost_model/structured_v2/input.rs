@@ -29,6 +29,33 @@ pub(super) struct PendingQuery {
     pub constraint: HostPendingConstraintV2,
 }
 impl StructuredInputV2 {
+    /// Private numerical reconstruction, not a deserializer for a live receipt
+    /// or forecast. Original Prepared and settled wire bindings are checked by
+    /// the profile10 importer before invoking this shared projection.
+    pub(in crate::implementations::continuous) fn from_replay_parts(
+        exact: &CanonicalWaveCostShape,
+        selected: &StatisticalWaveEvidenceV1,
+        ordered: [u8; 32],
+        grouped: Option<[u8; 32]>,
+        product: StructuredProductV2,
+        readback: CoreReadbackRoute,
+        rows: &[StructuredHostRowV1],
+        algorithms: &[([u8; 32], AlgorithmWorkKindV1, u64, DeviceNumericWorkV1)],
+    ) -> Result<(Self, StructuredOwnerFactsV2)> {
+        let facts = StructuredOwnerFactsV2::from_replay_parts(
+            rows, product, readback, ordered, grouped, algorithms,
+        )?;
+        let owner = facts.owner_key()?;
+        let old = StatisticalModelInputV1::from_future(exact, selected)
+            .map_err(|_| StructuredUnknown::MissingEvidence)?;
+        let input = Self::project_numeric(
+            owner,
+            &old,
+            rows,
+            algorithms.iter().map(|(_, k, n, w)| (*k, *n, *w)),
+        )?;
+        Ok((input, facts))
+    }
     pub fn owner_for(
         exact: &CanonicalWaveCostShape,
         selected: &StatisticalWaveEvidenceV1,

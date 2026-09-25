@@ -828,3 +828,10 @@ pub fn load_cost_profile_bytes(
 
 #[cfg(test)]
 mod tests;
+
+mod structured_v10;
+pub use structured_v10::{
+    export_structured_profile_v10, load_structured_profile_v10, ImportedStructuredModelV2,
+    StructuredImportProvenanceV10, StructuredPhaseProvenanceV10, StructuredProfileExportReceiptV10,
+    StructuredProfilePhaseV10, COST_PROFILE_SCHEMA_VERSION_V10,
+};
