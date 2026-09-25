@@ -10,10 +10,12 @@ mod artifact;
 mod selected;
 pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
 mod structured;
+mod structured_v2;
 pub use structured::{
     StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
     StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
+pub use structured_v2::{StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2};
 mod checkpoint;
 mod evidence;
 mod observation;
@@ -44,6 +46,7 @@ pub struct CalibrationSession {
     selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
     selected_capture_identity: Option<[u8; 32]>,
     structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
+    structured_capture_v2: Option<super::cost_observation::StructuredCalibrationCollectorV2>,
     engine: ContinuousBatchEngine,
     identity: Arc<()>,
     limits: CalibrationLimits,
@@ -84,6 +87,7 @@ impl CalibrationSession {
             selected_capture: None,
             selected_capture_identity: None,
             structured_capture: None,
+            structured_capture_v2: None,
             engine,
             identity: Arc::new(()),
             limits,
@@ -144,6 +148,7 @@ impl CalibrationSession {
             }
         }
         let id = request.id.clone();
+        let declared_maximum = request.sampling_params.max_tokens as u64;
         let output = self
             .engine
             .infer_credited_stream(request, context, contract)
@@ -156,7 +161,14 @@ impl CalibrationSession {
             .get(&id)
             .and_then(|sequence| sequence.cost_frontier)
         {
-            self.reference_origins.insert(id, origin);
+            self.reference_origins.insert(id.clone(), origin);
+        }
+        if let Some(collector) = &mut self.structured_capture_v2 {
+            if collector.collecting() {
+                if let Err(error) = collector.admitted(id, declared_maximum) {
+                    collector.invalidate(error.to_string());
+                }
+            }
         }
         Ok(output)
     }
@@ -218,6 +230,7 @@ impl CalibrationSession {
             self.indeterminate |= report.submission == CalibrationSubmissionState::InFlightUnknown;
             self.record_selected_capture(&receipt, &mut report)?;
             self.record_structured_capture(&receipt, &report);
+            self.record_structured_v2_capture(&receipt, &report);
             return Ok(CalibrationTurn::Reaped(report));
         }
         if self.indeterminate {
@@ -276,6 +289,13 @@ impl CalibrationSession {
                         collector.invalidate(error.to_string());
                     }
                 }
+                if let Some(collector) = &mut self.structured_capture_v2 {
+                    if collector.collecting() {
+                        if let Err(error) = collector.offer(&rows) {
+                            collector.invalidate(error.to_string());
+                        }
+                    }
+                }
                 let preparation =
                     inner.prepare_calibration_wave(&rows, self.limits.maximum_requests());
                 let prepared = match preparation {
@@ -313,6 +333,28 @@ impl CalibrationSession {
                         }
                     }
                 }
+                if let Some(collector) = &mut self.structured_capture_v2 {
+                    if collector.collecting() {
+                        match prepared.structured_prepared_facts(&inner) {
+                            Ok(facts) => {
+                                if let Err(error) = collector.reserve_prepared(facts) {
+                                    collector.invalidate(error.to_string());
+                                }
+                            }
+                            Err(error) => collector.invalidate(error.to_string()),
+                        }
+                    }
+                    if collector.collecting() {
+                        match collector.pending_capture() {
+                            Ok(capture) => {
+                                if let Err(error) = receipt.bind_structured_capture(capture) {
+                                    collector.invalidate(error.to_string());
+                                }
+                            }
+                            Err(error) => collector.invalidate(error.to_string()),
+                        }
+                    }
+                }
                 self.pending = Some(Arc::clone(&receipt));
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;
@@ -322,6 +364,7 @@ impl CalibrationSession {
                     report.submission == CalibrationSubmissionState::InFlightUnknown;
                 self.record_selected_capture(&receipt, &mut report)?;
                 self.record_structured_capture(&receipt, &report);
+                self.record_structured_v2_capture(&receipt, &report);
                 Ok(CalibrationTurn::Wave(report))
             }
         }

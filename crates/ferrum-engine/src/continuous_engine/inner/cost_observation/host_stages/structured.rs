@@ -44,6 +44,9 @@ impl QualifiedStructuredWaveEvidenceV1 {
     pub fn recipe(&self) -> &UnsettledStructuredWaveEvidenceV1 {
         &self.recipe
     }
+    pub(in crate::continuous_engine::inner::cost_observation) fn stage_binding(&self) -> [u8; 32] {
+        self.stage_binding
+    }
     pub fn full_wall_ns(&self) -> u64 {
         self.full_wall_ns
     }

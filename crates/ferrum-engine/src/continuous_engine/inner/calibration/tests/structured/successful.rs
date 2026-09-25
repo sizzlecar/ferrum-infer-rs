@@ -453,3 +453,48 @@ async fn structured_discovery_rejects_changed_outer_shape_and_still_ordered_cloc
     assert!(session.structured_cost_progress().is_none());
     bounded(session.shutdown()).await.unwrap();
 }
+
+#[tokio::test]
+async fn structured_v2_discovery_keeps_original_receipt_clock_and_outer_shape_binding() {
+    let (mut session, executor) = observed_session().await;
+    let mut reports = completed_request(&mut session, &executor).await;
+    let before = bounded(session.freeze_cost_model())
+        .await
+        .unwrap()
+        .accepted_ordinal();
+    let report = &mut reports[1];
+    let original = Arc::clone(report.host_stages.as_ref().unwrap());
+    let input = report.structured_cost_input_v2().unwrap();
+    assert_eq!(input.owner().rows, 1);
+    assert_ne!(*input.domain_signature(), [0; 32]);
+    Arc::make_mut(report.host_stages.as_mut().unwrap())
+        .actual_shape
+        .as_mut()
+        .unwrap()
+        .recurrent_state_bytes += 1;
+    assert!(matches!(
+        report.structured_cost_input_v2(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    report.host_stages = Some(Arc::clone(&original));
+    let stages = Arc::make_mut(report.host_stages.as_mut().unwrap());
+    stages.finalized_at_ns = Some(stages.finalized_at_ns.unwrap() + 1);
+    assert!(matches!(
+        report.structured_cost_input_v2(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    report.host_stages = Some(original);
+    report.structured_cost_input_v2().unwrap();
+    report.submission = CalibrationSubmissionState::Submitted;
+    assert!(matches!(
+        report.structured_cost_input_v2(),
+        Err(StructuredUnknown::InvalidSample)
+    ));
+    let after = bounded(session.freeze_cost_model())
+        .await
+        .unwrap()
+        .accepted_ordinal();
+    assert_eq!(before, after);
+    assert!(session.structured_cost_progress_v2().is_none());
+    bounded(session.shutdown()).await.unwrap();
+}

@@ -14,7 +14,7 @@ pub struct SelectedCalibrationOptions {
 }
 
 impl CalibrationSession {
-    fn selected_phase_boundary(&self) -> Result<()> {
+    pub(super) fn selected_phase_boundary(&self) -> Result<()> {
         if self.pending.is_some()
             || self.indeterminate
             || !self.frontiers()?.is_empty()
@@ -32,7 +32,10 @@ impl CalibrationSession {
         options: SelectedCalibrationOptions,
     ) -> Result<()> {
         self.selected_phase_boundary()?;
-        if self.selected_capture_identity.is_some() || self.structured_capture.is_some() {
+        if self.selected_capture_identity.is_some()
+            || self.structured_capture.is_some()
+            || self.structured_capture_v2.is_some()
+        {
             return Err(FerrumError::invalid_request(
                 "selected calibration already started",
             ));

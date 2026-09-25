@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 mod host_content;
 mod selected;
 pub(super) mod structured;
+pub(super) mod structured_v2;
 pub(super) use host_content::statistical::whole_wave_observation;
 
 pub(super) struct CostTrainingState {
