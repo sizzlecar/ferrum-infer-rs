@@ -5,6 +5,7 @@ use super::support::JointSupport;
 use super::*;
 use ferrum_interfaces::{execution_cost::*, vnext::DeviceCommandPhase};
 mod phases;
+mod required_demand;
 
 fn wave(
     terminal: usize,

@@ -184,20 +184,7 @@ pub(super) fn project<'epoch>(
     evidence_requirement: PlanningCostEvidenceRequirement,
     poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
 ) -> Result<Option<VerifiedExecution<'epoch>>, PlanningUnknownReason> {
-    if !super::candidates::within_work_envelope(&snapshot.capabilities, requests, work, poll)? {
-        return Ok(None);
-    }
-    let mut failure = None;
-    let prepared = shape::legal_rows(snapshot, requests, work, &mut || match poll() {
-        Ok(()) => true,
-        Err(reason) => {
-            failure = Some(reason);
-            false
-        }
-    });
-    if let Some(reason) = failure {
-        return Err(reason);
-    }
+    let prepared = shape::validate_work(snapshot, requests, work, poll)?;
     let Some((kind, rows, recurrent_state_bytes)) = prepared else {
         return Ok(None);
     };

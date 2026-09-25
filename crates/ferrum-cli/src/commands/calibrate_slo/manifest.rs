@@ -63,6 +63,12 @@ pub(super) enum ValidationSource {
         #[serde(default)]
         warmup: Vec<Cohort>,
     },
+    /// Read-only finite path requirements against genuine imported seed/reference.
+    RequiredFutureAuditV2 {
+        #[serde(default)]
+        warmup: Vec<Cohort>,
+        audit: required_audit::AuditConfigV2,
+    },
     StructuredWholeWaveV2 {
         capture: structured_v2::CaptureConfigV2,
         residual: Vec<Cohort>,
@@ -70,12 +76,20 @@ pub(super) enum ValidationSource {
 }
 
 impl ValidationSource {
+    pub(super) fn required_audit(&self) -> Option<&required_audit::AuditConfigV2> {
+        match self {
+            Self::RequiredFutureAuditV2 { audit, .. } => Some(audit),
+            _ => None,
+        }
+    }
     pub(super) fn is_discovery_v2(&self) -> bool {
         matches!(self, Self::StructuredDiscoveryV2 { .. })
     }
     pub(super) fn warmup_v2(&self) -> &[Cohort] {
         match self {
-            Self::StructuredDiscoveryV2 { warmup } => warmup,
+            Self::StructuredDiscoveryV2 { warmup } | Self::RequiredFutureAuditV2 { warmup, .. } => {
+                warmup
+            }
             Self::StructuredWholeWaveV2 { capture, .. } => &capture.warmup,
             _ => &[],
         }
@@ -155,7 +169,9 @@ impl ValidationSource {
             Self::StructuredWholeWaveV2 { capture, .. } => {
                 Some((&capture.profile, &capture.source))
             }
-            Self::LiveFrozen | Self::StructuredDiscoveryV2 { .. } => None,
+            Self::LiveFrozen
+            | Self::StructuredDiscoveryV2 { .. }
+            | Self::RequiredFutureAuditV2 { .. } => None,
         }
     }
 }
@@ -313,7 +329,9 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
         ValidationSource::StructuredWholeWaveV2 { capture, .. } => {
             Some((&mut capture.profile, &mut capture.source))
         }
-        ValidationSource::LiveFrozen | ValidationSource::StructuredDiscoveryV2 { .. } => None,
+        ValidationSource::LiveFrozen
+        | ValidationSource::StructuredDiscoveryV2 { .. }
+        | ValidationSource::RequiredFutureAuditV2 { .. } => None,
     };
     if let Some((profile, source)) = destinations {
         for target in [profile, source] {
@@ -362,7 +380,11 @@ impl Manifest {
         if let Some(capture) = self.validation_model.structured_v2() {
             capture.validate(self)?;
         }
-        let discovery = self.validation_model.is_discovery_v2();
+        let audit = self.validation_model.required_audit();
+        if let Some(audit) = audit {
+            audit.validate(self)?;
+        }
+        let discovery = self.validation_model.is_discovery_v2() || audit.is_some();
         if discovery && (self.reference.is_some() || !self.validation.is_empty()) {
             return invalid("structured discovery needs independent discovery cohorts without reference or validation populations");
         }

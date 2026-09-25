@@ -114,7 +114,7 @@ impl StructuredScopeV2 {
         {
             return Err(StructuredUnknown::QualificationCoverage);
         }
-        let (minimum, maximum) = if let Some(p) = &query.pending {
+        if let Some(p) = &query.pending {
             if !c.authorized_pending_constraints.contains(&p.constraint)
                 || p.eligible
                     .iter()
@@ -122,20 +122,8 @@ impl StructuredScopeV2 {
             {
                 return Err(StructuredUnknown::UnsupportedScope);
             }
-            let fixed = query
-                .input
-                .pending_positions
-                .iter()
-                .filter(|v| p.eligible.binary_search(v).is_err())
-                .count();
-            (
-                fixed + usize::from(p.constraint == HostPendingConstraintV2::NonEmptySubset),
-                fixed + p.eligible.len(),
-            )
-        } else {
-            let count = query.input.pending_positions.len();
-            (count, count)
-        };
+        }
+        let (minimum, maximum) = query.pending_count_range()?;
         if minimum > maximum
             || (minimum..=maximum).any(|n| {
                 c.pending_counts.binary_search(&(n as u32)).is_err()

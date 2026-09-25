@@ -49,6 +49,8 @@ pub(super) struct Summary {
     pub structured_calibration_v2: Option<structured_v2::StructuredReportV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_discovery_v2: Option<DiscoverySummaryV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_future_audit_v2: Option<required_audit::AuditSummaryV2>,
     pub phases: PhaseCounts,
     pub reference_frozen_plan: Option<serde_json::Value>,
     pub reference: Option<reference::ReferenceReceipt>,

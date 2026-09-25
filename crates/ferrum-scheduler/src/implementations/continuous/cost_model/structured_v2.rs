@@ -21,6 +21,8 @@ pub use input::{StructuredInputV2, StructuredQueryV2};
 pub mod population;
 pub use population::StructuredOwnerFactsV2;
 mod coverage;
+mod demand;
+pub use demand::StructuredQueryDemandV2;
 mod envelope;
 mod fit;
 mod phase;

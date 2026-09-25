@@ -11,6 +11,7 @@ use std::time::Duration;
 
 #[path = "reference/tests.rs"]
 mod reference;
+mod required_audit;
 mod structured;
 mod terminal;
 mod token_policy_residency;

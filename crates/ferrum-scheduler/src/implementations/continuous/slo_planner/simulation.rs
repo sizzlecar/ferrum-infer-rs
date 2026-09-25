@@ -286,38 +286,22 @@ fn apply(
             .position(|request| request.key == work.key)
             .ok_or(SimulationFailure::SequenceViolation)?;
         let request = &state.requests[index];
-        let (new_context, emits_token) = match (&work.action, &request.phase) {
-            (WaveAction::Decode, RequestPhaseView::Decode) => (
-                request
-                    .context_tokens
-                    .checked_add(1)
-                    .ok_or(PlanningUnknownReason::ArithmeticOverflow)?,
-                true,
-            ),
-            (WaveAction::Prefill { offset, count }, RequestPhaseView::Prefill(progress)) => {
-                let end = offset
-                    .checked_add(count.get())
-                    .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
-                (
-                    request.context_tokens.max(end),
-                    // Final PlanRuntime prefill samples one token even when
-                    // rebuilding an existing generation after preemption.
-                    end == progress.total_prompt_tokens.get(),
-                )
-            }
-            _ => return Err(SimulationFailure::SequenceViolation),
-        };
-        if new_context > snapshot.capacity.maximum_context_tokens.get() {
-            return Err(PlanningUnknownReason::OutputOrResourceBlocked.into());
-        }
+        let advance = super::output::work_output_advance(
+            request,
+            &work.action,
+            snapshot.capacity.maximum_context_tokens.get(),
+        )
+        .map_err(|reason| match reason {
+            PlanningUnknownReason::InvalidShapeEvidence => SimulationFailure::SequenceViolation,
+            other => SimulationFailure::Unknown(other),
+        })?;
+        let new_context = advance.context_tokens;
+        let emits_token = advance.emits_token;
         required_kv = required_kv
             .checked_add(u64::from(new_context - request.context_tokens))
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
-        let (output_credit, additional_output_bytes) = if emits_token {
-            request.output_credit.after_token()?
-        } else {
-            (request.output_credit, 0)
-        };
+        let output_credit = advance.output_credit;
+        let additional_output_bytes = advance.additional_output_bytes;
         required_output = required_output
             .checked_add(additional_output_bytes)
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;

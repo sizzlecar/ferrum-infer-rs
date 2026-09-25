@@ -38,7 +38,7 @@ impl ValidationModel {
         source: &manifest::ValidationSource,
     ) -> Result<Self> {
         match source {
-            manifest::ValidationSource::StructuredDiscoveryV2 { .. } | manifest::ValidationSource::StructuredWholeWaveV1 { .. } | manifest::ValidationSource::StructuredWholeWaveV2 {..} => Err(FerrumError::internal(
+            manifest::ValidationSource::RequiredFutureAuditV2 { .. } | manifest::ValidationSource::StructuredDiscoveryV2 { .. } | manifest::ValidationSource::StructuredWholeWaveV1 { .. } | manifest::ValidationSource::StructuredWholeWaveV2 {..} => Err(FerrumError::internal(
                 "structured calibration must use its real three-phase session driver",
             )),
             manifest::ValidationSource::LiveFrozen => {

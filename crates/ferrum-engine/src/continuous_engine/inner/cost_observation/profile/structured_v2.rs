@@ -84,20 +84,7 @@ pub(super) fn predict(
     let result = evidence
         .ok_or(Unknown::MissingEvidence)
         .and_then(|e| e.structured_query_v2_for(shape))
-        .and_then(|query| {
-            let child = snapshot.select(query)?;
-            let (value, model_now) =
-                child.predict_query_local_with_clock(fingerprint, query, local_now)?;
-            Ok(PlanningCost {
-                typical_ns: value.fitted_upper_ns,
-                planning_ns: value.planning_ns,
-                model_version: version,
-                valid_for_ns: value
-                    .valid_until_ns
-                    .checked_sub(model_now)
-                    .ok_or(Unknown::Clock)?,
-            })
-        });
+        .and_then(|query| predict_query(snapshot, fingerprint, query, local_now, version));
     super::super::query_metrics::record_structured_v2(&result);
     match result {
         Ok(value) => Some(value),
@@ -106,6 +93,27 @@ pub(super) fn predict(
             None
         }
     }
+}
+
+// Pure shared lookup: diagnostics neither emit serving-query metrics nor train.
+pub(super) fn predict_query(
+    snapshot: &StructuredSnapshot,
+    fingerprint: &model::ExecutionFingerprint,
+    query: &StructuredQueryV2,
+    local_now: u64,
+    version: u64,
+) -> Result<PlanningCost, Unknown> {
+    let child = snapshot.select(query)?;
+    let (value, model_now) = child.predict_query_local_with_clock(fingerprint, query, local_now)?;
+    Ok(PlanningCost {
+        typical_ns: value.fitted_upper_ns,
+        planning_ns: value.planning_ns,
+        model_version: version,
+        valid_for_ns: value
+            .valid_until_ns
+            .checked_sub(model_now)
+            .ok_or(Unknown::Clock)?,
+    })
 }
 
 #[cfg(test)]

@@ -261,6 +261,31 @@ pub(super) fn validate_domain(
     })
 }
 
+/// Shared production action validation. Costs, clocks and physical execution
+/// remain separate; structural diagnostics must not bypass these rules.
+pub(super) fn validate_work<'a>(
+    snapshot: &SchedulerSnapshot,
+    requests: &'a [RequestSchedulingView],
+    work: &[CandidateWork],
+    poll: &mut dyn FnMut() -> Result<(), PlanningUnknownReason>,
+) -> Result<Option<(ActualWaveKind, Vec<PlanningShapeRow<'a>>, u64)>, PlanningUnknownReason> {
+    if !super::candidates::within_work_envelope(&snapshot.capabilities, requests, work, poll)? {
+        return Ok(None);
+    }
+    let mut failure = None;
+    let rows = legal_rows(snapshot, requests, work, &mut || match poll() {
+        Ok(()) => true,
+        Err(reason) => {
+            failure = Some(reason);
+            false
+        }
+    });
+    if let Some(reason) = failure {
+        return Err(reason);
+    }
+    Ok(rows)
+}
+
 pub(super) fn legal_rows<'a>(
     snapshot: &SchedulerSnapshot,
     requests: &'a [RequestSchedulingView],

@@ -18,6 +18,13 @@ pub use structured::{
 pub use structured_v2::{StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2};
 mod checkpoint;
 mod evidence;
+mod planning_audit;
+pub use planning_audit::{
+    RequiredFutureAuditActionV2, RequiredFutureAuditCostV2, RequiredFutureAuditFailureV2,
+    RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,
+    RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
+    RequiredFutureAuditReportV2, RequiredFutureAuditRowV2,
+};
 mod observation;
 mod reference;
 mod token_policy_residency;

@@ -35,6 +35,9 @@ pub(super) async fn collect(
         return structured_v2::discovery::collect(session, manifest, inputs, artifacts, summary)
             .await;
     }
+    if manifest.validation_model.required_audit().is_some() {
+        return required_audit::collect(session, manifest, inputs, artifacts, summary).await;
+    }
     if manifest.validation_model.structured_v2().is_some() {
         return structured_v2::collect(session, manifest, inputs, artifacts, summary).await;
     }
@@ -195,6 +198,7 @@ pub(super) async fn cohort(
     }
     // Each invocation is one phase/case/repetition; no cursor crosses its drain.
     let mut wave_plan = wave_plan::Cursor::new(case)?;
+    let mut audit_wave_attempt = 0u64;
     let mut consumers = JoinSet::<Result<(ferrum_types::RequestId, serde_json::Value)>>::new();
     let mut window =
         AdmissionWindow::<ferrum_types::RequestId>::new(&case.prompts, case.maximum_in_flight())?;
@@ -337,6 +341,33 @@ pub(super) async fn cohort(
         }
         let rows = select_rows(prefills, decodes, case.execution);
         if !rows.is_empty() {
+            if manifest.validation_model.required_audit().is_some()
+                && matches!(phase, report::Phase::Discovery)
+            {
+                audit_wave_attempt = audit_wave_attempt.checked_add(1).ok_or_else(|| {
+                    FerrumError::resource_exhausted("audit attempt ordinal overflow")
+                })?;
+                // Full live population, ordered by original cohort admission;
+                // this is before Wave and does not filter by query availability.
+                let ordered_frontiers: Vec<_> = window
+                    .active()
+                    .iter()
+                    .filter_map(|owner| frontiers.iter().find(|f| f.request_id() == &owner.id))
+                    .cloned()
+                    .collect();
+                required_audit::before_wave(
+                    session,
+                    manifest,
+                    index,
+                    repetition,
+                    audit_wave_attempt,
+                    &ordered_frontiers,
+                    frontiers.len(),
+                    artifacts,
+                    totals,
+                )
+                .await?;
+            }
             let reference_rows = observer.as_ref().map(|_| rows.clone());
             let planned = wave_plan
                 .as_ref()

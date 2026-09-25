@@ -186,7 +186,8 @@ pub(super) fn validate_export_configuration(
     }
     let structured_v2 = manifest.validation_model.structured_v2();
     let discovery_v2 = manifest.validation_model.is_discovery_v2();
-    if (structured_v2.is_some() || discovery_v2)
+    let required_audit = manifest.validation_model.required_audit();
+    if (structured_v2.is_some() || discovery_v2 || required_audit.is_some())
         != (policy.cost_observation.predictor
             == ferrum_types::SloCostPredictor::StructuredWholeWaveV2)
     {
@@ -203,6 +204,48 @@ pub(super) fn validate_export_configuration(
         {
             return Err(FerrumError::config("structured discovery requires fresh HostSettledV1 observations without profile import or export"));
         }
+    }
+    if let Some(audit) = required_audit {
+        audit.validate(manifest)?;
+        let observation = &policy.cost_observation;
+        if observation.structured_capture != ferrum_types::SloStructuredCostCapture::HostSettledV1
+            || observation.profile_export.is_some()
+            || policy.cost_profile.is_none()
+            || policy.prefill_reference.is_none()
+            || observation
+                .profile_import
+                .declared_local_clock_max_error_ns
+                .is_none()
+        {
+            return Err(FerrumError::config("required-future audit requires genuine imported profile10/catalog and prefill-reference artifacts, original clock declaration, HostSettledV1, and no export"));
+        }
+        observation
+            .profile_import
+            .validate()
+            .map_err(FerrumError::config)?;
+        policy
+            .prefill_reference
+            .as_ref()
+            .expect("checked above")
+            .validate()
+            .map_err(FerrumError::config)?;
+        let mut bound_paths = paths::outputs(cmd, manifest);
+        bound_paths.push(
+            policy
+                .cost_profile
+                .as_ref()
+                .expect("checked above")
+                .as_path(),
+        );
+        bound_paths.push(
+            policy
+                .prefill_reference
+                .as_ref()
+                .expect("checked above")
+                .artifact_path
+                .as_path(),
+        );
+        paths::distinct(bound_paths)?;
     }
     if let Some(capture) = structured_v2 {
         capture.validate(manifest)?;

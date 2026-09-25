@@ -24,6 +24,7 @@ mod output;
 mod recovery;
 mod replay_budget;
 mod replayed_first_wave;
+mod required_structure;
 mod resolver;
 mod resources;
 mod selected_evidence;

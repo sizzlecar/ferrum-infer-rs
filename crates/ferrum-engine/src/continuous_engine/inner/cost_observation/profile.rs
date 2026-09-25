@@ -289,6 +289,24 @@ pub(in crate::continuous_engine) struct EngineCostSnapshot {
 }
 
 impl EngineCostSnapshot {
+    /// A read-only lookup against this original imported snapshot and clock.
+    /// Its result grants no publication, observation or training authority.
+    pub(in crate::continuous_engine::inner) fn audit_structured_query_v2(
+        &self,
+        query: &model::structured_v2::StructuredQueryV2,
+        local_now: u64,
+    ) -> Result<PlanningCost, model::structured_v2::StructuredUnknownV2> {
+        match &self.inner {
+            Snapshot::StructuredV2(snapshot) => structured_v2::predict_query(
+                snapshot,
+                &self.fingerprint,
+                query,
+                local_now,
+                self.model_version(),
+            ),
+            _ => Err(model::structured_v2::StructuredUnknownV2::UnsupportedScope),
+        }
+    }
     pub(super) fn feedback_enabled(&self) -> bool {
         matches!(&self.inner, Snapshot::Selected(s) if s.feedback.is_some())
     }

@@ -10,6 +10,15 @@ impl EngineInner {
         hint: &ferrum_interfaces::BatchHint,
         controller_budget: Arc<ControllerBudget>,
     ) -> ControllerResult<ControllerSnapshot> {
+        self.capture_slo_controller_snapshot_with_diagnostic(hint, controller_budget, &mut None)
+    }
+
+    pub(super) fn capture_slo_controller_snapshot_with_diagnostic(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        controller_budget: Arc<ControllerBudget>,
+        route_unknown: &mut Option<ferrum_interfaces::vnext::ExecutionCostRouteUnknown>,
+    ) -> ControllerResult<ControllerSnapshot> {
         let fallback_count = self.scheduler.active_count() + self.scheduler.waiting_count();
         let unavailable = |reason| Unavailable {
             reason,
@@ -371,15 +380,22 @@ impl EngineInner {
             ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
                 ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(reason),
             ) => {
+                *route_unknown =
+                    Some(ferrum_interfaces::vnext::ExecutionCostRouteUnknown::Resource(reason));
                 return Err(unavailable(unknown_label(resources::resource_reason(
                     reason,
-                ))))
+                ))));
             }
             ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(
                 ferrum_interfaces::vnext::ExecutionCostRouteUnknown::BudgetExhausted,
-            ) => return Err(unavailable("compute_budget_exhausted")),
-            ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(_) => {
-                return Err(unavailable("shape_unavailable"))
+            ) => {
+                *route_unknown =
+                    Some(ferrum_interfaces::vnext::ExecutionCostRouteUnknown::BudgetExhausted);
+                return Err(unavailable("compute_budget_exhausted"));
+            }
+            ferrum_interfaces::vnext::ExecutionCostRouteAvailability::Unknown(reason) => {
+                *route_unknown = Some(reason);
+                return Err(unavailable("shape_unavailable"));
             }
         };
         // Route and resource transitions must start in the same captured epoch.

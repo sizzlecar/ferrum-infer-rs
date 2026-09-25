@@ -14,6 +14,7 @@ mod resources;
 mod search;
 mod shape;
 mod simulation;
+mod structure;
 pub mod time_admission;
 mod types;
 mod validation;
@@ -30,6 +31,7 @@ pub use obligations::{
     RequestObligation,
 };
 pub use search::BoundedSloPlanner;
+pub use structure::PlanningStructure;
 pub use types::*;
 
 #[cfg(test)]

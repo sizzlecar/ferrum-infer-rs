@@ -1,4 +1,7 @@
-use super::types::{OutputByteBacking, OutputCreditView, PlanningUnknownReason};
+use super::types::{
+    OutputByteBacking, OutputCreditView, PlanningUnknownReason, RequestPhaseView,
+    RequestSchedulingView, WaveAction,
+};
 use ferrum_interfaces::output_flow::PrepaidOutputCapacityView;
 
 impl TryFrom<PrepaidOutputCapacityView> for OutputCreditView {
@@ -72,4 +75,53 @@ impl OutputCreditView {
             shared_bytes,
         ))
     }
+}
+
+/// Common no-refill resource arithmetic for timed simulation and untimed
+/// structure auditing. This neither commits output nor invents a service time.
+pub(super) struct WorkOutputAdvance {
+    pub context_tokens: u32,
+    pub emits_token: bool,
+    pub output_credit: OutputCreditView,
+    pub additional_output_bytes: u64,
+}
+
+pub(super) fn work_output_advance(
+    request: &RequestSchedulingView,
+    action: &WaveAction,
+    maximum_context: u32,
+) -> Result<WorkOutputAdvance, PlanningUnknownReason> {
+    let (context_tokens, emits_token) = match (action, &request.phase) {
+        (WaveAction::Decode, RequestPhaseView::Decode) => (
+            request
+                .context_tokens
+                .checked_add(1)
+                .ok_or(PlanningUnknownReason::ArithmeticOverflow)?,
+            true,
+        ),
+        (WaveAction::Prefill { offset, count }, RequestPhaseView::Prefill(progress)) => {
+            let end = offset
+                .checked_add(count.get())
+                .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
+            (
+                request.context_tokens.max(end),
+                end == progress.total_prompt_tokens.get(),
+            )
+        }
+        _ => return Err(PlanningUnknownReason::InvalidShapeEvidence),
+    };
+    if context_tokens > maximum_context {
+        return Err(PlanningUnknownReason::OutputOrResourceBlocked);
+    }
+    let (output_credit, additional_output_bytes) = if emits_token {
+        request.output_credit.after_token()?
+    } else {
+        (request.output_credit, 0)
+    };
+    Ok(WorkOutputAdvance {
+        context_tokens,
+        emits_token,
+        output_credit,
+        additional_output_bytes,
+    })
 }

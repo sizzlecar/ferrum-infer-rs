@@ -14,6 +14,7 @@ use ferrum_interfaces::{
 mod domain;
 mod execution;
 mod frontier;
+mod planning_audit;
 use domain::{FutureHostMode, RouteDomain};
 use frontier::{PreparedRow, ProjectedFrontiers, ProjectedRequest};
 #[cfg(test)]
@@ -128,13 +129,14 @@ impl ExecutorShape<'_> {
         Ok(projected)
     }
 
-    fn project(
+    fn project_with_diagnostic(
         &self,
         state: &ExecutionCostRouteState,
         frontiers: &[ProjectedRequest],
         prepared: &[PreparedRow],
         mode: FutureHostMode,
         poll: &mut dyn FnMut() -> std::result::Result<(), PlanningUnknownReason>,
+        unavailable: &mut Option<ExecutionCostRouteUnknown>,
     ) -> std::result::Result<
         Option<(
             ferrum_interfaces::vnext::ExecutionCostRouteProjection,
@@ -321,9 +323,11 @@ impl ExecutorShape<'_> {
         match projection {
             ExecutionCostRouteAvailability::Known(value) => Ok(Some(value)),
             ExecutionCostRouteAvailability::Unknown(ExecutionCostRouteUnknown::BudgetExhausted) => {
+                *unavailable = Some(ExecutionCostRouteUnknown::BudgetExhausted);
                 Err(PlanningUnknownReason::ComputeBudgetExhausted)
             }
             ExecutionCostRouteAvailability::Unknown(reason) => {
+                *unavailable = Some(reason);
                 tracing::trace!(
                     ?reason,
                     ?kind,

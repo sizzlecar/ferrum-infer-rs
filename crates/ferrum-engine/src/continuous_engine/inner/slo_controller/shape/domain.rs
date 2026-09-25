@@ -133,6 +133,25 @@ impl ExecutorShape<'_> {
         )>,
         PlanningUnknownReason,
     > {
+        self.project_domain_with_diagnostic(state, frontiers, prepared, poll, &mut None)
+    }
+
+    pub(super) fn project_domain_with_diagnostic(
+        &self,
+        state: &RouteDomain,
+        frontiers: &[ProjectedRequest],
+        prepared: &[PreparedRow],
+        poll: &mut dyn FnMut() -> std::result::Result<(), PlanningUnknownReason>,
+        unavailable: &mut Option<ExecutionCostRouteUnknown>,
+    ) -> std::result::Result<
+        Option<(
+            PlanningShapeDomain<CanonicalWaveCostShape>,
+            Option<PlanningShapeDomain<StatisticalWaveEvidenceV1>>,
+            Option<PlanningShapeDomain<HostContentForecastV2>>,
+            RouteDomain,
+        )>,
+        PlanningUnknownReason,
+    > {
         let Some(modes) = self.future_modes(frontiers, prepared, poll)? else {
             return Ok(None);
         };
@@ -184,8 +203,14 @@ impl ExecutorShape<'_> {
         for previous in &state.states {
             for &mode in &modes {
                 poll()?;
-                let Some((projected, forecast)) =
-                    self.project(previous, frontiers, prepared, mode, poll)?
+                let Some((projected, forecast)) = self.project_with_diagnostic(
+                    previous,
+                    frontiers,
+                    prepared,
+                    mode,
+                    poll,
+                    unavailable,
+                )?
                 else {
                     return Ok(None);
                 };
