@@ -24,6 +24,13 @@ async fn tokenizer() -> Arc<HuggingFaceTokenizer> {
 fn sequence(tokenizer: Arc<HuggingFaceTokenizer>, sampling: SamplingParams) -> SequenceState {
     let mut request = InferenceRequest::new("first prompt", "policy-model");
     request.sampling_params = sampling;
+    sequence_from_request(tokenizer, request)
+}
+
+fn sequence_from_request(
+    tokenizer: Arc<HuggingFaceTokenizer>,
+    request: InferenceRequest,
+) -> SequenceState {
     let mut state =
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
     state.stream_sender = Some(tokio::sync::mpsc::channel(1).0);
@@ -125,6 +132,18 @@ fn credited_sequence(
     SequenceState,
     ferrum_interfaces::output_flow::CreditedOutputSession,
 ) {
+    let mut request = InferenceRequest::new("first prompt", "policy-model");
+    request.sampling_params = sampling;
+    credited_sequence_from_request(tokenizer, request)
+}
+
+fn credited_sequence_from_request(
+    tokenizer: Arc<HuggingFaceTokenizer>,
+    request: InferenceRequest,
+) -> (
+    SequenceState,
+    ferrum_interfaces::output_flow::CreditedOutputSession,
+) {
     use crate::continuous_engine::credited_output::{CreditedDecodePolicy, CreditedSequenceOutput};
     use crate::continuous_engine::output_flow_runtime::{
         spawn_output_flow_runtime, OutputFlowRuntimeOptions,
@@ -136,7 +155,7 @@ fn credited_sequence(
         OutputProjectionContract, RequestOutputBudget, RequestOutputPlan,
     };
     use std::num::NonZeroUsize;
-    let mut state = sequence(tokenizer.clone(), sampling);
+    let mut state = sequence_from_request(tokenizer.clone(), request);
     state.stream_sender = None;
     let plan = RequestOutputPlan::derive(
         Arc::new(OutputProjectionContract::cli_text()),
@@ -172,6 +191,15 @@ fn credited_sequence(
         failure: None,
     });
     (state, session)
+}
+
+fn fixed_output_request(sampling: SamplingParams) -> InferenceRequest {
+    let mut request = InferenceRequest::new("first prompt", "policy-model");
+    request.sampling_params = sampling;
+    request
+        .metadata
+        .insert("ferrum_ignore_eos".into(), serde_json::Value::Bool(true));
+    request
 }
 
 #[tokio::test]
@@ -244,10 +272,12 @@ async fn real_bounded_owner_splits_lengths_from_static_policy_without_changing_v
 #[tokio::test]
 async fn empirical_content_domain_uses_installed_plain_greedy_policy_and_completion() {
     let tokenizer = tokenizer().await;
-    let (mut state, _session) = credited_sequence(tokenizer.clone(), SamplingParams::greedy());
-    state.stop_token_ids.clear();
-    state.user_stop_token_ids.clear();
-    state.stop_text_seqs.clear();
+    let (mut state, _session) = credited_sequence_from_request(
+        tokenizer.clone(),
+        fixed_output_request(SamplingParams::greedy()),
+    );
+    assert!(state.model_eos_token_ids.is_empty());
+    assert!(state.stop_token_ids.is_empty());
     assert_eq!(
         host_numeric_policy(&state, tokenizer.as_ref())
             .unwrap()
@@ -280,6 +310,126 @@ async fn empirical_content_domain_uses_installed_plain_greedy_policy_and_complet
         ferrum_types::ResponseCompletionBoundary::Immediate;
     state.sampling_params.repetition_penalty = 1.1;
     assert!(empirical_content_domain(&state).is_none());
+}
+
+#[tokio::test]
+async fn plain_text_domain_normal_constructor_resolves_length_only_without_early_eos() {
+    use ferrum_types::FinishReason;
+    let tokenizer = tokenizer().await;
+    let sampling = SamplingParams {
+        max_tokens: 3,
+        ..SamplingParams::greedy()
+    };
+    let (mut automatic, _automatic_session) =
+        credited_sequence(tokenizer.clone(), sampling.clone());
+    let eos = *automatic
+        .model_eos_token_ids
+        .first()
+        .expect("real tokenizer EOS");
+    assert!(automatic
+        .model_eos_token_ids
+        .iter()
+        .all(|id| automatic.stop_token_ids.contains(id)));
+    assert!(host_numeric_policy(&automatic, tokenizer.as_ref())
+        .unwrap()
+        .empirical_content_domain
+        .is_none());
+    automatic.generated_tokens.push(TokenId::new(eos));
+    assert_eq!(
+        automatic.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::EOS)
+    );
+
+    let (mut fixed, _fixed_session) =
+        credited_sequence_from_request(tokenizer.clone(), fixed_output_request(sampling));
+    assert!(fixed.model_eos_token_ids.is_empty());
+    assert!(fixed.stop_token_ids.is_empty());
+    assert!(fixed.user_stop_token_ids.is_empty());
+    assert!(fixed.stop_text_seqs.is_empty());
+    assert_eq!(
+        host_numeric_policy(&fixed, tokenizer.as_ref())
+            .unwrap()
+            .empirical_content_domain,
+        Some(HostContentDomainV1::PlainTextGreedyV1)
+    );
+    // The same tokenizer terminal is ordinary generated content under the
+    // effective request policy. Only the actual output budget completes it.
+    for token in [eos, 0] {
+        fixed.generated_tokens.push(TokenId::new(token));
+        assert_eq!(fixed.stop_reason(Some(tokenizer.as_ref())), None);
+    }
+    fixed.generated_tokens.push(TokenId::new(1));
+    assert_eq!(
+        fixed.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::Length)
+    );
+}
+
+#[tokio::test]
+async fn plain_text_domain_ignore_eos_preserves_user_stops_and_structured_boundaries() {
+    use ferrum_types::FinishReason;
+    let tokenizer = tokenizer().await;
+    for (stop, tokens) in [("a", vec![0]), ("ab", vec![0, 1])] {
+        let (mut state, _session) = credited_sequence_from_request(
+            tokenizer.clone(),
+            fixed_output_request(SamplingParams {
+                stop_sequences: vec![stop.into()],
+                ..SamplingParams::greedy()
+            }),
+        );
+        assert!(state.model_eos_token_ids.is_empty());
+        assert_eq!(state.stop_text_seqs, vec![stop]);
+        assert_eq!(state.user_stop_token_ids.contains(&0), tokens.len() == 1);
+        assert!(host_numeric_policy(&state, tokenizer.as_ref())
+            .unwrap()
+            .empirical_content_domain
+            .is_none());
+        state
+            .generated_tokens
+            .extend(tokens.into_iter().map(TokenId::new));
+        assert_eq!(
+            state.stop_reason(Some(tokenizer.as_ref())),
+            Some(FinishReason::Stop)
+        );
+    }
+    let structured = sequence_from_request(
+        tokenizer.clone(),
+        fixed_output_request(SamplingParams {
+            response_format: ResponseFormat::JsonObject,
+            ..SamplingParams::greedy()
+        }),
+    );
+    assert!(structured.model_eos_token_ids.is_empty());
+    assert!(structured.stop_token_ids.is_empty());
+    assert!(structured.structured_output_processor.is_some());
+    // Structured output is installed by the real sequence constructor. The
+    // CLI text codec does not prove a structured projection, so this negative
+    // domain test must not invent a credited output owner for it.
+    assert!(empirical_content_domain(&structured).is_none());
+}
+
+#[tokio::test]
+async fn plain_text_domain_rejects_inconsistent_resolved_eos_state() {
+    use ferrum_types::FinishReason;
+    let tokenizer = tokenizer().await;
+    let eos = tokenizer.token_id("</s>").unwrap().get();
+    let (mut state, _session) = credited_sequence_from_request(
+        tokenizer.clone(),
+        fixed_output_request(SamplingParams::greedy()),
+    );
+    assert!(state.stop_token_ids.is_empty());
+    // Deliberate negative corruption: only constructor-produced states are
+    // used as positives. stop_reason reads this resolved field independently.
+    state.model_eos_token_ids.push(eos);
+    state.generated_tokens.push(TokenId::new(eos));
+    assert_eq!(
+        state.stop_reason(Some(tokenizer.as_ref())),
+        Some(FinishReason::EOS)
+    );
+    assert!(host_numeric_policy(&state, tokenizer.as_ref())
+        .unwrap()
+        .empirical_content_domain
+        .is_none());
 }
 
 #[tokio::test]

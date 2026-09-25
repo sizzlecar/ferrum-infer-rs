@@ -75,6 +75,10 @@ fn empirical_content_domain(sequence: &SequenceState) -> Option<HostContentDomai
             SequenceSamplingHistoryScope::FullGeneration
         )
         && sequence.structured_output_processor.is_none()
+        // Normal construction keeps model EOS within stop_token_ids. Check
+        // both resolved fields so an inconsistent state cannot advertise the
+        // empirical domain while stop_reason can still terminate on EOS.
+        && sequence.model_eos_token_ids.is_empty()
         && sequence.stop_token_ids.is_empty()
         && sequence.user_stop_token_ids.is_empty()
         && sequence.stop_text_seqs.is_empty()
