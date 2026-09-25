@@ -7,9 +7,12 @@ use sha2::{Digest, Sha256};
 
 mod command;
 mod independent_rows;
+mod structure;
 mod wave;
 mod wire;
 pub use command::*;
+pub(in crate::execution_cost) use structure::StructuredHostAccumulator;
+pub use structure::*;
 pub(in crate::execution_cost) use wave::StatisticalWaveAccumulator;
 pub use wave::{
     CanonicalStatisticalWave, IndependentAttentionWaveEvidenceV2, StatisticalWaveEvidenceV1,

@@ -185,6 +185,7 @@ pub struct CanonicalWaveCostShape {
 /// representation on the actual observation path. All errors are sticky.
 pub struct CanonicalWaveCostBuilder {
     statistical: super::statistical::StatisticalWaveAccumulator,
+    structured_host: Option<super::statistical::StructuredHostAccumulator>,
     provider: Sha256,
     output: Sha256,
     numeric_output: Sha256,
@@ -280,6 +281,7 @@ impl CanonicalWaveCostBuilder {
         );
         Self {
             statistical: super::statistical::StatisticalWaveAccumulator::new(),
+            structured_host: None,
             provider,
             output,
             numeric_output,
@@ -303,6 +305,13 @@ impl CanonicalWaveCostBuilder {
             last_segment: None,
             failed: None,
         }
+    }
+    /// Explicit passive collection; the normal constructor does not retain
+    /// another row representation. This does not enable a new predictor.
+    pub fn new_with_structured_statistics(retries: u32, product: CostProductOutput) -> Self {
+        let mut value = Self::new(retries, product);
+        value.structured_host = Some(super::statistical::StructuredHostAccumulator::new(retries));
+        value
     }
     /// Must describe the real complete-wave disposition (including a staging
     /// rollback). No call or Unknown leaves numeric evidence unavailable.
@@ -667,6 +676,9 @@ impl CanonicalWaveCostBuilder {
                     number(&mut this.output, u64::from(repetition_penalty_bits));
                 }
             }
+            if let Some(structured) = &mut this.structured_host {
+                structured.observe(row);
+            }
             this.rows.push(row.work);
             Ok(())
         })
@@ -688,6 +700,40 @@ impl CanonicalWaveCostBuilder {
         let exact = self.finish(kind, path, graph, row_order, recurrent_state_bytes)?;
         let statistical = accumulator.finish(&exact);
         Ok(super::CanonicalStatisticalWave { exact, statistical })
+    }
+
+    /// Completes an opt-in, pre-host-settlement structural recipe. All legacy
+    /// canonical validation still runs. Missing structure cannot turn invalid
+    /// execution into valid execution or produce a trainable observation.
+    pub fn finish_with_structure(
+        mut self,
+        kind: ActualWaveKind,
+        path: ActualWavePath,
+        graph: ActualWaveGraphState,
+        row_order: ActualWaveRowOrder,
+        recurrent_state_bytes: u64,
+    ) -> Result<super::CanonicalStructuredWave, CanonicalCostError> {
+        let host = self.structured_host.take();
+        let product = self.row_multiset_product;
+        let readback = self.core_readback;
+        let accumulator = std::mem::replace(
+            &mut self.statistical,
+            super::statistical::StatisticalWaveAccumulator::new(),
+        );
+        let exact = self.finish(kind, path, graph, row_order, recurrent_state_bytes)?;
+        let structured = host
+            .ok_or(super::StatisticalEvidenceUnknown::MissingProducer)
+            .and_then(|rows| {
+                let device =
+                    accumulator.structured_device(&exact, product, readback, rows.retries)?;
+                super::UnsettledStructuredWaveEvidenceV1::finish(rows, device, &exact)
+            });
+        let statistical = accumulator.finish(&exact);
+        Ok(super::CanonicalStructuredWave {
+            exact,
+            statistical,
+            structured,
+        })
     }
 
     pub fn finish(

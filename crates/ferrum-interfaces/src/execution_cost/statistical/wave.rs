@@ -286,7 +286,37 @@ impl StatisticalWaveAccumulator {
     }
 }
 
-fn exact_binding(shape: &CanonicalWaveCostShape) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
+impl StatisticalWaveAccumulator {
+    pub(in crate::execution_cost) fn structured_device(
+        &self,
+        shape: &CanonicalWaveCostShape,
+        product: CostProductOutput,
+        readback: Option<CoreReadbackRoute>,
+        retries: u32,
+    ) -> Result<DeviceRouteTemplateV1, StatisticalEvidenceUnknown> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        // These states contain only the checked selected-command stream. The
+        // legacy finish has not appended host policy/categories or row flags.
+        DeviceRouteTemplateV1::from_selected_stream(
+            self.family.clone().finalize().into(),
+            self.independent_family
+                .as_ref()
+                .map(|hash| hash.clone().finalize().into()),
+            self.count,
+            self.work,
+            shape,
+            product,
+            readback,
+            retries,
+        )
+    }
+}
+
+pub(super) fn exact_binding(
+    shape: &CanonicalWaveCostShape,
+) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
     exact_binding_parts(
         shape.kind,
         shape.path,
