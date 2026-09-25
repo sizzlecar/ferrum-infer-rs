@@ -15,6 +15,7 @@ use ferrum_types::{
 use std::path::Path;
 mod selected;
 mod structured;
+mod structured_v2;
 
 pub(super) fn model_settings(config: &SloCostModelConfig) -> model::CostModelSettings {
     model::CostModelSettings {
@@ -126,6 +127,9 @@ pub(super) fn load_seed(
     if config.predictor == ferrum_types::SloCostPredictor::StructuredWholeWaveV1 {
         return structured::load_seed(fingerprint, config, path, clock);
     }
+    if config.predictor == ferrum_types::SloCostPredictor::StructuredWholeWaveV2 {
+        return structured_v2::load_seed(fingerprint, config, path, clock);
+    }
     let Some(path) = path else {
         return Ok(TrainingSeed {
             trainer: Some(CostTrainer {
@@ -201,6 +205,7 @@ fn import_receipt(
     Ok(SloCostProfileReceipt {
         selected_whole_wave: None,
         structured_whole_wave: None,
+        structured_whole_wave_v2: None,
         schema_version: p.schema_version,
         path: p
             .loaded_from
@@ -271,6 +276,7 @@ impl CostTrainer {
 enum Snapshot {
     Selected(selected::SelectedSnapshot),
     Structured(file::structured_v9::ImportedStructuredModelV1),
+    StructuredV2(structured_v2::StructuredSnapshot),
     Live(Arc<model::CostModelSnapshot>),
     Imported(file::ImportedCostSnapshot),
 }
@@ -389,7 +395,7 @@ impl EngineCostSnapshot {
 
     pub fn planning_boundary(&self) -> model::CostBoundary {
         match &self.inner {
-            Snapshot::Selected(_) | Snapshot::Structured(_) => {
+            Snapshot::Selected(_) | Snapshot::Structured(_) | Snapshot::StructuredV2(_) => {
                 model::CostBoundary::PreparationToHostSettledV1
             }
             Snapshot::Live(snapshot) => snapshot.planning_boundary(),
@@ -400,6 +406,7 @@ impl EngineCostSnapshot {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.feedback.as_ref().map_or(1, |v| v.epoch),
             Snapshot::Structured(_) => 1,
+            Snapshot::StructuredV2(_) => 1,
             Snapshot::Live(snapshot) => snapshot.model_version(),
             Snapshot::Imported(snapshot) => snapshot.model_version(),
         }
@@ -408,6 +415,7 @@ impl EngineCostSnapshot {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.model.segment_count(),
             Snapshot::Structured(_) => 1,
+            Snapshot::StructuredV2(snapshot) => snapshot.len(),
             Snapshot::Live(snapshot) => snapshot.bucket_count(),
             Snapshot::Imported(snapshot) => snapshot.bucket_count(),
         }
@@ -427,7 +435,7 @@ impl EngineCostSnapshot {
             return model::CostPrediction::Unknown(model::CostUnknownReason::FingerprintMismatch);
         }
         match &self.inner {
-            Snapshot::Selected(_) | Snapshot::Structured(_) => {
+            Snapshot::Selected(_) | Snapshot::Structured(_) | Snapshot::StructuredV2(_) => {
                 model::CostPrediction::Unknown(model::CostUnknownReason::NumericFeaturesMissing)
             }
             Snapshot::Live(snapshot) => {
@@ -445,6 +453,7 @@ impl PlanningCostModel for EngineCostSnapshot {
         match &self.inner {
             Snapshot::Selected(_) => PlanningCostEvidenceRequirement::Selected,
             Snapshot::Structured(_) => PlanningCostEvidenceRequirement::Structured,
+            Snapshot::StructuredV2(_) => PlanningCostEvidenceRequirement::StructuredV2,
             _ => PlanningCostEvidenceRequirement::None,
         }
     }
@@ -468,6 +477,14 @@ impl PlanningCostModel for EngineCostSnapshot {
                 self.model_version(),
             ),
             Snapshot::Structured(snapshot) => structured::predict(
+                snapshot,
+                fingerprint,
+                shape,
+                evidence,
+                now_ns,
+                self.model_version(),
+            ),
+            Snapshot::StructuredV2(snapshot) => structured_v2::predict(
                 snapshot,
                 fingerprint,
                 shape,

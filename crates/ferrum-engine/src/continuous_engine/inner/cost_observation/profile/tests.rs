@@ -539,3 +539,17 @@ async fn production_constructor_loads_file_before_online_background_updates() {
     assert!(runtime.snapshot().unwrap().model_version() > initial.model_version());
     assert_eq!(runtime.profile_receipt().unwrap().recorded_samples, 2);
 }
+
+#[test]
+fn structured_v2_observe_has_no_legacy_trainer_and_import_requires_its_protocol() {
+    let mut config = SloCostObservationConfig::structured_whole_wave_v2();
+    let observe = load_seed(&identity(), &config, None, None).unwrap();
+    assert!(observe.trainer.is_none() && observe.snapshot.is_none() && observe.receipt.is_none());
+    let legacy = Fixture::new();
+    assert!(load_seed(&identity(), &config, Some(&legacy.path), Some(load_clock())).is_err());
+    config.profile_import.declared_local_clock_max_error_ns = Some(0);
+    assert!(load_seed(&identity(), &config, Some(&legacy.path), Some(load_clock())).is_err());
+    let mut wrong = load_clock();
+    wrong.wall_max_error_ns = Some(1);
+    assert!(load_seed(&identity(), &config, Some(&legacy.path), Some(wrong)).is_err());
+}

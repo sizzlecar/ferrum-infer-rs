@@ -15,6 +15,14 @@ pub(super) fn record_structured<T>(result: &Result<T, StructuredUnknown>) {
     .increment(1);
 }
 
+pub(super) fn record_structured_v2<T>(result: &Result<T, StructuredUnknown>) {
+    let (status, reason) = match result {
+        Ok(_) => ("known", "none"),
+        Err(reason) => ("unknown", structured_label(*reason)),
+    };
+    metrics::counter!("ferrum.engine.structured_v2_cost_queries_total","scope"=>"candidate","result"=>status,"reason"=>reason).increment(1);
+}
+
 fn structured_label(reason: StructuredUnknown) -> &'static str {
     match reason {
         StructuredUnknown::MissingEvidence => "missing_evidence",

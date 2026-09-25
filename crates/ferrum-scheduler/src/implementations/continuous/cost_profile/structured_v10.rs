@@ -33,6 +33,8 @@ pub struct StructuredImportProvenanceV10 {
     pub cohort_manifest_sha256: [u8; 32],
     pub offered_attempts: u64,
     pub reserved_members: u64,
+    /// Original completed rows, including all outside-window FIFO evidence.
+    pub total_shape_rows: u64,
     pub file_bytes: u64,
     pub source_bytes: u64,
     pub conservative_clock_error_ns: u64,
@@ -77,8 +79,20 @@ impl ImportedStructuredModelV2 {
         input: &StructuredQueryV2,
         local_now_ns: u64,
     ) -> Result<StructuredPredictionV2, StructuredUnknownV2> {
-        self.model
-            .predict_query(fingerprint, input, self.model_now_ns(local_now_ns)?)
+        self.predict_query_local_with_clock(fingerprint, input, local_now_ns)
+            .map(|(value, _)| value)
+    }
+    /// Return the same converted epoch used for prediction so adapters can
+    /// compute remaining TTL without reading or converting a second clock.
+    pub fn predict_query_local_with_clock(
+        &self,
+        fingerprint: &ExecutionFingerprint,
+        input: &StructuredQueryV2,
+        local_now_ns: u64,
+    ) -> Result<(StructuredPredictionV2, u64), StructuredUnknownV2> {
+        let model_now_ns = self.model_now_ns(local_now_ns)?;
+        let value = self.model.predict_query(fingerprint, input, model_now_ns)?;
+        Ok((value, model_now_ns))
     }
     pub fn model_now_ns(&self, local_now_ns: u64) -> Result<u64, StructuredUnknownV2> {
         self.provenance
@@ -311,6 +325,7 @@ pub fn load_structured_profile_v10(
             cohort_manifest_sha256: declared.cohort_manifest_sha256,
             offered_attempts: replayed.offered_attempts,
             reserved_members: replayed.reserved_members,
+            total_shape_rows: replayed.total_shape_rows,
             file_bytes: bytes.len() as u64,
             source_bytes: source.len() as u64,
             conservative_clock_error_ns: mapped.error,

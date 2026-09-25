@@ -84,6 +84,7 @@ fn import_receipt(
     };
     Ok(SloCostProfileReceipt {
         selected_whole_wave: None,
+        structured_whole_wave_v2: None,
         structured_whole_wave: Some(ferrum_types::SloStructuredWholeWaveReceiptV1 {
             model_revision: MODEL_REVISION.to_owned(),
             domain_signature: *imported.domain_signature(),

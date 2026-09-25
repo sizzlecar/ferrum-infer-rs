@@ -570,3 +570,7 @@ fn validate_fraction(
 
 #[cfg(test)]
 mod tests;
+
+pub use cost::{
+    SloStructuredArtifactKindV2, SloStructuredChildReceiptV2, SloStructuredWholeWaveReceiptV2,
+};

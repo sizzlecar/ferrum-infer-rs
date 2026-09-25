@@ -158,6 +158,7 @@ mod tests {
                 .all(|entry| entry.key != key));
             let receipt = ferrum_types::SloCostProfileReceipt {
                 structured_whole_wave: None,
+                structured_whole_wave_v2: None,
                 selected_whole_wave: None,
                 schema_version: 1,
                 path: "/profile/imported.json".into(),

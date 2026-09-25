@@ -84,6 +84,8 @@ pub enum SloCostPredictor {
     /// Profile9: qualified structured whole-wave row-space model. Its original
     /// source owns fit, residual, qualification, support and clock settings.
     StructuredWholeWaveV1,
+    /// Source3/profile10 pending-set envelope with independently qualified scopes.
+    StructuredWholeWaveV2,
 }
 impl SloCostPredictor {
     pub const fn is_selected(self) -> bool {
@@ -130,10 +132,21 @@ impl SloCostObservationConfig {
         }
     }
 
+    pub fn structured_whole_wave_v2() -> Self {
+        Self {
+            predictor: SloCostPredictor::StructuredWholeWaveV2,
+            structured_capture: SloStructuredCostCapture::HostSettledV1,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.model.validate()?;
         self.selected_feedback.validate(self)?;
-        if self.predictor == SloCostPredictor::StructuredWholeWaveV1 {
+        if matches!(
+            self.predictor,
+            SloCostPredictor::StructuredWholeWaveV1 | SloCostPredictor::StructuredWholeWaveV2
+        ) {
             if self.structured_capture != SloStructuredCostCapture::HostSettledV1 {
                 return Err("structured predictor requires host_settled_v1 route evidence".into());
             }
@@ -375,6 +388,8 @@ pub struct SloCostProfileReceipt {
     pub selected_whole_wave: Option<SloSelectedWholeWaveReceiptV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_whole_wave: Option<SloStructuredWholeWaveReceiptV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_whole_wave_v2: Option<SloStructuredWholeWaveReceiptV2>,
     pub schema_version: u32,
     pub path: PathBuf,
     pub file_sha256: String,
@@ -395,6 +410,55 @@ pub struct SloCostProfileReceipt {
     pub source_generator_revision: String,
     pub source_measurement_protocol: String,
     pub source_observation_artifact_sha256: [u8; 32],
+}
+
+/// Source3/profile10 product receipt. Children keep their original independent
+/// source population and clock. Catalog membership never expands their support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SloStructuredWholeWaveReceiptV2 {
+    pub model_revision: String,
+    pub artifact_kind: SloStructuredArtifactKindV2,
+    pub child_count: usize,
+    /// Sum of catalog (if any), child profiles and original source bytes.
+    pub total_imported_bytes: u64,
+    pub total_shape_rows: u64,
+    /// Present only for a catalog; every original source digest is in children.
+    pub source_inventory_sha256: Option<[u8; 32]>,
+    pub children: Vec<SloStructuredChildReceiptV2>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloStructuredArtifactKindV2 {
+    SingleChild,
+    CatalogV1,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SloStructuredChildReceiptV2 {
+    pub profile_path: PathBuf,
+    pub profile_sha256: [u8; 32],
+    pub profile_bytes: u64,
+    pub domain_signature: [u8; 32],
+    pub owner_rows: u32,
+    /// Hash of the complete typed owner; scheduler owns its versioned DTO.
+    pub owner_sha256: [u8; 32],
+    pub scope_sha256: [u8; 32],
+    pub capture_identity_sha256: [u8; 32],
+    pub protocol_sha256: [u8; 32],
+    pub rule_signature: [u8; 32],
+    pub cohort_manifest_sha256: [u8; 32],
+    pub parameters_sha256: [u8; 32],
+    pub source_path: PathBuf,
+    pub source_sha256: [u8; 32],
+    pub source_bytes: u64,
+    pub offered_attempts: u64,
+    pub reserved_members: u64,
+    pub total_shape_rows: u64,
+    pub source_monotonic_anchor_ns: u64,
+    pub model_anchor_ns: u64,
+    pub conservative_clock_error_ns: u64,
+    pub oldest_imported_age_ns: u64,
+    pub newest_imported_age_ns: u64,
+    pub phases: [SloStructuredPhaseReceiptV1; 3],
 }
 
 /// Replay-verified structured import provenance, not a live settlement receipt
@@ -785,5 +849,32 @@ mod structured_capture_tests {
             r#"{"structured_capture":"train"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_v2_tests {
+    use super::*;
+    #[test]
+    fn structured_v2_preset_has_explicit_wire_and_source_frozen_settings() {
+        let config = SloCostObservationConfig::structured_whole_wave_v2();
+        config.validate().unwrap();
+        assert!(!config.predictor.is_selected());
+        let wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["predictor"], "structured_whole_wave_v2");
+        assert_eq!(wire["structured_capture"], "host_settled_v1");
+        assert_eq!(
+            serde_json::from_value::<SloCostObservationConfig>(wire).unwrap(),
+            config
+        );
+        let mut missing = config.clone();
+        missing.structured_capture = SloStructuredCostCapture::Disabled;
+        assert!(missing.validate().is_err());
+        let mut legacy = config.clone();
+        legacy.profile_export = Some(SloCostProfileExportConfig::default());
+        assert!(legacy.validate().is_err());
+        let mut changed = config;
+        changed.model.drift_margin_ns += 1;
+        assert!(changed.validate().is_err());
     }
 }

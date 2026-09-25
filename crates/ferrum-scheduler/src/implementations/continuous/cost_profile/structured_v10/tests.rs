@@ -89,6 +89,16 @@ fn structured_v10_replays_full_cohorts_outside_fifo_and_three_phases() {
     assert_eq!(model.provenance().schema_version, 10);
     assert_eq!(model.provenance().offered_attempts, 72);
     assert_eq!(model.provenance().reserved_members, 24);
+    assert_eq!(model.provenance().total_shape_rows, 72);
+    let (same, epoch) = model
+        .predict_query_local_with_clock(
+            &fingerprint(),
+            &StructuredQueryV2::exact(input.clone()),
+            17,
+        )
+        .unwrap();
+    assert_eq!(epoch, model.model_now_ns(17).unwrap());
+    assert!(same.valid_until_ns >= epoch);
     assert_eq!(
         model
             .provenance()
