@@ -105,7 +105,11 @@ pub(crate) fn runtime_fixture(
     OperationCostCommand,
     Vec<MetalBufferRegion>,
 ) {
-    let pipelines = Arc::new(MetalLinearPipelines::new(runtime.device()).unwrap());
+    let pipelines = Arc::new(
+        MetalLinearPipelines::new(runtime.device())
+            .unwrap()
+            .with_structured_capture(runtime.structured_capture()),
+    );
     let make = |name: &str, bytes: &[u8], ty| {
         let region = runtime
             .allocate_test_region(

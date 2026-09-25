@@ -126,7 +126,11 @@ fn changed(mut image: Vec<u8>, output: &[u8]) -> Vec<u8> {
 /// Uses actual primitive dispatch functions and their shared selected helpers.
 /// This tests native receipt/PSO/bytes, not a model-level timing or quality claim.
 pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> {
-    let p = Arc::new(MetalPrimitivePipelines::new(runtime.device()).unwrap());
+    let p = Arc::new(
+        MetalPrimitivePipelines::new(runtime.device())
+            .unwrap()
+            .with_structured_capture(runtime.structured_capture()),
+    );
     let mut cases = Vec::new();
     // Dense table lookup, two physical token rows, one participant command.
     {
@@ -138,7 +142,8 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
         );
         let (ids, ids_view, ids_bytes) = guarded(runtime, "primitive.ids", bytes(&[1u32, 0]));
         let (out, out_view, out_bytes) = guarded(runtime, "primitive.embedding.out", vec![0; 260]);
-        let mut b = SelectedCommandCostBuilderV1::new(2);
+        let mut b =
+            crate::backend::metal::vnext_runtime::selected_cost_builder(p.structured_capture(), 2);
         push_embedding(
             &mut b,
             &p,
@@ -336,7 +341,8 @@ pub(crate) fn runtime_fixtures(runtime: &MetalDeviceRuntime) -> Vec<NativeCase> 
             vec![0; scratch_bytes as usize],
         );
         regions.push(scratch_view);
-        let mut b = SelectedCommandCostBuilderV1::new(1);
+        let mut b =
+            crate::backend::metal::vnext_runtime::selected_cost_builder(p.structured_capture(), 1);
         push_argmax(&mut b, &p, params, ElementType::F32, scratch_bytes).unwrap();
         let evidence = b.finish().unwrap();
         let route = checked_command(

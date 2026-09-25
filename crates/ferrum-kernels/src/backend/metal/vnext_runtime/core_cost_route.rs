@@ -23,9 +23,10 @@ pub(super) fn transfer_evidence(
     kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
     bytes: u64,
     tokens: u64,
+    capture: ferrum_types::SloStructuredCostCapture,
 ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
     use ferrum_interfaces::execution_cost::{
-        SelectedAlgorithmClassV1, SelectedCommandCostBuilderV1, StatisticalTransferKindV1 as K,
+        SelectedAlgorithmClassV1, StatisticalTransferKindV1 as K,
     };
     use sha2::{Digest, Sha256};
     use std::sync::OnceLock;
@@ -48,7 +49,7 @@ pub(super) fn transfer_evidence(
     let numerical = *NUMERICAL.get_or_init(|| Sha256::digest(b"metal.blit.byte_exact.v1").into());
     let layout = Sha256::digest(abi).into();
     let class = SelectedAlgorithmClassV1::new(entry, 1, numerical, layout).ok()?;
-    let mut builder = SelectedCommandCostBuilderV1::new(tokens);
+    let mut builder = selected_cost_builder(capture, tokens);
     builder.transfer(class, kind, bytes).ok()?;
     builder.finish().ok()
 }

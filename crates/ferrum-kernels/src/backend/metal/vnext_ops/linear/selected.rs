@@ -248,7 +248,10 @@ pub(super) fn dense(
     launches: &[LinearLaunch],
     tokens: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut builder = SelectedCommandCostBuilderV1::new(tokens);
+    let mut builder = crate::backend::metal::vnext_runtime::selected_cost_builder(
+        pipelines.structured_capture(),
+        tokens,
+    );
     for &launch in launches {
         projection(&mut builder, pipelines, launch, None, 0)?;
     }
@@ -264,7 +267,10 @@ pub(super) fn swiglu(
     tokens: u64,
     scratch: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut builder = SelectedCommandCostBuilderV1::new(tokens);
+    let mut builder = crate::backend::metal::vnext_runtime::selected_cost_builder(
+        pipelines.structured_capture(),
+        tokens,
+    );
     // Transformed routes are unavailable, so there is no hidden reuse decision
     // to reconstruct. Plain gate/up order is exactly Sequence::encode's order.
     for &launch in gate {

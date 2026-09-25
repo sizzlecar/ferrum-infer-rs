@@ -65,12 +65,14 @@ pub(super) async fn fixture_with_structured_capture(
     // Functional boundary tests do not impose a hardware performance claim.
     config.scheduler.slo.planner.max_planning_us = NonZeroU64::new(30_000_000).unwrap();
     let (runtime, operations, materializers, materializer, catalog) =
-        MetalVNextComposition::create(
+        MetalVNextComposition::create_with_observation(
             DeviceId::new(format!(
                 "device.unified-transition.{}",
                 uuid::Uuid::new_v4()
             ))
             .unwrap(),
+            None,
+            config.scheduler.slo.cost_observation.structured_capture,
         )
         .unwrap()
         .into_parts();

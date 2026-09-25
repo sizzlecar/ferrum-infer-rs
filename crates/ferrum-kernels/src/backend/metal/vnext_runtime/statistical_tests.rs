@@ -20,7 +20,20 @@ fn bytes(region: &MetalBufferRegion) -> Vec<u8> {
 
 #[test]
 fn real_linear_native_statistics_match_future_and_bad_extension_preserves_exact_execution() {
-    let runtime = tests::runtime();
+    for capture in [
+        ferrum_types::SloStructuredCostCapture::Disabled,
+        ferrum_types::SloStructuredCostCapture::HostSettledV1,
+    ] {
+        check_linear_native_statistics_match_future_and_bad_extension_preserves_exact_execution(
+            capture,
+        );
+    }
+}
+
+fn check_linear_native_statistics_match_future_and_bad_extension_preserves_exact_execution(
+    capture: ferrum_types::SloStructuredCostCapture,
+) {
+    let runtime = tests::runtime_with_structured_capture(capture);
     let mut stream = runtime.create_stream().unwrap();
     for invalid in [false, true] {
         let (mut command, expected, regions) =
@@ -69,6 +82,11 @@ fn real_linear_native_statistics_match_future_and_bad_extension_preserves_exact_
                 actual.statistical_evidence(),
                 expected.statistical_evidence()
             );
+            assert_algorithm_capture(
+                actual.statistical_evidence().unwrap(),
+                expected.statistical_evidence().unwrap(),
+                capture,
+            );
         }
         assert_eq!(bytes(&regions[0]), input);
         assert_eq!(bytes(&regions[1]), weight);
@@ -91,8 +109,19 @@ fn real_linear_native_statistics_match_future_and_bad_extension_preserves_exact_
 
 #[test]
 fn real_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work() {
+    for capture in [
+        ferrum_types::SloStructuredCostCapture::Disabled,
+        ferrum_types::SloStructuredCostCapture::HostSettledV1,
+    ] {
+        check_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work(capture);
+    }
+}
+
+fn check_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work(
+    capture: ferrum_types::SloStructuredCostCapture,
+) {
     use StatisticalTransferKindV1 as K;
-    let runtime = tests::runtime();
+    let runtime = tests::runtime_with_structured_capture(capture);
     let source = runtime
         .allocate_request(&tests::buffer_request("resource/stat-source"))
         .unwrap();
@@ -151,6 +180,7 @@ fn real_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work() {
     assert_eq!(attribution.commands().len(), 3);
     for (actual, expected) in attribution.commands().iter().zip(&expected) {
         assert_eq!(actual.statistical_evidence(), Some(expected));
+        assert_algorithm_capture(actual.statistical_evidence().unwrap(), expected, capture);
         assert_eq!(actual.compute_dispatch_count(), 0);
         assert_eq!(actual.transfer_command_count(), 1);
     }
@@ -169,7 +199,18 @@ fn real_core_transfer_statistics_match_proven_spans_and_rebound_scratch_work() {
 
 #[test]
 fn real_primitive_native_statistics_match_selected_psos_and_preserve_guarded_outputs() {
-    let runtime = tests::runtime();
+    for capture in [
+        ferrum_types::SloStructuredCostCapture::Disabled,
+        ferrum_types::SloStructuredCostCapture::HostSettledV1,
+    ] {
+        check_primitive_native_statistics_match_selected_psos_and_preserve_guarded_outputs(capture);
+    }
+}
+
+fn check_primitive_native_statistics_match_selected_psos_and_preserve_guarded_outputs(
+    capture: ferrum_types::SloStructuredCostCapture,
+) {
+    let runtime = tests::runtime_with_structured_capture(capture);
     let mut stream = runtime.create_stream().unwrap();
     for fixture in super::super::vnext_ops::selected_primitive_runtime_fixtures(&runtime) {
         let fence = runtime
@@ -195,6 +236,11 @@ fn real_primitive_native_statistics_match_selected_psos_and_preserve_guarded_out
             fixture.projected.statistical_evidence()
         );
         assert!(actual.statistical_evidence().is_some());
+        assert_algorithm_capture(
+            actual.statistical_evidence().unwrap(),
+            fixture.projected.statistical_evidence().unwrap(),
+            capture,
+        );
         assert_eq!(
             actual.compute_dispatch_count(),
             fixture.projected.compute_dispatch_count()
@@ -211,4 +257,57 @@ fn real_primitive_native_statistics_match_selected_psos_and_preserve_guarded_out
         }
         assert_eq!(runtime.stream_state(&stream), StreamState::Ready);
     }
+}
+
+fn assert_algorithm_capture(
+    actual: &ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1,
+    future: &ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1,
+    capture: ferrum_types::SloStructuredCostCapture,
+) {
+    if capture.is_disabled() {
+        assert!(actual.algorithm_work().is_none());
+        assert!(future.algorithm_work().is_none());
+    } else {
+        let actual_work = actual
+            .algorithm_work()
+            .expect("actual command capture")
+            .unwrap();
+        let future_work = future
+            .algorithm_work()
+            .expect("future command capture")
+            .unwrap();
+        actual_work.validate_command(actual).unwrap();
+        future_work.validate_command(future).unwrap();
+        assert!(!actual_work.entries().is_empty());
+        assert_eq!(actual_work, future_work);
+    }
+}
+
+#[test]
+fn algorithm_work_opt_in_preserves_selected_wire_and_has_no_global_mode() {
+    use ferrum_interfaces::execution_cost::StatisticalTransferKindV1 as K;
+    // This pure test interleaves policies; neither creates a Metal device.
+    let build = |mode| core_cost_route::transfer_evidence(K::HostToDevice, 129, 7, mode).unwrap();
+    let off = build(ferrum_types::SloStructuredCostCapture::Disabled);
+    let on = build(ferrum_types::SloStructuredCostCapture::HostSettledV1);
+    let off_again = build(ferrum_types::SloStructuredCostCapture::Disabled);
+    assert_eq!(off, on);
+    assert_eq!(
+        serde_json::to_vec(&off).unwrap(),
+        serde_json::to_vec(&on).unwrap()
+    );
+    assert_eq!(off, off_again);
+    assert!(off.algorithm_work().is_none());
+    assert!(off_again.algorithm_work().is_none());
+    let captured = on.algorithm_work().unwrap().unwrap();
+    captured.validate_command(&on).unwrap();
+    assert_eq!(captured.entries().len(), 1);
+    assert_eq!(captured.entries()[0].work().host_to_device_bytes, 129);
+    assert!(core_cost_route::transfer_evidence(
+        K::DeviceToHost,
+        129,
+        7,
+        ferrum_types::SloStructuredCostCapture::HostSettledV1
+    )
+    .is_none());
 }

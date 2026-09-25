@@ -1,8 +1,6 @@
 //! Pure branch metadata shared by eager primitive encoding and route queries.
 use super::*;
-use ferrum_interfaces::execution_cost::{
-    SelectedCommandCostBuilderV1, SelectedCommandCostEvidenceV1,
-};
+use ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1;
 type SelectedPrimitiveRoute = (PrimitiveRoute, Option<SelectedCommandCostEvidenceV1>);
 use ferrum_interfaces::vnext::{
     DeviceBatchingForm, DeviceCommandPhase, HadamardApplication, HadamardSigns,
@@ -117,7 +115,10 @@ pub(super) fn eager_route(
                     )?;
                 }
                 let mut scratch = 0;
-                let mut stats = SelectedCommandCostBuilderV1::new(request.immediate_tokens());
+                let mut stats = crate::backend::metal::vnext_runtime::selected_cost_builder(
+                    pipelines.structured_capture(),
+                    request.immediate_tokens(),
+                );
                 let mut complete = transform.is_none();
                 for row in request.rows() {
                     let params = embedding_params(row.count.get(), hidden, vocabulary)?;
@@ -253,7 +254,10 @@ pub(super) fn eager_route(
                 let scratch = masked_argmax_scratch_stride(vocabulary, logits_type)?
                     .checked_mul(request.rows().len() as u64)
                     .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
-                let mut stats = SelectedCommandCostBuilderV1::new(request.rows().len() as u64);
+                let mut stats = crate::backend::metal::vnext_runtime::selected_cost_builder(
+                    pipelines.structured_capture(),
+                    request.rows().len() as u64,
+                );
                 let mut complete = true;
                 for _ in request.rows() {
                     complete &=

@@ -21,6 +21,13 @@ async fn structured_capture_metal_future_actual_and_real_terminal_settlement() {
         .as_ref()
         .unwrap();
     first_qualified.validate_host_stages(first_stages).unwrap();
+    assert!(!first_qualified
+        .recipe()
+        .device()
+        .algorithm_work()
+        .unwrap()
+        .entries()
+        .is_empty());
     session.freeze_cost_model().await.unwrap();
 
     // Exact prefill successor and fresh decode snapshots, including the real
@@ -72,6 +79,11 @@ async fn structured_capture_metal_future_actual_and_real_terminal_settlement() {
             .unwrap()
             .clone();
         future.validate_exact(&exact).unwrap();
+        let future_work = future
+            .device()
+            .algorithm_work()
+            .expect("every projected selected command captured");
+        assert!(!future_work.entries().is_empty());
         assert_no_live_effects(&inner, &captured, &counters);
         drop(projected);
         drop(parent);
@@ -100,6 +112,12 @@ async fn structured_capture_metal_future_actual_and_real_terminal_settlement() {
             .unwrap();
         qualified.validate_host_stages(stages).unwrap();
         assert_eq!(qualified.recipe(), future.as_ref());
+        // Old Eq deliberately ignores passive capture. Compare the separate
+        // checked per-algorithm evidence, including command assignment/order.
+        assert_eq!(
+            qualified.recipe().device().algorithm_work().unwrap(),
+            future.device().algorithm_work().unwrap()
+        );
         assert_eq!(
             stages.actual_shape.as_ref(),
             Some(&canonical_cost_shape(&exact).unwrap())

@@ -189,7 +189,8 @@ pub(super) fn embedding_evidence(
     out: ElementType,
     tokens: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut b = SelectedCommandCostBuilderV1::new(tokens);
+    let mut b =
+        crate::backend::metal::vnext_runtime::selected_cost_builder(p.structured_capture(), tokens);
     for launch in launches {
         if launch.transform.is_some() {
             return None;
@@ -204,7 +205,10 @@ pub(super) fn rms_evidence(
     input: ElementType,
     out: ElementType,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut b = SelectedCommandCostBuilderV1::new(u64::from(params.rows));
+    let mut b = crate::backend::metal::vnext_runtime::selected_cost_builder(
+        p.structured_capture(),
+        u64::from(params.rows),
+    );
     push_rms(&mut b, p, params, input, out, 0)?;
     b.finish().ok()
 }
@@ -237,7 +241,8 @@ pub(super) fn residual_evidence(
     out: ElementType,
     tokens: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut b = SelectedCommandCostBuilderV1::new(tokens);
+    let mut b =
+        crate::backend::metal::vnext_runtime::selected_cost_builder(p.structured_capture(), tokens);
     push_residual(&mut b, p, params, left, right, out, 0)?;
     b.finish().ok()
 }
@@ -311,7 +316,10 @@ pub(super) fn argmax_evidence(
     logits: ElementType,
     scratch: u64,
 ) -> Option<SelectedCommandCostEvidenceV1> {
-    let mut b = SelectedCommandCostBuilderV1::new(launches.len() as u64);
+    let mut b = crate::backend::metal::vnext_runtime::selected_cost_builder(
+        p.structured_capture(),
+        launches.len() as u64,
+    );
     for launch in launches {
         push_argmax(&mut b, p, launch.params, logits, scratch)?;
     }

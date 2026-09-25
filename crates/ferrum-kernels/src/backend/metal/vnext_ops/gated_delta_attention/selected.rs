@@ -255,7 +255,8 @@ pub(super) fn evidence<'a>(
     if count == 0 || total != tokens {
         return None;
     }
-    let mut b = SelectedCommandCostBuilderV1::new(tokens);
+    let mut b =
+        crate::backend::metal::vnext_runtime::selected_cost_builder(l.structured_capture(), tokens);
     if let Some(v) = packed {
         if u64::from(v.params.tokens) != tokens {
             return None;

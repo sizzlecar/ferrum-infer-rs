@@ -1489,6 +1489,7 @@ pub struct MetalDeviceCommand {
     core_transfer: Option<(
         ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
         u64,
+        ferrum_types::SloStructuredCostCapture,
     )>,
     regions: Vec<MetalBufferRegion>,
     staging: Vec<Buffer>,
@@ -1643,9 +1644,9 @@ impl MetalDeviceCommand {
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
-        if let Some((kind, bytes)) = self.core_transfer {
+        if let Some((kind, bytes, capture)) = self.core_transfer {
             self.statistical_evidence =
-                core_cost_route::transfer_evidence(kind, bytes, self.token_count);
+                core_cost_route::transfer_evidence(kind, bytes, self.token_count, capture);
         }
         Ok(self)
     }
@@ -1654,10 +1655,11 @@ impl MetalDeviceCommand {
         mut self,
         kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
         bytes: u64,
+        capture: ferrum_types::SloStructuredCostCapture,
     ) -> Self {
-        self.core_transfer = Some((kind, bytes));
+        self.core_transfer = Some((kind, bytes, capture));
         self.statistical_evidence =
-            core_cost_route::transfer_evidence(kind, bytes, self.token_count);
+            core_cost_route::transfer_evidence(kind, bytes, self.token_count, capture);
         self
     }
 
@@ -2565,7 +2567,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         bytes: u64,
         tokens: u64,
     ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
-        core_cost_route::transfer_evidence(kind, bytes, tokens)
+        core_cost_route::transfer_evidence(kind, bytes, tokens, self.structured_capture)
     }
 
     fn cost_core_execution_capabilities(
@@ -2705,6 +2707,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         .with_core_transfer(
             ferrum_interfaces::execution_cost::StatisticalTransferKindV1::DeviceToDevice,
             region.length_bytes(),
+            self.structured_capture,
         ))
     }
 
@@ -2764,6 +2767,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         .with_core_transfer(
             ferrum_interfaces::execution_cost::StatisticalTransferKindV1::HostToDevice,
             source_bytes,
+            self.structured_capture,
         ))
     }
 
@@ -2805,6 +2809,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         .with_core_transfer(
             ferrum_interfaces::execution_cost::StatisticalTransferKindV1::Fill,
             length_bytes,
+            self.structured_capture,
         ))
     }
 
@@ -3106,16 +3111,25 @@ mod tests {
     }
 
     pub(super) fn runtime() -> MetalDeviceRuntime {
-        MetalDeviceRuntime::new(MetalDeviceRuntimeConfig {
-            device_id: DeviceId::new("device/metal/test").expect("device id"),
-            runtime_implementation_fingerprint: "a".repeat(64),
-            capabilities: BTreeSet::new(),
-            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
-                DynamicStorageAllocator::LinearArena,
-                DynamicStorageView::Contiguous,
-            )
-            .expect("storage profile")]),
-        })
+        runtime_with_structured_capture(ferrum_types::SloStructuredCostCapture::Disabled)
+    }
+
+    pub(super) fn runtime_with_structured_capture(
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> MetalDeviceRuntime {
+        MetalDeviceRuntime::new_with_structured_capture(
+            MetalDeviceRuntimeConfig {
+                device_id: DeviceId::new("device/metal/test").expect("device id"),
+                runtime_implementation_fingerprint: "a".repeat(64),
+                capabilities: BTreeSet::new(),
+                dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                    DynamicStorageAllocator::LinearArena,
+                    DynamicStorageView::Contiguous,
+                )
+                .expect("storage profile")]),
+            },
+            capture,
+        )
         .expect("Metal runtime")
     }
 
