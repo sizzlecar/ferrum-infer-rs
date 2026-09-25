@@ -8,9 +8,13 @@ use crate::vnext::{ResourcePlanningState, ResourcePlanningUnknown, ResourcePlann
 use std::sync::Arc;
 
 mod core;
+mod host_content;
 mod masks;
 mod uploads;
 pub use core::{append_complete_eager_cost_route, EagerCoreWaveCostQuery};
+pub use host_content::{
+    ExecutionCostRouteForecastV2, FutureHostPendingQueryV2, FutureHostPendingRowV2,
+};
 pub use masks::{
     selection_mask_bytes_match, EagerCoreTokenMaskInput, ProductTokenMaskContent,
     ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot, ProductTokenMaskSelection,

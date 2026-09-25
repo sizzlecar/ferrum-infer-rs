@@ -3329,6 +3329,24 @@ pub trait ModelExecutor: Send + Sync {
         )
     }
 
+    /// Project one whole physical route and bind its unresolved host subsets.
+    /// Every represented subset must preserve selected providers, transfers,
+    /// mask residency, readback and the advanced numeric state. Supporting an
+    /// exact projection alone does not establish this stronger capability.
+    fn project_execution_cost_wave_with_host_content(
+        &self,
+        _view: &crate::vnext::ExecutionCostRouteView,
+        _state: &crate::vnext::ExecutionCostRouteState,
+        _query: &crate::vnext::FutureWaveCostQuery<'_>,
+        _host: &crate::vnext::FutureHostPendingQueryV2<'_>,
+        _budget: &mut dyn crate::vnext::ResourcePlanningBudget,
+    ) -> crate::vnext::ExecutionCostRouteAvailability<crate::vnext::ExecutionCostRouteForecastV2>
+    {
+        crate::vnext::ExecutionCostRouteAvailability::Unknown(
+            crate::vnext::ExecutionCostRouteUnknown::Unsupported,
+        )
+    }
+
     /// Plan an optional prompt-tail checkpoint before a prefill chunk is
     /// dispatched. The boundary must lie after this chunk's start and no later
     /// than its end, leaving a legal suffix for logits. None preserves the chunk. Planning

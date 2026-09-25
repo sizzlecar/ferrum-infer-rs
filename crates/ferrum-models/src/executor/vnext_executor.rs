@@ -10564,6 +10564,17 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         self.project_future_cost_route(view, state, query, budget)
     }
 
+    fn project_execution_cost_wave_with_host_content(
+        &self,
+        view: &ExecutionCostRouteView,
+        state: &ExecutionCostRouteState,
+        query: &FutureWaveCostQuery<'_>,
+        host: &FutureHostPendingQueryV2<'_>,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> ExecutionCostRouteAvailability<ExecutionCostRouteForecastV2> {
+        self.project_future_cost_route_with_host_content(view, state, query, host, budget)
+    }
+
     fn project_execution_resource_wave(
         &self,
         view: &ResourcePlanningView,

@@ -5,6 +5,7 @@ use ferrum_interfaces::execution_cost::*;
 use ferrum_interfaces::model_executor::ExecutorResourcePlanningRequest;
 use std::num::NonZeroU64;
 
+mod host_content;
 mod masks;
 mod uploads;
 pub(super) use uploads::{

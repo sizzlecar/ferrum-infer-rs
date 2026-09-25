@@ -43,6 +43,34 @@ impl Fixture {
         geometry: weights::CausalGeometry,
         preparation: ferrum_types::WorkspacePreparationMode,
     ) -> Self {
+        Self::with_capture(
+            maximum_batch_tokens,
+            prefix,
+            geometry,
+            preparation,
+            ferrum_types::SloStructuredCostCapture::Disabled,
+        )
+        .await
+    }
+
+    pub async fn with_structured_capture(maximum_batch_tokens: usize) -> Self {
+        Self::with_capture(
+            maximum_batch_tokens,
+            false,
+            weights::CausalGeometry::TINY,
+            ferrum_types::WorkspacePreparationMode::DemandDriven,
+            ferrum_types::SloStructuredCostCapture::HostSettledV1,
+        )
+        .await
+    }
+
+    async fn with_capture(
+        maximum_batch_tokens: usize,
+        prefix: bool,
+        geometry: weights::CausalGeometry,
+        preparation: ferrum_types::WorkspacePreparationMode,
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         weights::write_config(directory.path(), geometry);
         weights::write_weights(directory.path(), geometry);
@@ -70,8 +98,10 @@ impl Fixture {
             .unwrap();
         let prepared = defined.prepare(&profiles[0].id).unwrap();
         let (runtime, operations, materializers, materializer, catalog) =
-            MetalVNextComposition::create(
+            MetalVNextComposition::create_with_observation(
                 DeviceId::new(format!("device.observed-product.{}", uuid::Uuid::new_v4())).unwrap(),
+                None,
+                capture,
             )
             .unwrap()
             .into_parts();

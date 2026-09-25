@@ -51,6 +51,18 @@ fn predict(
     decodes: &[PlanRuntimeDecodeInput],
     probe: &Probe,
 ) -> CanonicalWaveCostShape {
+    predict_with_host(fixture, prefills, decodes, probe, None)
+        .projection
+        .shape
+}
+
+fn predict_with_host(
+    fixture: &Fixture,
+    prefills: &[PlanRuntimePrefillInput],
+    decodes: &[PlanRuntimeDecodeInput],
+    probe: &Probe,
+    host: Option<&FutureHostPendingQueryV2<'_>>,
+) -> ExecutionCostRouteForecastV2 {
     fixture.warm(prefills, decodes);
     let before = fixture.target_resource_evidence(prefills, decodes);
     let submissions = fixture.submissions();
@@ -79,7 +91,8 @@ fn predict(
             )) if Instant::now() < deadline => std::thread::yield_now(),
             ExecutionCostRouteAvailability::Unknown(reason) => panic!("future capture: {reason:?}"),
         }
-    };
+    }
+    .with_structured_capture(host.is_some());
     let query_rows: Vec<_> = rows
         .iter()
         .enumerate()
@@ -136,21 +149,51 @@ fn predict(
         },
         rows: &query_rows,
     };
-    let query_once = || match fixture.executor.project_execution_cost_wave(
-        &view,
-        &view.initial_state(),
-        &query,
-        &mut || true,
-    ) {
-        ExecutionCostRouteAvailability::Known(projection) => projection.shape,
-        ExecutionCostRouteAvailability::Unknown(reason) => panic!("future projection: {reason:?}"),
+    let query_once = || {
+        let result = if let Some(host) = host {
+            fixture
+                .executor
+                .project_execution_cost_wave_with_host_content(
+                    &view,
+                    &view.initial_state(),
+                    &query,
+                    host,
+                    &mut || true,
+                )
+        } else {
+            match fixture.executor.project_execution_cost_wave(
+                &view,
+                &view.initial_state(),
+                &query,
+                &mut || true,
+            ) {
+                ExecutionCostRouteAvailability::Known(projection) => {
+                    ExecutionCostRouteAvailability::Known(ExecutionCostRouteForecastV2 {
+                        projection,
+                        host_content: HostContentForecastV2::Exact,
+                    })
+                }
+                ExecutionCostRouteAvailability::Unknown(reason) => {
+                    ExecutionCostRouteAvailability::Unknown(reason)
+                }
+            }
+        };
+        match result {
+            ExecutionCostRouteAvailability::Known(projection) => projection,
+            ExecutionCostRouteAvailability::Unknown(reason) => {
+                panic!("future projection: {reason:?}")
+            }
+        }
     };
-    let shape = query_once();
+    let projection = query_once();
+    let shape = &projection.projection.shape;
     assert_eq!(
-        query_once(),
-        shape,
+        query_once().projection.shape,
+        *shape,
         "pure projections from one view must agree"
     );
+    assert_eq!(view.initial_state().projected_waves(), 0);
+    assert_eq!(projection.projection.state.projected_waves(), 1);
     assert!(
         shape.numeric_features.is_some(),
         "also compare the core readback/host numeric identity"
@@ -170,8 +213,10 @@ fn predict(
         before,
         "query must preserve target backing/frame/initialization evidence"
     );
-    shape
+    projection
 }
+
+mod host_forecast;
 
 fn assert_canonical(probe: &Probe, expected: &CanonicalWaveCostShape) {
     let observed = &probe.recorder.observations()[0];

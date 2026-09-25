@@ -81,10 +81,11 @@ pub use dispatch_contract::{
 pub use future_cost_route::{
     append_complete_eager_cost_route, selection_mask_bytes_match, DeviceCoreCostCapabilities,
     EagerCoreInputUpload, EagerCoreReadback, EagerCoreTokenMaskInput, EagerCoreWaveCostQuery,
-    ExecutionCostRouteAvailability, ExecutionCostRouteProjection, ExecutionCostRouteState,
-    ExecutionCostRouteUnknown, ExecutionCostRouteView, FutureCostOutput, FutureWaveCostQuery,
-    FutureWaveCostRow, ProductTokenMaskContent, ProductTokenMaskResidencyEntry,
-    ProductTokenMaskResidencySnapshot, ProductTokenMaskSelection,
+    ExecutionCostRouteAvailability, ExecutionCostRouteForecastV2, ExecutionCostRouteProjection,
+    ExecutionCostRouteState, ExecutionCostRouteUnknown, ExecutionCostRouteView, FutureCostOutput,
+    FutureHostPendingQueryV2, FutureHostPendingRowV2, FutureWaveCostQuery, FutureWaveCostRow,
+    ProductTokenMaskContent, ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot,
+    ProductTokenMaskSelection,
 };
 pub use identity::{
     BatchOperationIdentity, BatchOperationIdentityMaterializationSnapshot,
