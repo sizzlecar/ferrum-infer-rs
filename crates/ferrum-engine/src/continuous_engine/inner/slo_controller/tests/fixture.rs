@@ -5,6 +5,7 @@ use ferrum_interfaces::{engine::InferenceEngine, KvCacheHandle, ModelExecutor, T
 use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+mod deferral;
 mod snapshot_epoch;
 
 #[path = "../../../../../../ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs"]
@@ -108,6 +109,7 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     /// diagnostic evidence, not an injected answer or permission to retry.
     pub cost_route_unknown: Mutex<Option<vnext::ExecutionCostRouteUnknown>>,
     pub resource_revalidation_changed: AtomicBool,
+    pub deferrals: deferral::ControlledDeferrals,
     pub entered: Notify,
     pub resume: Notify,
 }
@@ -147,7 +149,7 @@ impl ModelExecutor for ControlledExecutor {
         Ok(Some(ExecutorAdmissionEpochs::new(
             NonZeroU64::new(47).unwrap(),
             0,
-            0,
+            self.deferrals.capacity_epoch.load(Ordering::Acquire),
         )))
     }
     fn write_execution_capacity_snapshot(
@@ -158,7 +160,7 @@ impl ModelExecutor for ControlledExecutor {
         sources.push(
             vnext::CapacityAvailabilityEpoch::new(
                 vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
-                1,
+                self.deferrals.capacity_epoch.load(Ordering::Acquire) + 1,
             )
             .unwrap(),
         );
@@ -196,7 +198,18 @@ impl ModelExecutor for ControlledExecutor {
         limits: ResourcePlanningLimits,
         budget: &mut dyn vnext::ResourcePlanningBudget,
     ) -> ExecutionCostRouteAvailability<ExecutionCostRouteView> {
+        self.deferrals
+            .planning_captures
+            .fetch_add(1, Ordering::AcqRel);
         self.route_for_requests(requests, limits, budget)
+    }
+
+    fn maintain_execution_capacity_once(
+        &self,
+        ticket: ExecutorExecutionMaintenanceTicket,
+        guard: &dyn NonblockingHostSubmissionGuard,
+    ) -> Result<ExecutorExecutionMaintenanceOutcome> {
+        self.deferrals.maintain(ticket, guard)
     }
     fn revalidate_execution_resource_planning_view(
         &self,
@@ -305,6 +318,9 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<Vec<PlanRuntimePrefillCompletion>> {
+        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+            return deferred;
+        }
         if !self.enter_guarded(guard).await {
             return GuardedDispatchOutcome::ReplanBeforeEncode;
         }
@@ -334,6 +350,9 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<PlanRuntimeMixedBatchOutput> {
+        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+            return deferred;
+        }
         if !self.enter_guarded(guard).await {
             return GuardedDispatchOutcome::ReplanBeforeEncode;
         }
@@ -394,6 +413,9 @@ impl ModelExecutor for ControlledExecutor {
         guard: &dyn NonblockingHostSubmissionGuard,
         mut observation: GuardedCostObservation<'_, '_>,
     ) -> GuardedDispatchOutcome<Vec<PlanRuntimeDecodeOutput>> {
+        if let Some(deferred) = self.deferrals.take(guard, &self.entries) {
+            return deferred;
+        }
         if !self.enter_guarded(guard).await {
             return GuardedDispatchOutcome::ReplanBeforeEncode;
         }
@@ -706,6 +728,11 @@ impl CostObservationClock for Clock {
 fn trained_runtime() -> Arc<EngineCostRuntime> {
     let clock = Arc::new(Clock(AtomicU64::new(11)));
     let runtime = Arc::new(EngineCostRuntime::with_clock(identity(), clock).unwrap());
+    train_runtime(&runtime);
+    runtime
+}
+
+pub(super) fn train_runtime(runtime: &Arc<EngineCostRuntime>) {
     for _ in 0
         ..ferrum_scheduler::implementations::continuous::cost_model::CostModelSettings::default()
             .min_samples
@@ -783,7 +810,6 @@ fn trained_runtime() -> Arc<EngineCostRuntime> {
     }
     runtime.consume_samples();
     assert!(runtime.snapshot().is_some());
-    runtime
 }
 
 pub(super) async fn fixture() -> (
@@ -847,6 +873,7 @@ pub(in crate::continuous_engine) async fn startup_components(
         resource_planning_unknown: Mutex::new(None),
         cost_route_unknown: Mutex::new(None),
         resource_revalidation_changed: AtomicBool::new(false),
+        deferrals: Default::default(),
         entered: Notify::new(),
         resume: Notify::new(),
     });

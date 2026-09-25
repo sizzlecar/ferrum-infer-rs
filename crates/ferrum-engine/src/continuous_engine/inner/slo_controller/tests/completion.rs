@@ -3,6 +3,7 @@
 use super::*;
 use ferrum_interfaces::engine::InferenceEngine;
 
+mod deferral;
 mod retry;
 mod work_envelope;
 

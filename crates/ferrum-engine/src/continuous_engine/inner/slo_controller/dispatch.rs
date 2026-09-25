@@ -210,6 +210,7 @@ impl EngineInner {
                         });
                     }
                 }
+                self.continue_deferred_completion(work);
                 self.slo_controller_idle_outcome()
             }
             GuardedDispatchOutcome::MaintenanceDeferred { deferral, ticket } => {
@@ -221,6 +222,9 @@ impl EngineInner {
                 capacity.validated_maintenance_retry_scope(&request_ids)?;
                 self.withdraw_controller_flight(flight)?;
                 self.retain_controller_maintenance(work.expected.work(), ticket)?;
+                // Recapture after the separate maintenance turn must preserve
+                // the completion intent, never the old physical work proof.
+                self.continue_deferred_completion(work);
                 self.slo_controller_idle_outcome()
             }
             GuardedDispatchOutcome::NotSubmittedAfterPreparation(receipt) => {

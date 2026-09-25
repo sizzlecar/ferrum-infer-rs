@@ -45,6 +45,27 @@ impl EngineInner {
         }
     }
 
+    /// Continue an already chosen completion attempt after a typed deferral
+    /// proved it submitted nothing. This is a scheduling intent, not cached
+    /// work, cost, or feasibility evidence: the next publication captures the
+    /// whole current queue again and must pass its ordinary physical guards.
+    /// Readiness waiters and capacity maintenance own their existing wakes;
+    /// adding a retry timer here would delay maintenance or poll a blocked owner.
+    pub(super) fn continue_deferred_completion(&self, work: &owner::ControllerWork) {
+        if self.completion_allowed()
+            && matches!(
+                work.timing,
+                owner::ControllerTimingCommitment::CompleteRequests
+            )
+        {
+            if let ferrum_interfaces::execution_cost::WaveCommitment::CompleteRequests(reason) =
+                work.expected.commitment()
+            {
+                self.slo_controller.lock().completion_next = Some(*reason);
+            }
+        }
+    }
+
     pub(super) fn prepare_completion_controller(
         &self,
         hint: &ferrum_interfaces::BatchHint,
