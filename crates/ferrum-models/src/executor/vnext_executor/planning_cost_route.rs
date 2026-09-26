@@ -356,6 +356,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 recurrent,
             )
             .map_err(|_| U::InvalidInput)?;
+        #[cfg(test)]
+        if let Err(reason) = &shape.statistical {
+            eprintln!(
+                "FUTURE_CPU_STATISTICAL_FAILURE {}",
+                serde_json::json!({
+                    "reason":format!("{reason:?}"),"kind":format!("{:?}",shape.exact.kind),
+                    "rows":shape.exact.rows.len(),"numeric_present":shape.exact.numeric_features.is_some(),
+                    "host_content_present":shape.exact.host_content_features.is_some(),
+                    "row_multiset_present":shape.exact.row_multiset_features.is_some(),
+                })
+            );
+        }
         Ok(ExecutionCostRouteProjection {
             statistical_evidence: shape.statistical.ok(),
             shape: shape.exact,
