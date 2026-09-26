@@ -900,20 +900,23 @@ pub trait PlanningClock {
 /// evidence. This is immutable numeric evidence, never a submission permit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalReplayFirstWave {
-    candidate: WaveCandidate,
+    candidate: Arc<WaveCandidate>,
     canonical: Arc<CanonicalWaveCostShape>,
+    statistics: Option<Arc<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
     snapshot_observed_at_ns: u64,
 }
 
 impl FinalReplayFirstWave {
     pub(super) fn from_replay(
         snapshot: &SchedulerSnapshot,
-        candidate: WaveCandidate,
+        candidate: Arc<WaveCandidate>,
         canonical: Arc<CanonicalWaveCostShape>,
+        statistics: Option<Arc<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
     ) -> Self {
         Self {
             candidate,
             canonical,
+            statistics,
             snapshot_observed_at_ns: snapshot.observed_at_ns,
         }
     }
@@ -938,6 +941,29 @@ pub struct SelectedWave {
 }
 
 impl SelectedWave {
+    /// Capture-only immutable evidence from the successful independent replay.
+    /// The public candidate sidecar is never consulted: candidate equality does
+    /// not compare that sidecar. This accessor adds no projection or authority.
+    pub fn replayed_first_wave_structured_v2(
+        &self,
+        snapshot: &SchedulerSnapshot,
+    ) -> Option<(
+        &Arc<CanonicalWaveCostShape>,
+        &Arc<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>,
+        &structured_v2::StructuredQueryV2,
+    )> {
+        self.replayed_first_wave(snapshot)?;
+        let proof = self.final_replay_first_wave.as_ref()?;
+        let query = proof
+            .candidate
+            .cost_evidence
+            .as_ref()?
+            .exact()?
+            .structured_query_v2_for(proof.candidate.execution_shape.exact()?)
+            .ok()?;
+        Some((&proof.canonical, proof.statistics.as_ref()?, query))
+    }
+
     /// Validate immutable candidate and snapshot identity before borrowing the
     /// canonical edge. Live route/resource/frontier/credit/time guards remain
     /// the publisher's responsibility. The canonical is never mutable here.
@@ -946,7 +972,7 @@ impl SelectedWave {
         snapshot: &SchedulerSnapshot,
     ) -> Option<&CanonicalWaveCostShape> {
         let proof = self.final_replay_first_wave.as_ref()?;
-        (self.candidate == proof.candidate
+        (&self.candidate == proof.candidate.as_ref()
             && self.snapshot_generation == snapshot.generation
             && self.candidate.based_on_generation == snapshot.generation
             && self.cost_model_version == snapshot.cost_model_version

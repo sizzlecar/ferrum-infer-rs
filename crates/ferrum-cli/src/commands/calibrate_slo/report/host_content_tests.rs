@@ -46,6 +46,7 @@ fn terminal() -> HostStageEvidenceV1 {
     };
     HostStageEvidenceV1 {
         presubmit_prediction: None,
+        prospective_capture: None,
         statistical_evidence: None,
         structured_evidence: None,
         schema_version: 1,

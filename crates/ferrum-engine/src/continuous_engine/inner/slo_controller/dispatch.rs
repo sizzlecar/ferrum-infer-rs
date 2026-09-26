@@ -18,6 +18,9 @@ impl EngineInner {
             "entering one guarded controller wave");
         let guard = HostGuard { engine: self, work };
         if let Err(reason) = guard.check() {
+            if let Some(capture) = &work.prospective_capture {
+                capture.not_submitted(slo_clock_now());
+            }
             tracing::trace!(?reason, "controller evidence changed before preparation");
             self.arm_controller_retry(retry::ControllerRetryReason::ChangedEvidence);
             if matches!(
@@ -87,6 +90,9 @@ impl EngineInner {
         let (prefills, decodes) = match prepared {
             Ok(inputs) => inputs,
             Err(error) => {
+                if let Some(capture) = &work.prospective_capture {
+                    capture.not_submitted(slo_clock_now());
+                }
                 self.withdraw_controller_flight(flight)?;
                 return Err(error);
             }
@@ -118,6 +124,9 @@ impl EngineInner {
                 witness.canonical(),
             );
         }
+        if let (Some(call), Some(capture)) = (cost.as_deref_mut(), &work.prospective_capture) {
+            call.attach_prospective_capture(Arc::clone(capture), slo_clock_now());
+        }
         if let (Some(call), Some(receipt)) = (cost.as_deref_mut(), &flight.calibration) {
             call.attach_calibration_capture(Arc::clone(receipt.capture()));
         }
@@ -138,6 +147,11 @@ impl EngineInner {
             )
             .await
         };
+        if !matches!(&outcome, GuardedDispatchOutcome::Submitted(_)) {
+            if let Some(capture) = &work.prospective_capture {
+                capture.not_submitted(slo_clock_now());
+            }
+        }
         if matches!(&outcome, GuardedDispatchOutcome::Submitted(_)) {
             work.proof.budget.record_backend_submitted();
             self.record_recovery_submission(work);

@@ -358,8 +358,17 @@ impl EngineInner {
             self.keep_unsubmitted_publication(receipt)?;
             publication_idle!(rejection_reason);
         }
+        let prospective_capture = self.cost_runtime.as_ref().and_then(|runtime| {
+            runtime.declare_prospective_capture(
+                &selected,
+                &captured.snapshot,
+                &expected,
+                valid_until,
+            )
+        });
         self.install_controller_wave(
             owner::ControllerWork {
+                prospective_capture,
                 batch,
                 timing: owner::ControllerTimingCommitment::Witness {
                     valid_until,

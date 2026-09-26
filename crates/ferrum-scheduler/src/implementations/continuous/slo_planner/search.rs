@@ -759,8 +759,12 @@ impl BoundedSloPlanner {
             let first_wave = SelectedWave {
                 final_replay_first_wave: Some(Arc::new(FinalReplayFirstWave::from_replay(
                     snapshot,
-                    solution.waves[0].clone(),
+                    state
+                        .first_wave_candidate
+                        .clone()
+                        .expect("successful replay has a first wave"),
                     canonical,
+                    state.first_wave_statistics.clone(),
                 ))),
                 protection: protection.clone(),
                 candidate: solution.waves[0].clone(),

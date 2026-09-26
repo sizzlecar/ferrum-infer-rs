@@ -368,6 +368,7 @@ pub(in crate::continuous_engine::inner::slo_controller) async fn install_with_ad
         .inner
         .install_controller_wave(
             owner::ControllerWork {
+                prospective_capture: None,
                 batch,
                 expected: ExpectedExecutionWave::from_cost_witness(expected, |id| {
                     captured

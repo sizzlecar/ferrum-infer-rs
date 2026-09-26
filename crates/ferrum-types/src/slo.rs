@@ -18,10 +18,11 @@ mod reference;
 pub use cost::{
     SloCostFeatureModel, SloCostModelConfig, SloCostObservationConfig, SloCostPredictor,
     SloCostProfileExportConfig, SloCostProfileImportConfig, SloCostProfileReceipt,
-    SloCostShapeLimits, SloSelectedFeedbackPolicy, SloSelectedFeedbackSettingsV1,
-    SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1, SloStructuredCostCapture,
-    SloStructuredFeedbackPolicy, SloStructuredPhaseReceiptV1, SloStructuredProfilePhaseV1,
-    SloStructuredWholeWaveReceiptV1, SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
+    SloCostShapeLimits, SloProspectiveStructuredCapture, SloSelectedFeedbackPolicy,
+    SloSelectedFeedbackSettingsV1, SloSelectedFeedbackStorageV1, SloSelectedWholeWaveReceiptV1,
+    SloStructuredCostCapture, SloStructuredFeedbackPolicy, SloStructuredPhaseReceiptV1,
+    SloStructuredProfilePhaseV1, SloStructuredWholeWaveReceiptV1,
+    SLO_COST_PROFILE_RECEIPT_RUNTIME_KEY,
 };
 pub use reference::*;
 

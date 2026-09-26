@@ -56,6 +56,8 @@ pub(in crate::continuous_engine) use runtime::*;
 pub(in crate::continuous_engine) use trainer::structured::structured_discovery_input;
 pub(in crate::continuous_engine) use trainer::structured_v2::structured_discovery_input_v2;
 mod presubmit;
+mod prospective_capture;
+pub(in crate::continuous_engine::inner) use prospective_capture::ProspectiveCapture;
 mod sample;
 mod selected_feedback;
 mod sink;
@@ -189,6 +191,7 @@ pub(in crate::continuous_engine) struct EngineCostCall {
     finished: bool,
     calibration_capture: Option<Arc<CostCalibrationCapture>>,
     presubmit_prediction: Option<presubmit::PendingPrediction>,
+    prospective_capture: Option<Arc<ProspectiveCapture>>,
 }
 
 /// Dropping this guard copies only already observed facts. In particular,
@@ -294,6 +297,7 @@ impl EngineCostCall {
             finished: false,
             calibration_capture: None,
             presubmit_prediction: None,
+            prospective_capture: None,
         })
     }
 

@@ -20,6 +20,21 @@ impl StructuredSnapshot {
             feedback: None,
         }
     }
+    pub fn prospective_source(
+        &self,
+        query: &StructuredQueryV2,
+    ) -> Option<super::super::prospective_capture::SourceIdentity> {
+        let child = self.select(query).ok()?;
+        let p = child.provenance();
+        Some(super::super::prospective_capture::SourceIdentity {
+            domain: *query.domain_signature(),
+            profile_sha256: p.file_sha256,
+            source_sha256: p.source_sha256,
+            parameters_sha256: p.parameters_sha256,
+            protocol_sha256: p.protocol,
+            capture_identity: p.capture_identity,
+        })
+    }
     pub fn len(&self) -> usize {
         self.children.len()
     }

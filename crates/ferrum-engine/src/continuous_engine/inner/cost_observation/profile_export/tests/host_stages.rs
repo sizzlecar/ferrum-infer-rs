@@ -3,6 +3,7 @@ use super::*;
 fn stages(capacity: usize) -> Arc<HostStageEvidenceV1> {
     Arc::new(HostStageEvidenceV1 {
         presubmit_prediction: None,
+        prospective_capture: None,
         statistical_evidence: None,
         structured_evidence: None,
         schema_version: 1,

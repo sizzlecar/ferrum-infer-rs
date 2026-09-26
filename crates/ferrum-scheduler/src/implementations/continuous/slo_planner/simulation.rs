@@ -11,6 +11,9 @@ pub(super) struct PlanningState<'epoch> {
     execution: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
     depth: usize,
     future_controller_ns: u64,
+    pub first_wave_candidate: Option<Arc<WaveCandidate>>,
+    pub first_wave_statistics:
+        Option<Arc<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
     pub first_wave_canonical:
         Option<Arc<ferrum_interfaces::execution_cost::CanonicalWaveCostShape>>,
 }
@@ -73,6 +76,8 @@ pub(super) fn begin_with_controller_time<'epoch>(
         execution,
         depth: 0,
         future_controller_ns,
+        first_wave_candidate: None,
+        first_wave_statistics: None,
         first_wave_canonical: None,
         logical: SimulatedSequence {
             requests: snapshot.requests.clone(),
@@ -166,6 +171,12 @@ pub(super) fn advance<'epoch>(
             execution: projected.successor,
             depth: parent.depth + 1,
             future_controller_ns: parent.future_controller_ns,
+            first_wave_candidate: parent.first_wave_candidate.clone(),
+            first_wave_statistics: if parent.depth == 0 {
+                projected.first_statistics
+            } else {
+                parent.first_wave_statistics.clone()
+            },
             first_wave_canonical: if parent.depth == 0 {
                 projected.first_canonical
             } else {
@@ -207,6 +218,11 @@ pub(super) fn replay<'epoch>(
             return Err(SimulationFailure::SequenceViolation);
         }
         state = transition.state;
+        if state.depth == 1 {
+            // Move the independently replayed bound input; search sidecars
+            // never become publication/capture evidence. No second bind/clone.
+            state.first_wave_candidate = Some(Arc::new(transition.wave));
+        }
     }
     Ok(state)
 }

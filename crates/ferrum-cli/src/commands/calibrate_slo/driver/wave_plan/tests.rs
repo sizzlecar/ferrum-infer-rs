@@ -53,6 +53,7 @@ fn evidence(attempt: &Attempt) -> (Vec<ReportedRow>, HostStageEvidenceV1) {
         schema_version: 1,
         call_id: 1,
         presubmit_prediction: None,
+        prospective_capture: None,
         fingerprint: None,
         actual_shape: None,
         statistical_evidence: None,

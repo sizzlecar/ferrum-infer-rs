@@ -15,6 +15,7 @@ const FINISHED: u8 = 2;
 const WITHDRAWN: u8 = 3;
 
 pub(super) struct ControllerWork {
+    pub prospective_capture: Option<Arc<super::super::cost_observation::ProspectiveCapture>>,
     pub batch: ferrum_interfaces::BatchPlan,
     pub timing: ControllerTimingCommitment,
     pub proof: ControllerSafetyProof,

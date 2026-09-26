@@ -1079,3 +1079,50 @@ membership windows、覆盖挑战及三阶段完整请求计划。其 `capture` 
 暖机排空后读取真实 opening clock/FIFO cut。暖机进入完整 manifest 摘要，但不成为
 fit/residual/qualification 的请求槽或成员。省略 `capture.warmup` 保持原行为。
 发现本身不会创建模型 source、训练成员或 profile10，不会授予未观测未来分支资格。
+
+
+### Prospective structured first-wave capture
+
+`cost_observation.prospective_structured_capture: replayed_first_wave_v1`
+(default `disabled`) requires `predictor: structured_whole_wave_v2` and
+`structured_capture: host_settled_v1`. The shared engine publication and dispatch
+path applies this option to both `ferrum run` and `ferrum serve`.
+
+This declares every published structured V2 cost witness before input preparation.
+It retains the exact recipe and bound query from the successful independent replay;
+it does not project the wave again. The declaration includes the original owner
+domain, profile/source/parameters/protocol/capture identities and catalog epoch.
+The original controller guards still decide whether execution may start.
+Completion-only and legacy dispatches are outside this declared population.
+
+The original host-settled recorder reconciles actual participants, exact route,
+statistics, both statistical sidecars, and consumed private settlement receipts.
+`prospective_capture` in the observation funnel reports declarations, terminal
+outcomes, FIFO acceptance and FIFO loss separately. Per-wave host evidence includes
+a serialize-only `ferrum.prospective-first-wave-capture.v1` receipt when available.
+Expired or revoked witnesses, missing replay evidence, changed participants/routes,
+EOS/Stop, incomplete settlement and cancellation cannot become matched evidence.
+Unsubmitted declarations retain an explicit failure/abandonment outcome. A live
+funnel is not an atomic cut; counters settle after outstanding waves are released.
+
+`matched` means one real wave matched its prospective declaration and private
+settlement. It grants **no source3 cohort/phase membership or model qualification**.
+This option does not fit a model, refresh its age, publish another catalog, bootstrap
+an unknown/expired model, or ensure that rare owners receive observations. Source3
+still requires its predeclared complete Length cohorts and disjoint fit, residual,
+and qualification phases. Live source capture and atomic catalog replacement are
+separate lifecycle work, with their own explicit population/version contracts.
+
+Deadline and catalog-current checks constrain declaration attachment **before
+submission**. Settlement deliberately retains the original submitted epoch when
+another feedback update publishes or time passes during execution; it does not
+reclassify an already executed wave using a later model. The original host guard
+still rejects stale work before actual submission.
+
+Capture has CPU and retention overhead even though it adds no inference or second
+full projection. The synchronous completion path validates the private settlement
+binding and compares the complete expected/actual structured recipes. Per-wave
+CPU cost and end-to-end SLO impact must be measured with capture enabled. A later
+worker-based implementation must carry original expected evidence with the same
+call through the bounded FIFO and account for its retained storage; a boolean or
+an unbound digest cannot replace those checks.

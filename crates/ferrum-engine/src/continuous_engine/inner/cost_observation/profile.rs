@@ -289,6 +289,19 @@ pub(in crate::continuous_engine) struct EngineCostSnapshot {
 }
 
 impl EngineCostSnapshot {
+    pub(super) fn prospective_source(
+        &self,
+        query: &model::structured_v2::StructuredQueryV2,
+    ) -> Option<super::prospective_capture::SourceIdentity> {
+        if !self.current() {
+            return None;
+        }
+        match &self.inner {
+            Snapshot::StructuredV2(snapshot) => snapshot.prospective_source(query),
+            _ => None,
+        }
+    }
+
     /// A read-only lookup against this original imported snapshot and clock.
     /// Its result grants no publication, observation or training authority.
     pub(in crate::continuous_engine::inner) fn audit_structured_query_v2(

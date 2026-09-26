@@ -142,6 +142,30 @@ fn record(
     capture: Option<Arc<CostCalibrationCapture>>,
     extra_wall: u64,
 ) -> Arc<HostStageEvidenceV1> {
+    record_with_hook(
+        ids,
+        queue,
+        clock,
+        actual,
+        host,
+        capture,
+        extra_wall,
+        None,
+        |_| {},
+    )
+}
+
+fn record_with_hook(
+    ids: &EngineCostIds,
+    queue: &Arc<BoundedCostSampleSink>,
+    clock: &Arc<VirtualClock>,
+    actual: ActualWaveShape,
+    host: HostCostFeaturesV1,
+    capture: Option<Arc<CostCalibrationCapture>>,
+    extra_wall: u64,
+    terminal_reason: Option<ferrum_types::FinishReason>,
+    hook: impl FnOnce(&mut EngineCostCall),
+) -> Arc<HostStageEvidenceV1> {
     let at = clock.now_ns().unwrap() + 100;
     clock.set(at + 2);
     let row = &actual.rows[0];
@@ -173,6 +197,7 @@ fn record(
     if let Some(capture) = &capture {
         call.attach_calibration_capture(capture.clone());
     }
+    hook(&mut call);
     let mut context = call.context().unwrap();
     context.physical_wave(Ok(actual.clone()), Some(at + 3));
     clock.set(at + 6);
@@ -202,15 +227,19 @@ fn record(
     pending.terminal_handed_off();
     clock.set(settled_at + 3);
     let mut terminal = terminal();
+    if let Some(reason) = terminal_reason {
+        terminal.finish_reason = reason;
+    }
     terminal.generated_tokens = 1;
     terminal.through_output_ordinal = 1;
     call.record_settled(pending.settle(owner(row), terminal));
+    let expected_rejection = call.rejection.unwrap_or(CostCallRejection::Composite);
     call.reject(CostCallRejection::Composite);
     clock.set(settled_at + 10);
     let stages = call.make_host_stages().unwrap();
     assert_eq!(
         call.finish(),
-        CostCallDisposition::Rejected(CostCallRejection::Composite)
+        CostCallDisposition::Rejected(expected_rejection)
     );
     capture.map_or(stages, |capture| capture.host_stages().unwrap())
 }
@@ -703,3 +732,8 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
     f.unchanged();
     runtime.shutdown().await.unwrap();
 }
+
+// Private prospective protocol is tested on this original recorder/source3/
+// profile10 fixture; constructing diagnostic rows cannot qualify the model.
+#[path = "prospective.rs"]
+mod prospective;

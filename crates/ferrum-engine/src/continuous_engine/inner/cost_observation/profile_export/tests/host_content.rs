@@ -17,6 +17,7 @@ pub(super) fn stages(start: u64, wall: u64, terminal: bool) -> Arc<HostStageEvid
     }
     Arc::new(HostStageEvidenceV1 {
         presubmit_prediction: None,
+        prospective_capture: None,
         statistical_evidence: None,
         structured_evidence: None,
         schema_version: 1,

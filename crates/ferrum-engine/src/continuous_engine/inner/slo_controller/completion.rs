@@ -328,6 +328,7 @@ impl EngineInner {
         let result = self
             .install_controller_wave(
                 owner::ControllerWork {
+                    prospective_capture: None,
                     batch,
                     proof: selected.proof,
                     expected: ExpectedExecutionWave::complete_requests(selected.work, reason),

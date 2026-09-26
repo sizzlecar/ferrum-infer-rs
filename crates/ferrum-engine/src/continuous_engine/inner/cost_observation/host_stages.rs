@@ -99,6 +99,9 @@ pub struct HostStageEvidenceV1 {
     /// actual-shape lookup, and does not alter any fit/residual source fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presubmit_prediction: Option<super::presubmit::PresubmitPredictionReceiptV1>,
+    /// Prospective per-wave provenance only; never a calibration membership.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prospective_capture: Option<super::prospective_capture::ProspectiveCaptureReceiptV1>,
     #[serde(serialize_with = "serialize_fingerprint")]
     pub fingerprint: Option<ExecutionFingerprint>,
     #[serde(serialize_with = "wire::serialize_shape")]
@@ -323,6 +326,9 @@ impl PendingHostRow {
 
 impl EngineCostCall {
     pub(super) fn record_host_stage_queue(&self, result: &Result<u64, CostSampleDrop>) {
+        if let Some(capture) = &self.prospective_capture {
+            capture.queue_result(result);
+        }
         if let Some(capture) = &self.calibration_capture {
             if capture.host_stages().is_some() {
                 capture.complete_host_stage_queue(match result {
@@ -673,6 +679,7 @@ impl EngineCostCall {
             schema_version: 1,
             call_id: self.call_id.get(),
             presubmit_prediction: self.presubmit_prediction.as_ref().map(|p| p.receipt(shape)),
+            prospective_capture: None,
             fingerprint,
             actual_shape: super::sample::scheduler_shape(shape).ok(),
             statistical_evidence: shape
@@ -691,6 +698,10 @@ impl EngineCostCall {
         if self.structured_capture {
             stages.structured_evidence = Some(structured::qualify(self, shape, &stages));
         }
+        stages.prospective_capture = self
+            .prospective_capture
+            .as_ref()
+            .map(|capture| capture.receipt(shape, &stages));
         Some(Arc::new(stages))
     }
 }

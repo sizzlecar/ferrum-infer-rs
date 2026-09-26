@@ -167,6 +167,7 @@ async fn installed(
     })
     .unwrap();
     let work = owner::ControllerWork {
+        prospective_capture: None,
         batch,
         expected,
         timing: owner::ControllerTimingCommitment::Witness {

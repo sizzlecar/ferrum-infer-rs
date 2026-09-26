@@ -486,6 +486,7 @@ impl CostTrainingState {
             }
         };
         ObservationFunnelSnapshot {
+            prospective_capture: None,
             selected_feedback,
             structured_feedback,
             scope: "instrumented calls and offered cost observations; entries_* also count auxiliary host-stage-only records; auxiliary stages train only the explicit empirical-host-content model at their original receipt clock and never become legacy samples; host_content and legacy training populations remain separate; live counters are not an atomic cut; pre-update prediction is retrospective actual-shape diagnostics, not pre-execution candidate coverage; uninstrumented physical waves remain unknown",

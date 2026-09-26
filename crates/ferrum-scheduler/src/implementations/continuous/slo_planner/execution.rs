@@ -54,6 +54,7 @@ pub struct ProjectedExecution<'epoch> {
 pub(super) struct VerifiedExecution<'epoch> {
     pub wave: WaveCandidate,
     pub first_canonical: Option<Arc<CanonicalWaveCostShape>>,
+    pub first_statistics: Option<Arc<ferrum_interfaces::execution_cost::StatisticalWaveEvidenceV1>>,
     pub successor: Arc<dyn PlanningExecutionState<'epoch> + 'epoch>,
 }
 
@@ -243,7 +244,23 @@ pub(super) fn project<'epoch>(
     } else {
         None
     };
+    // The successful V2 binding above already validated this same immutable
+    // exact/statistical/recipe tuple, including the attached recipe identity.
+    // Retain that proof and move its value; hashing both shapes again here
+    // would charge every first-edge search candidate even with capture off.
+    let bound_structured_v2 = cost_evidence
+        .as_ref()
+        .and_then(PlanningShapeDomain::exact)
+        .zip(execution_shape.exact())
+        .is_some_and(|(evidence, shape)| evidence.structured_query_v2_for(shape).is_ok());
+    let first_statistics = match (&first_canonical, projected.statistical_evidence) {
+        (Some(_), Some(PlanningShapeDomain::Exact(statistics))) if bound_structured_v2 => {
+            Some(Arc::new(statistics))
+        }
+        _ => None,
+    };
     Ok(Some(VerifiedExecution {
+        first_statistics,
         first_canonical,
         wave: WaveCandidate {
             cost_evidence,

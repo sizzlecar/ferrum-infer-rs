@@ -16,6 +16,7 @@ pub(in crate::continuous_engine) struct EngineCostRuntime {
     pub identity: ExecutorCostIdentityAvailability,
     pub recorder_limits: CostRecorderLimits,
     pub structured_capture: bool,
+    pub(super) prospective_capture: Option<Arc<super::prospective_capture::CaptureAudit>>,
     // The worker owns another training Arc, but never an EngineCostRuntime.
     // Thus no self-cycle or join-from-worker is possible during Drop.
     training: Arc<CostTrainingState>,
@@ -116,6 +117,8 @@ impl EngineCostRuntime {
             identity,
             recorder_limits,
             structured_capture: !config.structured_capture.is_disabled(),
+            prospective_capture: (!config.prospective_structured_capture.is_disabled())
+                .then(|| Arc::new(super::prospective_capture::CaptureAudit::default())),
             training,
             worker,
         })
@@ -214,7 +217,12 @@ impl EngineCostRuntime {
     }
 
     pub fn audit_snapshot(&self) -> audit::ObservationFunnelSnapshot {
-        self.training.audit_snapshot()
+        let mut snapshot = self.training.audit_snapshot();
+        snapshot.prospective_capture = self
+            .prospective_capture
+            .as_ref()
+            .map(|audit| audit.snapshot());
+        snapshot
     }
 }
 

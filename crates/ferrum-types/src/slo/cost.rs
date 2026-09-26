@@ -9,6 +9,8 @@ mod feedback;
 pub use feedback::*;
 mod structured_feedback;
 pub use structured_feedback::*;
+mod prospective_capture;
+pub use prospective_capture::*;
 
 /// Bounded observation storage and CPU training work. These limits never
 /// authorize model work or turn missing cost evidence into a prediction.
@@ -22,6 +24,8 @@ pub struct SloCostObservationConfig {
     pub selected_feedback: SloSelectedFeedbackPolicy,
     #[serde(skip_serializing_if = "SloStructuredFeedbackPolicy::is_disabled")]
     pub structured_feedback: SloStructuredFeedbackPolicy,
+    #[serde(skip_serializing_if = "SloProspectiveStructuredCapture::is_disabled")]
+    pub prospective_structured_capture: SloProspectiveStructuredCapture,
     /// Passive structural capture only; never changes the predictor/profile.
     #[serde(skip_serializing_if = "SloStructuredCostCapture::is_disabled")]
     pub structured_capture: SloStructuredCostCapture,
@@ -45,6 +49,7 @@ impl Default for SloCostObservationConfig {
             predictor: SloCostPredictor::default(),
             selected_feedback: SloSelectedFeedbackPolicy::Disabled,
             structured_feedback: SloStructuredFeedbackPolicy::Disabled,
+            prospective_structured_capture: SloProspectiveStructuredCapture::Disabled,
             structured_capture: SloStructuredCostCapture::Disabled,
             max_queued_samples: NonZeroUsize::new(256).unwrap(),
             max_queued_shape_rows: NonZeroUsize::new(8192).unwrap(),
@@ -149,6 +154,7 @@ impl SloCostObservationConfig {
         self.model.validate()?;
         self.selected_feedback.validate(self)?;
         self.structured_feedback.validate(self)?;
+        self.prospective_structured_capture.validate(self)?;
         if matches!(
             self.predictor,
             SloCostPredictor::StructuredWholeWaveV1 | SloCostPredictor::StructuredWholeWaveV2

@@ -88,6 +88,47 @@ fn bounded_execution_session_retains_v2_forecast_through_cost_lookup() {
                     e.cause
                 )
             });
+            let replay = simulation::replay(
+                &s,
+                &[result.wave.clone()],
+                &ModelV2,
+                &session,
+                false,
+                &mut || Ok(()),
+                100,
+                0,
+                false,
+                None,
+            )
+            .unwrap();
+            let proof = Arc::new(FinalReplayFirstWave::from_replay(
+                &s,
+                replay.first_wave_candidate.clone().unwrap(),
+                replay.first_wave_canonical.clone().unwrap(),
+                replay.first_wave_statistics.clone(),
+            ));
+            let mut delivered = SelectedWave {
+                final_replay_first_wave: Some(proof),
+                protection: None,
+                candidate: result.wave.clone(),
+                predicted_wall_ns: 20,
+                planning_observed_at_ns: 100,
+                snapshot_observed_at_ns: s.observed_at_ns,
+                snapshot_generation: s.generation,
+                cost_model_version: s.cost_model_version,
+                witness_valid_for_ns: 10,
+            };
+            let (_, stats, query) = delivered.replayed_first_wave_structured_v2(&s).unwrap();
+            let statistics_ptr = Arc::as_ptr(stats);
+            let query_ptr = query as *const _;
+            // Public candidate sidecars can be removed/replaced without
+            // changing its equality; they are never the delivered authority.
+            delivered.candidate.cost_evidence = None;
+            let (_, stats, query) = delivered.replayed_first_wave_structured_v2(&s).unwrap();
+            assert_eq!(Arc::as_ptr(stats), statistics_ptr);
+            assert_eq!(query as *const _, query_ptr);
+            delivered.candidate.work[0].key.incarnation += 1;
+            assert!(delivered.replayed_first_wave_structured_v2(&s).is_none());
             assert_eq!(result.state.now_ns, 120);
             assert_eq!(result.state.output_tokens, 2);
             assert!(result.state.requests[0].timing.completed());
