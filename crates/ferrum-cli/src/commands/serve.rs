@@ -274,6 +274,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
+    #[arg(long, value_name = "N", help = super::profile_capture::HELP,
+        conflicts_with = "observability_vertical_slice_out")]
+    pub profile_max_frames_per_request: Option<std::num::NonZeroU32>,
+
     /// Inject one typed vNext diagnostic fault. Requires a latency profile.
     #[arg(long, value_enum)]
     pub vnext_diagnostic_fault: Option<crate::commands::VNextDiagnosticFaultArg>,
@@ -448,6 +452,7 @@ async fn execute_with_compatibility(
         vnext_checkpoint,
         profile_jsonl,
         profile_detail,
+        profile_max_frames_per_request,
         vnext_diagnostic_fault,
         memory_profile_jsonl,
         device_memory_jsonl,
@@ -467,6 +472,15 @@ async fn execute_with_compatibility(
     let user_environment = RuntimeConfigSnapshot::capture_current();
     let loaded_slo =
         super::slo::load(slo_config.as_deref(), config.runtime.slo_config.as_deref()).await?;
+    let profile_frame_limit =
+        profile_max_frames_per_request.or(config.runtime.profile_max_frames_per_request);
+    super::profile_capture::validate_requested(
+        profile_frame_limit,
+        profile_detail.into(),
+        profile_jsonl.as_deref(),
+        scheduler_trace_jsonl.as_deref(),
+        &user_environment,
+    )?;
     let pid_file = std::env::temp_dir().join("ferrum.pid");
     super::device_memory::validate_output_paths(
         device_memory_jsonl.as_deref(),
@@ -501,6 +515,10 @@ async fn execute_with_compatibility(
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        super::profile_capture::validate_authority(
+            profile_frame_limit,
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        )?;
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Serve,
             out_dir,
@@ -550,6 +568,10 @@ async fn execute_with_compatibility(
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        super::profile_capture::validate_authority(
+            profile_frame_limit,
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        )?;
         if device_memory_jsonl.is_some() {
             return Err(FerrumError::unsupported(
                 "--device-memory-jsonl requires a real native Metal runtime, not synthetic observability",
@@ -897,6 +919,10 @@ async fn execute_with_compatibility(
         profile_detail.as_str(),
         RuntimeConfigSource::Cli,
     ));
+    super::profile_capture::push_cli_entry(
+        &mut startup_cli_runtime_entries,
+        profile_max_frames_per_request,
+    );
     if let Some(wait) = prefix_rendezvous_max_wait_ms {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
             "FERRUM_PREFIX_RENDEZVOUS_MAX_WAIT_MS",
@@ -964,6 +990,7 @@ async fn execute_with_compatibility(
         device_memory_sampling.as_ref(),
         execution_resource_authority,
     )?;
+    super::profile_capture::validate_authority(profile_frame_limit, execution_resource_authority)?;
     if let Some(slo) = &loaded_slo {
         slo.validate_authority(execution_resource_authority)?;
     }
@@ -1035,6 +1062,11 @@ async fn execute_with_compatibility(
     {
         return Err(FerrumError::unsupported(
             "enabled SLO policy requires a language-model runtime",
+        ));
+    }
+    if profile_frame_limit.is_some() && served_model_kind != ServedModelKind::Llm {
+        return Err(FerrumError::unsupported(
+            "--profile-max-frames-per-request requires a native language-model plan runtime",
         ));
     }
     if device_memory_sampling.is_some() && served_model_kind != ServedModelKind::Llm {

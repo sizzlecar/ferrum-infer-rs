@@ -1,8 +1,8 @@
 use super::*;
 use ferrum_types::KvStorageFormat;
 
-fn args() -> Args {
-    Args::try_parse_from([
+fn argv() -> Vec<&'static str> {
+    vec![
         "kv_teacher_regression",
         "--ferrum-bin",
         "ferrum",
@@ -28,8 +28,11 @@ fn args() -> Args {
         "0.02",
         "--max-kl-limit",
         "0.15",
-    ])
-    .unwrap()
+    ]
+}
+
+fn args() -> Args {
+    Args::try_parse_from(argv()).unwrap()
 }
 
 #[test]
@@ -49,7 +52,7 @@ fn local_gguf_symlink_survives_teacher_normalization_and_command_generation() {
     args.report_dir = root.join("report");
     args.normalize().unwrap();
     for dtype in ["fp16", "int8"] {
-        let words = args.run_args("fixture", dtype, "prompt", None);
+        let words = args.run_args("fixture", dtype, "prompt", None, None);
         assert_eq!(words[1], selected.to_str().unwrap());
         assert_eq!(fs::read(&words[1]).unwrap(), b"fixture");
     }
@@ -148,7 +151,7 @@ fn actual_dtype_backend_and_source_evidence_cannot_be_replaced_by_a_request_echo
         KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
     ] {
         let valid = config(format);
-        evidence::validate_config(&args, &valid, format).unwrap();
+        evidence::validate_config(&args, &valid, format, None).unwrap();
         for pointer in [
             "/kv_storage/source",
             "/kv_storage/selected",
@@ -161,7 +164,7 @@ fn actual_dtype_backend_and_source_evidence_cannot_be_replaced_by_a_request_echo
             let mut bad = valid.clone();
             *bad.pointer_mut(pointer).unwrap() = Value::Null;
             assert!(
-                evidence::validate_config(&args, &bad, format).is_err(),
+                evidence::validate_config(&args, &bad, format, None).is_err(),
                 "accepted {pointer}"
             );
         }
@@ -170,7 +173,7 @@ fn actual_dtype_backend_and_source_evidence_cannot_be_replaced_by_a_request_echo
         } else {
             KvStorageFormat::F16
         };
-        assert!(evidence::validate_config(&args, &valid, other).is_err());
+        assert!(evidence::validate_config(&args, &valid, other, None).is_err());
     }
 }
 
@@ -256,8 +259,14 @@ fn each_budget_is_enforced_independently_and_nonfinite_or_partial_evidence_fails
 fn paired_commands_preserve_sampling_capacity_and_only_vary_storage_and_capture_paths() {
     let args = args();
     let teacher = Path::new("teacher.json");
-    for dtype in ["fp16", "int8"] {
-        let words = args.run_args(dtype, dtype, "plain prompt", Some(teacher));
+    let arms = args.comparison_arms().unwrap();
+    assert_eq!([arms[0].name, arms[1].name], ["fp16", "int8"]);
+    assert_eq!(arms[0].storage, KvStorageFormat::F16);
+    assert_eq!(arms[1].storage, KvStorageFormat::Int8PerTokenHeadF32ScaleV1);
+    for arm in arms {
+        let dtype = arm.dtype;
+        let words = args.run_args(arm.name, dtype, "plain prompt", Some(teacher), arm.profile);
+        assert!(!words.iter().any(|word| word == "--numerical-profile"));
         for pair in [
             ["--kv-dtype", dtype],
             ["--temperature", "0"],
@@ -272,6 +281,153 @@ fn paired_commands_preserve_sampling_capacity_and_only_vary_storage_and_capture_
         assert!(words
             .iter()
             .any(|word| word == "--vnext-checkpoint-product-output"));
+    }
+}
+
+fn profile_args() -> Args {
+    let mut words = argv();
+    words.extend([
+        "--reference-numerical-profile",
+        "fixture.f32-master",
+        "--candidate-numerical-profile",
+        "fixture.f32-master.f16-head",
+    ]);
+    Args::try_parse_from(words).unwrap()
+}
+
+#[test]
+fn exact_profile_pair_keeps_seed_and_both_captures_on_f16_and_one_teacher_history() {
+    let args = profile_args();
+    let arms = args.comparison_arms().unwrap();
+    let teacher = Path::new("teacher.json");
+    let [reference, candidate] = arms;
+    assert_eq!([reference.name, candidate.name], ["reference", "candidate"]);
+    let seed = args.run_args("seed", reference.dtype, "prompt", None, reference.profile);
+    let mut captures = Vec::new();
+    for arm in arms {
+        assert_eq!(arm.storage, KvStorageFormat::F16);
+        let words = args.run_args(arm.name, arm.dtype, "prompt", Some(teacher), arm.profile);
+        for pair in [
+            ["--kv-dtype", "fp16"],
+            ["--numerical-profile", arm.profile.unwrap().as_str()],
+            ["--vnext-checkpoint-teacher-token-file", "teacher.json"],
+            ["--max-num-seqs", "1"],
+            ["--max-tokens", "2"],
+        ] {
+            assert!(
+                words.windows(2).any(|words| words == pair),
+                "missing {pair:?}"
+            );
+        }
+        assert!(words.windows(2).any(|words| {
+            words[0] == "--vnext-checkpoint-dir"
+                && words[1] == format!("report/{}.checkpoints", arm.name)
+        }));
+        // All model, sampler, context and teacher settings must remain paired.
+        // Only the explicitly different profile and arm-specific evidence paths
+        // are excluded from the whole-argv equality check.
+        let mut comparable = Vec::new();
+        let mut iter = words.into_iter();
+        while let Some(word) = iter.next() {
+            if matches!(
+                word.as_str(),
+                "--numerical-profile" | "--effective-config-json" | "--vnext-checkpoint-dir"
+            ) {
+                iter.next().unwrap();
+            } else {
+                comparable.push(word);
+            }
+        }
+        captures.push(comparable);
+    }
+    assert_eq!(captures[0], captures[1]);
+    assert!(seed.windows(2).any(|words| words == ["--kv-dtype", "fp16"]));
+    assert!(seed
+        .windows(2)
+        .any(|words| { words == ["--numerical-profile", reference.profile.unwrap().as_str()] }));
+    assert!(!seed
+        .iter()
+        .any(|word| word.starts_with("--vnext-checkpoint")));
+
+    for extra in [
+        vec!["--reference-numerical-profile", "fixture.reference"],
+        vec!["--candidate-numerical-profile", "fixture.candidate"],
+        vec![
+            "--reference-numerical-profile",
+            "auto",
+            "--candidate-numerical-profile",
+            "fixture.candidate",
+        ],
+        vec![
+            "--reference-numerical-profile",
+            "fixture.reference",
+            "--candidate-numerical-profile",
+            "auto",
+        ],
+        vec![
+            "--reference-numerical-profile",
+            "fixture reference",
+            "--candidate-numerical-profile",
+            "fixture.candidate",
+        ],
+    ] {
+        let mut words = argv();
+        words.extend(extra);
+        assert!(Args::try_parse_from(words).is_err());
+    }
+}
+
+#[test]
+fn profile_comparison_requires_actual_requested_and_selected_identity_for_each_arm() {
+    let args = profile_args();
+    for arm in args.comparison_arms().unwrap() {
+        let profile = arm.profile.unwrap();
+        let mut valid = config(KvStorageFormat::F16);
+        valid["numerical_execution"]["requested"] = json!({"require":profile});
+        valid["numerical_execution"]["selected_profile"] = json!(profile);
+        valid["kv_storage"]["numerical_profile"] = json!(profile);
+        evidence::validate_config(&args, &valid, KvStorageFormat::F16, Some(profile)).unwrap();
+        for requested in [
+            json!("auto"),
+            json!({"require":"fixture.wrong"}),
+            json!({"require":"invalid profile"}),
+            Value::Null,
+        ] {
+            let mut bad = valid.clone();
+            bad["numerical_execution"]["requested"] = requested;
+            assert!(
+                evidence::validate_config(&args, &bad, KvStorageFormat::F16, Some(profile))
+                    .is_err()
+            );
+        }
+        for selected in [
+            json!("fixture.wrong"),
+            json!("invalid profile"),
+            Value::Null,
+        ] {
+            let mut bad = valid.clone();
+            // Agreeing KV/profile echoes are insufficient when both name the
+            // wrong profile: the arm's exact required ID must also match.
+            bad["numerical_execution"]["selected_profile"] = selected.clone();
+            bad["kv_storage"]["numerical_profile"] = selected;
+            assert!(
+                evidence::validate_config(&args, &bad, KvStorageFormat::F16, Some(profile))
+                    .is_err()
+            );
+        }
+        for pointer in [
+            "/kv_storage/requested",
+            "/kv_storage/selected",
+            "/numerical_execution/requested_kv_storage",
+            "/numerical_execution/selected_kv_storage",
+        ] {
+            let mut bad = valid.clone();
+            *bad.pointer_mut(pointer).unwrap() = json!(KvStorageFormat::Int8PerTokenHeadF32ScaleV1);
+            assert!(
+                evidence::validate_config(&args, &bad, KvStorageFormat::F16, Some(profile))
+                    .is_err()
+            );
+        }
     }
 }
 

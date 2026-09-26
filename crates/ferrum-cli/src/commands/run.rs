@@ -968,6 +968,10 @@ pub struct RunCommand {
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
+    #[arg(long, value_name = "N", help = super::profile_capture::HELP,
+        conflicts_with = "observability_vertical_slice_out")]
+    pub profile_max_frames_per_request: Option<std::num::NonZeroU32>,
+
     /// Inject one typed vNext diagnostic fault. Requires a latency profile.
     #[arg(long, value_enum)]
     pub vnext_diagnostic_fault: Option<crate::commands::VNextDiagnosticFaultArg>,
@@ -1018,6 +1022,16 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             ));
         }
     }
+    let profile_frame_limit = cmd
+        .profile_max_frames_per_request
+        .or(config.runtime.profile_max_frames_per_request);
+    super::profile_capture::validate_requested(
+        profile_frame_limit,
+        cmd.profile_detail.into(),
+        cmd.profile_jsonl.as_deref(),
+        cmd.scheduler_trace_jsonl.as_deref(),
+        &user_environment,
+    )?;
     super::device_memory::validate_output_paths(
         cmd.device_memory_jsonl.as_deref(),
         [
@@ -1044,6 +1058,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        super::profile_capture::validate_authority(
+            profile_frame_limit,
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        )?;
         crate::observability_vertical_slice::write_observability_vertical_slice(
             ferrum_types::ProfileEntrypoint::Run,
             out_dir,
@@ -1082,6 +1100,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         if let Some(slo) = &loaded_slo {
             slo.validate_real_execution(true)?;
         }
+        super::profile_capture::validate_authority(
+            profile_frame_limit,
+            ferrum_types::ExecutionResourceAuthority::LegacyEngine,
+        )?;
         if cmd.device_memory_jsonl.is_some() {
             return Err(FerrumError::unsupported(
                 "--device-memory-jsonl requires a real native Metal runtime, not synthetic observability",
@@ -1234,6 +1256,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         device_memory_sampling.as_ref(),
         execution_resource_authority,
     )?;
+    super::profile_capture::validate_authority(profile_frame_limit, execution_resource_authority)?;
     if let Some(slo) = &loaded_slo {
         slo.validate_authority(execution_resource_authority)?;
     }
@@ -2755,6 +2778,7 @@ fn run_startup_cli_runtime_entries(
     gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
 ) -> Vec<RuntimeConfigEntry> {
     let mut entries = Vec::new();
+    super::profile_capture::push_cli_entry(&mut entries, cmd.profile_max_frames_per_request);
     entries.push(RuntimeConfigEntry::new(
         "FERRUM_PROFILE_DETAIL",
         cmd.profile_detail.as_str(),
@@ -3040,6 +3064,7 @@ mod tests {
             vnext_checkpoint: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
+            profile_max_frames_per_request: None,
             vnext_diagnostic_fault: None,
             memory_profile_jsonl: None,
             device_memory_jsonl: None,
@@ -3400,6 +3425,32 @@ mod tests {
             engine.runtime.profile_detail,
             ferrum_types::ObservabilityProfileDetail::Full
         );
+    }
+
+    #[test]
+    fn run_profile_frame_limit_reaches_engine_with_cli_over_config_provenance() {
+        let mut config = CliConfig::default();
+        config.runtime.profile_max_frames_per_request = std::num::NonZeroU32::new(7);
+        let mut cmd = test_run_cmd();
+        cmd.profile_detail = crate::observability_product::ProfileDetailArg::Full;
+        cmd.profile_jsonl = Some(PathBuf::from("profile.jsonl"));
+        cmd.profile_max_frames_per_request = std::num::NonZeroU32::new(3);
+        let base = run_base_runtime_config(&config, RuntimeConfigSnapshot::default());
+        let effective =
+            run_effective_runtime_config(&base, &run_startup_cli_runtime_entries(&cmd, None));
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == ferrum_types::PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY)
+            .unwrap();
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+        let mut engine = ferrum_types::EngineConfig::default();
+        engine.apply_runtime_config_snapshot(&effective).unwrap();
+        assert_eq!(
+            engine.runtime.profile_max_frames_per_request,
+            std::num::NonZeroU32::new(3)
+        );
+        assert!(engine.runtime.validate_profile_frame_limit().is_ok());
     }
 
     #[test]

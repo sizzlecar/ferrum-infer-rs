@@ -5,7 +5,7 @@ use ferrum_types::{
 };
 use std::path::Path;
 
-pub(super) const HELP: &str = "Write native Metal device-allocation samples every 250 ms before weight loading through shutdown. Reports MTLDevice.currentAllocatedSize, not RSS or total physical VRAM. Sampled peaks exclude device initialization and may miss shorter peaks. Requires a new file separate from other diagnostics.";
+pub(super) const HELP: &str = "Write native Metal or CUDA runtime memory samples every 250 ms before weight loading through shutdown. Metal reports device allocations; CUDA separately reports runtime requested allocations, pool/device queries and available NVML process accounting. Requested allocations are not physical VRAM. Sampled peaks exclude device initialization and may miss shorter peaks. Requires a new file separate from other diagnostics.";
 
 pub(super) fn validate_output_paths<'a>(
     path: Option<&Path>,
@@ -37,13 +37,15 @@ pub(super) fn resolve(
     };
     config.validate().map_err(FerrumError::config)?;
     let supported = match device {
-        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         Device::Metal => true,
+        #[cfg(feature = "cuda")]
+        Device::CUDA(_) => true,
         _ => false,
     };
     if !supported {
         return Err(FerrumError::unsupported(format!(
-            "--device-memory-jsonl requires a supported native Metal backend; selected device is {device}"
+            "--device-memory-jsonl requires a supported native Metal or CUDA backend; selected device is {device}"
         )));
     }
     Ok(Some(config))
@@ -110,21 +112,31 @@ mod tests {
     fn device_memory_sampling_run_and_serve_reject_unsupported_backends() {
         for command in ["run", "serve"] {
             let path = parsed_path(command, &["--device-memory-jsonl", "samples.jsonl"]);
-            let mut devices = vec![Device::CPU, Device::ROCm(0), Device::CUDA(0)];
-            if !cfg!(all(
-                feature = "metal",
-                any(target_os = "macos", target_os = "ios")
-            )) {
-                devices.push(Device::Metal);
-            }
-            for device in devices {
+            for device in [Device::CPU, Device::ROCm(0)] {
                 let error = resolve(path.as_deref(), &device).unwrap_err();
                 assert!(error.to_string().contains("requires a supported native"));
             }
+            #[cfg(not(feature = "cuda"))]
+            assert!(resolve(path.as_deref(), &Device::CUDA(0)).is_err());
         }
     }
 
-    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn device_memory_sampling_run_and_serve_cuda_share_typed_configuration() {
+        for command in ["run", "serve"] {
+            let path = parsed_path(command, &["--device-memory-jsonl", "cuda-samples.jsonl"]);
+            let config = resolve(path.as_deref(), &Device::CUDA(0)).unwrap().unwrap();
+            assert_eq!(config.jsonl_path, PathBuf::from("cuda-samples.jsonl"));
+            validate_authority(Some(&config), ExecutionResourceAuthority::PlanRuntime).unwrap();
+            assert!(
+                validate_authority(Some(&config), ExecutionResourceAuthority::LegacyEngine)
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn device_memory_sampling_run_and_serve_resolve_the_same_typed_config() {
         for command in ["run", "serve"] {
@@ -184,7 +196,7 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("requires a supported native Metal backend"));
+                .contains("requires a supported native Metal or CUDA backend"));
         }
     }
 

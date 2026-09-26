@@ -52,16 +52,19 @@ mod device_memory;
 pub mod doctor;
 pub mod embed;
 pub mod list;
+mod profile_capture;
 pub mod pull;
 pub mod replay_bundle;
 pub mod run;
 pub mod serve;
 mod slo;
+pub mod slo_compare;
 pub mod stop;
 pub mod transcribe;
 pub mod tts;
 pub mod vnext_checkpoint;
 pub mod vnext_determinism;
+pub mod vnext_teacher;
 
 #[cfg(test)]
 mod tests {

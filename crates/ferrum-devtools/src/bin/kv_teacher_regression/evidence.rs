@@ -1,7 +1,7 @@
 use super::Args;
 use anyhow::{ensure, Context, Result};
 use ferrum_bench_core::release_regression::model_sources::pinned_hf_source;
-use ferrum_types::KvStorageFormat;
+use ferrum_types::{KvStorageFormat, NumericalExecutionPolicy, NumericalProfileId};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -153,6 +153,7 @@ pub(super) fn validate_config(
     args: &Args,
     config: &Value,
     expected: KvStorageFormat,
+    expected_profile: Option<&NumericalProfileId>,
 ) -> Result<()> {
     ensure!(
         config["backend"] == args.backend && config["attention_execution_policy"] == "portable",
@@ -194,6 +195,19 @@ pub(super) fn validate_config(
             && storage["numerical_profile"] == config["numerical_execution"]["selected_profile"],
         "KV and numerical profile evidence disagree"
     );
+    if let Some(expected_profile) = expected_profile {
+        let requested: NumericalExecutionPolicy =
+            serde_json::from_value(config["numerical_execution"]["requested"].clone())
+                .context("missing typed numerical profile request")?;
+        let selected: NumericalProfileId =
+            serde_json::from_value(config["numerical_execution"]["selected_profile"].clone())
+                .context("missing typed selected numerical profile")?;
+        ensure!(
+            requested == NumericalExecutionPolicy::Require(expected_profile.clone())
+                && &selected == expected_profile,
+            "requested/selected numerical profile differs from the exact comparison arm"
+        );
+    }
     let source = &config["resolution_evidence"];
     ensure!(
         source["schema_version"] == 1 && source["requested_model"] == args.model,
@@ -277,13 +291,18 @@ pub(super) fn validate_config(
     Ok(())
 }
 
-pub(super) fn read_config(args: &Args, name: &str, expected: KvStorageFormat) -> Result<Value> {
+pub(super) fn read_config(
+    args: &Args,
+    name: &str,
+    expected: KvStorageFormat,
+    expected_profile: Option<&NumericalProfileId>,
+) -> Result<Value> {
     let path = args
         .report_dir
         .join(format!("{name}.effective-config.json"));
     let value: Value = serde_json::from_slice(
         &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
     )?;
-    validate_config(args, &value, expected)?;
+    validate_config(args, &value, expected, expected_profile)?;
     Ok(value)
 }

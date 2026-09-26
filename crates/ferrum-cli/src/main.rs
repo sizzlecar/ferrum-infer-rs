@@ -44,6 +44,9 @@ enum Commands {
     #[command(hide = true)]
     BenchServe(bench_serve::BenchServeCommand),
 
+    /// Compare frozen benchmark artifacts and write JSON plus English/Chinese tables.
+    SloCompare(slo_compare::SloCompareCommand),
+
     /// Measure real bounded cohorts and validate against a frozen cost model.
     CalibrateSlo(calibrate_slo::CalibrateSloCommand),
 
@@ -54,6 +57,8 @@ enum Commands {
     /// Collect bitwise CUDA vNext evidence for the release model matrix.
     #[command(hide = true)]
     VnextDeterminism(vnext_determinism::VNextDeterminismCommand),
+    /// Capture real-history serial/batched full-vocabulary model quality evidence
+    VnextTeacher(vnext_teacher::VNextTeacherCommand),
 
     /// Generate text embeddings using BERT models
     #[command(visible_alias = "e", hide = true)]
@@ -126,8 +131,18 @@ fn command_future(
         Commands::Bench(cmd) => Box::pin(bench::execute(cmd, config)),
         Commands::BenchServe(cmd) => Box::pin(bench_serve::execute(cmd, config)),
         Commands::CalibrateSlo(cmd) => Box::pin(calibrate_slo::execute(cmd, config)),
+        Commands::SloCompare(cmd) => Box::pin(async move {
+            let exit = slo_compare::execute(cmd)?;
+            // The command has closed all three report files before returning.
+            // Keep evidence insufficiency distinct from an execution error.
+            if exit.code() != 0 {
+                process::exit(exit.code());
+            }
+            Ok(())
+        }),
         Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
         Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
+        Commands::VnextTeacher(cmd) => Box::pin(vnext_teacher::execute(cmd, config)),
         Commands::Embed(cmd) => Box::pin(embed::execute(cmd, config)),
         Commands::Transcribe(cmd) => Box::pin(transcribe::execute(cmd, config)),
         Commands::Tts(cmd) => Box::pin(tts::execute(cmd, config)),

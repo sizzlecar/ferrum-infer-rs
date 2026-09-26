@@ -196,6 +196,10 @@ pub struct RuntimeCliConfig {
     /// use the process working directory, with no environment override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slo_config: Option<std::path::PathBuf>,
+    /// Bound diagnostic frames per request in an existing all-frame profile.
+    /// CLI selection takes precedence. This has no environment override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_max_frames_per_request: Option<std::num::NonZeroU32>,
     /// Named startup/runtime preset. Presets provide product-owned default
     /// bundles and can still be overridden by explicit runtime keys below,
     /// environment variables, or CLI flags.
@@ -445,6 +449,13 @@ pub struct RuntimeCliConfig {
 impl RuntimeCliConfig {
     pub fn runtime_config_entries(&self) -> Vec<RuntimeConfigEntry> {
         let mut entries = Vec::new();
+        if let Some(limit) = self.profile_max_frames_per_request {
+            entries.push(RuntimeConfigEntry::new(
+                ferrum_types::PROFILE_MAX_FRAMES_PER_REQUEST_CONFIG_KEY,
+                limit.to_string(),
+                RuntimeConfigSource::ConfigFile,
+            ));
+        }
         if let Some(wait) = self.prefix_rendezvous_max_wait_ms {
             push_string_entry(
                 &mut entries,

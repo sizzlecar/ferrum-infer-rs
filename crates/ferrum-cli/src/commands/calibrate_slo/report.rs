@@ -308,6 +308,10 @@ impl Artifacts {
             "host_stages":report.host_stages.as_deref().map(|stages| stages.structured_diagnostic_view()),"host_stage_queue":report.host_stage_queue,
             "host_content_frozen_prediction":host_prediction,
             "selected_whole_wave_frozen_prediction":selected_prediction});
+        if let Some(diagnostic) = &report.actual_evidence_diagnostic {
+            record["actual_evidence_diagnostic"] =
+                serde_json::to_value(diagnostic.as_ref()).map_err(json_error)?;
+        }
         if let Some(discovery) = structured_discovery::inspect(self.structured_capture, || {
             report.structured_cost_input()
         }) {

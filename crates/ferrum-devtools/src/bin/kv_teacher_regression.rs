@@ -1,4 +1,4 @@
-//! Bounded fixed-history F16/INT8 quality comparison using the product binary.
+//! Bounded fixed-history KV-storage or explicit-profile quality comparison.
 //! Passing certifies the supplied finite sample and budgets, not general quality.
 
 #[path = "kv_teacher_regression/evidence.rs"]
@@ -14,6 +14,7 @@ mod tests;
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use ferrum_bench_core::release_regression::model_sources::pinned_hf_source;
+use ferrum_types::{KvStorageFormat, NumericalProfileId};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Parser, Serialize)]
-#[command(about = "Measure paired F16/INT8 KV on one complete canonical teacher history")]
+#[command(about = "Compare KV storage or exact numerical profiles on one complete teacher history")]
 struct Args {
     #[arg(long)]
     ferrum_bin: PathBuf,
@@ -41,6 +42,12 @@ struct Args {
     tokenizer_source: Option<PathBuf>,
     #[arg(long, value_parser = ["metal", "cuda"])]
     backend: String,
+    /// Exact reference profile. With its paired candidate flag, all runs use F16 KV.
+    #[arg(long, requires = "candidate_numerical_profile", value_parser = exact_profile)]
+    reference_numerical_profile: Option<NumericalProfileId>,
+    /// Exact candidate profile, compared against the reference's complete teacher history.
+    #[arg(long, requires = "reference_numerical_profile", value_parser = exact_profile)]
+    candidate_numerical_profile: Option<NumericalProfileId>,
     /// UTF-8 plain text, passed unchanged as the one-shot user prompt.
     #[arg(long)]
     prompt_file: PathBuf,
@@ -61,6 +68,21 @@ struct Args {
     disable_thinking: bool,
     #[command(flatten)]
     budgets: scoring::Budgets,
+}
+
+fn exact_profile(value: &str) -> std::result::Result<NumericalProfileId, String> {
+    if value == "auto" {
+        return Err("profile comparison requires an exact ID, not auto".to_owned());
+    }
+    value.parse()
+}
+
+#[derive(Clone, Copy)]
+struct ComparisonArm<'a> {
+    name: &'static str,
+    dtype: &'static str,
+    storage: KvStorageFormat,
+    profile: Option<&'a NumericalProfileId>,
 }
 
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
@@ -85,6 +107,7 @@ fn binary_sha256(path: &Path) -> Result<String> {
 impl Args {
     fn normalize(&mut self) -> Result<()> {
         self.budgets.validate()?;
+        self.comparison_arms()?;
         ensure!(
             self.context_tokens > self.max_tokens,
             "output budget must fit the context"
@@ -133,12 +156,58 @@ impl Args {
         Ok(())
     }
 
+    fn comparison_arms(&self) -> Result<[ComparisonArm<'_>; 2]> {
+        match (
+            self.reference_numerical_profile.as_ref(),
+            self.candidate_numerical_profile.as_ref(),
+        ) {
+            (Some(reference), Some(candidate)) => {
+                ensure!(
+                    reference.as_str() != "auto" && candidate.as_str() != "auto",
+                    "profile comparison requires exact profile IDs"
+                );
+                Ok([
+                    ComparisonArm {
+                        name: "reference",
+                        dtype: "fp16",
+                        storage: KvStorageFormat::F16,
+                        profile: Some(reference),
+                    },
+                    ComparisonArm {
+                        name: "candidate",
+                        dtype: "fp16",
+                        storage: KvStorageFormat::F16,
+                        profile: Some(candidate),
+                    },
+                ])
+            }
+            (None, None) => Ok([
+                ComparisonArm {
+                    name: "fp16",
+                    dtype: "fp16",
+                    storage: KvStorageFormat::F16,
+                    profile: None,
+                },
+                ComparisonArm {
+                    name: "int8",
+                    dtype: "int8",
+                    storage: KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
+                    profile: None,
+                },
+            ]),
+            _ => anyhow::bail!(
+                "reference and candidate numerical profiles must be supplied together"
+            ),
+        }
+    }
+
     fn run_args(
         &self,
         name: &str,
         dtype: &str,
         prompt: &str,
         teacher: Option<&Path>,
+        profile: Option<&NumericalProfileId>,
     ) -> Vec<String> {
         let mut words = vec!["run".into(), self.model.clone()];
         for (flag, value) in [
@@ -169,6 +238,9 @@ impl Args {
             words.extend([flag.into(), value]);
         }
         words.push("--no-context-shift".into());
+        if let Some(profile) = profile {
+            words.extend(["--numerical-profile".into(), profile.to_string()]);
+        }
         if self.disable_thinking {
             words.push("--disable-thinking".into());
         }
@@ -203,6 +275,17 @@ impl Args {
 }
 
 async fn measure(args: &Args, report: &mut Value) -> Result<()> {
+    let arms = args.comparison_arms()?;
+    let [reference, candidate] = arms;
+    if reference.profile.is_some() {
+        report["comparison"] = json!({
+            "mode":"explicit_numerical_profiles",
+            "kv_storage":KvStorageFormat::F16,
+            "reference_profile":reference.profile,
+            "candidate_profile":candidate.profile,
+            "teacher_profile":reference.profile
+        });
+    }
     let prompt = fs::read_to_string(&args.prompt_file).context("read UTF-8 prompt")?;
     ensure!(!prompt.trim().is_empty(), "prompt must not be empty");
     fs::write(args.report_dir.join("prompt.txt"), &prompt)?;
@@ -215,31 +298,25 @@ async fn measure(args: &Args, report: &mut Value) -> Result<()> {
     let timeout = Duration::from_secs(args.timeout_secs);
     let stdout = process::run(
         &args.ferrum_bin,
-        &args.run_args("seed", "fp16", &prompt, None),
+        &args.run_args("seed", reference.dtype, &prompt, None, reference.profile),
         &args.report_dir,
         "seed",
         timeout,
     )
     .await?;
     let seed = evidence::parse_generation(&stdout, args, true)?;
-    let seed_config = evidence::read_config(args, "seed", ferrum_types::KvStorageFormat::F16)?;
+    let seed_config = evidence::read_config(args, "seed", reference.storage, reference.profile)?;
     let teacher = args.report_dir.join("teacher.json");
     write_json(
         &teacher,
         &json!({"schema_version":1,"encoding":"u32-le","token_ids":seed.tokens}),
     )?;
     report["seed"] = json!({"usage":seed.usage,"token_ids_sha256":evidence::token_digest(&seed.tokens),"effective_config":"seed.effective-config.json"});
-    for (name, dtype, format) in [
-        ("fp16", "fp16", ferrum_types::KvStorageFormat::F16),
-        (
-            "int8",
-            "int8",
-            ferrum_types::KvStorageFormat::Int8PerTokenHeadF32ScaleV1,
-        ),
-    ] {
+    for arm in arms {
+        let name = arm.name;
         let stdout = process::run(
             &args.ferrum_bin,
-            &args.run_args(name, dtype, &prompt, Some(&teacher)),
+            &args.run_args(name, arm.dtype, &prompt, Some(&teacher), arm.profile),
             &args.report_dir,
             name,
             timeout,
@@ -250,16 +327,16 @@ async fn measure(args: &Args, report: &mut Value) -> Result<()> {
             observed.usage == seed.usage,
             "{name} teacher run usage differs from complete seed usage"
         );
-        let config = evidence::read_config(args, name, format)?;
+        let config = evidence::read_config(args, name, arm.storage, arm.profile)?;
         ensure!(
             config["resolution_evidence"] == seed_config["resolution_evidence"],
             "{name} used different model, metadata, tokenizer or template sources"
         );
-        if name == "fp16" {
+        if name == reference.name {
             ensure!(
                 config["numerical_execution"]["selected_profile"]
                     == seed_config["numerical_execution"]["selected_profile"],
-                "F16 capture selected a different numerical profile from the seed"
+                "reference capture selected a different numerical profile from the seed"
             );
         }
         report[name] = json!({"usage":observed.usage,"effective_config":format!("{name}.effective-config.json")});
@@ -270,12 +347,12 @@ async fn measure(args: &Args, report: &mut Value) -> Result<()> {
     let words = [
         "--reference-dir".to_owned(),
         args.report_dir
-            .join("fp16.checkpoints")
+            .join(format!("{}.checkpoints", reference.name))
             .to_string_lossy()
             .into_owned(),
         "--candidate-dir".to_owned(),
         args.report_dir
-            .join("int8.checkpoints")
+            .join(format!("{}.checkpoints", candidate.name))
             .to_string_lossy()
             .into_owned(),
         "--output".to_owned(),
