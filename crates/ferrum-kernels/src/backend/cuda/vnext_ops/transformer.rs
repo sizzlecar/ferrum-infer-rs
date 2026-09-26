@@ -24,9 +24,9 @@ use ferrum_interfaces::vnext::{
     ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
     QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
-    ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
-    CONSTANT_SCALE_F16_CAPABILITY_ID, CONSTANT_SCALE_OPERATION_ID,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionTopologyView,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
+    WeightFormatId, CONSTANT_SCALE_F16_CAPABILITY_ID, CONSTANT_SCALE_OPERATION_ID,
     DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_GEGLU_TANH_OPERATION_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DENSE_SWIGLU_OPERATION_ID, LOGIT_SOFTCAP_F16_CAPABILITY_ID, LOGIT_SOFTCAP_OPERATION_ID,
@@ -63,10 +63,15 @@ use moe_weights::{
     COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
 };
 
+pub(super) mod cublas_api;
+mod dense_swiglu_api;
+
 mod attention;
 mod causal_attention;
+mod cost_route;
 #[cfg(test)]
 mod f16_tests;
+mod gguf_f16_projection;
 mod gpt_oss_attention;
 #[cfg(feature = "vllm-moe-marlin")]
 mod gpt_oss_moe;
@@ -89,6 +94,7 @@ mod native_matrix;
 mod native_swiglu;
 mod precision;
 mod q8_swiglu;
+mod stream_mmq_swiglu;
 #[cfg(test)]
 mod test_support;
 
@@ -109,6 +115,7 @@ pub(super) use moe_weights::{
     GPTQ_MARLIN_CAPABILITY_ID,
 };
 pub(super) use q8_swiglu::CudaQ8SwiGluProvider;
+pub(super) use stream_mmq_swiglu::CudaStreamMmqSwiGluProvider;
 
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_linear.f16.cublas";
@@ -157,7 +164,7 @@ pub(super) enum CapturedProviderWorkspace {
 }
 
 pub(super) fn captured_contiguous_addresses_are_reusable(
-    request: &ReusableExecutionTopologyRequest<'_>,
+    request: &impl ReusableExecutionTopologyView,
     input_count: u32,
     workspaces: &[CapturedProviderWorkspace],
 ) -> Result<bool, VNextError> {
@@ -182,7 +189,7 @@ pub(super) fn captured_contiguous_addresses_are_reusable(
 }
 
 pub(super) fn static_contiguous_reusable_topology(
-    request: &ReusableExecutionTopologyRequest<'_>,
+    request: &impl ReusableExecutionTopologyView,
     input_count: u32,
     workspaces: &[CapturedProviderWorkspace],
 ) -> Result<ReusableExecutionTopology, VNextError> {
@@ -197,6 +204,7 @@ pub(super) struct CudaRmsNormProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
     precision: RmsNormPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl CudaRmsNormProvider {
@@ -233,7 +241,10 @@ impl CudaRmsNormProvider {
             native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/cublas_api.rs").as_bytes(),
+                include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 include_str!("transformer/precision.rs").as_bytes(),
+                include_str!("transformer/cost_route.rs").as_bytes(),
                 crate::ptx::RMS_NORM.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
@@ -249,6 +260,7 @@ impl CudaRmsNormProvider {
             descriptor,
             function,
             precision,
+            structured_capture: runtime.structured_capture(),
         })
     }
 }
@@ -271,6 +283,40 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        static_contiguous_reusable_topology(&request, 2, &[]).map(Some)
+    }
+
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        if self.structured_capture == ferrum_types::SloStructuredCostCapture::Disabled {
+            return Ok(None);
+        }
+        let prepared = prepare_rms_norm(invocation, self.precision).map_err(invalid_plan)?;
+        Ok(cost_route::selected(
+            cost_route::Primitive::RmsNorm {
+                precision: self.precision,
+                epsilon: prepared.epsilon,
+            },
+            u64::from(prepared.rows),
+            prepared.hidden_size as u64,
+            self.structured_capture,
+        ))
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::rms_norm(request, self.precision, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -288,6 +334,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
             &self.function,
             self.precision,
             invocation,
+            self.structured_capture,
         )
         .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.rms_norm.encode", message))
@@ -316,6 +363,8 @@ impl CudaDenseLinearProvider {
             native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/cublas_api.rs").as_bytes(),
+                include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 include_str!("transformer/native_linear.rs").as_bytes(),
                 include_str!("transformer/native_matrix.rs").as_bytes(),
                 include_str!("native_blocks.rs").as_bytes(),
@@ -351,11 +400,18 @@ impl OperationResourceEstimator for CudaDenseLinearProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 2, &[])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -422,12 +478,16 @@ impl CudaMarlinFp8DenseLinearProvider {
         }
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/cublas_api.rs").as_bytes(),
+            include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
             include_str!("transformer/marlin_fp8_weights.rs").as_bytes(),
             include_str!("../vllm_marlin.rs").as_bytes(),
             MARLIN_FP8_DENSE_LINEAR_PROVIDER_ID.as_bytes(),
         ]);
         let estimator_fingerprint = implementation_fingerprint(&[
             include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/cublas_api.rs").as_bytes(),
+            include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
             MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID.as_bytes(),
             provider_fingerprint.as_bytes(),
         ]);
@@ -502,11 +562,18 @@ impl OperationResourceEstimator for CudaMarlinFp8DenseLinearProvider {
 
 #[cfg(feature = "vllm-marlin")]
 impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 2, &[CapturedProviderWorkspace::Scratch])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -599,7 +666,9 @@ fn dense_swiglu_projection(
 }
 
 pub(super) struct CudaDenseSwiGluProvider {
+    cublas_cost_identity: cublas_api::CublasCostIdentitySource,
     descriptor: OperationProviderDescriptor,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     silu_mul: CudaFunction,
     native: super::native_blocks::CudaNativeBlockKernels,
     #[cfg(feature = "vllm-marlin")]
@@ -610,10 +679,37 @@ pub(super) struct CudaDenseSwiGluProvider {
 
 impl CudaDenseSwiGluProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = dense_swiglu_contract().map_err(contract_error)?;
+        Self::with_weight_policy(runtime, false)
+    }
+
+    pub(super) fn new_gguf_f16_weights(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_weight_policy(runtime, true)
+    }
+
+    fn with_weight_policy(
+        runtime: &CudaDeviceRuntime,
+        rounded_gguf: bool,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = if rounded_gguf {
+            ferrum_interfaces::vnext::dense_swiglu_gguf_f16_weights_contract()
+        } else {
+            dense_swiglu_contract()
+        }
+        .map_err(contract_error)?;
         let provider_fingerprint = implementation_fingerprint(&[
+            include_bytes!("transformer/gguf_f16_projection.rs"),
             include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/cublas_api.rs").as_bytes(),
+            include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
             include_str!("transformer/native_swiglu.rs").as_bytes(),
+            include_bytes!("transformer/native_swiglu/prepared.rs"),
+            include_bytes!("transformer/native_swiglu/selected.rs"),
+            include_bytes!("native_blocks/linear_launch.rs"),
+            include_bytes!("native_blocks/selected.rs"),
+            include_str!("transformer/native_swiglu/route_selection.rs").as_bytes(),
+            include_str!("transformer/native_swiglu/cost_route.rs").as_bytes(),
             include_str!("transformer/native_matrix.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
             include_str!("native_blocks/hadamard.rs").as_bytes(),
@@ -630,24 +726,43 @@ impl CudaDenseSwiGluProvider {
             #[cfg(feature = "vllm-marlin")]
             include_str!("../vllm_marlin.rs").as_bytes(),
         ]);
-        #[cfg(not(feature = "vllm-marlin"))]
-        let descriptor = provider_descriptor_with_formats(
-            runtime,
-            &contract,
-            DENSE_SWIGLU_PROVIDER_ID,
-            DENSE_SWIGLU_F16_CAPABILITY_ID,
-            DENSE_SWIGLU_ESTIMATOR_ID,
-            contiguous_bindings(3),
-            BTreeSet::from([
-                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
-                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
-            ]),
-            native_linear::quantization_formats().map_err(contract_error)?,
-            provider_fingerprint,
-        )?;
-        #[cfg(feature = "vllm-marlin")]
-        let descriptor =
-            marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
+        let descriptor = if rounded_gguf {
+            provider_descriptor_with_formats(
+                runtime,
+                &contract,
+                "provider.cuda.dense_swiglu.gguf-f16-weights",
+                ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_F16_WEIGHTS_CAPABILITY_ID,
+                "resource-estimator.cuda.dense_swiglu.gguf-f16-weights",
+                contiguous_bindings(3),
+                BTreeSet::from([WeightFormatId::new(
+                    crate::gguf_f16_projection_materializer::GGUF_F16_PROJECTION_FORMAT_ID,
+                )
+                .map_err(contract_error)?]),
+                native_linear::quantization_formats().map_err(contract_error)?,
+                provider_fingerprint,
+            )?
+        } else {
+            #[cfg(not(feature = "vllm-marlin"))]
+            let descriptor = provider_descriptor_with_formats(
+                runtime,
+                &contract,
+                DENSE_SWIGLU_PROVIDER_ID,
+                DENSE_SWIGLU_F16_CAPABILITY_ID,
+                DENSE_SWIGLU_ESTIMATOR_ID,
+                contiguous_bindings(3),
+                BTreeSet::from([
+                    WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                    WeightFormatId::new("weight-format.gguf.native-block")
+                        .map_err(contract_error)?,
+                ]),
+                native_linear::quantization_formats().map_err(contract_error)?,
+                provider_fingerprint,
+            )?;
+            #[cfg(feature = "vllm-marlin")]
+            let descriptor =
+                marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
+            descriptor
+        };
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
@@ -664,6 +779,8 @@ impl CudaDenseSwiGluProvider {
         #[cfg(feature = "vllm-marlin")]
         let projection_runtime = MarlinProjectionRuntime::query(runtime)?;
         Ok(Self {
+            cublas_cost_identity: runtime.cublas_cost_identity_source(),
+            structured_capture: runtime.structured_capture(),
             descriptor,
             silu_mul,
             native: super::native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
@@ -684,7 +801,11 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        ensure_estimator_request(&self.descriptor, &request, DENSE_SWIGLU_OPERATION_ID)?;
+        ensure_estimator_request(
+            &self.descriptor,
+            &request,
+            self.descriptor.operation_id().as_str(),
+        )?;
         let intermediate_size =
             unsigned_attribute(request.attributes(), "intermediate_size").map_err(invalid_plan)?;
         let bytes_per_token = intermediate_size
@@ -728,11 +849,65 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        if gguf_f16_projection::is_operation(self.descriptor.operation_id()) {
+            return dense_swiglu_api::replay_evidence(
+                self.descriptor.operation_id().as_str(),
+                self.structured_capture,
+                self.cublas_cost_identity.frozen(),
+                invocation,
+            );
+        }
+
+        native_swiglu::replay_evidence(
+            self.descriptor.provider_implementation_fingerprint(),
+            None,
+            None,
+            self.structured_capture,
+            invocation,
+        )
+    }
+
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        if gguf_f16_projection::is_operation(self.descriptor.operation_id()) {
+            // Topology is the actual address contract; numeric availability
+            // is checked separately by eager_cost_route.
+            return self.shared_reusable_topology(&request).map(Some);
+        }
+
+        if !native_swiglu::uses_native(request.bindings()) {
+            return Ok(None);
+        }
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        if gguf_f16_projection::is_operation(self.descriptor.operation_id()) {
+            return dense_swiglu_api::route(
+                &request,
+                self.structured_capture,
+                self.cublas_cost_identity.frozen(),
+            );
+        }
+
+        native_swiglu::eager_cost_route(request, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 3, &[CapturedProviderWorkspace::Scratch])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -740,6 +915,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        ensure_invocation(&invocation, self.descriptor.operation_id().as_str()).map_err(
+            |message| provider_failure(identity.clone(), "cuda.dense_swiglu.select", message),
+        )?;
         if invocation
             .participants()
             .iter()
@@ -749,6 +927,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
                 self.descriptor.provider_implementation_fingerprint(),
                 &self.native,
                 &self.silu_mul,
+                self.structured_capture,
                 invocation,
             )
             .map(EncodedDeviceOperation::compute)
@@ -794,8 +973,11 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
             }
         }
         encode_dense_swiglu(
+            self.descriptor.operation_id().as_str(),
             self.descriptor.provider_implementation_fingerprint(),
             &self.silu_mul,
+            self.structured_capture,
+            self.cublas_cost_identity.frozen(),
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -886,6 +1068,8 @@ impl CudaDenseGeGluTanhProvider {
         let contract = dense_geglu_tanh_contract().map_err(contract_error)?;
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/cublas_api.rs").as_bytes(),
+            include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
             PLANAR_GELU_TANH_MUL_FUNCTION_NAME.as_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -968,11 +1152,18 @@ impl OperationResourceEstimator for CudaDenseGeGluTanhProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseGeGluTanhProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 4, &[CapturedProviderWorkspace::Scratch])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -1021,6 +1212,8 @@ impl CudaConstantScaleProvider {
             contiguous_bindings(1),
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/cublas_api.rs").as_bytes(),
+                include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 crate::ptx::FUSED_SILU_MUL.as_bytes(),
                 SCALE_INPLACE_FUNCTION_NAME.as_bytes(),
             ]),
@@ -1055,11 +1248,18 @@ impl OperationResourceEstimator for CudaConstantScaleProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaConstantScaleProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 1, &[])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -1094,6 +1294,8 @@ impl CudaLogitSoftcapProvider {
             contiguous_bindings(1),
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/cublas_api.rs").as_bytes(),
+                include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 crate::ptx::FUSED_SILU_MUL.as_bytes(),
                 LOGIT_SOFTCAP_INPLACE_FUNCTION_NAME.as_bytes(),
             ]),
@@ -1128,11 +1330,18 @@ impl OperationResourceEstimator for CudaLogitSoftcapProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLogitSoftcapProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        static_contiguous_reusable_topology(&request, 1, &[])
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -1154,6 +1363,7 @@ pub(super) struct CudaResidualAddProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
     precision: ResidualPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl CudaResidualAddProvider {
@@ -1184,7 +1394,10 @@ impl CudaResidualAddProvider {
             native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/cublas_api.rs").as_bytes(),
+                include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 include_str!("transformer/precision.rs").as_bytes(),
+                include_str!("transformer/cost_route.rs").as_bytes(),
                 crate::ptx::RESIDUAL_ADD.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
@@ -1200,6 +1413,7 @@ impl CudaResidualAddProvider {
             descriptor,
             function,
             precision,
+            structured_capture: runtime.structured_capture(),
         })
     }
 }
@@ -1222,6 +1436,39 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        static_contiguous_reusable_topology(&request, 2, &[]).map(Some)
+    }
+
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        if self.structured_capture == ferrum_types::SloStructuredCostCapture::Disabled {
+            return Ok(None);
+        }
+        let prepared = prepare_residual_add(invocation, self.precision).map_err(invalid_plan)?;
+        Ok(cost_route::selected(
+            cost_route::Primitive::ResidualAdd {
+                precision: self.precision,
+            },
+            prepared.token_count,
+            prepared.hidden_size,
+            self.structured_capture,
+        ))
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::residual(request, self.precision, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
@@ -1239,6 +1486,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
             &self.function,
             self.precision,
             invocation,
+            self.structured_capture,
         )
         .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.residual_add.encode", message))
@@ -1301,14 +1549,23 @@ pub(super) fn provider_descriptor_with_formats(
     accepted_quantization_formats: BTreeSet<QuantizationFormatId>,
     provider_fingerprint: String,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    let accepted_weight_formats =
+        gguf_f16_projection::provider_formats(&contract.descriptor().id, accepted_weight_formats)
+            .map_err(contract_error)?;
     let capability = CapabilityId::new(capability_id).map_err(contract_error)?;
     if !runtime.descriptor().capabilities.contains(&capability) {
         return Err(CudaDeviceRuntimeError::contract(format!(
             "CUDA runtime does not advertise capability `{capability_id}`"
         )));
     }
+    let provider_fingerprint = implementation_fingerprint(&[
+        provider_fingerprint.as_bytes(),
+        include_bytes!("transformer/gguf_f16_projection.rs"),
+    ]);
     let estimator_fingerprint = implementation_fingerprint(&[
         include_str!("transformer.rs").as_bytes(),
+        include_str!("transformer/cublas_api.rs").as_bytes(),
+        include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
         estimator_id.as_bytes(),
         provider_fingerprint.as_bytes(),
     ]);
@@ -1365,6 +1622,8 @@ fn marlin_swiglu_provider_descriptor(
     }
     let estimator_fingerprint = implementation_fingerprint(&[
         include_str!("transformer.rs").as_bytes(),
+        include_str!("transformer/cublas_api.rs").as_bytes(),
+        include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
         DENSE_SWIGLU_ESTIMATOR_ID.as_bytes(),
         provider_fingerprint.as_bytes(),
     ]);
@@ -1434,6 +1693,8 @@ fn marlin_geglu_provider_descriptor(
     }
     let estimator_fingerprint = implementation_fingerprint(&[
         include_str!("transformer.rs").as_bytes(),
+        include_str!("transformer/cublas_api.rs").as_bytes(),
+        include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
         DENSE_GEGLU_TANH_ESTIMATOR_ID.as_bytes(),
         provider_fingerprint.as_bytes(),
     ]);
@@ -1505,6 +1766,8 @@ pub(super) fn ensure_estimator_request(
             descriptor.resource_estimator_id()
         )));
     }
+    gguf_f16_projection::validate_values(&request.operation().id, request.values())
+        .map_err(invalid_plan)?;
     Ok(())
 }
 
@@ -1524,13 +1787,18 @@ pub(super) fn estimate(
     )
 }
 
-fn encode_rms_norm(
-    provider_fingerprint: &str,
-    function: &CudaFunction,
+struct PreparedRmsNorm {
+    regions: Vec<CudaBufferRegion>,
+    rows: u32,
+    hidden_size: i32,
+    epsilon: f32,
+    participant_count: u32,
+}
+fn prepare_rms_norm(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     precision: RmsNormPrecision,
-    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, precision.operation())?;
+) -> Result<PreparedRmsNorm, String> {
+    ensure_invocation(invocation, precision.operation())?;
     let first = &invocation.participants()[0];
     let first_input = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
     let first_weight = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
@@ -1557,15 +1825,15 @@ fn encode_rms_norm(
     }
     let tokens = invocation.work_shape().immediate_tokens();
     let input = shared_token_region(
-        &invocation,
+        invocation,
         ResolvedValueRole::Input,
         0,
         precision.input(),
         tokens,
     )?;
-    let weight = shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?;
+    let weight = shared_full_region(invocation, ResolvedValueRole::Input, 1, ElementType::F16)?;
     let output = shared_token_region(
-        &invocation,
+        invocation,
         ResolvedValueRole::Output,
         0,
         precision.output(),
@@ -1574,16 +1842,39 @@ fn encode_rms_norm(
     let regions = vec![input, weight, output];
     let rows = checked_u32(tokens, "RMSNorm row count")?;
     let hidden_size = checked_i32(hidden_size, "RMSNorm hidden size")?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "RMSNorm participant count",
+    )?;
+    Ok(PreparedRmsNorm {
+        regions,
+        rows,
+        hidden_size,
+        epsilon,
+        participant_count,
+    })
+}
+
+fn encode_rms_norm(
+    provider_fingerprint: &str,
+    function: &CudaFunction,
+    precision: RmsNormPrecision,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
+) -> Result<CudaDeviceCommand, String> {
+    let PreparedRmsNorm {
+        regions,
+        rows,
+        hidden_size,
+        epsilon,
+        participant_count,
+    } = prepare_rms_norm(&invocation, precision)?;
     let function = function.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_rms_norm")
         .u32(rows)
         .i32(hidden_size)
         .f32(epsilon)
         .finish();
-    let participant_count = checked_u32(
-        invocation.participants().len() as u64,
-        "RMSNorm participant count",
-    )?;
     CudaDeviceCommand::replayable_operation(
         "vnext_rms_norm",
         regions,
@@ -1610,12 +1901,13 @@ fn encode_rms_norm(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(
-            DeviceBatchingForm::Packed,
+        cost_route::attach(
+            command,
+            cost_route::Primitive::RmsNorm { precision, epsilon },
             participant_count,
             u64::from(rows),
-            1,
-            0,
+            hidden_size as u64,
+            structured_capture,
         )
     })
     .map_err(|error| error.to_string())
@@ -3266,154 +3558,21 @@ fn encode_marlin_fp8_dense_swiglu(
 }
 
 fn encode_dense_swiglu(
+    operation_id: &str,
     provider_fingerprint: &str,
     silu_mul: &CudaFunction,
+    capture: ferrum_types::SloStructuredCostCapture,
+    identity: Option<cublas_api::CublasHandleApiIdentity>,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
-    let first = &invocation.participants()[0];
-    let first_input = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
-    let first_gate_up = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
-    let first_down = binding(first.bindings(), ResolvedValueRole::Input, 2)?;
-    let first_output = binding(first.bindings(), ResolvedValueRole::Output, 0)?;
-    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
-    let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
-    validate_dense_swiglu(
-        first_input,
-        first_gate_up,
-        first_down,
-        first_output,
-        hidden_size,
-        intermediate_size,
-    )?;
-    for participant in &invocation.participants()[1..] {
-        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-        let gate_up = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-        let down = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
-        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
-        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
-            || unsigned_attribute(participant.attributes(), "intermediate_size")?
-                != intermediate_size
-        {
-            return Err("CUDA dense SwiGLU participant attributes disagree".to_owned());
-        }
-        validate_dense_swiglu(input, gate_up, down, output, hidden_size, intermediate_size)?;
-    }
-    let tokens = invocation.work_shape().immediate_tokens();
-    let activation_elements = tokens
-        .checked_mul(intermediate_size)
-        .ok_or_else(|| "dense SwiGLU activation element count overflows".to_owned())?;
-    let gate_up_bytes = activation_elements
-        .checked_mul(2)
-        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
-        .ok_or_else(|| "dense SwiGLU gate/up scratch size overflows".to_owned())?;
-    let required_scratch_bytes = gate_up_bytes
-        .checked_add(
-            activation_elements
-                .checked_mul(ElementType::F16.size_bytes())
-                .ok_or_else(|| "dense SwiGLU activation scratch size overflows".to_owned())?,
-        )
-        .ok_or_else(|| "dense SwiGLU total scratch size overflows".to_owned())?;
-    let scratch = shared_scratch_region(&invocation, required_scratch_bytes)?;
-    let regions = vec![
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 2, ElementType::F16)?,
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Output,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
-        scratch,
-    ];
-    let token_count = tokens;
-    let participant_count = checked_u32(
-        invocation.participants().len() as u64,
-        "dense SwiGLU participant count",
-    )?;
-    let tokens = checked_i32(tokens, "dense SwiGLU token count")?;
-    let hidden_size = checked_i32(hidden_size, "dense SwiGLU hidden size")?;
-    let intermediate_size = checked_i32(intermediate_size, "dense SwiGLU intermediate size")?;
-    let silu_mul = silu_mul.clone();
-    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_swiglu")
-        .i32(tokens)
-        .i32(hidden_size)
-        .i32(intermediate_size)
-        .u64(gate_up_bytes)
-        .u64(required_scratch_bytes)
-        .finish();
-    CudaDeviceCommand::replayable_operation_with_blas(
-        "vnext_dense_swiglu",
-        regions,
-        replay_key,
-        move |stream, blas, regions| {
-            let input = regions[0].device_ptr();
-            let gate_up_weight = regions[1].device_ptr();
-            let down_weight = regions[2].device_ptr();
-            let output = regions[3].device_ptr();
-            let scratch = &regions[4];
-            if scratch.length_bytes() < required_scratch_bytes {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "vNext dense SwiGLU scratch is smaller than its admitted estimate",
-                ));
-            }
-            let gate_up_output = scratch.device_ptr();
-            let activation = gate_up_output.checked_add(gate_up_bytes).ok_or_else(|| {
-                CudaDeviceRuntimeError::contract("vNext dense SwiGLU activation pointer overflows")
-            })?;
-            launch_gemm_f16(
-                blas,
-                input,
-                gate_up_weight,
-                gate_up_output,
-                tokens,
-                intermediate_size.checked_mul(2).ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract(
-                        "vNext dense SwiGLU packed width overflows i32",
-                    )
-                })?,
-                hidden_size,
-                "vNext dense SwiGLU gate/up GEMM",
-            )?;
-            launch_silu_mul(
-                stream,
-                &silu_mul,
-                gate_up_output,
-                activation,
-                intermediate_size,
-                activation_elements,
-            )?;
-            launch_gemm_f16(
-                blas,
-                activation,
-                down_weight,
-                output,
-                tokens,
-                hidden_size,
-                intermediate_size,
-                "vNext dense SwiGLU down GEMM",
-            )?;
-            Ok(())
-        },
+    dense_swiglu_api::encode(
+        operation_id,
+        provider_fingerprint,
+        silu_mul,
+        capture,
+        identity,
+        invocation,
     )
-    .and_then(|command| {
-        command.with_work_attribution(
-            DeviceBatchingForm::Packed,
-            participant_count,
-            token_count,
-            3,
-            0,
-        )
-    })
-    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3959,13 +4118,19 @@ fn encode_logit_softcap(
     .map_err(|error| error.to_string())
 }
 
-fn encode_residual_add(
-    provider_fingerprint: &str,
-    function: &CudaFunction,
+struct PreparedResidual {
+    regions: Vec<CudaBufferRegion>,
+    participant_count: u32,
+    token_count: u64,
+    hidden_size: u64,
+    elements: i32,
+    grid_x: u32,
+}
+fn prepare_residual_add(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     precision: ResidualPrecision,
-    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, precision.operation())?;
+) -> Result<PreparedResidual, String> {
+    ensure_invocation(invocation, precision.operation())?;
     let first = &invocation.participants()[0];
     let first_left = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
     let first_right = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
@@ -3993,21 +4158,21 @@ fn encode_residual_add(
         .ok_or_else(|| "CUDA residual add element count overflows".to_owned())?;
     let regions = vec![
         shared_token_region(
-            &invocation,
+            invocation,
             ResolvedValueRole::Input,
             0,
             precision.master(),
             tokens,
         )?,
         shared_token_region(
-            &invocation,
+            invocation,
             ResolvedValueRole::Input,
             1,
             ElementType::F16,
             tokens,
         )?,
         shared_token_region(
-            &invocation,
+            invocation,
             ResolvedValueRole::Output,
             0,
             precision.master(),
@@ -4026,6 +4191,31 @@ fn encode_residual_add(
             .div_ceil(u64::from(THREADS_PER_BLOCK)),
         "residual add launch grid",
     )?;
+    Ok(PreparedResidual {
+        regions,
+        participant_count,
+        token_count,
+        hidden_size,
+        elements,
+        grid_x,
+    })
+}
+
+fn encode_residual_add(
+    provider_fingerprint: &str,
+    function: &CudaFunction,
+    precision: ResidualPrecision,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
+) -> Result<CudaDeviceCommand, String> {
+    let PreparedResidual {
+        regions,
+        participant_count,
+        token_count,
+        hidden_size,
+        elements,
+        grid_x,
+    } = prepare_residual_add(&invocation, precision)?;
     let function = function.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_residual_add")
         .i32(elements)
@@ -4056,12 +4246,13 @@ fn encode_residual_add(
         },
     )
     .and_then(|command| {
-        command.with_work_attribution(
-            DeviceBatchingForm::Packed,
+        cost_route::attach(
+            command,
+            cost_route::Primitive::ResidualAdd { precision },
             participant_count,
             token_count,
-            1,
-            0,
+            hidden_size,
+            structured_capture,
         )
     })
     .map_err(|error| error.to_string())
@@ -4077,30 +4268,26 @@ pub(super) fn launch_gemm_f16(
     in_features: i32,
     operation: &'static str,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    unsafe {
-        gemm_ex(
-            *blas.handle(),
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            out_features,
-            rows,
-            in_features,
-            &CUDA_GEMM_ALPHA_F32 as *const f32 as *const c_void,
-            weight as *const c_void,
-            cudaDataType_t::CUDA_R_16F,
-            in_features,
-            input as *const c_void,
-            cudaDataType_t::CUDA_R_16F,
-            in_features,
-            &CUDA_GEMM_BETA_F32 as *const f32 as *const c_void,
-            output as *mut c_void,
-            cudaDataType_t::CUDA_R_16F,
-            out_features,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
-    }
-    .map_err(|error| CudaDeviceRuntimeError::blas(operation, error))
+    cublas_api::GemmF16ApiPlan::new(rows, out_features, in_features)?
+        .launch(blas, input, weight, output, operation)
+}
+
+fn silu_mul_launch_config(
+    activation_elements: u64,
+) -> Result<(LaunchConfig, i32), CudaDeviceRuntimeError> {
+    let total = checked_i32_runtime(activation_elements, "SwiGLU activation element count")?;
+    let grid_x = activation_elements
+        .div_ceil(u64::from(THREADS_PER_BLOCK))
+        .try_into()
+        .map_err(|_| CudaDeviceRuntimeError::contract("SwiGLU launch grid exceeds u32"))?;
+    Ok((
+        LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        total,
+    ))
 }
 
 fn launch_silu_mul(
@@ -4111,25 +4298,15 @@ fn launch_silu_mul(
     intermediate_size: i32,
     activation_elements: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let total = checked_i32_runtime(activation_elements, "SwiGLU activation element count")?;
-    let grid_x = activation_elements
-        .div_ceil(u64::from(THREADS_PER_BLOCK))
-        .try_into()
-        .map_err(|_| CudaDeviceRuntimeError::contract("SwiGLU launch grid exceeds u32"))?;
+    let (config, total) = silu_mul_launch_config(activation_elements)?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&gate_up);
     builder.arg(&output);
     builder.arg(&intermediate_size);
     builder.arg(&total);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (grid_x, 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("vNext SwiGLU activation launch", error))
+    unsafe { builder.launch(config) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("vNext SwiGLU activation launch", error))
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -4552,6 +4729,7 @@ pub(super) fn ensure_invocation(
             "CUDA provider for `{operation_id}` received another or empty operation"
         ));
     }
+    gguf_f16_projection::validate_invocation(invocation)?;
     Ok(())
 }
 
@@ -4630,4 +4808,59 @@ fn provider_failure(
         false,
     )
     .expect("core-issued CUDA operation identity must form a valid provider failure")
+}
+
+impl CudaDenseLinearProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 2, &[])
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+impl CudaMarlinFp8DenseLinearProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 2, &[CapturedProviderWorkspace::Scratch])
+    }
+}
+
+impl CudaDenseSwiGluProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 3, &[CapturedProviderWorkspace::Scratch])
+    }
+}
+
+impl CudaDenseGeGluTanhProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 4, &[CapturedProviderWorkspace::Scratch])
+    }
+}
+
+impl CudaConstantScaleProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 1, &[])
+    }
+}
+
+impl CudaLogitSoftcapProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(request, 1, &[])
+    }
 }

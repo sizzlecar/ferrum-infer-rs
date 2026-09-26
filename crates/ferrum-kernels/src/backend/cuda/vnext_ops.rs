@@ -25,8 +25,8 @@ use ferrum_interfaces::vnext::{
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
-    WeightMaterializerId, WeightMaterializerRegistry, WeightMaterializerSelection,
+    ReusableExecutionTopologyRequest, ReusableExecutionTopologyView, SemanticValue, VNextError,
+    WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry, WeightMaterializerSelection,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CONSTANT_SCALE_F16_CAPABILITY_ID,
     DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID,
@@ -58,11 +58,15 @@ use super::vnext_runtime::{
     CudaDeviceRuntimeConfig, CudaDeviceRuntimeError,
 };
 
+mod cost_route;
+mod embedding;
 #[cfg(test)]
 mod last_token_linear_tests;
 mod native_blocks;
 mod native_io;
 mod selection;
+#[cfg(test)]
+mod topology_tests;
 mod transformer;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_f32_master_contract, causal_paged_attention_f32_master_int8_kv_contract,
@@ -75,13 +79,20 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use ferrum_interfaces::vnext::{
-    dense_swiglu_q8_f32scale_contract,
+    dense_swiglu_q8_f32scale_contract, dense_swiglu_q8_f32scale_input_sum_contract,
+    dense_swiglu_q8_gate_up_stream_mmq_contract, dense_swiglu_q8_residual2_ffn_m2to8_contract,
     gated_delta_recurrent_attention_f32_master_q8_projections_contract,
-    DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+    DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID, DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID,
+    DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID,
+    DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
-use selection::{argmax_dispatches, ArgmaxArguments, ArgmaxFunctions, ArgmaxPrecision};
+use selection::{argmax_dispatches, ArgmaxFunctions, ArgmaxPrecision};
+pub(super) use transformer::cublas_api::{
+    CapturedCublasCostContract, CublasCostIdentitySource, CublasCostRequirement,
+    CublasHandleApiIdentity,
+};
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -115,27 +126,47 @@ pub fn cuda_vnext_runtime_config(
     let fingerprint_parts: Vec<&[u8]> = vec![
         include_str!("vnext_runtime.rs").as_bytes(),
         include_str!("vnext_runtime/submission.rs").as_bytes(),
+        include_str!("vnext_runtime/cost_identity.rs").as_bytes(),
         include_str!("vnext_runtime/core_cost_route.rs").as_bytes(),
+        include_str!("vnext_runtime/selected_cost.rs").as_bytes(),
+        include_str!("vnext_runtime/nvml.rs").as_bytes(),
+        include_str!("vnext_runtime/device_memory.rs").as_bytes(),
+        include_str!("vnext_runtime/device_memory/allocation.rs").as_bytes(),
+        include_str!("vnext_runtime/device_memory/query.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("../reusable_execution.rs").as_bytes(),
         include_str!("../reusable_execution/warmup.rs").as_bytes(),
         include_str!("vnext_ops.rs").as_bytes(),
+        include_str!("vnext_ops/cost_route.rs").as_bytes(),
         include_str!("vnext_ops/selection.rs").as_bytes(),
         include_str!("vnext_ops/transformer.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/cublas_api.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/dense_swiglu_api.rs").as_bytes(),
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/cost_route.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/native_swiglu/cost_route.rs").as_bytes(),
         include_str!("vnext_ops/transformer/q8_swiglu.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/stream_mmq_swiglu.rs").as_bytes(),
+        include_str!("vnext_ops/native_blocks/stream_mmq.rs").as_bytes(),
+        native_blocks::stream_mmq::PTX.as_bytes(),
         include_str!("vnext_ops/native_blocks/q8_f32scale.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
+        include_bytes!("vnext_ops/native_blocks/linear_launch.rs"),
+        include_bytes!("vnext_ops/native_blocks/selected.rs"),
         include_str!("vnext_ops/native_blocks/hadamard.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention/precision.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/attention/cost_route.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention/native_projection.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/causal_attention/batch_decode.rs").as_bytes(),
+        include_bytes!("vnext_ops/native_io/cost_route.rs"),
+        include_str!("vnext_ops/transformer/causal_attention/cost_route.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/gpt_oss_attention.rs").as_bytes(),
         crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
@@ -219,7 +250,14 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RMS_NORM_F32_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
+        ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_F16_WEIGHTS_CAPABILITY_ID,
+        ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+        ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
+        crate::gguf_f16_projection_materializer::GGUF_F16_PROJECTION_CAPABILITY_ID,
         DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+        DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID,
+        DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID,
+        DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID,
         DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
         CONSTANT_SCALE_F16_CAPABILITY_ID,
         LOGIT_SOFTCAP_F16_CAPABILITY_ID,
@@ -281,6 +319,26 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
 pub fn cuda_weight_materializer_selection(
     family: &PreparedModelFamily,
 ) -> Result<WeightMaterializerSelection, VNextError> {
+    if crate::gguf_f16_projection_materializer::requests_gguf_f16_projection_materialization(family)
+    {
+        let selection =
+            crate::gguf_f16_projection_materializer::gguf_f16_projection_materializer_selection(
+                family,
+            )?;
+        let inventory =
+            crate::gguf_f16_projection_materializer::gguf_f16_projection_inventory(family)?;
+        tracing::info!(
+            source_schema_fingerprint = %inventory.source_schema_fingerprint,
+            execution_schema_fingerprint = %inventory.execution_schema_fingerprint,
+            source_consumed_bytes = inventory.source_consumed_bytes,
+            converted_f16_bytes = inventory.converted_f16_bytes,
+            retained_consumed_bytes = inventory.retained_consumed_bytes,
+            unique_consumed_execution_bytes = inventory.unique_consumed_execution_bytes,
+            includes_placement_alignment = inventory.includes_placement_alignment,
+            "Explicit GGUF RN-F16 projection weight inventory (not Peak VRAM)"
+        );
+        return Ok(selection);
+    }
     let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
     let block_fp8_quantization =
         QuantizationFormatId::new(BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID)?;
@@ -400,6 +458,9 @@ fn cuda_operation_contracts(
         Box::new(rms_norm_f32_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
+        Box::new(ferrum_interfaces::vnext::dense_swiglu_gguf_f16_weights_contract().map_err(contract_error)?),
+        Box::new(ferrum_interfaces::vnext::gated_delta_recurrent_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
+        Box::new(ferrum_interfaces::vnext::causal_paged_attention_f32_master_gguf_f16_projections_contract().map_err(contract_error)?),
         Box::new(dense_geglu_tanh_contract().map_err(contract_error)?),
         Box::new(constant_scale_contract().map_err(contract_error)?),
         Box::new(logit_softcap_contract().map_err(contract_error)?),
@@ -460,6 +521,9 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaRmsNormProvider::new_f32(runtime)?),
         Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
+        Box::new(transformer::CudaDenseSwiGluProvider::new_gguf_f16_weights(runtime)?),
+        Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new_f32_master_gguf_f16_projections(runtime)?),
+        Box::new(transformer::CudaCausalPagedAttentionProvider::new_f32_master_gguf_f16_projections(runtime, runtime.attention_execution_policy())?),
         Box::new(transformer::CudaDenseGeGluTanhProvider::new(runtime)?),
         Box::new(transformer::CudaConstantScaleProvider::new(runtime)?),
         Box::new(transformer::CudaLogitSoftcapProvider::new(runtime)?),
@@ -540,12 +604,52 @@ pub fn cuda_vnext_operation_registry(
         .descriptor()
         .capabilities
         .iter()
+        .any(|c| c.as_str() == DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID)
+    {
+        contracts.push(Box::new(
+            dense_swiglu_q8_gate_up_stream_mmq_contract().map_err(contract_error)?,
+        ));
+        providers.push(Box::new(transformer::CudaStreamMmqSwiGluProvider::new(
+            runtime,
+        )?));
+    }
+    if runtime
+        .descriptor()
+        .capabilities
+        .iter()
+        .any(|c| c.as_str() == DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID)
+    {
+        contracts.push(Box::new(
+            dense_swiglu_q8_residual2_ffn_m2to8_contract().map_err(contract_error)?,
+        ));
+        providers.push(Box::new(
+            transformer::CudaStreamMmqSwiGluProvider::residual2_m2to8(runtime)?,
+        ));
+    }
+    if runtime
+        .descriptor()
+        .capabilities
+        .iter()
         .any(|capability| capability.as_str() == DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID)
     {
         contracts.push(Box::new(
             dense_swiglu_q8_f32scale_contract().map_err(contract_error)?,
         ));
         providers.push(Box::new(transformer::CudaQ8SwiGluProvider::new(runtime)?));
+    }
+    if runtime
+        .descriptor()
+        .capabilities
+        .iter()
+        .any(|capability| capability.as_str() == DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID)
+    {
+        contracts.push(Box::new(
+            dense_swiglu_q8_f32scale_input_sum_contract().map_err(contract_error)?,
+        ));
+        providers.push(Box::new(transformer::CudaQ8SwiGluProvider::with_policy(
+            runtime,
+            native_blocks::q8_f32scale::Q8SumPolicy::Input,
+        )?));
     }
     if runtime.descriptor().capabilities.iter().any(|capability| {
         capability.as_str()
@@ -580,37 +684,64 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::prepare_with_memory_sampling(ordinal, device_id, requested_attention_policy, None)
+    }
+
+    fn prepare_with_memory_sampling(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::prepare_with_observation(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            memory_sampling,
+            ferrum_types::SloStructuredCostCapture::Disabled,
+        )
+    }
+
+    fn prepare_with_observation(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
-        let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
+        let mut runtime =
+            CudaDeviceRuntime::new_with_structured_capture(config, structured_capture)?;
+        if let Some(config) = memory_sampling {
+            runtime.enable_device_memory_sampling(config)?;
+        }
+        let runtime = Arc::new(runtime);
         let registry = cuda_vnext_operation_registry(&runtime)?;
+        let mut weight_materializers = vec![
+            crate::gguf_f16_projection_materializer::gguf_f16_projection_materializer()
+                .map_err(contract_error)?,
+        ];
         #[cfg(feature = "vllm-marlin")]
-        let weight_materializers = vec![
+        weight_materializers.extend([
             crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
             crate::marlin_fp8_materializer::block_fp8_to_marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
-        ];
+        ]);
         #[cfg(feature = "vllm-moe-marlin")]
-        let weight_materializers = {
-            let mut weight_materializers = weight_materializers;
-            weight_materializers.push(
-                crate::mxfp4_marlin_materializer::gpt_oss_mxfp4_to_marlin_weight_materializer()
-                    .map_err(contract_error)?,
-            );
-            weight_materializers
-        };
-        #[cfg(feature = "vllm-marlin")]
+        weight_materializers.push(
+            crate::mxfp4_marlin_materializer::gpt_oss_mxfp4_to_marlin_weight_materializer()
+                .map_err(contract_error)?,
+        );
         let weight_materializers =
             WeightMaterializerRegistry::new(weight_materializers).map_err(contract_error)?;
-        #[cfg(not(feature = "vllm-marlin"))]
-        let weight_materializers =
-            WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
+                include_str!("vnext_ops/cost_route.rs").as_bytes(),
                 include_str!("vnext_runtime.rs").as_bytes(),
                 include_str!("vnext_runtime/submission.rs").as_bytes(),
                 include_str!("vnext_runtime/core_cost_route.rs").as_bytes(),
@@ -639,7 +770,41 @@ impl CudaVNextComposition {
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let composition = Self::prepare(ordinal, device_id, requested_attention_policy)?;
+        Self::create_with_memory_sampling(ordinal, device_id, requested_attention_policy, None)
+    }
+
+    pub fn create_with_memory_sampling(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let composition = Self::prepare_with_memory_sampling(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            memory_sampling,
+        )?;
+        composition.validate_compiled_native_operators()?;
+        Ok(composition)
+    }
+
+    /// Product composition shared by run and serve. Observation is immutable
+    /// before the retained registry/providers are built.
+    pub fn create_with_observation(
+        ordinal: usize,
+        device_id: DeviceId,
+        requested_attention_policy: AttentionExecutionPolicy,
+        memory_sampling: Option<&ferrum_types::DeviceMemorySamplingConfig>,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let composition = Self::prepare_with_observation(
+            ordinal,
+            device_id,
+            requested_attention_policy,
+            memory_sampling,
+            structured_capture,
+        )?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
     }
@@ -750,6 +915,7 @@ pub struct CudaTokenEmbeddingProvider {
     function: CudaFunction,
     native: native_blocks::CudaNativeBlockKernels,
     precision: TokenPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl CudaTokenEmbeddingProvider {
@@ -805,6 +971,7 @@ impl CudaTokenEmbeddingProvider {
             function,
             native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
             precision,
+            structured_capture: runtime.structured_capture(),
         })
     }
 }
@@ -839,14 +1006,58 @@ impl OperationResourceEstimator for CudaTokenEmbeddingProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        if self.structured_capture == ferrum_types::SloStructuredCostCapture::Disabled {
+            return Ok(None);
+        }
+        let invalid = |reason| VNextError::InvalidExecutionPlan { reason };
+        if self.precision == TokenPrecision::F32 || native_io::requires_native(invocation) {
+            let prepared = native_io::embedding::prepare(
+                self.descriptor.provider_implementation_fingerprint(),
+                self.precision,
+                invocation,
+            )
+            .map_err(invalid)?;
+            Ok(prepared.selected(self.precision, self.structured_capture))
+        } else {
+            let prepared = embedding::prepare_dense(invocation).map_err(invalid)?;
+            Ok(embedding::selected_dense(
+                prepared.launches.iter().map(|l| {
+                    (
+                        u64::from(l.vocabulary_size),
+                        l.hidden_size as u64,
+                        l.token_count,
+                    )
+                }),
+                prepared.tokens,
+                self.structured_capture,
+            ))
+        }
+    }
+
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::embedding(request, self.precision, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        reusable_token_topology(
-            &request,
-            b"ferrum.cuda.token-embedding.reusable-topology.v2\0",
-        )
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -860,12 +1071,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
                     self.descriptor.provider_implementation_fingerprint(),
                     &self.native,
                     self.precision,
+                    self.structured_capture,
                     invocation,
                 )
             } else {
                 encode_token_embedding(
                     &self.function,
                     self.descriptor.provider_implementation_fingerprint(),
+                    self.structured_capture,
                     invocation,
                 )
             };
@@ -879,6 +1092,7 @@ pub struct CudaLastTokenDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
     native: native_blocks::CudaNativeBlockKernels,
     precision: TokenPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl CudaLastTokenDenseLinearProvider {
@@ -915,6 +1129,7 @@ impl CudaLastTokenDenseLinearProvider {
             descriptor,
             native: native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
             precision,
+            structured_capture: runtime.structured_capture(),
         })
     }
 }
@@ -949,23 +1164,33 @@ impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        native_io::projection_replay_evidence(invocation, self.precision, self.structured_capture)
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        native_io::projection_cost_route(request, self.precision, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        // A dense F16 batch may gather even when its semantic spans are unit
-        // rows: physical input windows can still have gaps. Capture therefore
-        // requires the declared scratch address as well as every value address.
-        if last_token_uses_dense_f16(self.precision, request.bindings())
-            && request.work_shape().participant_token_ranges().len() > 1
-            && request.scratch_reusable_address_scope()?.is_none()
-        {
-            return Ok(ReusableExecutionTopology::EagerBoundary);
-        }
-        reusable_token_topology(
-            &request,
-            b"ferrum.cuda.last-token-linear.reusable-topology.v3\0",
-        )
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -979,6 +1204,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
                     self.descriptor.provider_implementation_fingerprint(),
                     &self.native,
                     self.precision,
+                    self.structured_capture,
                     invocation,
                 )
             } else {
@@ -999,6 +1225,7 @@ pub struct CudaLastTokenMaskedArgmaxProvider {
     descriptor: OperationProviderDescriptor,
     functions: ArgmaxFunctions,
     precision: ArgmaxPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
 }
 
 impl CudaLastTokenMaskedArgmaxProvider {
@@ -1024,7 +1251,10 @@ impl CudaLastTokenMaskedArgmaxProvider {
             transformer::contiguous_bindings(5),
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
+                include_str!("vnext_ops/cost_route.rs").as_bytes(),
                 include_str!("vnext_ops/selection.rs").as_bytes(),
+                include_str!("vnext_ops/selection/prepared.rs").as_bytes(),
+                include_str!("vnext_ops/selection/selected.rs").as_bytes(),
                 crate::ptx::ARGMAX_ROWS.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
@@ -1034,6 +1264,7 @@ impl CudaLastTokenMaskedArgmaxProvider {
             descriptor,
             functions,
             precision,
+            structured_capture: runtime.structured_capture(),
         })
     }
 }
@@ -1072,15 +1303,33 @@ impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider {
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        selection::prepared::replay_evidence(invocation, self.precision, self.structured_capture)
+    }
+
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::argmax(request, self.precision, self.structured_capture)
+    }
+
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        transformer::static_contiguous_reusable_topology(
-            &request,
-            5,
-            &[transformer::CapturedProviderWorkspace::Scratch],
-        )
+        self.shared_reusable_topology(&request)
     }
 
     fn encode_selected(
@@ -1088,10 +1337,11 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_last_token_masked_argmax(
+        selection::prepared::encode(
             &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
             self.precision,
+            self.structured_capture,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -1099,162 +1349,6 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
             provider_failure(identity, "cuda.last_token_masked_argmax.encode", message)
         })
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MaskedArgmaxLaunch {
-    first_region: usize,
-    scratch_offset_bytes: u64,
-    vocabulary_size: i32,
-    repetition_capacity: i32,
-}
-
-fn encode_last_token_masked_argmax(
-    functions: &ArgmaxFunctions,
-    provider_fingerprint: &str,
-    precision: ArgmaxPrecision,
-    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != precision.operation()
-        || invocation.participants().is_empty()
-    {
-        return Err("CUDA masked argmax received another or empty operation".to_owned());
-    }
-
-    let first_vocabulary_size =
-        unsigned_attribute(invocation.participants()[0].attributes(), "vocab_size")?;
-    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size, precision.element())?;
-    let required_scratch_bytes = scratch_stride
-        .checked_mul(invocation.participants().len() as u64)
-        .ok_or_else(|| "CUDA masked argmax scratch size overflows".to_owned())?;
-    let mut regions = Vec::with_capacity(invocation.participants().len() * 6 + 1);
-    let mut launches = Vec::with_capacity(invocation.participants().len());
-    for (participant_index, participant) in invocation.participants().iter().enumerate() {
-        let logits = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-        let valid_mask = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-        let repetition_token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
-        let repetition_offsets = binding(participant.bindings(), ResolvedValueRole::Input, 3)?;
-        let repetition_penalty = binding(participant.bindings(), ResolvedValueRole::Input, 4)?;
-        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
-        let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        if vocabulary_size != first_vocabulary_size {
-            return Err("CUDA masked argmax participants disagree on vocabulary size".to_owned());
-        }
-        let repetition_capacity = validate_masked_argmax_signature(
-            logits,
-            valid_mask,
-            repetition_token_ids,
-            repetition_offsets,
-            repetition_penalty,
-            output,
-            vocabulary_size,
-            precision.element(),
-        )?;
-
-        let first_region = regions.len();
-        regions.push(contiguous_region(participant, logits, precision.element())?);
-        regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
-        regions.push(contiguous_region(
-            participant,
-            repetition_token_ids,
-            ElementType::U32,
-        )?);
-        regions.push(contiguous_region(
-            participant,
-            repetition_offsets,
-            ElementType::U32,
-        )?);
-        regions.push(contiguous_region(
-            participant,
-            repetition_penalty,
-            ElementType::F32,
-        )?);
-        regions.push(contiguous_region(participant, output, ElementType::U32)?);
-        launches.push(MaskedArgmaxLaunch {
-            first_region,
-            scratch_offset_bytes: scratch_stride
-                .checked_mul(participant_index as u64)
-                .ok_or_else(|| "CUDA masked argmax scratch offset overflows".to_owned())?,
-            vocabulary_size: i32::try_from(vocabulary_size)
-                .map_err(|_| "masked argmax vocabulary exceeds i32".to_owned())?,
-            repetition_capacity,
-        });
-    }
-    let scratch_region = regions.len();
-    regions.push(transformer::shared_scratch_region(
-        &invocation,
-        required_scratch_bytes,
-    )?);
-
-    let participant_count = u32::try_from(invocation.participants().len())
-        .map_err(|_| "masked argmax participant count exceeds u32".to_owned())?;
-    let dispatches_per_participant = argmax_dispatches(launches[0].vocabulary_size);
-    let parallel = dispatches_per_participant == 2;
-    let mut replay_key =
-        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_masked_argmax")
-            .u64(dispatches_per_participant)
-            .u64(launches.len() as u64);
-    for launch in &launches {
-        replay_key = replay_key
-            .u64(launch.first_region as u64)
-            .u64(launch.scratch_offset_bytes)
-            .i32(launch.vocabulary_size)
-            .i32(launch.repetition_capacity);
-    }
-    let functions = functions.clone();
-    CudaDeviceCommand::replayable_operation(
-        "vnext_last_token_masked_argmax",
-        regions,
-        replay_key.finish(),
-        move |stream, regions| {
-            for launch in &launches {
-                let logits = regions[launch.first_region].device_ptr();
-                let valid_mask = regions[launch.first_region + 1].device_ptr();
-                let repetition_token_ids = regions[launch.first_region + 2].device_ptr();
-                let repetition_offsets = regions[launch.first_region + 3].device_ptr();
-                let repetition_penalty = regions[launch.first_region + 4].device_ptr();
-                let output = regions[launch.first_region + 5].device_ptr();
-                let scratch = regions[scratch_region]
-                    .device_ptr()
-                    .checked_add(launch.scratch_offset_bytes)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "vNext masked argmax scratch pointer overflows",
-                        )
-                    })?;
-                functions.launch(
-                    stream,
-                    ArgmaxArguments {
-                        logits,
-                        scratch,
-                        valid_mask,
-                        repetition_offsets,
-                        repetition_token_ids,
-                        repetition_penalty,
-                        output,
-                        vocabulary_size: launch.vocabulary_size,
-                        repetition_capacity: launch.repetition_capacity,
-                    },
-                    parallel,
-                )?;
-            }
-            Ok(())
-        },
-    )
-    .and_then(|command| {
-        command.with_work_attribution(
-            if participant_count == 1 {
-                DeviceBatchingForm::Scalar
-            } else {
-                DeviceBatchingForm::ParticipantLoop
-            },
-            participant_count,
-            u64::from(participant_count),
-            u64::from(participant_count) * dispatches_per_participant,
-            0,
-        )
-    })
-    .map_err(|error| error.to_string())
 }
 
 fn masked_argmax_scratch_stride(
@@ -1840,80 +1934,26 @@ struct EmbeddingLaunch {
 fn encode_token_embedding(
     function: &CudaFunction,
     provider_fingerprint: &str,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != TOKEN_EMBEDDING_OPERATION_ID
-        || invocation.participants().is_empty()
-    {
-        return Err("CUDA token embedding received another or empty operation".to_owned());
-    }
-
-    let token_ranges = invocation.participant_token_ranges();
-    if token_ranges.len() != invocation.participants().len() {
-        return Err("CUDA token embedding participant ranges are incomplete".to_owned());
-    }
-    let input_packed =
-        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
-    let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
-    let mut launches = Vec::with_capacity(invocation.participants().len());
-    for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
-        let token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-        let table = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
-        let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
-        let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        validate_signature(
-            token_ids,
-            table,
-            output,
-            vocabulary_size,
-            hidden_size,
-            ElementType::F16,
-        )?;
-        let source_range = token_range.source_token_range();
-        let packed_range = token_range.immediate_token_range();
-        let token_count = token_range.immediate_tokens();
-        let grid_x = hidden_size
-            .div_ceil(THREADS_PER_BLOCK as u64)
-            .try_into()
-            .map_err(|_| "embedding launch grid exceeds u32".to_owned())?;
-
-        let first_region = regions.len();
-        regions.push(contiguous_region(participant, table, ElementType::F16)?);
-        regions.push(contiguous_token_region(
-            participant,
-            token_ids,
-            ElementType::U32,
-            if input_packed {
-                packed_range.start
-            } else {
-                source_range.start
-            },
-            token_count,
-        )?);
-        regions.push(contiguous_token_region(
-            participant,
-            output,
-            ElementType::F16,
-            packed_range.start,
-            token_count,
-        )?);
-        launches.push(EmbeddingLaunch {
-            first_region,
-            token_count,
-            vocabulary_size: vocabulary_size
-                .try_into()
-                .map_err(|_| "embedding vocabulary size exceeds u32".to_owned())?,
-            hidden_size: hidden_size
-                .try_into()
-                .map_err(|_| "embedding hidden size exceeds i32".to_owned())?,
-            grid_x,
-        });
-    }
-
-    let participant_count = u32::try_from(invocation.participants().len())
-        .map_err(|_| "embedding participant count exceeds u32".to_owned())?;
-    let token_count = invocation.work_shape().immediate_tokens();
+    let embedding::DensePrepared {
+        regions,
+        launches,
+        participants: participant_count,
+        tokens: token_count,
+    } = embedding::prepare_dense(&invocation)?;
+    let selected = embedding::selected_dense(
+        launches.iter().map(|l| {
+            (
+                u64::from(l.vocabulary_size),
+                l.hidden_size as u64,
+                l.token_count,
+            )
+        }),
+        token_count,
+        structured_capture,
+    );
     let compute_dispatch_count = launches
         .iter()
         .map(|launch| launch.token_count.div_ceil(MAXIMUM_TOKENS_PER_LAUNCH))
@@ -1962,22 +2002,19 @@ fn encode_token_embedding(
                         ElementType::F16.size_bytes(),
                         "embedding output",
                     )?;
-                    let batch = chunk_tokens as i32;
+                    let selected = embedding::dense_plan(
+                        u64::from(launch.vocabulary_size),
+                        launch.hidden_size as u64,
+                        chunk_tokens,
+                    )?;
                     let mut builder = stream.launch_builder(&function);
-                    builder.arg(&table);
-                    builder.arg(&token_ids);
-                    builder.arg(&output);
-                    builder.arg(&batch);
-                    builder.arg(&launch.hidden_size);
-                    builder.arg(&launch.vocabulary_size);
-                    unsafe {
-                        builder.launch(LaunchConfig {
-                            grid_dim: (launch.grid_x, chunk_tokens as u32, 1),
-                            block_dim: (THREADS_PER_BLOCK, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                    }
-                    .map_err(|error| {
+                    builder.arg(&table).arg(&token_ids).arg(&output);
+                    let [batch, hidden, vocabulary] = selected.parameters;
+                    // Keep the existing signed batch/hidden ABI and unsigned vocabulary.
+                    let batch = batch as i32;
+                    let hidden = hidden as i32;
+                    builder.arg(&batch).arg(&hidden).arg(&vocabulary);
+                    unsafe { builder.launch(selected.config) }.map_err(|error| {
                         CudaDeviceRuntimeError::driver("vNext token embedding launch", error)
                     })?;
                     token_offset += chunk_tokens;
@@ -1995,6 +2032,7 @@ fn encode_token_embedding(
             0,
         )
     })
+    .map(|command| command.with_statistical_evidence(selected))
     .map_err(|error| error.to_string())
 }
 
@@ -2067,7 +2105,7 @@ fn unsigned_attribute(
 }
 
 fn reusable_token_topology(
-    request: &ReusableExecutionTopologyRequest<'_>,
+    request: &impl ReusableExecutionTopologyView,
     domain: &'static [u8],
 ) -> Result<ReusableExecutionTopology, VNextError> {
     for (role, ordinal) in [
@@ -2085,15 +2123,21 @@ fn reusable_token_topology(
 
     let bind_source_ranges =
         !request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)?;
-    let ranges = request.work_shape().participant_token_ranges();
     let mut digest = Sha256::new();
     digest.update(domain);
-    digest.update((ranges.len() as u64).to_le_bytes());
-    digest.update(request.work_shape().immediate_tokens().to_le_bytes());
-    for range in ranges {
-        let source = range.source_token_range();
-        let packed = range.immediate_token_range();
-        digest.update(range.immediate_tokens().to_le_bytes());
+    digest.update((request.participant_count() as u64).to_le_bytes());
+    digest.update(request.immediate_tokens().to_le_bytes());
+    let mut packed_start = 0_u64;
+    for index in 0..request.participant_count() {
+        let row = request
+            .token_row(index)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "missing topology row".to_owned(),
+            })?;
+        let source = row.offset..row.offset + row.count.get();
+        let packed = packed_start..packed_start + row.count.get();
+        packed_start = packed.end;
+        digest.update(row.count.get().to_le_bytes());
         if bind_source_ranges {
             digest.update(source.start.to_le_bytes());
             digest.update(source.end.to_le_bytes());
@@ -2104,6 +2148,51 @@ fn reusable_token_topology(
     Ok(ReusableExecutionTopology::Dynamic(
         DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
     ))
+}
+
+impl CudaTokenEmbeddingProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        reusable_token_topology(
+            request,
+            b"ferrum.cuda.token-embedding.reusable-topology.v2\0",
+        )
+    }
+}
+
+impl CudaLastTokenDenseLinearProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        // Unit semantic spans may still require a gather across physical gaps.
+        // Preserve the actual-path scratch-address requirement on both views.
+        if last_token_uses_dense_f16(self.precision, request.bindings())
+            && request.participant_count() > 1
+            && request.scratch_reusable_address_scope()?.is_none()
+        {
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        }
+        reusable_token_topology(
+            request,
+            b"ferrum.cuda.last-token-linear.reusable-topology.v3\0",
+        )
+    }
+}
+
+impl CudaLastTokenMaskedArgmaxProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        transformer::static_contiguous_reusable_topology(
+            request,
+            5,
+            &[transformer::CapturedProviderWorkspace::Scratch],
+        )
+    }
 }
 
 fn contiguous_region(

@@ -22,9 +22,9 @@ use ferrum_interfaces::vnext::{
     ProviderCheckpointStatePort, ProviderId, ProviderWorkspaceRequirement,
     ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
     QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
-    ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
-    GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionTopologyView,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
+    WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -63,8 +63,12 @@ use crate::marlin_fp8_materializer::{
     MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
+mod cost_route;
+mod launch_geometry;
 mod native_projection;
 mod precision;
+mod prepared;
+mod selected;
 use crate::backend::cuda::vnext_ops::native_blocks::q8_f32scale::Q8F32ScaleKernels;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use precision::AttentionPrecision;
@@ -92,6 +96,8 @@ const STATE_BINDING_SLOT_BYTES: u64 = 16;
 pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
     precision: AttentionPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
+    cublas_cost_identity: super::cublas_api::CublasCostIdentitySource,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     functions: AttentionFunctions,
     #[cfg(feature = "vllm-marlin")]
@@ -137,6 +143,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Self::with_precision(runtime, AttentionPrecision::F32MasterQ8Projections)
     }
 
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master_gguf_f16_projections(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32MasterGgufF16Projections)
+    }
+
     fn with_precision(
         runtime: &CudaDeviceRuntime,
         precision: AttentionPrecision,
@@ -153,14 +165,29 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let source = include_str!("attention.rs");
         let mut provider_fingerprint_parts = vec![
             source.as_bytes(),
+            include_bytes!("attention/prepared.rs"),
+            include_bytes!("attention/launch_geometry.rs"),
+            include_bytes!("attention/selected.rs"),
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
+            include_bytes!("cublas_api.rs"),
+            include_bytes!("attention/cost_route.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             include_bytes!("../native_blocks/q8_f32scale.rs"),
+            include_bytes!("../native_blocks/linear_launch.rs"),
+            include_bytes!("../native_blocks/selected.rs"),
+            include_bytes!("../native_blocks/q8_f32scale/launch_plan.rs"),
+            include_bytes!("../native_blocks/q8_f32scale/selected.rs"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/gguf_blocks/q8_projection_plan.rs"
+            )),
+            include_bytes!("../native_blocks/q8_pair.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::LINEAR_ATTENTION.as_bytes(),
@@ -181,12 +208,26 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
+            include_bytes!("attention/prepared.rs"),
+            include_bytes!("attention/launch_geometry.rs"),
+            include_bytes!("attention/selected.rs"),
             include_bytes!("attention/precision.rs"),
+            include_bytes!("gguf_f16_projection.rs"),
+            include_bytes!("cublas_api.rs"),
             include_bytes!("attention/native_projection.rs"),
             include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
             include_bytes!("../native_blocks/q8_f32scale.rs"),
+            include_bytes!("../native_blocks/linear_launch.rs"),
+            include_bytes!("../native_blocks/selected.rs"),
+            include_bytes!("../native_blocks/q8_f32scale/launch_plan.rs"),
+            include_bytes!("../native_blocks/q8_f32scale/selected.rs"),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/gguf_blocks/q8_projection_plan.rs"
+            )),
+            include_bytes!("../native_blocks/q8_pair.rs"),
             precision.estimator().as_bytes(),
         ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
@@ -249,6 +290,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                     .map_err(contract_error)?,
             );
         }
+        let accepted_weight_formats = super::gguf_f16_projection::provider_formats(
+            &contract.descriptor().id,
+            accepted_weight_formats,
+        )
+        .map_err(contract_error)?;
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(precision.provider()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -375,6 +421,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         Ok(Self {
             descriptor,
             precision,
+            structured_capture: runtime.structured_capture(),
+            cublas_cost_identity: runtime.cublas_cost_identity_source(),
             execution_capabilities,
             functions,
             #[cfg(feature = "vllm-marlin")]
@@ -456,6 +504,46 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionProvider {
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        if self.structured_capture == ferrum_types::SloStructuredCostCapture::Disabled {
+            return Ok(None);
+        }
+        let prepared = prepared::prepare(
+            invocation,
+            self.precision,
+            self.execution_capabilities,
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+        .map_err(invalid_plan)?;
+        Ok(selected::from_prepared(
+            &prepared,
+            self.precision,
+            self.functions.native.q8_pair_enabled(),
+            self.structured_capture,
+            self.cublas_cost_identity.frozen(),
+        ))
+    }
+
+    fn eager_cost_route(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ferrum_interfaces::vnext::OperationCostRoute>, VNextError> {
+        cost_route::route(
+            request,
+            self.precision,
+            self.execution_capabilities,
+            self.structured_capture,
+            self.cublas_cost_identity.frozen(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+    }
+
     fn reusable_binding_resources(&self) -> ferrum_interfaces::vnext::ReusableBindingResources {
         ferrum_interfaces::vnext::ReusableBindingResources::RequestStateAndBinding
     }
@@ -464,31 +552,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        let mut values = (0..8)
-            .map(|ordinal| {
-                ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
-            })
-            .collect::<Vec<_>>();
-        values.extend([
-            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
-            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
-            ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
-        ]);
-        if request
-            .reusable_address_scope(
-                &values,
-                &[
-                    ReusableExecutionWorkspaceAddress::Scratch,
-                    ReusableExecutionWorkspaceAddress::Binding,
-                ],
-            )?
-            .is_none()
-        {
-            return Ok(ReusableExecutionTopology::EagerBoundary);
-        }
-        reusable_attention_topology(&request, self.execution_capabilities, self.precision)
-            .map(ReusableExecutionTopology::Dynamic)
-            .map_err(invalid_plan)
+        self.shared_reusable_topology(&request)
+    }
+
+    fn reusable_execution_cost_topology(
+        &self,
+        request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        self.shared_reusable_topology(&request).map(Some)
     }
 
     fn encode_selected(
@@ -501,6 +572,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
             &self.functions,
             self.precision,
             self.execution_capabilities,
+            self.structured_capture,
+            self.cublas_cost_identity.frozen(),
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
             invocation,
@@ -536,7 +609,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
 }
 
 fn reusable_attention_topology(
-    request: &ReusableExecutionTopologyRequest<'_>,
+    request: &impl ReusableExecutionTopologyView,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     precision: AttentionPrecision,
 ) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
@@ -544,12 +617,12 @@ fn reusable_attention_topology(
         return Err("CUDA recurrent topology received another operation".to_owned());
     }
     let shape = AttentionShape::from_attributes(request.attributes())?;
-    let ranges = request.work_shape().participant_token_ranges();
+    let participants = request.participant_count();
     reusable_attention_topology_for_tokens(
         shape,
         execution_capabilities,
-        ranges.len(),
-        ranges.iter().map(|range| range.immediate_tokens()),
+        participants,
+        (0..participants).map(|index| request.token_row(index).map_or(0, |row| row.count.get())),
     )
 }
 
@@ -1275,9 +1348,7 @@ impl SharedProjectionWeight {
     fn dispatch_count(&self, rows: u64) -> Result<u64, String> {
         match *self {
             Self::F16 { .. } => Ok(1),
-            Self::Native { ref parts, .. } => {
-                native_projection::dispatch_count(weights::dispatches(parts) as usize, rows)
-            }
+            Self::Native { ref parts, .. } => native_projection::strict_dispatch_count(parts, rows),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => Ok(1),
             #[cfg(feature = "vllm-marlin")]
@@ -1402,6 +1473,10 @@ fn attention_dispatches_per_launch(
     };
     let qkvzba = count(qkvzba)?;
     let output = count(output)?;
+    combine_attention_dispatches(qkvzba, output)
+}
+
+fn combine_attention_dispatches(qkvzba: u64, output: u64) -> Result<u64, String> {
     8_u64
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
@@ -1414,6 +1489,10 @@ fn attention_transfers_per_launch(
 ) -> Result<u64, String> {
     let qkvzba = qkvzba.marlin_workspace_zero_count()?;
     let output = output.marlin_workspace_zero_count()?;
+    combine_attention_transfers(qkvzba, output)
+}
+
+fn combine_attention_transfers(qkvzba: u64, output: u64) -> Result<u64, String> {
     2_u64
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
@@ -1425,252 +1504,44 @@ fn encode_attention(
     functions: &AttentionFunctions,
     precision: AttentionPrecision,
     execution_capabilities: GatedDeltaExecutionCapabilities,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
+    cublas_identity: Option<super::cublas_api::CublasHandleApiIdentity>,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
-    if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != precision.operation()
-    {
-        return Err("CUDA recurrent attention received another or empty operation".to_owned());
-    }
-    let first = &invocation.participants()[0];
-    let shape = AttentionShape::from_attributes(first.attributes())?;
-    let projection = AttentionProjection::from_values(
-        first.bindings(),
+    let prepared = prepared::prepare(
+        &invocation,
         precision,
+        execution_capabilities,
         #[cfg(feature = "vllm-marlin")]
         projection_runtime,
     )?;
-    validate_signature(first, shape, precision)?;
-    for participant in &invocation.participants()[1..] {
-        if AttentionShape::from_attributes(participant.attributes())? != shape {
-            return Err("CUDA recurrent attention participant attributes disagree".to_owned());
-        }
-        validate_signature(participant, shape, precision)?;
-    }
+    let selected = selected::from_prepared(
+        &prepared,
+        precision,
+        functions.native.q8_pair_enabled(),
+        structured_capture,
+        cublas_identity,
+    );
+    let prepared::PreparedAttention {
+        shape,
+        projection,
+        total_tokens,
+        layout,
+        binding_layout,
+        cuda_shape,
+        use_packed,
+        compute_regions,
+        shared,
+        binding_regions,
+        binding_host_storage,
+        state_bindings,
+        compute_fence_dependencies,
+        host_storage,
+        launches,
+        participant_token_counts,
+    } = prepared;
     let program_binding = invocation.program_binding().cloned();
-
-    let total_tokens = invocation.work_shape().immediate_tokens();
-    let participant_count_usize = invocation.participants().len();
-    let participant_count_u64 = u64::try_from(participant_count_usize)
-        .map_err(|_| "CUDA recurrent attention participant count exceeds u64".to_owned())?;
-    shape.validate_launch_extents(total_tokens)?;
-    let layout = ScratchLayout::new(shape, total_tokens, participant_count_usize, projection)?;
-    let binding_layout = StateBindingLayout::new(participant_count_usize)?;
-    let cuda_shape = shape.cuda_shape()?;
-    let token_ranges = invocation.participant_token_ranges();
-    if token_ranges.len() != invocation.participants().len() {
-        return Err("CUDA recurrent attention participant ranges are incomplete".to_owned());
-    }
-    let input_packed = super::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
-    let output_packed = super::token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
-    let use_packed = participant_count_usize > 1 && input_packed && output_packed;
-
-    let mut compute_regions = Vec::new();
-    let shared = SharedRegions {
-        input_norm: push_shared_weight(&mut compute_regions, &invocation, 1, ElementType::F16)?,
-        qkvzba: push_shared_projection_weight(
-            &mut compute_regions,
-            &invocation,
-            2,
-            &[shape.qkvzba_features, shape.hidden_size],
-        )?,
-        conv: push_shared_weight(&mut compute_regions, &invocation, 3, ElementType::F16)?,
-        a_log: push_shared_weight(&mut compute_regions, &invocation, 4, ElementType::F32)?,
-        dt_bias: push_shared_weight(&mut compute_regions, &invocation, 5, ElementType::F32)?,
-        norm: push_shared_weight(&mut compute_regions, &invocation, 6, ElementType::F32)?,
-        output: push_shared_projection_weight(
-            &mut compute_regions,
-            &invocation,
-            7,
-            &[shape.hidden_size, shape.value_features],
-        )?,
-        scratch: {
-            let index = compute_regions.len();
-            compute_regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
-            index
-        },
-        binding: {
-            let index = compute_regions.len();
-            compute_regions.push(super::shared_binding_region(
-                &invocation,
-                binding_layout.required_bytes,
-            )?);
-            index
-        },
-    };
-    let packed_regions = if use_packed {
-        let input_region = compute_regions.len();
-        compute_regions.push(super::shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            precision.hidden(),
-            total_tokens,
-        )?);
-        let output_region = compute_regions.len();
-        compute_regions.push(super::shared_token_region(
-            &invocation,
-            ResolvedValueRole::Output,
-            0,
-            precision.hidden(),
-            total_tokens,
-        )?);
-        Some((input_region, output_region))
-    } else {
-        None
-    };
-    let mut binding_regions = vec![compute_regions[shared.binding].clone()];
-    let mut binding_host_storage = Vec::with_capacity(invocation.participants().len());
-    let mut state_bindings = Vec::with_capacity(invocation.participants().len());
-    let mut compute_fence_dependencies =
-        Vec::with_capacity(invocation.participants().len().saturating_mul(2));
-    let mut host_storage = Vec::with_capacity(if use_packed {
-        2
-    } else {
-        participant_count_usize
-    });
-    let mut launches = Vec::with_capacity(if use_packed {
-        1
-    } else {
-        participant_count_usize
-    });
-    let mut participant_token_counts = Vec::with_capacity(participant_count_usize);
-    let mut packed_token_cursor = 0_u64;
-    let mut packed_execution_form = None;
-    for (participant_index, (participant, token_range)) in invocation
-        .participants()
-        .iter()
-        .zip(token_ranges)
-        .enumerate()
-    {
-        let tokens = token_range.immediate_tokens();
-        shape.validate_launch_extents(tokens)?;
-        if use_packed {
-            let packed = token_range.immediate_token_range();
-            let expected_end = packed_token_cursor
-                .checked_add(tokens)
-                .ok_or_else(|| "CUDA packed recurrent token range overflows".to_owned())?;
-            if packed.start != packed_token_cursor || packed.end != expected_end {
-                return Err(
-                    "CUDA packed recurrent attention token ranges are not canonical".to_owned(),
-                );
-            }
-            packed_token_cursor = expected_end;
-        }
-        participant_token_counts.push(tokens);
-        let conv_state = contiguous_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 8)?,
-            ElementType::F16,
-        )?;
-        let delta_state = contiguous_region(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, 9)?,
-            ElementType::F32,
-        )?;
-        let first_state_region = binding_regions.len();
-        binding_regions.push(conv_state.clone());
-        binding_regions.push(delta_state.clone());
-        compute_fence_dependencies.push(conv_state.clone());
-        compute_fence_dependencies.push(delta_state.clone());
-        let binding_offset = binding_layout.offset(participant_index)?;
-        let host_binding = binding_host_storage.len();
-        binding_host_storage.push(state_binding_payload(&conv_state, &delta_state));
-        state_bindings.push(AttentionStateBinding {
-            first_state_region,
-            host_binding,
-            binding_offset,
-            conv_state_bytes: conv_state.length_bytes(),
-            delta_state_bytes: delta_state.length_bytes(),
-        });
-        let tokens_i32 = checked_i32(tokens, "attention participant token count")?;
-        let execution_form = execution_capabilities
-            .select(tokens, GatedDeltaExecutionPreference::RecurrentScan)
-            .map_err(|error| error.to_string())?;
-        if let GatedDeltaExecutionForm::ChunkedScan(plan) = execution_form {
-            return Err(format!(
-                "CUDA gated-delta provider selected an uninstalled {} form for {} tokens",
-                execution_form.as_str(),
-                plan.token_count()
-            ));
-        }
-        if use_packed {
-            if packed_execution_form
-                .replace(execution_form)
-                .is_some_and(|previous| previous != execution_form)
-            {
-                return Err(
-                    "CUDA packed recurrent attention participants selected different execution forms"
-                        .to_owned(),
-                );
-            }
-        } else {
-            let source = token_range.source_token_range();
-            let packed = token_range.immediate_token_range();
-            let input_region = compute_regions.len();
-            compute_regions.push(contiguous_token_region(
-                participant,
-                binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-                precision.hidden(),
-                if input_packed {
-                    packed.start
-                } else {
-                    source.start
-                },
-                tokens,
-            )?);
-            let output_region = compute_regions.len();
-            compute_regions.push(contiguous_token_region(
-                participant,
-                binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-                precision.hidden(),
-                if output_packed {
-                    packed.start
-                } else {
-                    source.start
-                },
-                tokens,
-            )?);
-            let host_control = host_storage.len();
-            host_storage.push(sequence_control(&[tokens])?);
-            launches.push(AttentionLaunch {
-                input_region,
-                output_region,
-                state_binding_offset: binding_offset,
-                host_control,
-                host_token_seq_indices: None,
-                execution_form,
-                batch_i32: 1,
-                tokens,
-                tokens_i32,
-            });
-        }
-    }
-    if let Some((input_region, output_region)) = packed_regions {
-        if packed_token_cursor != total_tokens {
-            return Err(
-                "CUDA packed recurrent attention token ranges do not cover the wave".to_owned(),
-            );
-        }
-        let host_control = host_storage.len();
-        host_storage.push(sequence_control(&participant_token_counts)?);
-        let host_token_seq_indices = host_storage.len();
-        host_storage.push(token_sequence_indices(&participant_token_counts)?);
-        launches.push(AttentionLaunch {
-            input_region,
-            output_region,
-            state_binding_offset: 0,
-            host_control,
-            host_token_seq_indices: Some(host_token_seq_indices),
-            execution_form: packed_execution_form.ok_or_else(|| {
-                "CUDA packed recurrent attention has no execution form".to_owned()
-            })?,
-            batch_i32: checked_i32(participant_count_u64, "attention packed participant count")?,
-            tokens: total_tokens,
-            tokens_i32: checked_i32(total_tokens, "attention packed token count")?,
-        });
-    }
 
     let functions = functions.clone();
     let transfers_per_launch = attention_transfers_per_launch(&shared.qkvzba, &shared.output)?;
@@ -1678,6 +1549,7 @@ fn encode_attention(
         provider_fingerprint,
         "vnext_gated_delta_recurrent_attention",
     )
+    .bytes(crate::backend::cuda::vnext_ops::native_blocks::q8_pair::SELECTOR_VERSION.as_bytes())
     .bytes(projection.replay_tag().as_bytes())
     .bytes(precision.operation().as_bytes())
     .u64(shape.hidden_size)
@@ -1806,6 +1678,13 @@ fn encode_attention(
                 u64::from(participant_count),
             )
         })
+        .map(|command| {
+            command.with_statistical_evidence(selected::bindings(
+                participant_count as usize,
+                total_tokens,
+                structured_capture,
+            ))
+        })
         .map_err(|error| error.to_string())?;
 
     let compute_command =
@@ -1846,6 +1725,16 @@ fn encode_attention(
                 logical_compute_dispatches,
                 physical_transfer_commands,
             )
+        })
+        .map(|command| {
+            let command = command.with_statistical_evidence(selected);
+            if matches!(precision, AttentionPrecision::F32MasterGgufF16Projections) {
+                // Missing selected work is Required(None), never NotRequired.
+                // The runtime checks the executing/captured handle for CostWitness.
+                command.with_cublas_cost_requirement(cublas_identity)
+            } else {
+                command
+            }
         })
         .map_err(|error| error.to_string())?;
 
@@ -2710,29 +2599,6 @@ fn launch_prepare(request: AttentionPrepareRequest<'_>) -> Result<(), CudaDevice
         physical,
         logical,
     } = context;
-    if batch <= 0 {
-        return Err(CudaDeviceRuntimeError::contract(
-            "attention prepare batch is not positive",
-        ));
-    }
-    let batch_u64 = u64::try_from(batch)
-        .map_err(|_| CudaDeviceRuntimeError::contract("attention batch exceeds u64"))?;
-    let total = tokens
-        .checked_mul(logical.qkv_features)
-        .and_then(|conv| {
-            tokens
-                .checked_mul(logical.value_heads)
-                .map(|gate| conv.max(gate))
-        })
-        .and_then(|work| {
-            logical
-                .conv_state_elements()
-                .ok()
-                .and_then(|state| state.checked_mul(batch_u64))
-                .map(|state| work.max(state))
-        })
-        .ok_or_else(|| CudaDeviceRuntimeError::contract("attention prepare work overflows"))?;
-    let grid = checked_grid(total, THREADS_PER_BLOCK, "attention prepare")?;
     let mut builder = stream.launch_builder(function);
     let kernel_arguments = buffers.kernel_arguments();
     for pointer in &kernel_arguments {
@@ -2750,15 +2616,9 @@ fn launch_prepare(request: AttentionPrepareRequest<'_>) -> Result<(), CudaDevice
     for dimension in &dimensions {
         builder.arg(dimension);
     }
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention prepare launch", error))
+    unsafe { builder.launch(launch_geometry::prepare(logical, tokens, batch)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention prepare launch", error))
 }
 
 fn launch_conv_state_commit(
@@ -2769,41 +2629,16 @@ fn launch_conv_state_commit(
     batch: i32,
     elements_per_sequence: i32,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    if batch <= 0 || elements_per_sequence <= 0 {
-        return Err(CudaDeviceRuntimeError::contract(
-            "attention convolution state commit is empty",
-        ));
-    }
-    let elements = i64::from(batch)
-        .checked_mul(i64::from(elements_per_sequence))
-        .and_then(|elements| u64::try_from(elements).ok())
-        .ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("attention convolution state commit size overflows")
-        })?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&source);
     builder.arg(&state_binding);
     builder.arg(&batch);
     builder.arg(&elements_per_sequence);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (
-                checked_grid(
-                    elements,
-                    THREADS_PER_BLOCK,
-                    "attention convolution state commit",
-                )?,
-                1,
-                1,
-            ),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
+    unsafe { builder.launch(launch_geometry::conv(batch, elements_per_sequence)?) }
+        .map(|_| ())
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver("attention convolution state commit launch", error)
         })
-    }
-    .map(|_| ())
-    .map_err(|error| {
-        CudaDeviceRuntimeError::driver("attention convolution state commit launch", error)
-    })
 }
 
 fn launch_rms_norm(
@@ -2816,22 +2651,15 @@ fn launch_rms_norm(
     hidden_size: i32,
     epsilon: f32,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let rows = checked_u32(tokens, "attention RMSNorm rows")?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&input);
     builder.arg(&weight);
     builder.arg(&output);
     builder.arg(&hidden_size);
     builder.arg(&epsilon);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (rows, 1, 1),
-            block_dim: (super::rms_norm_threads(hidden_size), 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention RMSNorm launch", error))
+    unsafe { builder.launch(launch_geometry::rms(tokens, hidden_size)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention RMSNorm launch", error))
 }
 
 fn launch_qk_norm(
@@ -2844,9 +2672,6 @@ fn launch_qk_norm(
     shape: CudaAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let epsilon = 1.0e-6_f32;
-    let rows = tokens
-        .checked_mul(shape.key_heads as u64)
-        .ok_or_else(|| CudaDeviceRuntimeError::contract("attention QK rows overflow"))?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&query);
     builder.arg(&key);
@@ -2854,19 +2679,9 @@ fn launch_qk_norm(
     builder.arg(&shape.key_heads);
     builder.arg(&shape.key_head_dim);
     builder.arg(&epsilon);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (checked_u32(rows, "attention QK rows")?, 1, 1),
-            block_dim: (
-                (shape.key_head_dim as u32).next_power_of_two().min(256),
-                1,
-                1,
-            ),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention QK norm launch", error))
+    unsafe { builder.launch(launch_geometry::qk(tokens, shape)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention QK norm launch", error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2890,13 +2705,12 @@ fn launch_delta(
             "attention delta batch is not positive",
         ));
     }
-    let function = match (shape.tiled_delta, shape.value_head_mapping) {
-        (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
-        (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
-        (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => &functions.delta_interleaved,
-        (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
-            &functions.delta_tiled_interleaved
-        }
+    let function = match launch_geometry::delta_entry(shape) {
+        DELTA_FUNCTION => &functions.delta,
+        DELTA_TILED_FUNCTION => &functions.delta_tiled,
+        DELTA_INTERLEAVED_FUNCTION => &functions.delta_interleaved,
+        DELTA_TILED_INTERLEAVED_FUNCTION => &functions.delta_tiled_interleaved,
+        _ => unreachable!("shared delta selector returns installed entry"),
     };
     let pointers = [
         query,
@@ -2924,35 +2738,13 @@ fn launch_delta(
     for dimension in &dimensions {
         builder.arg(dimension);
     }
-    let grid_dim = if shape.tiled_delta {
-        builder.arg(&shape.scale);
-        (
-            (shape.value_head_dim as u32).div_ceil(16),
-            shape.value_heads as u32,
-            batch as u32,
-        )
-    } else {
+    if !shape.tiled_delta {
         builder.arg(&use_qk_l2norm);
-        builder.arg(&shape.scale);
-        (shape.value_heads as u32, batch as u32, 1)
-    };
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim,
-            block_dim: (
-                if shape.tiled_delta {
-                    256
-                } else {
-                    shape.value_head_dim.min(256) as u32
-                },
-                1,
-                1,
-            ),
-            shared_mem_bytes: 0,
-        })
     }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention delta launch", error))
+    builder.arg(&shape.scale);
+    unsafe { builder.launch(launch_geometry::delta(batch, shape)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention delta launch", error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2979,19 +2771,9 @@ fn launch_gated_norm(
     builder.arg(&rows_i32);
     builder.arg(&shape.value_head_dim);
     builder.arg(&shape.epsilon);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (checked_u32(rows, "attention gated rows")?, 1, 1),
-            block_dim: (
-                (shape.value_head_dim as u32).next_power_of_two().min(256),
-                1,
-                1,
-            ),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention gated norm launch", error))
+    unsafe { builder.launch(launch_geometry::gated(tokens, shape)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention gated norm launch", error))
 }
 
 fn launch_cast(
@@ -3007,19 +2789,9 @@ fn launch_cast(
     builder.arg(&input);
     builder.arg(&output);
     builder.arg(&elements_i32);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (
-                checked_grid(elements, THREADS_PER_BLOCK, "attention cast")?,
-                1,
-                1,
-            ),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention cast launch", error))
+    unsafe { builder.launch(launch_geometry::cast(elements)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention cast launch", error))
 }
 
 fn launch_residual(
@@ -3037,19 +2809,9 @@ fn launch_residual(
     builder.arg(&branch);
     builder.arg(&output);
     builder.arg(&elements_i32);
-    unsafe {
-        builder.launch(LaunchConfig {
-            grid_dim: (
-                checked_grid(elements, THREADS_PER_BLOCK, "attention residual")?,
-                1,
-                1,
-            ),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        })
-    }
-    .map(|_| ())
-    .map_err(|error| CudaDeviceRuntimeError::driver("attention residual launch", error))
+    unsafe { builder.launch(launch_geometry::residual(elements)?) }
+        .map(|_| ())
+        .map_err(|error| CudaDeviceRuntimeError::driver("attention residual launch", error))
 }
 
 fn validate_signature(
@@ -3057,9 +2819,17 @@ fn validate_signature(
     shape: AttentionShape,
     precision: AttentionPrecision,
 ) -> Result<(), String> {
-    let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
+    validate_signature_values(participant.bindings(), shape, precision)
+}
+
+fn validate_signature_values(
+    values: &[ResolvedValueBinding],
+    shape: AttentionShape,
+    precision: AttentionPrecision,
+) -> Result<(), String> {
+    let value = |ordinal| binding(values, ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
-    let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+    let output = binding(values, ResolvedValueRole::Output, 0)?;
     let [tokens, hidden_width] = hidden.tensor().dimensions() else {
         return Err("recurrent attention hidden input is not two-dimensional".to_owned());
     };
@@ -4156,5 +3926,38 @@ mod tests {
         .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
         .finish();
         assert_ne!(canonical, group128);
+    }
+}
+
+impl CudaGatedDeltaRecurrentAttentionProvider {
+    fn shared_reusable_topology(
+        &self,
+        request: &impl ReusableExecutionTopologyView,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        let mut values = (0..8)
+            .map(|ordinal| {
+                ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
+            })
+            .collect::<Vec<_>>();
+        values.extend([
+            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
+            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
+            ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
+        ]);
+        if request
+            .reusable_address_scope(
+                &values,
+                &[
+                    ReusableExecutionWorkspaceAddress::Scratch,
+                    ReusableExecutionWorkspaceAddress::Binding,
+                ],
+            )?
+            .is_none()
+        {
+            return Ok(ReusableExecutionTopology::EagerBoundary);
+        }
+        reusable_attention_topology(request, self.execution_capabilities, self.precision)
+            .map(ReusableExecutionTopology::Dynamic)
+            .map_err(invalid_plan)
     }
 }

@@ -2,6 +2,9 @@
 
 use super::native_blocks::{weights, CudaNativeBlockKernels};
 use super::*;
+mod cost_route;
+pub(super) mod embedding;
+pub(super) use cost_route::projection as projection_cost_route;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TokenPrecision {
@@ -58,6 +61,13 @@ pub(super) fn descriptor(
             .map_err(contract_error)?,
         implementation_fingerprint(&[
             include_str!("native_io.rs").as_bytes(),
+            include_bytes!("native_io/cost_route.rs"),
+            include_bytes!("embedding.rs"),
+            include_bytes!("native_io/embedding.rs"),
+            include_bytes!("native_blocks/embedding.rs"),
+            include_bytes!("native_blocks/linear_launch.rs"),
+            include_bytes!("native_blocks/selected.rs"),
+            include_str!("cost_route.rs").as_bytes(),
             include_str!("../vnext_ops.rs").as_bytes(),
             include_str!("native_blocks.rs").as_bytes(),
             include_str!("native_blocks/hadamard.rs").as_bytes(),
@@ -137,92 +147,22 @@ pub(super) fn encode_embedding(
     fingerprint: &str,
     kernels: &CudaNativeBlockKernels,
     precision: TokenPrecision,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    transformer::ensure_invocation(&invocation, precision.embedding_operation())?;
-    let first = &invocation.participants()[0];
-    let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;
-    let vocabulary = unsigned_attribute(first.attributes(), "vocab_size")?;
-    let weight = retain_shared_weight(&invocation, &[vocabulary, hidden])?;
-    // Vocabulary partitions require ID routing before lookup; this kernel
-    // consumes one complete table and must not silently address the first part.
-    let [part] = weight.parts.as_slice() else {
-        return Err("CUDA native embedding requires one complete vocabulary table".into());
-    };
-    let chunk_limit = embedding_chunk_limit(part)?;
-    let input_packed =
-        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
-    let output_packed =
-        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
-    let mut key = matrix_key(fingerprint, "vnext_native_embedding", &weight);
-    let mut regions = weight.regions;
-    let scratch = super::native_blocks::hadamard::retain_workspace(&invocation, &mut regions)?;
-    let mut launches = Vec::new();
-    for (participant, range) in invocation
-        .participants()
-        .iter()
-        .zip(invocation.participant_token_ranges())
-    {
-        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-        let table = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
-        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
-        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden
-            || unsigned_attribute(participant.attributes(), "vocab_size")? != vocabulary
-        {
-            return Err("CUDA native embedding participant dimensions disagree".into());
-        }
-        validate_signature(
-            input,
-            table,
-            output,
-            vocabulary,
-            hidden,
-            precision.element(),
-        )?;
-        let count = range.immediate_tokens();
-        if count == 0 {
-            return Err("CUDA native embedding cannot launch an empty token span".into());
-        }
-        let source = range.source_token_range();
-        let packed = range.immediate_token_range();
-        let input_index = regions.len();
-        regions.push(contiguous_token_region(
-            participant,
-            input,
-            ElementType::U32,
-            if input_packed {
-                packed.start
-            } else {
-                source.start
-            },
-            count,
-        )?);
-        let output_index = regions.len();
-        regions.push(contiguous_token_region(
-            participant,
-            output,
-            precision.element(),
-            if output_packed {
-                packed.start
-            } else {
-                source.start
-            },
-            count,
-        )?);
-        launches.push((input_index, output_index, count));
-        key = key
-            .u64(input_index as u64)
-            .u64(output_index as u64)
-            .u64(count);
-    }
-    let participants =
-        u32::try_from(launches.len()).map_err(|_| "too many embedding participants")?;
-    let tokens = invocation.work_shape().immediate_tokens();
-    let dispatches = launches.iter().try_fold(0_u64, |sum, &(_, _, count)| {
-        sum.checked_add(count.div_ceil(chunk_limit) * (1 + u64::from(part.transform.is_some())))
-            .ok_or("embedding dispatch count overflows")
-    })?;
-    let part = part.clone();
+    let prepared = embedding::prepare(fingerprint, precision, &invocation)?;
+    let selected = prepared.selected(precision, structured_capture);
+    let embedding::Prepared {
+        part,
+        regions,
+        scratch,
+        launches,
+        key,
+        chunk_limit,
+        participants,
+        tokens,
+        dispatches,
+    } = prepared;
     let kernels = kernels.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_native_embedding",
@@ -276,12 +216,30 @@ pub(super) fn encode_embedding(
             0,
         )
     })
+    .map(|command| command.with_statistical_evidence(selected))
     .map_err(|error| error.to_string())
 }
 
 fn embedding_chunk_limit(part: &weights::MatrixPart) -> Result<u64, String> {
     super::native_blocks::embedding_elements(part, 1).map_err(|error| error.to_string())?;
     Ok(u64::from(u32::MAX / part.columns).min(MAXIMUM_TOKENS_PER_LAUNCH))
+}
+
+pub(super) fn embedding_dispatches(
+    part: &weights::MatrixPart,
+    counts: impl IntoIterator<Item = u64>,
+) -> Result<u64, String> {
+    let limit = embedding_chunk_limit(part)?;
+    counts.into_iter().try_fold(0_u64, |sum, count| {
+        if count == 0 {
+            return Err("CUDA embedding cost span is empty".into());
+        }
+        count
+            .div_ceil(limit)
+            .checked_mul(1 + u64::from(part.transform.is_some()))
+            .and_then(|dispatches| sum.checked_add(dispatches))
+            .ok_or_else(|| "CUDA embedding dispatch count overflows".into())
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -306,11 +264,8 @@ fn packed_projection_rows(
     weight_ranges: &[std::ops::Range<u64>],
 ) -> Option<u32> {
     let count = token_ranges.len();
-    if !input_packed
-        || count < 2
+    if !packed_projection_semantics(input_packed, parts, count, true)
         || rows.len() != count
-        || parts.is_empty()
-        || parts.iter().any(|part| part.transform.is_some())
         || weight_ranges.is_empty()
         || weight_ranges.iter().any(|range| range.is_empty())
     {
@@ -354,23 +309,52 @@ fn packed_projection_rows(
     Some(count)
 }
 
-pub(super) fn encode_projection(
+fn packed_projection_semantics(
+    input_packed: bool,
+    parts: &[weights::MatrixPart],
+    count: usize,
+    canonical_unit_rows: bool,
+) -> bool {
+    input_packed
+        && (2..=u16::MAX as usize).contains(&count)
+        && !parts.is_empty()
+        && parts.iter().all(|part| part.transform.is_none())
+        && canonical_unit_rows
+}
+
+struct PreparedNativeProjection {
+    regions: Vec<CudaBufferRegion>,
+    parts: Vec<weights::MatrixPart>,
+    launches: Vec<(usize, usize, u32)>,
+    scratch: Option<usize>,
+    participants: u32,
+    packed_rows: Option<u32>,
+    stride: u32,
+    dispatches: u64,
+    key: crate::backend::cuda::vnext_replay::CudaCommandReplayKey,
+    selected: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+}
+
+// This prepares retained row metadata only. It neither encodes nor submits
+// kernels. Eager and direct graph replay therefore prove the same actual
+// packed/participant layout before attaching selected work.
+fn prepare_projection(
     fingerprint: &str,
-    kernels: &CudaNativeBlockKernels,
     precision: TokenPrecision,
-    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
-    transformer::ensure_invocation(&invocation, precision.projection_operation())?;
+    capture: ferrum_types::SloStructuredCostCapture,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<PreparedNativeProjection, String> {
+    transformer::ensure_invocation(invocation, precision.projection_operation())?;
     let first = &invocation.participants()[0];
     let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;
     let outputs = unsigned_attribute(first.attributes(), "out_features")?;
-    let weight = retain_shared_weight(&invocation, &[outputs, hidden])?;
+    let weight = retain_shared_weight(invocation, &[outputs, hidden])?;
     let input_packed =
-        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+        transformer::token_binding_is_packed(invocation, ResolvedValueRole::Input, 0)?;
     let mut key = matrix_key(fingerprint, "vnext_native_last_token_linear", &weight);
     let mut regions = weight.regions;
     let weight_region_count = regions.len();
-    let scratch = super::native_blocks::hadamard::retain_workspace(&invocation, &mut regions)?;
+    let scratch = super::native_blocks::hadamard::retain_workspace(invocation, &mut regions)?;
     let mut launches = Vec::new();
     for (participant, range) in invocation
         .participants()
@@ -456,14 +440,74 @@ pub(super) fn encode_projection(
     let dispatches = (launches.len() as u64)
         .checked_mul(weights::dispatches(&weight.parts))
         .ok_or("native projection dispatch count overflows")?;
+    let selected = super::native_blocks::selected::linear(
+        &weight.parts,
+        launches.iter().map(|&(_, _, rows)| rows),
+        u64::from(participants),
+        stride,
+        precision.element(),
+        scratch.map_or(0, |index| regions[index].length_bytes()),
+        capture,
+    );
+    Ok(PreparedNativeProjection {
+        regions,
+        parts: weight.parts,
+        launches,
+        scratch,
+        participants,
+        packed_rows,
+        stride,
+        dispatches,
+        key: key.finish(),
+        selected,
+    })
+}
+
+pub(super) fn projection_replay_evidence(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    precision: TokenPrecision,
+    capture: ferrum_types::SloStructuredCostCapture,
+) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError> {
+    if capture == ferrum_types::SloStructuredCostCapture::Disabled {
+        return Ok(None);
+    }
+    // Dense F16 dispatches through the separate cuBLAS/gather encoder; this
+    // native helper cannot declare that unimplemented provider branch complete.
+    if precision != TokenPrecision::F32 && !requires_native(invocation) {
+        return Ok(None);
+    }
+    prepare_projection("passive-replay-query", precision, capture, invocation)
+        .map(|prepared| prepared.selected)
+        .map_err(|reason| VNextError::InvalidExecutionPlan { reason })
+}
+
+pub(super) fn encode_projection(
+    fingerprint: &str,
+    kernels: &CudaNativeBlockKernels,
+    precision: TokenPrecision,
+    capture: ferrum_types::SloStructuredCostCapture,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    let PreparedNativeProjection {
+        regions,
+        parts,
+        launches,
+        scratch,
+        participants,
+        packed_rows,
+        stride,
+        dispatches,
+        key,
+        selected,
+    } = prepare_projection(fingerprint, precision, capture, &invocation)?;
     let kernels = kernels.clone();
     CudaDeviceCommand::replayable_operation(
         "vnext_native_last_token_linear",
         regions,
-        key.finish(),
+        key,
         move |stream, regions| {
             for &(input, output, rows) in &launches {
-                for (index, part) in weight.parts.iter().enumerate() {
+                for (index, part) in parts.iter().enumerate() {
                     kernels.transformed_linear(
                         stream,
                         regions[input].device_ptr(),
@@ -495,6 +539,7 @@ pub(super) fn encode_projection(
             0,
         )
     })
+    .map(|command| command.with_statistical_evidence(selected))
     .map_err(|error| error.to_string())
 }
 

@@ -223,6 +223,45 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
     head_dim: i32,
     max_num_blocks_per_seq: i32,
 ) -> Result<VnextAddressedPagedAttentionKernel> {
+    dispatch_vnext_addressed_paged_attention_batch_raw(
+        stream,
+        out,
+        query,
+        block_addresses,
+        sequence_length_device,
+        sequence_length,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        1,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_num_blocks_per_seq,
+    )
+}
+
+/// The caller owns dense query/output rows and partition scratch for every
+/// sequence, a dense device i32 length vector, and an addressed table with the
+/// declared u64 row stride. All pointers must survive completion/replay. Each
+/// actual length must be nonzero and no larger than `sequence_length`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_batch_raw(
+    stream: &CudaStream,
+    out: u64,
+    query: u64,
+    block_addresses: u64,
+    sequence_length_device: u64,
+    sequence_length: u64,
+    exp_sums: Option<u64>,
+    max_logits: Option<u64>,
+    temporary_output: Option<u64>,
+    num_seqs: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    max_num_blocks_per_seq: i32,
+) -> Result<VnextAddressedPagedAttentionKernel> {
     if out == 0
         || query == 0
         || block_addresses == 0
@@ -234,6 +273,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
         ));
     }
     if !matches!(head_dim, 128 | 256)
+        || num_seqs <= 0
         || num_heads <= 0
         || num_kv_heads <= 0
         || num_heads % num_kv_heads != 0
@@ -246,6 +286,9 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
     let sequence_length_i32 = i32::try_from(sequence_length).map_err(|_| {
         FerrumError::model("vNext addressed paged attention sequence length exceeds i32")
     })?;
+    sequence_length_i32
+        .checked_add(511)
+        .ok_or_else(|| FerrumError::model("vNext addressed native partition rounding overflows"))?;
     let required_blocks = sequence_length.div_ceil(VNEXT_VLLM_BLOCK_TOKENS);
     if u64::try_from(max_num_blocks_per_seq).unwrap_or(0) < required_blocks {
         return Err(FerrumError::model(format!(
@@ -255,6 +298,20 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
     let q_stride = num_heads
         .checked_mul(head_dim)
         .ok_or_else(|| FerrumError::model("vNext addressed query stride overflows"))?;
+    // Native kernels use i32 products for sequence/head/partition indexing.
+    let partition_rows = num_seqs
+        .checked_mul(num_heads)
+        .and_then(|rows| rows.checked_mul(sequence_length.div_ceil(512) as i32))
+        .ok_or_else(|| FerrumError::model("vNext addressed partition rows overflow"))?;
+    partition_rows
+        .checked_mul(head_dim)
+        .ok_or_else(|| FerrumError::model("vNext addressed temporary-output indexing overflows"))?;
+    num_seqs
+        .checked_mul(q_stride)
+        .ok_or_else(|| FerrumError::model("vNext addressed batch query indexing overflows"))?;
+    num_seqs
+        .checked_mul(max_num_blocks_per_seq)
+        .ok_or_else(|| FerrumError::model("vNext addressed batch table indexing overflows"))?;
     let kv_head_stride = head_dim
         .checked_mul(VNEXT_VLLM_BLOCK_TOKENS as i32)
         .ok_or_else(|| FerrumError::model("vNext addressed KV head stride overflows"))?;
@@ -274,7 +331,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
                     scale,
                     block_addresses as *const std::ffi::c_void,
                     sequence_length_device as *const std::ffi::c_void,
-                    1,
+                    num_seqs,
                     num_heads,
                     max_num_blocks_per_seq,
                     q_stride,
@@ -291,7 +348,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
                     scale,
                     block_addresses as *const std::ffi::c_void,
                     sequence_length_device as *const std::ffi::c_void,
-                    1,
+                    num_seqs,
                     num_heads,
                     max_num_blocks_per_seq,
                     q_stride,
@@ -326,7 +383,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
                     scale,
                     block_addresses as *const std::ffi::c_void,
                     sequence_length_device as *const std::ffi::c_void,
-                    1,
+                    num_seqs,
                     num_heads,
                     max_num_blocks_per_seq,
                     q_stride,
@@ -346,7 +403,7 @@ pub(crate) unsafe fn dispatch_vnext_addressed_paged_attention_raw(
                     scale,
                     block_addresses as *const std::ffi::c_void,
                     sequence_length_device as *const std::ffi::c_void,
-                    1,
+                    num_seqs,
                     num_heads,
                     max_num_blocks_per_seq,
                     q_stride,

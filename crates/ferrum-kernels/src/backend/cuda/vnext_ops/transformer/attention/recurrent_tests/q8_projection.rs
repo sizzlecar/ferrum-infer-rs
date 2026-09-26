@@ -11,6 +11,9 @@ use crate::gguf_blocks::{
 };
 use ferrum_interfaces::vnext::WeightId;
 
+#[path = "q8_projection/q5k_fixed_abi.rs"]
+mod q5k_fixed_abi;
+
 const HIDDEN: usize = 256;
 const BATCHES: [[usize; 3]; 4] = [[0, 1, 6], [0, 1, 7], [0, 1, 32], [0, 1, 63]];
 
@@ -286,12 +289,24 @@ fn frames(
     shape: AttentionShape,
     quantized: bool,
 ) -> Vec<Frame> {
+    frames_with_batches(stream, functions, q8, matrices, shape, quantized, &BATCHES)
+}
+
+fn frames_with_batches(
+    stream: &Arc<CudaStream>,
+    functions: &AttentionFunctions,
+    q8: &Q8F32ScaleKernels,
+    matrices: &[Matrix],
+    shape: AttentionShape,
+    quantized: bool,
+    batches: &[[usize; 3]],
+) -> Vec<Frame> {
     let weights = (0..HIDDEN)
         .map(|i| f16::from_f32(1.0 + sample(i, 5, 0.015625)))
         .collect::<Vec<_>>();
     let norm = Guarded::new(stream, &weights, f16::from_f32(27.0));
     let mut positions = [0; 3];
-    BATCHES
+    batches
         .iter()
         .map(|counts| {
             let rows: usize = counts.iter().sum();
@@ -399,6 +414,26 @@ fn compose(
     output_matrix: &[Matrix],
     quantized: bool,
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>) {
+    compose_with_batches(
+        stream,
+        functions,
+        q8,
+        inputs,
+        output_matrix,
+        quantized,
+        &BATCHES,
+    )
+}
+
+fn compose_with_batches(
+    stream: &Arc<CudaStream>,
+    functions: &AttentionFunctions,
+    q8: &Q8F32ScaleKernels,
+    inputs: &[Frame],
+    output_matrix: &[Matrix],
+    quantized: bool,
+    batches: &[[usize; 3]],
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>) {
     let shape = shape();
     let norm_values = (0..128)
         .map(|i| 1.0 + sample(i, 13, 0.015625))
@@ -410,7 +445,7 @@ fn compose(
         stream,
         functions,
         shape,
-        &BATCHES,
+        batches,
         Some(&raw),
         |index, counts, core, z| {
             let rows: usize = counts.iter().sum();

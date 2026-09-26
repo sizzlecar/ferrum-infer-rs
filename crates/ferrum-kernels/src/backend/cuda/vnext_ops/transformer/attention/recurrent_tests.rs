@@ -6,6 +6,8 @@ use ferrum_interfaces::vnext::DeviceId;
 use ferrum_types::AttentionExecutionPolicy;
 use half::f16;
 
+#[path = "recurrent_tests/q8_pair.rs"]
+mod q8_pair;
 #[path = "recurrent_tests/q8_projection.rs"]
 mod q8_projection;
 fn assert_close(actual: &[f32], expected: &[f64], stage: &str) {

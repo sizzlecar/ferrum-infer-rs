@@ -367,3 +367,6 @@ fn native_swiglu_packed_rows_match_independent_source_slices_on_cuda() {
         matrix.assert_unchanged(&stream);
     }
 }
+
+#[path = "residual2_rows_tests.rs"]
+mod residual2_rows_tests;

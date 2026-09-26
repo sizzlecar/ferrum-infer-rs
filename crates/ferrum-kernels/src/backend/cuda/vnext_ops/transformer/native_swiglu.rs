@@ -1,11 +1,47 @@
 //! Mixed native gate/up/down matrices with bounded F16 activation scratch.
 
-use super::super::native_blocks::q8_f32scale::{self, PackLayout, Q8F32ScaleKernels};
-use super::super::native_blocks::{weights, CudaNativeBlockKernels};
+use super::super::native_blocks::q8_f32scale::{self, PackLayout, Q8F32ScaleKernels, Q8SumPolicy};
+use super::super::native_blocks::{
+    stream_mmq::{self, StreamMmq},
+    weights, CudaNativeBlockKernels,
+};
 use super::*;
-use ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID;
+
+mod cost_route;
+mod prepared;
+mod route_selection;
+mod selected;
+pub(super) use cost_route::{
+    q8_route as eager_q8_cost_route, route as eager_cost_route,
+    stream_mmq_route as eager_stream_mmq_cost_route,
+};
+pub(super) use selected::append_silu;
+
+fn dispatches_per_launch(
+    gate_up: &[weights::MatrixPart],
+    down: &[weights::MatrixPart],
+    q8: bool,
+) -> Result<u64, String> {
+    if !q8 {
+        return Ok(weights::dispatches(gate_up) + weights::dispatches(down) + 1);
+    }
+    // Sum policy changes coefficients and scratch, never this launch count.
+    let gate = q8_f32scale::matrix_plan_from_parts(gate_up, 1, Q8SumPolicy::Quantized)?;
+    let down = q8_f32scale::matrix_plan_from_parts(down, 1, Q8SumPolicy::Quantized)?;
+    gate.dispatches(1)?
+        .checked_add(down.dispatches(1)?)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "Q8 SwiGLU dispatch count overflows".into())
+}
 
 pub(super) fn q8_workspace_per_token(values: &[ResolvedValueBinding]) -> Result<u64, String> {
+    q8_workspace_per_token_with_policy(values, Q8SumPolicy::Quantized)
+}
+
+pub(super) fn q8_workspace_per_token_with_policy(
+    values: &[ResolvedValueBinding],
+    policy: Q8SumPolicy,
+) -> Result<u64, String> {
     let mut bytes = 0;
     for ordinal in [1, 2] {
         let value = binding(values, ResolvedValueRole::Input, ordinal)?;
@@ -13,22 +49,21 @@ pub(super) fn q8_workspace_per_token(values: &[ResolvedValueBinding]) -> Result<
             .weight()
             .ok_or("Q8 SwiGLU lacks physical matrix metadata")?;
         let parts = weights::matrix_parts(weight, value.tensor().dimensions())?;
-        bytes = bytes.max(q8_part_workspace_per_token(&parts)?);
+        bytes = bytes.max(q8_part_workspace_per_token_with_policy(&parts, policy)?);
     }
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn q8_part_workspace_per_token(parts: &[weights::MatrixPart]) -> Result<u64, String> {
-    let mut bytes = 0;
-    for part in parts {
-        if part.transform.is_some() || part.signs_region.is_some() {
-            return Err("Q8 SwiGLU does not support activation rotation".into());
-        }
-        if q8_f32scale::quantizes(part) {
-            bytes = bytes.max(PackLayout::new(1, u64::from(part.columns))?.total_bytes);
-        }
-    }
-    Ok(bytes)
+    q8_part_workspace_per_token_with_policy(parts, Q8SumPolicy::Quantized)
+}
+
+fn q8_part_workspace_per_token_with_policy(
+    parts: &[weights::MatrixPart],
+    policy: Q8SumPolicy,
+) -> Result<u64, String> {
+    Ok(q8_f32scale::matrix_plan_from_parts(parts, 1, policy)?.pack_bytes_per_row())
 }
 
 pub(super) fn uses_native(values: &[ResolvedValueBinding]) -> bool {
@@ -82,9 +117,10 @@ pub(super) fn encode(
     fingerprint: &str,
     kernels: &CudaNativeBlockKernels,
     silu: &CudaFunction,
+    capture: ferrum_types::SloStructuredCostCapture,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    encode_with_q8(fingerprint, kernels, silu, None, invocation)
+    encode_with_q8(fingerprint, kernels, silu, None, capture, invocation)
 }
 
 pub(super) fn encode_with_q8(
@@ -92,279 +128,179 @@ pub(super) fn encode_with_q8(
     kernels: &CudaNativeBlockKernels,
     silu: &CudaFunction,
     q8: Option<&Q8F32ScaleKernels>,
+    capture: ferrum_types::SloStructuredCostCapture,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    let operation = if q8.is_some() {
-        DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID
-    } else {
-        DENSE_SWIGLU_OPERATION_ID
-    };
-    ensure_invocation(&invocation, operation)?;
-    let first = &invocation.participants()[0];
-    let hidden = unsigned_attribute(first.attributes(), "hidden_size")?;
-    let intermediate = unsigned_attribute(first.attributes(), "intermediate_size")?;
-    let mut matrices = Vec::new();
-    for (ordinal, shape) in [
-        (1, vec![2, intermediate, hidden]),
-        (2, vec![hidden, intermediate]),
-    ] {
-        let matrix = weights::resolve(
-            first,
-            binding(first.bindings(), ResolvedValueRole::Input, ordinal)?,
-            &shape,
-        )?;
-        for participant in &invocation.participants()[1..] {
-            let candidate = weights::resolve(
-                participant,
-                binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
-                &shape,
+    encode_with_policy(fingerprint, kernels, silu, q8, None, capture, invocation)
+}
+
+pub(super) fn encode_with_stream_mmq(
+    fingerprint: &str,
+    kernels: &CudaNativeBlockKernels,
+    silu: &CudaFunction,
+    mmq: &StreamMmq,
+    capture: ferrum_types::SloStructuredCostCapture,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    encode_with_policy(
+        fingerprint,
+        kernels,
+        silu,
+        None,
+        Some(mmq),
+        capture,
+        invocation,
+    )
+}
+
+pub(super) fn stream_mmq_workspace(
+    values: &[ResolvedValueBinding],
+    hidden: u32,
+    intermediate: u32,
+    mmq: &StreamMmq,
+) -> Result<u64, String> {
+    let value = binding(values, ResolvedValueRole::Input, 1)?;
+    let weight = value
+        .weight()
+        .ok_or("Stream-MMQ requires native physical metadata")?;
+    let parts = weights::matrix_parts(weight, value.tensor().dimensions())?;
+    if stream_mmq::eligible(&parts, 8, hidden, intermediate) {
+        let mut bytes = mmq.workspace(hidden, intermediate)?.total_bytes;
+        if mmq.is_residual2() {
+            let down = binding(values, ResolvedValueRole::Input, 2)?;
+            let parts = weights::matrix_parts(
+                down.weight().ok_or("Stream-MMQ down metadata missing")?,
+                down.tensor().dimensions(),
             )?;
-            if candidate.parts != matrix.parts
-                || candidate.regions.len() != matrix.regions.len()
-                || !candidate
-                    .regions
-                    .iter()
-                    .zip(&matrix.regions)
-                    .all(|(a, b)| same_physical_region(a, b))
-            {
-                return Err("CUDA native SwiGLU participants do not share physical weights".into());
+            if stream_mmq::eligible_q4_down(&parts, 8, intermediate, hidden) {
+                bytes = bytes.max(mmq.workspace(intermediate, hidden)?.total_bytes);
             }
         }
-        matrices.push(matrix);
-    }
-    let mut regions = Vec::new();
-    let mut parts = Vec::new();
-    let mut key = CudaCommandReplayKeyBuilder::new(fingerprint, "vnext_native_swiglu")
-        .bytes(operation.as_bytes())
-        .u64(hidden)
-        .u64(intermediate);
-    for matrix in matrices {
-        key = weights::key(key, &matrix.parts);
-        regions.extend(matrix.regions);
-        parts.push(matrix.parts);
-    }
-    let mut parts = parts.into_iter();
-    let gate_up = parts.next().ok_or("missing native gate/up matrix")?;
-    let down = parts.next().ok_or("missing native down matrix")?;
-    let tokens = invocation.work_shape().immediate_tokens();
-    let scratch_layout = ScratchLayout::new(tokens, intermediate)?;
-    let q8_bytes = if q8.is_some() {
-        q8_part_workspace_per_token(&gate_up)?
-            .max(q8_part_workspace_per_token(&down)?)
-            .checked_mul(tokens)
-            .ok_or("Q8 SwiGLU scratch overflows")?
+        Ok(bytes)
     } else {
-        0
-    };
-    let transform_bytes =
-        super::super::native_blocks::hadamard::workspace_bytes_per_token(first.bindings())?
-            .checked_mul(tokens)
-            .ok_or("native SwiGLU Hadamard scratch overflows")?;
-    let required_bytes = scratch_layout
-        .total_bytes
-        .checked_add(transform_bytes)
-        .and_then(|bytes| bytes.checked_add(q8_bytes))
-        .ok_or("native SwiGLU scratch overflows")?;
-    let scratch_index = regions.len();
-    regions.push(shared_scratch_region(&invocation, required_bytes)?);
-    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
-    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
-    if invocation.participant_token_ranges().len() != invocation.participants().len() {
-        return Err("CUDA native SwiGLU participant ranges are incomplete".into());
+        Ok(0)
     }
-    let packed_rows = scratch_layout
-        .packed_rows(tokens)
-        .filter(|_| input_packed && output_packed);
-    key = key.boolean(packed_rows.is_some());
-    let mut launches = Vec::new();
-    for (participant, range) in invocation
-        .participants()
-        .iter()
-        .zip(invocation.participant_token_ranges())
-    {
-        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
-        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
-        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden
-            || unsigned_attribute(participant.attributes(), "intermediate_size")? != intermediate
-        {
-            return Err("CUDA native SwiGLU participant dimensions disagree".into());
-        }
-        validate_dense_swiglu(
-            input,
-            binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
-            binding(participant.bindings(), ResolvedValueRole::Input, 2)?,
-            output,
-            hidden,
-            intermediate,
-        )?;
-        let count = checked_u32(range.immediate_tokens(), "native SwiGLU tokens")?;
-        if count == 0 || count > u16::MAX as u32 {
-            return Err("CUDA native SwiGLU token count exceeds its launch extent".into());
-        }
-        let packed = range.immediate_token_range();
-        let source = range.source_token_range();
-        if packed.end > tokens {
-            return Err("native SwiGLU packed span exceeds scratch".into());
-        }
-        if packed_rows.is_some() {
-            continue;
-        }
-        let input_index = regions.len();
-        regions.push(contiguous_token_region(
-            participant,
-            input,
-            ElementType::F16,
-            if input_packed {
-                packed.start
-            } else {
-                source.start
-            },
-            u64::from(count),
-        )?);
-        let output_index = regions.len();
-        regions.push(contiguous_token_region(
-            participant,
-            output,
-            ElementType::F16,
-            if output_packed {
-                packed.start
-            } else {
-                source.start
-            },
-            u64::from(count),
-        )?);
-        launches.push((input_index, output_index, count, packed.start));
-        key = key
-            .u64(input_index as u64)
-            .u64(output_index as u64)
-            .u32(count)
-            .u64(packed.start);
-    }
-    if let Some(rows) = packed_rows {
-        let input = regions.len();
-        regions.push(shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            ElementType::F16,
-            tokens,
-        )?);
-        let output = regions.len();
-        regions.push(shared_token_region(
-            &invocation,
-            ResolvedValueRole::Output,
-            0,
-            ElementType::F16,
-            tokens,
-        )?);
-        launches.push((input, output, rows, 0));
-        key = key.u64(input as u64).u64(output as u64).u32(rows).u64(0);
-    }
-    let participants = checked_u32(
-        invocation.participants().len() as u64,
-        "native SwiGLU participants",
+}
+
+fn encode_with_policy(
+    fingerprint: &str,
+    kernels: &CudaNativeBlockKernels,
+    silu: &CudaFunction,
+    q8: Option<&Q8F32ScaleKernels>,
+    mmq: Option<&StreamMmq>,
+    capture: ferrum_types::SloStructuredCostCapture,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    let prepared::Prepared {
+        regions,
+        gate_up,
+        down,
+        launches,
+        scratch_index,
+        scratch_layout,
+        hidden,
+        intermediate,
+        transform_bytes,
+        q8_bytes,
+        mmq_bytes,
+        selection,
+        key,
+    } = prepared::prepare(
+        fingerprint,
+        q8.map(Q8F32ScaleKernels::policy),
+        mmq,
+        capture,
+        &invocation,
     )?;
-    let dispatches = (launches.len() as u64)
-        .checked_mul(
-            weights::dispatches(&gate_up)
-                + weights::dispatches(&down)
-                + 1
-                + if q8.is_some() {
-                    u64::from(gate_up.iter().any(q8_f32scale::quantizes))
-                        + u64::from(down.iter().any(q8_f32scale::quantizes))
+    let native_name = selection.command.native_operation();
+    let mmq_hit = selection.mmq_hit;
+    let kernels = kernels.clone();
+    let q8 = q8.cloned();
+    let mmq = mmq.filter(|_| mmq_hit).cloned();
+    let silu = silu.clone();
+    CudaDeviceCommand::replayable_operation(native_name, regions, key, move |stream, regions| {
+        let weights = regions[..scratch_index]
+            .iter()
+            .map(CudaBufferRegion::device_ptr)
+            .collect::<Vec<_>>();
+        let transform_scratch = regions[scratch_index].device_ptr();
+        let scratch = transform_scratch
+            .checked_add(transform_bytes)
+            .and_then(|pointer| pointer.checked_add(q8_bytes))
+            .and_then(|pointer| pointer.checked_add(mmq_bytes))
+            .ok_or_else(|| CudaDeviceRuntimeError::contract("SwiGLU scratch pointer overflows"))?;
+        for &(input, output, count, packed_start) in &launches {
+            let gate_offset = packed_start
+                .checked_mul(u64::from(intermediate))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("native SwiGLU scratch offset overflows")
+                })?;
+            let activation_offset = packed_start
+                .checked_mul(u64::from(intermediate))
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(scratch_layout.gate_up_bytes))
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("native SwiGLU activation offset overflows")
+                })?;
+            launch_with_policy(
+                &kernels,
+                &silu,
+                stream,
+                &gate_up,
+                &down,
+                &weights,
+                regions[input].device_ptr(),
+                regions[output].device_ptr(),
+                scratch.checked_add(gate_offset).ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("native gate/up pointer overflows")
+                })?,
+                scratch.checked_add(activation_offset).ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("native activation pointer overflows")
+                })?,
+                count,
+                hidden,
+                intermediate,
+                if transform_bytes > 0 {
+                    transform_scratch
                 } else {
                     0
                 },
-        )
-        .ok_or("native SwiGLU dispatch count overflows")?;
-    let hidden = checked_u32(hidden, "native SwiGLU hidden")?;
-    let intermediate = checked_u32(intermediate, "native SwiGLU intermediate")?;
-    key = key
-        .u64(scratch_layout.gate_up_bytes)
-        .u64(required_bytes)
-        .u64(transform_bytes)
-        .u64(q8_bytes);
-    let kernels = kernels.clone();
-    let q8 = q8.cloned();
-    let silu = silu.clone();
-    CudaDeviceCommand::replayable_operation(
-        "vnext_native_swiglu",
-        regions,
-        key.finish(),
-        move |stream, regions| {
-            let weights = regions[..scratch_index]
-                .iter()
-                .map(CudaBufferRegion::device_ptr)
-                .collect::<Vec<_>>();
-            let transform_scratch = regions[scratch_index].device_ptr();
-            let scratch = transform_scratch
-                .checked_add(transform_bytes)
-                .and_then(|pointer| pointer.checked_add(q8_bytes))
-                .ok_or_else(|| {
-                    CudaDeviceRuntimeError::contract("SwiGLU scratch pointer overflows")
-                })?;
-            for &(input, output, count, packed_start) in &launches {
-                let gate_offset = packed_start
-                    .checked_mul(u64::from(intermediate))
-                    .and_then(|n| n.checked_mul(4))
+                q8.as_ref(),
+                transform_scratch,
+                mmq.as_ref(),
+                transform_scratch
+                    .checked_add(transform_bytes)
+                    .and_then(|p| p.checked_add(q8_bytes))
                     .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract("native SwiGLU scratch offset overflows")
-                    })?;
-                let activation_offset = packed_start
-                    .checked_mul(u64::from(intermediate))
-                    .and_then(|n| n.checked_mul(2))
-                    .and_then(|n| n.checked_add(scratch_layout.gate_up_bytes))
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "native SwiGLU activation offset overflows",
-                        )
-                    })?;
-                launch_with_q8(
-                    &kernels,
-                    &silu,
-                    stream,
-                    &gate_up,
-                    &down,
-                    &weights,
-                    regions[input].device_ptr(),
-                    regions[output].device_ptr(),
-                    scratch.checked_add(gate_offset).ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract("native gate/up pointer overflows")
+                        CudaDeviceRuntimeError::contract("Stream-MMQ scratch pointer overflows")
                     })?,
-                    scratch.checked_add(activation_offset).ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract("native activation pointer overflows")
-                    })?,
-                    count,
-                    hidden,
-                    intermediate,
-                    if transform_bytes > 0 {
-                        transform_scratch
-                    } else {
-                        0
-                    },
-                    q8.as_ref(),
-                    transform_scratch,
-                )?;
-            }
-            Ok(())
-        },
-    )
-    .and_then(|command| {
-        command.with_work_attribution(
-            if participants == 1 {
-                DeviceBatchingForm::Scalar
-            } else if packed_rows.is_some() {
-                DeviceBatchingForm::Packed
-            } else {
-                DeviceBatchingForm::ParticipantLoop
-            },
-            participants,
-            tokens,
-            dispatches,
-            0,
-        )
+            )?;
+        }
+        Ok(())
     })
+    .and_then(|command| super::super::cost_route::apply(command, selection.command))
     .map_err(|error| error.to_string())
+}
+
+pub(super) fn replay_evidence(
+    fingerprint: &str,
+    q8: Option<Q8SumPolicy>,
+    mmq: Option<&StreamMmq>,
+    capture: ferrum_types::SloStructuredCostCapture,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError> {
+    if capture == ferrum_types::SloStructuredCostCapture::Disabled
+        || !invocation
+            .participants()
+            .iter()
+            .any(|p| uses_native(p.bindings()))
+    {
+        return Ok(None);
+    }
+    let prepared =
+        prepared::prepare(fingerprint, q8, mmq, capture, invocation).map_err(invalid_plan)?;
+    Ok(prepared.selection.command.statistical_evidence().cloned())
 }
 
 #[cfg(test)]
@@ -385,7 +321,7 @@ fn launch(
     intermediate: u32,
     transform_scratch: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    launch_with_q8(
+    launch_with_policy(
         kernels,
         silu,
         stream,
@@ -402,9 +338,12 @@ fn launch(
         transform_scratch,
         None,
         0,
+        None,
+        0,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn launch_with_q8(
     kernels: &CudaNativeBlockKernels,
@@ -423,6 +362,49 @@ fn launch_with_q8(
     transform_scratch: u64,
     q8: Option<&Q8F32ScaleKernels>,
     q8_scratch: u64,
+) -> Result<(), CudaDeviceRuntimeError> {
+    launch_with_policy(
+        kernels,
+        silu,
+        stream,
+        gate_up,
+        down,
+        weights,
+        input,
+        output,
+        gate_up_output,
+        activation,
+        tokens,
+        hidden,
+        intermediate,
+        transform_scratch,
+        q8,
+        q8_scratch,
+        None,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_with_policy(
+    kernels: &CudaNativeBlockKernels,
+    silu: &CudaFunction,
+    stream: &CudaStream,
+    gate_up: &[weights::MatrixPart],
+    down: &[weights::MatrixPart],
+    weights: &[u64],
+    input: u64,
+    output: u64,
+    gate_up_output: u64,
+    activation: u64,
+    tokens: u32,
+    hidden: u32,
+    intermediate: u32,
+    transform_scratch: u64,
+    q8: Option<&Q8F32ScaleKernels>,
+    q8_scratch: u64,
+    mmq: Option<&StreamMmq>,
+    mmq_scratch: u64,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let layout = ScratchLayout::new(u64::from(tokens), u64::from(intermediate))
         .map_err(CudaDeviceRuntimeError::contract)?;
@@ -445,7 +427,25 @@ fn launch_with_q8(
             "native SwiGLU matrix pointer inventory differs",
         ));
     }
-    if let Some(q8) = q8 {
+    if let Some(mmq) = mmq {
+        let launch = if mmq.is_residual2() {
+            StreamMmq::launch_residual_gate_up
+        } else {
+            StreamMmq::launch_gate_up
+        };
+        launch(
+            mmq,
+            stream,
+            gate_up,
+            &weights[..down_start],
+            input,
+            gate_up_output,
+            tokens,
+            hidden,
+            intermediate,
+            mmq_scratch,
+        )?;
+    } else if let Some(q8) = q8 {
         q8.launch(
             kernels,
             stream,
@@ -482,7 +482,21 @@ fn launch_with_q8(
         intermediate_i32,
         layout.activation_elements,
     )?;
-    if let Some(q8) = q8 {
+    if let Some(mmq) = mmq.filter(|mmq| {
+        mmq.is_residual2() && stream_mmq::eligible_q4_down(down, 8, intermediate, hidden)
+    }) {
+        mmq.launch_residual_q4_down(
+            stream,
+            down,
+            &weights[down_start..],
+            activation,
+            output,
+            tokens,
+            intermediate,
+            hidden,
+            mmq_scratch,
+        )?;
+    } else if let Some(q8) = q8 {
         q8.launch(
             kernels,
             stream,

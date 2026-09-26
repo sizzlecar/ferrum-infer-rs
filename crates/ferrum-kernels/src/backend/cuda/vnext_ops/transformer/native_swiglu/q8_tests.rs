@@ -96,7 +96,32 @@ impl HostMatrix {
         }
     }
 
-    fn policy(&self, input: &[f16], column: usize) -> (f64, f64) {
+    fn policy(&self, input: &[f16], column: usize, sum_policy: Q8SumPolicy) -> (f64, f64) {
+        if sum_policy == Q8SumPolicy::Input {
+            use crate::gguf_blocks::q8_input_sum_reference::{dot_q4, dot_q5};
+            let corrected = match self.format {
+                MatrixFormat::Block(GgufBlockFormat::Q4K) => Some(dot_q4(
+                    input,
+                    &(0..self.columns / 256)
+                        .map(|b| fixture_block(column + self.salt, b))
+                        .collect::<Vec<_>>(),
+                )),
+                MatrixFormat::Block(GgufBlockFormat::Q5K) => Some(dot_q5(
+                    input,
+                    &(0..self.columns / 256)
+                        .map(|b| fixture_q5(column + self.salt, b))
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            };
+            if let Some(reference) = corrected {
+                let nu = ((self.columns / 32).div_ceil(4) + 9) as f64 * f64::from(f32::EPSILON);
+                return (
+                    reference.policy,
+                    nu / (1.0 - nu) * reference.expanded_abs_terms,
+                );
+            }
+        }
         let reference: DotReference = match self.format {
             MatrixFormat::DenseF16 => {
                 let products = input
@@ -213,6 +238,7 @@ fn check_stages(
     scratch: &[u8],
     output: &[u8],
     packed_bytes: usize,
+    sum_policy: Q8SumPolicy,
 ) {
     let gates = halves(&scratch[packed_bytes..packed_bytes + rows * intermediate * 4]);
     let activation = halves(&scratch[packed_bytes + rows * intermediate * 4..]);
@@ -221,7 +247,7 @@ fn check_stages(
         let x = &input[row * hidden..][..hidden];
         for col in 0..intermediate {
             for (ordinal, matrix) in matrices[..2].iter().enumerate() {
-                let (policy, error) = matrix.policy(x, col);
+                let (policy, error) = matrix.policy(x, col, sum_policy);
                 assert_rounded(
                     gates[row * 2 * intermediate + ordinal * intermediate + col],
                     policy,
@@ -243,7 +269,7 @@ fn check_stages(
         }
         let x = &activation[row * intermediate..][..intermediate];
         for col in 0..hidden {
-            let (policy, error) = matrices[2].policy(x, col);
+            let (policy, error) = matrices[2].policy(x, col, sum_policy);
             assert_rounded(output[row * hidden + col], policy, error, "down");
         }
     }
@@ -259,7 +285,23 @@ fn check_stages(
         scales,
         "down must repack the F16 SiLU result"
     );
-    assert_eq!(&scratch[scales.len()..scales.len() + words.len()], words);
+    let words_offset = if sum_policy == Q8SumPolicy::Input {
+        let sums =
+            crate::gguf_blocks::q8_input_sum_reference::pack_rows(&activation, rows, intermediate)
+                .input_sums;
+        let sum_bytes: Vec<_> = sums
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect();
+        assert_eq!(
+            &scratch[scales.len()..scales.len() + sum_bytes.len()],
+            sum_bytes
+        );
+        scales.len() + sum_bytes.len()
+    } else {
+        scales.len()
+    };
+    assert_eq!(&scratch[words_offset..words_offset + words.len()], words);
 }
 
 fn assert_captured_packs(
@@ -270,6 +312,7 @@ fn assert_captured_packs(
     rows: u32,
     hidden: u32,
     intermediate: u32,
+    sum_policy: Q8SumPolicy,
 ) {
     // SAFETY: graph remains alive and no thread accesses it concurrently. CUDA
     // owns the returned node parameter storage. Only the known pack ABI is read.
@@ -306,7 +349,11 @@ fn assert_captured_packs(
                 sys::CUresult::CUDA_SUCCESS
             );
             assert!(!name.is_null());
-            if CStr::from_ptr(name).to_bytes() != b"vnext_gguf_q8_f32scale_pack_f16_prototype" {
+            let pack_name: &[u8] = match sum_policy {
+                Q8SumPolicy::Quantized => b"vnext_gguf_q8_f32scale_pack_f16_prototype",
+                Q8SumPolicy::Input => b"vnext_gguf_q8_f32scale_input_sum_pack_f16_prototype",
+            };
+            if CStr::from_ptr(name).to_bytes() != pack_name {
                 continue;
             }
             assert!(!params.kernelParams.is_null());
@@ -314,10 +361,11 @@ fn assert_captured_packs(
             let n = (*params.kernelParams.add(3)).cast::<u32>().read_unaligned();
             let k = (*params.kernelParams.add(4)).cast::<u32>().read_unaligned();
             assert_eq!(pointer(1), workspace);
-            assert_eq!(
-                pointer(2),
-                workspace + PackLayout::new(n.into(), k.into()).unwrap().scales_bytes
-            );
+            let layout = PackLayout::with_policy(n.into(), k.into(), sum_policy).unwrap();
+            assert_eq!(pointer(2), workspace + layout.words_offset);
+            if sum_policy == Q8SumPolicy::Input {
+                assert_eq!(pointer(5), workspace + layout.scales_bytes);
+            }
             packs.push((pointer(0), n, k));
         }
         packs.sort_unstable();
@@ -333,12 +381,22 @@ fn assert_captured_packs(
 #[test]
 #[ignore = "requires an actual SM80+ CUDA device; Q8 SwiGLU stage and graph conformance"]
 fn native_q8_swiglu_stages_and_replay_preserve_f16_policy_on_cuda() {
+    stages_and_replay(Q8SumPolicy::Quantized, &[1, 3, 32]);
+}
+
+#[test]
+#[ignore = "requires an actual SM80+ CUDA device; explicit input-sum SwiGLU stage and graph conformance"]
+fn native_q8_input_sum_swiglu_stages_and_replay_on_cuda() {
+    stages_and_replay(Q8SumPolicy::Input, &[1, 4, 8, 33]);
+}
+
+fn stages_and_replay(sum_policy: Q8SumPolicy, row_counts: &[usize]) {
     use GgufBlockFormat::*;
     use MatrixFormat::{Block as Q, DenseF16 as D};
     let context = CudaContext::new(0).expect("Q8 SwiGLU requires CUDA");
     let stream = context.new_stream().unwrap();
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();
-    let q8 = Q8F32ScaleKernels::load(&context).unwrap();
+    let q8 = Q8F32ScaleKernels::load_with_policy(&context, sum_policy).unwrap();
     let module = context
         .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL))
         .unwrap();
@@ -359,11 +417,11 @@ fn native_q8_swiglu_stages_and_replay_preserve_f16_policy_on_cuda() {
             part(formats[1], intermediate, hidden, intermediate),
         ];
         let down = [part(formats[2], hidden, intermediate, 0)];
-        for rows in [1, 3, 32] {
+        for &rows in row_counts {
             let layout = ScratchLayout::new(rows as u64, intermediate as u64).unwrap();
-            let packed = q8_part_workspace_per_token(&gate_up)
+            let packed = q8_part_workspace_per_token_with_policy(&gate_up, sum_policy)
                 .unwrap()
-                .max(q8_part_workspace_per_token(&down).unwrap())
+                .max(q8_part_workspace_per_token_with_policy(&down, sum_policy).unwrap())
                 * rows as u64;
             let mut input = Bytes::new(&stream, &vec![0; rows * hidden * 2]);
             let mut scratch =
@@ -418,6 +476,7 @@ fn native_q8_swiglu_stages_and_replay_preserve_f16_policy_on_cuda() {
                 rows as u32,
                 hidden as u32,
                 intermediate as u32,
+                sum_policy,
             );
             let mut previous = None;
             for generation in [0, 1] {
@@ -442,6 +501,7 @@ fn native_q8_swiglu_stages_and_replay_preserve_f16_policy_on_cuda() {
                     &eager_scratch,
                     &eager_output,
                     packed as usize,
+                    sum_policy,
                 );
                 scratch.write(&stream, &vec![0x7e; scratch.len]);
                 output.write(&stream, &vec![0x7e; output.len]);

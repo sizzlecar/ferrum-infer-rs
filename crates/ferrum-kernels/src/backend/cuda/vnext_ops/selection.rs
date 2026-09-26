@@ -7,6 +7,9 @@ use ferrum_interfaces::vnext::{
     LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
 };
 
+pub(super) mod prepared;
+pub(super) mod selected;
+
 #[derive(Clone, Copy)]
 pub(super) enum ArgmaxPrecision {
     F16,
@@ -25,6 +28,24 @@ pub(super) fn argmax_dispatches(vocabulary_size: i32) -> u64 {
         1
     }
 }
+
+fn first_launch_config(parallel: bool) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (if parallel { ARGMAX_PARTITIONS } else { 1 }, 1, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn finalize_launch_config() -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+const FINALIZE_ENTRY: &str = "last_token_masked_argmax_finalize";
 
 #[derive(Clone)]
 pub(super) struct ArgmaxFunctions {
@@ -61,8 +82,8 @@ impl ArgmaxFunctions {
         };
         Ok(Self {
             scalar: load(precision.kernel())?,
-            partitioned: load(&format!("{}_partitioned", precision.kernel()))?,
-            finalize: load("last_token_masked_argmax_finalize")?,
+            partitioned: load(precision.partitioned_kernel())?,
+            finalize: load(FINALIZE_ENTRY)?,
         })
     }
 
@@ -91,14 +112,8 @@ impl ArgmaxFunctions {
             .arg(&args.output);
         // The caller retains the invocation regions and their scratch lease.
         // Only the large-vocabulary route uses the first 32 eight-byte partials.
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (if parallel { ARGMAX_PARTITIONS } else { 1 }, 1, 1),
-                block_dim: (THREADS_PER_BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|error| CudaDeviceRuntimeError::driver("vNext masked argmax launch", error))?;
+        unsafe { builder.launch(first_launch_config(parallel)) }
+            .map_err(|error| CudaDeviceRuntimeError::driver("vNext masked argmax launch", error))?;
         if parallel {
             let mut finalize = stream.launch_builder(&self.finalize);
             finalize
@@ -109,14 +124,7 @@ impl ArgmaxFunctions {
                 .arg(&args.output);
             // Same CUDA stream orders every partial write before finalization.
             // Active penalties retain the scalar result; finalization is a no-op.
-            unsafe {
-                finalize.launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|error| {
+            unsafe { finalize.launch(finalize_launch_config()) }.map_err(|error| {
                 CudaDeviceRuntimeError::driver("vNext masked argmax finalize", error)
             })?;
         }
@@ -164,6 +172,13 @@ impl ArgmaxPrecision {
         match self {
             Self::F16 => MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME,
             Self::F32 => "last_token_masked_argmax_preserving_logits_f32",
+        }
+    }
+
+    fn partitioned_kernel(self) -> &'static str {
+        match self {
+            Self::F16 => "last_token_masked_argmax_preserving_logits_f16_partitioned",
+            Self::F32 => "last_token_masked_argmax_preserving_logits_f32_partitioned",
         }
     }
 

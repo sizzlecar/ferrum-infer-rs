@@ -26,6 +26,7 @@ sha2 = "0.10"
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "f16", "nvrtc", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 metal = { version = "0.31", optional = true }
 libc = "0.2"
+libloading = { version = "0.8.9", optional = true }
 
 [dev-dependencies]
 libloading = "0.8.9"
@@ -44,7 +45,7 @@ sha2 = "0.10"
 
 [features]
 default = []
-cuda = ["dep:cudarc", "marlin", "native-op-artifact"]
+cuda = ["dep:cudarc", "dep:libloading", "marlin", "native-op-artifact"]
 # Explicit opt-in for ignored diagnostic tests; no production Lt dispatch.
 cuda-cublaslt-bench = ["cuda", "cudarc/cublaslt"]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
@@ -78,4 +79,9 @@ required-features = ["cuda"]
 [[example]]
 name = "runtime_vnext_cuda_catalog_input"
 path = "examples/runtime_vnext_cuda_catalog_input.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "runtime_vnext_cuda_evidence"
+path = "examples/runtime_vnext_cuda_evidence.rs"
 required-features = ["cuda"]

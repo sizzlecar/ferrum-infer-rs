@@ -35,6 +35,7 @@ pub fn cuda_device_name(ordinal: usize) -> Result<String, String> {
 pub mod backend;
 pub use backend::probe_device_memory;
 pub mod gguf_blocks;
+pub mod gguf_f16_projection_materializer;
 #[cfg(test)]
 pub(crate) mod hadamard;
 pub mod native_ops;

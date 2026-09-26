@@ -1,5 +1,6 @@
 //! Exact physical matrix partitions; projections allocate no expanded weights.
 use super::*;
+use crate::backend::cuda::vnext_ops::native_blocks::q8_pair;
 use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
 use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use std::sync::Arc;
@@ -85,6 +86,37 @@ pub(super) fn dispatch_count(parts: usize, rows: u64) -> Result<u64, String> {
     (parts as u64)
         .checked_mul(rows.div_ceil(MAX_ROWS))
         .ok_or_else(|| "native attention projection dispatch count overflows".into())
+}
+
+/// Strict projection topology, shared by actual attribution and future route.
+/// Every full MAX_ROWS chunk is ineligible for the small-row pair. Only the
+/// final chunk needs selection, keeping even a large pure query bounded.
+pub(super) fn strict_dispatch_count(
+    parts: &[weights::MatrixPart],
+    rows: u64,
+) -> Result<u64, String> {
+    let first = parts
+        .first()
+        .ok_or("native attention projection is empty")?;
+    if rows == 0 {
+        return Err("native attention projection is empty".into());
+    }
+    let stride = parts.iter().try_fold(0_u32, |end, part| {
+        part.output_offset
+            .checked_add(part.rows)
+            .map(|value| end.max(value))
+            .ok_or("native projection output extent overflows")
+    })?;
+    let full = weights::dispatches(parts)
+        .checked_mul(rows / MAX_ROWS)
+        .ok_or("native attention dispatch count overflows")?;
+    let tail = (rows % MAX_ROWS) as u32;
+    full.checked_add(if tail == 0 {
+        0
+    } else {
+        q8_pair::dispatches(parts, tail, first.columns, stride)
+    })
+    .ok_or_else(|| "native attention dispatch count overflows".into())
 }
 
 #[allow(clippy::too_many_arguments)]

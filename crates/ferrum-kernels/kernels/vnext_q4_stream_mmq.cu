@@ -153,3 +153,117 @@ extern "C" __global__ void vnext_q4_stream_fixup(const float* scratch,half* y,
     }
     y[size_t(row)*stride+offset+col]=__float2half_rn(sum);
 }
+
+// Experimental two-level activation quantization. Existing exports and product
+// selectors above are unchanged. The second term quantizes the F32 residual
+// x - RN_F32(delta0*q0); coefficients keep their original F32 reconstruction.
+// This is an explicit new numerical policy, not strict F32 activation math.
+struct ResidualShared : Shared {
+    unsigned qr[MR][PITCH]; float dr[MR][8]; int sumr[MR][8];
+};
+static_assert(sizeof(ResidualShared)==48384,"residual2 shared ABI");
+extern "C" __global__ void vnext_q4_stream_pack_residual2(const half* x,unsigned* q,float* d,int* sums,unsigned rows,unsigned inputs) {
+    const unsigned lane=threadIdx.x%32;
+    const size_t gid=size_t(blockIdx.x)*8+threadIdx.x/32;
+    const unsigned groups=inputs/32;
+    if(gid>=size_t(rows)*groups)return;
+    const unsigned row=gid/groups,group=gid%groups;
+    float value=__half2float(x[gid*32+lane]);
+    const size_t term_groups=size_t(rows)*groups;
+    for(unsigned term=0;term<2;++term) {
+    const bool invalid=__ballot_sync(0xffffffff,!isfinite(value))!=0;
+    float mx=isfinite(value)?fabsf(value):0;
+    for(unsigned step=16;step;step/=2)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,step));
+    const float delta=invalid?NAN:mx==0?0:__fdiv_rn(mx,127.0f);
+    int qi=0;
+    if(!invalid&&mx!=0)qi=int(fmaxf(-127.0f,fminf(127.0f,roundf(__fdiv_rn(value,delta)))));
+    int sum=qi;
+    for(unsigned step=16;step;step/=2)sum+=__shfl_down_sync(0xffffffff,sum,step);
+    const size_t pg=term*term_groups+(size_t(group/8)*rows+row)*8+group%8;
+    if(lane==0){d[pg]=delta;sums[pg]=sum;}
+    const unsigned q0=unsigned(qi)&255;
+    const unsigned q1=__shfl_down_sync(0xffffffff,q0,1,4);
+    const unsigned q2=__shfl_down_sync(0xffffffff,q0,2,4);
+    const unsigned q3=__shfl_down_sync(0xffffffff,q0,3,4);
+    if(lane%4==0)q[pg*8+lane/4]=q0|(q1<<8)|(q2<<16)|(q3<<24);
+    value=__fsub_rn(value,__fmul_rn(delta,float(qi)));
+    }
+}
+extern "C" __global__ void vnext_q4_stream_mmq_residual2(const unsigned* q,const float* d,const int* sums,
+    const byte* w,float* scratch,unsigned rows,unsigned inputs,unsigned outputs,unsigned ctas) {
+    extern __shared__ __align__(32) byte storage[];
+    ResidualShared& sh=*reinterpret_cast<ResidualShared*>(storage);
+    const unsigned tid=threadIdx.x,warp=tid/32,lane=tid%32,g=lane/4,t=lane%4;
+    const unsigned blocks=inputs/256,ntx=(outputs+127)/128,nty=(rows+7)/8;
+    const unsigned tiles=ntx*nty;
+    const uint64_t total=uint64_t(tiles)*blocks;
+    uint64_t pos=uint64_t(blockIdx.x)*total/ctas;
+    const uint64_t stop=uint64_t(blockIdx.x+1)*total/ctas;
+    while(pos<stop) {
+        const unsigned tile=pos/blocks,start=pos%blocks;
+        const unsigned end=unsigned(min(uint64_t(blocks),stop-uint64_t(tile)*blocks));
+        const unsigned first_col=(tile%ntx)*128,first_row=(tile/ntx)*8;
+        float acc[4]={0,0,0,0};
+        for(unsigned bi=start;bi<end;++bi) {
+            for(unsigned col=tid/32;col<128;col+=8) {
+                const unsigned word=tid%32;
+                const bool valid=first_col+col<outputs;
+                const byte* block=valid?w+(size_t(first_col+col)*blocks+bi)*144:w;
+                const unsigned group=(word/8)*2,kword=word%8;
+                sh.codes[col][group*8+kword]=valid?code_word(block,group,kword):0;
+                sh.codes[col][(group+1)*8+kword]=valid?code_word(block,group+1,kword):0;
+                if(word<8){float a=0,b=0;if(valid)coefficients(block,word,a,b);sh.a[col][word]=a;sh.b[col][word]=b;}
+            }
+            for(unsigned j=tid;j<8*64;j+=256) {
+                const unsigned row=j/64,k=j%64;
+                const size_t pg=(size_t(bi)*rows+first_row+row)*8+k/8;
+                sh.q[row][k]=first_row+row<rows?q[pg*8+k%8]:0;
+                if(k%8==0){sh.d[row][k/8]=first_row+row<rows?d[pg]:0;sh.sum[row][k/8]=first_row+row<rows?sums[pg]:0;}
+            }
+            const size_t term_groups=size_t(rows)*(inputs/32);
+            for(unsigned j=tid;j<8*64;j+=256) {
+                const unsigned row=j/64,k=j%64;
+                const size_t pg=term_groups+(size_t(bi)*rows+first_row+row)*8+k/8;
+                sh.qr[row][k]=first_row+row<rows?q[pg*8+k%8]:0;
+                if(k%8==0){sh.dr[row][k/8]=first_row+row<rows?d[pg]:0;sh.sumr[row][k/8]=first_row+row<rows?sums[pg]:0;}
+            }
+            __syncthreads();
+            // Register-prefetch fragments and metadata, as in the pinned MMQ
+            // implementation. Four warps of absent token rows are never created.
+            unsigned a0[8],a1[8],a2[8],a3[8];
+            float al[8],ah[8],bl[8],bh[8];
+            #pragma unroll
+            for(unsigned group=0;group<8;++group) {
+                const unsigned col=warp*16+g,k=group*8;
+                a0[group]=sh.codes[col][k+t];a1[group]=sh.codes[col+8][k+t];
+                a2[group]=sh.codes[col][k+t+4];a3[group]=sh.codes[col+8][k+t+4];
+                al[group]=sh.a[col][group];ah[group]=sh.a[col+8][group];
+                bl[group]=sh.b[col][group];bh[group]=sh.b[col+8][group];
+            }
+            #pragma unroll
+            for(unsigned group=0;group<8;++group) {
+                #pragma unroll
+                for(unsigned term=0;term<2;++term) {
+                const unsigned b0=(term==0?sh.q:sh.qr)[g][group*8+t],b1=(term==0?sh.q:sh.qr)[g][group*8+t+4];
+                const unsigned r0=2*t,r1=2*t+1;
+                const float d0=(term==0?sh.d:sh.dr)[r0][group],d1=(term==0?sh.d:sh.dr)[r1][group];
+                const int s0=(term==0?sh.sum:sh.sumr)[r0][group],s1=(term==0?sh.sum:sh.sumr)[r1][group];
+                int c0=0,c1=0,c2=0,c3=0;
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                    : "+r"(c0),"+r"(c1),"+r"(c2),"+r"(c3)
+                    : "r"(a0[group]),"r"(a1[group]),"r"(a2[group]),"r"(a3[group]),"r"(b0),"r"(b1));
+                acc[0]=__fadd_rn(acc[0],__fmul_rn(d0,__fsub_rn(__fmul_rn(al[group],float(c0)),__fmul_rn(bl[group],float(s0)))));
+                acc[1]=__fadd_rn(acc[1],__fmul_rn(d1,__fsub_rn(__fmul_rn(al[group],float(c1)),__fmul_rn(bl[group],float(s1)))));
+                acc[2]=__fadd_rn(acc[2],__fmul_rn(d0,__fsub_rn(__fmul_rn(ah[group],float(c2)),__fmul_rn(bh[group],float(s0)))));
+                acc[3]=__fadd_rn(acc[3],__fmul_rn(d1,__fsub_rn(__fmul_rn(ah[group],float(c3)),__fmul_rn(bh[group],float(s1)))));
+                }
+            }
+            __syncthreads();
+        }
+        const size_t target=end==blocks?size_t(tile)*1024:size_t(tiles+blockIdx.x)*1024;
+        #pragma unroll
+        for(unsigned n=0;n<4;++n){unsigned row=2*t+n%2,col=warp*16+g+(n/2)*8;scratch[target+row*128+col]=acc[n];}
+        pos=uint64_t(tile)*blocks+end;
+        __syncthreads();
+    }
+}

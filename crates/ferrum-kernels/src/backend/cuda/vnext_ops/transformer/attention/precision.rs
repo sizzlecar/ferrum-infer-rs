@@ -15,6 +15,7 @@ pub(super) enum AttentionPrecision {
     F16,
     F32Master,
     F32MasterQ8Projections,
+    F32MasterGgufF16Projections,
 }
 
 impl AttentionPrecision {
@@ -22,6 +23,7 @@ impl AttentionPrecision {
         match self {
             Self::F16 => GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             Self::F32Master => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            Self::F32MasterGgufF16Projections => ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
             Self::F32MasterQ8Projections => {
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_OPERATION_ID
             }
@@ -32,6 +34,7 @@ impl AttentionPrecision {
         match self {
             Self::F16 => gated_delta_recurrent_attention_contract(),
             Self::F32Master => gated_delta_recurrent_attention_f32_master_contract(),
+            Self::F32MasterGgufF16Projections => ferrum_interfaces::vnext::gated_delta_recurrent_attention_f32_master_gguf_f16_projections_contract(),
             Self::F32MasterQ8Projections => {
                 gated_delta_recurrent_attention_f32_master_q8_projections_contract()
             }
@@ -42,6 +45,7 @@ impl AttentionPrecision {
         match self {
             Self::F16 => GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
             Self::F32Master => GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+            Self::F32MasterGgufF16Projections => ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
             Self::F32MasterQ8Projections => {
                 GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID
             }
@@ -52,6 +56,9 @@ impl AttentionPrecision {
         match self {
             Self::F16 => "provider.cuda.gated_delta_recurrent_attention.f16",
             Self::F32Master => "provider.cuda.gated_delta_recurrent_attention.f32-master",
+            Self::F32MasterGgufF16Projections => {
+                "provider.cuda.gated_delta_recurrent_attention.f32-master.gguf-f16-projections"
+            }
             Self::F32MasterQ8Projections => {
                 "provider.cuda.gated_delta_recurrent_attention.f32-master.q8-projections"
             }
@@ -62,6 +69,7 @@ impl AttentionPrecision {
         match self {
             Self::F16 => "resource-estimator.cuda.gated_delta_recurrent_attention.f16",
             Self::F32Master => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master",
+            Self::F32MasterGgufF16Projections => "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.gguf-f16-projections",
             Self::F32MasterQ8Projections => {
                 "resource-estimator.cuda.gated_delta_recurrent_attention.f32-master.q8-projections"
             }
@@ -71,21 +79,27 @@ impl AttentionPrecision {
     pub(super) fn hidden(self) -> ElementType {
         match self {
             Self::F16 => ElementType::F16,
-            Self::F32Master | Self::F32MasterQ8Projections => ElementType::F32,
+            Self::F32Master | Self::F32MasterQ8Projections | Self::F32MasterGgufF16Projections => {
+                ElementType::F32
+            }
         }
     }
 
     pub(super) fn norm(self) -> &'static str {
         match self {
             Self::F16 => "rms_norm_f16",
-            Self::F32Master | Self::F32MasterQ8Projections => "vnext_rms_norm_f32_to_f16",
+            Self::F32Master | Self::F32MasterQ8Projections | Self::F32MasterGgufF16Projections => {
+                "vnext_rms_norm_f32_to_f16"
+            }
         }
     }
 
     pub(super) fn residual(self) -> &'static str {
         match self {
             Self::F16 => "residual_add_f16",
-            Self::F32Master | Self::F32MasterQ8Projections => "vnext_residual_add_f32_f16",
+            Self::F32Master | Self::F32MasterQ8Projections | Self::F32MasterGgufF16Projections => {
+                "vnext_residual_add_f32_f16"
+            }
         }
     }
 
