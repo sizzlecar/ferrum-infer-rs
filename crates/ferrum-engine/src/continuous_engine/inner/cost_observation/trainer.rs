@@ -514,6 +514,14 @@ impl CostTrainingState {
         let _guard = self.trainer.lock();
         action()
     }
+
+    #[cfg(test)]
+    pub async fn with_training_paused_async<F: std::future::Future>(&self, action: F) -> F::Output {
+        // Protocol fixtures control producer/consumer interleaving. Holding
+        // this test-only guard never changes the nonblocking production sink.
+        let _guard = self.trainer.lock();
+        action.await
+    }
 }
 
 /// Owned by the worker closure itself. It runs on normal exit and unwind, even

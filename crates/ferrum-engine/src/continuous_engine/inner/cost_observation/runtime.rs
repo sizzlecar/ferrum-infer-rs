@@ -193,6 +193,11 @@ impl EngineCostRuntime {
     }
 
     #[cfg(test)]
+    pub async fn with_training_paused_async<F: std::future::Future>(&self, action: F) -> F::Output {
+        self.training.with_training_paused_async(action).await
+    }
+
+    #[cfg(test)]
     pub fn shutdown_started(&self) -> bool {
         self.worker
             .as_ref()

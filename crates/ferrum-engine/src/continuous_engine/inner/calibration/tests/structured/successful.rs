@@ -169,12 +169,21 @@ async fn structured_collector_real_driver_completes_three_frozen_populations_and
         (StructuredCapturePhase::Residual, PHASE_REQUESTS[1]),
         (StructuredCapturePhase::Qualification, PHASE_REQUESTS[2]),
     ] {
-        for _ in 0..requests {
-            completed_request(&mut session, &executor).await;
-        }
+        // The production sink may drop on try_lock contention. This success
+        // protocol fixture queues its declared finite population while the
+        // real worker is paused, then uses the normal FIFO freeze barrier to
+        // drain it. Loss/error behavior is exercised by the separate tests.
+        let runtime = Arc::clone(session.engine.inner.cost_runtime.as_ref().unwrap());
+        runtime
+            .with_training_paused_async(async {
+                for _ in 0..requests {
+                    completed_request(&mut session, &executor).await;
+                }
+            })
+            .await;
         let progress = session.structured_cost_progress().unwrap();
         assert_eq!(progress.phase, phase);
-        assert_eq!(progress.failed_members, [0, 0, 0]);
+        assert_eq!(progress.failed_members, [0, 0, 0], "{progress:?}");
         receipts.push(
             bounded(session.freeze_structured_cost_phase())
                 .await
