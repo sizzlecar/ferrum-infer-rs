@@ -8,35 +8,32 @@ use ferrum_interfaces::vnext::{
     causal_paged_attention_f32_master_int8_kv_contract, causal_paged_attention_int8_kv_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
     gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_contract,
-    last_token_dense_linear_f32_contract, last_token_masked_argmax_contract,
-    last_token_masked_argmax_f32_contract, residual_add_contract, residual_add_f32_f16_contract,
-    rms_norm_contract, rms_norm_f32_contract, rms_norm_f32_to_f16_contract,
-    routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract, token_embedding_contract,
-    token_embedding_f32_master_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityCatalog, CapabilityId, ContractVersion, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationRuntimeRegistry,
-    ProfilePhase, ProviderExecutionSemantics, ProviderId, ProviderReplayEquivalence,
-    ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology, SemanticValue, VNextError,
-    WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    last_token_dense_linear_f32_contract, last_token_dense_linear_f32_f16_operands_contract,
+    last_token_masked_argmax_contract, last_token_masked_argmax_f32_contract,
+    residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
+    rms_norm_f32_to_f16_contract, routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
+    token_embedding_contract, token_embedding_f32_master_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationRuntimeRegistry, ProfilePhase, ProviderExecutionSemantics, ProviderId,
+    ProviderReplayEquivalence, ProviderStorageBindingRequirement, QuantizationFormatId,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    SemanticValue, VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_CAPABILITY_ID,
     CAUSAL_PAGED_ATTENTION_INT8_KV_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID,
     RMS_NORM_F32_CAPABILITY_ID, RMS_NORM_F32_TO_F16_CAPABILITY_ID,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
-};
-use ferrum_interfaces::vnext::{
-    last_token_dense_linear_f32_f16_operands_contract,
-    LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_CAPABILITY_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -58,10 +55,9 @@ mod weights;
 
 use causal_attention::{MetalCausalAttentionPipelines, MetalCausalPagedAttentionProvider};
 use gated_delta_attention::{MetalGatedDeltaPipelines, MetalGatedDeltaRecurrentAttentionProvider};
-use linear::MetalHalfHeadProvider;
 use linear::{
-    MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalLastTokenDenseLinearProvider,
-    MetalLinearPipelines,
+    MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalHalfHeadProvider,
+    MetalLastTokenDenseLinearProvider, MetalLinearPipelines,
 };
 use moe::{MetalMoePipelines, MetalRoutedSharedSwiGluMoeProvider, MetalRoutedSwiGluMoeProvider};
 use primitives::{
@@ -907,7 +903,6 @@ mod tests {
             RMS_NORM_F32_OPERATION_ID,
             RESIDUAL_ADD_F32_F16_OPERATION_ID,
             LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
-            ferrum_interfaces::vnext::LAST_TOKEN_DENSE_LINEAR_F32_F16_OPERANDS_OPERATION_ID,
             LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,

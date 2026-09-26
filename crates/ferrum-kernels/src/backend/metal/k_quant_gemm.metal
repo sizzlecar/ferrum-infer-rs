@@ -73,6 +73,37 @@ static inline void dequantize_q4_K(
     }
 }
 
+#if defined(FERRUM_TEST_Q4_U16_BYTES)
+// Experimental fused-Q4 byte loader only. This function requires no stronger
+// alignment than block_q4_K already has: d/dmin are half, sizeof(block)=144,
+// offsetof(qs)=16 and this slice begins at a multiple of 16 bytes.
+// There is no persistent dequantized matrix or change to the MMA arithmetic.
+template <typename type4x4>
+static inline void dequantize_q4_K_u16_bytes(
+    device const block_q4_K * xb,
+    short il,
+    thread type4x4 & reg
+) {
+    device const uchar * q = xb->qs + 32 * (il / 4) + 16 * (il & 1);
+    device const ushort * pairs = reinterpret_cast<device const ushort *>(q);
+    const short is = (il / 4) * 2;
+    il &= 3;
+    const uchar2 sc = get_scale_min_k4(is, il / 2, xb->scales);
+    const float d = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
+    const float dl = d * float(sc[0]);
+    const float ml = float(xb->dmin) * float(sc[1]);
+    const ushort mask = il < 2 ? 0x0f : 0xf0;
+    FOR_UNROLL (int pair = 0; pair < 8; ++pair) {
+        // as_type preserves each byte's original memory position without
+        // introducing a host-endianness assumption in the byte extraction.
+        const uchar2 bytes = as_type<uchar2>(pairs[pair]);
+        const int i = 2 * pair;
+        reg[i / 4][i % 4] = dl * float(bytes[0] & mask) - ml;
+        reg[(i + 1) / 4][(i + 1) % 4] = dl * float(bytes[1] & mask) - ml;
+    }
+}
+#endif
+
 template <typename type4x4>
 static inline void dequantize_q5_K(
     device const block_q5_K * xb,
@@ -139,10 +170,47 @@ constant short TILE_INPUT_ROWS = 32;
 constant short TILE_K = 32;
 constant short WEIGHT_LOADERS_PER_ROW = 2;
 constant short INPUT_LOADERS_PER_ROW = 4;
+
+#if defined(FERRUM_TEST_Q4_DIRECT_F16_STORE)
+// Each lane owns two adjacent columns of an 8x8 MMA fragment. Keep the exact
+// final float-to-half conversion; no F32 result round trip through shared.
+static inline void store_full_tile_f16_direct(
+    thread const simdgroup_float8x8 * accumulators,
+    device half * output,
+    constant KQuantGemmParams & p,
+    int input_start,
+    int output_start,
+    ushort thread_index,
+    ushort simdgroup_index
+) {
+    const ushort lane = thread_index % 32;
+    const ushort quadrant = lane / 4;
+    const ushort local_row = (quadrant & 4) + (lane / 2) % 4;
+    const ushort local_column = (quadrant & 2) * 2 + (lane % 2) * 2;
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        const uint row = input_start + 16 * (simdgroup_index / 2)
+            + 8 * (i / 4) + local_row;
+        const uint column = output_start + 32 * (simdgroup_index % 2)
+            + 8 * (i % 4) + local_column;
+        const ulong offset = ulong(row) * p.output_stride
+            + p.output_column_offset + column;
+        thread const auto & values = accumulators[i].thread_elements();
+        output[offset] = half(values[0]);
+        output[offset + 1] = half(values[1]);
+    }
+}
+#endif
+
 template <
     typename block_q,
     short dequant_tiles_per_block,
     void (*dequantize)(device const block_q *, short, thread half4x4 &)
+#if defined(FERRUM_TEST_STAGED_CONTIGUOUS_STORE)
+    , bool contiguous_output_store = false
+#endif
+#if defined(FERRUM_TEST_Q4_DIRECT_F16_STORE)
+    , bool direct_f16_store = false
+#endif
 >
 static inline void gemm_f16a_quant_tiled(
     device const half * input,
@@ -247,6 +315,17 @@ static inline void gemm_f16a_quant_tiled(
         }
     }
 
+#if defined(FERRUM_TEST_Q4_DIRECT_F16_STORE)
+    // Uniform per-threadgroup choice. Partial tiles retain the exact old
+    // shared-memory path below; no thread returns across a divergent barrier.
+    if (direct_f16_store && input_count == TILE_INPUT_ROWS
+        && output_count == TILE_OUTPUT_ROWS) {
+        store_full_tile_f16_direct(accumulators, output, p, input_start,
+            output_start, thread_index, simdgroup_index);
+        return;
+    }
+#endif
+
     threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float * result_tile = ((threadgroup float *)shmem)
         + 32 * (simdgroup_index & 1)
@@ -262,6 +341,24 @@ static inline void gemm_f16a_quant_tiled(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#if defined(FERRUM_TEST_STAGED_CONTIGUOUS_STORE)
+    if (contiguous_output_store) {
+        // Test-only instantiation: all four SIMD groups write adjacent scalar
+        // half values. The shared float tile, conversion and preceding barrier
+        // are identical to the existing staged entrypoint.
+        for (uint index = thread_index;
+             index < uint(TILE_INPUT_ROWS * TILE_OUTPUT_ROWS);
+             index += 128) {
+            const uint row = index / uint(TILE_OUTPUT_ROWS);
+            const uint column = index % uint(TILE_OUTPUT_ROWS);
+            if (row < uint(input_count) && column < uint(output_count)) {
+                output[ulong(input_start + row) * p.output_stride
+                    + p.output_column_offset + output_start + column] =
+                    half(((threadgroup float *)shmem)[index]);
+            }
+        }
+    } else
+#endif
     if (simdgroup_index == 0) {
         for (int row = thread_index; row < input_count; row += TILE_INPUT_ROWS) {
             device half * destination = output
@@ -289,6 +386,62 @@ kernel void gemm_f16a_q4kw_tiled(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
+
+#if defined(FERRUM_TEST_Q4_U16_BYTES)
+kernel void gemm_f16a_q4kw_tiled_u16_bytes_experiment(
+    device const half * input [[buffer(0)]],
+    device const block_q4_K * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant KQuantGemmParams & p [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    gemm_f16a_quant_tiled<block_q4_K, 16, dequantize_q4_K_u16_bytes>(
+        input, weight, output, p, shmem, position, thread_index, simdgroup_index
+    );
+}
+#endif
+
+#if defined(FERRUM_TEST_Q4_DIRECT_F16_STORE)
+kernel void gemm_f16a_q4kw_tiled_direct_f16_experiment(
+    device const half * input [[buffer(0)]],
+    device const block_q4_K * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant KQuantGemmParams & p [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    // Use the original scalar-byte decoder, never the ushort candidate.
+    gemm_f16a_quant_tiled<block_q4_K, 16, dequantize_q4_K
+#if defined(FERRUM_TEST_STAGED_CONTIGUOUS_STORE)
+        , false
+#endif
+        , true>(input, weight, output, p, shmem, position,
+            thread_index, simdgroup_index);
+}
+
+// Untimed lane-layout test, using the exact same store helper as the candidate.
+// Rust supplies a distinct F32 value at every logical [32,64] position and an
+// independently guarded, strided F16 output. No GEMM timing uses this kernel.
+kernel void full_tile_f16_direct_store_probe(
+    device const float * source [[buffer(0)]],
+    device half * output [[buffer(1)]],
+    constant KQuantGemmParams & p [[buffer(2)]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    simdgroup_float8x8 accumulators[8];
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        const uint row = 16 * (simdgroup_index / 2) + 8 * (i / 4);
+        const uint column = 32 * (simdgroup_index % 2) + 8 * (i % 4);
+        simdgroup_load(accumulators[i], source + row * 64 + column,
+            64, 0, false);
+    }
+    store_full_tile_f16_direct(accumulators, output, p, 0, 0,
+        thread_index, simdgroup_index);
+}
+#endif
 
 kernel void gemm_f16a_q5kw_tiled(
     device const half * input [[buffer(0)]],
@@ -377,6 +530,20 @@ kernel void stage_q4k_f16(
     stage_quant_f16<block_q4_K, dequantize_q4_K>(weight, staged, blocks, tile);
 }
 
+#if defined(FERRUM_TEST_Q4_U16_BYTES)
+// Untimed coefficient conformance probe. This is not the candidate compute
+// route: both timed arms consume packed Q4 blocks directly in the fused GEMM.
+kernel void stage_q4k_f16_u16_bytes_probe(
+    device const block_q4_K * weight [[buffer(0)]],
+    device half * staged [[buffer(1)]],
+    constant uint & blocks [[buffer(2)]],
+    uint tile [[thread_position_in_grid]]) {
+    stage_quant_f16<block_q4_K, dequantize_q4_K_u16_bytes>(
+        weight, staged, blocks, tile
+    );
+}
+#endif
+
 kernel void stage_q6k_f16(
     device const block_q6_K * weight [[buffer(0)]],
     device half * staged [[buffer(1)]],
@@ -406,3 +573,21 @@ kernel void gemm_f16a_f16w_tiled(
         input, weight, output, p, shmem, position, thread_index, simdgroup_index
     );
 }
+
+#if defined(FERRUM_TEST_STAGED_CONTIGUOUS_STORE)
+// Compiled only by the opt-in Rust test helper, never registered or selected
+// by a production pipeline. It uses the same 128 threads and 8 KiB workspace.
+kernel void gemm_f16a_f16w_tiled_contiguous_store(
+    device const half * input [[buffer(0)]],
+    device const block_f16_32 * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant KQuantGemmParams & p [[buffer(3)]],
+    threadgroup char * shmem [[threadgroup(0)]],
+    uint3 position [[threadgroup_position_in_grid]],
+    ushort thread_index [[thread_index_in_threadgroup]],
+    ushort simdgroup_index [[simdgroup_index_in_threadgroup]]) {
+    gemm_f16a_quant_tiled<block_f16_32, 2, load_f16_tile, true>(
+        input, weight, output, p, shmem, position, thread_index, simdgroup_index
+    );
+}
+#endif

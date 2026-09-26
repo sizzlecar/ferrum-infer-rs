@@ -25,6 +25,23 @@ pub(crate) struct MetalKQuantGemmPipelines {
 }
 
 impl MetalKQuantGemmPipelines {
+    /// Independent test PSO; production construction and selection are unchanged.
+    #[cfg(test)]
+    pub(crate) fn staged_contiguous_store_for_test(
+        device: &Device,
+    ) -> Result<ComputePipelineState, String> {
+        let source = format!("#define FERRUM_TEST_STAGED_CONTIGUOUS_STORE 1\n{SHADER_SOURCE}");
+        let library = device
+            .new_library_with_source(&source, &CompileOptions::new())
+            .map_err(|error| format!("compile staged contiguous-store test library: {error}"))?;
+        let function = library
+            .get_function("gemm_f16a_f16w_tiled_contiguous_store", None)
+            .map_err(|error| format!("load staged contiguous-store test kernel: {error}"))?;
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| format!("build staged contiguous-store test pipeline: {error}"))
+    }
+
     pub(crate) fn new(device: &Device) -> Result<Self, String> {
         let library = device
             .new_library_with_source(SHADER_SOURCE, &CompileOptions::new())

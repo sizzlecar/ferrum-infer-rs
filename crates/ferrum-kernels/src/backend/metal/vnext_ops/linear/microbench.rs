@@ -19,7 +19,13 @@ use metal::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
+mod b8_m8_mma;
+mod b8_two_b4;
+mod gdn_prefill_staging;
+mod q4_b4_ffn_cooperative;
+mod q4_prefill_u16;
 mod q6_shared_groups;
+mod staged_contiguous_store;
 
 const WARMUP_ROUNDS: usize = 2;
 const MEASURED_ROUNDS: usize = 8;
@@ -488,6 +494,26 @@ fn quantized_decode_dispatch_microbench() {
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn quantized_shared_weight_microbench() {
     measure_dispatches(&[2, 3, 4], false);
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn q4_small_batch_ffn_dispatch_microbench() {
+    // The captured 9B ShareGPT decode waves use M3/M4. The production control
+    // at this geometry is SharedWeight, which already reuses quantized weights
+    // across rows; Gemv is a diagnostic reference, not the baseline to beat.
+    // Compare the existing fused tiled kernel, including its padded small-M
+    // work. No full-matrix staging or materialized-weight cache is introduced.
+    measure_dispatch_shapes(
+        &[Shape {
+            name: "ffn_gate_or_up",
+            input: 4096,
+            output: 12288,
+            format: GgufBlockFormat::Q4K,
+        }],
+        &[3, 4],
+        true,
+    );
 }
 
 #[test]
@@ -1436,11 +1462,12 @@ fn q5_shared_weight_selection_preserves_shape_and_f32_boundaries() {
             .f32_pipeline(LinearPhysicalFormat::Q5K, rows)
             .is_none());
     }
-    for rows in [1, 2, 3, 4, 5, 7, 8] {
+    for rows in [1, 2, 3, 4, 5, 7, 8, 9, 16] {
         for output_width in [7, 1023, 1024, 1025, 8192] {
             let expected = match (rows, output_width) {
                 (2..=4, 1024..) => LinearDispatchKind::SharedWeightGemv,
-                (8.., _) => LinearDispatchKind::TiledGemm,
+                (8, _) => LinearDispatchKind::TiledGemmM8,
+                (9.., _) => LinearDispatchKind::TiledGemm,
                 _ => LinearDispatchKind::CooperativeGemv,
             };
             assert_eq!(
@@ -1524,6 +1551,17 @@ impl PrefillStagingCase {
     const GUARD: f16 = f16::from_bits(0x57b0); // 123
 
     fn new(device: &Device, shape: Shape, rows: u32) -> Self {
+        Self::with_output_layout(device, shape, rows, shape.output + 11, 5)
+    }
+
+    fn with_output_layout(
+        device: &Device,
+        shape: Shape,
+        rows: u32,
+        output_stride: u32,
+        output_column_offset: u32,
+    ) -> Self {
+        assert!(output_stride >= output_column_offset.checked_add(shape.output).unwrap());
         let mut input_values = vec![Self::GUARD; Self::INPUT_PREFIX];
         input_values.extend(
             (0..rows as usize * shape.input as usize)
@@ -1538,8 +1576,8 @@ impl PrefillStagingCase {
             rows,
             in_features: shape.input,
             out_features: shape.output,
-            output_stride: shape.output + 11,
-            output_column_offset: 5,
+            output_stride,
+            output_column_offset,
         };
         let output_elements =
             Self::OUTPUT_PREFIX + rows as usize * params.output_stride as usize + 13;
@@ -1565,7 +1603,26 @@ impl PrefillStagingCase {
         staged: &Buffer,
         candidate: bool,
     ) -> serde_json::Value {
-        let output = &self.outputs[usize::from(candidate)];
+        self.run_with_staged_pipeline(
+            queue,
+            pipelines,
+            staged,
+            candidate,
+            &pipelines.staged_f16,
+            usize::from(candidate),
+        )
+    }
+
+    fn run_with_staged_pipeline(
+        &self,
+        queue: &CommandQueueRef,
+        pipelines: &MetalKQuantGemmPipelines,
+        staged: &Buffer,
+        candidate: bool,
+        staged_pipeline: &metal::ComputePipelineState,
+        output_index: usize,
+    ) -> serde_json::Value {
+        let output = &self.outputs[output_index];
         // SAFETY: the shared half buffer has this size and no prior command is
         // live. Guards stay finite; every actual output starts as NaN.
         let values = unsafe {
@@ -1601,11 +1658,7 @@ impl PrefillStagingCase {
                 MTLSize::new(128, 1, 1),
             );
         }
-        encoder.set_compute_pipeline_state(if candidate {
-            &pipelines.staged_f16
-        } else {
-            fused
-        });
+        encoder.set_compute_pipeline_state(if candidate { staged_pipeline } else { fused });
         encoder.set_buffer(0, Some(&self.input), (Self::INPUT_PREFIX * 2) as u64);
         encoder.set_buffer(
             1,
@@ -1793,6 +1846,49 @@ fn quantized_prefill_staging_microbench() {
 
 #[test]
 #[ignore = "GPU performance experiment: coordinate exclusive device access"]
+fn quantized_prefill_staging_9b_mixed_width_microbench() {
+    // Independent of the contiguous-store candidate: compare only the existing
+    // fused kernel with fresh staging plus the existing staged GEMM. Explicit
+    // test dispatch bypasses the production row threshold without changing it.
+    for (name, input, output, format, stride, column) in [
+        (
+            "mixed_ffn_gate_or_up",
+            4096,
+            12288,
+            GgufBlockFormat::Q4K,
+            24576,
+            12288,
+        ),
+        (
+            "mixed_ffn_down_q4",
+            12288,
+            4096,
+            GgufBlockFormat::Q4K,
+            4096,
+            0,
+        ),
+        (
+            "mixed_ffn_down_q6",
+            12288,
+            4096,
+            GgufBlockFormat::Q6K,
+            4096,
+            0,
+        ),
+    ] {
+        let shape = Shape {
+            name,
+            input,
+            output,
+            format,
+        };
+        let cases = [64, 128, 256].map(|rows| (shape, rows));
+        measure_prefill_staging_with_output_layout(&cases, Some((stride, column)));
+    }
+}
+
+#[test]
+#[ignore = "GPU performance experiment: coordinate exclusive device access"]
 fn quantized_prefill_staging_large_ffn_microbench() {
     // Real mixed 27B FFN dimensions, including active-decode prefill chunks.
     // Every candidate command pays for dequantization; the control is fused.
@@ -1873,12 +1969,24 @@ fn quantized_prefill_staging_small_cost_microbench() {
 }
 
 fn measure_prefill_staging(shapes: &[(Shape, u32)]) {
+    measure_prefill_staging_with_output_layout(shapes, None);
+}
+
+fn measure_prefill_staging_with_output_layout(
+    shapes: &[(Shape, u32)],
+    output_layout: Option<(u32, u32)>,
+) {
     let device = Device::system_default().expect("prefill microbench requires Metal");
     let queue = device.new_command_queue();
     let pipelines = MetalKQuantGemmPipelines::new(&device).unwrap();
     let cases = shapes
         .iter()
-        .map(|&(shape, rows)| PrefillStagingCase::new(&device, shape, rows))
+        .map(|&(shape, rows)| match output_layout {
+            Some((stride, column)) => {
+                PrefillStagingCase::with_output_layout(&device, shape, rows, stride, column)
+            }
+            None => PrefillStagingCase::new(&device, shape, rows),
+        })
         .collect::<Vec<_>>();
     let staged_elements = cases
         .iter()
@@ -1911,6 +2019,7 @@ fn measure_prefill_staging(shapes: &[(Shape, u32)]) {
                 "kind": "quantized_prefill_staging_microbench", "device": device.name(),
                 "shape": case.shape.name, "format": case.shape.format.format_id(),
                 "rows": case.params.rows, "input_features": case.shape.input, "output_features": case.shape.output,
+                "output_stride": case.params.output_stride, "output_column_offset": case.params.output_column_offset,
                 "quantized_bytes": case.quantized_bytes.len(), "staged_payload_bytes": case.staged_elements() * 2,
                 "shared_staged_allocation_bytes": staged.length(), "scratch_reused_across_cases": true,
                 "pipeline_max_threads": pipelines.staged_f16.max_total_threads_per_threadgroup(),

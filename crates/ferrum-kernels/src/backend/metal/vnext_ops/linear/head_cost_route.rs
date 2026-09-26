@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn half_packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
+    fn packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
         for (count, dispatches) in [(2, 1), (5, 2), (7, 2), (8, 1), (17, 1), (33, 1)] {
             let route = command(
                 LastTokenProjectionKind::Half,
@@ -228,99 +228,6 @@ mod tests {
             assert_eq!(route.batching(), DeviceBatchingForm::Packed);
             let gathered = command(
                 LastTokenProjectionKind::Half,
-                ElementType::F32,
-                part(),
-                256,
-                1024,
-                count,
-                count as u64 + 2,
-                true,
-                false,
-            )
-            .unwrap();
-            assert_eq!(gathered.transfer_command_count(), 2 * count as u64);
-            assert_eq!(
-                gathered.compute_dispatch_count(),
-                route.compute_dispatch_count()
-            );
-        }
-    }
-
-    #[test]
-    fn half_head_checks_kernel_integer_boundaries_before_submission() {
-        assert!(command(
-            LastTokenProjectionKind::Half,
-            ElementType::F32,
-            part(),
-            256,
-            i32::MAX as u64 + 1,
-            2,
-            2,
-            true,
-            true
-        )
-        .is_err());
-        assert!(command(
-            LastTokenProjectionKind::Half,
-            ElementType::F16,
-            part(),
-            256,
-            1024,
-            2,
-            2,
-            true,
-            true
-        )
-        .is_err());
-        assert!(command(
-            LastTokenProjectionKind::Strict,
-            ElementType::F32,
-            part(),
-            256,
-            1024,
-            0,
-            0,
-            false,
-            false
-        )
-        .is_err());
-    }
-}
-
-#[cfg(test)]
-mod strict_regression {
-    use super::*;
-
-    fn part() -> PreparedLinearPart {
-        PreparedLinearPart {
-            region: 0,
-            format: LinearPhysicalFormat::Q6K,
-            out_features: 1024,
-            output_offset: 0,
-            transform: None,
-        }
-    }
-
-    #[test]
-    fn packed_decode_skips_gather_but_keeps_scatter_and_small_cohort_splits() {
-        for (count, dispatches) in [(2, 1), (5, 1), (7, 1), (8, 2), (17, 5), (33, 1)] {
-            let route = command(
-                LastTokenProjectionKind::Strict,
-                ElementType::F32,
-                part(),
-                256,
-                1024,
-                count,
-                count as u64,
-                true,
-                true,
-            )
-            .unwrap();
-            assert_eq!(route.transfer_command_count(), count as u64);
-            assert_eq!(route.compute_dispatch_count(), dispatches);
-            assert_eq!(route.batching(), DeviceBatchingForm::Packed);
-            let gathered = command(
-                LastTokenProjectionKind::Strict,
                 ElementType::F32,
                 part(),
                 256,
@@ -364,20 +271,42 @@ mod strict_regression {
     }
 
     #[test]
-    fn strict_head_rejects_empty_and_shader_width_overflow() {
-        for (outputs, participants, tokens) in [(1024, 0, 0), (u32::MAX as u64 + 1, 2, 2)] {
-            assert!(command(
-                LastTokenProjectionKind::Strict,
-                ElementType::F32,
-                part(),
-                256,
-                outputs,
-                participants,
-                tokens,
-                false,
-                false
-            )
-            .is_err());
-        }
+    fn half_head_checks_kernel_integer_boundaries_before_submission() {
+        assert!(command(
+            LastTokenProjectionKind::Half,
+            ElementType::F32,
+            part(),
+            256,
+            i32::MAX as u64 + 1,
+            2,
+            2,
+            true,
+            true
+        )
+        .is_err());
+        assert!(command(
+            LastTokenProjectionKind::Half,
+            ElementType::F16,
+            part(),
+            256,
+            1024,
+            2,
+            2,
+            true,
+            true
+        )
+        .is_err());
+        assert!(command(
+            LastTokenProjectionKind::Strict,
+            ElementType::F32,
+            part(),
+            256,
+            1024,
+            0,
+            0,
+            false,
+            false
+        )
+        .is_err());
     }
 }

@@ -354,35 +354,7 @@ pub(super) fn embedding_scratch_bytes(
         .ok_or_else(|| "Metal embedding inverse workspace size overflows".to_owned())
 }
 
-/// Equivalent explicit row-major strides are legal resolved value/block storage. The
-/// future route must prove the flat ABI; actual encoding retains its original
-/// live-layout validation and does not acquire a new storage restriction here.
-fn row_major_storage(storage: &PhysicalStorageLayout, dimensions: &[u64]) -> bool {
-    match storage {
-        PhysicalStorageLayout::Contiguous {
-            padding: PhysicalWeightPadding::Exact,
-        } => true,
-        PhysicalStorageLayout::Strided {
-            strides_in_elements,
-            padding: PhysicalWeightPadding::Exact,
-        } if strides_in_elements.len() == dimensions.len() => {
-            let mut expected = 1_u64;
-            for (&extent, &stride) in dimensions.iter().zip(strides_in_elements).rev() {
-                if extent == 0 || (extent > 1 && stride != expected) {
-                    return false;
-                }
-                let Some(next) = expected.checked_mul(extent) else {
-                    return false;
-                };
-                expected = next;
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Static interpretation of the resolved embedding ABI for the future query. Component
+/// One shared static interpretation of the resolved embedding ABI. Component
 /// indices retain the canonical order used by `resolve_weight`; no GPU region
 /// or allocation is created. Actual encoding additionally validates live views.
 pub(super) fn embedding_weight_metadata(
@@ -413,11 +385,10 @@ fn embedding_weight_layout(
             .map_err(|_| "Metal embedding physical component is absent".to_owned())
     };
     let exact = |component: &ferrum_interfaces::vnext::PhysicalWeightComponentBinding| {
-        let at = index(&component.component_id)?;
-        if !row_major_storage(&component.storage, components[at].physical_dimensions()) {
-            return Err("Metal embedding cost requires row-major component storage".to_owned());
+        if component.storage != PhysicalStorageLayout::exact_contiguous() {
+            return Err("Metal embedding requires exact contiguous component storage".to_owned());
         }
-        Ok(at)
+        index(&component.component_id)
     };
     let (layout, transform) = match weight.physical_layout() {
         PhysicalWeightLayout::Hadamard { values, transform } => {
@@ -428,11 +399,6 @@ fn embedding_weight_layout(
             let signs_region = match &transform.signs {
                 HadamardSigns::Identity => None,
                 HadamardSigns::Explicit(signs) => {
-                    // The schema deliberately narrows TransformSigns to this
-                    // immutable exact-contiguous ABI, unlike values/blocks.
-                    if signs.storage != PhysicalStorageLayout::exact_contiguous() {
-                        return Err("Metal Hadamard signs require exact-contiguous storage".into());
-                    }
                     let at = exact(signs)?;
                     if components[at].encoding()
                         != &(WeightEncoding::Dense {

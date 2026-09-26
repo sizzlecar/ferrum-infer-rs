@@ -37,7 +37,7 @@ use super::super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 use super::hadamard::{self, HadamardTransform, MetalHadamardPipelines};
-use super::weights::{resolve_weight, validate_hadamard_transform, MetalResolvedWeightLayout};
+use super::weights::{resolve_weight, validate_hadamard_transform};
 use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
     contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
@@ -890,9 +890,17 @@ fn encode_token_embedding_typed(
             hidden_size,
             output_type,
         )?;
-        let weight = resolve_weight(participant, table)?;
         let (format, table_component, transform) =
-            embedding_weight_format(&weight, vocabulary_size, hidden_size)?;
+            cost_route::embedding_weight_metadata(table, vocabulary_size, hidden_size)?;
+        let weight = resolve_weight(participant, table)?;
+        if let Some(transform) = transform {
+            validate_hadamard_transform(
+                transform,
+                hidden_size,
+                weight.components(),
+                weight.regions(),
+            )?;
+        }
         let (mut table_regions, _, _) = weight.into_command_parts();
         let first_region = regions.len();
         let transform = transform
@@ -1029,101 +1037,6 @@ fn encode_token_embedding_typed(
     .with_statistical_evidence(statistical)
     .with_work_shape(batching, participant_count, token_count)
     .map_err(|error| error.to_string())
-}
-
-fn embedding_weight_format(
-    weight: &super::weights::MetalResolvedWeight,
-    vocabulary_size: u64,
-    hidden_size: u64,
-) -> Result<(EmbeddingPhysicalFormat, usize, Option<HadamardTransform>), String> {
-    if weight.logical_element_type() != ElementType::F16
-        || weight.logical_dimensions() != [vocabulary_size, hidden_size]
-    {
-        return Err("Metal embedding logical weight differs from its contract".to_owned());
-    }
-    let (layout, transform) = match weight.layout() {
-        MetalResolvedWeightLayout::Hadamard { values, transform } => {
-            if !transform.inverse {
-                return Err("Metal embedding requires an inverse Hadamard transform".to_owned());
-            }
-            validate_hadamard_transform(
-                *transform,
-                hidden_size,
-                weight.components(),
-                weight.regions(),
-            )?;
-            (values.as_ref(), Some(*transform))
-        }
-        layout => (layout, None),
-    };
-    let (component, format) = match layout {
-        MetalResolvedWeightLayout::Dense { component }
-        | MetalResolvedWeightLayout::Stored { component } => {
-            let component = *component;
-            let metadata = weight
-                .components()
-                .get(component)
-                .ok_or_else(|| "Metal dense embedding component is absent".to_owned())?;
-            if metadata.encoding()
-                != &(WeightEncoding::Dense {
-                    element_type: ElementType::F16,
-                })
-                || metadata.physical_dimensions() != [vocabulary_size, hidden_size]
-            {
-                return Err("Metal dense embedding physical ABI differs".to_owned());
-            }
-            (component, EmbeddingPhysicalFormat::DenseF16)
-        }
-        MetalResolvedWeightLayout::BlockQuantized {
-            component,
-            spec,
-            block_axis,
-            block_padding,
-        } => {
-            if *block_axis != 1 || block_padding != &PhysicalWeightPadding::Exact {
-                return Err("Metal quantized embedding physical ABI differs".to_owned());
-            }
-            let (format, values_per_block) = match (
-                spec.format_id.as_str(),
-                spec.logical_values_per_block,
-                spec.bytes_per_block,
-            ) {
-                (Q4_K_FORMAT_ID, 256, 144) => (EmbeddingPhysicalFormat::Q4K, 256),
-                (Q6_K_FORMAT_ID, 256, 210) => (EmbeddingPhysicalFormat::Q6K, 256),
-                (Q8_0_FORMAT_ID, 32, 34) => (EmbeddingPhysicalFormat::Q8_0, 32),
-                (PQ2_0_FORMAT_ID, 128, 34) => (EmbeddingPhysicalFormat::Pq2_0, 128),
-                _ => {
-                    return Err(
-                        "Metal embedding does not support this quantized block ABI".to_owned()
-                    )
-                }
-            };
-            if !hidden_size.is_multiple_of(values_per_block) {
-                return Err("Metal quantized embedding row has partial blocks".to_owned());
-            }
-            let metadata = weight
-                .components()
-                .get(*component)
-                .ok_or_else(|| "Metal quantized embedding component is absent".to_owned())?;
-            if metadata.physical_dimensions() != [vocabulary_size, hidden_size / values_per_block]
-                || metadata.encoding() != &WeightEncoding::BlockQuantized(spec.clone())
-            {
-                return Err("Metal quantized embedding component shape differs".to_owned());
-            }
-            (*component, format)
-        }
-        _ => return Err("Metal token embedding does not support this physical layout".to_owned()),
-    };
-    let signs = transform.and_then(|transform| transform.signs_region);
-    if component >= weight.regions().len()
-        || signs == Some(component)
-        || weight.regions().len() != 1 + usize::from(signs.is_some())
-    {
-        return Err(
-            "Metal token embedding requires one table and its declared transform signs".to_owned(),
-        );
-    }
-    Ok((format, component, transform))
 }
 
 fn validate_embedding_signature(

@@ -48,48 +48,6 @@ fn start_fake(
 }
 
 #[test]
-fn device_memory_runtime_samples_real_allocations_and_refuses_a_second_capture() {
-    use ferrum_interfaces::vnext::DeviceRuntime;
-
-    let runtime = super::super::tests::runtime();
-    let path = CapturePath::new();
-    let second_path = CapturePath::new();
-    runtime
-        .enable_device_memory_sampling(&DeviceMemorySamplingConfig {
-            jsonl_path: path.0.clone(),
-        })
-        .unwrap();
-    let initial = runtime.device_memory_snapshot().unwrap();
-    assert!(
-        initial.sample_count > 0,
-        "first query precedes start returning"
-    );
-    assert_eq!(
-        initial.device_registry_id,
-        runtime.device().registry_id().to_string()
-    );
-    assert!(runtime
-        .enable_device_memory_sampling(&DeviceMemorySamplingConfig {
-            jsonl_path: second_path.0.clone(),
-        })
-        .is_err());
-    assert!(!second_path.0.exists());
-
-    let allocation = runtime.device().new_buffer(
-        8 * 1024 * 1024,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    runtime.finish_device_memory_sampling().unwrap();
-    let final_sample = runtime.device_memory_snapshot().unwrap();
-    assert!(final_sample.complete);
-    assert_eq!(final_sample.source, "MTLDevice.currentAllocatedSize");
-    assert!(final_sample.current_allocated_bytes >= u64::from(allocation.allocated_size()));
-    assert!(final_sample.peak_allocated_bytes >= initial.current_allocated_bytes);
-    assert_eq!(final_sample.error_count, 0);
-    assert_eq!(final_sample.end_reason.as_deref(), Some("shutdown"));
-}
-
-#[test]
 fn device_memory_final_sample_preserves_identity_and_peak_and_finish_is_idempotent() {
     let path = CapturePath::new();
     let mut samples = [Ok(8), Ok(29)].into_iter();

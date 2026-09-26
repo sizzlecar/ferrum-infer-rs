@@ -29,10 +29,13 @@ void q4_shared(device const T * input, device const Q4Block * weights,
     const ushort it = lane % 8;
     const ushort iq = it / 4;
     const ushort ir = it % 4;
-    float sums[B][2] = {};
-    for (uint block = ix; block < blocks; block += 4) {
-        UNROLL (ushort row = 0; row < 2; ++row) {
-            if (first + row >= p.out_features) continue;
+    // As in Q5, finish one output before starting the next so only its B
+    // accumulators remain live throughout the quantized block traversal.
+    #pragma clang loop unroll(disable)
+    for (ushort row = 0; row < 2; ++row) {
+        if (first + row >= p.out_features) continue;
+        float sums[B] = {};
+        for (uint block = ix; block < blocks; block += 4) {
             device const Q4Block & w = weights[(first + row) * blocks + block];
             device const ushort * sc = (device const ushort *)w.scales + iq;
             ushort packed_sc[4];
@@ -68,7 +71,7 @@ void q4_shared(device const T * input, device const Q4Block * weights,
                     acc2[2] += yh[2*i + 8] * (qhi[i] & 0x00f0);
                     acc2[3] += yh[2*i + 9] * (qhi[i] & 0xf000);
                 }
-                sums[batch][row] += d * (
+                sums[batch] += d * (
                     (acc1[0] + (1.f/256.f) * acc1[1]) * scales[0] +
                     (acc1[2] + (1.f/256.f) * acc1[3]) * scales[1] * (1.f/16.f) +
                     (acc2[0] + (1.f/256.f) * acc2[1]) * scales[4] +
@@ -77,11 +80,8 @@ void q4_shared(device const T * input, device const Q4Block * weights,
                             sumy[2] * scales[6] + sumy[3] * scales[7]);
             }
         }
-    }
-    UNROLL (ushort batch = 0; batch < B; ++batch) {
-        UNROLL (ushort row = 0; row < 2; ++row) {
-            if (first + row >= p.out_features) continue;
-            const float sum = simd_sum(sums[batch][row]);
+        UNROLL (ushort batch = 0; batch < B; ++batch) {
+            const float sum = simd_sum(sums[batch]);
             if (lane == 0) output[ulong(batch) * p.output_stride + p.output_column_offset + first + row] = T(sum);
         }
     }

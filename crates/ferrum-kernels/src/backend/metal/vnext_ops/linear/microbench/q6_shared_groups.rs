@@ -5,6 +5,7 @@ use crate::backend::metal::vnext_ops::MetalVNextComposition;
 use ferrum_interfaces::vnext::{BufferRequest, BufferUsage, DeviceId, ResourceId};
 
 mod f32_groups;
+mod half_operands;
 
 const INPUT_PREFIX: usize = 4;
 const OUTPUT_PREFIX: usize = 8;
