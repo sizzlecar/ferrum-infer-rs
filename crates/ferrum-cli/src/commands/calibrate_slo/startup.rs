@@ -131,7 +131,12 @@ pub(super) async fn prepare(
     }
     let session = EngineBuilder::new(engine)
         .with_defined_model(defined)
-        .build_calibration(CalibrationLimits::new(manifest.protocol.maximum_requests)?)
+        .build_calibration(
+            CalibrationLimits::new(manifest.protocol.maximum_requests)?
+                .with_structured_prepared_projection_budget(
+                    manifest.protocol.structured_prepared_projection_budget_us,
+                ),
+        )
         .await?;
     crate::startup::apply_engine_plan(&mut resolved, session.configuration());
     let provenance = serde_json::json!({

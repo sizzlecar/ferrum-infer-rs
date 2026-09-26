@@ -195,6 +195,10 @@ impl ValidationSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Protocol {
+    /// Manual Structured V2 membership read only; omission preserves the legacy allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_prepared_projection_budget_us:
+        Option<ferrum_engine::continuous_engine::StructuredPreparedProjectionBudgetV2>,
     pub total_timeout_ms: NonZeroU64,
     pub shutdown_timeout_ms: NonZeroU64,
     pub maximum_wave_attempts: NonZeroU64,
@@ -377,6 +381,14 @@ impl Manifest {
     pub(super) fn validate(&self) -> Result<()> {
         let invalid = |message| Err(FerrumError::config(message));
         let p = &self.protocol;
+        if p.structured_prepared_projection_budget_us.is_some()
+            && self.validation_model.structured_v2().is_none()
+            && self.validation_model.structured_group_v2().is_none()
+        {
+            return invalid(
+                "Prepared diagnostic budget is only valid for single/group Structured V2 capture",
+            );
+        }
         if let Some((profile, source)) = self.validation_model.destinations() {
             if profile.as_os_str().is_empty() || source.as_os_str().is_empty() || profile == source
             {

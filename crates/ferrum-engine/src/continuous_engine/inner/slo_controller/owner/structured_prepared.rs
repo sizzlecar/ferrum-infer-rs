@@ -22,6 +22,30 @@ impl PreparedControllerWave {
     pub(in crate::continuous_engine::inner) fn structured_prepared_facts(
         &self,
         engine: &EngineInner,
+        configured_budget: Option<
+            super::super::super::calibration::StructuredPreparedProjectionBudgetV2,
+        >,
+    ) -> Result<PreparedStructuredFactsV2> {
+        use super::super::super::calibration::StructuredPreparedProjectionReportV2;
+        let (result, report) = StructuredPreparedProjectionReportV2::capture(
+            configured_budget,
+            engine.config.scheduler.slo.planner.planning_budget(),
+            slo_clock_now,
+            |started, allowance| {
+                self.structured_prepared_facts_with_budget(engine, started, allowance)
+            },
+        );
+        if let Some(receipt) = &self.flight.calibration {
+            receipt.record_structured_prepared_projection(report)?;
+        }
+        result
+    }
+
+    fn structured_prepared_facts_with_budget(
+        &self,
+        engine: &EngineInner,
+        started: Instant,
+        allowance: std::time::Duration,
     ) -> Result<PreparedStructuredFactsV2> {
         if !engine.manual_calibration_driver
             || !self.armed
@@ -46,10 +70,7 @@ impl PreparedControllerWave {
         }
         // An independent bounded diagnostic read: this never extends the
         // original publication/witness deadline or supplies an execution token.
-        let budget = ControllerBudget::new(
-            slo_clock_now(),
-            engine.config.scheduler.slo.planner.planning_budget(),
-        )?;
+        let budget = ControllerBudget::new(started, allowance)?;
         let poll = || -> Result<()> {
             if budget.poll() {
                 Ok(())

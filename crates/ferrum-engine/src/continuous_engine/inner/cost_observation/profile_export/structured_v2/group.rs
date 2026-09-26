@@ -124,8 +124,10 @@ impl StructuredCalibrationGroupV2 {
                 child.options.phase_members,
                 Arc::clone(&capture),
             )?;
-            // No JSON construction/file writes here: the original host wall
-            // has begun, and every child already has its fixed member slot.
+            // Reserve every child before execution. The original measured wall
+            // starts later in dispatch_controller_wave; diagnostic projection
+            // and membership assignment do not shift that boundary. Defer the
+            // shared JSON output until the original receipt is finalized.
             Ok(())
         })
     }

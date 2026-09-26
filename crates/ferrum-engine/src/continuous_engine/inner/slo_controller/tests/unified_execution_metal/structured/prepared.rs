@@ -31,7 +31,7 @@ async fn structured_prepared_metal_route_is_read_only_and_matches_real_length_se
             }
         };
         let counters = inner.model_executor.cache_metrics_snapshot().unwrap()["counters"].clone();
-        let facts = prepared.structured_prepared_facts(&inner).unwrap();
+        let facts = prepared.structured_prepared_facts(&inner, None).unwrap();
         facts.validate().unwrap();
         assert_eq!(facts.rows.len(), 1);
         assert_eq!(facts.rows[0].request_id, id);

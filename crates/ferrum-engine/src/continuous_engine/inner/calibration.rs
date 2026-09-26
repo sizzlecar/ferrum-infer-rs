@@ -25,12 +25,16 @@ mod audit_readiness;
 mod checkpoint;
 mod evidence;
 mod planning_audit;
+mod prepared_projection;
 pub use audit_readiness::{CalibrationAuditReadinessV2, CalibrationAuditRowReadinessV2};
 pub use planning_audit::{
     RequiredFutureAuditActionV2, RequiredFutureAuditCostV2, RequiredFutureAuditFailureV2,
     RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,
     RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
     RequiredFutureAuditReportV2, RequiredFutureAuditRowV2,
+};
+pub use prepared_projection::{
+    StructuredPreparedProjectionBudgetV2, StructuredPreparedProjectionReportV2,
 };
 mod observation;
 mod reference;
@@ -365,7 +369,10 @@ impl CalibrationSession {
                 }
                 if let Some(collector) = &mut self.structured_capture_v2 {
                     if collector.collecting() {
-                        match prepared.structured_prepared_facts(&inner) {
+                        match prepared.structured_prepared_facts(
+                            &inner,
+                            self.limits.structured_prepared_projection_budget(),
+                        ) {
                             Ok(facts) => {
                                 if let Err(error) = collector.reserve_prepared(facts) {
                                     collector.invalidate(error.to_string());
@@ -387,7 +394,10 @@ impl CalibrationSession {
                 }
                 if let Some(collector) = &mut self.structured_group_v2 {
                     if collector.collecting() {
-                        match prepared.structured_prepared_facts(&inner) {
+                        match prepared.structured_prepared_facts(
+                            &inner,
+                            self.limits.structured_prepared_projection_budget(),
+                        ) {
                             Ok(facts) => {
                                 if let Err(error) = collector.reserve_prepared(facts) {
                                     collector.invalidate(error.to_string());

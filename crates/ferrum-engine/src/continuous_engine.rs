@@ -1272,7 +1272,8 @@ pub use inner::calibration::{
     RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,
     RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
     RequiredFutureAuditReportV2, RequiredFutureAuditRowV2, SelectedCalibrationOptions,
-    SelectedFitFreezeReceipt,
+    SelectedFitFreezeReceipt, StructuredPreparedProjectionBudgetV2,
+    StructuredPreparedProjectionReportV2,
 };
 pub use inner::calibration::{
     StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,

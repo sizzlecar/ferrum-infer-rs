@@ -4,6 +4,25 @@ use sha2::{Digest, Sha256};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 #[test]
+fn prepared_projection_budget_preserves_legacy_wire_and_rejects_unrelated_modes() {
+    let original = manifest();
+    let wire = serde_json::to_value(&original).unwrap();
+    assert!(wire["protocol"]
+        .get("structured_prepared_projection_budget_us")
+        .is_none());
+    let legacy: manifest::Manifest = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), wire);
+    let mut explicit = wire;
+    explicit["protocol"]["structured_prepared_projection_budget_us"] = 1_000_000.into();
+    let unrelated: manifest::Manifest = serde_json::from_value(explicit.clone()).unwrap();
+    assert!(unrelated.validate().is_err());
+    for invalid in [0, 30_000_001_u64] {
+        explicit["protocol"]["structured_prepared_projection_budget_us"] = invalid.into();
+        assert!(serde_json::from_value::<manifest::Manifest>(explicit.clone()).is_err());
+    }
+}
+
+#[test]
 fn calibration_token_policy_residency_is_explicit_and_legacy_manifest_preserves_it() {
     let original = manifest();
     let mut wire = serde_json::to_value(&original).unwrap();
@@ -84,6 +103,7 @@ pub(super) fn manifest() -> manifest::Manifest {
         sharegpt: None,
         input_preprocessing_sha256: [1; 32],
         protocol: manifest::Protocol {
+            structured_prepared_projection_budget_us: None,
             total_timeout_ms: NonZeroU64::new(10_000).unwrap(),
             shutdown_timeout_ms: NonZeroU64::new(1000).unwrap(),
             maximum_wave_attempts: NonZeroU64::new(100).unwrap(),

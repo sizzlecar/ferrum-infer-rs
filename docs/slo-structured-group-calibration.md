@@ -16,6 +16,27 @@ The validation model has `capture` and `residual` fields. `capture` contains:
 - `limits`: `maximum_children`, `maximum_total_file_bytes`,
   `maximum_retained_numeric_bytes`, and `maximum_retained_coordinates`.
 
+Single-owner and shared-group V2 capture may declare
+`protocol.structured_prepared_projection_budget_us` in the calibration manifest.
+This positive, typed allowance has a hard ceiling of 30,000,000 microseconds,
+matching the existing independent future-audit diagnostic ceiling. Omission
+preserves the original planner-derived allowance and legacy manifest encoding.
+An explicit value is frozen into the original manifest/protocol digest before
+warmup; it applies once to each shared wave, not once per child. Other calibration
+modes reject the field. The original total timeout and attempt/row/file limits
+also apply; this is a cooperatively polled deadline, not a preemptive CPU quota.
+
+This diagnostic read assigns membership before the real dispatch. It runs before
+`prepare_started` and grants no publication, resource, witness or execution time.
+Changing its allowance does not change the service planner budget, original
+TTL, or the execution/host whole-wave measurement boundary. Every attempted read
+is reported in the raw wave's `structured_prepared_projection`, including the
+effective `budget_ns`, original `wall_ns`, explicit/legacy setting, and errors.
+Clock failures remain unavailable. Exhaustion still fails the complete source;
+failed attempts cannot be discarded or replaced by retrying until one succeeds.
+A successful calibration with a separate allowance does not demonstrate that
+service planning succeeds within its original budget.
+
 Use independently observed owner identities and freeze all windows and expected
 counts before capture. `training`, `residual` and `validation` are the common fit,
 residual and qualification complete cohorts. Every child sees the original FIFO,

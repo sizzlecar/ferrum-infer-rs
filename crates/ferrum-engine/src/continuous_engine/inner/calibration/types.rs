@@ -5,12 +5,30 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationLimits {
     maximum_requests: NonZeroUsize,
+    structured_prepared_projection_budget: Option<StructuredPreparedProjectionBudgetV2>,
 }
 impl CalibrationLimits {
     pub fn new(maximum_requests: NonZeroUsize) -> Result<Self> {
-        let limits = Self { maximum_requests };
+        let limits = Self {
+            maximum_requests,
+            structured_prepared_projection_budget: None,
+        };
         limits.validate()?;
         Ok(limits)
+    }
+    /// Omission preserves the original planner-derived diagnostic allowance.
+    /// The explicit value applies only to manual Structured V2 capture.
+    pub fn with_structured_prepared_projection_budget(
+        mut self,
+        budget: Option<StructuredPreparedProjectionBudgetV2>,
+    ) -> Self {
+        self.structured_prepared_projection_budget = budget;
+        self
+    }
+    pub const fn structured_prepared_projection_budget(
+        self,
+    ) -> Option<StructuredPreparedProjectionBudgetV2> {
+        self.structured_prepared_projection_budget
     }
     pub const fn maximum_requests(self) -> NonZeroUsize {
         self.maximum_requests
@@ -191,6 +209,7 @@ pub struct CalibrationWaveReport {
     pub host_stages: Option<Arc<super::super::cost_observation::HostStageEvidenceV1>>,
     pub host_stage_queue: Option<super::super::cost_observation::HostStageQueueReceipt>,
     /// Original typed failure diagnostics only, independent of eligibility.
+    pub structured_prepared_projection: Option<StructuredPreparedProjectionReportV2>,
     pub actual_evidence_diagnostic:
         Option<Arc<super::super::cost_observation::CalibrationActualEvidenceDiagnostic>>,
 }
@@ -207,6 +226,7 @@ pub enum CalibrationTurn {
 /// Only the actual controller dispatch writes this shared one-wave receipt.
 pub(in crate::continuous_engine::inner) struct CalibrationWaveReceipt {
     ordered_work: ExpectedWaveWork,
+    structured_prepared_projection: std::sync::OnceLock<StructuredPreparedProjectionReportV2>,
     state: std::sync::atomic::AtomicU8,
     capture: std::sync::OnceLock<Arc<super::super::cost_observation::CostCalibrationCapture>>,
 }
@@ -214,6 +234,7 @@ impl CalibrationWaveReceipt {
     pub(in crate::continuous_engine::inner) fn new(ordered_work: ExpectedWaveWork) -> Self {
         Self {
             ordered_work,
+            structured_prepared_projection: std::sync::OnceLock::new(),
             state: std::sync::atomic::AtomicU8::new(0),
             capture: std::sync::OnceLock::new(),
         }
@@ -238,6 +259,21 @@ impl CalibrationWaveReceipt {
             )
         })
     }
+    pub(in crate::continuous_engine::inner) fn record_structured_prepared_projection(
+        &self,
+        report: StructuredPreparedProjectionReportV2,
+    ) -> Result<()> {
+        if self.state() != CalibrationSubmissionState::NotSubmitted {
+            return Err(FerrumError::invalid_request(
+                "Prepared diagnostic must precede execution",
+            ));
+        }
+        self.structured_prepared_projection
+            .set(report)
+            .map_err(|_| {
+                FerrumError::invalid_request("Prepared diagnostic attempt was already recorded")
+            })
+    }
     pub(in crate::continuous_engine::inner) fn record(&self, state: CalibrationSubmissionState) {
         self.state.store(state as u8, Ordering::Release);
     }
@@ -253,6 +289,7 @@ impl CalibrationWaveReceipt {
     pub(super) fn report(&self, error: Option<FerrumError>) -> CalibrationWaveReport {
         CalibrationWaveReport {
             selected: None,
+            structured_prepared_projection: self.structured_prepared_projection.get().cloned(),
             ordered_work: self.ordered_work.clone(),
             submission: self.state(),
             error,

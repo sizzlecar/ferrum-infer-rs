@@ -4,6 +4,40 @@ use ferrum_engine::continuous_engine::StructuredCapturePhase;
 use ferrum_interfaces::execution_cost::{CoreReadbackRoute, HostPendingConstraintV2};
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{windows::*, *};
 use std::num::{NonZeroU64, NonZeroUsize};
+
+#[test]
+fn prepared_projection_single_v2_budget_binds_manifest_without_changing_cohorts() {
+    use ferrum_engine::continuous_engine::{
+        CalibrationLimits, StructuredPreparedProjectionBudgetV2,
+    };
+    let mut value = manifest();
+    let original = serde_json::to_value(&value).unwrap();
+    let plan = config::cohort_plan(&value, |_, _| Ok(73)).unwrap();
+    value.protocol.structured_prepared_projection_budget_us =
+        Some(StructuredPreparedProjectionBudgetV2::new(1_000_000).unwrap());
+    value.validate().unwrap();
+    let explicit = serde_json::to_value(&value).unwrap();
+    assert_ne!(
+        plan.signature(&original).unwrap(),
+        plan.signature(&explicit).unwrap()
+    );
+    assert_eq!(original["training"], explicit["training"]);
+    assert_eq!(original["validation"], explicit["validation"]);
+    assert_eq!(original["prompts"], explicit["prompts"]);
+    let loaded: manifest::Manifest = serde_json::from_value(explicit).unwrap();
+    let limits = CalibrationLimits::new(loaded.protocol.maximum_requests)
+        .unwrap()
+        .with_structured_prepared_projection_budget(
+            loaded.protocol.structured_prepared_projection_budget_us,
+        );
+    assert_eq!(
+        limits
+            .structured_prepared_projection_budget()
+            .unwrap()
+            .microseconds(),
+        1_000_000
+    );
+}
 fn manifest() -> manifest::Manifest {
     let mut value = super::super::tests::manifest();
     value.protocol.maximum_wave_attempts = NonZeroU64::new(512).unwrap();
