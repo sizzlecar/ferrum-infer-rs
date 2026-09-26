@@ -82,6 +82,7 @@ impl PlanningShapeResolver for TestResolver {
             WaveGraphState::Disabled => ActualWaveGraphState::Disabled,
             WaveGraphState::Cold => ActualWaveGraphState::Cold,
             WaveGraphState::Warm => ActualWaveGraphState::Warm,
+            WaveGraphState::ConfiguredEager => ActualWaveGraphState::ConfiguredEager,
         };
         let order = match caps.order {
             BatchOrderSemantics::Ordered => ActualWaveRowOrder::Ordered,

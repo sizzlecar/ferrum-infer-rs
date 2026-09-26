@@ -1,6 +1,33 @@
 use super::*;
 mod fixture;
 use fixture::*;
+
+#[test]
+fn configured_eager_profile10_preserves_distinct_graph_identity() {
+    use ferrum_interfaces::execution_cost::ActualWaveGraphState;
+    for generated in 0..3 {
+        let (p, rows, native) = prepared_route(
+            "eager",
+            generated + 1,
+            generated,
+            None,
+            ActualWaveGraphState::ConfiguredEager,
+        );
+        assert_eq!(super::prepared::project(&p, &rows).unwrap(), native);
+        let (_, _, disabled) = prepared("eager", generated + 1, generated);
+        assert_ne!(native.owner(), disabled.owner());
+        for graph in [
+            ProfileGraphState::Disabled,
+            ProfileGraphState::Cold,
+            ProfileGraphState::Warm,
+        ] {
+            let mut mislabeled = p.clone();
+            mislabeled.exact.exact.graph_state = graph;
+            assert!(super::prepared::project(&mislabeled, &rows).is_err());
+        }
+    }
+}
+
 struct Files {
     dir: PathBuf,
     source: PathBuf,
@@ -71,6 +98,10 @@ fn structured_v10_original_producer_and_private_replay_projection_agree() {
 #[test]
 fn structured_v10_replays_full_cohorts_outside_fifo_and_three_phases() {
     let (bytes, input) = source();
+    assert_full_source(&bytes, input);
+}
+
+fn assert_full_source(bytes: &[u8], input: StructuredInputV2) {
     let f = Files::new(&bytes);
     let receipt = export_structured_profile_v10(
         &f.source,
@@ -138,6 +169,141 @@ fn structured_v10_replays_full_cohorts_outside_fifo_and_three_phases() {
         &limits()
     )
     .is_err()); // no overwrite
+}
+
+#[test]
+fn structured_v10_warm_source_replay_preserves_shared_domain_not_resident_binding() {
+    let (a, rows, input_a) = prepared_graph("request", 2, 1, Some("resident-A"));
+    let (b, _, input_b) = prepared_graph("request", 2, 1, Some("resident-B"));
+    assert_ne!(a.recipe.exact_binding, b.recipe.exact_binding);
+    assert_ne!(
+        a.recipe
+            .device
+            .replay_work
+            .as_ref()
+            .unwrap()
+            .resident_binding,
+        b.recipe
+            .device
+            .replay_work
+            .as_ref()
+            .unwrap()
+            .resident_binding
+    );
+    assert_eq!(input_a, input_b);
+    assert_eq!(super::prepared::project(&a, &rows).unwrap(), input_a);
+    assert_eq!(super::prepared::project(&b, &rows).unwrap(), input_b);
+    let (_, _, eager) = prepared("request", 2, 1);
+    assert_ne!(input_a.domain_signature(), eager.domain_signature());
+    assert_eq!(
+        input_a.regression_axes().len(),
+        eager.regression_axes().len() + 3
+    );
+    assert_eq!(
+        input_a.joint_support_coordinates().len(),
+        eager.joint_support_coordinates().len() + 3
+    );
+
+    // Fit/residual/qualification replay consumes the complete original FIFO,
+    // including outside terminal waves. A distinct legitimate resident instance
+    // may query the same numeric model without obtaining A's live authority.
+    let (bytes, _) = source_graph(Some("resident-A"));
+    assert_full_source(&bytes, input_b);
+}
+
+#[test]
+fn structured_v10_warm_projection_rejects_missing_exchanged_or_cold_replay_facts() {
+    let (original, rows, _) = prepared_graph("request", 2, 1, Some("resident-A"));
+    for failure in 0..8 {
+        let mut changed = original.clone();
+        match failure {
+            0 => changed.recipe.device.replay_work = None,
+            1 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .exact_binding = [9; 32]
+            }
+            2 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .resident_binding = [0; 32]
+            }
+            3 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .replayed_segments = 0
+            }
+            4 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .replayed_segments = 2
+            }
+            5 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .logical_commands = 2
+            }
+            6 => {
+                changed
+                    .recipe
+                    .device
+                    .replay_work
+                    .as_mut()
+                    .unwrap()
+                    .native_graph_nodes = 0
+            }
+            _ => changed.exact.exact.graph_state = ProfileGraphState::Cold,
+        }
+        assert!(
+            super::prepared::project(&changed, &rows).is_err(),
+            "case {failure}"
+        );
+    }
+    let (mut eager, eager_rows, _) = prepared("request", 2, 1);
+    eager.recipe.device.replay_work = original.recipe.device.replay_work;
+    assert!(super::prepared::project(&eager, &eager_rows).is_err());
+}
+
+#[test]
+fn structured_v10_warm_source_cannot_drop_prepared_or_settled_replay_bindings() {
+    let (bytes, _) = source_graph(Some("resident-A"));
+    for field in ["prepared", "settled"] {
+        let changed = mutate(&bytes, |record| {
+            if field == "prepared" && record["kind"] == "reserved" && record["offered"] == 2 {
+                record["prepared"]["recipe"]["device"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("replay_work");
+            }
+            if field == "settled" && record["kind"] == "completed" && record["offered"] == 2 {
+                record["host_stages"]["structured_evidence"]["Ok"]["recipe"]["device"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("replay_work");
+            }
+        });
+        rejected(&changed);
+    }
 }
 #[test]
 fn structured_v10_footer_cannot_hide_failed_or_filtered_population() {

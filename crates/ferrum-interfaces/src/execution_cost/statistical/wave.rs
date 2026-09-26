@@ -183,6 +183,7 @@ pub(in crate::execution_cost) struct StatisticalWaveAccumulator {
     work: DeviceNumericWorkV1,
     failure: Option<StatisticalEvidenceUnknown>,
     algorithm_work: Option<super::wave_algorithm_work::WaveAlgorithmAccumulator>,
+    replay: Option<super::wave_replay::ReplayWaveAccumulator>,
 }
 impl StatisticalWaveAccumulator {
     pub(in crate::execution_cost) fn new() -> Self {
@@ -200,10 +201,12 @@ impl StatisticalWaveAccumulator {
             work: Default::default(),
             failure: None,
             algorithm_work: None,
+            replay: None,
         }
     }
     pub(in crate::execution_cost) fn capture_algorithm_work(&mut self) {
         self.algorithm_work = Some(super::wave_algorithm_work::WaveAlgorithmAccumulator::new());
+        self.replay = Some(super::wave_replay::ReplayWaveAccumulator::new());
     }
     pub(in crate::execution_cost) fn observe(&mut self, command: CostPhysicalCommand<'_>) {
         if self.failure.is_some() {
@@ -220,9 +223,25 @@ impl StatisticalWaveAccumulator {
         if self.count == MAX_COST_COMMANDS {
             return Err(StatisticalEvidenceUnknown::Capacity);
         }
-        // Replay needs sealed logical sub-work evidence. Do not infer it from
-        // one physical graph-launch command or reuse an eager classification.
-        if command.path != CostCommandPath::Eager || command.reusable_graph_node_count.is_some() {
+        if command.path == CostCommandPath::Replayed {
+            self.replay
+                .as_mut()
+                .ok_or(StatisticalEvidenceUnknown::UnsupportedReplay)?
+                .physical(command)?;
+            self.algorithm_work
+                .as_mut()
+                .ok_or(StatisticalEvidenceUnknown::MissingProducer)?
+                .observe_replay(command);
+            bytes(&mut self.family, b"ferrum.physical-replay.v1");
+            append_command_identity(&mut self.family, command);
+            if let Some(hash) = &mut self.independent_family {
+                bytes(hash, b"ferrum.physical-replay.v1");
+                append_command_identity(hash, command);
+            }
+            self.count += 1;
+            return Ok(());
+        }
+        if command.reusable_graph_node_count.is_some() {
             return Err(StatisticalEvidenceUnknown::UnsupportedReplay);
         }
         let evidence = command
@@ -255,6 +274,93 @@ impl StatisticalWaveAccumulator {
         self.count += 1;
         Ok(())
     }
+    pub(in crate::execution_cost) fn replay_segment(
+        &mut self,
+        physical: u32,
+        fingerprint: &str,
+        count: usize,
+    ) {
+        if self.failure.is_some() {
+            return;
+        }
+        let result = self
+            .replay
+            .as_mut()
+            .ok_or(StatisticalEvidenceUnknown::UnsupportedReplay)
+            .and_then(|replay| replay.segment(physical, fingerprint, count));
+        if let Err(error) = result {
+            self.failure = Some(error);
+            return;
+        }
+        if let Some(capture) = &mut self.algorithm_work {
+            capture.replay_segment(physical, fingerprint, count);
+        }
+        // The instance fingerprint belongs only to resident/assignment binding.
+        // The numerical model may share topology across legitimate instances.
+        bytes(&mut self.family, b"ferrum.logical-segment.v1");
+        number(&mut self.family, u64::from(physical));
+        number(&mut self.family, count as u64);
+        if let Some(hash) = &mut self.independent_family {
+            bytes(hash, b"ferrum.logical-segment.v1");
+            number(hash, u64::from(physical));
+            number(hash, count as u64);
+        }
+    }
+    pub(in crate::execution_cost) fn logical_command(&mut self, command: CostLogicalCommand<'_>) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Err(error) = self.append_logical(command) {
+            self.failure = Some(error);
+        }
+    }
+    fn append_logical(
+        &mut self,
+        command: CostLogicalCommand<'_>,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        let physical = self
+            .replay
+            .as_mut()
+            .ok_or(StatisticalEvidenceUnknown::UnsupportedReplay)?
+            .logical(command)?;
+        let selected = command
+            .statistical_evidence
+            .ok_or(StatisticalEvidenceUnknown::MissingProducer)?;
+        self.work = self.work.checked_add(selected.work())?;
+        self.algorithm_work
+            .as_mut()
+            .ok_or(StatisticalEvidenceUnknown::MissingProducer)?
+            .observe_logical(physical, command);
+        super::wave_replay::append_logical_identity(&mut self.family, physical, command);
+        self.family.update(selected.family_signature());
+        match (
+            self.independent_family.as_mut(),
+            selected.independent_attention_family_v2(),
+        ) {
+            (Some(hash), Some(family)) => {
+                super::wave_replay::append_logical_identity(hash, physical, command);
+                hash.update(family);
+            }
+            _ => self.independent_family = None,
+        }
+        Ok(())
+    }
+    fn replay_work(
+        &self,
+        shape: &CanonicalWaveCostShape,
+    ) -> Result<Option<StructuredReplayWorkV1>, StatisticalEvidenceUnknown> {
+        match &self.replay {
+            Some(replay) => replay.finish(shape),
+            None if matches!(
+                shape.graph,
+                ActualWaveGraphState::Disabled | ActualWaveGraphState::ConfiguredEager
+            ) =>
+            {
+                Ok(None)
+            }
+            None => Err(StatisticalEvidenceUnknown::UnsupportedReplay),
+        }
+    }
     pub(in crate::execution_cost) fn finish(
         mut self,
         shape: &CanonicalWaveCostShape,
@@ -265,11 +371,10 @@ impl StatisticalWaveAccumulator {
         if self.count == 0 {
             return Err(StatisticalEvidenceUnknown::MissingProducer);
         }
-        if shape.path != ActualWavePath::PlanRuntime
-            || shape.graph != ActualWaveGraphState::Disabled
-        {
+        if shape.path != ActualWavePath::PlanRuntime {
             return Err(StatisticalEvidenceUnknown::UnsupportedWave);
         }
+        self.replay_work(shape)?;
         let host = shape
             .row_multiset_features
             .as_ref()
@@ -348,6 +453,7 @@ impl StatisticalWaveAccumulator {
         if let Some(error) = self.failure {
             return Err(error);
         }
+        let replay = self.replay_work(shape)?;
         // These states contain only the checked selected-command stream. The
         // legacy finish has not appended host policy/categories or row flags.
         DeviceRouteTemplateV1::from_selected_stream(
@@ -365,6 +471,7 @@ impl StatisticalWaveAccumulator {
                 .take()
                 .ok_or(StatisticalEvidenceUnknown::MissingProducer)
                 .and_then(|capture| capture.finish(shape, self.count, self.work)),
+            replay,
         )
     }
 }

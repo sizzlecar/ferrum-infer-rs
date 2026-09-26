@@ -69,8 +69,26 @@ pub struct DeviceRouteTemplateV1 {
     /// Existing total launch work; this is NOT per-algorithm regression work.
     aggregate_work: DeviceNumericWorkV1,
     algorithm_work: Result<DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_work: Option<StructuredReplayWorkV1>,
 }
 impl DeviceRouteTemplateV1 {
+    pub fn replay_work(&self) -> Option<&StructuredReplayWorkV1> {
+        self.replay_work.as_ref()
+    }
+    fn validate_replay(
+        &self,
+        graph: ActualWaveGraphState,
+        binding: [u8; 32],
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        match (graph, self.replay_work.as_ref()) {
+            (ActualWaveGraphState::Disabled | ActualWaveGraphState::ConfiguredEager, None) => {
+                Ok(())
+            }
+            (ActualWaveGraphState::Warm, Some(replay)) => replay.validate_binding(binding),
+            _ => Err(StatisticalEvidenceUnknown::UnsupportedReplay),
+        }
+    }
     pub fn ordered_template(&self) -> &[u8; 32] {
         &self.ordered_template
     }
@@ -108,16 +126,20 @@ impl DeviceRouteTemplateV1 {
         readback: Option<CoreReadbackRoute>,
         retries: u32,
         algorithm_work: Result<DeviceAlgorithmWorkEvidenceV1, StatisticalEvidenceUnknown>,
+        replay_work: Option<StructuredReplayWorkV1>,
     ) -> Result<Self, StatisticalEvidenceUnknown> {
         if physical_commands == 0 || physical_commands > MAX_COST_COMMANDS {
             return Err(StatisticalEvidenceUnknown::MissingProducer);
         }
-        // Sealed current-wave Graph recipes require their own adapter. Never
-        // reclassify a physical replay as an eager selected stream.
-        if shape.path != ActualWavePath::PlanRuntime
-            || shape.graph != ActualWaveGraphState::Disabled
-        {
+        if shape.path != ActualWavePath::PlanRuntime {
             return Err(StatisticalEvidenceUnknown::UnsupportedReplay);
+        }
+        match (shape.graph, replay_work.as_ref()) {
+            (ActualWaveGraphState::Disabled | ActualWaveGraphState::ConfiguredEager, None) => {}
+            (ActualWaveGraphState::Warm, Some(replay)) => {
+                replay.validate_binding(super::wave::exact_binding(shape)?)?
+            }
+            _ => return Err(StatisticalEvidenceUnknown::UnsupportedReplay),
         }
         let readback = readback
             .filter(|route| *route != CoreReadbackRoute::Unknown)
@@ -155,6 +177,7 @@ impl DeviceRouteTemplateV1 {
             retries,
             aggregate_work: work,
             algorithm_work,
+            replay_work,
         })
     }
 }
@@ -245,6 +268,7 @@ impl UnsettledStructuredWaveEvidenceV1 {
         {
             return Err(StatisticalEvidenceUnknown::ExactBindingMismatch);
         }
+        self.device.validate_replay(shape.graph, digest)?;
         self.retained_units()?;
         if let Ok(work) = self.algorithm_work() {
             work.validate_binding(digest)?;
@@ -268,6 +292,8 @@ impl UnsettledStructuredWaveEvidenceV1 {
         {
             return Err(StatisticalEvidenceUnknown::ExactBindingMismatch);
         }
+        self.device
+            .validate_replay(shape.graph, self.exact_binding)?;
         self.retained_units()?;
         if let Ok(work) = self.algorithm_work() {
             work.validate_binding(self.exact_binding)?;

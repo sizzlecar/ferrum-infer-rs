@@ -19,9 +19,36 @@ pub fn prepared(
     generation: u64,
     generated: u64,
 ) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
+    prepared_graph(id, generation, generated, None)
+}
+pub fn prepared_graph(
+    id: &str,
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
+    prepared_route(
+        id,
+        generation,
+        generated,
+        resident,
+        if resident.is_some() {
+            ActualWaveGraphState::Warm
+        } else {
+            ActualWaveGraphState::Disabled
+        },
+    )
+}
+pub fn prepared_route(
+    id: &str,
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
     let mut command = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
     command
-        .kernel(
+        .kernel_with_replay_geometry(
             SelectedAlgorithmClassV1::new("fixture.profile10", 1, [1; 32], [2; 32]).unwrap(),
             KernelNumericWorkV1 {
                 logical_units: 16,
@@ -30,6 +57,11 @@ pub fn prepared(
                 grid: [1, 1, 1],
                 scratch_bytes: 64,
                 staged_weight_bytes: 0,
+            },
+            KernelReplayGeometryV1 {
+                block: [32, 1, 1],
+                dynamic_shared_bytes: 0,
+                fixed_parameters: &[16],
             },
         )
         .unwrap();
@@ -46,17 +78,42 @@ pub fn prepared(
             implementation_fingerprint: "v1",
             operation_fingerprint: "v1",
         }),
-        path: CostCommandPath::Eager,
+        path: if resident.is_some() {
+            CostCommandPath::Replayed
+        } else {
+            CostCommandPath::Eager
+        },
         participant_start: 0,
         participant_count: 1,
         token_count: 1,
         batching_form: "packed",
         compute_dispatch_count: 1,
         transfer_command_count: 0,
-        reusable_graph_node_count: None,
-        statistical_evidence: Some(&command),
+        reusable_graph_node_count: resident.map(|_| 1),
+        statistical_evidence: resident.is_none().then_some(&command),
     })
     .unwrap();
+    if let Some(resident) = resident {
+        b.replay_segment(0, resident, 1).unwrap();
+        b.logical_command(CostLogicalCommand {
+            native_op_id: "fixture.profile10",
+            logical_command_ordinal: 0,
+            node_index: 0,
+            provider: CostProviderIdentity {
+                provider_id: "fixture.provider",
+                implementation_fingerprint: "v1",
+                operation_fingerprint: "v1",
+            },
+            participant_count: 1,
+            token_count: 1,
+            batching_form: "packed",
+            compute_dispatch_count: 1,
+            transfer_command_count: 0,
+            reusable_graph_node_count: 1,
+            statistical_evidence: Some(&command),
+        })
+        .unwrap();
+    }
     b.core_readback_route(CoreReadbackRoute::HostSynchronized)
         .unwrap();
     let first = generated == 0;
@@ -109,13 +166,19 @@ pub fn prepared(
                 ActualWaveKind::Decode
             },
             ActualWavePath::PlanRuntime,
-            ActualWaveGraphState::Disabled,
+            graph,
             ActualWaveRowOrder::Ordered,
             0,
         )
         .unwrap();
     let stat = wave.statistical.as_ref().unwrap();
     let recipe = stat.structured_capture().unwrap().unwrap();
+    if graph != ActualWaveGraphState::Disabled {
+        assert!(matches!(
+            crate::implementations::continuous::cost_model::statistical::StatisticalModelInputV1::from_future(&wave.exact, stat),
+            Err(StatisticalEvidenceUnknown::UnsupportedReplay)
+        ));
+    }
     let native = StructuredInputV2::from_actual(&wave.exact, stat, recipe).unwrap();
     let facts = StructuredOwnerFactsV2::from_prepared(&wave.exact, stat, recipe).unwrap();
     let one = std::num::NonZeroU32::new(64).unwrap();
@@ -129,7 +192,12 @@ pub fn prepared(
             path: ProfileExecutionPath::PlanRuntime,
             provider_signature: wave.exact.provider_signature,
             output_policy_signature: wave.exact.output_policy_signature,
-            graph_state: ProfileGraphState::Disabled,
+            graph_state: match graph {
+                ActualWaveGraphState::Disabled => ProfileGraphState::Disabled,
+                ActualWaveGraphState::ConfiguredEager => ProfileGraphState::ConfiguredEager,
+                ActualWaveGraphState::Warm => ProfileGraphState::Warm,
+                ActualWaveGraphState::Cold => ProfileGraphState::Cold,
+            },
             order: ProfileBatchOrder::Ordered,
             decode_kv_tokens: if first { vec![] } else { vec![64] },
             prefill_chunks: if first {
@@ -196,7 +264,10 @@ pub fn prepared(
     (p, offered, native)
 }
 pub fn header() -> Header {
-    let (_, _, input) = prepared("seed", 1, 1);
+    header_graph(None)
+}
+pub fn header_graph(resident: Option<&str>) -> Header {
+    let (_, _, input) = prepared_graph("seed", 1, 1, resident);
     let owner = input.owner().clone();
     let scope = StructuredScopeV2 {
         owner: owner.clone(),
@@ -383,7 +454,10 @@ fn push(bytes: &mut Vec<u8>, ordinal: &mut u64, record: impl Serialize) {
     bytes.push(b'\n');
 }
 pub fn source() -> (Vec<u8>, StructuredInputV2) {
-    let h = header();
+    source_graph(None)
+}
+pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
+    let h = header_graph(resident);
     let mut bytes = Vec::new();
     let mut ordinal = 0;
     push(&mut bytes, &mut ordinal, &h);
@@ -429,7 +503,7 @@ pub fn source() -> (Vec<u8>, StructuredInputV2) {
             );
             for generated in 0..3 {
                 offers += 1;
-                let (p, rows, input) = prepared(&id, generated + 1, generated);
+                let (p, rows, input) = prepared_graph(&id, generated + 1, generated, resident);
                 let s = stages(&h, &p, offers);
                 let member = if generated == 1 {
                     members += 1;
@@ -622,5 +696,5 @@ pub fn source() -> (Vec<u8>, StructuredInputV2) {
             }),
         },
     );
-    (bytes, prepared("query", 1, 1).2)
+    (bytes, prepared_graph("query", 1, 1, resident).2)
 }

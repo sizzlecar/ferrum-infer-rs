@@ -195,6 +195,7 @@ fn logical(nodes: u64) -> CostLogicalCommand<'static> {
         compute_dispatch_count: 1,
         transfer_command_count: 0,
         reusable_graph_node_count: nodes,
+        statistical_evidence: None,
     }
 }
 fn replay(nodes: u64) -> CanonicalWaveCostBuilder {

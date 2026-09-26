@@ -592,7 +592,7 @@ pub enum PlanningGraphDomain {
     #[default]
     SnapshotExact,
     /// A captured configured catalog supports per-wave route selection.
-    /// Cold is only the core-proven configured eager route; Warm still requires
+    /// ConfiguredEager needs a core-proven eager route; Warm still requires
     /// an exact uploaded-program match. Disabled is outside this domain.
     ConfiguredPerWave,
     /// StartupReady permits only independently matched resident replay.
@@ -604,7 +604,10 @@ impl PlanningGraphDomain {
             Self::SnapshotExact => expected == actual,
             Self::ResidentReplayOnly => actual == WaveGraphState::Warm,
             Self::ConfiguredPerWave => {
-                matches!(actual, WaveGraphState::Cold | WaveGraphState::Warm)
+                matches!(
+                    actual,
+                    WaveGraphState::ConfiguredEager | WaveGraphState::Warm
+                )
             }
         }
     }

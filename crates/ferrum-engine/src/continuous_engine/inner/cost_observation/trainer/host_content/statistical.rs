@@ -42,6 +42,22 @@ pub(in crate::continuous_engine::inner::cost_observation) struct CompleteSelecte
 pub(in crate::continuous_engine::inner::cost_observation) fn complete_observation(
     entry: &CostEvidenceEntry,
 ) -> Result<CompleteSelectedObservation, ModelUnknown> {
+    complete_observation_with_graph(entry, false)
+}
+
+/// V2 alone supports complete warm graph work. This still consumes the actual
+/// private settlement and its original attached recipe; numerical import never
+/// calls this receipt adapter. Legacy selected/V1 callers retain Disabled-only.
+pub(in crate::continuous_engine::inner::cost_observation) fn complete_structured_observation_v2(
+    entry: &CostEvidenceEntry,
+) -> Result<CompleteSelectedObservation, ModelUnknown> {
+    complete_observation_with_graph(entry, true)
+}
+
+fn complete_observation_with_graph(
+    entry: &CostEvidenceEntry,
+    structured_v2: bool,
+) -> Result<CompleteSelectedObservation, ModelUnknown> {
     let (stages, legacy) = match entry {
         CostEvidenceEntry::Training { sample, stages } => {
             let stages = stages.as_deref().ok_or(ModelUnknown::Evidence(
@@ -62,7 +78,12 @@ pub(in crate::continuous_engine::inner::cost_observation) fn complete_observatio
     let observed = sample(Some(stages), legacy, true).map_err(|_| ModelUnknown::InvalidSample)?;
     let shape = &observed.actual_shape;
     if shape.path != model::WaveExecutionPath::PlanRuntime
-        || shape.graph_state != model::WaveGraphState::Disabled
+        || !(shape.graph_state == model::WaveGraphState::Disabled
+            || (structured_v2
+                && matches!(
+                    shape.graph_state,
+                    model::WaveGraphState::Warm | model::WaveGraphState::ConfiguredEager
+                )))
         || shape.order != model::BatchOrderSemantics::Ordered
         || shape.restore_bytes != 0
         || shape.maintenance_bytes != 0
@@ -98,7 +119,12 @@ pub(in crate::continuous_engine::inner::cost_observation) fn complete_observatio
     let exact = CanonicalWaveCostShape {
         kind,
         path: ActualWavePath::PlanRuntime,
-        graph: ActualWaveGraphState::Disabled,
+        graph: match shape.graph_state {
+            model::WaveGraphState::Warm => ActualWaveGraphState::Warm,
+            model::WaveGraphState::ConfiguredEager => ActualWaveGraphState::ConfiguredEager,
+            model::WaveGraphState::Disabled => ActualWaveGraphState::Disabled,
+            model::WaveGraphState::Cold => return Err(ModelUnknown::InvalidSample),
+        },
         row_order: ActualWaveRowOrder::Ordered,
         provider_signature: shape.provider_signature,
         output_policy_signature: shape.output_policy_signature,
@@ -115,6 +141,28 @@ pub(in crate::continuous_engine::inner::cost_observation) fn complete_observatio
             StatisticalEvidenceUnknown::MissingProducer,
         ))?;
     selected.validate_exact(&exact)?;
+    if structured_v2 {
+        let qualified = stages
+            .structured_evidence
+            .as_ref()
+            .and_then(|value| value.as_ref().ok())
+            .ok_or(ModelUnknown::InvalidSample)?;
+        qualified
+            .validate_host_stages(stages)
+            .map_err(|_| ModelUnknown::InvalidSample)?;
+        let recipe = selected
+            .structured_capture()
+            .ok_or(ModelUnknown::Evidence(
+                StatisticalEvidenceUnknown::MissingProducer,
+            ))??;
+        recipe.validate_exact(&exact)?;
+        recipe.algorithm_work()?.validate_structure(recipe)?;
+        if !std::ptr::eq(qualified.recipe(), recipe.as_ref())
+            || qualified.full_wall_ns() != observed.timing.wall_total_ns
+        {
+            return Err(ModelUnknown::InvalidSample);
+        }
+    }
     if stages.call_id == 0 {
         return Err(ModelUnknown::InvalidSample);
     }

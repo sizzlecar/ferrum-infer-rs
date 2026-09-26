@@ -1,6 +1,31 @@
 use super::*;
 use ferrum_interfaces::execution_cost::*;
 
+#[test]
+fn configured_eager_domain_does_not_authorize_cold_or_resident_only_work() {
+    assert_eq!(
+        validate(
+            ActualWaveGraphState::Cold,
+            PlanningGraphDomain::ConfiguredPerWave
+        ),
+        Err(PlanningUnknownReason::InvalidShapeEvidence)
+    );
+    assert_eq!(
+        validate(
+            ActualWaveGraphState::ConfiguredEager,
+            PlanningGraphDomain::SnapshotExact
+        ),
+        Err(PlanningUnknownReason::InvalidShapeEvidence)
+    );
+    assert_eq!(
+        validate(
+            ActualWaveGraphState::ConfiguredEager,
+            PlanningGraphDomain::ResidentReplayOnly
+        ),
+        Err(PlanningUnknownReason::InvalidShapeEvidence)
+    );
+}
+
 fn validate(
     graph: ActualWaveGraphState,
     domain: PlanningGraphDomain,
@@ -53,12 +78,15 @@ fn graph_domain_default_exact_rejects_cold_and_warm_mismatch() {
 
 #[test]
 fn graph_domain_configured_accepts_real_per_wave_labels_and_rejects_disabled() {
-    for graph in [ActualWaveGraphState::Cold, ActualWaveGraphState::Warm] {
+    for graph in [
+        ActualWaveGraphState::ConfiguredEager,
+        ActualWaveGraphState::Warm,
+    ] {
         let result = validate(graph, PlanningGraphDomain::ConfiguredPerWave).unwrap();
         assert_eq!(
             result.exact().unwrap().graph_state,
             match graph {
-                ActualWaveGraphState::Cold => WaveGraphState::Cold,
+                ActualWaveGraphState::ConfiguredEager => WaveGraphState::ConfiguredEager,
                 _ => WaveGraphState::Warm,
             }
         );
@@ -97,14 +125,17 @@ impl PlanningShapeResolver for ConfiguredResolver {
 
 #[test]
 fn graph_domain_survives_execution_wrappers_and_preserves_selected_canonical() {
-    for graph in [ActualWaveGraphState::Cold, ActualWaveGraphState::Warm] {
+    for graph in [
+        ActualWaveGraphState::ConfiguredEager,
+        ActualWaveGraphState::Warm,
+    ] {
         let snapshot = snapshot(vec![decode(1)]);
         let resolver = ConfiguredResolver {
             graph,
             stale: std::cell::Cell::new(false),
         };
-        let expected = if graph == ActualWaveGraphState::Cold {
-            WaveGraphState::Cold
+        let expected = if graph == ActualWaveGraphState::ConfiguredEager {
+            WaveGraphState::ConfiguredEager
         } else {
             WaveGraphState::Warm
         };

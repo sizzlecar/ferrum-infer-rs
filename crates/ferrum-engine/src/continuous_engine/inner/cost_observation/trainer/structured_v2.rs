@@ -98,8 +98,8 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
     qualified
         .validate_host_stages(&stages)
         .map_err(|_| U::InvalidSample)?;
-    let actual =
-        host_content::statistical::complete_observation(&entry).map_err(|_| U::InvalidSample)?;
+    let actual = host_content::statistical::complete_structured_observation_v2(&entry)
+        .map_err(|_| U::InvalidSample)?;
     if &actual.fingerprint != session.fingerprint() {
         return Err(U::WrongFingerprint);
     }
@@ -171,8 +171,8 @@ pub(in crate::continuous_engine) fn structured_discovery_input_v2(
         stages: Arc::clone(stages),
         legacy_rejection: CostCallRejection::Composite,
     };
-    let actual =
-        host_content::statistical::complete_observation(&entry).map_err(|_| U::InvalidSample)?;
+    let actual = host_content::statistical::complete_structured_observation_v2(&entry)
+        .map_err(|_| U::InvalidSample)?;
     let recipe = actual
         .selected
         .structured_capture()

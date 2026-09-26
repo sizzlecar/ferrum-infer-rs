@@ -41,18 +41,29 @@ impl StructuredInputV2 {
         readback: CoreReadbackRoute,
         rows: &[StructuredHostRowV1],
         algorithms: &[([u8; 32], AlgorithmWorkKindV1, u64, DeviceNumericWorkV1)],
+        replay_counts: Option<[u64; 3]>,
     ) -> Result<(Self, StructuredOwnerFactsV2)> {
+        match (exact.graph, replay_counts) {
+            (
+                ferrum_interfaces::execution_cost::ActualWaveGraphState::Disabled
+                | ferrum_interfaces::execution_cost::ActualWaveGraphState::ConfiguredEager,
+                None,
+            )
+            | (ferrum_interfaces::execution_cost::ActualWaveGraphState::Warm, Some(_)) => {}
+            _ => return Err(StructuredUnknown::MissingEvidence),
+        }
         let facts = StructuredOwnerFactsV2::from_replay_parts(
             rows, product, readback, ordered, grouped, algorithms,
         )?;
         let owner = facts.owner_key()?;
-        let old = StatisticalModelInputV1::from_future(exact, selected)
+        let old = StatisticalModelInputV1::from_future_structured_v2(exact, selected)
             .map_err(|_| StructuredUnknown::MissingEvidence)?;
         let input = Self::project_numeric(
             owner,
             &old,
             rows,
             algorithms.iter().map(|(_, k, n, w)| (*k, *n, *w)),
+            replay_counts,
         )?;
         Ok((input, facts))
     }
@@ -69,7 +80,7 @@ impl StructuredInputV2 {
         recipe: &Arc<UnsettledStructuredWaveEvidenceV1>,
     ) -> Result<Self> {
         let owner = Self::owner_for(exact, selected, recipe)?;
-        let old = StatisticalModelInputV1::from_future(exact, selected)
+        let old = StatisticalModelInputV1::from_future_structured_v2(exact, selected)
             .map_err(|_| StructuredUnknown::MissingEvidence)?;
         let algorithms = recipe
             .algorithm_work()
@@ -82,6 +93,13 @@ impl StructuredInputV2 {
                 .entries()
                 .iter()
                 .map(|a| (a.kind(), a.commands(), a.work())),
+            recipe.device().replay_work().map(|r| {
+                [
+                    u64::from(r.replayed_segments()),
+                    u64::from(r.logical_commands()),
+                    r.native_graph_nodes(),
+                ]
+            }),
         )
     }
     pub fn owner(&self) -> &StructuredOwnerKeyV2 {
@@ -105,6 +123,7 @@ impl StructuredInputV2 {
         old: &StatisticalModelInputV1,
         rows: &[StructuredHostRowV1],
         algorithms: impl Iterator<Item = (AlgorithmWorkKindV1, u64, DeviceNumericWorkV1)>,
+        replay_counts: Option<[u64; 3]>,
     ) -> Result<Self> {
         if rows.len() != owner.rows as usize || rows.is_empty() || rows.len() > 128 {
             return Err(StructuredUnknown::InvalidInput);
@@ -190,7 +209,24 @@ impl StructuredInputV2 {
                 basis.push(bytes as f64);
             }
         }
+        if let Some(counts) = replay_counts {
+            if counts.iter().any(|n| *n == 0)
+                || counts[0] > ferrum_interfaces::execution_cost::MAX_COST_COMMANDS as u64
+                || counts[1] > ferrum_interfaces::execution_cost::MAX_COST_COMMANDS as u64
+                || counts[1] < counts[0]
+                || counts[2] < counts[1]
+            {
+                return Err(StructuredUnknown::MissingEvidence);
+            }
+            // Shared topology/domain excludes resident binding. Actual graph
+            // work, including launch and logical counts, remains numeric and
+            // must be inside the same joint support as all other coordinates.
+            domain.update(b"ferrum.structured-replay-coordinates.v1\0");
+            support.extend(counts);
+            basis.extend(counts.map(|n| n as f64));
+        }
         let h = old.host_and_sequence();
+
         support.extend([
             h.rows,
             h.prefill_tokens,

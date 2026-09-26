@@ -70,6 +70,32 @@ impl StatisticalModelInputV1 {
         shape: &CanonicalWaveCostShape,
         evidence: &StatisticalWaveEvidenceV1,
     ) -> Result<Self, Unknown> {
+        if shape.graph != ferrum_interfaces::execution_cost::ActualWaveGraphState::Disabled {
+            return Err(Unknown::UnsupportedReplay);
+        }
+        evidence.validate_exact(shape)?;
+        Self::aggregate(
+            evidence,
+            shape.numeric_features.as_ref(),
+            shape.rows.iter().copied(),
+            shape.recurrent_state_bytes,
+        )
+    }
+    /// Numerical projection shared only by the V2 live recipe validator and
+    /// profile10 original-source replay. Does not construct live evidence or
+    /// broaden legacy selected/V1 entrypoints.
+    pub(super) fn from_future_structured_v2(
+        shape: &CanonicalWaveCostShape,
+        evidence: &StatisticalWaveEvidenceV1,
+    ) -> Result<Self, Unknown> {
+        if !matches!(
+            shape.graph,
+            ferrum_interfaces::execution_cost::ActualWaveGraphState::Disabled
+                | ferrum_interfaces::execution_cost::ActualWaveGraphState::Warm
+                | ferrum_interfaces::execution_cost::ActualWaveGraphState::ConfiguredEager
+        ) {
+            return Err(Unknown::UnsupportedReplay);
+        }
         evidence.validate_exact(shape)?;
         Self::aggregate(
             evidence,
@@ -79,6 +105,9 @@ impl StatisticalModelInputV1 {
         )
     }
     pub fn from_actual(shape: &ActualWaveShape) -> Result<Self, Unknown> {
+        if shape.graph != ferrum_interfaces::execution_cost::ActualWaveGraphState::Disabled {
+            return Err(Unknown::UnsupportedReplay);
+        }
         let evidence = shape
             .statistical_evidence
             .as_ref()

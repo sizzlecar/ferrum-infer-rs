@@ -4,6 +4,9 @@ use super::super::super::trainer::structured::{
     inspect_numeric_observation_for_test as whole_wave_numeric_observation,
 };
 use super::*;
+use ferrum_interfaces::execution_cost::{
+    CostLogicalCommand, CostProviderIdentity, KernelReplayGeometryV1,
+};
 use ferrum_scheduler::implementations::continuous::cost_model::structured::StructuredUnknown;
 
 fn session_at(protocol: [u8; 32], opened_at: u64) -> Arc<StructuredCaptureSessionBinding> {
@@ -26,6 +29,13 @@ fn session() -> Arc<StructuredCaptureSessionBinding> {
 }
 
 fn algorithm_shape(maxima: &[u64], first_work: u64) -> (ActualWaveShape, Vec<HostCostFeaturesV1>) {
+    algorithm_shape_graph(maxima, first_work, None)
+}
+fn algorithm_shape_graph(
+    maxima: &[u64],
+    first_work: u64,
+    resident: Option<&str>,
+) -> (ActualWaveShape, Vec<HostCostFeaturesV1>) {
     let (mut actual, hosts) = selected_shape(maxima);
     let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(maxima.len() as u64);
     for (name, units) in [
@@ -33,7 +43,7 @@ fn algorithm_shape(maxima: &[u64], first_work: u64) -> (ActualWaveShape, Vec<Hos
         ("fixture.bridge.second", 32 - first_work),
     ] {
         selected
-            .kernel(
+            .kernel_with_replay_geometry(
                 SelectedAlgorithmClassV1::new(name, 1, [1; 32], [2; 32]).unwrap(),
                 KernelNumericWorkV1 {
                     logical_units: units,
@@ -42,6 +52,11 @@ fn algorithm_shape(maxima: &[u64], first_work: u64) -> (ActualWaveShape, Vec<Hos
                     grid: [1, 1, 1],
                     scratch_bytes: 0,
                     staged_weight_bytes: 0,
+                },
+                KernelReplayGeometryV1 {
+                    block: [32, 1, 1],
+                    dynamic_shared_bytes: 0,
+                    fixed_parameters: &[units],
                 },
             )
             .unwrap();
@@ -55,17 +70,42 @@ fn algorithm_shape(maxima: &[u64], first_work: u64) -> (ActualWaveShape, Vec<Hos
         node_index: None,
         command_phase: DeviceCommandPhase::Compute,
         provider: None,
-        path: CostCommandPath::Eager,
+        path: if resident.is_some() {
+            CostCommandPath::Replayed
+        } else {
+            CostCommandPath::Eager
+        },
         participant_start: 0,
         participant_count: maxima.len() as u32,
         token_count: maxima.len() as u64,
         batching_form: "packed",
-        compute_dispatch_count: 2,
+        compute_dispatch_count: if resident.is_some() { 1 } else { 2 },
         transfer_command_count: 0,
-        reusable_graph_node_count: None,
-        statistical_evidence: Some(&selected),
+        reusable_graph_node_count: resident.map(|_| 2),
+        statistical_evidence: resident.is_none().then_some(&selected),
     })
     .unwrap();
+    if let Some(resident) = resident {
+        b.replay_segment(0, resident, 1).unwrap();
+        b.logical_command(CostLogicalCommand {
+            native_op_id: "fixture.structured",
+            logical_command_ordinal: 0,
+            node_index: 0,
+            provider: CostProviderIdentity {
+                provider_id: "fixture.provider",
+                implementation_fingerprint: "v1",
+                operation_fingerprint: "v1",
+            },
+            participant_count: maxima.len() as u32,
+            token_count: maxima.len() as u64,
+            batching_form: "packed",
+            compute_dispatch_count: 2,
+            transfer_command_count: 0,
+            reusable_graph_node_count: 2,
+            statistical_evidence: Some(&selected),
+        })
+        .unwrap();
+    }
     b.core_readback_route(CoreReadbackRoute::HostSynchronized)
         .unwrap();
     for host in &hosts {
@@ -86,12 +126,17 @@ fn algorithm_shape(maxima: &[u64], first_work: u64) -> (ActualWaveShape, Vec<Hos
         .finish_with_captured_structure(
             ActualWaveKind::Decode,
             ActualWavePath::PlanRuntime,
-            ActualWaveGraphState::Disabled,
+            if resident.is_some() {
+                ActualWaveGraphState::Warm
+            } else {
+                ActualWaveGraphState::Disabled
+            },
             ActualWaveRowOrder::Ordered,
             64,
         )
         .unwrap();
     actual.provider_signature = built.exact.provider_signature;
+    actual.graph = built.exact.graph;
     actual.output_policy_signature = built.exact.output_policy_signature;
     actual.numeric_features = built.exact.numeric_features;
     actual.host_content_features = built.exact.host_content_features;
@@ -112,7 +157,16 @@ fn stages_with_capture(
     work: u64,
     capture: Option<Arc<CostCalibrationCapture>>,
 ) -> Arc<HostStageEvidenceV1> {
-    let (actual, hosts) = algorithm_shape(maxima, work);
+    stages_with_graph(maxima, result, work, capture, None)
+}
+fn stages_with_graph(
+    maxima: &[u64],
+    result: Option<HostTerminalStageV1>,
+    work: u64,
+    capture: Option<Arc<CostCalibrationCapture>>,
+    resident: Option<&str>,
+) -> Arc<HostStageEvidenceV1> {
+    let (actual, hosts) = algorithm_shape_graph(maxima, work, resident);
     // This fixture retains the additional per-algorithm table. Keep the old
     // shared begin default (32) and production limits untouched.
     let (call, clock) = begin_with_retained_capacity(&actual, &sink(8, 256), 64);
@@ -149,6 +203,46 @@ fn entry(stages: Arc<HostStageEvidenceV1>) -> CostEvidenceEntry {
         stages,
         legacy_rejection: CostCallRejection::Composite,
     }
+}
+
+#[test]
+fn structured_bridge_v2_warm_graph_uses_private_settlement_and_keeps_legacy_closed() {
+    use super::super::super::trainer::structured_v2;
+    let stages_a = stages_with_graph(&[3], Some(terminal()), 8, None, Some("resident-A"));
+    let stages_b = stages_with_graph(&[3], Some(terminal()), 8, None, Some("resident-B"));
+    let input_a = structured_v2::structured_discovery_input_v2(&stages_a).unwrap();
+    let input_b = structured_v2::structured_discovery_input_v2(&stages_b).unwrap();
+    assert_eq!(input_a, input_b);
+    assert_eq!(
+        stages_a.actual_shape.as_ref().unwrap().graph_state,
+        model::WaveGraphState::Warm
+    );
+    assert_eq!(stages_a.full_wall_ns, Some(12));
+    assert_ne!(stages_a.actual_shape, stages_b.actual_shape);
+    assert!(whole_wave_numeric_observation(&entry(stages_a), 1, &session()).is_err());
+}
+
+#[test]
+fn structured_bridge_v2_warm_graph_rejects_receipt_swap_clock_and_unsupported_terminal() {
+    use super::super::super::trainer::structured_v2::structured_discovery_input_v2;
+    let original = stages_with_graph(&[3], Some(terminal()), 8, None, Some("resident-A"));
+    let (another, _) = algorithm_shape_graph(&[3], 8, Some("resident-B"));
+    for failure in 0..3 {
+        let mut changed = original.as_ref().clone();
+        match failure {
+            0 => changed.structured_evidence = None,
+            1 => changed.statistical_evidence = another.statistical_evidence.clone(),
+            _ => changed.full_wall_ns = Some(999),
+        }
+        assert!(
+            structured_discovery_input_v2(&Arc::new(changed)).is_err(),
+            "case {failure}"
+        );
+    }
+    let mut eos = terminal();
+    eos.finish_reason = FinishReason::EOS;
+    let stages = stages_with_graph(&[3], Some(eos), 8, None, Some("resident-A"));
+    assert!(matches!(structured_discovery_input_v2(&stages), Err(ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredUnknownV2::UnsupportedScope)));
 }
 
 #[test]

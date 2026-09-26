@@ -51,7 +51,7 @@ profile_enum!(ProfileWaveKind => WaveKind { Decode, Prefill, Mixed, Restore, Mai
 profile_enum!(ProfileExecutionPath => WaveExecutionPath {
     PlanRuntime, NativeUnified, LegacySplit, UnsupportedFallback, CapacityFallback
 });
-profile_enum!(ProfileGraphState => WaveGraphState { Disabled, Cold, Warm });
+profile_enum!(ProfileGraphState => WaveGraphState { Disabled, Cold, Warm, ConfiguredEager });
 profile_enum!(ProfileBatchOrder => BatchOrderSemantics { Ordered, IndependentRows });
 /// V1/V2 wire boundaries remain closed; host-settled evidence requires V3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

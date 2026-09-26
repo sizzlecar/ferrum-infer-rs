@@ -27,7 +27,12 @@ pub(super) fn project(
     }
     let e = &p.exact.exact;
     if e.path != ProfileExecutionPath::PlanRuntime
-        || e.graph_state != ProfileGraphState::Disabled
+        || !matches!(
+            e.graph_state,
+            ProfileGraphState::Disabled
+                | ProfileGraphState::Warm
+                | ProfileGraphState::ConfiguredEager
+        )
         || e.order != ProfileBatchOrder::Ordered
         || e.restore_bytes != 0
         || e.maintenance_bytes != 0
@@ -153,7 +158,12 @@ pub(super) fn project(
     let canonical = CanonicalWaveCostShape {
         kind,
         path: ActualWavePath::PlanRuntime,
-        graph: ActualWaveGraphState::Disabled,
+        graph: match e.graph_state {
+            ProfileGraphState::Warm => ActualWaveGraphState::Warm,
+            ProfileGraphState::ConfiguredEager => ActualWaveGraphState::ConfiguredEager,
+            ProfileGraphState::Disabled => ActualWaveGraphState::Disabled,
+            ProfileGraphState::Cold => return Err(fail()),
+        },
         row_order: ActualWaveRowOrder::Ordered,
         provider_signature: e.provider_signature,
         output_policy_signature: e.output_policy_signature,
@@ -173,7 +183,7 @@ pub(super) fn project(
         IndependentAttentionWaveEvidenceV2::from_wire_v2(v.clone(), &canonical)
             .map_err(|_| fail())?;
     }
-    validate_recipe(&p.recipe, &p.selected, &selected)?;
+    validate_recipe(&p.recipe, &p.selected, &selected, canonical.graph)?;
     let host = p
         .recipe
         .physical_host_rows
@@ -204,6 +214,13 @@ pub(super) fn project(
         p.recipe.device.readback,
         &host,
         &algorithms,
+        p.recipe.device.replay_work.as_ref().map(|r| {
+            [
+                u64::from(r.replayed_segments),
+                u64::from(r.logical_commands),
+                r.native_graph_nodes,
+            ]
+        }),
     )
     .map_err(numeric_error)?;
     if serde_json::to_value(facts)? != p.owner_facts {
@@ -215,6 +232,7 @@ fn validate_recipe(
     r: &Recipe,
     stat: &StatisticalWaveEvidenceWireV1,
     selected: &StatisticalWaveEvidenceV1,
+    graph: ActualWaveGraphState,
 ) -> Result<(), CostProfileError> {
     let fail = || invalid("invalid structured algorithm recipe");
     let a = r.device.algorithm_work.as_ref().map_err(|_| fail())?;
@@ -241,6 +259,24 @@ fn validate_recipe(
         || r.device.readback == CoreReadbackRoute::Unknown
     {
         return Err(fail());
+    }
+    match (graph, r.device.replay_work.as_ref()) {
+        (ActualWaveGraphState::Disabled | ActualWaveGraphState::ConfiguredEager, None) => {}
+        (ActualWaveGraphState::Warm, Some(replay)) => {
+            if replay.protocol != "ferrum.structured-replay-work.v1"
+                || replay.exact_binding != exact
+                || replay.resident_binding == [0; 32]
+                || replay.replayed_segments == 0
+                || replay.replayed_segments > r.device.physical_commands
+                || replay.logical_commands < replay.replayed_segments
+                || replay.logical_commands as usize > MAX_COST_COMMANDS
+                || u64::from(replay.logical_commands) > a.selected_commands
+                || replay.native_graph_nodes < u64::from(replay.logical_commands)
+            {
+                return Err(fail());
+            }
+        }
+        _ => return Err(fail()),
     }
     let mut total = Work::default();
     let mut commands = 0u64;

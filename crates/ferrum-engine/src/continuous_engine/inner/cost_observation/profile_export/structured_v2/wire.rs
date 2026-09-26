@@ -29,7 +29,12 @@ impl<'a> PreparedWire<'a> {
             _ => return Err(ExportError::Source("unsupported Prepared wave kind")),
         };
         if s.path != ActualWavePath::PlanRuntime
-            || s.graph != ActualWaveGraphState::Disabled
+            || !matches!(
+                s.graph,
+                ActualWaveGraphState::Disabled
+                    | ActualWaveGraphState::Warm
+                    | ActualWaveGraphState::ConfiguredEager
+            )
             || s.row_order != ActualWaveRowOrder::Ordered
         {
             return Err(ExportError::Source("unsupported Prepared route"));
@@ -60,7 +65,16 @@ impl<'a> PreparedWire<'a> {
                     path: profile::ProfileExecutionPath::PlanRuntime,
                     provider_signature: s.provider_signature,
                     output_policy_signature: s.output_policy_signature,
-                    graph_state: profile::ProfileGraphState::Disabled,
+                    graph_state: match s.graph {
+                        ActualWaveGraphState::Warm => profile::ProfileGraphState::Warm,
+                        ActualWaveGraphState::ConfiguredEager => {
+                            profile::ProfileGraphState::ConfiguredEager
+                        }
+                        ActualWaveGraphState::Disabled => profile::ProfileGraphState::Disabled,
+                        ActualWaveGraphState::Cold => {
+                            return Err(ExportError::Source("unsupported Prepared route"))
+                        }
+                    },
                     order: profile::ProfileBatchOrder::Ordered,
                     decode_kv_tokens,
                     prefill_chunks,

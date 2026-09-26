@@ -139,6 +139,61 @@ impl WaveAlgorithmAccumulator {
             self.pending = Err(error);
         }
     }
+    pub(super) fn observe_replay(&mut self, command: CostPhysicalCommand<'_>) {
+        self.update(|pending| {
+            if pending.commands >= MAX_COST_COMMANDS {
+                return Err(StatisticalEvidenceUnknown::Capacity);
+            }
+            bytes(&mut pending.ordered, b"ferrum.physical-replay.v1");
+            super::wave::append_command_identity(&mut pending.ordered, command);
+            number(
+                &mut pending.ordered,
+                command
+                    .reusable_graph_node_count
+                    .ok_or(StatisticalEvidenceUnknown::UnsupportedReplay)?,
+            );
+            pending.commands += 1;
+            Ok(())
+        });
+    }
+    pub(super) fn replay_segment(&mut self, physical: u32, fingerprint: &str, count: usize) {
+        self.update(|pending| {
+            bytes(&mut pending.ordered, b"ferrum.resident-segment.v1");
+            number(&mut pending.ordered, u64::from(physical));
+            bytes(&mut pending.ordered, fingerprint.as_bytes());
+            number(&mut pending.ordered, count as u64);
+            Ok(())
+        });
+    }
+    pub(super) fn observe_logical(&mut self, physical: u32, command: CostLogicalCommand<'_>) {
+        self.update(|pending| {
+            let selected = command
+                .statistical_evidence
+                .ok_or(StatisticalEvidenceUnknown::MissingProducer)?;
+            selected.validate_command(
+                command.token_count,
+                command.compute_dispatch_count,
+                command.transfer_command_count,
+            )?;
+            let dispatches = command
+                .compute_dispatch_count
+                .checked_add(command.transfer_command_count)
+                .ok_or(StatisticalEvidenceUnknown::Overflow)?;
+            pending.merge_selected(selected, dispatches)?;
+            super::wave_replay::append_logical_identity(&mut pending.ordered, physical, command);
+            pending.ordered.update(selected.algorithm_work_binding()?);
+            Ok(())
+        });
+    }
+    fn update(&mut self, f: impl FnOnce(&mut Pending) -> Result<(), StatisticalEvidenceUnknown>) {
+        let result = match &mut self.pending {
+            Ok(p) => f(p),
+            Err(_) => return,
+        };
+        if let Err(error) = result {
+            self.pending = Err(error);
+        }
+    }
     pub(super) fn finish(
         self,
         shape: &CanonicalWaveCostShape,
@@ -192,14 +247,29 @@ impl Pending {
             command.compute_dispatch_count,
             command.transfer_command_count,
         )?;
-        let evidence = selected
-            .algorithm_work()
-            .ok_or(StatisticalEvidenceUnknown::MissingProducer)??;
-        evidence.validate_command(selected)?;
+        if self.commands >= MAX_COST_COMMANDS {
+            return Err(StatisticalEvidenceUnknown::Capacity);
+        }
         let dispatches = command
             .compute_dispatch_count
             .checked_add(command.transfer_command_count)
             .ok_or(StatisticalEvidenceUnknown::Overflow)?;
+        self.merge_selected(selected, dispatches)?;
+        number(&mut self.ordered, self.commands as u64);
+        super::wave::append_command_identity(&mut self.ordered, command);
+        self.ordered.update(selected.algorithm_work_binding()?);
+        self.commands += 1;
+        Ok(())
+    }
+    fn merge_selected(
+        &mut self,
+        selected: &SelectedCommandCostEvidenceV1,
+        dispatches: u64,
+    ) -> Result<(), StatisticalEvidenceUnknown> {
+        let evidence = selected
+            .algorithm_work()
+            .ok_or(StatisticalEvidenceUnknown::MissingProducer)??;
+        evidence.validate_command(selected)?;
         let selected_commands = self
             .selected_commands
             .checked_add(dispatches)
@@ -208,9 +278,6 @@ impl Pending {
             return Err(StatisticalEvidenceUnknown::Capacity);
         }
         let aggregate = self.aggregate.checked_add(selected.work())?;
-        if self.commands >= MAX_COST_COMMANDS {
-            return Err(StatisticalEvidenceUnknown::Capacity);
-        }
         for entry in evidence.entries() {
             let key = (entry.algorithm().signature().to_owned(), entry.kind());
             match self
@@ -239,10 +306,6 @@ impl Pending {
                 }
             }
         }
-        number(&mut self.ordered, self.commands as u64);
-        super::wave::append_command_identity(&mut self.ordered, command);
-        self.ordered.update(selected.algorithm_work_binding()?);
-        self.commands += 1;
         self.selected_commands = selected_commands;
         self.aggregate = aggregate;
         Ok(())

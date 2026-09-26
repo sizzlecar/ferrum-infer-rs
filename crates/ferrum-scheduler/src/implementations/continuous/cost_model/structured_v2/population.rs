@@ -90,8 +90,10 @@ impl StructuredOwnerFactsV2 {
         work.validate_structure(recipe)
             .map_err(|_| StructuredUnknown::MissingEvidence)?;
         // Validate the original exact/statistical bridge as well as the sidecar.
-        super::super::statistical::StatisticalModelInputV1::from_future(exact, selected)
-            .map_err(|_| StructuredUnknown::MissingEvidence)?;
+        super::super::statistical::StatisticalModelInputV1::from_future_structured_v2(
+            exact, selected,
+        )
+        .map_err(|_| StructuredUnknown::MissingEvidence)?;
         let device = recipe.device();
         let value = Self {
             rows: recipe

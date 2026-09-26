@@ -84,7 +84,7 @@ impl PartialEq for CostPhysicalCommand<'_> {
 }
 impl Eq for CostPhysicalCommand<'_> {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct CostLogicalCommand<'a> {
     pub native_op_id: &'a str,
     pub logical_command_ordinal: u32,
@@ -96,7 +96,24 @@ pub struct CostLogicalCommand<'a> {
     pub compute_dispatch_count: u64,
     pub transfer_command_count: u64,
     pub reusable_graph_node_count: u64,
+    pub statistical_evidence: Option<&'a super::SelectedCommandCostEvidenceV1>,
 }
+// Preserve the original exact command comparison; passive work is checked separately.
+impl PartialEq for CostLogicalCommand<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.native_op_id == other.native_op_id
+            && self.logical_command_ordinal == other.logical_command_ordinal
+            && self.node_index == other.node_index
+            && self.provider == other.provider
+            && self.participant_count == other.participant_count
+            && self.token_count == other.token_count
+            && self.batching_form == other.batching_form
+            && self.compute_dispatch_count == other.compute_dispatch_count
+            && self.transfer_command_count == other.transfer_command_count
+            && self.reusable_graph_node_count == other.reusable_graph_node_count
+    }
+}
+impl Eq for CostLogicalCommand<'_> {}
 impl<'a> CostPhysicalCommand<'a> {
     /// Lossless projection of actual work evidence, not a future route promise.
     pub fn from_attribution(
@@ -140,6 +157,7 @@ impl<'a> CostLogicalCommand<'a> {
             compute_dispatch_count: command.compute_dispatch_count(),
             transfer_command_count: command.transfer_command_count(),
             reusable_graph_node_count: command.reusable_graph_node_count(),
+            statistical_evidence: command.statistical_evidence(),
         }
     }
 }
@@ -468,6 +486,11 @@ impl CanonicalWaveCostBuilder {
             this.expected_graph_nodes = expected_nodes;
             this.last_segment = Some(physical_command);
             this.segments += 1;
+            this.statistical.replay_segment(
+                physical_command,
+                executable_fingerprint,
+                logical_count,
+            );
             Ok(())
         })
     }
@@ -511,6 +534,7 @@ impl CanonicalWaveCostBuilder {
             {
                 return Err(CanonicalCostError::EvidenceMismatch);
             }
+            this.statistical.logical_command(command);
             Ok(())
         })
     }

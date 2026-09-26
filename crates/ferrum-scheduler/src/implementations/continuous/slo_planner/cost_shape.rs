@@ -169,6 +169,7 @@ fn project(
             ActualWaveGraphState::Disabled => WaveGraphState::Disabled,
             ActualWaveGraphState::Cold => WaveGraphState::Cold,
             ActualWaveGraphState::Warm => WaveGraphState::Warm,
+            ActualWaveGraphState::ConfiguredEager => WaveGraphState::ConfiguredEager,
         },
         order: match metadata.order {
             ActualWaveRowOrder::Ordered => BatchOrderSemantics::Ordered,

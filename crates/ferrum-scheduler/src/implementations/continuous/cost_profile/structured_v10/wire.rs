@@ -442,6 +442,19 @@ pub(super) struct Device {
     pub retries: u32,
     pub aggregate_work: Work,
     pub algorithm_work: std::result::Result<Algorithms, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_work: Option<ReplayWork>,
+}
+/// Untrusted source numeric DTO, not the interfaces live/private replay type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReplayWork {
+    pub protocol: String,
+    pub exact_binding: [u8; 32],
+    pub resident_binding: [u8; 32],
+    pub replayed_segments: u32,
+    pub logical_commands: u32,
+    pub native_graph_nodes: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

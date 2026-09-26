@@ -139,6 +139,9 @@ pub enum ActualWaveGraphState {
     Disabled,
     Cold,
     Warm,
+    /// Configured OnDemand stream, proven eager without candidate preparation,
+    /// capture, upload, replay or a cache-state transition. Not graph-disabled.
+    ConfiguredEager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -13,6 +13,8 @@ mod replay;
 mod structure;
 mod wave;
 mod wave_algorithm_work;
+mod wave_replay;
+pub use wave_replay::StructuredReplayWorkV1;
 mod wire;
 pub use algorithm_work::{
     AlgorithmNumericWorkV1, AlgorithmWorkKindV1, SelectedAlgorithmWorkEvidenceV1,
