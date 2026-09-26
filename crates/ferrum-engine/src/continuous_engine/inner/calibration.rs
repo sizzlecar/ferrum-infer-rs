@@ -11,6 +11,7 @@ mod selected;
 pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
 mod structured;
 mod structured_group_v2;
+mod structured_prefix_v5;
 mod structured_v2;
 pub use structured::{
     StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
@@ -48,8 +49,8 @@ pub use reference::{
     CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
 };
 pub use token_preparation::{
-    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
-    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
+    PrefixReleasedV1, PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
 };
 mod types;
 pub use observation::{
@@ -67,6 +68,8 @@ pub use types::{
 
 pub struct CalibrationSession {
     prefix_preparation: Option<token_preparation::PrefixPreparationRun>,
+    // Permanent session isolation, including ordinary cohorts and after close.
+    prefix_source5: bool,
     selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
     selected_capture_identity: Option<[u8; 32]>,
     structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
@@ -110,6 +113,7 @@ impl CalibrationSession {
         inner.manual_calibration_driver = true;
         Ok(Self {
             prefix_preparation: None,
+            prefix_source5: false,
             selected_capture: None,
             selected_capture_identity: None,
             structured_capture: None,
@@ -154,6 +158,11 @@ impl CalibrationSession {
         context: InferenceRequestContext,
         contract: Arc<OutputProjectionContract>,
     ) -> Result<CreditedOutputSession> {
+        if self.prefix_source5 {
+            return self
+                .add_declared_prefix_source_request_v5(request, context, contract)
+                .await;
+        }
         if self.prefix_preparation.is_some() {
             return Err(FerrumError::invalid_request("prefix session requires every request to be declared through its private preparation entry"));
         }
@@ -332,6 +341,17 @@ impl CalibrationSession {
                     ));
                 }
                 self.check_prefix_wave(&rows)?;
+                let prefix_preparing = self.prefix_source5
+                    && self
+                        .structured_group_v2
+                        .as_ref()
+                        .ok_or_else(|| FerrumError::invalid_request("source5 collector is closed"))?
+                        .preparing_prefix()
+                        .map_err(structured::capture_error)?;
+                if prefix_preparing {
+                    self.offer_prefix_wave(&rows)?;
+                    self.offer_prefix_source_wave_v5()?;
+                }
                 if let Some(collector) = &mut self.structured_capture {
                     if let Err(error) = collector.offer(&rows) {
                         collector.invalidate(error.to_string());
@@ -345,7 +365,7 @@ impl CalibrationSession {
                     }
                 }
                 if let Some(group) = &mut self.structured_group_v2 {
-                    if group.collecting() {
+                    if group.collecting() && !prefix_preparing {
                         if let Err(error) = group.offer(&rows) {
                             group.invalidate(error.to_string());
                         }
@@ -414,7 +434,7 @@ impl CalibrationSession {
                     }
                 }
                 if let Some(collector) = &mut self.structured_group_v2 {
-                    if collector.collecting() {
+                    if collector.collecting() && !prefix_preparing {
                         match prepared.structured_prepared_facts(
                             &inner,
                             self.limits.structured_prepared_projection_budget(),
@@ -427,7 +447,7 @@ impl CalibrationSession {
                             Err(error) => collector.invalidate(error.to_string()),
                         }
                     }
-                    if collector.collecting() {
+                    if collector.collecting() && !prefix_preparing {
                         match collector.pending_capture() {
                             Ok(capture) => {
                                 if let Err(error) = receipt.bind_structured_capture(capture) {
@@ -438,7 +458,9 @@ impl CalibrationSession {
                         }
                     }
                 }
-                self.offer_prefix_wave(&rows)?;
+                if !prefix_preparing {
+                    self.offer_prefix_wave(&rows)?;
+                }
                 self.pending = Some(Arc::clone(&receipt));
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;

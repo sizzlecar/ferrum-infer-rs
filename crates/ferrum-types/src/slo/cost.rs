@@ -446,6 +446,8 @@ pub enum SloStructuredArtifactKindV2 {
     CatalogV1,
     /// Schema11: one original physical source4 with independent child models.
     SharedCatalogV11,
+    /// Schema12: one original source5 with verified preparation and full Length.
+    PrefixCatalogV12,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloStructuredChildReceiptV2 {

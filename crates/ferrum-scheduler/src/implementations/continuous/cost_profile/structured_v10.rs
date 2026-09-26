@@ -14,8 +14,10 @@ mod prepared;
 mod replay;
 mod shared;
 pub use shared::{
-    export_structured_profile_v11, load_structured_profile_v11, structured_shared_source_header_v4,
-    ImportedStructuredCatalogV11, StructuredProfileExportReceiptV11,
+    export_structured_profile_v11, export_structured_profile_v12, load_structured_profile_v11,
+    load_structured_profile_v12, structured_prefix_source_header_v5,
+    structured_shared_source_header_v4, ImportedStructuredCatalogV11, ImportedStructuredCatalogV12,
+    StructuredProfileExportReceiptV11, StructuredProfileExportReceiptV12,
 };
 mod wire;
 use wire::*;

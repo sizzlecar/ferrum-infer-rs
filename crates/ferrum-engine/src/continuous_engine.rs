@@ -1093,32 +1093,7 @@ fn is_utf8_continuation(byte: u8) -> bool {
 }
 
 fn advance_pending_utf8_fragment(pending: &[u8], next: &[u8]) -> std::result::Result<Vec<u8>, ()> {
-    let mut combined = Vec::with_capacity(pending.len().saturating_add(next.len()));
-    combined.extend_from_slice(pending);
-    combined.extend_from_slice(next);
-    match std::str::from_utf8(&combined) {
-        Ok(text) => {
-            if text.contains('\u{FFFD}') || contains_replacement_char_mojibake(text) {
-                Err(())
-            } else {
-                Ok(Vec::new())
-            }
-        }
-        Err(error) if error.error_len().is_none() => {
-            let valid_prefix =
-                std::str::from_utf8(&combined[..error.valid_up_to()]).map_err(|_| ())?;
-            if valid_prefix.contains('\u{FFFD}') || contains_replacement_char_mojibake(valid_prefix)
-            {
-                return Err(());
-            }
-            let fragment = &combined[error.valid_up_to()..];
-            if fragment.is_empty() || fragment.len() > 3 {
-                return Err(());
-            }
-            Ok(fragment.to_vec())
-        }
-        Err(_) => Err(()),
-    }
+    ferrum_interfaces::output_flow::advance_committed_utf8_fragment(pending, next).map_err(|_| ())
 }
 
 fn decoded_delta_has_forbidden_quality(
@@ -1144,24 +1119,7 @@ fn decoded_delta_has_forbidden_quality(
 }
 
 fn contains_replacement_char_mojibake(text: &str) -> bool {
-    let mut chars = text.chars();
-    let mut a = chars.next();
-    let mut b = chars.next();
-    let mut c = chars.next();
-    loop {
-        if matches!(
-            (a, b, c),
-            (Some('\u{00ef}'), Some('\u{00bf}'), Some('\u{00bd}'))
-        ) {
-            return true;
-        }
-        if c.is_none() {
-            return false;
-        }
-        a = b;
-        b = c;
-        c = chars.next();
-    }
+    ferrum_interfaces::output_flow::contains_output_replacement_mojibake(text)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1276,8 +1234,8 @@ pub use inner::calibration::{
     StructuredPreparedProjectionReportV2,
 };
 pub use inner::calibration::{
-    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
-    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
+    PrefixReleasedV1, PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
 };
 pub use inner::calibration::{
     StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,

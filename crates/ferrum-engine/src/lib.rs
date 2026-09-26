@@ -96,8 +96,8 @@ pub use continuous_engine::{
     SequenceState,
 };
 pub use continuous_engine::{
-    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
-    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleaseProgressV5,
+    PrefixReleasedV1, PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
 };
 
 // Re-exports of pipeline

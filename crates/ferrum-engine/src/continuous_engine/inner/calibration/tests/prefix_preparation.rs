@@ -6,6 +6,7 @@ use crate::continuous_engine::inner::slo_controller::tests::fixture::fixture_wit
 use ferrum_interfaces::{output_flow::OutputCompletion, Tokenizer};
 use ferrum_tokenizer::implementations::HuggingFaceTokenizer;
 use ferrum_types::{SamplingParams, TokenId};
+mod source5;
 
 async fn prepared_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
     let (mut engine, _, executor) = fixture_with_custom_config(1, |config| {

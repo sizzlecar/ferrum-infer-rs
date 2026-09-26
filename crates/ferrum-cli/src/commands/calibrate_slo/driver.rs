@@ -291,6 +291,29 @@ pub(super) async fn cohort(
             artifacts.record(&serde_json::json!({"schema_version":1,"event":"admission_or_maintenance",
                 "phase":phase,"case":index,"repetition":repetition,"outcome":format!("{admission:?}")}))?;
         }
+        let prefix_progress = session.advance_structured_prefix_release_v5()?;
+        if matches!(
+            prefix_progress,
+            ferrum_engine::continuous_engine::PrefixReleaseProgressV5::AwaitingCredit
+        ) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if matches!(
+            prefix_progress,
+            ferrum_engine::continuous_engine::PrefixReleaseProgressV5::Released { .. }
+        ) {
+            artifacts.record(&serde_json::json!({"schema_version":1,"event":"structured_prefix_cohort_released","phase":phase,"case":index,"repetition":repetition,"release":prefix_progress}))?;
+        }
+        let preparing_prefix = matches!(
+            prefix_progress,
+            ferrum_engine::continuous_engine::PrefixReleaseProgressV5::Preparing
+        );
+        let prefix_frontier = if preparing_prefix {
+            session.structured_prefix_release_generated_v5()?
+        } else {
+            None
+        };
         let frontiers = session.frontiers()?;
         for frontier in &frontiers {
             let Some(owner) = window.owner_mut(frontier.request_id()) else {
@@ -323,10 +346,20 @@ pub(super) async fn cohort(
         let prefill_chunk = choice.map_or(case.prefill_chunk_tokens, |value| {
             value.prefill_chunk_tokens
         });
-        let decode_route = choice.map_or(case.decode_route, |value| value.decode_route);
+        let decode_route = if preparing_prefix {
+            ferrum_engine::continuous_engine::CalibrationDecodeRoute::Actual
+        } else {
+            choice.map_or(case.decode_route, |value| value.decode_route)
+        };
         let mut prefills = Vec::new();
         let mut decodes = Vec::new();
         for frontier in ordered {
+            // All slots remain live. A slot already at its immutable release
+            // frontier waits for its cohort peers; it is never truncated or
+            // promoted into a numerical member while any prefix is installed.
+            if prefix_frontier.is_some_and(|n| frontier.generated_tokens() >= n) {
+                continue;
+            }
             if let Some((offset, total)) = frontier.prefill_progress() {
                 let count = super::reference::prefill_count(
                     manifest.reference.as_ref(),

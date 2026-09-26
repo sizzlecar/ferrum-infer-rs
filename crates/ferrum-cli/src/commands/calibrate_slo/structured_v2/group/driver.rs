@@ -15,6 +15,13 @@ pub(in crate::commands::calibrate_slo) async fn collect(
     // Freeze all child populations and the shared full request plan before any
     // warmup outcome. The core checks aggregate allocation/file bounds again.
     let options = capture.options(manifest, inputs, session)?;
+    if let Some(prefixes) = manifest.validation_model.prefix_plan_v5() {
+        prefixes
+            .validate(&options.children[0].cohort_plan)
+            .map_err(|e| {
+                FerrumError::config(format!("source5 complete request/prefix plan: {e:?}"))
+            })?;
+    }
     discovery::complete_cases(
         session,
         manifest,
@@ -26,7 +33,13 @@ pub(in crate::commands::calibrate_slo) async fn collect(
     )
     .await?;
     summary.structured_calibration_group_v2 = Some(GroupReportV2::new(capture));
-    session.begin_structured_cost_group_v2(options).await?;
+    if let Some(prefixes) = manifest.validation_model.prefix_plan_v5() {
+        session
+            .begin_structured_prefix_cost_group_v5(options, prefixes.clone())
+            .await?;
+    } else {
+        session.begin_structured_cost_group_v2(options).await?;
+    }
     update_progress(session, summary)?;
     artifacts.record(&serde_json::json!({"schema_version":1,"event":"structured_v2_group_started","progress":session.structured_cost_group_progress_v2()}))?;
     for (cases, phase, expected) in [
@@ -154,6 +167,13 @@ pub(in crate::commands::calibrate_slo) async fn finish(
     // Validate ALL children before exporting the first one. Export and import
     // retain their own original source replay and expiration checks.
     export::require_group_exportable(report)?;
-    export::export_and_inspect(session, capture, source, report, artifacts)?;
+    export::export_and_inspect(
+        session,
+        capture,
+        source,
+        report,
+        artifacts,
+        manifest.validation_model.prefix_plan_v5().is_some(),
+    )?;
     Ok(())
 }

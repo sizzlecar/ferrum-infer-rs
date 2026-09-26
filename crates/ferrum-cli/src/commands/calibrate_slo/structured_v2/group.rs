@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 mod config;
 mod driver;
 mod export;
+mod prefix;
+pub(in crate::commands::calibrate_slo) use prefix::validate_prefix_v5;
 #[cfg(test)]
 mod tests;
 pub(in crate::commands::calibrate_slo) use config::GroupCaptureConfigV2;
@@ -21,6 +23,7 @@ pub(crate) struct GroupReportV2 {
     pub children: Vec<report::StructuredReportV2>,
     pub group_failure: Option<String>,
     pub exported_shared_profile: Option<ferrum_scheduler::implementations::continuous::cost_profile::StructuredProfileExportReceiptV11>,
+    pub exported_prefix_profile: Option<ferrum_scheduler::implementations::continuous::cost_profile::StructuredProfileExportReceiptV12>,
     pub verified_catalog: Option<ferrum_types::SloCostProfileReceipt>,
     pub finalization_error: Option<String>,
 }
@@ -33,6 +36,7 @@ impl GroupReportV2 {
             children: config.children.iter().map(|c| report::StructuredReportV2::new(c.scope.clone())).collect(),
             group_failure: None,
             exported_shared_profile: None,
+            exported_prefix_profile: None,
             verified_catalog: None,
             finalization_error: None,
         }

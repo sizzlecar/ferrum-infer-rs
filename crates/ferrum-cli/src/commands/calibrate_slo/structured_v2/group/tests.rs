@@ -2,6 +2,8 @@ use super::*;
 use ferrum_interfaces::execution_cost::{CoreReadbackRoute, HostPendingConstraintV2};
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{windows::*, *};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[path = "tests/prefix.rs"]
+mod prefix;
 
 #[test]
 fn prepared_projection_group_v2_uses_one_bound_for_shared_population() {

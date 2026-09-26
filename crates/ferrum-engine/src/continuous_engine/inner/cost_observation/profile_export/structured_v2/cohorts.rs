@@ -93,6 +93,123 @@ impl CohortLedgerV2 {
             .map(|c| c.ordinal)
             .ok_or(ExportError::Source("no declared cohort active"))
     }
+    pub fn next_admission_slot(&self) -> Result<usize, ExportError> {
+        self.active
+            .as_ref()
+            .map(|c| c.admitted)
+            .ok_or(ExportError::Source("no declared cohort active"))
+    }
+    pub fn request_slot(&self, id: &RequestId) -> Result<usize, ExportError> {
+        self.active
+            .as_ref()
+            .and_then(|c| {
+                c.slots
+                    .iter()
+                    .position(|s| s.request_id.as_ref() == Some(id))
+            })
+            .ok_or(ExportError::Source(
+                "prefix request is outside its declared cohort",
+            ))
+    }
+    pub fn admitted_ids(&self) -> Result<Vec<RequestId>, ExportError> {
+        self.active
+            .as_ref()
+            .ok_or(ExportError::Source("no declared cohort active"))?
+            .slots
+            .iter()
+            .map(|s| {
+                s.request_id
+                    .clone()
+                    .ok_or(ExportError::Source("prefix slot has not been admitted"))
+            })
+            .collect()
+    }
+    pub fn preparation_offered(
+        &mut self,
+        rows: &[crate::continuous_engine::inner::calibration::token_preparation::PrefixPreparedRowV5],
+    ) -> Result<(), ExportError> {
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(ExportError::Source("prefix offer without cohort"))?;
+        if rows.is_empty() || active.admitted != active.slots.len() {
+            return Err(ExportError::Source(
+                "prefix requires every declared slot admitted before preparation",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let before = row.before();
+            let slot = active
+                .slots
+                .iter()
+                .find(|s| s.request_id.as_ref() == Some(&before.request_id))
+                .ok_or(ExportError::Source("prefix request never admitted"))?;
+            if !seen.insert(&before.request_id)
+                || slot.completed
+                || slot.generated != before.generated_tokens as u64
+                || slot
+                    .owner
+                    .is_some_and(|owner| owner != before.owner_incarnation)
+            {
+                return Err(ExportError::Source(
+                    "prefix offer differs from original request frontier",
+                ));
+            }
+            row.work().emits_token().map_err(numeric_error)?;
+        }
+        for row in rows {
+            let before = row.before();
+            active
+                .slots
+                .iter_mut()
+                .find(|s| s.request_id.as_ref() == Some(&before.request_id))
+                .unwrap()
+                .owner = Some(before.owner_incarnation);
+        }
+        Ok(())
+    }
+    pub fn preparation_completed(
+        &mut self,
+        captured: &crate::continuous_engine::inner::calibration::token_preparation::CapturedPrefixWaveV5,
+    ) -> Result<(), ExportError> {
+        let evidence = captured.evidence();
+        if evidence.chain_error.is_some() || evidence.error.is_some() {
+            return Err(ExportError::Source("prefix actual settlement failed"));
+        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(ExportError::Source("prefix completion without cohort"))?;
+        for row in &evidence.rows {
+            let slot = active
+                .slots
+                .iter()
+                .find(|s| s.request_id.as_ref() == Some(&row.before.request_id))
+                .ok_or(ExportError::Source("prefix completion never offered"))?;
+            let after = row.after.as_ref().ok_or(ExportError::Source(
+                "prefix owner terminated before release",
+            ))?;
+            if slot.completed
+                || slot.generated != row.before.generated_tokens as u64
+                || slot.owner != Some(after.owner_incarnation)
+                || after.generated_tokens as u64 >= slot.maximum
+            {
+                return Err(ExportError::Source(
+                    "prefix completion differs from original full lifecycle",
+                ));
+            }
+        }
+        for row in &evidence.rows {
+            active
+                .slots
+                .iter_mut()
+                .find(|s| s.request_id.as_ref() == Some(&row.before.request_id))
+                .unwrap()
+                .generated = row.after.as_ref().unwrap().generated_tokens as u64;
+        }
+        Ok(())
+    }
     pub fn admit(&mut self, id: RequestId, maximum: u64) -> Result<usize, ExportError> {
         let active = self
             .active

@@ -15,7 +15,7 @@ impl CalibrationSession {
         &self,
         path: &std::path::Path,
     ) -> Result<ferrum_types::SloCostProfileReceipt> {
-        self.selected_phase_boundary()?;
+        self.group_phase_boundary()?;
         self.engine
             .inner
             .cost_runtime
@@ -30,6 +30,13 @@ impl CalibrationSession {
     pub async fn begin_structured_cost_group_v2(
         &mut self,
         options: StructuredCalibrationGroupOptionsV2,
+    ) -> Result<()> {
+        self.begin_structured_group_inner(options, None).await
+    }
+    pub(super) async fn begin_structured_group_inner(
+        &mut self,
+        options: StructuredCalibrationGroupOptionsV2,
+        prefix: Option<ferrum_scheduler::implementations::continuous::cost_model::structured_v2::prefixes::StructuredPrefixPlanV5>,
     ) -> Result<()> {
         self.selected_phase_boundary()?;
         if self.structured_group_v2.is_some()
@@ -81,15 +88,26 @@ impl CalibrationSession {
                 device_runtime: identity.device_runtime,
                 execution_config: identity.execution_config,
             };
+        let is_prefix = prefix.is_some();
         self.structured_group_v2 = Some(
-            StructuredCalibrationGroupV2::new(
-                options,
-                fingerprint,
-                Arc::clone(&runtime.clock),
-                checkpoint.accepted_ordinal(),
-            )
+            match prefix {
+                Some(plan) => StructuredCalibrationGroupV2::new_with_prefix(
+                    options,
+                    plan,
+                    fingerprint,
+                    Arc::clone(&runtime.clock),
+                    checkpoint.accepted_ordinal(),
+                ),
+                None => StructuredCalibrationGroupV2::new(
+                    options,
+                    fingerprint,
+                    Arc::clone(&runtime.clock),
+                    checkpoint.accepted_ordinal(),
+                ),
+            }
             .map_err(capture_error)?,
         );
+        self.prefix_source5 = is_prefix;
         Ok(())
     }
     pub fn structured_cost_group_progress_v2(&self) -> Option<Vec<StructuredCalibrationProgress>> {
@@ -105,7 +123,7 @@ impl CalibrationSession {
             .map_err(capture_error)
     }
     pub fn begin_structured_cost_group_cohort_v2(&mut self, ordinal: usize) -> Result<()> {
-        self.selected_phase_boundary()?;
+        self.group_phase_boundary()?;
         self.structured_group_v2
             .as_mut()
             .ok_or_else(|| FerrumError::invalid_request("group not started"))?
@@ -113,7 +131,10 @@ impl CalibrationSession {
             .map_err(capture_error)
     }
     pub fn end_structured_cost_group_cohort_v2(&mut self) -> Result<()> {
-        self.selected_phase_boundary()?;
+        self.group_phase_boundary()?;
+        if self.prefix_source5 {
+            self.finish_prefix_source_cohort_v5()?;
+        }
         self.structured_group_v2
             .as_mut()
             .ok_or_else(|| FerrumError::invalid_request("group not started"))?
@@ -123,7 +144,7 @@ impl CalibrationSession {
     pub async fn freeze_structured_cost_group_phase_v2(
         &mut self,
     ) -> Result<Vec<StructuredPhaseFreezeReceipt>> {
-        self.selected_phase_boundary()?;
+        self.group_phase_boundary()?;
         let checkpoint = self.freeze_cost_model().await?;
         self.structured_group_v2
             .as_mut()
@@ -134,7 +155,7 @@ impl CalibrationSession {
     pub async fn finish_structured_cost_group_v2(
         &mut self,
     ) -> Result<StructuredCalibrationGroupArtifactV2> {
-        self.selected_phase_boundary()?;
+        self.group_phase_boundary()?;
         let checkpoint = self.freeze_cost_model().await?;
         self.structured_group_v2
             .take()

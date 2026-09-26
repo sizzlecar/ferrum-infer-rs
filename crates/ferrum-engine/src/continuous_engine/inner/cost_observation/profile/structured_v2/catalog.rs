@@ -221,9 +221,34 @@ pub(super) fn load(
         let receipt = receipt::shared(path, &imported, &snapshot, declared)?;
         return Ok((snapshot, receipt));
     }
+    if kind.schema_version == 12
+        && kind.artifact_type.as_deref() == Some("ferrum.structured-prefix-v2-catalog")
+    {
+        drop(bytes);
+        let imported =
+            file::load_structured_profile_v12(path, fp, limits, clock).map_err(profile_error)?;
+        if imported.file_sha256 != digest {
+            return Err(FerrumError::config("prefix catalog changed during startup"));
+        }
+        let mut children = BTreeMap::new();
+        for child in &imported.children {
+            if children
+                .insert(*child.domain_signature(), child.clone())
+                .is_some()
+            {
+                return Err(FerrumError::config("duplicate prefix replayed domain"));
+            }
+        }
+        let snapshot = StructuredSnapshot {
+            children: Arc::new(children),
+            feedback: None,
+        };
+        let receipt = receipt::prefix(path, &imported, &snapshot, declared)?;
+        return Ok((snapshot, receipt));
+    }
     if kind.schema_version != 1 || kind.artifact_type.as_deref() != Some(ARTIFACT_TYPE) {
         return Err(FerrumError::config(
-            "expected schema10 child, explicit V2 catalog, or shared schema11",
+            "expected schema10 child, explicit V2 catalog, shared schema11, or prefix schema12",
         ));
     }
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(profile_error)?;

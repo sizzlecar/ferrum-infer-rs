@@ -19,7 +19,7 @@ impl CalibrationSession {
             .map(|collector| collector.progress())
     }
     fn structured_phase_boundary(&self) -> Result<()> {
-        if self.prefix_preparation.is_some() {
+        if self.prefix_preparation.is_some() || self.prefix_source5 {
             return Err(FerrumError::invalid_request(
                 "prefix preparation needs its independent source5 protocol; old collectors cannot omit its request frontier",
             ));

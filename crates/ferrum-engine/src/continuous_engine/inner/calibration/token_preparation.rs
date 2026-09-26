@@ -9,6 +9,7 @@ use std::collections::HashMap;
 mod plan;
 mod sequence;
 mod session;
+mod source5;
 pub use plan::CalibrationPrefixTokensV1;
 use plan::ValidatedCalibrationPrefixTokensV1;
 
@@ -71,12 +72,50 @@ impl PrefixFrontierV1 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PrefixRowEvidenceV1 {
     pub before: PrefixFrontierV1,
     /// A terminal owner has been removed; use the real host terminal receipt.
     pub after: Option<PrefixFrontierV1>,
     pub preparation_commit: Option<PrefixTokenCommitV1>,
+}
+
+/// Only this module constructs these snapshots from the actual private
+/// sequence and declared manual work. Public diagnostic DTOs are never input
+/// authority for a source writer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(in crate::continuous_engine::inner) struct PrefixPreparedRowV5 {
+    before: PrefixFrontierV1,
+    work: ferrum_scheduler::implementations::continuous::cost_model::structured_v2::windows::PreparedWorkV2,
+}
+impl PrefixPreparedRowV5 {
+    pub(in crate::continuous_engine::inner) fn before(&self) -> &PrefixFrontierV1 {
+        &self.before
+    }
+    pub(in crate::continuous_engine::inner) fn work(&self) -> ferrum_scheduler::implementations::continuous::cost_model::structured_v2::windows::PreparedWorkV2{
+        self.work
+    }
+}
+pub(in crate::continuous_engine::inner) struct CapturedPrefixWaveV5(PrefixWaveEvidenceV1);
+impl CapturedPrefixWaveV5 {
+    pub(in crate::continuous_engine::inner) fn evidence(&self) -> &PrefixWaveEvidenceV1 {
+        &self.0
+    }
+}
+pub(in crate::continuous_engine::inner) struct CapturedPrefixReleaseV5(PrefixReleasedV1);
+impl CapturedPrefixReleaseV5 {
+    pub(in crate::continuous_engine::inner) fn receipt(&self) -> &PrefixReleasedV1 {
+        &self.0
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PrefixReleaseProgressV5 {
+    Inactive,
+    Preparing,
+    AwaitingCredit,
+    Released { receipts: Vec<PrefixReleasedV1> },
 }
 
 /// One actual wave, including ordinary suffix/terminal waves. The manual
@@ -128,7 +167,7 @@ struct RequestRecord {
 #[derive(Default)]
 pub(super) struct PrefixPreparationRun {
     records: HashMap<RequestId, RequestRecord>,
-    pending_offer: Option<Vec<PrefixFrontierV1>>,
+    pending_offer: Option<Vec<PrefixPreparedRowV5>>,
     pending_wave: Option<PrefixWaveEvidenceV1>,
     last_fifo: u64,
     last_call: u64,

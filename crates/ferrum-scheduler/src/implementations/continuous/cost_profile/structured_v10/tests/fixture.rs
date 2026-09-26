@@ -46,6 +46,16 @@ pub fn prepared_route(
     resident: Option<&str>,
     graph: ActualWaveGraphState,
 ) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
+    prepared_route_policy(id, generation, generated, resident, graph, None)
+}
+pub fn prepared_route_policy(
+    id: &str,
+    generation: u64,
+    generated: u64,
+    resident: Option<&str>,
+    graph: ActualWaveGraphState,
+    base_policy: Option<[u8; 32]>,
+) -> (Prepared, Vec<OfferedRow>, StructuredInputV2) {
     let mut command = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
     command
         .kernel_with_replay_geometry(
@@ -137,7 +147,8 @@ pub fn prepared_route(
                 repetition_penalty_bits: 1f32.to_bits(),
             }
         },
-        host_policy_signature: [3; 32],
+        host_policy_signature: base_policy
+            .map_or([3; 32], |base| host_history_cost_signature(base, generated)),
         mask_upload_required: false,
         host_features: Some(HostCostFeaturesV1 {
             policy: HostCostPolicyV2 {
@@ -457,12 +468,19 @@ pub fn source() -> (Vec<u8>, StructuredInputV2) {
     source_graph(None)
 }
 pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
-    source_graph_fit_tail(resident, false)
+    source_graph_fit_tail(resident, false, None)
 }
 pub fn source_with_fit_tail() -> (Vec<u8>, StructuredInputV2) {
-    source_graph_fit_tail(None, true)
+    source_graph_fit_tail(None, true, None)
 }
-fn source_graph_fit_tail(resident: Option<&str>, fit_tail: bool) -> (Vec<u8>, StructuredInputV2) {
+pub fn source_policy(base_policy: [u8; 32]) -> (Vec<u8>, StructuredInputV2) {
+    source_graph_fit_tail(None, false, Some(base_policy))
+}
+fn source_graph_fit_tail(
+    resident: Option<&str>,
+    fit_tail: bool,
+    base_policy: Option<[u8; 32]>,
+) -> (Vec<u8>, StructuredInputV2) {
     let h = header_graph(resident);
     let mut bytes = Vec::new();
     let mut ordinal = 0;
@@ -509,7 +527,18 @@ fn source_graph_fit_tail(resident: Option<&str>, fit_tail: bool) -> (Vec<u8>, St
             );
             for generated in 0..3 {
                 offers += 1;
-                let (p, rows, input) = prepared_graph(&id, generated + 1, generated, resident);
+                let (p, rows, input) = prepared_route_policy(
+                    &id,
+                    generated + 1,
+                    generated,
+                    resident,
+                    if resident.is_some() {
+                        ActualWaveGraphState::Warm
+                    } else {
+                        ActualWaveGraphState::Disabled
+                    },
+                    base_policy,
+                );
                 let wall_ns = if fit_tail
                     && phase == StructuredProfilePhaseV10::Fit
                     && cohort == 3

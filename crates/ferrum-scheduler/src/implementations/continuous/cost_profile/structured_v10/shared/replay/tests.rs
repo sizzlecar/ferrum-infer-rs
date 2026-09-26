@@ -38,7 +38,7 @@ fn resign_child(h: &mut Header) {
 // This is fixture construction, not the production replay strategy. A second
 // owner selects original prefill waves that the first owner's source kept as
 // outside settlements. The third (terminal) wave remains outside both owners.
-fn source4() -> Vec<u8> {
+pub(in super::super) fn source4() -> Vec<u8> {
     let (original, _) = fixture::source();
     let mut lines = original.split_inclusive(|b| *b == b'\n');
     let old: Header =

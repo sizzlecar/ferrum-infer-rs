@@ -150,9 +150,18 @@ fn validate_header(
     bytes: usize,
     limits: &CostProfileLoadLimits,
 ) -> Result<(), CostProfileError> {
-    if h.artifact_type != "ferrum.structured-shared-live-source"
-        || h.schema_version != 4
-        || h.model_revision != MODEL_REVISION_V2
+    validate_shared_header(h, bytes, limits, false)
+}
+fn validate_shared_header(
+    h: &HeaderV4,
+    bytes: usize,
+    limits: &CostProfileLoadLimits,
+    prefix_source: bool,
+) -> Result<(), CostProfileError> {
+    if !prefix_source
+        && (h.artifact_type != "ferrum.structured-shared-live-source"
+            || h.schema_version != 4
+            || h.model_revision != MODEL_REVISION_V2)
         || h.children.is_empty()
         || h.maximum_children == 0
         || h.children.len() > h.maximum_children
@@ -162,7 +171,7 @@ fn validate_header(
         || h.maximum_retained_coordinates == 0
         || h.maximum_retained_coordinates > 16_777_216
         || h.maximum_file_bytes < bytes as u64
-        || h.capture_protocol != h.signature()?
+        || (!prefix_source && h.capture_protocol != h.signature()?)
     {
         return Err(failure());
     }
@@ -234,7 +243,21 @@ pub(super) fn replay_source(
 fn replay_with_observer(
     bytes: &[u8],
     limits: &CostProfileLoadLimits,
+    physical_validated: impl FnMut(),
+) -> Result<ReplayedV4, CostProfileError> {
+    replay_driver(bytes, limits, physical_validated, false)
+}
+pub(super) fn replay_prefix_source(
+    bytes: &[u8],
+    limits: &CostProfileLoadLimits,
+) -> Result<ReplayedV4, CostProfileError> {
+    replay_driver(bytes, limits, || {}, true)
+}
+pub(super) fn replay_driver(
+    bytes: &[u8],
+    limits: &CostProfileLoadLimits,
     mut physical_validated: impl FnMut(),
+    prefix_source: bool,
 ) -> Result<ReplayedV4, CostProfileError> {
     limits.validate()?;
     if bytes.is_empty() || bytes.len() > limits.max_file_bytes.get() || bytes.last() != Some(&b'\n')
@@ -247,8 +270,18 @@ fn replay_with_observer(
     if wrapper.source_record_ordinal != 1 {
         return Err(failure());
     }
-    let header: HeaderV4 = serde_json::from_value(wrapper.record)?;
-    validate_header(&header, bytes.len(), limits)?;
+    let (header, prefix_plan) = if prefix_source {
+        let (header, plan) = prefix::header(wrapper.record)?;
+        (header, Some(plan))
+    } else {
+        (serde_json::from_value::<HeaderV4>(wrapper.record)?, None)
+    };
+    if prefix_source {
+        validate_shared_header(&header, bytes.len(), limits, true)?;
+    } else {
+        validate_header(&header, bytes.len(), limits)?;
+    }
+    let mut preparation = prefix_plan.map(prefix::Preparation::new);
     let capture_protocol = header.capture_protocol;
     let h = &header.common;
     let mut lifecycle = lifecycle::Lifecycle::new(h.cohort_plan.clone());
@@ -265,7 +298,12 @@ fn replay_with_observer(
         .iter()
         .map(|c| c.len() as u64)
         .sum::<u64>();
-    let record_limit = 4 * h.maximum_offered_waves as u64 + 2 * requests + 2 * cohorts + 8;
+    // Source5 adds exactly one release record per declared request, while the
+    // unchanged record-byte/file/offer/physical-row budgets remain in force.
+    let record_limit = 4 * h.maximum_offered_waves as u64
+        + (2 + u64::from(prefix_source)) * requests
+        + 2 * cohorts
+        + 8;
     let maximum_offered = h.maximum_offered_waves as u64;
     let mut last_fifo = h.initial_fifo_cutoff;
     let mut last_finalized = h.opening.monotonic_ns;
@@ -316,6 +354,48 @@ fn replay_with_observer(
         {
             return Err(invalid("source4 lacks original sidecar field"));
         }
+        if prefix::is_preparation(&wrapper.record) {
+            if pending.is_some()
+                || coverage_recorded
+                || lifecycle.expects_completion()
+                || phase >= 3
+            {
+                return Err(failure());
+            }
+            let prep = preparation
+                .as_mut()
+                .ok_or_else(|| invalid("source4 cannot contain source5 preparation"))?;
+            let earliest = children
+                .iter()
+                .map(|c| c.last_freeze.max(c.header.opened_at_ns))
+                .max()
+                .ok_or_else(failure)?;
+            let validated = prep.handle(
+                wrapper.record,
+                &mut prefix::Progress {
+                    phase,
+                    offered: &mut offered,
+                    maximum_offered,
+                    last_fifo: &mut last_fifo,
+                    last_finalized: &mut last_finalized,
+                    earliest,
+                    calls: &mut calls,
+                    total_rows: &mut total_rows,
+                    common: &common,
+                    limits,
+                    lifecycle: &mut lifecycle,
+                },
+            )?;
+            if validated {
+                physical_validated();
+            }
+            prefix.update(line);
+            offset = offset.checked_add(line.len() as u64).ok_or_else(failure)?;
+            continue;
+        }
+        if preparation.as_ref().is_some_and(|p| !p.idle()) {
+            return Err(failure());
+        }
         let record: RecordV4 = serde_json::from_value(wrapper.record)?;
         if lifecycle.expects_completion()
             && !matches!(
@@ -342,6 +422,9 @@ fn replay_with_observer(
                         return Err(failure());
                     }
                     lifecycle.begin(phase, cohort, manifest_case, repetition)?;
+                    if let Some(p) = &mut preparation {
+                        p.begin(phase, cohort, &common.cohort_plan)?;
+                    }
                 }
                 Record::RequestAdmitted {
                     phase: p,
@@ -352,6 +435,9 @@ fn replay_with_observer(
                 } => {
                     if p.index() != phase || pending.is_some() {
                         return Err(failure());
+                    }
+                    if let Some(p) = &mut preparation {
+                        p.admit(slot, &request_id)?;
                     }
                     lifecycle.admit(
                         phase,
@@ -372,6 +458,9 @@ fn replay_with_observer(
                         return Err(failure());
                     }
                     lifecycle.end(phase, cohort, admitted_count, completed_count)?;
+                    if let Some(p) = &mut preparation {
+                        p.end()?;
+                    }
                 }
                 Record::RequestCompleted { request } => {
                     if pending.is_some() || request.phase.index() != phase {
@@ -386,6 +475,9 @@ fn replay_with_observer(
                     rows,
                 } => {
                     lifecycle.active(phase, cohort)?;
+                    if let Some(p) = &preparation {
+                        p.ready()?;
+                    }
                     if phase >= 3
                         || p.index() != phase
                         || pending.is_some()
@@ -460,6 +552,9 @@ fn replay_with_observer(
                     return Err(failure());
                 }
                 let input = prepared::project(&prepared, &a.rows)?;
+                if let Some(p) = &preparation {
+                    p.prepared(&prepared)?;
+                }
                 let rows = prepared.rows.iter().map(|r| r.frontier).collect::<Vec<_>>();
                 for (child, membership) in children.iter_mut().zip(&memberships) {
                     let window = child
@@ -591,6 +686,9 @@ fn replay_with_observer(
                     independent.as_ref(),
                     binding,
                 )?;
+                if let Some(p) = &mut preparation {
+                    p.observed_call(stages.call_id)?;
+                }
                 physical_validated();
                 if observed < last_finalized
                     || children.iter().any(|child| {
@@ -607,6 +705,9 @@ fn replay_with_observer(
                 }
                 last_finalized = observed;
                 lifecycle.completed(p, cohort, &prepared, &stages, last_fifo)?;
+                if let Some(p) = &mut preparation {
+                    p.ordinary_completed(&prepared)?;
+                }
                 // Unique declared owners make at most one child a member. Move
                 // the private projection into that population without copying
                 // its recipe-derived axes or allocating a second projection.
@@ -765,4 +866,4 @@ fn replay_with_observer(
 
 #[cfg(test)]
 #[path = "replay/tests.rs"]
-mod tests;
+pub(super) mod tests;

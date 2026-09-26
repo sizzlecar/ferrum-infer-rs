@@ -14,6 +14,23 @@ impl CalibrationSession {
         contract: Arc<OutputProjectionContract>,
         declaration: CalibrationPrefixTokensV1,
     ) -> Result<CreditedOutputSession> {
+        if self.prefix_source5 {
+            return Err(invalid(
+                "source5 prefix authority comes only from its frozen cohort plan",
+            ));
+        }
+        self.install_prefix_request(request, context, contract, declaration, false)
+            .await
+    }
+
+    pub(super) async fn install_prefix_request(
+        &mut self,
+        request: ferrum_types::InferenceRequest,
+        context: InferenceRequestContext,
+        contract: Arc<OutputProjectionContract>,
+        declaration: CalibrationPrefixTokensV1,
+        source5: bool,
+    ) -> Result<CreditedOutputSession> {
         let config = &self.configuration().scheduler.slo.cost_observation;
         if self.pending.is_some()
             || self.indeterminate
@@ -23,7 +40,8 @@ impl CalibrationSession {
             || self.selected_capture_identity.is_some()
             || self.structured_capture.is_some()
             || self.structured_capture_v2.is_some()
-            || self.structured_group_v2.is_some()
+            || (self.structured_group_v2.is_some() != source5)
+            || self.prefix_source5 != source5
             || config.predictor != ferrum_types::SloCostPredictor::StructuredWholeWaveV2
             || !config.selected_feedback.is_disabled()
             || !config.structured_feedback.is_disabled()
@@ -180,7 +198,8 @@ impl CalibrationSession {
                 || record.completed_length
                 || (record.released.is_none()
                     && sequence.generated_tokens.len() >= record.declaration.release_generated)
-                || row.decode_route != CalibrationDecodeRoute::Actual
+                || (row.decode_route != CalibrationDecodeRoute::Actual
+                    && (!self.prefix_source5 || record.released.is_none()))
             {
                 return Err(invalid(
                     "prefix wave must use original route and release at its fixed frontier",
@@ -205,6 +224,16 @@ impl CalibrationSession {
                     .get(row.frontier.request_id())
                     .ok_or_else(|| invalid("prefix owner missing at publication"))
                     .and_then(PrefixFrontierV1::capture)
+                    .and_then(|before| {
+                        use ferrum_interfaces::execution_cost::ActualRowWork;
+                        use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::windows::PreparedWorkV2;
+                        let work = match row.work() {
+                            ActualRowWork::Prefill { offset, count, total_prompt_tokens } => PreparedWorkV2::Prefill { offset, count, total_prompt_tokens },
+                            ActualRowWork::Decode { kv_tokens } => PreparedWorkV2::Decode { kv_tokens },
+                            _ => return Err(invalid("prefix supports only real prefill/decode work")),
+                        };
+                        Ok(PrefixPreparedRowV5 { before, work })
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
         self.prefix_preparation
@@ -228,8 +257,9 @@ impl CalibrationSession {
         };
         let mut sequences = self.engine.inner.sequences.write();
         let rows = before
-            .into_iter()
-            .map(|before| {
+            .iter()
+            .map(|offered| {
+                let before = offered.before.clone();
                 let sequence = sequences.get_mut(&before.request_id);
                 let (after, preparation_commit) = match sequence {
                     Some(sequence) => (
@@ -293,6 +323,34 @@ impl CalibrationSession {
                 }
                 let generated_after = match (&row.after, &stage.terminal) {
                     (Some(after), None) if after.owner_incarnation == record.owner => {
+                        let original = before
+                            .iter()
+                            .find(|r| r.before.request_id == row.before.request_id)
+                            .ok_or_else(|| invalid("prefix original work is missing"))?;
+                        use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::windows::PreparedWorkV2;
+                        let (kv_before, kv_after) = match original.work {
+                            PreparedWorkV2::Prefill { offset, count, .. } => {
+                                (u64::from(offset), u64::from(offset) + u64::from(count))
+                            }
+                            PreparedWorkV2::Decode { kv_tokens } => {
+                                (u64::from(kv_tokens), u64::from(kv_tokens) + 1)
+                            }
+                        };
+                        if row.before.work_generation.checked_add(1) != Some(after.work_generation)
+                            || row.before.kv_tokens as u64 != kv_before
+                            || after.kv_tokens as u64 != kv_after
+                            || row.before.generated_tokens.checked_add(usize::from(
+                                original
+                                    .work
+                                    .emits_token()
+                                    .map_err(|_| invalid("prefix invalid original work"))?,
+                            )) != Some(after.generated_tokens)
+                            || after.request_id != row.before.request_id
+                        {
+                            return Err(invalid(
+                                "prefix actual generation/KV does not follow original work",
+                            ));
+                        }
                         after.generated_tokens
                     }
                     (None, Some(terminal))
@@ -359,9 +417,24 @@ impl CalibrationSession {
             actual_evidence_diagnostic: report.actual_evidence_diagnostic.clone(),
             chain_error,
         });
+        drop(sequences);
+        if self.prefix_source5 {
+            self.record_prefix_source_wave_v5();
+        }
     }
 
     pub fn release_prefix_preparation(&mut self, id: &RequestId) -> Result<PrefixReleasedV1> {
+        if self.prefix_source5 {
+            return Err(invalid(
+                "source5 releases the complete declared cohort through its writer",
+            ));
+        }
+        self.release_prefix_preparation_inner(id)
+    }
+    pub(super) fn release_prefix_preparation_inner(
+        &mut self,
+        id: &RequestId,
+    ) -> Result<PrefixReleasedV1> {
         if self.pending.is_some() || self.indeterminate {
             return Err(invalid("prefix release requires a reconciled call"));
         }

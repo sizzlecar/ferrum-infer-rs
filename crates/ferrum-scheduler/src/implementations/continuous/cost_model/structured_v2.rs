@@ -30,6 +30,7 @@ mod support;
 pub use coverage::{StructuredCoverageFactsV2, StructuredCoverageReportV2};
 mod model;
 pub use model::{CalibratedStructuredModelV2, FittedStructuredModelV2, QualifiedStructuredModelV2};
+pub mod prefixes;
 pub mod windows;
 pub type StructuredNumericObservationV2 = StructuredObservationV2<StructuredInputV2>;
 #[cfg(test)]

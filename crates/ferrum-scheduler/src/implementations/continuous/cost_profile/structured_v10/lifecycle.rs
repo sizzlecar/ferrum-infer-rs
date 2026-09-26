@@ -195,6 +195,39 @@ impl Lifecycle {
         }
         Ok(())
     }
+    /// Advance only already validated real preparation settlements. This does
+    /// not manufacture Prepared numeric evidence or a terminal receipt.
+    pub fn preparation_row(
+        &mut self,
+        phase: usize,
+        cohort: usize,
+        id: &str,
+        owner: u64,
+        before: u64,
+        after: u64,
+    ) -> Result<(), CostProfileError> {
+        self.active(phase, cohort)?;
+        let slot = self
+            .active
+            .as_mut()
+            .and_then(|c| c.slots.iter_mut().find(|s| s.id.as_deref() == Some(id)))
+            .ok_or_else(|| invalid("source5 preparation owner was not admitted"))?;
+        if slot.completed
+            || slot.generated != before
+            || slot.owner.is_some_and(|v| v != owner)
+            || owner == 0
+            || after < before
+            || after > before.saturating_add(1)
+            || after >= slot.maximum
+        {
+            return Err(invalid(
+                "source5 preparation cannot shorten original Length lifecycle",
+            ));
+        }
+        slot.generated = after;
+        slot.owner = Some(owner);
+        Ok(())
+    }
     pub fn request_completed(&mut self, request: CompletedRequest) -> Result<(), CostProfileError> {
         if self.expected.pop_front().as_ref() != Some(&request) {
             return Err(invalid(

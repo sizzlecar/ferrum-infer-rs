@@ -15,9 +15,12 @@ pub struct SelectedCalibrationOptions {
 
 impl CalibrationSession {
     pub(super) fn selected_phase_boundary(&self) -> Result<()> {
-        if self.prefix_preparation.is_some() {
+        if self.prefix_preparation.is_some() || self.prefix_source5 {
             return Err(FerrumError::invalid_request("prefix preparation needs its independent source5 protocol; old collectors cannot omit its request frontier"));
         }
+        self.completed_owner_boundary()
+    }
+    pub(super) fn completed_owner_boundary(&self) -> Result<()> {
         if self.pending.is_some()
             || self.indeterminate
             || !self.frontiers()?.is_empty()

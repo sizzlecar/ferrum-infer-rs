@@ -26,12 +26,16 @@ pub use completion_plan::{CompletionTokenIds, ResponseCompletionPlan};
 pub use evidence::EngineEvidenceRetentionPlan;
 pub use evidence_profile::{CreditedExecutionProfile, CreditedPromptEvidence};
 mod session;
+mod utf8;
 pub use budget::{
     OutputFrameAttempt, OutputFramePermit, PrepaidOutputCapacityView, RequestOutputBudget,
 };
 pub use session::{
     CreditedFrameStream, CreditedOutputFrame, CreditedOutputSession, OutputCompletion,
     OutputConsumerControl, OutputFrameMetadata, OutputHistory,
+};
+pub use utf8::{
+    advance_committed_utf8_fragment, contains_output_replacement_mojibake, InvalidCommittedUtf8,
 };
 
 #[cfg(test)]

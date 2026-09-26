@@ -116,7 +116,7 @@ impl CalibrationSession {
         report: &CalibrationWaveReport,
     ) {
         if let Some(group) = &mut self.structured_group_v2 {
-            if group.collecting() {
+            if group.collecting() && !group.prefix_pending() {
                 if let Err(error) = group.complete(
                     receipt.capture(),
                     report.submission == CalibrationSubmissionState::HostReconciled

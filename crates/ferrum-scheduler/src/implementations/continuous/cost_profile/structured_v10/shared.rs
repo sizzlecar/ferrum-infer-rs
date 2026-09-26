@@ -3,8 +3,13 @@
 use super::*;
 mod wire;
 use wire::*;
+mod prefix;
 mod profile;
 mod replay;
+pub use prefix::{
+    export_structured_profile_v12, load_structured_profile_v12, structured_prefix_source_header_v5,
+    ImportedStructuredCatalogV12, StructuredProfileExportReceiptV12,
+};
 pub use profile::{
     export_structured_profile_v11, load_structured_profile_v11, ImportedStructuredCatalogV11,
     StructuredProfileExportReceiptV11,
@@ -19,6 +24,25 @@ pub fn structured_shared_source_header_v4(
     maximum_retained_numeric_bytes: usize,
     maximum_retained_coordinates: usize,
 ) -> Result<serde_json::Value, CostProfileError> {
+    let h = shared_header(
+        children,
+        maximum_file_bytes,
+        maximum_children,
+        maximum_retained_numeric_bytes,
+        maximum_retained_coordinates,
+    )?;
+    let value = serde_json::to_value(h)?;
+    checked_header_record_bytes(&value, maximum_file_bytes)?;
+    Ok(value)
+}
+
+fn shared_header(
+    children: Vec<serde_json::Value>,
+    maximum_file_bytes: u64,
+    maximum_children: usize,
+    maximum_retained_numeric_bytes: usize,
+    maximum_retained_coordinates: usize,
+) -> Result<HeaderV4, CostProfileError> {
     if children.is_empty() || children.len() > maximum_children || maximum_children > 128 {
         return Err(invalid("invalid shared child count"));
     }
@@ -68,11 +92,7 @@ pub fn structured_shared_source_header_v4(
         return Err(invalid("source4 child clock or identity differs"));
     }
     h.capture_protocol = h.signature()?;
-    let value = serde_json::to_value(h)?;
-    // Include exactly the live wrapper and LF. Reject before the first offer,
-    // using the unchanged loader line limit and declared common file limit.
-    checked_header_record_bytes(&value, maximum_file_bytes)?;
-    Ok(value)
+    Ok(h)
 }
 
 fn checked_header_record_bytes(

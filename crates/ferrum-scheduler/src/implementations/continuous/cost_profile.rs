@@ -831,9 +831,11 @@ mod tests;
 
 mod structured_v10;
 pub use structured_v10::{
-    export_structured_profile_v10, export_structured_profile_v11, load_structured_profile_v10,
-    load_structured_profile_v11, structured_shared_source_header_v4, ImportedStructuredCatalogV11,
-    ImportedStructuredModelV2, StructuredImportProvenanceV10, StructuredPhaseProvenanceV10,
-    StructuredProfileExportReceiptV10, StructuredProfileExportReceiptV11,
+    export_structured_profile_v10, export_structured_profile_v11, export_structured_profile_v12,
+    load_structured_profile_v10, load_structured_profile_v11, load_structured_profile_v12,
+    structured_prefix_source_header_v5, structured_shared_source_header_v4,
+    ImportedStructuredCatalogV11, ImportedStructuredCatalogV12, ImportedStructuredModelV2,
+    StructuredImportProvenanceV10, StructuredPhaseProvenanceV10, StructuredProfileExportReceiptV10,
+    StructuredProfileExportReceiptV11, StructuredProfileExportReceiptV12,
     StructuredProfilePhaseV10, COST_PROFILE_SCHEMA_VERSION_V10,
 };

@@ -3,6 +3,8 @@
 use super::*;
 #[path = "group/options.rs"]
 mod options;
+#[path = "group/prefix.rs"]
+mod prefix;
 #[path = "group/shared.rs"]
 mod shared;
 pub use options::{StructuredCalibrationGroupLimitsV2, StructuredCalibrationGroupOptionsV2};
@@ -18,10 +20,37 @@ pub(in crate::continuous_engine::inner) struct StructuredCalibrationGroupV2 {
     pending_prepared: Option<Arc<PreparedStructuredFactsV2>>,
     failure: Option<String>,
     shared: Option<StructuredSource>,
+    prefix: Option<prefix::PrefixSourceState>,
 }
 impl StructuredCalibrationGroupV2 {
     pub fn new(
         options: StructuredCalibrationGroupOptionsV2,
+        fingerprint: model::ExecutionFingerprint,
+        clock: Arc<dyn CostObservationClock>,
+        cutoff: u64,
+    ) -> Result<Self, ExportError> {
+        Self::new_inner(options, None, fingerprint, clock, cutoff)
+    }
+    pub fn new_with_prefix(
+        options: StructuredCalibrationGroupOptionsV2,
+        plan: prefixes::StructuredPrefixPlanV5,
+        fingerprint: model::ExecutionFingerprint,
+        clock: Arc<dyn CostObservationClock>,
+        cutoff: u64,
+    ) -> Result<Self, ExportError> {
+        options.validate()?;
+        if options.shared_source.is_none() {
+            return Err(ExportError::Source(
+                "source5 requires one shared physical source",
+            ));
+        }
+        plan.validate(&options.children[0].cohort_plan)
+            .map_err(numeric_error)?;
+        Self::new_inner(options, Some(plan), fingerprint, clock, cutoff)
+    }
+    fn new_inner(
+        options: StructuredCalibrationGroupOptionsV2,
+        prefix_plan: Option<prefixes::StructuredPrefixPlanV5>,
         fingerprint: model::ExecutionFingerprint,
         clock: Arc<dyn CostObservationClock>,
         cutoff: u64,
@@ -72,13 +101,24 @@ impl StructuredCalibrationGroupV2 {
                     Ok(header)
                 })
                 .collect::<Result<Vec<_>, ExportError>>()?;
-            let header = profile::structured_shared_source_header_v4(
-                headers,
-                source_limit(&children),
-                options.limits.maximum_children.get(),
-                options.limits.maximum_retained_numeric_bytes.get(),
-                options.limits.maximum_retained_coordinates.get(),
-            )
+            let header = if let Some(plan) = &prefix_plan {
+                profile::structured_prefix_source_header_v5(
+                    headers,
+                    source_limit(&children),
+                    options.limits.maximum_children.get(),
+                    options.limits.maximum_retained_numeric_bytes.get(),
+                    options.limits.maximum_retained_coordinates.get(),
+                    plan.clone(),
+                )
+            } else {
+                profile::structured_shared_source_header_v4(
+                    headers,
+                    source_limit(&children),
+                    options.limits.maximum_children.get(),
+                    options.limits.maximum_retained_numeric_bytes.get(),
+                    options.limits.maximum_retained_coordinates.get(),
+                )
+            }
             .map_err(|e| ExportError::Config(e.to_string()))?;
             source.record(&header)?;
         }
@@ -88,6 +128,7 @@ impl StructuredCalibrationGroupV2 {
             pending_prepared: None,
             failure: None,
             shared,
+            prefix: prefix_plan.map(prefix::PrefixSourceState::new),
         })
     }
     pub fn progress(&self) -> Vec<StructuredCalibrationProgress> {
@@ -141,15 +182,24 @@ impl StructuredCalibrationGroupV2 {
         }
     }
     pub fn begin_cohort(&mut self, ordinal: usize) -> Result<(), ExportError> {
+        if let Some(prefix) = &mut self.prefix {
+            prefix.begin(population::phase_index(self.children[0].phase)?, ordinal)?;
+        }
         self.each(|c| c.begin_cohort(ordinal))
     }
     pub fn admitted(&mut self, id: RequestId, maximum: u64) -> Result<(), ExportError> {
         self.each(|c| c.admitted(id.clone(), maximum))
     }
     pub fn end_cohort(&mut self) -> Result<(), ExportError> {
-        self.each(|c| c.end_cohort())
+        self.require_prefix_released()?;
+        self.each(|c| c.end_cohort())?;
+        if let Some(prefix) = &mut self.prefix {
+            prefix.end();
+        }
+        Ok(())
     }
     pub fn offer(&mut self, work: &[CalibrationWork]) -> Result<(), ExportError> {
+        self.require_prefix_released()?;
         self.each(|c| c.offer(work))
     }
     pub fn reserve_prepared(
@@ -251,6 +301,12 @@ impl StructuredCalibrationGroupV2 {
         failure.map_or(Ok(()), Err)
     }
     pub fn complete_unsubmitted(&mut self, reason: &str) -> Result<(), ExportError> {
+        if self.prefix_pending() {
+            self.invalidate(format!("source5 preparation was not submitted: {reason}"));
+            return Err(ExportError::Source(
+                "source5 preparation failed before submission",
+            ));
+        }
         let flush = self.flush_prepared();
         let result = self.each(|c| c.complete_unsubmitted(reason));
         match flush {

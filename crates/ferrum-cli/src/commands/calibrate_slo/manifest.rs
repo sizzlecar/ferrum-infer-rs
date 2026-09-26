@@ -78,12 +78,25 @@ pub(super) enum ValidationSource {
         capture: structured_v2::GroupCaptureConfigV2,
         residual: Vec<Cohort>,
     },
+    /// Independent source5/profile12 with real generated preparation prefixes.
+    StructuredPrefixWholeWaveGroupV5 {
+        capture: structured_v2::GroupCaptureConfigV2,
+        prefixes: ferrum_scheduler::implementations::continuous::cost_model::structured_v2::prefixes::StructuredPrefixPlanV5,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
+    pub(super) fn prefix_plan_v5(&self) -> Option<&ferrum_scheduler::implementations::continuous::cost_model::structured_v2::prefixes::StructuredPrefixPlanV5>{
+        match self {
+            Self::StructuredPrefixWholeWaveGroupV5 { prefixes, .. } => Some(prefixes),
+            _ => None,
+        }
+    }
     pub(super) fn structured_group_v2(&self) -> Option<&structured_v2::GroupCaptureConfigV2> {
         match self {
-            Self::StructuredWholeWaveGroupV2 { capture, .. } => Some(capture),
+            Self::StructuredWholeWaveGroupV2 { capture, .. }
+            | Self::StructuredPrefixWholeWaveGroupV5 { capture, .. } => Some(capture),
             _ => None,
         }
     }
@@ -102,7 +115,8 @@ impl ValidationSource {
                 warmup
             }
             Self::StructuredWholeWaveV2 { capture, .. } => &capture.warmup,
-            Self::StructuredWholeWaveGroupV2 { capture, .. } => &capture.warmup,
+            Self::StructuredWholeWaveGroupV2 { capture, .. }
+            | Self::StructuredPrefixWholeWaveGroupV5 { capture, .. } => &capture.warmup,
             _ => &[],
         }
     }
@@ -166,6 +180,7 @@ impl ValidationSource {
             | Self::SelectedWorkSupportV1 { residual, .. }
             | Self::StructuredWholeWaveV1 { residual, .. }
             | Self::StructuredWholeWaveGroupV2 { residual, .. }
+            | Self::StructuredPrefixWholeWaveGroupV5 { residual, .. }
             | Self::StructuredWholeWaveV2 { residual, .. } => residual,
             _ => &[],
         }
@@ -186,6 +201,7 @@ impl ValidationSource {
             }
             Self::LiveFrozen
             | Self::StructuredWholeWaveGroupV2 { .. }
+            | Self::StructuredPrefixWholeWaveGroupV5 { .. }
             | Self::StructuredDiscoveryV2 { .. }
             | Self::RequiredFutureAuditV2 { .. } => None,
         }
@@ -336,7 +352,8 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
     if let Some(reference) = &mut manifest.reference {
         reference.resolve_paths(parent);
     }
-    if let ValidationSource::StructuredWholeWaveGroupV2 { capture, .. } =
+    if let ValidationSource::StructuredWholeWaveGroupV2 { capture, .. }
+    | ValidationSource::StructuredPrefixWholeWaveGroupV5 { capture, .. } =
         &mut manifest.validation_model
     {
         capture.resolve_paths(parent);
@@ -356,6 +373,7 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
         }
         ValidationSource::LiveFrozen
         | ValidationSource::StructuredWholeWaveGroupV2 { .. }
+        | ValidationSource::StructuredPrefixWholeWaveGroupV5 { .. }
         | ValidationSource::StructuredDiscoveryV2 { .. }
         | ValidationSource::RequiredFutureAuditV2 { .. } => None,
     };
@@ -416,6 +434,9 @@ impl Manifest {
         }
         if let Some(capture) = self.validation_model.structured_group_v2() {
             capture.validate(self)?;
+        }
+        if let Some(prefixes) = self.validation_model.prefix_plan_v5() {
+            structured_v2::group::validate_prefix_v5(self, prefixes)?;
         }
         let audit = self.validation_model.required_audit();
         if let Some(audit) = audit {
