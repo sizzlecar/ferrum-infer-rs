@@ -15,6 +15,7 @@ pub(super) fn check_native_paths(
     captured: &ControllerSnapshot,
     lookup: &mut dyn FnMut(&StructuredQueryV2) -> RequiredFutureAuditCostV2,
 ) {
+    context.assert_decode_domain_equivalence(4);
     let plan = RequiredFutureAuditPlanV2 {
         paths: vec![RequiredFutureAuditPathV2 {
             waves: (0..3)

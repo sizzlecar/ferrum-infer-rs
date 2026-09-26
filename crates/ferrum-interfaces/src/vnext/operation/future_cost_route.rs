@@ -10,6 +10,7 @@ use std::sync::Arc;
 mod core;
 mod host_content;
 mod masks;
+mod state_equivalence;
 mod uploads;
 pub use core::{append_complete_eager_cost_route, EagerCoreWaveCostQuery};
 pub use host_content::{
@@ -173,8 +174,9 @@ impl ExecutionCostRouteView {
 }
 
 /// Private per-witness state. Persistent initialization/frontiers advance only
-/// after a modeled successful whole-wave receipt. Never reuse a beam sibling's
-/// state, or infer its history from its final token count.
+/// after a modeled successful whole-wave receipt. Sharing a successor requires
+/// exact future-state equality within the same capture; its final token count
+/// alone cannot establish that equality.
 #[derive(Debug, Clone)]
 pub struct ExecutionCostRouteState {
     pub(crate) fence: Arc<()>,
@@ -182,6 +184,8 @@ pub struct ExecutionCostRouteState {
     pub(crate) frontiers: Vec<u64>,
     pub(crate) initialized: Vec<bool>,
     pub(crate) token_masks: Option<ProductTokenMaskResidencySnapshot>,
+    /// Receipt used to construct the completed wave's cost. Every subsequent
+    /// projection replaces it before reading; it is not persistent route state.
     pub(crate) last_token_mask_uploads: Option<Vec<bool>>,
     pub(crate) projected_graph_state: crate::execution_cost::ActualWaveGraphState,
 }
@@ -194,6 +198,7 @@ impl ExecutionCostRouteState {
     pub fn projected_waves(&self) -> usize {
         self.resources.projected_waves()
     }
+    /// Upload receipt for this wave, independent of future-state equivalence.
     pub fn last_token_mask_uploads(&self) -> Option<&[bool]> {
         self.last_token_mask_uploads.as_deref()
     }

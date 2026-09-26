@@ -7,6 +7,9 @@ use crate::vnext::{
     ExecutionCostRouteUnknown, ProductTokenMaskResidencyEntry, ProductTokenMaskResidencySnapshot,
 };
 
+#[path = "planning_workspace_tests/state_equivalence.rs"]
+mod state_equivalence;
+
 fn lane_view(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     session: &SequenceSession<TestRuntime>,

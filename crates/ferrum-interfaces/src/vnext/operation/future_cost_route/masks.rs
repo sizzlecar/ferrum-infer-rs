@@ -205,6 +205,21 @@ pub struct ProductTokenMaskResidencySnapshot {
     entries: Vec<ProductTokenMaskResidencyEntry>,
 }
 impl ProductTokenMaskResidencySnapshot {
+    pub(super) fn same_future_state(
+        &self,
+        other: &Self,
+        budget: &mut dyn ResourcePlanningBudget,
+    ) -> Result<bool, U> {
+        poll(budget)?;
+        if self.eligible != other.eligible || self.maximum_entries != other.maximum_entries {
+            return Ok(false);
+        }
+        // Entry equality includes slot identity and the weak source pointer,
+        // length and fingerprint. Do not upgrade sources or infer equality from
+        // normalized mask bytes: both would change the residency contract.
+        super::state_equivalence::same_values(&self.entries, &other.entries, budget)
+    }
+
     pub fn new(
         eligible: bool,
         maximum_entries: usize,

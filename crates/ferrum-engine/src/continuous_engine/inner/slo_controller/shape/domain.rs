@@ -1,12 +1,15 @@
 //! Finite whole-wave alternatives. Unknown text is an empirical latent input,
-//! never a guessed exact UTF-8 state. Every reachable physical/residency state
-//! survives until the configured bound; exhaustion cannot select a subset.
+//! never a guessed exact UTF-8 state. Every distinct reachable complete future
+//! state survives until the configured bound; exhaustion cannot select a subset.
 use super::*;
 use ferrum_interfaces::{
     execution_cost::{HostCostFeaturesV1, StatisticalWaveEvidenceV1},
     model_executor::LogitsReturnPolicy,
 };
 use ferrum_scheduler::implementations::continuous::slo_planner::PlanningCostEvidenceRequirement;
+
+#[cfg(all(test, feature = "metal"))]
+mod differential;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FutureHostMode {
@@ -161,10 +164,7 @@ impl ExecutorShape<'_> {
             .len()
             .checked_mul(modes.len())
             .ok_or(PlanningUnknownReason::ArithmeticOverflow)?;
-        if count == 0
-            || count > settings.max_route_states.get()
-            || count > settings.max_shape_alternatives.get()
-        {
+        if count == 0 || count > settings.max_shape_alternatives.get() {
             return Err(PlanningUnknownReason::ShapeCapacity);
         }
         let empirical = state.empirical || modes != [FutureHostMode::Exact];
@@ -196,10 +196,11 @@ impl ExecutorShape<'_> {
             .try_reserve_exact(count)
             .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
         states
-            .try_reserve_exact(count)
+            .try_reserve_exact(count.min(settings.max_route_states.get()))
             .map_err(|_| PlanningUnknownReason::ShapeCapacity)?;
-        // Keep all states rather than merging by hashes or ignoring allocator
-        // and mask differences. H3 needs at most 8 states regardless of width.
+        // Every current physical alternative keeps its cost and host evidence.
+        // Only identical complete successors share future work; equality must
+        // include allocator/mask history under this same capture fence.
         for previous in &state.states {
             for &mode in &modes {
                 poll()?;
@@ -230,7 +231,12 @@ impl ExecutorShape<'_> {
                     }
                 }
                 shapes.push(projected.shape);
-                states.push(projected.state);
+                retain_distinct_state(
+                    &mut states,
+                    projected.state,
+                    settings.max_route_states.get(),
+                    poll,
+                )?;
             }
         }
         let domain = if empirical {
@@ -274,6 +280,38 @@ impl ExecutorShape<'_> {
             RouteDomain { states, empirical },
         )))
     }
+}
+
+fn retain_distinct_state(
+    states: &mut Vec<ExecutionCostRouteState>,
+    next: ExecutionCostRouteState,
+    maximum: usize,
+    poll: &mut dyn FnMut() -> std::result::Result<(), PlanningUnknownReason>,
+) -> std::result::Result<(), PlanningUnknownReason> {
+    poll()?;
+    for existing in states.iter() {
+        let mut failure = None;
+        let equal = existing.same_future_state(&next, &mut || match poll() {
+            Ok(()) if failure.is_none() => true,
+            Ok(()) => false,
+            Err(reason) => {
+                failure.get_or_insert(reason);
+                false
+            }
+        });
+        if let Some(reason) = failure {
+            return Err(reason);
+        }
+        poll()?;
+        if equal.map_err(|_| PlanningUnknownReason::InvalidShapeEvidence)? {
+            return Ok(());
+        }
+    }
+    if states.len() >= maximum {
+        return Err(PlanningUnknownReason::ShapeCapacity);
+    }
+    states.push(next);
+    Ok(())
 }
 
 pub(super) fn cost_shapes(

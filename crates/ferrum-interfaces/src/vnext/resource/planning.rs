@@ -17,6 +17,7 @@ mod cost_route;
 mod physical_ranges;
 mod project;
 mod sequence_ranges;
+mod state_equivalence;
 mod workspace;
 pub(crate) use physical_ranges::ResourceCostRangeProof;
 

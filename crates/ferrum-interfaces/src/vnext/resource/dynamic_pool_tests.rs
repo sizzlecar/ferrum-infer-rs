@@ -580,6 +580,7 @@ impl DeviceRuntime for TestRuntime {
 enum TestDemand {
     Fixed,
     Tokens,
+    TokensThrough(u64),
     ActualSequences(u32),
 }
 
@@ -662,7 +663,7 @@ fn pool_catalog_with_options(
     let mut resource_ids = Vec::new();
     let maximum_instances = match demand {
         TestDemand::ActualSequences(maximum_sequences) => maximum_sequences,
-        TestDemand::Fixed | TestDemand::Tokens => 64,
+        TestDemand::Fixed | TestDemand::Tokens | TestDemand::TokensThrough(_) => 64,
     };
     for index in 0..resource_count {
         let resource_id = format!("resource/dynamic-{layout_digit}-{index:02}");
@@ -670,6 +671,9 @@ fn pool_catalog_with_options(
         let demand = match demand {
             TestDemand::Fixed => DynamicResourceDemand::fixed(64).unwrap(),
             TestDemand::Tokens => DynamicResourceDemand::tokens(64, 4).unwrap(),
+            TestDemand::TokensThrough(maximum_tokens) => {
+                DynamicResourceDemand::tokens(64, maximum_tokens).unwrap()
+            }
             TestDemand::ActualSequences(maximum_sequences) => {
                 DynamicResourceDemand::actual_sequences(64, maximum_sequences).unwrap()
             }
@@ -711,6 +715,7 @@ fn pool_catalog_with_options(
     let theoretical_per_descriptor = match demand {
         TestDemand::Fixed => 64_u128,
         TestDemand::Tokens => 256_u128,
+        TestDemand::TokensThrough(maximum_tokens) => 64_u128 * u128::from(maximum_tokens),
         TestDemand::ActualSequences(_) => 64_u128,
     };
     let theoretical_ceiling = theoretical_per_descriptor

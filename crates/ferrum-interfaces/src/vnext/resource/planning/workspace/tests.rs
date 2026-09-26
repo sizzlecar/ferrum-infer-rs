@@ -80,6 +80,62 @@ struct HotClaimsFixture {
     projections: Vec<ProjectionReadView>,
 }
 
+#[test]
+fn future_workspace_equality_keeps_slot_claim_and_projection_identity() {
+    let fixture = HotClaimsFixture::new();
+    let lane = ExecutionLaneId::mint().unwrap();
+    let bucket = crate::vnext::ReusableExecutionBucketSpec::new(
+        crate::vnext::ReusableExecutionClassId::new("workspace.equivalence").unwrap(),
+        crate::vnext::ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let original = WorkspaceReadView {
+        lane_id: lane,
+        lane_epoch: 1,
+        arena_clock: 2,
+        next_slot_id: 2,
+        slots: vec![SlotReadView {
+            key: LaneStableArenaKey {
+                lane_id: lane,
+                lifetime: AllocationLifetime::Step,
+                reusable_execution_bucket_id: bucket.bucket_id().clone(),
+                layout_fingerprint: "a".repeat(64),
+            },
+            slot_id: 1,
+            in_use: false,
+            last_used: 1,
+            claims: fixture.claims,
+            projections: fixture.projections,
+        }],
+    };
+    assert!(original
+        .same_future_state(&original.clone(), &mut || true)
+        .unwrap());
+    let mut changed = original.clone();
+    changed.slots[0].slot_id += 1;
+    assert!(!original.same_future_state(&changed, &mut || true).unwrap());
+    let mut changed = original.clone();
+    changed.slots[0].in_use = true;
+    assert!(!original.same_future_state(&changed, &mut || true).unwrap());
+    let mut changed = original.clone();
+    changed.slots[0].last_used += 1;
+    assert!(!original.same_future_state(&changed, &mut || true).unwrap());
+    let mut changed = original.clone();
+    changed.slots[0].claims[0].pool_instance += 1;
+    assert!(!original.same_future_state(&changed, &mut || true).unwrap());
+    let mut changed = original.clone();
+    changed.slots[0].projections[0].physical_offset += 1;
+    assert!(!original.same_future_state(&changed, &mut || true).unwrap());
+    let mut polls = 0;
+    assert_eq!(
+        original.same_future_state(&original, &mut || {
+            polls += 1;
+            polls < 5
+        }),
+        Err(ResourcePlanningUnknown::BudgetExhausted)
+    );
+}
+
 impl HotClaimsFixture {
     fn new() -> Self {
         use crate::vnext::resource::dynamic_pool::DynamicPoolDomainSpec;

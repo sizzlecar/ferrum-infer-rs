@@ -5,6 +5,7 @@ use crate::vnext::resource::lane_stable_arena::{
     lane_stable_layout_key, LaneStableArenaKey, LaneStableArenaState,
 };
 
+mod state_equivalence;
 #[cfg(test)]
 mod tests;
 
