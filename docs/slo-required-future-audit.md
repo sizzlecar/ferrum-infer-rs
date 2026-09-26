@@ -61,6 +61,13 @@ ferrum calibrate-slo MODEL --backend metal --startup-usage serve --manifest audi
 
 每个 cohort 的尝试号从 1 开始，实际 NotSubmitted 也消耗尝试号。未知、预算耗尽或其他审计错误不会隐式重试。cohort 提前终态而未达到 trigger 时，报告保留未触发索引。原请求仍运行至自己的真实终态并排空输出。
 
+也可用 `when` 代替 `before_wave_attempt`，两者必须且只能声明一个：
+
+- `"when": {"kind": "initial_prefill_ready"}`：原完整 cohort 仍处于初始 prefill，且所有成员已完成真实物理准入、具有执行和输出额度时触发。
+- `"when": {"kind": "decode_ready", "generated_tokens": 1}`：原完整 cohort 均完成 prefill，生成数恰好到达预声明的正整数，且已就绪时触发。
+
+阶段触发不支持 rolling window，不依赖成本是否 Known，不申请资源或制造执行许可。每个声明最多审计一次；Unknown 或错误也消费该次触发。若越过阶段、原 cohort 不再完整或请求结束前仍未就绪，报告明确保存未触发原因。读取就绪后，原审计仍重新核验真实 snapshot。
+
 单次最多 8 路径 × 每路径 16 波，每波最多 256 行；独立审计预算最多 30 秒、1024 queries、65536 coordinates。整份 manifest 最多 64 triggers、8192 query 预算与 1048576 coordinate 预算。原 raw 大小和全运行超时同时适用。独立诊断预算不是执行 witness 或默认 2 ms 规划预算的延长。
 
 合法路径仍经过生产 readiness、chunk alignment/端点、总 token cap、mixed 策略与输出 credit 逐波消费。没有模拟服务时间，不能假设 credit 自行恢复。所有路径从同一个真实 snapshot 出发，保留全部物理 alternatives；成本 Unknown 可继续结构需求审计，动作/资源/graph Unknown 则保留原因并停止，不跳过后继障碍。
@@ -71,4 +78,4 @@ raw 事件 `required_future_owner_audit` 保存声明、原 snapshot/frontier、
 
 `all_declared_requirements_recorded=true` 只表示这些有限声明路径取全。成本 KnownAtRead 仍有其原 model age，不能当提交时可用的时限或执行许可；不发布 `complete feasible plan`。
 
-已有 profile10 catalog 可同时导入多个真实合格 child，并按唯一 owner/domain 选择，禁止 Unknown 后换便宜模型。每个 child 保留自己的完整 source/FIFO/三阶段时钟。当前采集 CLI 仍是**单 owner 三阶段**；本片不提供一次 cohort 同时训练多个 owner，也不能保证依次采完几十个 child 时最早样本仍在 300 秒内。若顺序采集超龄，这是真实阻塞，不是扩大 TTL 的理由。下一步需按本审计得到的必要集合，复用完整 cohort 同时分发给有硬上限的现有单-owner collectors；必须保留每 child 原 FIFO/outside/失败槽及统一 cohort phase 边界，不能按结果或 Known 筛样。这一多-owner 采集接线尚未在本功能中实现。
+已有 profile10 catalog 可同时导入多个真实合格 child，并按唯一 owner/domain 选择，禁止 Unknown 后换便宜模型。[多 owner 校准](slo-structured-group-calibration.md)可在同一次完整 cohort 中分发观察，保留每个 child 原 source/FIFO/outside/失败槽和统一三阶段边界。所有 child 合格后才导出并重新加载校验；共享采集不刷新样本时钟或延长 TTL。完整未来覆盖与可行计划仍须独立审计，不能从校准成功推出。

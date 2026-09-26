@@ -50,6 +50,25 @@ Backend compile checks (not runtime regression tests):
 
 ## Performance evidence
 
+- Ferrum's project-wide performance objective is to maximize output throughput
+  subject to meeting TTFT, TPOT, and ITL latency SLOs. A throughput increase that
+  violates any required latency SLO is not a successful optimization. Declare
+  workload-specific thresholds and percentiles before comparing candidates;
+  missing thresholds or latency evidence cannot establish SLO compliance.
+- Report concurrency results with TTFT P50/P99, TPOT P50/P99, ITL P50/P99,
+  output throughput, and Peak VRAM / Memory Usage. Include SLO status, errors,
+  sample counts, and repetitions. Keep server capacity/configuration fixed
+  during a client concurrency sweep. See [performance evaluation](docs/performance-evaluation.md).
+- For the serving SLO and primary table, ITL means the client-observed interval
+  between successive non-empty visible text updates. Label this SSE text-event
+  measurement explicitly; exclude role-only, empty, and finish-only messages.
+  Keep strict single-token timing eligibility as a separate diagnostic, and
+  disclose transport coalescing instead of discarding visible-text stalls.
+- Use a pinned ShareGPT dataset as the primary serving benchmark and llama.cpp
+  on the same hardware/model/workload as the initial comparison baseline.
+  Keep the selected samples identical across implementations and concurrency
+  cells, and disclose length filters and output-length policy. Synthetic loads
+  remain diagnostic evidence, not a substitute for the primary benchmark.
 - Support performance claims with same-hardware measurements. Record model and
   precision, server/client versions, dataset, input/output lengths, commands,
   configuration, and repetitions. State intentional differences in comparisons.

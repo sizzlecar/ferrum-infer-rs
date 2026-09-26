@@ -36,6 +36,10 @@ Ferrum 使用 Rust 编写，以单个二进制文件运行，支持 Apple Silico
 
 Ferrum 专注于语言模型推理。
 
+Ferrum 的性能优化原则是：**在满足 TTFT / TPOT / ITL 延迟 SLO 的前提下，
+最大化 Throughput。** 各使用场景先明确延迟上限，再比较达标配置的吞吐；
+单独提高吞吐不能作为优化成功的依据。详见[性能评估与报告规范](docs/performance-evaluation.md)。
+
 ## 快速开始
 
 在 macOS Apple Silicon 或 Linux x86_64 上安装 Ferrum 最新正式版：

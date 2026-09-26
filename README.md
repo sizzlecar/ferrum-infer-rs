@@ -37,6 +37,11 @@ Python runtime.
 
 Ferrum focuses on language-model inference.
 
+Ferrum's performance objective is to **maximize throughput while meeting TTFT,
+TPOT, and ITL latency SLOs**. Workload-specific latency limits determine which
+configurations qualify; throughput gains alone do not establish success.
+See [performance evaluation and reporting](docs/performance-evaluation.md).
+
 ## Quick Start
 
 Install the latest stable Ferrum on macOS Apple Silicon or Linux x86_64:
