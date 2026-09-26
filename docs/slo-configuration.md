@@ -1126,3 +1126,30 @@ CPU cost and end-to-end SLO impact must be measured with capture enabled. A late
 worker-based implementation must carry original expected evidence with the same
 call through the bounded FIFO and account for its retained storage; a boolean or
 an unbound digest cannot replace those checks.
+
+
+### Shared Structured V2 calibration evidence (source4 / profile11)
+
+`calibrate-slo` group capture accepts an optional typed `shared_source` path.
+The default (`null` or omitted) retains source3/profile10/catalog-v1 behavior.
+When set, every child must declare that same `source`, the same
+`maximum_file_bytes`, and `profile` equal to the group's `catalog` path. The
+common source and profile11 catalog are each created once. The declared file
+budget counts those physical bytes once; child samples and numerical storage
+remain additive, and the existing 256 MiB import ceiling is unchanged.
+
+Source4 records each original Prepared recipe and physical settlement once,
+including outside-window work, admitted requests, original FIFO order and full
+Length completion. Membership is fixed before execution for every declared
+owner. Each child still independently freezes fit, residual calibration and
+qualification; one failed child rejects the entire catalog. Shared phase
+receipts bind the same original source prefix. Failed physical receipts and
+child failure identities remain in the diagnostic source.
+
+Profile11 export, inspection and `run`/`serve` import replay the one physical
+transcript, then verify every child's frozen parameters and original clock.
+Neither import nor catalog sharing renews the original TTL, broadens support,
+reuses qualification samples for fitting, or supplies missing pending/history
+coverage. Existing source3/profile10 artifacts remain readable under their
+original revision and protocol checks. Source4 is an explicit storage and
+validation optimization; it is not a serving SLO result.

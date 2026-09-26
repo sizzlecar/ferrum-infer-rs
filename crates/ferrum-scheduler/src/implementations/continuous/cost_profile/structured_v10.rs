@@ -12,6 +12,11 @@ mod lifecycle;
 mod observation;
 mod prepared;
 mod replay;
+mod shared;
+pub use shared::{
+    export_structured_profile_v11, load_structured_profile_v11, structured_shared_source_header_v4,
+    ImportedStructuredCatalogV11, StructuredProfileExportReceiptV11,
+};
 mod wire;
 use wire::*;
 pub use wire::{StructuredPhaseProvenanceV10, StructuredProfilePhaseV10};

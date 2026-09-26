@@ -200,6 +200,7 @@ fn options(files: &Files) -> StructuredCalibrationGroupOptionsV2 {
         })
         .collect();
     StructuredCalibrationGroupOptionsV2 {
+        shared_source: None,
         children,
         limits: Default::default(),
     }
@@ -462,5 +463,80 @@ fn structured_group_original_fifo_gap_and_opening_clock_are_not_rebased() {
         assert_eq!(raw.last().unwrap()["record"]["last_captured_fifo"], 42);
         assert_eq!(raw.last().unwrap()["record"]["accepted_fifo_cutoff"], 44);
         assert_eq!(raw.last().unwrap()["record"]["fifo_audit_complete"], false);
+    }
+}
+
+#[test]
+fn shared_source4_records_unavailable_once_and_failed_population_cannot_publish() {
+    let files = Files::new();
+    let mut configured = options(&files);
+    let path = files.0.canonicalize().unwrap().join("shared.jsonl");
+    configured.shared_source = Some(path.clone());
+    for child in &mut configured.children {
+        child.observations_path = path.clone();
+    }
+    let mut group = StructuredCalibrationGroupV2::new(
+        configured,
+        fingerprint(),
+        Arc::new(Clock(AtomicU64::new(7))),
+        0,
+    )
+    .unwrap();
+    group.begin_cohort(0).unwrap();
+    group.admitted(RequestId::new(), 10).unwrap();
+    group.offer(&[]).unwrap();
+    group
+        .complete_unsubmitted("original preparation unavailable")
+        .unwrap();
+    assert!(group.freeze(0).is_err());
+    let artifact = group.finish(0).unwrap();
+    assert!(artifact.failure.is_some());
+    assert!(artifact
+        .children
+        .iter()
+        .all(|c| c.model.is_none() && c.source_path == path));
+    let raw = records(&path);
+    assert_eq!(raw[0]["record"]["schema_version"], 4);
+    assert_eq!(
+        raw.iter()
+            .filter(|r| r["record"]["record"]["kind"] == "preparation_unavailable")
+            .count(),
+        1
+    );
+    assert!(!raw.iter().any(|r| r["record"]["kind"] == "phase_freeze"));
+    assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 1);
+}
+
+#[test]
+fn shared_source4_header_capacity_fails_during_group_construction_before_offers() {
+    for oversized_record in [false, true] {
+        let files = Files::new();
+        let mut configured = options(&files);
+        let path = files.0.canonicalize().unwrap().join("shared.jsonl");
+        configured.shared_source = Some(path.clone());
+        for child in &mut configured.children {
+            child.observations_path = path.clone();
+            if oversized_record {
+                // File budget permits this declaration; the unchanged 8 MiB
+                // line bound must still reject it before any cohort or offer.
+                child.maximum_file_bytes = NonZeroU64::new(32 * 1024 * 1024).unwrap();
+                child.cohort_manifest_payload =
+                    serde_json::json!({"declaration":"a".repeat(8 * 1024 * 1024 - 128)});
+            } else {
+                child.maximum_file_bytes = NonZeroU64::new(1).unwrap();
+            }
+        }
+        configured.validate().unwrap();
+        let result = StructuredCalibrationGroupV2::new(
+            configured,
+            fingerprint(),
+            Arc::new(Clock(AtomicU64::new(7))),
+            0,
+        );
+        assert!(matches!(result, Err(ExportError::Config(_))));
+        // A failed capture may leave its original empty diagnostic file, but
+        // cannot write a header the loader would reject or begin inference.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(std::fs::read_dir(&files.0).unwrap().count(), 1);
     }
 }

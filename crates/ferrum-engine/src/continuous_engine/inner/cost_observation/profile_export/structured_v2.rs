@@ -76,6 +76,18 @@ impl StructuredCalibrationCollectorV2 {
         initial_fifo_cutoff: u64,
     ) -> Result<Self, ExportError> {
         options.validate()?;
+        let source =
+            StructuredSource::create(&options.observations_path, options.maximum_file_bytes.get())?;
+        Self::new_with_source(options, fingerprint, clock, initial_fifo_cutoff, source)
+    }
+    fn new_with_source(
+        options: StructuredCalibrationOptionsV2,
+        fingerprint: model::ExecutionFingerprint,
+        clock: Arc<dyn CostObservationClock>,
+        initial_fifo_cutoff: u64,
+        mut source: StructuredSource,
+    ) -> Result<Self, ExportError> {
+        options.validate()?;
         let rule = options.membership_rule.signature().map_err(numeric_error)?;
         let manifest = options
             .cohort_plan
@@ -96,8 +108,6 @@ impl StructuredCalibrationCollectorV2 {
             cohort_manifest: manifest,
             phase_members: options.phase_members,
         };
-        let mut source =
-            StructuredSource::create(&options.observations_path, options.maximum_file_bytes.get())?;
         source.record(&serde_json::json!({
             "artifact_type":"ferrum.structured-live-source","schema_version":3,"model_revision":MODEL_REVISION_V2,
             "capture_identity":binding.identity(),"protocol":binding.protocol(),"declared_protocol":options.protocol_sha256,
@@ -350,12 +360,14 @@ impl StructuredCalibrationCollectorV2 {
         // Retain the original failed call even when a later lifecycle/numeric
         // check rejects it. This diagnostic record cannot qualify a source.
         let stages = capture.host_stages();
-        self.source.record(&serde_json::json!({"kind":"completed","offered":reserved.attempt.offered,
+        if !self.source.is_shared() || self.source.captures_completed() {
+            self.source.record(&serde_json::json!({"kind":"completed","offered":reserved.attempt.offered,
             "member":reserved.member,"phase":reserved.attempt.phase,"cohort":reserved.attempt.cohort,
             "queue":capture.host_stage_queue(),"reconciled":reconciled,"conversion_error":error.to_string(),
             "host_stages":stages.as_ref().map(|s|s.structured_diagnostic_view()),
             "selected_independent_attention_v2":stages.as_ref().and_then(|s|s.statistical_evidence.as_ref()).and_then(|v|v.independent_attention_v2()),
             "selected_structured_capture":stages.as_ref().and_then(|s|s.statistical_evidence.as_ref()).and_then(|v|v.structured_capture()).map(|v|v.map(AsRef::as_ref))}))?;
+        }
         Err(error)
     }
     pub fn freeze(&mut self, cutoff: u64) -> Result<StructuredPhaseFreezeReceipt, ExportError> {
@@ -387,9 +399,12 @@ impl StructuredCalibrationCollectorV2 {
         now: u64,
     ) -> Result<StructuredPhaseFreezeReceipt, ExportError> {
         self.check_freeze(cutoff)?;
-        let coverage = self.coverage()?;
-        self.source
-            .record(&serde_json::json!({"kind":"coverage","phase":self.phase,"report":coverage}))?;
+        if !self.source.is_shared() {
+            let coverage = self.coverage()?;
+            self.source.record(
+                &serde_json::json!({"kind":"coverage","phase":self.phase,"report":coverage}),
+            )?;
+        }
         let signature = match self.phase {
             StructuredCapturePhase::Fit => {
                 let model = FittedStructuredModelV2::fit(

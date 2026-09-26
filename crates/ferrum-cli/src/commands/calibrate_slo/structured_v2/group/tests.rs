@@ -90,6 +90,7 @@ fn manifest() -> manifest::Manifest {
         .collect();
     m.validation_model = manifest::ValidationSource::StructuredWholeWaveGroupV2 {
         capture: GroupCaptureConfigV2 {
+            shared_source: None,
             warmup: vec![m.training[0].clone()],
             catalog: "catalog.json".into(),
             children,
@@ -224,4 +225,87 @@ fn structured_group_cli_one_failed_child_prevents_whole_group_export() {
     group.group_failure = Some("closing clock invalid".into());
     assert!(export::require_group_exportable(&group).is_err());
     assert!(group.verified_catalog.is_none());
+}
+
+#[test]
+fn structured_group_cli_source4_explicit_shared_paths_and_physical_budget_roundtrip() {
+    let mut m = manifest();
+    let c = capture(&mut m);
+    c.shared_source = Some("shared.jsonl".into());
+    for child in &mut c.children {
+        child.source = "shared.jsonl".into();
+        child.profile = c.catalog.clone();
+    }
+    c.limits.maximum_total_file_bytes = NonZeroU64::new(8 * 1024 * 1024).unwrap();
+    m.validate().unwrap();
+    let wire = serde_json::to_value(&m).unwrap();
+    let loaded: manifest::Manifest = serde_json::from_value(wire).unwrap();
+    loaded.validate().unwrap();
+    let mut changed = m.clone();
+    capture(&mut changed).children[1].source = "other.jsonl".into();
+    assert!(changed.validate().is_err());
+    let mut changed = m.clone();
+    capture(&mut changed).children[1].profile = "other.json".into();
+    assert!(changed.validate().is_err());
+    let mut changed = m.clone();
+    capture(&mut changed).shared_source = None;
+    assert!(
+        changed.validate().is_err(),
+        "aliasing remains illegal without typed source4 mode"
+    );
+    let mut changed = m;
+    capture(&mut changed).limits.maximum_total_file_bytes = NonZeroU64::MIN;
+    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn shared_source4_cli_startup_counts_declared_physical_outputs_once() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        command: super::super::super::CalibrateSloCommand,
+    }
+    let mut m = manifest();
+    let c = capture(&mut m);
+    c.shared_source = Some("shared.jsonl".into());
+    for child in &mut c.children {
+        child.source = "shared.jsonl".into();
+        child.profile = c.catalog.clone();
+    }
+    let directory = tempfile::tempdir().unwrap();
+    c.resolve_paths(directory.path());
+    m.validate().unwrap();
+    let mut cmd = Args::try_parse_from([
+        "fixture",
+        "registered-model",
+        "--manifest",
+        "manifest.json",
+        "--slo-config",
+        "slo.json",
+        "--startup-usage",
+        "serve",
+        "--observations",
+        "raw.jsonl",
+        "--out",
+        "report.json",
+    ])
+    .unwrap()
+    .command;
+    cmd.observations = directory.path().join("raw.jsonl");
+    cmd.out = directory.path().join("report.json");
+    let paths = super::super::super::paths::outputs(&cmd, &m);
+    super::super::super::paths::validate(paths).unwrap();
+    // Aliasing an independent output is still rejected; sharing is declared by
+    // source4 identity, not a generic deduplication of arbitrary paths.
+    cmd.out = m
+        .validation_model
+        .structured_group_v2()
+        .unwrap()
+        .catalog
+        .clone();
+    assert!(
+        super::super::super::paths::validate(super::super::super::paths::outputs(&cmd, &m))
+            .is_err()
+    );
 }

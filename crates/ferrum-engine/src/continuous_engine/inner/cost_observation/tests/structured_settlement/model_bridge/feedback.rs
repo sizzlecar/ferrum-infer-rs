@@ -737,3 +737,6 @@ async fn structured_feedback_real_worker_rejects_missing_private_settlement_and_
 // profile10 fixture; constructing diagnostic rows cannot qualify the model.
 #[path = "prospective.rs"]
 mod prospective;
+
+#[path = "feedback/shared_source.rs"]
+mod shared_source;

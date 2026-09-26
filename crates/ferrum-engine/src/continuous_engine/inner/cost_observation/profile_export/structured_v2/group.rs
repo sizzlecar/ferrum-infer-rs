@@ -1,8 +1,10 @@
 //! One physical observation, immutable pre-execution child populations.
-//! Sources stay schema3. A group is not a catalog or execution permission.
+//! Explicit shared source4 deduplicates physical evidence; default remains source3.
 use super::*;
 #[path = "group/options.rs"]
 mod options;
+#[path = "group/shared.rs"]
+mod shared;
 pub use options::{StructuredCalibrationGroupLimitsV2, StructuredCalibrationGroupOptionsV2};
 
 pub struct StructuredCalibrationGroupArtifactV2 {
@@ -15,6 +17,7 @@ pub(in crate::continuous_engine::inner) struct StructuredCalibrationGroupV2 {
     clock: Arc<dyn CostObservationClock>,
     pending_prepared: Option<Arc<PreparedStructuredFactsV2>>,
     failure: Option<String>,
+    shared: Option<StructuredSource>,
 }
 impl StructuredCalibrationGroupV2 {
     pub fn new(
@@ -24,23 +27,67 @@ impl StructuredCalibrationGroupV2 {
         cutoff: u64,
     ) -> Result<Self, ExportError> {
         options.validate()?;
-        let children = options
+        let mut shared = options
+            .shared_source
+            .as_ref()
+            .map(|path| {
+                StructuredSource::create(path, options.children[0].maximum_file_bytes.get())
+            })
+            .transpose()?;
+        let mut children = options
             .children
             .into_iter()
-            .map(|options| {
-                StructuredCalibrationCollectorV2::new(
-                    options,
-                    fingerprint.clone(),
-                    Arc::clone(&clock),
-                    cutoff,
-                )
+            .map(|child| {
+                if shared.is_some() {
+                    let source = StructuredSource::shared_child(&child.observations_path);
+                    StructuredCalibrationCollectorV2::new_with_source(
+                        child,
+                        fingerprint.clone(),
+                        Arc::clone(&clock),
+                        cutoff,
+                        source,
+                    )
+                } else {
+                    StructuredCalibrationCollectorV2::new(
+                        child,
+                        fingerprint.clone(),
+                        Arc::clone(&clock),
+                        cutoff,
+                    )
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(source) = &mut shared {
+            // Pair one actual opening after all original child bindings exist.
+            let opening = serde_json::to_value(ExportClockReading::opening(clock.as_ref())?)?;
+            let headers = children
+                .iter_mut()
+                .map(|child| {
+                    let mut records = child.source.take_staged();
+                    if records.len() != 1 {
+                        return Err(ExportError::Source("shared child declaration missing"));
+                    }
+                    let mut header = records.remove(0);
+                    header["opening"] = opening.clone();
+                    Ok(header)
+                })
+                .collect::<Result<Vec<_>, ExportError>>()?;
+            let header = profile::structured_shared_source_header_v4(
+                headers,
+                source_limit(&children),
+                options.limits.maximum_children.get(),
+                options.limits.maximum_retained_numeric_bytes.get(),
+                options.limits.maximum_retained_coordinates.get(),
+            )
+            .map_err(|e| ExportError::Config(e.to_string()))?;
+            source.record(&header)?;
+        }
         Ok(Self {
             children,
             clock,
             pending_prepared: None,
             failure: None,
+            shared,
         })
     }
     pub fn progress(&self) -> Vec<StructuredCalibrationProgress> {
@@ -60,6 +107,12 @@ impl StructuredCalibrationGroupV2 {
         for child in &mut self.children {
             child.invalidate(reason.clone());
         }
+        if let Some(source) = &mut self.shared {
+            let _ = source.record(&serde_json::json!({"kind":"phase_failed","reason":reason,"child_failures":[],"completed_freezes":[]}));
+            for child in &mut self.children {
+                child.source.take_staged();
+            }
+        }
     }
     fn each(
         &mut self,
@@ -72,6 +125,11 @@ impl StructuredCalibrationGroupV2 {
         for child in &mut self.children {
             if let Err(error) = f(child) {
                 failure.get_or_insert(error);
+            }
+        }
+        if failure.is_none() {
+            if let Err(error) = self.flush_common_metadata() {
+                failure = Some(error);
             }
         }
         match failure {
@@ -139,6 +197,28 @@ impl StructuredCalibrationGroupV2 {
             return Ok(());
         };
         let wire = wire::PreparedWire::new(&prepared)?;
+        if let Some(source) = &mut self.shared {
+            let first = self.children[0]
+                .ledger
+                .pending
+                .as_ref()
+                .ok_or(ExportError::Source("shared reservation missing"))?;
+            let memberships = self
+                .children
+                .iter()
+                .map(|c| {
+                    let r = c
+                        .ledger
+                        .pending
+                        .as_ref()
+                        .ok_or(ExportError::Source("shared child reservation missing"))?;
+                    Ok(serde_json::json!({"member":r.member,"window":r.window}))
+                })
+                .collect::<Result<Vec<_>, ExportError>>()?;
+            return source.record(&serde_json::json!({"kind":"reserved","offered":first.attempt.offered,
+                "phase":first.attempt.phase,"cohort":first.attempt.cohort,"boundary":"prepared_before_execute",
+                "prepared":wire,"memberships":memberships}));
+        }
         #[derive(Serialize)]
         struct Reservation<'a, 'b> {
             kind: &'static str,
@@ -197,9 +277,21 @@ impl StructuredCalibrationGroupV2 {
         let actual = super::super::super::trainer::structured_v2::validate_capture_v2(
             capture, reconciled, &prepared,
         );
-        // The original finalized wall is immutable before any multi-file output.
+        // The original finalized wall is immutable before any source output.
         let mut failure = self.flush_prepared().err();
-        for child in &mut self.children {
+        let members = self
+            .children
+            .iter()
+            .map(|c| c.ledger.pending.as_ref().and_then(|r| r.member))
+            .collect::<Vec<_>>();
+        if self.shared.is_some() {
+            let selected = members.iter().position(Option::is_some).unwrap_or(0);
+            for (i, child) in self.children.iter_mut().enumerate() {
+                child.source.collect_completed(i == selected);
+            }
+        }
+        let mut child_failures = Vec::new();
+        for (index, child) in self.children.iter_mut().enumerate() {
             let settled = (|| {
                 let reserved = child.ledger.take_pending(Some(capture))?;
                 let valid = child
@@ -212,7 +304,20 @@ impl StructuredCalibrationGroupV2 {
                 }
             })();
             if let Err(error) = settled {
+                child_failures.push(serde_json::json!({"child":index,"capture_identity":child.binding.identity(),"reason":error.to_string()}));
                 failure.get_or_insert(error);
+            }
+        }
+        if self.shared.is_some() {
+            if let Some(error) = &failure {
+                // Keep the one original failed physical receipt before closing.
+                let _ = self.flush_shared_failed_completion(
+                    &members,
+                    &child_failures,
+                    &error.to_string(),
+                );
+            } else if let Err(error) = self.flush_shared_completion(&members) {
+                failure = Some(error);
             }
         }
         match failure {
@@ -244,6 +349,9 @@ impl StructuredCalibrationGroupV2 {
                 .clock
                 .now_ns()
                 .ok_or(ExportError::Clock("original group clock unavailable"))?;
+            if self.shared.is_some() {
+                return self.freeze_shared(cutoff, now);
+            }
             // No result is published until every child has frozen. If numeric
             // fitting fails partway, all artifacts are marked Failed below.
             self.children
@@ -275,6 +383,9 @@ impl StructuredCalibrationGroupV2 {
                 None
             }
         };
+        if self.shared.is_some() {
+            return self.finish_shared(cutoff, closing);
+        }
         if self
             .children
             .iter()
@@ -318,3 +429,7 @@ impl StructuredCalibrationGroupV2 {
 #[cfg(test)]
 #[path = "group/tests.rs"]
 mod tests;
+
+fn source_limit(children: &[StructuredCalibrationCollectorV2]) -> u64 {
+    children[0].options.maximum_file_bytes.get()
+}

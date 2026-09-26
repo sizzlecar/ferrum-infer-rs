@@ -431,7 +431,8 @@ pub struct SloStructuredWholeWaveReceiptV2 {
     pub model_revision: String,
     pub artifact_kind: SloStructuredArtifactKindV2,
     pub child_count: usize,
-    /// Sum of catalog (if any), child profiles and original source bytes.
+    /// Physical imported bytes. SharedCatalogV11 counts its common source and
+    /// profile once; per-child references are not additional files.
     pub total_imported_bytes: u64,
     pub total_shape_rows: u64,
     /// Present only for a catalog; every original source digest is in children.
@@ -443,6 +444,8 @@ pub struct SloStructuredWholeWaveReceiptV2 {
 pub enum SloStructuredArtifactKindV2 {
     SingleChild,
     CatalogV1,
+    /// Schema11: one original physical source4 with independent child models.
+    SharedCatalogV11,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SloStructuredChildReceiptV2 {

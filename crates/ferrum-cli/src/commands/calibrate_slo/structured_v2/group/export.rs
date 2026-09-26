@@ -58,6 +58,9 @@ pub(super) fn export_and_inspect(
     {
         return Err(FerrumError::internal("group export cardinality changed"));
     }
+    if capture.shared_source.is_some() {
+        return export_shared_and_inspect(session, capture, source, report, artifacts, &limits);
+    }
     let mut catalog = Catalog {
         artifact_type: "ferrum.structured-v2-catalog",
         schema_version: 1,
@@ -175,4 +178,82 @@ fn structured_group_cli_catalog_serialization_is_bounded_during_escaped_text() {
         serde_json::from_slice::<String>(&bytes.bytes).unwrap(),
         "\"界\n"
     );
+}
+
+fn export_shared_and_inspect(
+    session: &CalibrationSession,
+    capture: &GroupCaptureConfigV2,
+    source: StructuredCalibrationGroupArtifactV2,
+    report: &mut GroupReportV2,
+    artifacts: &mut super::super::super::report::Artifacts,
+    limits: &ferrum_scheduler::implementations::continuous::cost_profile::CostProfileLoadLimits,
+) -> Result<()> {
+    let first = source
+        .children
+        .first()
+        .ok_or_else(|| FerrumError::config("empty shared source"))?;
+    if source.failure.is_some()
+        || source.children.iter().any(|c| {
+            c.source_path != first.source_path
+                || c.source_sha256 != first.source_sha256
+                || c.source_bytes != first.source_bytes
+                || c.failure.is_some()
+                || c.model.is_none()
+        })
+    {
+        return Err(FerrumError::config(
+            "shared group did not close one qualified immutable source",
+        ));
+    }
+    let errors = capture
+        .children
+        .iter()
+        .map(|c| c.declared_source_clock_error_ns)
+        .collect::<Vec<_>>();
+    let exported =
+        ferrum_scheduler::implementations::continuous::cost_profile::export_structured_profile_v11(
+            &first.source_path,
+            first.source_sha256,
+            &capture.catalog,
+            &errors,
+            limits,
+        )
+        .map_err(|e| FerrumError::config(format!("group profile11 export: {e}")))?;
+    if exported.children.len() != source.children.len() {
+        return Err(FerrumError::internal("shared export child count changed"));
+    }
+    for (((configured, original), receipt), child) in capture
+        .children
+        .iter()
+        .zip(&source.children)
+        .zip(&exported.children)
+        .zip(&mut report.children)
+    {
+        let model = original.model.as_ref().unwrap();
+        if receipt.parameters_sha256 != model.parameters_signature()
+            || model.owner() != &configured.scope.owner
+        {
+            return Err(FerrumError::internal(
+                "shared export changed original child parameters/owner",
+            ));
+        }
+        child.exported_profile = Some(receipt.clone());
+    }
+    report.exported_shared_profile = Some(exported);
+    artifacts.record(&serde_json::json!({"schema_version":1,"event":"structured_v2_shared_profile_exported","receipt":report.exported_shared_profile}))?;
+    let receipt = session.inspect_structured_cost_profile_v2(&capture.catalog)?;
+    let v2 = receipt
+        .structured_whole_wave_v2
+        .as_ref()
+        .ok_or_else(|| FerrumError::internal("shared loader returned no V2 receipt"))?;
+    if v2.artifact_kind != ferrum_types::SloStructuredArtifactKindV2::SharedCatalogV11
+        || v2.child_count != capture.children.len()
+    {
+        return Err(FerrumError::internal(
+            "shared loader did not verify every declared child",
+        ));
+    }
+    report.verified_catalog = Some(receipt);
+    artifacts.record(&serde_json::json!({"schema_version":1,"event":"structured_v2_shared_catalog_verified","receipt":report.verified_catalog}))?;
+    Ok(())
 }

@@ -6,20 +6,40 @@ pub(super) struct Mapped {
     pub newest_age: u64,
     pub wall: u64,
 }
+#[derive(Clone, Copy)]
+pub(super) struct Evidence {
+    pub opening: PairedClock,
+    pub closing: PairedClock,
+    pub oldest_observed: u64,
+    pub newest_observed: u64,
+    pub max_age_ns: u64,
+}
+impl From<&replay::Replayed> for Evidence {
+    fn from(r: &replay::Replayed) -> Self {
+        Self {
+            opening: r.header.opening,
+            closing: r.closing,
+            oldest_observed: r.oldest_observed,
+            newest_observed: r.newest_observed,
+            max_age_ns: r.header.settings.max_age_ns,
+        }
+    }
+}
 pub(super) fn validate_source(
-    r: &replay::Replayed,
+    r: impl Into<Evidence>,
     source_error: u64,
 ) -> Result<(), CostProfileError> {
+    let r = r.into();
     let fail = || CostProfileError::Clock("inconsistent original paired clocks");
     let monotonic = r
         .closing
         .monotonic_ns
-        .checked_sub(r.header.opening.monotonic_ns)
+        .checked_sub(r.opening.monotonic_ns)
         .ok_or_else(fail)?;
     let wall = r
         .closing
         .wall_unix_ns
-        .checked_sub(r.header.opening.wall_unix_ns)
+        .checked_sub(r.opening.wall_unix_ns)
         .ok_or_else(fail)?;
     if wall
         .checked_add(source_error.checked_mul(2).ok_or_else(fail)?)
@@ -31,11 +51,12 @@ pub(super) fn validate_source(
     Ok(())
 }
 pub(super) fn map_clock(
-    r: &replay::Replayed,
+    r: impl Into<Evidence>,
     source_error: u64,
     limits: &CostProfileLoadLimits,
     load: ProfileLoadClock,
 ) -> Result<Mapped, CostProfileError> {
+    let r = r.into();
     let fail =
         || CostProfileError::Clock("invalid structured paired clock or original evidence expired");
     validate_source(r, source_error)?;
@@ -51,7 +72,7 @@ pub(super) fn map_clock(
     // Opening wall is read before monotonic. Its offset is a lower bound;
     // using it makes observations conservatively older. Closing bounds the
     // opposite end and checks source-clock consistency, never renews its age.
-    let opening = r.header.opening;
+    let opening = r.opening;
     let close = r.closing;
     let mono_delta = close
         .monotonic_ns
@@ -85,7 +106,7 @@ pub(super) fn map_clock(
     }
     let oldest_age = anchor.checked_sub(r.oldest_observed).ok_or_else(fail)?;
     let newest_age = anchor.checked_sub(r.newest_observed).ok_or_else(fail)?;
-    if oldest_age > r.header.settings.max_age_ns {
+    if oldest_age > r.max_age_ns {
         return Err(fail());
     }
     Ok(Mapped {

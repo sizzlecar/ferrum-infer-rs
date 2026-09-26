@@ -152,6 +152,7 @@ async fn structured_group_metal_two_live_owners_sources_profiles_catalog_query()
     }).collect();
     session
         .begin_structured_cost_group_v2(StructuredCalibrationGroupOptionsV2 {
+            shared_source: None,
             children,
             limits: StructuredCalibrationGroupLimitsV2::default(),
         })

@@ -211,3 +211,37 @@ pub(super) fn catalog(
         source_observation_artifact_sha256: source_inventory,
     })
 }
+
+/// The physical file/row accounting is explicit, never path/hash deduplication
+/// applied opportunistically to unrelated legacy catalogs.
+pub(super) fn shared(
+    path: &Path,
+    imported: &file::ImportedStructuredCatalogV11,
+    snapshot: &StructuredSnapshot,
+    declared: u64,
+) -> Result<SloCostProfileReceipt, FerrumError> {
+    let mut receipt = catalog(
+        path,
+        imported.file_sha256,
+        size(imported.file_bytes)?,
+        snapshot,
+        declared,
+    )?;
+    let v2 = receipt.structured_whole_wave_v2.as_mut().unwrap();
+    v2.artifact_kind = ferrum_types::SloStructuredArtifactKindV2::SharedCatalogV11;
+    v2.total_imported_bytes = imported
+        .file_bytes
+        .checked_add(imported.source_bytes)
+        .ok_or_else(|| FerrumError::config("shared imported byte count overflow"))?;
+    v2.total_shape_rows = imported.total_shape_rows;
+    // Inventory continues to bind every child independently; the actual source
+    // digest and physical accounting are separately unambiguous.
+    receipt.schema_version = 11;
+    receipt.offered_samples = size(imported.offered_attempts)?;
+    receipt.source_generator = "ferrum.structured-shared-v2-catalog".into();
+    receipt.source_generator_revision = "11".into();
+    receipt.source_measurement_protocol =
+        format!("source4:sha256:{}", hex(&imported.capture_protocol));
+    receipt.source_observation_artifact_sha256 = imported.source_sha256;
+    Ok(receipt)
+}

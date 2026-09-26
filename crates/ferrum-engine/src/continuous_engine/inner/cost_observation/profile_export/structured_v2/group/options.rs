@@ -21,6 +21,8 @@ impl Default for StructuredCalibrationGroupLimitsV2 {
 }
 #[derive(Debug, Clone)]
 pub struct StructuredCalibrationGroupOptionsV2 {
+    /// Explicit shared source4; None preserves independent source3 files.
+    pub shared_source: Option<PathBuf>,
     pub children: Vec<StructuredCalibrationOptionsV2>,
     pub limits: StructuredCalibrationGroupLimitsV2,
 }
@@ -46,7 +48,7 @@ impl StructuredCalibrationGroupOptionsV2 {
             child.validate()?;
             // Resolve parent aliases before any source file is created.
             let destination = files::destination(&child.observations_path)?;
-            if destinations.contains(&destination) {
+            if self.shared_source.is_none() && destinations.contains(&destination) {
                 return Err(ExportError::Config(
                     "group child files alias the same destination".into(),
                 ));
@@ -57,7 +59,8 @@ impl StructuredCalibrationGroupOptionsV2 {
                 || child.maximum_offered_waves != first.maximum_offered_waves
                 || self.children[..index].iter().any(|old| {
                     old.scope.owner == child.scope.owner
-                        || old.observations_path == child.observations_path
+                        || (self.shared_source.is_none()
+                            && old.observations_path == child.observations_path)
                 })
             {
                 return Err(ExportError::Config(
@@ -65,8 +68,22 @@ impl StructuredCalibrationGroupOptionsV2 {
                         .into(),
                 ));
             }
+            if let Some(shared) = &self.shared_source {
+                if &child.observations_path != shared
+                    || child.maximum_file_bytes != first.maximum_file_bytes
+                {
+                    return Err(ExportError::Config(
+                        "shared children must declare the same physical source and byte limit"
+                            .into(),
+                    ));
+                }
+            }
             files = files
-                .checked_add(child.maximum_file_bytes.get())
+                .checked_add(if self.shared_source.is_none() || index == 0 {
+                    child.maximum_file_bytes.get()
+                } else {
+                    0
+                })
                 .ok_or(ExportError::Source("group file capacity overflow"))?;
             numeric = numeric
                 .checked_add(

@@ -19,17 +19,18 @@ pub(super) fn outside(p: &Prepared, s: OutsideSettlement) -> Stages {
         completeness: s.completeness,
     }
 }
-pub(super) fn validate(
-    h: &Header,
+pub(super) fn validate<'a>(
+    h: impl Into<replay::HeaderRef<'a>>,
     p: &Prepared,
     s: &Stages,
     independent: Option<&IndependentAttentionWaveEvidenceWireV2>,
     binding: [u8; 32],
 ) -> Result<(u64, u64), CostProfileError> {
+    let h = h.into();
     let fail = || invalid("original V2 host settlement differs from Prepared or terminal protocol");
     if s.schema_version != 1
         || s.call_id == 0
-        || s.fingerprint.as_ref() != Some(&h.fingerprint)
+        || s.fingerprint.as_ref() != Some(h.fingerprint)
         || s.completeness != "complete_single_wave"
         || s.rows.len() != p.rows.len()
         || s.actual_shape.as_ref() != Some(&p.exact)
@@ -152,8 +153,8 @@ pub(super) fn terminal(t: &Terminal) -> Result<(), CostProfileError> {
     }
     Ok(())
 }
-pub(super) fn convert(
-    h: &Header,
+pub(super) fn convert<'a>(
+    h: impl Into<replay::HeaderRef<'a>>,
     input: StructuredInputV2,
     n: &Numeric,
     phase: StructuredProfilePhaseV10,
@@ -163,6 +164,7 @@ pub(super) fn convert(
     wall: u64,
     observed: u64,
 ) -> Result<StructuredNumericObservationV2, CostProfileError> {
+    let h = h.into();
     if n.call_id != call
         || n.wall_ns != wall
         || n.observed_at_ns != observed

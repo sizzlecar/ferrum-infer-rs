@@ -6,7 +6,7 @@ use ferrum_interfaces::execution_cost::{CoreReadbackRoute, HostPendingConstraint
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{windows::*, *};
 
 fn group_options(paths: &[SourcePath; 2]) -> StructuredCalibrationGroupOptionsV2 {
-    StructuredCalibrationGroupOptionsV2 { limits:Default::default(), children:paths.iter().enumerate().map(|(i,path)| {
+    StructuredCalibrationGroupOptionsV2 { shared_source: None, limits:Default::default(), children:paths.iter().enumerate().map(|(i,path)| {
         let owner = StructuredOwnerKeyV2 {rows:1, role:StructuredWaveRoleV2::OrdinaryDecode,
             product:StructuredProductV2::GreedyToken, readback:CoreReadbackRoute::HostSynchronized,
             provider_template:StructuredTemplateV2::Ordered([1;32]), algorithm_domain:[i as u8+1;32], installed_policy:[3;32]};

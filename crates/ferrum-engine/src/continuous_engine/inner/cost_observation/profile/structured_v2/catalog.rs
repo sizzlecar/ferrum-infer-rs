@@ -196,9 +196,34 @@ pub(super) fn load(
         let receipt = receipt::single(&child, declared)?;
         return Ok((StructuredSnapshot::single(child), receipt));
     }
+    if kind.schema_version == 11
+        && kind.artifact_type.as_deref() == Some("ferrum.structured-shared-v2-catalog")
+    {
+        drop(bytes);
+        let imported =
+            file::load_structured_profile_v11(path, fp, limits, clock).map_err(profile_error)?;
+        if imported.file_sha256 != digest {
+            return Err(FerrumError::config("shared catalog changed during startup"));
+        }
+        let mut children = BTreeMap::new();
+        for child in &imported.children {
+            if children
+                .insert(*child.domain_signature(), child.clone())
+                .is_some()
+            {
+                return Err(FerrumError::config("duplicate shared replayed domain"));
+            }
+        }
+        let snapshot = StructuredSnapshot {
+            children: Arc::new(children),
+            feedback: None,
+        };
+        let receipt = receipt::shared(path, &imported, &snapshot, declared)?;
+        return Ok((snapshot, receipt));
+    }
     if kind.schema_version != 1 || kind.artifact_type.as_deref() != Some(ARTIFACT_TYPE) {
         return Err(FerrumError::config(
-            "expected schema10 child or explicit structured V2 catalog",
+            "expected schema10 child, explicit V2 catalog, or shared schema11",
         ));
     }
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(profile_error)?;

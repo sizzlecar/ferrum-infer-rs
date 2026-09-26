@@ -44,10 +44,73 @@ struct Producer {
     source_revision: Option<String>,
 }
 
-fn header_valid(
+/// Borrow common and child declarations without expanding shared payloads.
+#[derive(Clone, Copy)]
+pub(super) struct HeaderRef<'a> {
+    pub artifact_type: &'a str,
+    pub schema_version: u32,
+    pub model_revision: &'a str,
+    pub capture_identity: [u8; 32],
+    pub protocol: [u8; 32],
+    pub declared_protocol: [u8; 32],
+    pub rule_signature: [u8; 32],
+    pub fingerprint: &'a ProfileFingerprint,
+    pub producer: &'a serde_json::Value,
+    pub opening: PairedClock,
+    pub opened_at_ns: u64,
+    pub initial_fifo_cutoff: u64,
+    pub scope: &'a StructuredScopeV2,
+    pub membership_rule: &'a MembershipRuleV2,
+    pub cohort_plan: &'a CohortPlanV2,
+    pub cohort_manifest_payload: &'a serde_json::Value,
+    pub cohort_manifest_sha256: [u8; 32],
+    pub phase_members: [usize; 3],
+    pub maximum_offered_waves: usize,
+    pub maximum_file_bytes: u64,
+    pub settings: &'a Settings,
+}
+impl<'a> From<&'a Header> for HeaderRef<'a> {
+    fn from(h: &'a Header) -> Self {
+        Self {
+            artifact_type: &h.artifact_type,
+            schema_version: h.schema_version,
+            model_revision: &h.model_revision,
+            capture_identity: h.capture_identity,
+            protocol: h.protocol,
+            declared_protocol: h.declared_protocol,
+            rule_signature: h.rule_signature,
+            fingerprint: &h.fingerprint,
+            producer: &h.producer,
+            opening: h.opening,
+            opened_at_ns: h.opened_at_ns,
+            initial_fifo_cutoff: h.initial_fifo_cutoff,
+            scope: &h.scope,
+            membership_rule: &h.membership_rule,
+            cohort_plan: &h.cohort_plan,
+            cohort_manifest_payload: &h.cohort_manifest_payload,
+            cohort_manifest_sha256: h.cohort_manifest_sha256,
+            phase_members: h.phase_members,
+            maximum_offered_waves: h.maximum_offered_waves,
+            maximum_file_bytes: h.maximum_file_bytes,
+            settings: &h.settings,
+        }
+    }
+}
+
+pub(super) fn header_valid(
     h: &Header,
     bytes: usize,
     limits: &CostProfileLoadLimits,
+) -> Result<(), CostProfileError> {
+    header_valid_ref(h.into(), bytes, limits, true)
+}
+/// `validate_common` is false only after this same immutable common declaration
+/// has already passed the complete check in a shared-source import.
+pub(super) fn header_valid_ref(
+    h: HeaderRef<'_>,
+    bytes: usize,
+    limits: &CostProfileLoadLimits,
+    validate_common: bool,
 ) -> Result<(), CostProfileError> {
     if h.model_revision != MODEL_REVISION_V2 {
         return Err(invalid("unsupported structured source revision"));
@@ -56,7 +119,9 @@ fn header_valid(
     h.settings.native().validate().map_err(numeric_error)?;
     h.scope.validate().map_err(numeric_error)?;
     h.membership_rule.validate().map_err(numeric_error)?;
-    h.cohort_plan.validate().map_err(numeric_error)?;
+    if validate_common {
+        h.cohort_plan.validate().map_err(numeric_error)?;
+    }
     if h.artifact_type != "ferrum.structured-live-source"
         || h.schema_version != 3
         || h.capture_identity == [0; 32]
@@ -71,10 +136,11 @@ fn header_valid(
             .iter()
             .any(|n| *n < h.settings.min_samples || *n > h.settings.max_phase_samples)
         || h.membership_rule.signature().map_err(numeric_error)? != h.rule_signature
-        || h.cohort_plan
-            .signature(&h.cohort_manifest_payload)
-            .map_err(numeric_error)?
-            != h.cohort_manifest_sha256
+        || validate_common
+            && h.cohort_plan
+                .signature(h.cohort_manifest_payload)
+                .map_err(numeric_error)?
+                != h.cohort_manifest_sha256
     {
         return Err(fail());
     }
@@ -130,6 +196,9 @@ fn header_valid(
     }
     if <[u8; 32]>::from(protocol.finalize()) != h.protocol {
         return Err(fail());
+    }
+    if !validate_common {
+        return Ok(());
     }
     let producer: Producer = serde_json::from_value(h.producer.clone())?;
     if producer.executable_bytes == 0

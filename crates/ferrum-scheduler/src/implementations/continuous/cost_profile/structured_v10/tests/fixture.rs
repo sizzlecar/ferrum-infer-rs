@@ -371,7 +371,7 @@ pub fn header_graph(resident: Option<&str>) -> Header {
     h.protocol = sha.finalize().into();
     h
 }
-fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64) -> Stages {
+pub(in super::super) fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64) -> Stages {
     let start = call * 2000;
     let last = p.rows[0].frontier.generated_before == 2;
     let mut s = Stages {
@@ -444,7 +444,7 @@ fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64) -> Stages {
     }));
     s
 }
-fn push(bytes: &mut Vec<u8>, ordinal: &mut u64, record: impl Serialize) {
+pub(in super::super) fn push(bytes: &mut Vec<u8>, ordinal: &mut u64, record: impl Serialize) {
     *ordinal += 1;
     serde_json::to_writer(
         &mut *bytes,

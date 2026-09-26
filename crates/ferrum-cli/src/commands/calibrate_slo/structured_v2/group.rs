@@ -20,6 +20,7 @@ pub(crate) struct GroupReportV2 {
     pub declared_limits: config::GroupLimitsV2,
     pub children: Vec<report::StructuredReportV2>,
     pub group_failure: Option<String>,
+    pub exported_shared_profile: Option<ferrum_scheduler::implementations::continuous::cost_profile::StructuredProfileExportReceiptV11>,
     pub verified_catalog: Option<ferrum_types::SloCostProfileReceipt>,
     pub finalization_error: Option<String>,
 }
@@ -31,6 +32,7 @@ impl GroupReportV2 {
             declared_limits: config.limits.clone(),
             children: config.children.iter().map(|c| report::StructuredReportV2::new(c.scope.clone())).collect(),
             group_failure: None,
+            exported_shared_profile: None,
             verified_catalog: None,
             finalization_error: None,
         }

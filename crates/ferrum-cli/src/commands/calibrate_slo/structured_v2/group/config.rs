@@ -34,6 +34,10 @@ impl GroupLimitsV2 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupCaptureConfigV2 {
+    /// Source4 mode. Every child source must equal this path and its profile
+    /// must equal catalog; those files are physically created only once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_source: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warmup: Vec<manifest::Cohort>,
     pub catalog: PathBuf,
@@ -68,18 +72,33 @@ impl GroupCaptureConfigV2 {
             {
                 return Err(FerrumError::config("group requires shared warmup and FIFO capacity with distinct predeclared owners"));
             }
-            for destination in [&child.profile, &child.source] {
-                if destination.as_os_str().is_empty()
-                    || destinations.contains(&destination.as_path())
+            if let Some(shared) = &self.shared_source {
+                if shared.as_os_str().is_empty()
+                    || shared == &self.catalog
+                    || &child.source != shared
+                    || child.profile != self.catalog
+                    || child.maximum_file_bytes != self.children[0].maximum_file_bytes
                 {
-                    return Err(FerrumError::config(
-                        "group source/profile/catalog destinations must be distinct",
-                    ));
+                    return Err(FerrumError::config("source4 requires common source/byte limit and profile11 catalog for every declared child"));
                 }
-                destinations.push(destination.as_path());
+            } else {
+                for destination in [&child.profile, &child.source] {
+                    if destination.as_os_str().is_empty()
+                        || destinations.contains(&destination.as_path())
+                    {
+                        return Err(FerrumError::config(
+                            "group source/profile/catalog destinations must be distinct",
+                        ));
+                    }
+                    destinations.push(destination.as_path());
+                }
             }
             files = files
-                .checked_add(child.maximum_file_bytes.get())
+                .checked_add(if self.shared_source.is_none() || index == 0 {
+                    child.maximum_file_bytes.get()
+                } else {
+                    0
+                })
                 .ok_or_else(|| FerrumError::config("group declared file bound overflow"))?;
             for count in child.phase_members {
                 coordinates = count
@@ -101,6 +120,11 @@ impl GroupCaptureConfigV2 {
         Ok(())
     }
     pub(crate) fn resolve_paths(&mut self, parent: &std::path::Path) {
+        if let Some(path) = &mut self.shared_source {
+            if path.is_relative() {
+                *path = parent.join(&*path);
+            }
+        }
         for path in std::iter::once(&mut self.catalog).chain(
             self.children
                 .iter_mut()
@@ -129,7 +153,14 @@ impl GroupCaptureConfigV2 {
         let source_bytes = self
             .children
             .iter()
-            .try_fold(0_u64, |sum, c| sum.checked_add(c.maximum_file_bytes.get()))
+            .enumerate()
+            .try_fold(0_u64, |sum, (index, c)| {
+                sum.checked_add(if self.shared_source.is_none() || index == 0 {
+                    c.maximum_file_bytes.get()
+                } else {
+                    0
+                })
+            })
             .ok_or_else(|| FerrumError::config("group source capacity overflow"))?;
         if observation.predictor != ferrum_types::SloCostPredictor::StructuredWholeWaveV2
             || observation.structured_capture
@@ -156,6 +187,7 @@ impl GroupCaptureConfigV2 {
     ) -> Result<StructuredCalibrationGroupOptionsV2> {
         self.validate(manifest)?;
         Ok(StructuredCalibrationGroupOptionsV2 {
+            shared_source: self.shared_source.clone(),
             children: self
                 .children
                 .iter()

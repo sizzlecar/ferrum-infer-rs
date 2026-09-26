@@ -1,6 +1,6 @@
 use super::*;
 mod fit_floor;
-mod fixture;
+pub(super) mod fixture;
 use fixture::*;
 
 #[test]
