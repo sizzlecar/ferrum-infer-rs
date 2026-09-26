@@ -1272,8 +1272,10 @@ pub use inner::calibration::{
     RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
     RequiredFutureAuditReportV2, RequiredFutureAuditRowV2, SelectedCalibrationOptions,
     SelectedFitFreezeReceipt, StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,
-    StructuredCalibrationOptions, StructuredCalibrationOptionsV2, StructuredCalibrationProgress,
-    StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
+    StructuredCalibrationGroupArtifactV2, StructuredCalibrationGroupLimitsV2,
+    StructuredCalibrationGroupOptionsV2, StructuredCalibrationOptions,
+    StructuredCalibrationOptionsV2, StructuredCalibrationProgress, StructuredCalibrationScopeV1,
+    StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
 pub use inner::cost_observation::{
     HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,

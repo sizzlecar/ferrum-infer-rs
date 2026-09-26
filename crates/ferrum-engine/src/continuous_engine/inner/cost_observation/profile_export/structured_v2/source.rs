@@ -17,6 +17,11 @@ impl StructuredSource {
         })
     }
     pub fn record(&mut self, value: &impl Serialize) -> Result<(), ExportError> {
+        self.record_borrowed(value)
+    }
+    /// Serialize borrowed common wave data directly into the bounded writer,
+    /// without building N complete JSON Values for a multi-child source.
+    pub fn record_borrowed<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), ExportError> {
         if self.poisoned.is_some() {
             return Err(ExportError::Source(
                 "structured raw source is already incomplete",
@@ -26,9 +31,15 @@ impl StructuredSource {
             .records
             .checked_add(1)
             .ok_or(ExportError::Source("structured source ordinal exhausted"))?;
-        let result = self
-            .raw
-            .record(&serde_json::json!({"source_record_ordinal":ordinal,"record":value}));
+        #[derive(Serialize)]
+        struct Envelope<'a, T: Serialize + ?Sized> {
+            source_record_ordinal: u64,
+            record: &'a T,
+        }
+        let result = self.raw.record(&Envelope {
+            source_record_ordinal: ordinal,
+            record: value,
+        });
         match result {
             Ok(()) => {
                 self.records = ordinal;

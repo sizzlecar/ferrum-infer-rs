@@ -40,7 +40,7 @@ pub(in crate::continuous_engine) struct CostCalibrationCapture {
     conflict: AtomicBool,
     // Set only by construction, before attach/context/execute. Existing capture
     // paths keep None and cannot be retroactively relabeled as this protocol.
-    structured_session: Option<Arc<StructuredCaptureSessionBinding>>,
+    structured_sessions: Box<[Arc<StructuredCaptureSessionBinding>]>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,13 +55,47 @@ impl CostCalibrationCapture {
         session: Arc<StructuredCaptureSessionBinding>,
     ) -> Self {
         Self {
-            structured_session: Some(session),
+            structured_sessions: Box::new([session]),
             ..Self::default()
         }
     }
 
     pub(super) fn structured_session(&self) -> Option<&StructuredCaptureSessionBinding> {
-        self.structured_session.as_deref()
+        match self.structured_sessions.as_ref() {
+            [session] => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Immutable population attached before the one real call. This never
+    /// accepts a receipt or mutates an already attached capture.
+    pub(in crate::continuous_engine::inner) fn for_structured_sessions(
+        sessions: Vec<Arc<StructuredCaptureSessionBinding>>,
+    ) -> Result<
+        Self,
+        ferrum_scheduler::implementations::continuous::cost_model::structured::StructuredUnknown,
+    > {
+        use ferrum_scheduler::implementations::continuous::cost_model::structured::StructuredUnknown as U;
+        if sessions.is_empty() || sessions.len() > 128 {
+            return Err(U::Capacity);
+        }
+        for (index, session) in sessions.iter().enumerate() {
+            if session.fingerprint() != sessions[0].fingerprint()
+                || sessions[..index]
+                    .iter()
+                    .any(|s| s.identity() == session.identity())
+            {
+                return Err(U::WrongSource);
+            }
+        }
+        Ok(Self {
+            structured_sessions: sessions.into_boxed_slice(),
+            ..Self::default()
+        })
+    }
+
+    pub(super) fn structured_sessions(&self) -> &[Arc<StructuredCaptureSessionBinding>] {
+        &self.structured_sessions
     }
 
     pub fn host_stage_queue(&self) -> Option<HostStageQueueReceipt> {

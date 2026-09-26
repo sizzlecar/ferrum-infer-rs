@@ -29,8 +29,15 @@ use cohorts::CohortLedgerV2;
 #[path = "structured_v2/source.rs"]
 mod source;
 use source::StructuredSource;
+#[path = "structured_v2/group.rs"]
+mod group;
 #[path = "structured_v2/wire.rs"]
 mod wire;
+pub(in crate::continuous_engine::inner) use group::StructuredCalibrationGroupV2;
+pub use group::{
+    StructuredCalibrationGroupArtifactV2, StructuredCalibrationGroupLimitsV2,
+    StructuredCalibrationGroupOptionsV2,
+};
 
 pub struct StructuredCalibrationArtifactV2 {
     pub source_path: PathBuf,
@@ -253,6 +260,16 @@ impl StructuredCalibrationCollectorV2 {
             Ok(actual) => actual,
             Err(error) => return self.completion_failed(&reserved, capture, reconciled, error),
         };
+        self.complete_validated(reserved, capture, reconciled, &actual)
+    }
+    fn complete_validated(
+        &mut self,
+        reserved: population::ReservedWaveV2,
+        capture: &Arc<CostCalibrationCapture>,
+        reconciled: bool,
+        actual: &super::super::trainer::structured_v2::ValidatedStructuredWaveV2,
+    ) -> Result<(), ExportError> {
+        let queue = capture.host_stage_queue();
         let stages = Arc::clone(&actual.stages);
         let converted = (|| {
             let completed = self
@@ -260,12 +277,15 @@ impl StructuredCalibrationCollectorV2 {
                 .completed(self.phase, &reserved.prepared, &actual)?;
             let numeric = if let Some(member) = reserved.member {
                 let value = actual
-                    .into_member(StructuredMemberBindingV2 {
-                        rule_signature: self.contract.membership_rule,
-                        offered_ordinal: reserved.attempt.offered,
-                        member_ordinal: member,
-                        phase: numeric_phase(reserved.attempt.phase)?,
-                    })
+                    .member_for(
+                        &self.binding,
+                        StructuredMemberBindingV2 {
+                            rule_signature: self.contract.membership_rule,
+                            offered_ordinal: reserved.attempt.offered,
+                            member_ordinal: member,
+                            phase: numeric_phase(reserved.attempt.phase)?,
+                        },
+                    )
                     .map_err(numeric_error)?;
                 if value.input.owner() != &self.options.scope.owner
                     || value.input.regression_axes().len() > self.options.settings.max_axes
@@ -294,22 +314,24 @@ impl StructuredCalibrationCollectorV2 {
             Ok(value) => value,
             Err(error) => return self.completion_failed(&reserved, capture, reconciled, error),
         };
-        let compact = serde_json::json!({"call_id":stages.call_id,"fingerprint":stages.fingerprint.as_ref().map(profile::ProfileFingerprint::from),
-            "prepare_started_at_ns":stages.prepare_started_at_ns,"executor_returned_at_ns":stages.executor_returned_at_ns,
-            "finalized_at_ns":stages.finalized_at_ns,"full_wall_ns":stages.full_wall_ns,
-            "completeness":stages.completeness,"rows":stages.rows,"stage_binding":stage_binding});
-        self.source.record(&serde_json::json!({"kind":"completed","offered":reserved.attempt.offered,
-            "member":reserved.member,"phase":reserved.attempt.phase,"cohort":reserved.attempt.cohort,"queue":queue,"reconciled":reconciled,
-            "host_stages":reserved.member.map(|_|stages.structured_diagnostic_view()),
-            "outside_settlement":if reserved.member.is_none(){Some(compact)}else{None},
-            "selected_independent_attention_v2":reserved.member.and_then(|_|stages.statistical_evidence.as_ref()).and_then(|v|v.independent_attention_v2()),
-            "selected_structured_capture":reserved.member.and_then(|_|stages.statistical_evidence.as_ref()).and_then(|v|v.structured_capture()).map(|v|v.map(AsRef::as_ref)),
-            "numeric":numeric.as_ref().map(|s|serde_json::json!({"fifo":s.ordinal,"call_id":s.call_id,"observed_at_ns":s.observed_at_ns,
-                "wall_ns":s.wall_ns,"domain":s.input.domain_signature(),"basis":s.input.regression_axes(),"support":s.input.joint_support_coordinates()})),
-            "conversion_error":serde_json::Value::Null}))?;
-        for request in completed {
-            self.source
-                .record(&serde_json::json!({"kind":"request_completed","request":request}))?;
+        let written = (|| {
+            self.source.record_borrowed(&wire::CompletedWire {
+                reserved: &reserved,
+                stages: &stages,
+                queue,
+                reconciled,
+                numeric: numeric.as_ref(),
+                stage_binding,
+            })?;
+            for request in completed {
+                self.source
+                    .record(&serde_json::json!({"kind":"request_completed","request":request}))?;
+            }
+            Ok::<(), ExportError>(())
+        })();
+        if let Err(error) = written {
+            self.ledger.settle_member(&reserved, false);
+            return Err(error);
         }
         self.ledger.settle_member(&reserved, true);
         if let Some(numeric) = numeric {
@@ -344,17 +366,27 @@ impl StructuredCalibrationCollectorV2 {
         result
     }
     fn freeze_inner(&mut self, cutoff: u64) -> Result<StructuredPhaseFreezeReceipt, ExportError> {
+        let now = self
+            .clock
+            .now_ns()
+            .ok_or(ExportError::Clock("V2 original freeze clock unavailable"))?;
+        self.freeze_at(cutoff, now)
+    }
+    fn check_freeze(&self, cutoff: u64) -> Result<(), ExportError> {
         self.cohorts.freeze(self.phase)?;
         self.ledger.freeze(
             self.phase,
             cutoff,
             self.samples.len(),
             self.options.phase_members,
-        )?;
-        let now = self
-            .clock
-            .now_ns()
-            .ok_or(ExportError::Clock("V2 original freeze clock unavailable"))?;
+        )
+    }
+    fn freeze_at(
+        &mut self,
+        cutoff: u64,
+        now: u64,
+    ) -> Result<StructuredPhaseFreezeReceipt, ExportError> {
+        self.check_freeze(cutoff)?;
         let coverage = self.coverage()?;
         self.source
             .record(&serde_json::json!({"kind":"coverage","phase":self.phase,"report":coverage}))?;
@@ -421,6 +453,20 @@ impl StructuredCalibrationCollectorV2 {
         Ok(receipt)
     }
     pub fn finish(mut self, cutoff: u64) -> Result<StructuredCalibrationArtifactV2, ExportError> {
+        let closing = match ExportClockReading::closing(self.clock.as_ref()) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.invalidate(error.to_string());
+                None
+            }
+        };
+        self.finish_with_closing(cutoff, closing)
+    }
+    fn finish_with_closing(
+        mut self,
+        cutoff: u64,
+        closing: Option<ExportClockReading>,
+    ) -> Result<StructuredCalibrationArtifactV2, ExportError> {
         if !self.ledger.audit_complete(cutoff) || self.phase != StructuredCapturePhase::Qualified {
             self.invalidate(
                 "V2 source ended without complete original FIFO and qualification".into(),
@@ -429,13 +475,6 @@ impl StructuredCalibrationCollectorV2 {
         if let Some(error) = self.source.incomplete_error() {
             return Err(error);
         }
-        let closing = match ExportClockReading::closing(self.clock.as_ref()) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                self.invalidate(error.to_string());
-                None
-            }
-        };
         self.source.record(&serde_json::json!({"kind":"footer","phase":self.phase,"failure":self.failure,
             "offered":self.ledger.offered,"members":self.ledger.members,"failed_members":self.ledger.failed.iter().sum::<usize>(),
             "accepted_fifo_cutoff":cutoff,"last_captured_fifo":self.ledger.last_fifo,"fifo_audit_complete":self.ledger.audit_complete(cutoff),"closing":closing}))?;

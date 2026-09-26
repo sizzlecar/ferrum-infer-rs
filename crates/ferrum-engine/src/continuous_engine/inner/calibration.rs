@@ -10,10 +10,15 @@ mod artifact;
 mod selected;
 pub use selected::{SelectedCalibrationOptions, SelectedFitFreezeReceipt};
 mod structured;
+mod structured_group_v2;
 mod structured_v2;
 pub use structured::{
     StructuredCalibrationArtifact, StructuredCalibrationOptions, StructuredCalibrationProgress,
     StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
+};
+pub use structured_group_v2::{
+    StructuredCalibrationGroupArtifactV2, StructuredCalibrationGroupLimitsV2,
+    StructuredCalibrationGroupOptionsV2,
 };
 pub use structured_v2::{StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2};
 mod checkpoint;
@@ -54,6 +59,7 @@ pub struct CalibrationSession {
     selected_capture_identity: Option<[u8; 32]>,
     structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
     structured_capture_v2: Option<super::cost_observation::StructuredCalibrationCollectorV2>,
+    structured_group_v2: Option<super::cost_observation::StructuredCalibrationGroupV2>,
     engine: ContinuousBatchEngine,
     identity: Arc<()>,
     limits: CalibrationLimits,
@@ -95,6 +101,7 @@ impl CalibrationSession {
             selected_capture_identity: None,
             structured_capture: None,
             structured_capture_v2: None,
+            structured_group_v2: None,
             engine,
             identity: Arc::new(()),
             limits,
@@ -172,8 +179,15 @@ impl CalibrationSession {
         }
         if let Some(collector) = &mut self.structured_capture_v2 {
             if collector.collecting() {
-                if let Err(error) = collector.admitted(id, declared_maximum) {
+                if let Err(error) = collector.admitted(id.clone(), declared_maximum) {
                     collector.invalidate(error.to_string());
+                }
+            }
+        }
+        if let Some(group) = &mut self.structured_group_v2 {
+            if group.collecting() {
+                if let Err(error) = group.admitted(id, declared_maximum) {
+                    group.invalidate(error.to_string());
                 }
             }
         }
@@ -303,6 +317,13 @@ impl CalibrationSession {
                         }
                     }
                 }
+                if let Some(group) = &mut self.structured_group_v2 {
+                    if group.collecting() {
+                        if let Err(error) = group.offer(&rows) {
+                            group.invalidate(error.to_string());
+                        }
+                    }
+                }
                 let preparation =
                     inner.prepare_calibration_wave(&rows, self.limits.maximum_requests());
                 let prepared = match preparation {
@@ -341,6 +362,28 @@ impl CalibrationSession {
                     }
                 }
                 if let Some(collector) = &mut self.structured_capture_v2 {
+                    if collector.collecting() {
+                        match prepared.structured_prepared_facts(&inner) {
+                            Ok(facts) => {
+                                if let Err(error) = collector.reserve_prepared(facts) {
+                                    collector.invalidate(error.to_string());
+                                }
+                            }
+                            Err(error) => collector.invalidate(error.to_string()),
+                        }
+                    }
+                    if collector.collecting() {
+                        match collector.pending_capture() {
+                            Ok(capture) => {
+                                if let Err(error) = receipt.bind_structured_capture(capture) {
+                                    collector.invalidate(error.to_string());
+                                }
+                            }
+                            Err(error) => collector.invalidate(error.to_string()),
+                        }
+                    }
+                }
+                if let Some(collector) = &mut self.structured_group_v2 {
                     if collector.collecting() {
                         match prepared.structured_prepared_facts(&inner) {
                             Ok(facts) => {

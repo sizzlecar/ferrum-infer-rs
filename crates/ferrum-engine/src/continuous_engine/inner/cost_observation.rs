@@ -35,11 +35,14 @@ pub use profile_export::structured::{
     StructuredCalibrationScopeV1, StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
 pub(in crate::continuous_engine::inner) use profile_export::structured_v2::StructuredCalibrationCollectorV2;
+pub(in crate::continuous_engine::inner) use profile_export::structured_v2::StructuredCalibrationGroupV2;
 pub(in crate::continuous_engine::inner) use profile_export::structured_v2::{
     PreparedRowBindingV2, PreparedStructuredFactsV2,
 };
 pub use profile_export::structured_v2::{
-    StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2,
+    StructuredCalibrationArtifactV2, StructuredCalibrationGroupArtifactV2,
+    StructuredCalibrationGroupLimitsV2, StructuredCalibrationGroupOptionsV2,
+    StructuredCalibrationOptionsV2,
 };
 pub(in crate::continuous_engine) use profile_export::{CostProfileCutPaths, CostProfileCutReceipt};
 mod publication;

@@ -11,7 +11,7 @@ pub(super) struct ReservedWaveV2 {
     pub attempt: OfferedWaveV2,
     pub member: Option<u64>,
     pub window: Option<u32>,
-    pub prepared: PreparedStructuredFactsV2,
+    pub prepared: Arc<PreparedStructuredFactsV2>,
     pub capture: Arc<CostCalibrationCapture>,
 }
 pub(super) struct PopulationLedgerV2 {
@@ -86,12 +86,28 @@ impl PopulationLedgerV2 {
         binding: Arc<StructuredCaptureSessionBinding>,
     ) -> Result<&ReservedWaveV2, ExportError> {
         let owner = prepared.validate().map_err(numeric_error)?;
+        self.reserve_shared(
+            Arc::new(prepared),
+            &owner,
+            rule,
+            counts,
+            Arc::new(CostCalibrationCapture::for_structured_session(binding)),
+        )
+    }
+    pub fn reserve_shared(
+        &mut self,
+        prepared: Arc<PreparedStructuredFactsV2>,
+        owner: &StructuredOwnerKeyV2,
+        rule: &MembershipRuleV2,
+        counts: [usize; 3],
+        capture: Arc<CostCalibrationCapture>,
+    ) -> Result<&ReservedWaveV2, ExportError> {
         let rows = prepared
             .rows
             .iter()
             .map(|r| r.frontier.clone())
             .collect::<Vec<_>>();
-        let window = rule.classify(&owner, &rows).map_err(numeric_error)?;
+        let window = rule.classify(owner, &rows).map_err(numeric_error)?;
         let attempt = self
             .attempt
             .as_ref()
@@ -114,7 +130,7 @@ impl PopulationLedgerV2 {
             member,
             window,
             prepared,
-            capture: Arc::new(CostCalibrationCapture::for_structured_session(binding)),
+            capture,
         });
         Ok(self.pending.as_ref().unwrap())
     }

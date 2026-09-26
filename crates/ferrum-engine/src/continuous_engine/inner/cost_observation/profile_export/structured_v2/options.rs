@@ -35,8 +35,16 @@ impl StructuredCalibrationOptionsV2 {
                 "invalid V2 structured population or bounds".into(),
             ));
         }
-        let numeric_bytes = self
-            .settings
+        let numeric_bytes = self.numeric_storage_bound();
+        if numeric_bytes.is_none_or(|n| n > 128 * 1024 * 1024) {
+            return Err(ExportError::Config(
+                "V2 structured numeric storage exceeds 128 MiB".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(super) fn numeric_storage_bound(&self) -> Option<usize> {
+        self.settings
             .max_phase_samples
             .checked_mul(self.settings.max_axes)
             .and_then(|n| n.checked_mul(12 * std::mem::size_of::<f64>()))
@@ -48,13 +56,7 @@ impl StructuredCalibrationOptionsV2 {
                         rows.checked_mul(4 * std::mem::size_of::<StructuredHostRowV1>())
                     })
                     .and_then(|host| n.checked_add(host))
-            });
-        if numeric_bytes.is_none_or(|n| n > 128 * 1024 * 1024) {
-            return Err(ExportError::Config(
-                "V2 structured numeric storage exceeds 128 MiB".into(),
-            ));
-        }
-        Ok(())
+            })
     }
     pub(super) fn protocol_signature(
         &self,

@@ -35,6 +35,7 @@ impl CalibrationSession {
         if self.selected_capture_identity.is_some()
             || self.structured_capture.is_some()
             || self.structured_capture_v2.is_some()
+            || self.structured_group_v2.is_some()
         {
             return Err(FerrumError::invalid_request(
                 "selected calibration already started",

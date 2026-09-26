@@ -37,6 +37,7 @@ impl CalibrationSession {
         if self.structured_capture.is_some()
             || self.selected_capture_identity.is_some()
             || self.structured_capture_v2.is_some()
+            || self.structured_group_v2.is_some()
         {
             return Err(FerrumError::invalid_request(
                 "a calibration collector is already active",
@@ -93,6 +94,14 @@ impl CalibrationSession {
     }
 
     pub(super) fn record_structured_unsubmitted(&mut self, reason: &str) {
+        if let Some(group) = &mut self.structured_group_v2 {
+            if group.collecting() {
+                if let Err(error) = group.complete_unsubmitted(reason) {
+                    group.invalidate(error.to_string());
+                }
+            }
+        }
+
         if let Some(collector) = &mut self.structured_capture_v2 {
             if collector.collecting() {
                 if let Err(error) = collector.complete_unsubmitted(reason) {

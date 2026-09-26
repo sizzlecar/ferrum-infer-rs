@@ -1,5 +1,6 @@
 //! Exercise collector isolation through the real manual driver and output flow.
 use super::*;
+mod multi;
 mod successful;
 use crate::continuous_engine::inner::cost_observation::{
     CostCalibrationCapture, StructuredCalibrationCollector, StructuredCaptureSessionBinding,

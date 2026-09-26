@@ -15,6 +15,7 @@ impl CalibrationSession {
     ) -> Result<()> {
         self.selected_phase_boundary()?;
         if self.structured_capture_v2.is_some()
+            || self.structured_group_v2.is_some()
             || self.structured_capture.is_some()
             || self.selected_capture_identity.is_some()
         {
@@ -114,6 +115,17 @@ impl CalibrationSession {
         receipt: &CalibrationWaveReceipt,
         report: &CalibrationWaveReport,
     ) {
+        if let Some(group) = &mut self.structured_group_v2 {
+            if group.collecting() {
+                if let Err(error) = group.complete(
+                    receipt.capture(),
+                    report.submission == CalibrationSubmissionState::HostReconciled
+                        && report.error.is_none(),
+                ) {
+                    group.invalidate(error.to_string());
+                }
+            }
+        }
         if let Some(collector) = &mut self.structured_capture_v2 {
             if collector.collecting() {
                 if let Err(error) = collector.complete(

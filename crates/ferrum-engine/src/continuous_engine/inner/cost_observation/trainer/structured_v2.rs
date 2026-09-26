@@ -11,8 +11,7 @@ use ferrum_types::FinishReason;
 pub(in crate::continuous_engine::inner::cost_observation) struct ValidatedStructuredWaveV2 {
     pub stages: Arc<HostStageEvidenceV1>,
     pub actual: host_content::statistical::CompleteSelectedObservation,
-    source: [u8; 32],
-    protocol: [u8; 32],
+    sessions: Box<[Arc<StructuredCaptureSessionBinding>]>,
     ordinal: u64,
     recipe: Arc<UnsettledStructuredWaveEvidenceV1>,
 }
@@ -21,18 +20,35 @@ impl ValidatedStructuredWaveV2 {
         self,
         membership: StructuredMemberBindingV2,
     ) -> Result<StructuredNumericObservationV2, StructuredUnknownV2> {
+        let [session] = self.sessions.as_ref() else {
+            return Err(StructuredUnknownV2::WrongSource);
+        };
+        self.member_for(session, membership)
+    }
+    pub fn member_for(
+        &self,
+        session: &Arc<StructuredCaptureSessionBinding>,
+        membership: StructuredMemberBindingV2,
+    ) -> Result<StructuredNumericObservationV2, StructuredUnknownV2> {
+        if !self
+            .sessions
+            .iter()
+            .any(|bound| Arc::ptr_eq(bound, session))
+        {
+            return Err(StructuredUnknownV2::WrongSource);
+        }
         let input = StructuredInputV2::from_actual(
             &self.actual.exact,
             &self.actual.selected,
             &self.recipe,
         )?;
         Ok(StructuredNumericObservationV2 {
-            source: self.source,
-            protocol: self.protocol,
+            source: session.identity(),
+            protocol: session.protocol(),
             ordinal: self.ordinal,
             membership,
             call_id: self.actual.call_id,
-            fingerprint: self.actual.fingerprint,
+            fingerprint: self.actual.fingerprint.clone(),
             input,
             boundary: self.actual.boundary,
             outcome: self.actual.outcome,
@@ -55,7 +71,10 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
         return Err(U::InvalidSample);
     }
     prepared.validate()?;
-    let session = capture.structured_session().ok_or(U::WrongSource)?;
+    let sessions = capture.structured_sessions();
+    if sessions.is_empty() {
+        return Err(U::WrongSource);
+    }
     let ordinal = match capture.host_stage_queue() {
         Some(HostStageQueueReceipt {
             disposition: HostStageQueueDisposition::Published,
@@ -83,10 +102,11 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
         },
         _ => return Err(U::InvalidSample),
     };
-    if stages
-        .prepare_started_at_ns
-        .is_none_or(|at| at < session.opened_at_ns())
-    {
+    if sessions.iter().any(|session| {
+        stages
+            .prepare_started_at_ns
+            .is_none_or(|at| at < session.opened_at_ns())
+    }) {
         return Err(U::Clock);
     }
     let qualified = stages
@@ -100,7 +120,10 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
         .map_err(|_| U::InvalidSample)?;
     let actual = host_content::statistical::complete_structured_observation_v2(&entry)
         .map_err(|_| U::InvalidSample)?;
-    if &actual.fingerprint != session.fingerprint() {
+    if sessions
+        .iter()
+        .any(|session| &actual.fingerprint != session.fingerprint())
+    {
         return Err(U::WrongFingerprint);
     }
     if actual.wall_ns != qualified.full_wall_ns()
@@ -145,8 +168,7 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
     Ok(ValidatedStructuredWaveV2 {
         stages,
         actual,
-        source: session.identity(),
-        protocol: session.protocol(),
+        sessions: sessions.to_vec().into_boxed_slice(),
         ordinal,
         recipe,
     })

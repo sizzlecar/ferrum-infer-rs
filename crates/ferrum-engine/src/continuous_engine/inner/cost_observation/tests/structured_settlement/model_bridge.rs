@@ -36,6 +36,18 @@ fn algorithm_shape_graph(
     first_work: u64,
     resident: Option<&str>,
 ) -> (ActualWaveShape, Vec<HostCostFeaturesV1>) {
+    let (actual, hosts, _) = algorithm_parts_graph(maxima, first_work, resident);
+    (actual, hosts)
+}
+fn algorithm_parts_graph(
+    maxima: &[u64],
+    first_work: u64,
+    resident: Option<&str>,
+) -> (
+    ActualWaveShape,
+    Vec<HostCostFeaturesV1>,
+    ferrum_interfaces::execution_cost::CanonicalWaveCostShape,
+) {
     let (mut actual, hosts) = selected_shape(maxima);
     let mut selected = SelectedCommandCostBuilderV1::new_with_algorithm_work(maxima.len() as u64);
     for (name, units) in [
@@ -138,11 +150,11 @@ fn algorithm_shape_graph(
     actual.provider_signature = built.exact.provider_signature;
     actual.graph = built.exact.graph;
     actual.output_policy_signature = built.exact.output_policy_signature;
-    actual.numeric_features = built.exact.numeric_features;
+    actual.numeric_features = built.exact.numeric_features.clone();
     actual.host_content_features = built.exact.host_content_features;
-    actual.row_multiset_features = built.exact.row_multiset_features;
+    actual.row_multiset_features = built.exact.row_multiset_features.clone();
     actual.statistical_evidence = Some(built.statistical.unwrap());
-    (actual, hosts)
+    (actual, hosts, built.exact)
 }
 fn stages(
     maxima: &[u64],
@@ -167,6 +179,14 @@ fn stages_with_graph(
     resident: Option<&str>,
 ) -> Arc<HostStageEvidenceV1> {
     let (actual, hosts) = algorithm_shape_graph(maxima, work, resident);
+    stages_for_actual(actual, hosts, result, capture)
+}
+fn stages_for_actual(
+    actual: ActualWaveShape,
+    hosts: Vec<HostCostFeaturesV1>,
+    result: Option<HostTerminalStageV1>,
+    capture: Option<Arc<CostCalibrationCapture>>,
+) -> Arc<HostStageEvidenceV1> {
     // This fixture retains the additional per-algorithm table. Keep the old
     // shared begin default (32) and production limits untouched.
     let (call, clock) = begin_with_retained_capacity(&actual, &sink(8, 256), 64);
@@ -204,6 +224,9 @@ fn entry(stages: Arc<HostStageEvidenceV1>) -> CostEvidenceEntry {
         legacy_rejection: CostCallRejection::Composite,
     }
 }
+
+#[path = "model_bridge/multi.rs"]
+mod multi;
 
 #[test]
 fn structured_bridge_v2_warm_graph_uses_private_settlement_and_keeps_legacy_closed() {
