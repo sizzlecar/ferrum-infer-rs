@@ -105,6 +105,38 @@ pub(super) struct ControllerBudget {
     decision: Mutex<(&'static str, &'static str)>,
 }
 
+/// A local stopping boundary for optional cost capture and search. It retains
+/// the original transaction clock and cannot grant publication time or work.
+#[derive(Clone)]
+pub(super) struct ControllerOptionalPhase {
+    budget: Arc<ControllerBudget>,
+    deadline: Instant,
+}
+
+impl ControllerOptionalPhase {
+    pub fn poll(&self) -> bool {
+        let now = slo_clock_now();
+        if !self.budget.poll_at(now) {
+            return false;
+        }
+        if now >= self.deadline {
+            self.budget.planner_exhausted.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    pub fn planning_window(
+        &self,
+        origin: &PlanningTimeOrigin,
+    ) -> std::result::Result<PlanningPhaseBudget, PlanningTimeError> {
+        Ok(PlanningPhaseBudget {
+            window: self.budget.planning_window(origin)?,
+            planner_deadline_ns: Some(origin.at_ns(self.deadline)?),
+        })
+    }
+}
+
 impl ControllerBudget {
     pub fn new(started_at: Instant, allowance: std::time::Duration) -> Result<Arc<Self>> {
         let deadline = started_at
@@ -139,6 +171,28 @@ impl ControllerBudget {
             started_at_ns: origin.at_ns(self.started_at)?,
             deadline_ns: origin.at_ns(self.deadline)?,
         })
+    }
+    /// Reserve the work measured while preparing this transaction's executable
+    /// completion draft, plus the configured publication window. Like planner
+    /// replay reservation, this stops optional work; it is not a duration proof.
+    /// A slow callback still fails the unchanged hard deadline at publication.
+    pub fn completion_optional_phase(
+        self: &Arc<Self>,
+        preparation_wall: std::time::Duration,
+        publication_reserve_percent: u8,
+    ) -> ControllerOptionalPhase {
+        let configured = std::time::Duration::from_nanos(
+            ((u128::from(self.budget_ns) * u128::from(publication_reserve_percent.min(100))) / 100)
+                as u64,
+        );
+        let deadline = preparation_wall
+            .checked_add(configured)
+            .and_then(|reserve| self.deadline.checked_sub(reserve))
+            .map_or(self.started_at, |end| end.max(self.started_at));
+        ControllerOptionalPhase {
+            budget: Arc::clone(self),
+            deadline,
+        }
     }
     pub fn poll(&self) -> bool {
         self.poll_at(slo_clock_now())

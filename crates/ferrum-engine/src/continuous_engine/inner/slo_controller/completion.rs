@@ -11,7 +11,16 @@ struct CompletionSelection {
     proof: ControllerSafetyProof,
     resources: ResourcePlanningView,
     selected: Vec<PlanningWorkSelection>,
-    expected: ExpectedExecutionWave,
+    work: ExpectedWaveWork,
+    required_owner: Option<(RequestId, u64, u64)>,
+    normalized_order: Option<VecDeque<(RequestId, u64)>>,
+}
+
+/// Numeric work evidence local to one transaction. No scheduler publication,
+/// output grant, completion intent, or fairness rotation belongs to a draft.
+pub(super) struct CompletionDraft {
+    selection: CompletionSelection,
+    pub(super) preparation_wall: std::time::Duration,
 }
 
 /// A captured runnable wave that cannot be published needs a future snapshot,
@@ -30,6 +39,57 @@ impl Drop for PublicationRetry<'_> {
 }
 
 impl EngineInner {
+    pub(super) fn capture_completion_draft(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        budget: &Arc<ControllerBudget>,
+    ) -> ControllerResult<CompletionDraft> {
+        let started = slo_clock_now();
+        let _stage = budget.stage(ControllerStage::Capture);
+        let selection = self.capture_completion_selection(
+            hint,
+            Arc::clone(budget),
+            None,
+            NonZeroUsize::new(4096).unwrap(),
+        )?;
+        let preparation_wall =
+            slo_clock_now()
+                .checked_duration_since(started)
+                .ok_or(Unavailable {
+                    reason: "clock_moved_backwards",
+                    obligations: selection.proof.queue.requests().len(),
+                    retry: Some(retry::ControllerRetryReason::ComputeBudget),
+                })?;
+        Ok(CompletionDraft {
+            selection,
+            preparation_wall,
+        })
+    }
+
+    pub(super) fn publish_completion_draft(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        budget: &Arc<ControllerBudget>,
+        draft: CompletionDraft,
+        reason: CompletionOnlyReason,
+    ) -> Result<SloIterationPlan> {
+        self.slo_controller.lock().completion_next = Some(reason);
+        self.publish_completion_selection(hint, budget, draft.selection, reason, false)
+    }
+
+    pub(super) fn prepare_completion_with_draft(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        budget: &Arc<ControllerBudget>,
+        draft: Option<CompletionDraft>,
+        reason: CompletionOnlyReason,
+    ) -> Result<SloIterationPlan> {
+        match draft {
+            Some(draft) => self.publish_completion_draft(hint, budget, draft, reason),
+            None => self.prepare_completion_controller(hint, budget, reason),
+        }
+    }
+
     pub(super) fn completion_allowed(&self) -> bool {
         self.config.scheduler.slo.mode == ferrum_types::SloMode::Enforce
             && self.config.scheduler.slo.admission.time_policy
@@ -118,13 +178,7 @@ impl EngineInner {
         self.slo_controller.lock().completion_next = Some(reason);
         let selected = match {
             let _stage = budget.stage(ControllerStage::Capture);
-            self.capture_completion_selection(
-                hint,
-                Arc::clone(budget),
-                reason,
-                exact,
-                maximum_requests,
-            )
+            self.capture_completion_selection(hint, Arc::clone(budget), exact, maximum_requests)
         } {
             Ok(selected) => selected,
             Err(error) => {
@@ -144,6 +198,17 @@ impl EngineInner {
                 return Ok(SloIterationPlan::Idle);
             }
         };
+        self.publish_completion_selection(hint, budget, selected, reason, exact.is_some())
+    }
+
+    fn publish_completion_selection(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        budget: &Arc<ControllerBudget>,
+        mut selected: CompletionSelection,
+        reason: CompletionOnlyReason,
+        exact: bool,
+    ) -> Result<SloIterationPlan> {
         let mut retry = PublicationRetry {
             engine: self,
             armed: true,
@@ -180,11 +245,13 @@ impl EngineInner {
         else {
             return Ok(SloIterationPlan::Idle);
         };
-        if !budget.poll() || !self.completion_frontiers_match(&selected.proof) {
+        if !budget.poll()
+            || (!exact && !self.refresh_completion_recovery(&mut selected))
+            || !self.completion_frontiers_match(&selected.proof)
+        {
             return Ok(SloIterationPlan::Idle);
         }
-        if exact.is_none()
-            && !self.completion_work_policy_matches(&selected.proof, &selected.selected, hint)
+        if !exact && !self.completion_work_policy_matches(&selected.proof, &selected.selected, hint)
         {
             return Ok(SloIterationPlan::Idle);
         }
@@ -232,9 +299,12 @@ impl EngineInner {
         {
             let mut state = self.slo_controller.lock();
             state.completion_next = None;
+            if let Some(order) = selected.normalized_order.take() {
+                state.completion_order = order;
+            }
             // Rotate all attempted participants, including a later physical
             // deferral. A permanently blocked peer cannot monopolize the head.
-            for row in selected.expected.work().participants() {
+            for row in selected.work.participants() {
                 let row = row.selection();
                 let key = (row.request_id.clone(), row.owner_incarnation.get());
                 state.completion_order.retain(|old| old != &key);
@@ -243,7 +313,7 @@ impl EngineInner {
         }
         self.record_controller(ControllerObservation {
             obligations: selected.proof.queue.requests().len(),
-            disposition: if exact.is_some() {
+            disposition: if exact {
                 "calibration"
             } else {
                 "complete_requests"
@@ -260,7 +330,7 @@ impl EngineInner {
                 owner::ControllerWork {
                     batch,
                     proof: selected.proof,
-                    expected: selected.expected,
+                    expected: ExpectedExecutionWave::complete_requests(selected.work, reason),
                     timing: owner::ControllerTimingCommitment::CompleteRequests,
                 },
                 receipt,
@@ -268,6 +338,46 @@ impl EngineInner {
             .map(SloIterationPlan::Selected);
         retry.armed = result.is_err();
         result
+    }
+
+    /// Search may change the control scope, and a deadline can pass while it
+    /// runs. Reclassify the complete frontier before publishing a draft. A new
+    /// required owner needs a fresh selection: merely containing that owner
+    /// would bypass the existing single-owner/minimum-service policy.
+    fn refresh_completion_recovery(&self, selected: &mut CompletionSelection) -> bool {
+        let Some(sequences) = self.sequences.try_read() else {
+            return false;
+        };
+        if sequences.len() != selected.proof.queue.requests().len()
+            || selected
+                .proof
+                .queue
+                .requests()
+                .iter()
+                .any(|row| !sequences.contains_key(&row.key.request_id))
+        {
+            return false;
+        }
+        let Some(state) = self.slo_controller.try_lock() else {
+            return false;
+        };
+        let scope = state.last_recovery_scope.clone();
+        drop(state);
+        let Ok(peers) = Self::recovery_peers_locked(
+            &selected.proof.queue,
+            &sequences,
+            &selected.proof.budget,
+            scope.as_deref(),
+        ) else {
+            return false;
+        };
+        let required = recovery::required_peer(&peers)
+            .map(|peer| (peer.id.clone(), peer.incarnation, peer.generation));
+        if required != selected.required_owner {
+            return false;
+        }
+        selected.proof.recovery_peers = peers;
+        true
     }
 
     fn completion_frontiers_match(&self, proof: &ControllerSafetyProof) -> bool {
@@ -292,7 +402,6 @@ impl EngineInner {
         &self,
         hint: &ferrum_interfaces::BatchHint,
         budget: Arc<ControllerBudget>,
-        reason: CompletionOnlyReason,
         exact: Option<&[super::super::calibration::CalibrationWork]>,
         maximum_requests: NonZeroUsize,
     ) -> ControllerResult<CompletionSelection> {
@@ -386,6 +495,9 @@ impl EngineInner {
         } else {
             None
         };
+        let required_owner =
+            required.map(|peer| (peer.id.clone(), peer.incarnation, peer.generation));
+        let mut normalized_order = None;
         let order = if let Some(required) = required {
             VecDeque::from([(required.id.clone(), required.incarnation)])
         } else if let Some(exact) = exact {
@@ -425,19 +537,21 @@ impl EngineInner {
             }
             order
         } else {
-            let mut state = self.slo_controller.try_lock().ok_or_else(|| {
+            let state = self.slo_controller.try_lock().ok_or_else(|| {
                 unavailable("controller_busy").retry(retry::ControllerRetryReason::SnapshotBusy)
             })?;
             let live_set: std::collections::HashSet<_> = live.iter().cloned().collect();
-            state.completion_order.retain(|key| live_set.contains(key));
-            let mut included: std::collections::HashSet<_> =
-                state.completion_order.iter().cloned().collect();
+            let mut order = state.completion_order.clone();
+            drop(state);
+            order.retain(|key| live_set.contains(key));
+            let mut included: std::collections::HashSet<_> = order.iter().cloned().collect();
             for key in live {
                 if included.insert(key.clone()) {
-                    state.completion_order.push_back(key);
+                    order.push_back(key);
                 }
             }
-            state.completion_order.clone()
+            normalized_order = Some(order.clone());
+            order
         };
         let policy_envelope = if exact.is_none() {
             Some(
@@ -736,7 +850,9 @@ impl EngineInner {
             },
             resources,
             selected,
-            expected: ExpectedExecutionWave::complete_requests(work, reason),
+            work,
+            required_owner,
+            normalized_order,
         })
     }
 }

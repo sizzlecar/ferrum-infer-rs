@@ -17,8 +17,8 @@ impl EngineInner {
     pub(super) fn capture_recovery_peers(
         &self,
         queue: &PlanningQueueSnapshot,
-        budget: &ControllerBudget,
         protection: Option<&PlanningObligationSet>,
+        poll: &mut dyn FnMut() -> bool,
     ) -> ControllerResult<Vec<RecoveryPeer>> {
         let unavailable = |reason| Unavailable {
             reason,
@@ -28,7 +28,7 @@ impl EngineInner {
         let sequences = self.sequences.try_read().ok_or_else(|| {
             unavailable("recovery_owner_busy").retry(retry::ControllerRetryReason::SnapshotBusy)
         })?;
-        Self::recovery_peers_locked(queue, &sequences, budget, protection)
+        Self::recovery_peers_locked_with_poll(queue, &sequences, protection, poll)
     }
 
     pub(super) fn recovery_peers_locked(
@@ -36,6 +36,15 @@ impl EngineInner {
         sequences: &HashMap<RequestId, SequenceState>,
         budget: &ControllerBudget,
         protection: Option<&PlanningObligationSet>,
+    ) -> ControllerResult<Vec<RecoveryPeer>> {
+        Self::recovery_peers_locked_with_poll(queue, sequences, protection, &mut || budget.poll())
+    }
+
+    fn recovery_peers_locked_with_poll(
+        queue: &PlanningQueueSnapshot,
+        sequences: &HashMap<RequestId, SequenceState>,
+        protection: Option<&PlanningObligationSet>,
+        poll: &mut dyn FnMut() -> bool,
     ) -> ControllerResult<Vec<RecoveryPeer>> {
         let unavailable = |reason| Unavailable {
             reason,
@@ -45,7 +54,7 @@ impl EngineInner {
         let now = slo_clock_now();
         let mut peers = Vec::with_capacity(queue.requests().len());
         for row in queue.requests() {
-            if !budget.poll() {
+            if !poll() {
                 return Err(unavailable("compute_budget_exhausted")
                     .retry(retry::ControllerRetryReason::ComputeBudget));
             }

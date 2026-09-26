@@ -75,7 +75,7 @@ impl EngineInner {
             .iter()
             .zip(captured.queue.requests())
         {
-            if !captured.budget.poll() {
+            if !captured.poll_planning() {
                 return Some(TimeAdmissionProposal::unknown(
                     PlanningUnknownReason::ComputeBudgetExhausted,
                 ));
@@ -107,7 +107,7 @@ impl EngineInner {
             model: &cost,
             execution: &shapes,
         };
-        let Ok(window) = captured.budget.planning_window(&captured.origin) else {
+        let Ok(window) = captured.planning_window() else {
             return Some(TimeAdmissionProposal::unknown(
                 PlanningUnknownReason::ClockMovedBackwards,
             ));
@@ -145,7 +145,7 @@ impl EngineInner {
             .ok_or(PlanningUnknownReason::UnknownReadiness)?;
         let mut selected: Option<(&RequestWorkKey, Option<Instant>, Instant)> = None;
         for request in &captured.snapshot.requests {
-            if !captured.budget.poll() {
+            if !captured.poll_planning() {
                 return Err(PlanningUnknownReason::ComputeBudgetExhausted);
             }
             if request.timing.committed_tokens != 0

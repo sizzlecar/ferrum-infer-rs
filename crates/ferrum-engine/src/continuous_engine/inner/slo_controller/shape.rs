@@ -56,7 +56,7 @@ impl EngineInner {
         let cost = AnchoredPlanningCostModel::new(captured.model.as_ref(), captured.anchor);
         // Use the same Tokio-backed monotonic origin as request commit/waits.
         // The checked wrapper accounts for snapshot construction and replay.
-        let Ok(window) = captured.budget.planning_window(&captured.origin) else {
+        let Ok(window) = captured.planning_window() else {
             return PlanningDecision::Unknown {
                 reason: PlanningUnknownReason::ClockMovedBackwards,
                 search: Default::default(),

@@ -151,6 +151,10 @@ impl PlanningClock for TrackingClock<'_> {
     fn planning_budget_window(&self) -> Option<PlanningBudgetWindow> {
         self.inner.planning_budget_window()
     }
+
+    fn planning_phase_deadline_ns(&self) -> Option<u64> {
+        self.inner.planning_phase_deadline_ns()
+    }
 }
 
 impl TimeAdmissionExecutionEvaluator<'_> {

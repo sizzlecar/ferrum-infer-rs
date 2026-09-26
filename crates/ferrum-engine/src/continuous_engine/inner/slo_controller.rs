@@ -12,7 +12,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 pub(in crate::continuous_engine) mod admission;
 mod budget;
-use budget::{ControllerAudit, ControllerBudget, ControllerStage};
+use budget::{ControllerAudit, ControllerBudget, ControllerOptionalPhase, ControllerStage};
 mod commit;
 pub(super) use commit::ControllerCommitFence;
 pub(super) mod calibration;
@@ -139,6 +139,7 @@ impl EngineFence {
 
 struct ControllerSnapshot {
     budget: Arc<ControllerBudget>,
+    optional_phase: Option<ControllerOptionalPhase>,
     queue: PlanningQueueSnapshot,
     snapshot: SchedulerSnapshot,
     origin: PlanningTimeOrigin,
@@ -149,6 +150,21 @@ struct ControllerSnapshot {
     model: Arc<dyn PlanningCostModel + Send + Sync>,
     protection: Arc<PlanningObligationSet>,
     recovery_peers: Vec<recovery::RecoveryPeer>,
+}
+
+impl ControllerSnapshot {
+    fn poll_planning(&self) -> bool {
+        self.optional_phase
+            .as_ref()
+            .map_or_else(|| self.budget.poll(), ControllerOptionalPhase::poll)
+    }
+
+    fn planning_window(&self) -> std::result::Result<PlanningPhaseBudget, PlanningTimeError> {
+        self.optional_phase.as_ref().map_or_else(
+            || self.budget.planning_window(&self.origin).map(Into::into),
+            |phase| phase.planning_window(&self.origin),
+        )
+    }
 }
 
 struct ControllerSafetyProof {
@@ -278,31 +294,73 @@ impl EngineInner {
         if let Some(reason) = completion.filter(|_| self.completion_allowed()) {
             return self.prepare_completion_controller(hint, budget, reason);
         }
-        let captured =
-            match {
-                let _stage = budget.stage(ControllerStage::Capture);
-                self.capture_slo_controller_snapshot(hint, Arc::clone(budget))
-            } {
-                Ok(value) => value,
-                Err(error) => {
-                    budget.record_unavailable(error.reason);
-                    self.record_controller(ControllerObservation {
-                        obligations: error.obligations,
-                        disposition: "unknown",
-                        reason: error.reason,
-                    });
-                    return if self.completion_allowed() {
-                        self.prepare_completion_controller(hint, budget,
-                        ferrum_interfaces::execution_cost::CompletionOnlyReason::CostUnavailable)
+        // CompleteRequests permits safe physical progress without a time
+        // witness. Prepare that evidence before optional cost work can spend
+        // the transaction. A draft holds no publication or output permission.
+        // If it is unavailable, retain the ordinary complete-obligation search.
+        let draft = self
+            .completion_allowed()
+            .then(|| self.capture_completion_draft(hint, budget).ok())
+            .flatten();
+        let optional_phase = draft.as_ref().map(|draft| {
+            budget.completion_optional_phase(
+                draft.preparation_wall,
+                self.config
+                    .scheduler
+                    .slo
+                    .planner
+                    .publication_reserve_percent,
+            )
+        });
+        if optional_phase.as_ref().is_some_and(|phase| !phase.poll()) {
+            budget.record_search(&PlanningDecision::Unknown {
+                reason: PlanningUnknownReason::ComputeBudgetExhausted,
+                search: Default::default(),
+            });
+            return self.prepare_completion_with_draft(
+                hint,
+                budget,
+                draft,
+                ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
+            );
+        }
+        let captured = match {
+            let _stage = budget.stage(ControllerStage::Capture);
+            self.capture_slo_controller_snapshot_in_phase(
+                hint,
+                Arc::clone(budget),
+                optional_phase,
+                &mut None,
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => {
+                budget.record_unavailable(error.reason);
+                self.record_controller(ControllerObservation {
+                    obligations: error.obligations,
+                    disposition: "unknown",
+                    reason: error.reason,
+                });
+                return if self.completion_allowed() {
+                    self.prepare_completion_with_draft(
+                            hint,
+                            budget,
+                            draft,
+                            if error.reason == "compute_budget_exhausted" {
+                                ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive
+                            } else {
+                                ferrum_interfaces::execution_cost::CompletionOnlyReason::CostUnavailable
+                            },
+                        )
+                } else {
+                    Ok(if mode == ferrum_types::SloMode::Enforce {
+                        SloIterationPlan::Idle
                     } else {
-                        Ok(if mode == ferrum_types::SloMode::Enforce {
-                            SloIterationPlan::Idle
-                        } else {
-                            SloIterationPlan::Legacy
-                        })
-                    };
-                }
-            };
+                        SloIterationPlan::Legacy
+                    })
+                };
+            }
+        };
         self.slo_controller.lock().last_recovery_scope = captured
             .protection
             .needs_recovery()
@@ -332,9 +390,10 @@ impl EngineInner {
             return if mode == ferrum_types::SloMode::Observe {
                 Ok(SloIterationPlan::Legacy)
             } else {
-                self.prepare_completion_controller(
+                self.prepare_completion_with_draft(
                     hint,
                     budget,
+                    draft,
                     ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
                 )
             };
@@ -367,15 +426,17 @@ impl EngineInner {
             | PlanningDecision::ProtectedWithinHorizon { first_wave, .. } => first_wave,
             _ => {
                 if self.completion_allowed() {
-                    return self.prepare_completion_controller(
+                    return self.prepare_completion_with_draft(
                         hint,
                         budget,
+                        draft,
                         ferrum_interfaces::execution_cost::CompletionOnlyReason::SearchInconclusive,
                     );
                 }
                 return Ok(SloIterationPlan::Idle);
             }
         };
+        drop(draft);
         let _stage = budget.stage(ControllerStage::Publication);
         self.prepare_slo_controller_wave_with_admission(captured, first_wave, hint, admission)
     }

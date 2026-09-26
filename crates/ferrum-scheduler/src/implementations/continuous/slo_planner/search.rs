@@ -63,11 +63,12 @@ struct ComputeBudget {
 
 impl ComputeBudget {
     fn new(
-        window: PlanningBudgetWindow,
+        phase: PlanningPhaseBudget,
         now_ns: u64,
         settings: &ferrum_types::SloPlannerConfig,
     ) -> Result<Self, PlanningUnknownReason> {
-        let (search_deadline_ns, planner_deadline_ns) = window.phase_deadlines(settings)?;
+        let (search_deadline_ns, planner_deadline_ns) = phase.phase_deadlines(settings)?;
+        let window = phase.window;
         if window.started_at_ns > now_ns || now_ns >= planner_deadline_ns {
             return Err(PlanningUnknownReason::ComputeBudgetExhausted);
         }
@@ -309,7 +310,11 @@ impl BoundedSloPlanner {
                 None => return unknown(PlanningUnknownReason::ArithmeticOverflow, stats),
             },
         };
-        let mut budget = match ComputeBudget::new(window, start_ns, &self.settings.search) {
+        let phase = PlanningPhaseBudget {
+            window,
+            planner_deadline_ns: clock.planning_phase_deadline_ns(),
+        };
+        let mut budget = match ComputeBudget::new(phase, start_ns, &self.settings.search) {
             Ok(value) => value,
             Err(reason) => return unknown(reason, stats),
         };

@@ -40,7 +40,8 @@ pub(super) struct ReplayReserve {
 
 impl ReplayReserve {
     pub(super) fn new(origin_ns: u64, search_end_ns: u64, planner_end_ns: u64) -> Self {
-        // PlanningBudgetWindow::phase_deadlines has already checked the order.
+        // PlanningPhaseBudget checked the order. With an early outer cap the
+        // optional endpoint can equal the origin, while construct still runs.
         Self {
             origin_ns,
             configured_search_end_ns: search_end_ns,

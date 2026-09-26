@@ -6,6 +6,7 @@ use std::cell::Cell;
 struct TransactionClock<'a> {
     now: &'a Cell<u64>,
     window: PlanningBudgetWindow,
+    cap: Option<u64>,
 }
 impl PlanningClock for TransactionClock<'_> {
     fn now_ns(&mut self) -> u64 {
@@ -13,6 +14,9 @@ impl PlanningClock for TransactionClock<'_> {
     }
     fn planning_budget_window(&self) -> Option<PlanningBudgetWindow> {
         Some(self.window)
+    }
+    fn planning_phase_deadline_ns(&self) -> Option<u64> {
+        self.cap
     }
 }
 
@@ -56,6 +60,14 @@ fn workload() -> SchedulerSnapshot {
     s
 }
 fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, bool, usize) {
+    run_capped(final_read, recovery, None)
+}
+
+fn run_capped(
+    final_read: Option<u64>,
+    recovery: bool,
+    cap: Option<u64>,
+) -> (PlanningDecision, bool, usize) {
     let mut s = workload();
     if recovery {
         s.requests[0].timing.slo_failed = true;
@@ -71,6 +83,7 @@ fn run(final_read: Option<u64>, recovery: bool) -> (PlanningDecision, bool, usiz
     };
     let mut clock = TransactionClock {
         now: &now,
+        cap,
         window: PlanningBudgetWindow {
             started_at_ns: 0,
             deadline_ns: 1_000,
@@ -169,6 +182,7 @@ fn soft_deadline_cannot_convert_partial_service_into_shared_witness() {
     let now = Cell::new(650);
     let mut clock = TransactionClock {
         now: &now,
+        cap: None,
         window: PlanningBudgetWindow {
             started_at_ns: 0,
             deadline_ns: 1_000,
@@ -195,6 +209,7 @@ fn capture_consumes_original_window_and_empty_rounded_phases_are_unknown() {
         let now = Cell::new(now);
         let mut clock = TransactionClock {
             now: &now,
+            cap: None,
             window: PlanningBudgetWindow {
                 started_at_ns,
                 deadline_ns,
@@ -213,6 +228,79 @@ fn capture_consumes_original_window_and_empty_rounded_phases_are_unknown() {
                 ..
             }
         ));
+    }
+}
+
+#[test]
+fn outer_phase_cap_preserves_percentages_and_order_before_search_endpoint() {
+    let mut settings = ferrum_types::SloPlannerConfig::default();
+    settings.max_planning_us = n64(2);
+    let window = PlanningBudgetWindow {
+        started_at_ns: 0,
+        deadline_ns: 2_000,
+    };
+    assert_eq!(window.phase_deadlines(&settings), Ok((1_200, 1_600)));
+    let capped = |cap| PlanningPhaseBudget {
+        window,
+        planner_deadline_ns: Some(cap),
+    };
+    assert_eq!(capped(1_100).phase_deadlines(&settings), Ok((700, 1_100)));
+    assert_eq!(capped(399).phase_deadlines(&settings), Ok((0, 399)));
+    assert_eq!(capped(3_000).phase_deadlines(&settings), Ok((1_200, 1_600)));
+    assert_eq!(
+        capped(0).phase_deadlines(&settings),
+        Err(PlanningUnknownReason::ComputeBudgetExhausted)
+    );
+}
+
+#[test]
+fn completion_reserve_allows_a_complete_witness_but_rejects_late_final_replay() {
+    let (decision, replayed, _) = run_capped(None, false, Some(700));
+    let (_, witness, _) = feasible(decision);
+    assert_eq!(witness.predicted_output_tokens, 2);
+    assert!(replayed);
+    let (decision, replayed, _) = run_capped(Some(750), false, Some(700));
+    assert!(replayed);
+    assert!(matches!(
+        decision,
+        PlanningDecision::Unknown {
+            reason: PlanningUnknownReason::ComputeBudgetExhausted,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn checked_clock_bridge_obeys_cap_without_rescaling_window() {
+    use std::time::{Duration, Instant};
+    let mut s = workload();
+    s.observed_at_ns = 600;
+    let at = Instant::now();
+    let origin = PlanningTimeOrigin::from_origin(at, at + Duration::from_nanos(600)).unwrap();
+    for (now, succeeds) in [(650, true), (700, false)] {
+        let decision = origin
+            .propose_scoped_with_budget_window(
+                &planner(2),
+                &s,
+                &Model(|_: &WaveExecutionShape| Some(5)),
+                &TestResolver,
+                None,
+                None,
+                PlanningPhaseBudget {
+                    window: PlanningBudgetWindow {
+                        started_at_ns: 0,
+                        deadline_ns: 1_000,
+                    },
+                    planner_deadline_ns: Some(700),
+                },
+                || at + Duration::from_nanos(now),
+            )
+            .unwrap();
+        assert_eq!(
+            matches!(decision, PlanningDecision::FeasibleWithinHorizon { .. }),
+            succeeds,
+            "{decision:?}"
+        );
     }
 }
 

@@ -19,6 +19,16 @@ impl EngineInner {
         controller_budget: Arc<ControllerBudget>,
         route_unknown: &mut Option<ferrum_interfaces::vnext::ExecutionCostRouteUnknown>,
     ) -> ControllerResult<ControllerSnapshot> {
+        self.capture_slo_controller_snapshot_in_phase(hint, controller_budget, None, route_unknown)
+    }
+
+    pub(super) fn capture_slo_controller_snapshot_in_phase(
+        &self,
+        hint: &ferrum_interfaces::BatchHint,
+        controller_budget: Arc<ControllerBudget>,
+        optional_phase: Option<ControllerOptionalPhase>,
+        route_unknown: &mut Option<ferrum_interfaces::vnext::ExecutionCostRouteUnknown>,
+    ) -> ControllerResult<ControllerSnapshot> {
         let fallback_count = self.scheduler.active_count() + self.scheduler.waiting_count();
         let unavailable = |reason| Unavailable {
             reason,
@@ -31,7 +41,11 @@ impl EngineInner {
         {
             return Err(unavailable("unsupported_execution_authority"));
         }
-        let mut budget = || controller_budget.poll();
+        let mut budget = || {
+            optional_phase
+                .as_ref()
+                .map_or_else(|| controller_budget.poll(), ControllerOptionalPhase::poll)
+        };
         if !budget() {
             return Err(unavailable("compute_budget_exhausted"));
         }
@@ -501,7 +515,7 @@ impl EngineInner {
         }
         let protection = Arc::new(
             PlanningObligationSet::capture_with_budget(&snapshot, classified_at_ns, &mut || {
-                if controller_budget.poll() {
+                if budget() {
                     Ok(())
                 } else {
                     Err(PlanningUnknownReason::ComputeBudgetExhausted)
@@ -509,12 +523,12 @@ impl EngineInner {
             })
             .map_err(|_| unavailable("recovery_scope_unavailable"))?,
         );
-        let recovery_peers =
-            self.capture_recovery_peers(&queue, &controller_budget, Some(&protection))?;
+        let recovery_peers = self.capture_recovery_peers(&queue, Some(&protection), &mut budget)?;
         Ok(ControllerSnapshot {
             protection,
             recovery_peers,
             budget: controller_budget,
+            optional_phase,
             queue,
             snapshot,
             origin,

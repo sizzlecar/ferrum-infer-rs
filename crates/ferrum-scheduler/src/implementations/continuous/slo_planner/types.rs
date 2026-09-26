@@ -808,6 +808,46 @@ pub struct PlanningBudgetWindow {
     pub deadline_ns: u64,
 }
 
+/// An earlier planner stop inside the original transaction. Phase percentages
+/// still use `window`; adding a completion reserve must not scale them twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningPhaseBudget {
+    pub window: PlanningBudgetWindow,
+    pub planner_deadline_ns: Option<u64>,
+}
+
+impl From<PlanningBudgetWindow> for PlanningPhaseBudget {
+    fn from(window: PlanningBudgetWindow) -> Self {
+        Self {
+            window,
+            planner_deadline_ns: None,
+        }
+    }
+}
+
+impl PlanningPhaseBudget {
+    pub(super) fn phase_deadlines(
+        self,
+        settings: &SloPlannerConfig,
+    ) -> Result<(u64, u64), PlanningUnknownReason> {
+        let (search, replay) = self.window.phase_deadlines(settings)?;
+        let capped_replay = replay.min(self.planner_deadline_ns.unwrap_or(replay));
+        if capped_replay <= self.window.started_at_ns {
+            return Err(PlanningUnknownReason::ComputeBudgetExhausted);
+        }
+        // Keep the configured final-replay allowance where it fits. A cap
+        // before the old search endpoint must neither underflow nor remove
+        // replay's reserve. Construct may still run to capped_replay; optional
+        // improvement only begins after a complete common plan exists.
+        let capped_search = search.min(
+            capped_replay
+                .saturating_sub(replay - search)
+                .max(self.window.started_at_ns),
+        );
+        Ok((capped_search, capped_replay))
+    }
+}
+
 impl PlanningBudgetWindow {
     pub(super) fn phase_deadlines(
         self,
@@ -847,6 +887,10 @@ pub trait PlanningClock {
     fn now_ns(&mut self) -> u64;
     /// Standalone callers may omit this; adapters preserve the outer start.
     fn planning_budget_window(&self) -> Option<PlanningBudgetWindow> {
+        None
+    }
+    /// An optional earlier planner boundary, in the unchanged window's epoch.
+    fn planning_phase_deadline_ns(&self) -> Option<u64> {
         None
     }
 }

@@ -149,3 +149,39 @@ async fn controller_window_keeps_capture_elapsed_and_full_publication_deadline()
         "the final reserve cannot extend the transaction"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn completion_reserve_stops_optional_capture_without_spending_hard_publication_time() {
+    let started = slo_clock_now();
+    let budget = ControllerBudget::new(started, Duration::from_micros(2_000)).unwrap();
+    tokio::time::advance(Duration::from_micros(500)).await;
+    let phase = budget.completion_optional_phase(Duration::from_micros(500), 20);
+    let origin = PlanningTimeOrigin::from_origin(started, slo_clock_now()).unwrap();
+    let window = phase.planning_window(&origin).unwrap();
+    assert_eq!(window.window.started_at_ns, 0);
+    assert_eq!(window.window.deadline_ns, 2_000_000);
+    assert_eq!(window.planner_deadline_ns, Some(1_100_000));
+    assert!(phase.poll());
+    tokio::time::advance(Duration::from_micros(600)).await;
+    assert!(!phase.poll());
+    assert!(budget.poll());
+    tokio::time::advance(Duration::from_micros(899)).await;
+    assert!(budget.finish_planning());
+    let audit = budget.take_audit("selected").unwrap();
+    assert!(audit.planner_budget_exhausted);
+    assert!(!audit.budget_exhausted);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_reserve_never_extends_hard_deadline_or_underflows() {
+    for preparation in [Duration::from_millis(3), Duration::MAX] {
+        let budget = ControllerBudget::new(slo_clock_now(), Duration::from_millis(2)).unwrap();
+        let phase = budget.completion_optional_phase(preparation, 20);
+        assert!(!phase.poll());
+        assert!(budget.poll());
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(!budget.finish_planning());
+        let audit = budget.take_audit("idle").unwrap();
+        assert!(audit.planner_budget_exhausted && audit.budget_exhausted);
+    }
+}
