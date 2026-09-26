@@ -2,7 +2,10 @@ use super::*;
 use crate::vnext::resource::backing_initialization::order::{
     InitializationOrder, InitializationRanges,
 };
-use crate::vnext::{ResourcePlanningAvailability, ResourcePlanningLimits, ResourcePlanningUnknown};
+use crate::vnext::{
+    ResourcePlanningAvailability, ResourcePlanningLimits, ResourcePlanningReadStage,
+    ResourcePlanningUnknown,
+};
 
 fn harness() -> RestoreHarness {
     let mut spec = checkpoint_fixture::Spec::default();
@@ -25,13 +28,23 @@ fn snapshot(
     h: &RestoreHarness,
     sessions: &[Arc<SequenceSession<TestRuntime>>],
 ) -> crate::vnext::ResourcePlanningView {
-    match h.root.resource_planning_view(
-        &sessions.iter().map(Arc::as_ref).collect::<Vec<_>>(),
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ) {
-        ResourcePlanningAvailability::Known(view) => view,
-        other => panic!("real idle initialization snapshot: {other:?}"),
+    let sessions = sessions.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match h.root.resource_planning_view(
+            &sessions,
+            ResourcePlanningLimits::default(),
+            &mut || true,
+        ) {
+            ResourcePlanningAvailability::Known(view) => return view,
+            // Each harness has a distinct device and cleanup domain, but the
+            // nonblocking status read uses one process-wide registry mutex.
+            // Another parallel test may hold it while this harness stays idle.
+            ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::ReadUnavailable(
+                ResourcePlanningReadStage::DeferredCleanup,
+            )) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+            other => panic!("real idle initialization snapshot: {other:?}"),
+        }
     }
 }
 
