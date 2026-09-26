@@ -1408,6 +1408,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks,
             statistical_evidence,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         }])
