@@ -105,6 +105,12 @@ pub struct SelectedAlgorithmWorkEvidenceV1 {
     entries: Vec<AlgorithmNumericWorkV1>,
 }
 impl SelectedAlgorithmWorkEvidenceV1 {
+    /// Already checked by the private accumulator before attachment to its
+    /// immutable selected command. This is passive identity, not a permit.
+    pub(super) fn command_binding(&self) -> [u8; 32] {
+        self.command_binding
+    }
+
     pub fn entries(&self) -> &[AlgorithmNumericWorkV1] {
         &self.entries
     }

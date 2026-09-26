@@ -58,6 +58,14 @@ impl SelectedCommandCostEvidenceV1 {
         self.token_count
     }
     pub(super) fn algorithm_work_binding(&self) -> Result<[u8; 32], StatisticalEvidenceUnknown> {
+        // The sole builder attaches this immutable table only after finish()
+        // has computed and validated its binding against this exact command.
+        // Reuse that existing digest; no captured graph's numeric work is used.
+        // During construction the table is None, so the original calculation
+        // below still establishes the binding before it can be reused.
+        if let Some(Ok(work)) = &self.algorithm_work {
+            return Ok(work.command_binding());
+        }
         let assignment = self
             .algorithm_assignment_signature
             .ok_or(StatisticalEvidenceUnknown::MissingProducer)?;
@@ -445,3 +453,7 @@ impl SelectedCommandCostBuilderV1 {
 #[cfg(test)]
 #[path = "command/transfer_geometry_tests.rs"]
 mod transfer_geometry_tests;
+
+#[cfg(test)]
+#[path = "command/binding_reuse_tests.rs"]
+mod binding_reuse_tests;
