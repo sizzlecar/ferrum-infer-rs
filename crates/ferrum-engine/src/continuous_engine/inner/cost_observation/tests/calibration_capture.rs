@@ -1,5 +1,121 @@
 use super::*;
 
+#[test]
+fn calibration_actual_unknown_diagnostic_keeps_typed_reason_without_minting_host_stages() {
+    for reason in [
+        ActualWaveEvidenceUnknown::GraphPath,
+        ActualWaveEvidenceUnknown::ProviderPath,
+    ] {
+        let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
+        let sink = sink(4, 16);
+        let (mut call, clock) = begin(&shape, &sink);
+        let capture = Arc::new(CostCalibrationCapture::default());
+        call.attach_calibration_capture(Arc::clone(&capture));
+        {
+            let mut context = call.context().unwrap();
+            context.physical_wave(Err(reason), Some(3));
+            clock.set(6);
+            context.terminal(ActualWaveOutcome::Completed, None);
+            context.finish_call(ObservedCallOutcome::Completed);
+        }
+        call.record_host_result(committed(&shape.rows[0], 9));
+        clock.set(10);
+        assert_eq!(
+            call.finish(),
+            CostCallDisposition::Rejected(CostCallRejection::ActualEvidenceUnknown)
+        );
+        assert!(capture.host_stages().is_none());
+        assert!(sink.pop().is_none());
+        let diagnostic = capture.actual_evidence_diagnostic().unwrap();
+        assert_eq!(diagnostic.dispatch_unknown, Some(reason));
+        assert_eq!(
+            (
+                diagnostic.physical_waves,
+                diagnostic.retained_waves,
+                diagnostic.lost_observations
+            ),
+            (1, 1, 0)
+        );
+        assert!(diagnostic.retained_wave_details_complete);
+        assert_eq!(diagnostic.waves.len(), 1);
+        assert_eq!(diagnostic.waves[0].physical_wave_ordinal, 0);
+        assert_eq!(diagnostic.waves[0].reason, reason);
+        let json = serde_json::to_value(diagnostic.as_ref()).unwrap();
+        assert_eq!(json["dispatch_unknown"], format!("{reason:?}"));
+        assert_eq!(json["waves"][0]["reason"], format!("{reason:?}"));
+        let CostCalibrationStatus::Complete(result) = capture.status() else {
+            panic!("finished capture");
+        };
+        assert!(matches!(
+            result.as_ref(),
+            CostCalibrationResult::Rejected(CostCallRejection::ActualEvidenceUnknown)
+        ));
+    }
+}
+
+#[test]
+fn calibration_actual_unknown_diagnostic_keeps_recorder_loss_bounded_and_first_reason() {
+    let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
+    let sink = sink(4, 16);
+    let (mut call, clock) = begin(&shape, &sink); // original recorder max_waves = 4
+    let capture = Arc::new(CostCalibrationCapture::default());
+    call.attach_calibration_capture(Arc::clone(&capture));
+    {
+        let mut context = call.context().unwrap();
+        for wave in 0..6_u64 {
+            context.physical_wave(
+                Err(ActualWaveEvidenceUnknown::GraphPath),
+                Some(3 + wave * 3),
+            );
+            clock.set(4 + wave * 3);
+            context.terminal(ActualWaveOutcome::Completed, None);
+        }
+        context.finish_call(ObservedCallOutcome::Completed);
+    }
+    assert_eq!(
+        call.finish(),
+        CostCallDisposition::Rejected(CostCallRejection::Composite)
+    );
+    let diagnostic = capture.actual_evidence_diagnostic().unwrap();
+    assert_eq!(
+        diagnostic.dispatch_unknown,
+        Some(ActualWaveEvidenceUnknown::GraphPath)
+    );
+    assert_eq!(diagnostic.physical_waves, 6);
+    assert_eq!(diagnostic.retained_waves, 4);
+    assert_eq!(diagnostic.lost_observations, 2);
+    assert_eq!(
+        diagnostic
+            .waves
+            .iter()
+            .map(|wave| wave.physical_wave_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert!(capture.host_stages().is_none());
+    assert!(sink.pop().is_none());
+}
+
+#[test]
+fn calibration_actual_unknown_diagnostic_stays_absent_without_a_typed_unknown() {
+    let shape = shape(&[ActualRowWork::Decode { kv_tokens: 12 }]);
+    let sink = sink(4, 16);
+    let capture = Arc::new(CostCalibrationCapture::default());
+    let (mut call, _) = begin(&shape, &sink);
+    call.attach_calibration_capture(Arc::clone(&capture));
+    assert_eq!(
+        call.finish(),
+        CostCallDisposition::Rejected(CostCallRejection::NoPhysicalWave)
+    );
+    assert!(capture.actual_evidence_diagnostic().is_none());
+    let capture = Arc::new(CostCalibrationCapture::default());
+    assert_eq!(
+        measured(&shape, &sink, Arc::clone(&capture)).finish(),
+        CostCallDisposition::Published
+    );
+    assert!(capture.actual_evidence_diagnostic().is_none());
+}
+
 fn measured(
     shape: &ActualWaveShape,
     sink: &Arc<BoundedCostSampleSink>,

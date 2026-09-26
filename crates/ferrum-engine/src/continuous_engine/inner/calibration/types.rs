@@ -190,6 +190,9 @@ pub struct CalibrationWaveReport {
     /// observation into a training/reference sample.
     pub host_stages: Option<Arc<super::super::cost_observation::HostStageEvidenceV1>>,
     pub host_stage_queue: Option<super::super::cost_observation::HostStageQueueReceipt>,
+    /// Original typed failure diagnostics only, independent of eligibility.
+    pub actual_evidence_diagnostic:
+        Option<Arc<super::super::cost_observation::CalibrationActualEvidenceDiagnostic>>,
 }
 
 #[derive(Debug)]
@@ -256,6 +259,7 @@ impl CalibrationWaveReceipt {
             observation: super::observation::project_capture(self.capture()),
             host_stages: self.capture().host_stages(),
             host_stage_queue: self.capture().host_stage_queue(),
+            actual_evidence_diagnostic: self.capture().actual_evidence_diagnostic(),
         }
     }
 }

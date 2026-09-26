@@ -130,6 +130,40 @@ fn serialize_fingerprint<S: serde::Serializer>(
 }
 
 impl HostStageEvidenceV1 {
+    /// Read-only diagnostic arithmetic over the original private lifecycle's
+    /// timestamps. This creates no qualified receipt and changes no wire or
+    /// training eligibility. Actor handoff is not network-visible delivery.
+    pub fn diagnostic_wall_partition(
+        &self,
+    ) -> Result<
+        ferrum_interfaces::execution_cost::HostWallPartitionV1,
+        ferrum_interfaces::execution_cost::HostWallPartitionUnknownV1,
+    > {
+        use ferrum_interfaces::execution_cost::{
+            diagnose_host_wall_partition_v1, HostRowTimesV1, HostWallTimesV1,
+        };
+        diagnose_host_wall_partition_v1(
+            HostWallTimesV1 {
+                schema_version: self.schema_version,
+                complete_single_wave: self.completeness
+                    == HostStageCompleteness::CompleteSingleWave,
+                prepare_started_at_ns: self.prepare_started_at_ns,
+                executor_returned_at_ns: self.executor_returned_at_ns,
+                finalized_at_ns: self.finalized_at_ns,
+                full_wall_ns: self.full_wall_ns,
+            },
+            self.rows.iter().map(|row| HostRowTimesV1 {
+                complete_single_wave: row.completeness == HostStageCompleteness::CompleteSingleWave,
+                host_processing_ordinal: row.host_processing_ordinal,
+                host_started_at_ns: row.host_started_at_ns,
+                token_committed_at_ns: row.token_committed_at_ns,
+                output_published_at_ns: row.output_published_at_ns,
+                completion_started_at_ns: row.completion_started_at_ns,
+                settled_at_ns: row.settled_at_ns,
+            }),
+        )
+    }
+
     /// Explicit calibration/raw-only borrowed view. Legacy source/profile
     /// serialization intentionally omits the capture-only field.
     pub fn structured_diagnostic_view(&self) -> impl Serialize + '_ {

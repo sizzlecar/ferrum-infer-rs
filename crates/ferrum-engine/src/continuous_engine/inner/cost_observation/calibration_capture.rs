@@ -7,7 +7,9 @@ use std::sync::{
     OnceLock,
 };
 
+mod diagnostic;
 mod structured_session;
+pub use diagnostic::{CalibrationActualEvidenceDiagnostic, CalibrationActualWaveUnknown};
 pub(in crate::continuous_engine::inner) use structured_session::StructuredCaptureSessionBinding;
 
 #[derive(Debug)]
@@ -36,6 +38,7 @@ pub(in crate::continuous_engine) struct CostCalibrationCapture {
     value: OnceLock<Arc<CostCalibrationResult>>,
     host_stages: OnceLock<Arc<HostStageEvidenceV1>>,
     host_stage_queue: OnceLock<HostStageQueueReceipt>,
+    actual_evidence_diagnostic: OnceLock<Arc<CalibrationActualEvidenceDiagnostic>>,
     claimed: AtomicBool,
     conflict: AtomicBool,
     // Set only by construction, before attach/context/execute. Existing capture
@@ -51,6 +54,13 @@ pub(in crate::continuous_engine) enum CostCalibrationStatus {
 }
 
 impl CostCalibrationCapture {
+    pub fn actual_evidence_diagnostic(&self) -> Option<Arc<CalibrationActualEvidenceDiagnostic>> {
+        if self.conflict.load(Ordering::Acquire) {
+            None
+        } else {
+            self.actual_evidence_diagnostic.get().map(Arc::clone)
+        }
+    }
     pub(in crate::continuous_engine::inner) fn for_structured_session(
         session: Arc<StructuredCaptureSessionBinding>,
     ) -> Self {

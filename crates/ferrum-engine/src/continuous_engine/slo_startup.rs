@@ -37,10 +37,13 @@ pub(super) fn validate_execution(
     }
     if speculative
         || executor.execution_resource_authority() != ExecutionResourceAuthority::PlanRuntime
-        || executor.slo_execution_capability() != ExecutorSloCapability::GuardedEagerWaves
+        || !matches!(
+            executor.slo_execution_capability(),
+            ExecutorSloCapability::GuardedEagerWaves | ExecutorSloCapability::GuardedOnDemandWaves
+        )
     {
         return Err(FerrumError::unsupported(
-            "SLO Enforce requires guarded single-wave PlanRuntime execution and eager cost projection without speculative execution",
+            "SLO Enforce requires guarded single-wave PlanRuntime execution and declared eager/on-demand projection without speculative execution",
         ));
     }
     if slo.cost_profile.is_none() || slo.prefill_reference.is_none() {

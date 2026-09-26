@@ -1271,15 +1271,19 @@ pub use inner::calibration::{
     RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,
     RequiredFutureAuditPathV2, RequiredFutureAuditPlanV2, RequiredFutureAuditQueryV2,
     RequiredFutureAuditReportV2, RequiredFutureAuditRowV2, SelectedCalibrationOptions,
-    SelectedFitFreezeReceipt, StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,
+    SelectedFitFreezeReceipt,
+};
+pub use inner::calibration::{
+    StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,
     StructuredCalibrationGroupArtifactV2, StructuredCalibrationGroupLimitsV2,
     StructuredCalibrationGroupOptionsV2, StructuredCalibrationOptions,
     StructuredCalibrationOptionsV2, StructuredCalibrationProgress, StructuredCalibrationScopeV1,
     StructuredCapturePhase, StructuredPhaseFreezeReceipt,
 };
 pub use inner::cost_observation::{
-    HostRowStageV1, HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition,
-    HostStageQueueReceipt, HostStageWork, HostTerminalStageV1,
+    CalibrationActualEvidenceDiagnostic, CalibrationActualWaveUnknown, HostRowStageV1,
+    HostStageCompleteness, HostStageEvidenceV1, HostStageQueueDisposition, HostStageQueueReceipt,
+    HostStageWork, HostTerminalStageV1,
 };
 pub use sequence::SequenceState;
 use sequence::*;
@@ -2870,6 +2874,17 @@ impl ContinuousBatchEngine {
             model_executor.as_ref(),
             draft_executor.is_some() || spec_config.is_some(),
         )?;
+        config
+            .runtime
+            .validate_profile_frame_limit()
+            .map_err(FerrumError::config)?;
+        if config.runtime.profile_max_frames_per_request.is_some()
+            && executor_authority != ExecutionResourceAuthority::PlanRuntime
+        {
+            return Err(FerrumError::unsupported(
+                "bounded profile frames require a PlanRuntime executor",
+            ));
+        }
         crate::registry::validate_device_memory_sampling_config(&config, &config.backend.device)?;
         if config.runtime.device_memory_sampling.is_some()
             && (executor_authority != ExecutionResourceAuthority::PlanRuntime

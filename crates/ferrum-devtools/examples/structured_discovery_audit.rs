@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+#[path = "structured_discovery_audit/host_wall.rs"]
+mod host_wall;
 
 const MAX_RAW_BYTES: u64 = 1 << 30;
 const MAX_LINE_BYTES: u64 = 8 << 20;
@@ -170,6 +172,7 @@ fn audit(raw: &Path, report_path: &Path) -> Result<Value> {
     let mut transitions = Vec::new();
     let mut transition_counts = BTreeMap::new();
     let mut summary = SummaryReplay::default();
+    let mut wall_partition = host_wall::Audit::default();
     let mut request_records = Vec::new();
     let mut terminal_records = Vec::new();
     loop {
@@ -201,6 +204,7 @@ fn audit(raw: &Path, report_path: &Path) -> Result<Value> {
         }
         wave_count += 1;
         ensure!(wave_count <= MAX_WAVES, "wave population exceeds bound");
+        wall_partition.observe(&v, line)?;
         let d = &v["structured_cost_discovery_v2"];
         let phase = label(&v["phase"]);
         increment(
@@ -335,7 +339,8 @@ fn audit(raw: &Path, report_path: &Path) -> Result<Value> {
         "phases":phases,"discovery":{"known":known,"unknown":unknown_count,"domains":domains.len(),"domain_frequency":frequency,"groups":groups},
         "bounded_summary_replay":{"domains_retained":summary.domains.len(),"coordinates_retained":summary.coordinates,"joint_pairs_retained":summary.joint_pairs,"waves_retained":summary.retained,"omitted":summary.omitted},
         "unknown_groups":unknown,"unknown_examples":unknown_examples,"identity_transition_counts":transition_counts,"first_identity_transitions":transitions,
-        "request_records":request_records,"output_records":terminal_records,"domains":domains}),
+        "request_records":request_records,"output_records":terminal_records,"domains":domains,
+        "host_wall_partition_diagnostic":wall_partition.report()}),
     )
 }
 

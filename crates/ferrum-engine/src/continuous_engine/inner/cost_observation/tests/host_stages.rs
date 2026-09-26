@@ -118,6 +118,19 @@ fn host_settled_wall_preserves_actual_mixed_host_order_and_old_composite_rejecti
         HostStageCompleteness::CompleteSingleWave
     );
     assert_eq!(stages.rows[0].settled_at_ns, Some(25));
+    let partition = stages.diagnostic_wall_partition().unwrap();
+    assert_eq!(partition.full_wall_ns, 24);
+    assert_eq!(partition.serial_host_ns, 10);
+    assert_eq!(partition.finalized_after_settled_ns, 5);
+    assert_eq!(
+        partition.execution_ns + partition.serial_host_ns + partition.shared_gap_ns,
+        partition.full_wall_ns
+    );
+    assert_eq!(partition.rows[0].physical_row_index, 1);
+    assert_eq!(partition.rows[1].physical_row_index, 0);
+    assert_eq!(partition.rows[1].host_ns, 5);
+    // The diagnostic does not alter legacy Composite rejection or qualify a
+    // separate model. It uses the real call's settlement, including terminal.
     assert_eq!(sink.stats().rejected(CostCallRejection::Composite), 1);
 }
 

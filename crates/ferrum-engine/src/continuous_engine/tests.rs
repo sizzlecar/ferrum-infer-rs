@@ -27,9 +27,6 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
-#[path = "device_memory_tests.rs"]
-mod device_memory_tests;
-
 #[path = "stop_boundary_tests.rs"]
 mod stop_boundary_tests;
 
@@ -40,6 +37,8 @@ mod prefix_restore_deferred_tests;
 #[path = "prefix_restore_tests.rs"]
 mod prefix_restore_tests;
 
+#[path = "bounded_profile_capture_tests.rs"]
+mod bounded_profile_capture_tests;
 #[path = "metrics_only_tests.rs"]
 mod metrics_only_tests;
 #[path = "mixed_batch_tests.rs"]

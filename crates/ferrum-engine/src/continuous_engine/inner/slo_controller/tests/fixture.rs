@@ -95,6 +95,7 @@ pub(in crate::continuous_engine) struct ControlledExecutor {
     evidence: CoreEvidence,
     /// Models PlanRuntime-owned state without installing a legacy handle.
     pub typed_sequence_state: Mutex<Option<TypedSequenceStateMemory>>,
+    pub startup_capability_override: Mutex<Option<ExecutorSloCapability>>,
     pub entries: AtomicUsize,
     pub physical: AtomicUsize,
     pub prefill_granularity: AtomicUsize,
@@ -149,7 +150,9 @@ impl ModelExecutor for ControlledExecutor {
         // The controlled backend executes all three guarded eager wave kinds
         // below. Missing future route evidence still returns Unknown; this is
         // an algorithm capability, never a promise of predictive coverage.
-        ExecutorSloCapability::GuardedEagerWaves
+        self.startup_capability_override
+            .lock()
+            .unwrap_or(ExecutorSloCapability::GuardedEagerWaves)
     }
     fn guarded_prefill_granularity(&self) -> Option<NonZeroUsize> {
         NonZeroUsize::new(self.prefill_granularity.load(Ordering::Acquire))
@@ -875,6 +878,7 @@ pub(in crate::continuous_engine) async fn startup_components(
         base: MockModelExecutor::instant(64),
         evidence: CoreEvidence::new(width),
         typed_sequence_state: Mutex::new(None),
+        startup_capability_override: Mutex::new(None),
         entries: AtomicUsize::new(0),
         physical: AtomicUsize::new(0),
         prefill_granularity: AtomicUsize::new(1),

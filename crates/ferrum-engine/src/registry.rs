@@ -558,8 +558,12 @@ pub(crate) fn validate_device_memory_sampling_config(
         if matches!(device, Device::Metal) {
             return Ok(());
         }
+        #[cfg(feature = "cuda")]
+        if matches!(device, Device::CUDA(_)) {
+            return Ok(());
+        }
         return Err(FerrumError::unsupported(
-            format!("device-memory sampling requires a native Metal runtime enabled in this build; selected device is {device}"),
+            format!("device-memory sampling requires a native Metal or CUDA runtime enabled in this build; selected device is {device}"),
         ));
     }
     Ok(())
@@ -1289,13 +1293,15 @@ fn create_registered_vnext_executor(
                 ))
                 .map_err(|error| FerrumError::device(error.to_string()))?;
                 let composition =
-                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create_with_observation(
                         *ordinal,
                         device_id,
                         crate::product_composition::cuda_attention_policy_for_kv(
                             config.engine_config.runtime.attention_execution_policy,
                             config.engine_config.kv_cache.dtype,
                         )?,
+                        config.engine_config.runtime.device_memory_sampling.as_ref(),
+                        config.engine_config.scheduler.slo.cost_observation.structured_capture,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -2016,7 +2022,10 @@ mod tests {
     #[tokio::test]
     async fn device_memory_sampling_direct_engine_config_rejects_unavailable_backend_before_loading(
     ) {
-        let mut devices = vec![Device::CPU, Device::ROCm(0), Device::CUDA(0)];
+        let mut devices = vec![Device::CPU, Device::ROCm(0)];
+        if !cfg!(feature = "cuda") {
+            devices.push(Device::CUDA(0));
+        }
         if !cfg!(all(
             feature = "metal",
             any(target_os = "macos", target_os = "ios")

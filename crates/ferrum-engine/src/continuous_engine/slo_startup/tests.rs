@@ -17,6 +17,33 @@ use std::{fs, num::NonZeroU64, path::PathBuf, time::SystemTime};
 
 mod waiting_capacity;
 
+#[tokio::test]
+async fn enforce_ondemand_capability_still_requires_real_artifacts_and_complete_requests() {
+    // Only the shared startup protocol is exercised here. This controlled
+    // capability claim is not evidence of CUDA capture/replay execution.
+    let f = Fixture::new().await;
+    *f.executor.startup_capability_override.lock() =
+        Some(ExecutorSloCapability::GuardedOnDemandWaves);
+    validate_execution(&f.config, f.executor.as_ref(), false).unwrap();
+    for missing_profile in [false, true] {
+        let mut config = f.config.clone();
+        if missing_profile {
+            config.scheduler.slo.cost_profile = None;
+        } else {
+            config.scheduler.slo.prefill_reference = None;
+        }
+        assert!(matches!(
+            validate_execution(&config, f.executor.as_ref(), false),
+            Err(FerrumError::Config { .. })
+        ));
+    }
+    assert!(validate_execution(&f.config, f.executor.as_ref(), true).is_err());
+    *f.executor.startup_capability_override.lock() = Some(ExecutorSloCapability::Unavailable);
+    assert!(validate_execution(&f.config, f.executor.as_ref(), false).is_err());
+    assert_eq!(f.executor.entries.load(Ordering::Acquire), 0);
+    assert_eq!(f.executor.physical.load(Ordering::Acquire), 0);
+}
+
 struct Fixture {
     dir: PathBuf,
     config: EngineConfig,

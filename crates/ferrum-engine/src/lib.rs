@@ -63,6 +63,11 @@ pub mod transcription_engine;
 pub mod tts_engine;
 #[cfg(feature = "cuda")]
 pub mod vnext_determinism;
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+pub mod vnext_teacher;
 
 // Re-exports of interfaces
 pub use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};

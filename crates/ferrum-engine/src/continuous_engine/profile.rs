@@ -272,7 +272,10 @@ impl VNextProfileExecutionEventSink {
                         | ObservabilityProfileDetail::Verify
                         | ObservabilityProfileDetail::Full
                 ) {
-                    ExecutionEventCapturePolicy::AllFrames
+                    config.runtime.profile_max_frames_per_request.map_or(
+                        ExecutionEventCapturePolicy::AllFrames,
+                        ExecutionEventCapturePolicy::FirstFramesPerRequest,
+                    )
                 } else {
                     ExecutionEventCapturePolicy::FirstFramePerRequest
                 },
@@ -282,8 +285,17 @@ impl VNextProfileExecutionEventSink {
 
     fn enqueue_profile_batch(
         &self,
-        events: Vec<FerrumProfileEvent>,
+        mut events: Vec<FerrumProfileEvent>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if matches!(
+            self.context.capture_policy,
+            ExecutionEventCapturePolicy::FirstFramesPerRequest(_)
+        ) {
+            for event in &mut events {
+                self.context
+                    .extend_capture_attributes(&mut event.attributes);
+            }
+        }
         for journal in &self.journals {
             journal.enqueue_batch(events.clone()).map_err(|error| {
                 ExecutionEventSinkError::new(format!(
@@ -331,6 +343,27 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl VNextProfileEventContext {
+    fn extend_capture_attributes(&self, attributes: &mut BTreeMap<String, serde_json::Value>) {
+        if let ExecutionEventCapturePolicy::FirstFramesPerRequest(limit) = self.capture_policy {
+            attributes.insert(
+                "profile_max_frames_per_request".into(),
+                serde_json::json!(limit.get()),
+            );
+            attributes.insert(
+                "execution_capture_scope".into(),
+                serde_json::json!("first_n_physical_submissions_per_request"),
+            );
+            attributes.insert(
+                "device_capture_scope".into(),
+                serde_json::json!("waves_with_at_least_one_in_prefix_participant"),
+            );
+            attributes.insert(
+                "capture_completeness".into(),
+                serde_json::json!("bounded_prefix_not_complete_execution"),
+            );
+        }
+    }
+
     fn capture_policy_for_request(
         &self,
         origin: ExecutorRequestOrigin,
@@ -699,6 +732,7 @@ impl VNextProfileEventContext {
                 .transpose()?,
             _ => None,
         };
+        self.extend_capture_attributes(&mut attributes);
         let profile = FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
             ts_unix_nanos: timestamp
@@ -1659,6 +1693,106 @@ impl VNextProfileExecutionEventSink {
 }
 
 impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn record_frame_capture_summary(
+        &self,
+        summary: &ferrum_interfaces::vnext::ExecutionFrameCaptureSummary,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if self.context.capture_policy
+            != ExecutionEventCapturePolicy::FirstFramesPerRequest(summary.limit)
+            || summary.captured_completed_frames > u64::from(summary.limit.get())
+        {
+            return Err(ExecutionEventSinkError::new(
+                "frame capture summary does not match the configured capture prefix",
+            ));
+        }
+        let omitted = summary
+            .completed_frames
+            .checked_sub(summary.captured_completed_frames)
+            .ok_or_else(|| {
+                ExecutionEventSinkError::new("capture count exceeds completed frames")
+            })?;
+        let timestamp = chrono::Utc::now();
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!(
+                "evt-vnext-capture-summary-{}-{}",
+                summary.run_id, summary.request_id
+            ),
+            request_id: summary.request_id.to_string(),
+            correlation_id: Some(summary.request_id.to_string()),
+            entrypoint: self.context.entrypoint,
+            backend: "actual".into(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.into(),
+            phase: "vnext.frame_capture_summary".into(),
+            event_kind: ProfileEventKind::Instant,
+            timestamp,
+            status: ProfileStatus::DiagnosticOnly,
+            model: Some(self.context.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: None,
+            replay: None,
+            shape: BTreeMap::from([
+                (
+                    "completed_frames".into(),
+                    serde_json::json!(summary.completed_frames),
+                ),
+                (
+                    "captured_completed_frames".into(),
+                    serde_json::json!(summary.captured_completed_frames),
+                ),
+                (
+                    "omitted_completed_frames".into(),
+                    serde_json::json!(omitted),
+                ),
+            ]),
+            backend_detail: None,
+            attributes: BTreeMap::from([
+                (
+                    "run_id".into(),
+                    serde_json::json!(summary.run_id.to_string()),
+                ),
+                (
+                    "profile_detail".into(),
+                    serde_json::json!(self.context.profile_detail.as_str()),
+                ),
+                (
+                    "request_succeeded".into(),
+                    serde_json::json!(summary.request_succeeded),
+                ),
+                (
+                    "journal_terminal_observed".into(),
+                    serde_json::json!(summary.journal_terminal_observed),
+                ),
+                (
+                    "pending_submission".into(),
+                    serde_json::json!(summary.pending_submission),
+                ),
+                (
+                    "full_execution_frames_captured".into(),
+                    serde_json::json!(
+                        summary.request_succeeded
+                            && summary.journal_terminal_observed
+                            && !summary.pending_submission
+                            && omitted == 0
+                    ),
+                ),
+                (
+                    "prefill_coverage".into(),
+                    serde_json::json!("requires_chunk_and_first_token_join"),
+                ),
+            ]),
+        };
+        event
+            .validate()
+            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
+        self.enqueue_profile_batch(vec![event])
+    }
+
     fn enablement(&self) -> ferrum_interfaces::vnext::ExecutionEventSinkEnablement {
         ferrum_interfaces::vnext::ExecutionEventSinkEnablement::All
     }

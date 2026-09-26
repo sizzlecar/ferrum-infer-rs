@@ -13,6 +13,7 @@ use ferrum_types::RequestId;
 mod audit;
 mod calibration_capture;
 pub(in crate::continuous_engine) use calibration_capture::*;
+pub use calibration_capture::{CalibrationActualEvidenceDiagnostic, CalibrationActualWaveUnknown};
 mod checkpoint;
 pub(in crate::continuous_engine) use checkpoint::FrozenCostCheckpoint;
 mod clock;
@@ -391,6 +392,7 @@ impl EngineCostCall {
 
     pub fn finish(mut self) -> CostCallDisposition {
         self.finished = true;
+        self.capture_actual_unknown_diagnostic();
         let stages = self.make_host_stages();
         if let (Some(capture), Some(stages)) = (&self.calibration_capture, &stages) {
             capture.complete_host_stages(Arc::clone(stages));
@@ -486,6 +488,7 @@ impl EngineCostCall {
 impl Drop for EngineCostCall {
     fn drop(&mut self) {
         if !self.finished {
+            self.capture_actual_unknown_diagnostic();
             self.sink.reject(CostCallRejection::Abandoned);
             if let Some(stages) = self.make_host_stages() {
                 if let Some(capture) = &self.calibration_capture {

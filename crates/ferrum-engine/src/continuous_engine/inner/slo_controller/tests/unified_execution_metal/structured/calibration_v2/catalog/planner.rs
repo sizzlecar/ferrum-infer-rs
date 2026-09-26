@@ -11,6 +11,8 @@ use ferrum_scheduler::implementations::continuous::{
 use std::cell::Cell;
 #[path = "planner/query_metrics.rs"]
 mod query_metrics;
+#[path = "planner/required_audit.rs"]
+mod required_audit;
 
 struct Compare<'a> {
     direct: AnchoredPlanningCostModel<'a>,
@@ -202,6 +204,21 @@ pub(super) async fn compare_real_queries(
             compare.known_original.get() > 0,
             "must compare a Known real ordinary exact query, not two Unknown results"
         );
+        required_audit::check_native_paths(&context, &captured, &mut |query| {
+            use crate::continuous_engine::RequiredFutureAuditCostV2;
+            let now = direct.clock.now_ns().unwrap();
+            match direct_snapshot.audit_structured_query_v2(query, now) {
+                Ok(value) => RequiredFutureAuditCostV2::KnownAtRead {
+                    local_now_ns: now,
+                    planning_ns: value.planning_ns,
+                    valid_for_ns: value.valid_for_ns,
+                },
+                Err(reason) => RequiredFutureAuditCostV2::Unknown {
+                    local_now_ns: Some(now),
+                    reason: format!("{reason:?}"),
+                },
+            }
+        });
         assert_no_live_effects(&inner, &captured, &counters);
     }
     while !session.frontiers().unwrap().is_empty() {
