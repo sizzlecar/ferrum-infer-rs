@@ -49,6 +49,9 @@ fn header_valid(
     bytes: usize,
     limits: &CostProfileLoadLimits,
 ) -> Result<(), CostProfileError> {
+    if h.model_revision != MODEL_REVISION_V2 {
+        return Err(invalid("unsupported structured source revision"));
+    }
     let fail = || invalid("invalid source3 header, scope or protocol");
     h.settings.native().validate().map_err(numeric_error)?;
     h.scope.validate().map_err(numeric_error)?;
@@ -56,7 +59,6 @@ fn header_valid(
     h.cohort_plan.validate().map_err(numeric_error)?;
     if h.artifact_type != "ferrum.structured-live-source"
         || h.schema_version != 3
-        || h.model_revision != MODEL_REVISION_V2
         || h.capture_identity == [0; 32]
         || h.declared_protocol == [0; 32]
         || h.scope.owner != h.membership_rule.owner

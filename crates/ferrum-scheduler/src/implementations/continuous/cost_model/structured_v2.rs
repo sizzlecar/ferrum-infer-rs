@@ -13,7 +13,7 @@ pub use super::structured::{
 };
 use StructuredUnknownV2 as StructuredUnknown;
 type Result<T> = std::result::Result<T, StructuredUnknownV2>;
-pub const MODEL_REVISION_V2: &str = "structured_whole_wave_pending_envelope_v2";
+pub const MODEL_REVISION_V2: &str = "structured_whole_wave_pending_envelope_v2_fit_floor_v1";
 mod types;
 pub use types::*;
 mod input;

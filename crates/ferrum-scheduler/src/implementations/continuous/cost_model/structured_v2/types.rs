@@ -88,11 +88,27 @@ pub struct StructuredObservationV2<I> {
     pub observed_at_ns: u64,
     pub wall_ns: u64,
 }
+/// Frozen empirical uncertainty. None of these components is a hard future bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StructuredUncertaintyV2 {
+    /// Largest positive error on the complete fit population at fit freeze.
+    pub fit_error_floor_ns: u64,
+    /// Nearest-rank q99 positive error from the independent residual population.
+    pub residual_ns: u64,
+    /// max(fit_error_floor_ns, residual_ns), before the declared static margin.
+    pub effective_residual_ns: u64,
+    pub static_margin_ns: u64,
+}
 #[derive(Debug, Clone, Copy)]
 pub struct StructuredPredictionV2 {
     pub fitted_lower_ns: u64,
     pub fitted_upper_ns: u64,
+    /// Independent residual q99; does not include the fit floor or static margin.
     pub residual_ns: u64,
+    /// Largest observed positive fit error, not a statistical confidence bound.
+    pub fit_error_floor_ns: u64,
+    /// max(fit_error_floor_ns, residual_ns), before the declared static margin.
+    pub effective_residual_ns: u64,
     pub planning_ns: u64,
     /// Original model epoch. Engine must subtract imported.model_now_ns(local_now).
     pub valid_until_ns: u64,

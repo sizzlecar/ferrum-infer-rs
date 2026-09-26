@@ -371,7 +371,7 @@ pub fn header_graph(resident: Option<&str>) -> Header {
     h.protocol = sha.finalize().into();
     h
 }
-fn stages(h: &Header, p: &Prepared, call: u64) -> Stages {
+fn stages(h: &Header, p: &Prepared, call: u64, wall_ns: u64) -> Stages {
     let start = call * 2000;
     let last = p.rows[0].frontier.generated_before == 2;
     let mut s = Stages {
@@ -406,7 +406,7 @@ fn stages(h: &Header, p: &Prepared, call: u64) -> Stages {
             token_committed_at_ns: Some(start + 700),
             output_published_at_ns: Some(start + 800),
             completion_started_at_ns: if last { Some(start + 900) } else { None },
-            settled_at_ns: Some(start + 1000),
+            settled_at_ns: Some(start + wall_ns),
             terminal: if last {
                 Some(Terminal {
                     finish_reason: ferrum_types::FinishReason::Length,
@@ -428,8 +428,8 @@ fn stages(h: &Header, p: &Prepared, call: u64) -> Stages {
             },
             completeness: "complete_single_wave".into(),
         }],
-        finalized_at_ns: Some(start + 1100),
-        full_wall_ns: Some(1000),
+        finalized_at_ns: Some(start + wall_ns + 100),
+        full_wall_ns: Some(wall_ns),
         completeness: "complete_single_wave".into(),
     };
     let binding = observation::stage_binding(&s, None).unwrap();
@@ -439,8 +439,8 @@ fn stages(h: &Header, p: &Prepared, call: u64) -> Stages {
         recipe: p.recipe.clone(),
         stage_binding: binding,
         executor_envelope_ns: 500,
-        host_settled_after_executor_ns: 500,
-        full_wall_ns: 1000,
+        host_settled_after_executor_ns: wall_ns - 500,
+        full_wall_ns: wall_ns,
     }));
     s
 }
@@ -457,6 +457,12 @@ pub fn source() -> (Vec<u8>, StructuredInputV2) {
     source_graph(None)
 }
 pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
+    source_graph_fit_tail(resident, false)
+}
+pub fn source_with_fit_tail() -> (Vec<u8>, StructuredInputV2) {
+    source_graph_fit_tail(None, true)
+}
+fn source_graph_fit_tail(resident: Option<&str>, fit_tail: bool) -> (Vec<u8>, StructuredInputV2) {
     let h = header_graph(resident);
     let mut bytes = Vec::new();
     let mut ordinal = 0;
@@ -504,7 +510,16 @@ pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
             for generated in 0..3 {
                 offers += 1;
                 let (p, rows, input) = prepared_graph(&id, generated + 1, generated, resident);
-                let s = stages(&h, &p, offers);
+                let wall_ns = if fit_tail
+                    && phase == StructuredProfilePhaseV10::Fit
+                    && cohort == 3
+                    && generated == 1
+                {
+                    1600
+                } else {
+                    1000
+                };
+                let s = stages(&h, &p, offers, wall_ns);
                 let member = if generated == 1 {
                     members += 1;
                     Some(members)
@@ -537,8 +552,8 @@ pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
                 let n = Numeric {
                     fifo: offers,
                     call_id: offers,
-                    observed_at_ns: offers * 2000 + 1100,
-                    wall_ns: 1000,
+                    observed_at_ns: offers * 2000 + wall_ns + 100,
+                    wall_ns,
                     domain: *input.domain_signature(),
                     basis: input.regression_axes().into(),
                     support: input.joint_support_coordinates().into(),
@@ -553,7 +568,7 @@ pub fn source_graph(resident: Option<&str>) -> (Vec<u8>, StructuredInputV2) {
                             member,
                             offers,
                             offers,
-                            1000,
+                            wall_ns,
                             n.observed_at_ns,
                         )
                         .unwrap(),

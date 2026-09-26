@@ -1,6 +1,7 @@
 //! Numerical phase tests reuse actual typed canonical producer inputs. Timings
 //! are synthetic, explicitly not a calibration-session or GPU performance test.
 use super::*;
+mod fit_floor;
 fn fp() -> ExecutionFingerprint {
     ExecutionFingerprint {
         model_weights: [1; 32],

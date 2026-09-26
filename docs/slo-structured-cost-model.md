@@ -131,10 +131,42 @@ populations with source/protocol identities, unique call IDs, original clock
 boundaries, and a fixed TTL. Numerical callers explicitly choose dense FIFO
 ordinals or pre-execution reserved members; these coordinates cannot be mixed.
 Neither numerical input format proves live provenance on its own. Residual
-calibration uses an empirical whole-wave q99 plus a declared margin. Qualification
+calibration uses an empirical whole-wave q99. At fit freeze, the model also retains
+the largest positive error of the complete fit population, evaluated with the
+final fitted predictor and its normal upward rounding. Planning adds the larger
+of this fit error floor and the independent residual q99, then adds the original
+declared static margin once. Qualification
 requires coverage of every declared physical termination position and the
 nonterminal case, with no unknown or underestimated heldout point. This finite
 challenge does not establish a distribution-free p99 guarantee.
+
+The fit floor is a deliberately more conservative rule than a pure residual
+quantile; an observed training maximum above a quantile prediction alone is not
+a statistical correctness error. A single slow fit outlier can dominate this
+floor, reduce admitted concurrency, or prevent qualification under the existing
+maximum wave cost. Predictions exceeding that maximum remain Unknown; values
+are never clamped to manufacture a usable model. This rule does not promise
+better throughput or SLO compliance and must be evaluated on a new independent
+calibration and fixed serving workload. The original TTL, static margin,
+membership and phase sample requirements are unchanged. Fit-only or unsupported
+queries remain Unknown even if the floor would cover their cost.
+
+Predictions and the calibration export report distinguish `fit_error_floor_ns`,
+`residual_ns` (only the independent empirical q99), and
+`effective_residual_ns` (their maximum, before static margin). The floor is a
+finite observed-error safeguard, not a future hard bound, confidence interval,
+or additional qualification sample. Qualification cannot update any of these
+frozen components. No qualification sample is reused to enlarge the floor.
+
+The algorithm identity is
+`structured_whole_wave_pending_envelope_v2_fit_floor_v1`. The source3/profile10
+wire schemas remain unchanged, but their model revision, protocol, domain and
+parameter bindings use the new rule. Old source, profile and catalog revisions
+are rejected explicitly; they cannot be relabeled or replayed into new
+qualification. A fresh complete three-phase capture is required. The shared
+runtime adapter used by `run` and `serve` consumes the same planning value;
+optional runtime feedback remains a separate, bounded addition and cannot
+renew the original TTL or grant missing support.
 
 The core does not deserialize qualified receipts or authorize execution. The
 separate schema-9 adapter below owns startup import. Independent full-model

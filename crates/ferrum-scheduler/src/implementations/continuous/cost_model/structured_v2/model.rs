@@ -168,6 +168,15 @@ pub struct CalibratedStructuredModelV2 {
     frozen_at_ns: u64,
 }
 impl CalibratedStructuredModelV2 {
+    fn uncertainty(&self) -> StructuredUncertaintyV2 {
+        let fit_error_floor_ns = self.fitted.fit.fit_error_floor_ns();
+        StructuredUncertaintyV2 {
+            fit_error_floor_ns,
+            residual_ns: self.residual_ns,
+            effective_residual_ns: fit_error_floor_ns.max(self.residual_ns),
+            static_margin_ns: self.fitted.settings.static_margin_ns,
+        }
+    }
     pub fn parameters_signature(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"ferrum.structured-calibrated-state.v2\0");
@@ -200,16 +209,19 @@ impl CalibratedStructuredModelV2 {
         {
             return Err(StructuredUnknown::JointSupport);
         }
+        let uncertainty = self.uncertainty();
         let planning_ns = bounds
             .upper_ns
-            .checked_add(self.residual_ns)
+            .checked_add(uncertainty.effective_residual_ns)
             .and_then(|v| v.checked_add(f.settings.static_margin_ns))
             .filter(|v| *v <= f.settings.max_wave_ns)
             .ok_or(StructuredUnknown::Numerical)?;
         Ok(StructuredPredictionV2 {
             fitted_lower_ns: bounds.lower_ns,
             fitted_upper_ns: bounds.upper_ns,
-            residual_ns: self.residual_ns,
+            residual_ns: uncertainty.residual_ns,
+            fit_error_floor_ns: uncertainty.fit_error_floor_ns,
+            effective_residual_ns: uncertainty.effective_residual_ns,
             planning_ns,
             valid_until_ns: f.state.expires_at_ns,
             fit_samples: f.fit_samples,
@@ -265,6 +277,10 @@ pub struct QualifiedStructuredModelV2 {
     frozen_at_ns: u64,
 }
 impl QualifiedStructuredModelV2 {
+    /// Frozen diagnostic components; qualification never updates these values.
+    pub fn uncertainty(&self) -> StructuredUncertaintyV2 {
+        self.calibrated.uncertainty()
+    }
     /// Frozen safety limits for the runtime adapter; feedback cannot change them.
     pub fn runtime_limits(&self) -> (u64, u64) {
         (

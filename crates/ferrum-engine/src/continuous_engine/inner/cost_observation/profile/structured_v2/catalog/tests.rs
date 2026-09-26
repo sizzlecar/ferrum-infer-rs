@@ -191,3 +191,17 @@ fn catalog_symlink_paths_are_locators_and_the_opened_bytes_are_authoritative() {
     assert_eq!(after, b"second");
     assert_ne!(Sha256::digest(before), Sha256::digest(after));
 }
+
+#[test]
+fn structured_v2_fit_floor_catalog_rejects_legacy_revision_before_child_io() {
+    let mut value = wire_manifest();
+    let limits = file::CostProfileLoadLimits::default();
+    serde_json::from_value::<Manifest>(value.clone())
+        .unwrap()
+        .validate(&fp(), &limits)
+        .unwrap();
+    value["model_revision"] = "structured_whole_wave_pending_envelope_v2".into();
+    let legacy = serde_json::from_value::<Manifest>(value).unwrap();
+    // No child file is present: rejection belongs to algorithm identity, before IO.
+    assert!(legacy.validate(&fp(), &limits).is_err());
+}

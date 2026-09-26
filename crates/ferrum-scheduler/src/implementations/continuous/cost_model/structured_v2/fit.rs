@@ -18,11 +18,13 @@ pub(super) struct RowSpaceFit {
     basis: Vec<Vec<f64>>,
     coefficients: Vec<f64>,
     input_coefficients: Vec<f64>,
+    fit_error_floor_ns: u64,
 }
 impl RowSpaceFit {
     pub(super) fn bind_parameters(&self, digest: &mut sha2::Sha256) {
         use sha2::Digest;
-        digest.update(b"row-space-parameters-v1\0");
+        digest.update(b"row-space-parameters-with-fit-floor-v1\0");
+        digest.update(self.fit_error_floor_ns.to_le_bytes());
         digest.update((self.basis.len() as u64).to_le_bytes());
         for values in std::iter::once(&self.scale)
             .chain(self.basis.iter())
@@ -33,6 +35,10 @@ impl RowSpaceFit {
                 digest.update(value.to_bits().to_le_bytes());
             }
         }
+    }
+    /// Finite observed positive errors, not a future timing guarantee.
+    pub(super) fn fit_error_floor_ns(&self) -> u64 {
+        self.fit_error_floor_ns
     }
     pub(super) fn rank(&self) -> usize {
         self.basis.len()
@@ -168,15 +174,19 @@ impl RowSpaceFit {
         if input_coefficients.iter().any(|v| !v.is_finite()) {
             return Err(StructuredUnknown::Numerical);
         }
-        let model = Self {
+        let mut model = Self {
             scale,
             basis,
             coefficients,
             input_coefficients,
+            fit_error_floor_ns: 0,
         };
         // Reject physically invalid fits; never clip a negative model to zero.
         for sample in samples {
-            model.predict(&sample.basis)?;
+            let fitted = model.predict(sample.basis)?;
+            model.fit_error_floor_ns = model
+                .fit_error_floor_ns
+                .max(sample.wall_ns.saturating_sub(fitted));
         }
         Ok(model)
     }

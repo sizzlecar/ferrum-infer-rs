@@ -48,6 +48,8 @@ pub struct StructuredImportProvenanceV10 {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct StructuredProfileExportReceiptV10 {
+    pub model_revision: &'static str,
+    pub uncertainty: StructuredUncertaintyV2,
     pub path: PathBuf,
     pub source_path: PathBuf,
     pub file_sha256: [u8; 32],
@@ -219,6 +221,8 @@ pub fn export_structured_profile_v10(
     }
     publish_new(destination, &bytes)?;
     Ok(StructuredProfileExportReceiptV10 {
+        model_revision: MODEL_REVISION_V2,
+        uncertainty: replayed.model.uncertainty(),
         path: destination.into(),
         source_path,
         file_sha256: Sha256::digest(&bytes).into(),

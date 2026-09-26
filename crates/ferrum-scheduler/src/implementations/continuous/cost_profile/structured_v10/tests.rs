@@ -1,4 +1,5 @@
 use super::*;
+mod fit_floor;
 mod fixture;
 use fixture::*;
 
