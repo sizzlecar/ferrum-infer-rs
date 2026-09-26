@@ -38,6 +38,9 @@ pub(super) async fn collect(
     if manifest.validation_model.required_audit().is_some() {
         return required_audit::collect(session, manifest, inputs, artifacts, summary).await;
     }
+    if manifest.validation_model.structured_group_v2().is_some() {
+        return structured_v2::group::collect(session, manifest, inputs, artifacts, summary).await;
+    }
     if manifest.validation_model.structured_v2().is_some() {
         return structured_v2::collect(session, manifest, inputs, artifacts, summary).await;
     }

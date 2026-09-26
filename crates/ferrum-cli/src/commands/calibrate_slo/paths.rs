@@ -12,6 +12,12 @@ pub(super) fn outputs<'a>(
     if let Some((profile, source)) = manifest.validation_model.destinations() {
         result.extend([profile, source]);
     }
+    if let Some(group) = manifest.validation_model.structured_group_v2() {
+        result.push(group.catalog.as_path());
+        for child in &group.children {
+            result.extend([child.profile.as_path(), child.source.as_path()]);
+        }
+    }
     if let Some(reference) = &manifest.reference {
         result.extend([
             reference.artifact_path.as_path(),

@@ -11,6 +11,28 @@ pub(in crate::continuous_engine) struct LoadedCalibrationProfile {
 mod tests;
 
 impl EngineCostRuntime {
+    /// Read-only verification through the exact product loader, original live
+    /// identity and clock. No trainer, snapshot installation or TTL renewal.
+    pub fn inspect_structured_cost_profile_v2(
+        &self,
+        config: &SloCostObservationConfig,
+        path: &Path,
+    ) -> Result<ferrum_types::SloCostProfileReceipt, FerrumError> {
+        if config.predictor != ferrum_types::SloCostPredictor::StructuredWholeWaveV2 {
+            return Err(FerrumError::config(
+                "structured profile inspection requires the V2 predictor",
+            ));
+        }
+        config.validate().map_err(FerrumError::config)?;
+        let clock = profile::read_load_clock(self.clock.as_ref(), &config.profile_import)?;
+        let seed = profile::load_seed(&self.identity, config, Some(path), Some(clock))?;
+        seed.receipt
+            .filter(|r| r.structured_whole_wave_v2.is_some())
+            .ok_or_else(|| {
+                FerrumError::config("structured profile inspection has no V2 import receipt")
+            })
+    }
+
     /// The input is the worker's actual publication receipt, never a path or
     /// predicted model supplied by the external calibration caller.
     pub fn load_calibration_profile(

@@ -30,7 +30,7 @@ pub enum CalibrationStartupUsage {
 
 #[derive(Args)]
 #[command(
-    after_help = "Uses real PlanRuntime owners with explicit Observe/CompleteRequests and credited output. Schema 1 accepts already rendered inputs; schema 2 replays a pinned ShareGPT selection through product Chat conversion. Optional reference phases persist discovered identities before fresh singleton trials and publish from the original training cut. An explicit fixed reference policy creates independent requests; training and held-out source limits stay unchanged. The selected_whole_wave_v1 (profile6/source1), selected_independent_attention_v2 (profile7/source2), and selected_work_support_v1 (profile8/source3) validation sources instead run fresh training, freeze the fitted model, collect independent residual cohorts, and evaluate held-out requests against the sealed imported model; collect any reference separately. Work-support keeps family schema2 and excludes only output_budget_sum from statistical support; request authority and terminal categories remain intact. Model revision and family version are separate identities. Never relabel old profile/source headers. Defaults, min_samples, residual quantile and TTL are unchanged. Every request completes its own declared output policy. The structured_whole_wave_v1 validation source declares an independent fixed domain and complete live fit/residual/qualification populations before capture, then exports schema 9 only after replaying the original source; min 8 is not a p99 guarantee. Its manifest validation cohorts are qualification, not a fourth held-out set. The structured_whole_wave_v2 source predeclares an owner, finite numeric windows and pending/Length coverage, runs all complete request cohorts across the original three clocks, and exports profile10 after replaying source3. Unsupported owners or future branch combinations remain Unknown. The report distinguishes retrospective held-out cost checks from pre-submission forecasts. It is not an SLO or serving-performance certificate. The required_future_audit_v2 mode imports a genuine profile10/catalog and matching prefill reference, audits predeclared paths before fixed real wave attempts, and drains every complete request. It does not infer feasibility, publish work, or collect training source members; missing or expired input remains explicit. Existing output files are never overwritten."
+    after_help = "Uses real PlanRuntime owners with explicit Observe/CompleteRequests and credited output. Schema 1 accepts already rendered inputs; schema 2 replays a pinned ShareGPT selection through product Chat conversion. Optional reference phases persist discovered identities before fresh singleton trials and publish from the original training cut. An explicit fixed reference policy creates independent requests; training and held-out source limits stay unchanged. The selected_whole_wave_v1 (profile6/source1), selected_independent_attention_v2 (profile7/source2), and selected_work_support_v1 (profile8/source3) validation sources instead run fresh training, freeze the fitted model, collect independent residual cohorts, and evaluate held-out requests against the sealed imported model; collect any reference separately. Work-support keeps family schema2 and excludes only output_budget_sum from statistical support; request authority and terminal categories remain intact. Model revision and family version are separate identities. Never relabel old profile/source headers. Defaults, min_samples, residual quantile and TTL are unchanged. Every request completes its own declared output policy. The structured_whole_wave_v1 validation source declares an independent fixed domain and complete live fit/residual/qualification populations before capture, then exports schema 9 only after replaying the original source; min 8 is not a p99 guarantee. Its manifest validation cohorts are qualification, not a fourth held-out set. The structured_whole_wave_v2 source predeclares an owner, finite numeric windows and pending/Length coverage, runs all complete request cohorts across the original three clocks, and exports profile10 after replaying source3. Unsupported owners or future branch combinations remain Unknown. The structured_whole_wave_group_v2 mode declares distinct child owners before shared warmup, executes one complete three-phase cohort plan, preserves every child source FIFO and clock, then verifies the complete exported catalog through the product loader. Any child failure prevents whole-group qualification; total file/numeric/coordinate/import bounds are explicit. The report distinguishes retrospective held-out cost checks from pre-submission forecasts. It is not an SLO or serving-performance certificate. The required_future_audit_v2 mode imports a genuine profile10/catalog and matching prefill reference, audits predeclared paths before fixed real wave attempts, and drains every complete request. It does not infer feasibility, publish work, or collect training source members; missing or expired input remains explicit. Existing output files are never overwritten."
 )]
 pub struct CalibrateSloCommand {
     /// Registered model alias, source directory or GGUF artifact.
@@ -121,7 +121,16 @@ pub async fn execute(cmd: CalibrateSloCommand, config: CliConfig) -> Result<()> 
         let finalized = tokio::time::timeout(
             std::time::Duration::from_millis(manifest.protocol.shutdown_timeout_ms.get()),
             async {
-                if manifest.validation_model.structured_v2().is_some() {
+                if manifest.validation_model.structured_group_v2().is_some() {
+                    structured_v2::group::finish(
+                        &mut session,
+                        &manifest,
+                        result.is_ok(),
+                        &mut artifacts,
+                        &mut summary,
+                    )
+                    .await
+                } else if manifest.validation_model.structured_v2().is_some() {
                     structured_v2::finish(
                         &mut session,
                         &manifest,
@@ -156,6 +165,9 @@ pub async fn execute(cmd: CalibrateSloCommand, config: CliConfig) -> Result<()> 
             if let Some(report) = &mut summary.structured_calibration_v2 {
                 report.finalization_error = Some(error.to_string());
             }
+            if let Some(report) = &mut summary.structured_calibration_group_v2 {
+                report.finalization_error = Some(error.to_string());
+            }
             result = match result {
                 Ok(()) => Err(error),
                 Err(collection) => Err(FerrumError::internal(format!(
@@ -184,6 +196,8 @@ pub async fn execute(cmd: CalibrateSloCommand, config: CliConfig) -> Result<()> 
     }
     if manifest.validation_model.is_discovery_v2() {
         println!("Independent structured discovery observations written; freeze the next capture scope in a separate manifest.");
+    } else if manifest.validation_model.structured_group_v2().is_some() {
+        println!("Structured V2 complete-cohort child sources/profiles and product-loader-verified catalog written; declared owners do not imply complete future coverage or serving SLO compliance.");
     } else if manifest.validation_model.structured_v2().is_some() {
         println!("Structured V2 complete-cohort source3 and profile10 written; pending/Length coverage is an empirical challenge, not a serving SLO certificate.");
     } else if manifest.validation_model.structured().is_some() {

@@ -9,6 +9,24 @@ use super::*;
 use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::StructuredCoverageReportV2;
 
 impl CalibrationSession {
+    /// Verify a just-exported child/catalog through the real startup loader.
+    /// This returns diagnostic provenance; it never changes the live predictor.
+    pub fn inspect_structured_cost_profile_v2(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<ferrum_types::SloCostProfileReceipt> {
+        self.selected_phase_boundary()?;
+        self.engine
+            .inner
+            .cost_runtime
+            .as_ref()
+            .ok_or_else(|| FerrumError::internal("cost runtime unavailable"))?
+            .inspect_structured_cost_profile_v2(
+                &self.configuration().scheduler.slo.cost_observation,
+                path,
+            )
+    }
+
     pub async fn begin_structured_cost_group_v2(
         &mut self,
         options: StructuredCalibrationGroupOptionsV2,

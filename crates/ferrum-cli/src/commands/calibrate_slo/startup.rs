@@ -185,9 +185,13 @@ pub(super) fn validate_export_configuration(
         }
     }
     let structured_v2 = manifest.validation_model.structured_v2();
+    let structured_group_v2 = manifest.validation_model.structured_group_v2();
     let discovery_v2 = manifest.validation_model.is_discovery_v2();
     let required_audit = manifest.validation_model.required_audit();
-    if (structured_v2.is_some() || discovery_v2 || required_audit.is_some())
+    if (structured_v2.is_some()
+        || structured_group_v2.is_some()
+        || discovery_v2
+        || required_audit.is_some())
         != (policy.cost_observation.predictor
             == ferrum_types::SloCostPredictor::StructuredWholeWaveV2)
     {
@@ -261,6 +265,9 @@ pub(super) fn validate_export_configuration(
         {
             return Err(FerrumError::config("V2 calibration needs fresh HostSettledV1 capture within clock/population limits and schema10 envelope capacity"));
         }
+    }
+    if let Some(capture) = structured_group_v2 {
+        capture.validate_policy(manifest, policy)?;
     }
     let selected = manifest.validation_model.selected();
     if selected.map(|(predictor, _, _)| predictor)

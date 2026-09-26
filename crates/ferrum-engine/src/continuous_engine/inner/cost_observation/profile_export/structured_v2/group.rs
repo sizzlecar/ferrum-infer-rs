@@ -6,6 +6,7 @@ mod options;
 pub use options::{StructuredCalibrationGroupLimitsV2, StructuredCalibrationGroupOptionsV2};
 
 pub struct StructuredCalibrationGroupArtifactV2 {
+    pub fingerprint: model::ExecutionFingerprint,
     pub children: Vec<StructuredCalibrationArtifactV2>,
     pub failure: Option<String>,
 }
@@ -280,6 +281,7 @@ impl StructuredCalibrationGroupV2 {
             self.invalidate("a child source is incomplete at group close".into());
         }
         let mut failure = self.failure;
+        let fingerprint = self.children[0].binding.fingerprint().clone();
         // Finish every file even if one writer is poisoned; never publish a
         // partial child collection as a successful catalog.
         let mut children = Vec::with_capacity(self.children.len());
@@ -302,7 +304,11 @@ impl StructuredCalibrationGroupV2 {
         }
         match error {
             Some(error) => Err(error),
-            None => Ok(StructuredCalibrationGroupArtifactV2 { children, failure }),
+            None => Ok(StructuredCalibrationGroupArtifactV2 {
+                fingerprint,
+                children,
+                failure,
+            }),
         }
     }
 }

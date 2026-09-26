@@ -16,6 +16,9 @@ use ferrum_scheduler::implementations::continuous::{
 #[path = "calibration_v2/catalog.rs"]
 mod catalog;
 
+#[path = "calibration_v2/multi.rs"]
+mod multi;
+
 const PROMPT: &str = "hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello";
 
 struct OutputDirectory(std::path::PathBuf);
@@ -89,6 +92,17 @@ async fn add_native_request(
 }
 
 async fn complete_native_request(session: &mut CalibrationSession) -> Vec<CalibrationWaveReport> {
+    complete_native_request_with_route(
+        session,
+        crate::continuous_engine::CalibrationDecodeRoute::Actual,
+    )
+    .await
+}
+
+async fn complete_native_request_with_route(
+    session: &mut CalibrationSession,
+    route: crate::continuous_engine::CalibrationDecodeRoute,
+) -> Vec<CalibrationWaveReport> {
     let (id, consume) = add_native_request(session).await;
     let inner = session.test_engine_inner();
     ready(&inner, &id).await;
@@ -100,7 +114,7 @@ async fn complete_native_request(session: &mut CalibrationSession) -> Vec<Calibr
         let work = if f.prefill_progress().is_some() {
             f.prefill_work(n32(8)).unwrap()
         } else {
-            f.decode_work().unwrap()
+            f.decode_work_with_route(route).unwrap()
         };
         reports.push(wave(session, vec![work]).await);
     }

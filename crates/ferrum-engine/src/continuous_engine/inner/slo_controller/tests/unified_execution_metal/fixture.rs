@@ -28,6 +28,14 @@ pub(super) async fn fixture_with_structured_geometry(
     enabled: bool,
     geometry: weights::CausalGeometry,
 ) -> (CalibrationSession, ModelDirectory) {
+    fixture_with_cost_config(enabled, geometry, None).await
+}
+
+pub(super) async fn fixture_with_cost_config(
+    enabled: bool,
+    geometry: weights::CausalGeometry,
+    observation: Option<ferrum_types::SloCostObservationConfig>,
+) -> (CalibrationSession, ModelDirectory) {
     let directory = ModelDirectory(
         std::env::temp_dir().join(format!("ferrum-unified-metal-{}", uuid::Uuid::new_v4())),
     );
@@ -50,6 +58,9 @@ pub(super) async fn fixture_with_structured_geometry(
     config.batching.max_num_batched_tokens = 8;
     config.memory.usable_capacity_bytes = Some(64 << 20);
     config.scheduler.slo.mode = ferrum_types::SloMode::Observe;
+    if let Some(observation) = observation {
+        config.scheduler.slo.cost_observation = observation;
+    }
     if enabled {
         config.scheduler.slo.cost_observation.structured_capture =
             ferrum_types::SloStructuredCostCapture::HostSettledV1;

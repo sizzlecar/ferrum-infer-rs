@@ -4,11 +4,13 @@ use super::*;
 mod config;
 pub(super) mod discovery;
 mod driver;
+pub(super) mod group;
 mod report;
 #[cfg(test)]
 mod tests;
 pub(super) use config::CaptureConfigV2;
 pub(super) use driver::{collect, finish};
+pub(super) use group::{GroupCaptureConfigV2, GroupReportV2};
 pub(super) use report::StructuredReportV2;
 
 #[cfg(test)]

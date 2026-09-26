@@ -73,9 +73,20 @@ pub(super) enum ValidationSource {
         capture: structured_v2::CaptureConfigV2,
         residual: Vec<Cohort>,
     },
+    /// One complete run, predeclared independent child sources, profile10 catalog.
+    StructuredWholeWaveGroupV2 {
+        capture: structured_v2::GroupCaptureConfigV2,
+        residual: Vec<Cohort>,
+    },
 }
 
 impl ValidationSource {
+    pub(super) fn structured_group_v2(&self) -> Option<&structured_v2::GroupCaptureConfigV2> {
+        match self {
+            Self::StructuredWholeWaveGroupV2 { capture, .. } => Some(capture),
+            _ => None,
+        }
+    }
     pub(super) fn required_audit(&self) -> Option<&required_audit::AuditConfigV2> {
         match self {
             Self::RequiredFutureAuditV2 { audit, .. } => Some(audit),
@@ -91,6 +102,7 @@ impl ValidationSource {
                 warmup
             }
             Self::StructuredWholeWaveV2 { capture, .. } => &capture.warmup,
+            Self::StructuredWholeWaveGroupV2 { capture, .. } => &capture.warmup,
             _ => &[],
         }
     }
@@ -101,7 +113,9 @@ impl ValidationSource {
         }
     }
     pub(super) fn is_structured(&self) -> bool {
-        self.structured().is_some() || self.structured_v2().is_some()
+        self.structured().is_some()
+            || self.structured_v2().is_some()
+            || self.structured_group_v2().is_some()
     }
     pub(super) fn structured(&self) -> Option<&structured::CaptureConfig> {
         match self {
@@ -151,6 +165,7 @@ impl ValidationSource {
             | Self::SelectedIndependentAttentionV2 { residual, .. }
             | Self::SelectedWorkSupportV1 { residual, .. }
             | Self::StructuredWholeWaveV1 { residual, .. }
+            | Self::StructuredWholeWaveGroupV2 { residual, .. }
             | Self::StructuredWholeWaveV2 { residual, .. } => residual,
             _ => &[],
         }
@@ -170,6 +185,7 @@ impl ValidationSource {
                 Some((&capture.profile, &capture.source))
             }
             Self::LiveFrozen
+            | Self::StructuredWholeWaveGroupV2 { .. }
             | Self::StructuredDiscoveryV2 { .. }
             | Self::RequiredFutureAuditV2 { .. } => None,
         }
@@ -316,6 +332,11 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
     if let Some(reference) = &mut manifest.reference {
         reference.resolve_paths(parent);
     }
+    if let ValidationSource::StructuredWholeWaveGroupV2 { capture, .. } =
+        &mut manifest.validation_model
+    {
+        capture.resolve_paths(parent);
+    }
     let destinations = match &mut manifest.validation_model {
         ValidationSource::ExportedProfile { profile, source } => Some((profile, source)),
         ValidationSource::SelectedWholeWaveV1 { export, .. }
@@ -330,6 +351,7 @@ pub(super) fn load(path: &std::path::Path) -> Result<Manifest> {
             Some((&mut capture.profile, &mut capture.source))
         }
         ValidationSource::LiveFrozen
+        | ValidationSource::StructuredWholeWaveGroupV2 { .. }
         | ValidationSource::StructuredDiscoveryV2 { .. }
         | ValidationSource::RequiredFutureAuditV2 { .. } => None,
     };
@@ -378,6 +400,9 @@ impl Manifest {
             capture.validate(self)?;
         }
         if let Some(capture) = self.validation_model.structured_v2() {
+            capture.validate(self)?;
+        }
+        if let Some(capture) = self.validation_model.structured_group_v2() {
             capture.validate(self)?;
         }
         let audit = self.validation_model.required_audit();
