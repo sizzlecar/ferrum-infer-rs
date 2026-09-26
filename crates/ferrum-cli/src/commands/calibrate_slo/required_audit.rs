@@ -1,5 +1,6 @@
 //! Finite pre-wave diagnostics using the existing complete-request driver.
-//! The caller declares trigger ordinals and paths before any request executes.
+//! The caller declares trigger attempts or physical frontier stages and paths
+//! before any request executes. Readiness is independent of cost availability.
 use super::*;
 use ferrum_engine::continuous_engine::{
     CalibrationFrontier, CalibrationSession, RequiredFutureAuditCostV2, RequiredFutureAuditPlanV2,
@@ -7,6 +8,8 @@ use ferrum_engine::continuous_engine::{
 };
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
+mod trigger;
+use trigger::{AuditFrontierTriggerV2, StageMatch, TriggerProgress, UntriggeredReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,10 +23,15 @@ pub(super) struct AuditTriggerV2 {
     pub repetition: usize,
     /// One-based nonempty Wave attempt in this complete cohort. A rejected
     /// physical attempt still consumes its ordinal; no retry until Known.
-    pub before_wave_attempt: NonZeroU64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_wave_attempt: Option<NonZeroU64>,
+    /// Physical readiness is read only after the declared stage matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<AuditFrontierTriggerV2>,
     pub plan: RequiredFutureAuditPlanV2,
 }
 impl AuditConfigV2 {
+    #[cfg(test)]
     fn trigger(
         &self,
         case: usize,
@@ -34,8 +42,8 @@ impl AuditConfigV2 {
             (
                 trigger.case_index,
                 trigger.repetition,
-                trigger.before_wave_attempt.get(),
-            ) == (case, repetition, attempt)
+                trigger.before_wave_attempt.map(NonZeroU64::get),
+            ) == (case, repetition, Some(attempt))
         })
     }
     pub(super) fn validate(&self, manifest: &manifest::Manifest) -> Result<()> {
@@ -56,11 +64,16 @@ impl AuditConfigV2 {
                 .get(trigger.case_index)
                 .ok_or_else(invalid)?;
             if trigger.repetition >= case.repetitions.get()
-                || trigger.before_wave_attempt.get() > manifest.protocol.maximum_wave_attempts.get()
+                || trigger.before_wave_attempt.is_some() == trigger.when.is_some()
+                || trigger
+                    .before_wave_attempt
+                    .is_some_and(|n| n.get() > manifest.protocol.maximum_wave_attempts.get())
+                || (trigger.when.is_some() && case.rolling_window.is_some())
                 || !keys.insert((
                     trigger.case_index,
                     trigger.repetition,
-                    trigger.before_wave_attempt.get(),
+                    trigger.before_wave_attempt,
+                    trigger.when,
                 ))
             {
                 return Err(invalid());
@@ -91,6 +104,7 @@ pub(super) struct AuditSummaryV2 {
     pub cost_unknown_reasons: std::collections::BTreeMap<String, usize>,
     pub input_unknown_reasons: std::collections::BTreeMap<String, usize>,
     pub remaining_trigger_indices: Vec<usize>,
+    pub trigger_progress: Vec<TriggerProgress>,
     pub collection_completed: bool,
     pub all_declared_requirements_recorded: bool,
 }
@@ -107,6 +121,7 @@ impl AuditSummaryV2 {
             cost_unknown_reasons: Default::default(),
             input_unknown_reasons: Default::default(),
             remaining_trigger_indices: (0..count).collect(),
+            trigger_progress: (0..count).map(|_| TriggerProgress::default()).collect(),
             collection_completed: false,
             all_declared_requirements_recorded: false,
         }
@@ -206,35 +221,131 @@ pub(super) async fn before_wave(
         .validation_model
         .required_audit()
         .ok_or_else(|| FerrumError::internal("missing required-future audit declaration"))?;
-    let Some((index, trigger)) = config.trigger(case_index, repetition, attempt) else {
-        return Ok(());
-    };
-    let result = if frontiers.len() != full_population {
-        Err(FerrumError::invalid_request(
-            "audit cohort ordering omitted a live owner",
-        ))
-    } else {
-        session
-            .audit_required_owners_v2(frontiers, &trigger.plan)
-            .await
-    };
-    let (audit, error) = match result {
-        Ok(report) => (Some(report), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    totals
+    for (index, trigger) in config.triggers.iter().enumerate() {
+        if trigger.case_index != case_index || trigger.repetition != repetition {
+            continue;
+        }
+        let summary = totals
+            .required_future_audit_v2
+            .as_mut()
+            .ok_or_else(|| FerrumError::internal("required-future audit summary missing"))?;
+        if !summary.remaining_trigger_indices.contains(&index)
+            || summary.trigger_progress[index].untriggered_reason.is_some()
+        {
+            continue;
+        }
+        if let Some(when) = trigger.when {
+            let progress = &mut summary.trigger_progress[index];
+            match when.match_stage(
+                manifest.training[case_index].prompts.len(),
+                frontiers
+                    .iter()
+                    .map(|f| (f.generated_tokens(), f.prefill_progress())),
+            ) {
+                StageMatch::Before => continue,
+                StageMatch::Passed => {
+                    progress.untriggered_reason =
+                        Some(UntriggeredReason::StagePassedBeforeReadiness);
+                    continue;
+                }
+                StageMatch::PopulationChanged => {
+                    progress.untriggered_reason =
+                        Some(UntriggeredReason::OriginalCohortNoLongerComplete);
+                    continue;
+                }
+                StageMatch::At => progress.stage_seen = true,
+            }
+            progress.readiness_checks = progress
+                .readiness_checks
+                .checked_add(1)
+                .ok_or_else(|| FerrumError::resource_exhausted("audit readiness count overflow"))?;
+            let ready = match session.audit_frontier_readiness_v2(frontiers) {
+                Ok(readiness) => {
+                    let ready = readiness.all_ready();
+                    progress.last_readiness = Some(readiness);
+                    progress.last_readiness_error = None;
+                    ready
+                }
+                Err(error) => {
+                    progress.last_readiness = None;
+                    progress.last_readiness_error = Some(error.to_string());
+                    false
+                }
+            };
+            artifacts.record(&serde_json::json!({
+                "schema_version": 1, "event": "required_future_trigger_readiness",
+                "trigger_index": index, "case": case_index, "repetition": repetition,
+                "before_wave_attempt": attempt, "declaration": trigger,
+                "progress": progress, "ready": ready,
+            }))?;
+            if !ready {
+                continue;
+            }
+        } else if trigger.before_wave_attempt.map(NonZeroU64::get) != Some(attempt) {
+            continue;
+        }
+        let result = if frontiers.len() != full_population {
+            Err(FerrumError::invalid_request(
+                "audit cohort ordering omitted a live owner",
+            ))
+        } else {
+            session
+                .audit_required_owners_v2(frontiers, &trigger.plan)
+                .await
+        };
+        let (audit, error) = match result {
+            Ok(report) => (Some(report), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        totals
+            .required_future_audit_v2
+            .as_mut()
+            .expect("checked above")
+            .record(index, audit.as_ref())?;
+        // Once fired, either mode consumes its declaration even on Unknown.
+        // Readiness never suppresses ordinary admission, Wave or request drain.
+        artifacts.record(&serde_json::json!({
+            "schema_version": 1, "event": "required_future_owner_audit", "phase": "discovery",
+            "trigger_index": index, "case": case_index, "repetition": repetition,
+            "before_wave_attempt": attempt, "declaration": trigger,
+            "report": audit, "error": error,
+        }))?;
+    }
+    Ok(())
+}
+
+pub(super) fn cohort_completed(
+    manifest: &manifest::Manifest,
+    case: usize,
+    repetition: usize,
+    artifacts: &mut report::Artifacts,
+    totals: &mut report::Summary,
+) -> Result<()> {
+    let config = manifest
+        .validation_model
+        .required_audit()
+        .ok_or_else(|| FerrumError::internal("missing required-future audit declaration"))?;
+    let summary = totals
         .required_future_audit_v2
         .as_mut()
-        .ok_or_else(|| FerrumError::internal("required-future audit summary missing"))?
-        .record(index, audit.as_ref())?;
-    // Diagnostic failure does not discard a request or move/retry its trigger.
-    // Raw byte-limit/write failures still propagate through the original driver.
-    artifacts.record(&serde_json::json!({
-        "schema_version": 1, "event": "required_future_owner_audit", "phase": "discovery",
-        "trigger_index": index, "case": case_index, "repetition": repetition,
-        "before_wave_attempt": attempt, "declaration": trigger,
-        "report": audit, "error": error,
-    }))
+        .ok_or_else(|| FerrumError::internal("required-future audit summary missing"))?;
+    for (index, trigger) in config.triggers.iter().enumerate() {
+        if trigger.case_index == case
+            && trigger.repetition == repetition
+            && summary.remaining_trigger_indices.contains(&index)
+        {
+            let progress = &mut summary.trigger_progress[index];
+            progress
+                .untriggered_reason
+                .get_or_insert(UntriggeredReason::CohortCompletedBeforeTrigger);
+            artifacts.record(&serde_json::json!({
+                "schema_version": 1, "event": "required_future_trigger_untriggered",
+                "trigger_index": index, "case": case, "repetition": repetition,
+                "declaration": trigger, "progress": progress,
+            }))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

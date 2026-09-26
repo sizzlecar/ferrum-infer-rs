@@ -21,9 +21,11 @@ pub use structured_group_v2::{
     StructuredCalibrationGroupOptionsV2,
 };
 pub use structured_v2::{StructuredCalibrationArtifactV2, StructuredCalibrationOptionsV2};
+mod audit_readiness;
 mod checkpoint;
 mod evidence;
 mod planning_audit;
+pub use audit_readiness::{CalibrationAuditReadinessV2, CalibrationAuditRowReadinessV2};
 pub use planning_audit::{
     RequiredFutureAuditActionV2, RequiredFutureAuditCostV2, RequiredFutureAuditFailureV2,
     RequiredFutureAuditFrontierV2, RequiredFutureAuditLimitsV2, RequiredFutureAuditPathReportV2,

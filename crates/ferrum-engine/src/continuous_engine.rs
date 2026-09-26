@@ -1260,7 +1260,8 @@ fn token_id_tail(tokens: &[TokenId], limit: usize) -> Vec<u32> {
 
 mod sequence;
 pub use inner::calibration::{
-    CalibrationAction, CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
+    CalibrationAction, CalibrationAuditReadinessV2, CalibrationAuditRowReadinessV2,
+    CalibrationBlockReason, CalibrationCommittedRow, CalibrationCommittedWork,
     CalibrationDecodeRoute, CalibrationFrontier, CalibrationLimits, CalibrationObservation,
     CalibrationProfileArtifact, CalibrationProfilePaths, CalibrationQueueDisposition,
     CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,

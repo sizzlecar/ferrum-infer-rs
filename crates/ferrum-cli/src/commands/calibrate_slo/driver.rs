@@ -424,6 +424,11 @@ pub(super) async fn cohort(
         // shorten max_tokens to force a particular calibration shape.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
+    if manifest.validation_model.required_audit().is_some()
+        && matches!(phase, report::Phase::Discovery)
+    {
+        required_audit::cohort_completed(manifest, index, repetition, artifacts, totals)?;
+    }
     if case.rolling_window.is_some() {
         artifacts.record(&serde_json::json!({
             "schema_version": 1, "event": "rolling_cohort_drained",

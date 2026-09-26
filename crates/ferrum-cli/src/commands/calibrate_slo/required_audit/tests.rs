@@ -13,7 +13,8 @@ fn declared() -> manifest::Manifest {
         triggers: vec![AuditTriggerV2 {
             case_index: 0,
             repetition: 0,
-            before_wave_attempt: NonZeroU64::new(2).unwrap(),
+            before_wave_attempt: NonZeroU64::new(2),
+            when: None,
             plan: RequiredFutureAuditPlanV2 {
                 paths: vec![RequiredFutureAuditPathV2 {
                     waves: vec![vec![RequiredFutureAuditRowV2 {
@@ -71,7 +72,7 @@ fn required_future_cli_rejects_duplicate_outside_cohort_and_out_of_bound_plans()
     invalid.triggers[0].plan.paths[0].waves[0][0].frontier_index = 2;
     assert!(invalid.validate(&manifest).is_err());
     let mut invalid = config;
-    invalid.triggers[0].before_wave_attempt = NonZeroU64::new(101).unwrap();
+    invalid.triggers[0].before_wave_attempt = NonZeroU64::new(101);
     assert!(invalid.validate(&manifest).is_err());
     let mut wire = serde_json::to_value(&manifest).unwrap();
     wire["validation_model"]["audit"]["advance_clock_ns"] = 1.into();
@@ -146,4 +147,79 @@ fn required_future_cli_requires_real_loader_inputs_and_cannot_overwrite_them() {
         .expected_protocol_sha256 = [1; 32];
     policy.cost_observation = ferrum_types::SloCostObservationConfig::default();
     assert!(startup::validate_export_configuration(&cmd, &manifest, &policy).is_err());
+}
+
+#[test]
+fn required_future_cli_stage_trigger_keeps_original_population_and_exact_generation() {
+    let prefill = AuditFrontierTriggerV2::InitialPrefillReady;
+    assert_eq!(
+        prefill.match_stage(2, [(0, Some((0, 22))); 2].into_iter()),
+        StageMatch::At
+    );
+    assert_eq!(
+        prefill.match_stage(2, [(0, Some((1, 22))); 2].into_iter()),
+        StageMatch::Passed
+    );
+    let decode = AuditFrontierTriggerV2::DecodeReady {
+        generated_tokens: NonZeroUsize::new(1).unwrap(),
+    };
+    assert_eq!(
+        decode.match_stage(2, [(0, Some((0, 22))); 2].into_iter()),
+        StageMatch::Before
+    );
+    assert_eq!(
+        decode.match_stage(2, [(1, None); 2].into_iter()),
+        StageMatch::At
+    );
+    assert_eq!(
+        decode.match_stage(2, [(1, None), (2, None)].into_iter()),
+        StageMatch::Passed
+    );
+    assert_eq!(
+        decode.match_stage(2, [(1, None)].into_iter()),
+        StageMatch::PopulationChanged
+    );
+    let mut summary = AuditSummaryV2::new(1);
+    // A real Unknown consumes a stage trigger just as it consumes an attempt.
+    summary.trigger_progress[0].stage_seen = true;
+    summary.record(0, None).unwrap();
+    assert!(summary.record(0, None).is_err());
+    summary.finish();
+    assert_eq!(summary.attempted_triggers, 1);
+    assert!(!summary.all_declared_requirements_recorded);
+}
+
+#[test]
+fn required_future_cli_stage_wire_requires_one_mode_and_a_fixed_cohort() {
+    let manifest = declared();
+    let config = manifest.validation_model.required_audit().unwrap().clone();
+    let mut stage = config.clone();
+    stage.triggers[0].before_wave_attempt = None;
+    stage.triggers[0].when = Some(AuditFrontierTriggerV2::InitialPrefillReady);
+    stage.validate(&manifest).unwrap();
+    let wire = serde_json::to_value(&stage).unwrap();
+    assert!(wire["triggers"][0].get("before_wave_attempt").is_none());
+    assert_eq!(wire["triggers"][0]["when"]["kind"], "initial_prefill_ready");
+    serde_json::from_value::<AuditConfigV2>(wire)
+        .unwrap()
+        .validate(&manifest)
+        .unwrap();
+    let mut invalid = stage.clone();
+    invalid.triggers[0].before_wave_attempt = NonZeroU64::new(2);
+    assert!(invalid.validate(&manifest).is_err());
+    let mut invalid = config;
+    invalid.triggers[0].before_wave_attempt = None;
+    assert!(invalid.validate(&manifest).is_err());
+    let mut rolling = manifest.clone();
+    rolling.training[0].rolling_window = Some(manifest::RollingWindow {
+        maximum_in_flight: NonZeroUsize::new(1).unwrap(),
+    });
+    assert!(stage.validate(&rolling).is_err());
+    let mut summary = AuditSummaryV2::new(1);
+    summary.trigger_progress[0].untriggered_reason =
+        Some(UntriggeredReason::StagePassedBeforeReadiness);
+    summary.finish();
+    assert_eq!(summary.remaining_trigger_indices, vec![0]);
+    assert_eq!(summary.attempted_triggers, 0);
+    assert!(!summary.all_declared_requirements_recorded);
 }

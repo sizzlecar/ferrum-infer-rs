@@ -89,3 +89,88 @@ fn required_future_audit_plan_bounds_precede_any_projector() {
     p.limits.maximum_coordinates = NonZeroUsize::new(65_537).unwrap();
     assert!(p.validate(1).is_err());
 }
+
+#[tokio::test]
+async fn required_future_readiness_waits_for_each_real_admission_without_reserving() {
+    let (mut session, executor) = fixture(2).await;
+    let (a, mut output_a) = add(&mut session, 4).await;
+    let (b, mut output_b) = add(&mut session, 4).await;
+    let initial = session.frontiers().unwrap();
+    assert_eq!(initial.len(), 2); // logical population alone is insufficient
+    let observed = session.audit_frontier_readiness_v2(&initial).unwrap();
+    assert_eq!(
+        observed
+            .rows
+            .iter()
+            .filter(|r| r.physically_admitted)
+            .count(),
+        0
+    );
+    assert!(!observed.all_ready());
+    admit(&mut session).await;
+    let observed = session
+        .audit_frontier_readiness_v2(&session.frontiers().unwrap())
+        .unwrap();
+    assert_eq!(
+        observed
+            .rows
+            .iter()
+            .filter(|r| r.physically_admitted)
+            .count(),
+        1
+    );
+    assert!(!observed.all_ready());
+    admit(&mut session).await;
+    let ready_frontiers = session.frontiers().unwrap();
+    for _ in 0..2 {
+        assert!(session
+            .audit_frontier_readiness_v2(&ready_frontiers)
+            .unwrap()
+            .all_ready());
+    }
+    assert_eq!(executor.entries.load(Ordering::Acquire), 0);
+    assert!(session.engine.inner.sequences.read().values().all(|s| {
+        s.generated_tokens.is_empty() && s.credited_output.as_ref().unwrap().grant.is_none()
+    }));
+    assert!(session
+        .audit_frontier_readiness_v2(&ready_frontiers[..1])
+        .is_err());
+    let work = ready_frontiers
+        .iter()
+        .map(|f| f.prefill_work(NonZeroU32::new(4).unwrap()).unwrap())
+        .collect();
+    wave(&mut session, &executor, work).await;
+    drop(bounded(output_a.frames.next()).await.unwrap());
+    drop(bounded(output_b.frames.next()).await.unwrap());
+    ready(&session, &a, false).await;
+    ready(&session, &b, false).await;
+    let after = session.frontiers().unwrap();
+    assert!(after
+        .iter()
+        .all(|f| f.generated_tokens() == 1 && f.prefill_progress().is_none()));
+    assert!(session
+        .audit_frontier_readiness_v2(&after)
+        .unwrap()
+        .all_ready());
+    assert!(session
+        .audit_frontier_readiness_v2(&ready_frontiers)
+        .is_err());
+    assert_eq!(executor.entries.load(Ordering::Acquire), 1);
+    drop((output_a, output_b));
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn required_future_readiness_rejects_foreign_frontiers_without_a_seed() {
+    let (mut session, executor) = fixture(1).await;
+    let (mut other, _) = fixture(1).await;
+    let (_, output) = add(&mut session, 4).await;
+    let (_, foreign) = add(&mut other, 4).await;
+    assert!(session
+        .audit_frontier_readiness_v2(&other.frontiers().unwrap())
+        .is_err());
+    assert_eq!(executor.entries.load(Ordering::Acquire), 0);
+    drop((output, foreign));
+    session.shutdown().await.unwrap();
+    other.shutdown().await.unwrap();
+}
