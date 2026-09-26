@@ -406,15 +406,18 @@ fn coalesce_program_binding_transfers(
         let packed_bytes = row_bytes.checked_mul(layout.row_count).ok_or_else(|| {
             CudaDeviceRuntimeError::contract("CUDA program binding packed rows exceed usize")
         })?;
-        let payload = if layout.source_writes.len() == 1 {
-            std::mem::take(&mut writes[layout.source_writes.start].payload)
-        } else {
-            let mut payload = Vec::with_capacity(packed_bytes);
-            for write in &writes[layout.source_writes] {
-                payload.extend_from_slice(&write.payload);
-            }
-            payload.into_boxed_slice()
-        };
+        let payload =
+            if layout.source_write_ranges.len() == 1 && layout.source_write_ranges[0].len() == 1 {
+                std::mem::take(&mut writes[layout.source_write_ranges[0].start].payload)
+            } else {
+                let mut payload = Vec::with_capacity(packed_bytes);
+                for range in layout.source_write_ranges {
+                    for write in &writes[range] {
+                        payload.extend_from_slice(&write.payload);
+                    }
+                }
+                payload.into_boxed_slice()
+            };
         debug_assert_eq!(payload.len(), packed_bytes);
         transfers.push(CudaProgramBindingTransfer {
             destination_offset_bytes: layout.destination_offset_bytes,
@@ -425,6 +428,60 @@ fn coalesce_program_binding_transfers(
         });
     }
     Ok(transfers)
+}
+
+fn enqueue_program_binding_transfers(
+    stream: &CudaStream,
+    regions: &[CudaBufferRegion],
+    host_storage: &[Box<[u8]>],
+    transfer_shapes: &[(usize, usize, usize)],
+) -> Result<(), CudaDeviceRuntimeError> {
+    if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA sparse program binding transfer storage differs from its shape",
+        ));
+    }
+    for ((region, payload), &(destination_pitch, row_bytes, row_count)) in
+        regions.iter().zip(host_storage).zip(transfer_shapes)
+    {
+        if row_count == 1 {
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    region.device_ptr,
+                    payload.as_ref(),
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("sparse program binding upload", error)
+            })?;
+            continue;
+        }
+        let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
+            srcHost: payload.as_ptr().cast(),
+            srcDevice: 0,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: row_bytes,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: region.device_ptr,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: destination_pitch,
+            WidthInBytes: row_bytes,
+            Height: row_count,
+        };
+        unsafe { cudarc::driver::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }
+            .result()
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("strided sparse program binding upload", error)
+            })?;
+    }
+    Ok(())
 }
 
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
@@ -1339,55 +1396,7 @@ impl CudaDeviceCommand {
             regions,
             host_storage,
             enqueue: Mutex::new(Box::new(move |stream, _blas, regions, host_storage| {
-                if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
-                    return Err(CudaDeviceRuntimeError::contract(
-                        "CUDA sparse program binding transfer storage differs from its shape",
-                    ));
-                }
-                for ((region, payload), &(destination_pitch, row_bytes, row_count)) in
-                    regions.iter().zip(host_storage).zip(&transfer_shapes)
-                {
-                    if row_count == 1 {
-                        unsafe {
-                            cudarc::driver::result::memcpy_htod_async(
-                                region.device_ptr,
-                                payload.as_ref(),
-                                stream.cu_stream(),
-                            )
-                        }
-                        .map_err(|error| {
-                            CudaDeviceRuntimeError::driver("sparse program binding upload", error)
-                        })?;
-                        continue;
-                    }
-                    let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
-                        srcXInBytes: 0,
-                        srcY: 0,
-                        srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
-                        srcHost: payload.as_ptr().cast(),
-                        srcDevice: 0,
-                        srcArray: std::ptr::null_mut(),
-                        srcPitch: row_bytes,
-                        dstXInBytes: 0,
-                        dstY: 0,
-                        dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                        dstHost: std::ptr::null_mut(),
-                        dstDevice: region.device_ptr,
-                        dstArray: std::ptr::null_mut(),
-                        dstPitch: destination_pitch,
-                        WidthInBytes: row_bytes,
-                        Height: row_count,
-                    };
-                    unsafe { cudarc::driver::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }
-                        .result()
-                        .map_err(|error| {
-                            CudaDeviceRuntimeError::driver(
-                                "strided sparse program binding upload",
-                                error,
-                            )
-                        })?;
-                }
-                Ok(())
+                enqueue_program_binding_transfers(stream, regions, host_storage, &transfer_shapes)
             })),
         });
         Ok(vec![Self {
@@ -4247,6 +4256,105 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an actual CUDA device; production sparse enqueue byte roundtrip"]
+    fn sparse_program_binding_cross_slot_2d_roundtrip_preserves_holes_and_changed_payload() {
+        const ARENA_BYTES: usize = 320;
+        const GUARD_BYTES: usize = 16;
+        let runtime = CudaDeviceRuntime::new(
+            crate::backend::cuda::vnext_ops::cuda_vnext_runtime_config(
+                0,
+                DeviceId::new("device.test.sparse-binding-roundtrip").unwrap(),
+                AttentionExecutionPolicy::Portable,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let allocation_bytes = ARENA_BYTES + 2 * GUARD_BYTES;
+        let base = stream.stream.alloc_zeros::<u8>(allocation_bytes).unwrap();
+        let pointer = base.device_ptr(&stream.stream).0;
+        let allocation = Arc::new(CudaAllocation {
+            _base: base,
+            _memory_charge: None,
+            aligned_ptr: pointer,
+            requested_bytes: allocation_bytes as u64,
+        });
+        // Three 64B slots contain interleaved 4B and 8B live rows. A separate
+        // 5B tail exercises the 1D path alongside the regrouped 2D transfers.
+        let spans = [
+            (0, 2),
+            (2, 2),
+            (16, 8),
+            (64, 1),
+            (65, 3),
+            (80, 8),
+            (128, 4),
+            (144, 8),
+            (256, 5),
+        ];
+        for generation in 0..2_u8 {
+            let sentinel = 0xa7 + generation;
+            let mut expected = vec![sentinel; allocation_bytes];
+            let mut writes = Vec::new();
+            for (index, &(offset, length)) in spans.iter().enumerate() {
+                let payload = (0..length)
+                    .map(|byte| generation * 71 + index as u8 * 11 + byte as u8)
+                    .collect::<Vec<_>>();
+                expected[GUARD_BYTES + offset..GUARD_BYTES + offset + length]
+                    .copy_from_slice(&payload);
+                writes.push(program_binding_write(offset as u64, payload));
+            }
+            writes.reverse();
+            let transfers = coalesce_program_binding_transfers(writes, ARENA_BYTES as u64).unwrap();
+            assert!(transfers.iter().any(|transfer| transfer.row_count > 1));
+            assert!(transfers.iter().any(|transfer| transfer.row_count == 1));
+            let mut regions = Vec::new();
+            let mut payloads = Vec::new();
+            let mut shapes = Vec::new();
+            for transfer in transfers {
+                let span = transfer.destination_stride_bytes * (transfer.row_count as u64 - 1)
+                    + transfer.row_bytes as u64;
+                assert!(transfer.destination_offset_bytes + span <= ARENA_BYTES as u64);
+                regions.push(CudaBufferRegion {
+                    _allocation: Arc::clone(&allocation),
+                    _core_retention: None,
+                    reusable_address_scope: None,
+                    runtime_instance: runtime.runtime_instance,
+                    device_ptr: pointer + GUARD_BYTES as u64 + transfer.destination_offset_bytes,
+                    length_bytes: span,
+                    element_type: ElementType::U8,
+                });
+                shapes.push((
+                    transfer.destination_stride_bytes as usize,
+                    transfer.row_bytes,
+                    transfer.row_count,
+                ));
+                payloads.push(transfer.payload);
+            }
+            unsafe {
+                cudarc::driver::result::memset_d8_async(
+                    pointer,
+                    sentinel,
+                    allocation_bytes,
+                    stream.stream.cu_stream(),
+                )
+            }
+            .unwrap();
+            // This is the exact production enqueue helper, not another CUDA
+            // copy implementation. Retain all device/host owners through sync.
+            enqueue_program_binding_transfers(&stream.stream, &regions, &payloads, &shapes)
+                .unwrap();
+            stream.stream.synchronize().unwrap();
+            let mut actual = vec![0_u8; allocation_bytes];
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut actual, pointer) }.unwrap();
+            assert_eq!(
+                actual, expected,
+                "generation {generation}: full arena and guards"
+            );
+        }
+    }
+
+    #[test]
     fn sparse_program_binding_transfers_preserve_live_bytes_and_destination_offsets() {
         let transfers = coalesce_program_binding_transfers(
             vec![
@@ -4398,28 +4506,77 @@ mod tests {
         }
         assert_eq!(logical_patches.len(), 64);
 
-        let transfers = coalesce_program_binding_transfers(
-            logical_patches.into_iter().flatten().collect(),
+        let writes = logical_patches.into_iter().flatten().collect::<Vec<_>>();
+        let numeric_writes = writes
+            .iter()
+            .map(|write| {
+                ferrum_interfaces::vnext::ProgramBindingCostWrite::new(
+                    write.destination_offset_bytes,
+                    write.payload.len() as u64,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let future_layout = ferrum_interfaces::vnext::coalesce_sorted_program_binding_writes(
+            &numeric_writes,
             arena_size,
+            &mut || Ok(()),
         )
         .unwrap();
-        let live_payload_bytes = transfers
-            .iter()
-            .map(|transfer| transfer.payload.len())
-            .sum::<usize>();
-        assert_eq!(live_payload_bytes, 65_536);
-        assert_eq!(transfers.len(), 32);
-        assert_eq!(transfers[0].destination_offset_bytes, 0);
-        assert_eq!(transfers[0].row_bytes, 1_616);
-        assert_eq!(transfers[0].row_count, 1);
+        let source_payloads = writes.iter().map(|w| w.payload.clone()).collect::<Vec<_>>();
+        let mut expected = std::collections::BTreeMap::new();
+        for write in &writes {
+            for (byte, value) in write.payload.iter().copied().enumerate() {
+                assert!(expected
+                    .insert(write.destination_offset_bytes + byte as u64, value)
+                    .is_none());
+            }
+        }
+        let transfers = coalesce_program_binding_transfers(writes, arena_size).unwrap();
+        assert_eq!(transfers.len(), future_layout.len());
+        let mut actual = std::collections::BTreeMap::new();
+        for (transfer, projected) in transfers.iter().zip(&future_layout) {
+            assert_eq!(
+                transfer.destination_offset_bytes,
+                projected.destination_offset_bytes
+            );
+            assert_eq!(
+                transfer.destination_stride_bytes,
+                projected.destination_stride_bytes
+            );
+            assert_eq!(transfer.row_bytes as u64, projected.row_bytes);
+            assert_eq!(transfer.row_count, projected.row_count);
+            let projected_payload = projected
+                .source_write_ranges
+                .iter()
+                .flat_map(|range| range.clone())
+                .flat_map(|index| source_payloads[index].iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(transfer.payload.as_ref(), projected_payload);
+            assert_eq!(
+                transfer.payload.len(),
+                transfer.row_bytes * transfer.row_count
+            );
+            for row in 0..transfer.row_count {
+                let destination = transfer.destination_offset_bytes
+                    + row as u64 * transfer.destination_stride_bytes;
+                for byte in 0..transfer.row_bytes {
+                    let address = destination + byte as u64;
+                    assert!(address < arena_size);
+                    assert!(
+                        actual
+                            .insert(address, transfer.payload[row * transfer.row_bytes + byte])
+                            .is_none(),
+                        "live destination byte may be written only once"
+                    );
+                }
+            }
+        }
+        assert_eq!(expected.len(), 65_536);
         assert_eq!(
-            transfers[1].destination_offset_bytes,
-            3 * recurrent_slot_capacity + causal_row_capacity,
+            actual, expected,
+            "exact live bytes; no address in an arena hole is written"
         );
-        assert_eq!(transfers[1].destination_stride_bytes, causal_row_capacity);
-        assert_eq!(transfers[1].row_bytes, CAUSAL_ROW_BYTES);
-        assert_eq!(transfers[1].row_count, 31);
-        assert_eq!(transfers[2].destination_offset_bytes, group_capacity);
     }
 
     pub(super) fn command(operation: &'static str) -> CudaDeviceCommand {

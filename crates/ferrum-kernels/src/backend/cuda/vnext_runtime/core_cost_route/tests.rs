@@ -1,6 +1,78 @@
 use super::super::{coalesce_program_binding_transfers, CudaProgramBindingWrite};
 use super::*;
 
+#[test]
+fn indexed_binding_groups_actual_payload_and_future_recipe_use_the_same_physical_plan() {
+    let command = binding(2, 2);
+    let first = spans(&[(0, 2), (2, 2), (16, 8)]);
+    let second = spans(&[(0, 1), (1, 3), (16, 8)]);
+    let patches = [
+        ProgramBindingCostPatch {
+            node_index: 1,
+            command: &command,
+            writes: &first,
+        },
+        ProgramBindingCostPatch {
+            node_index: 4,
+            command: &command,
+            writes: &second,
+        },
+    ];
+    let projected = project_binding_slots(
+        96,
+        [(1, 0, 32), (4, 64, 32)].into_iter(),
+        &patches,
+        &mut || Ok(()),
+        SloStructuredCostCapture::HostSettledV1,
+    )
+    .unwrap();
+    let mut actual_writes = Vec::new();
+    for (slot, patch) in [0, 64].into_iter().zip(&patches) {
+        for write in patch.writes {
+            actual_writes.push(
+                CudaProgramBindingWrite::new(
+                    slot + write.offset_bytes(),
+                    vec![(slot + write.offset_bytes()) as u8; write.length_bytes() as usize]
+                        .into_boxed_slice(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    actual_writes.reverse();
+    let actual = coalesce_program_binding_transfers(actual_writes, 96).unwrap();
+    assert_eq!(actual.len(), 2);
+    assert_eq!(actual[0].payload.as_ref(), &[0, 0, 2, 2, 64, 65, 65, 65]);
+    assert_eq!(
+        actual[1].payload.as_ref(),
+        &[16; 8].into_iter().chain([80; 8]).collect::<Vec<_>>()
+    );
+    assert!(actual
+        .iter()
+        .all(|t| t.row_count == 2 && t.destination_stride_bytes == 64));
+    let observed = super::super::selected_cost::program_binding(
+        actual.iter().map(|t| {
+            (
+                t.destination_stride_bytes,
+                t.row_bytes as u64,
+                t.row_count as u64,
+            )
+        }),
+        2,
+        SloStructuredCostCapture::HostSettledV1,
+    )
+    .unwrap();
+    let expected = projected.statistical_evidence().unwrap();
+    assert_eq!(projected.transfer_command_count(), 2);
+    assert_eq!(observed.family_signature(), expected.family_signature());
+    assert_eq!(observed.work(), expected.work());
+    assert_eq!(observed.work().host_to_device_bytes, 24);
+    assert_eq!(
+        observed.algorithm_work().unwrap().unwrap(),
+        expected.algorithm_work().unwrap().unwrap()
+    );
+}
+
 fn binding(participants: u32, tokens: u64) -> OperationCostCommand {
     OperationCostCommand::new(
         "fixture.binding",
