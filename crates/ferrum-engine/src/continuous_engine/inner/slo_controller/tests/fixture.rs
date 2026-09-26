@@ -630,19 +630,37 @@ impl ControlledExecutor {
             .iter()
             .map(|&index| self.evidence.sessions[index].as_ref())
             .collect::<Vec<_>>();
-        let route = self
-            .evidence
-            .fixture
-            .as_ref()
-            .unwrap()
-            .plan_resources
-            .execution_cost_route_view(
+        let resources = &self.evidence.fixture.as_ref().unwrap().plan_resources;
+        let tokens = vec![1; sessions.len()];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let route = loop {
+            let route = resources.execution_cost_route_view(
                 &sessions,
-                &vec![1; sessions.len()],
+                &tokens,
                 self.evidence.lane.as_ref().unwrap().as_ref(),
                 limits,
                 budget,
             );
+            match route {
+                // Distinct fixture cleanup domains still share one status
+                // registry mutex. Wait only for this unrelated try-read race,
+                // before any executor entry; recapture the full real view.
+                // Saturation, stale/unsupported evidence and all other read
+                // failures remain Unknown. Never reset the caller's budget.
+                ExecutionCostRouteAvailability::Unknown(
+                    vnext::ExecutionCostRouteUnknown::Resource(
+                        ResourcePlanningUnknown::ReadUnavailable(
+                            vnext::ResourcePlanningReadStage::DeferredCleanup,
+                        ),
+                    ),
+                ) if std::time::Instant::now() < deadline && budget.has_budget() => {
+                    std::thread::yield_now();
+                }
+                // On either deadline keep the final actual Unknown; do not
+                // substitute a cached view or turn contention into Known.
+                other => break other,
+            }
+        };
         if let ExecutionCostRouteAvailability::Unknown(reason) = &route {
             *self.cost_route_unknown.lock() = Some(*reason);
             eprintln!("controlled executor cost route unavailable: {reason:?}");
