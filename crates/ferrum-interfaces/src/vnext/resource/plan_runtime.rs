@@ -1008,9 +1008,9 @@ where
             runtime,
             deferred_cleanup_domain,
         } = resources;
-        debug_assert!(retire_deferred_device_cleanup_domain(
-            deferred_cleanup_domain
-        ));
+        // Registry retirement is required in release builds as well.
+        let cleanup_domain_retired = retire_deferred_device_cleanup_domain(deferred_cleanup_domain);
+        debug_assert!(cleanup_domain_retired);
         drop(lifecycle_tx);
         drop(maintenance_controller);
         drop(dynamic_pools);

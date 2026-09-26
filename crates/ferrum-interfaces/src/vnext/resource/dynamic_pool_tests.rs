@@ -1813,6 +1813,42 @@ fn saturated_cleanup_backlog_blocks_new_authority_until_maintenance() {
 }
 
 #[test]
+fn closing_plan_retires_drained_cleanup_domain_in_all_build_profiles() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 512);
+    let harness = harness(runtime, catalog, 512, false);
+    let domain = harness.root.deferred_cleanup_domain;
+    defer_device_cleanup(
+        domain,
+        CleanupPressureTask {
+            ready: Arc::new(AtomicBool::new(true)),
+        },
+    );
+    let receipt = harness.root.maintain_deferred_cleanups(1).unwrap();
+    assert_eq!(receipt.completed(), 1);
+    assert_eq!(receipt.status_after().pending(), 0);
+    assert_eq!(receipt.status_after().submitted_total(), 1);
+    assert_eq!(receipt.status_after().completed_total(), 1);
+
+    close_dynamic_test_root(harness.root);
+
+    // An empty, still-registered domain retains its historical totals. Zero
+    // totals here prove the real close retired it, even without debug asserts.
+    let retired = deferred_device_cleanup_status(domain);
+    assert_eq!(retired.pending(), 0);
+    assert_eq!(retired.submitted_total(), 0);
+    assert_eq!(retired.attempted_total(), 0);
+    assert_eq!(retired.completed_total(), 0);
+}
+
+#[test]
 fn zero_initial_capacity_defers_until_typed_initialization() {
     let catalog = pool_catalog(
         linear_profile(),
