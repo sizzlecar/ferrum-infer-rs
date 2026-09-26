@@ -9,7 +9,7 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::SloStructuredCostCapture;
 
 #[derive(Clone, Copy)]
-struct Shape {
+pub(super) struct Shape {
     tokens: u64,
     rows: i32,
     hidden: i32,
@@ -22,6 +22,17 @@ struct Shape {
 }
 
 impl Shape {
+    pub(super) fn project(
+        self,
+        tokens: u64,
+        identity: CublasHandleApiIdentity,
+    ) -> Option<SelectedCommandCostEvidenceV1> {
+        if tokens != self.tokens {
+            return None;
+        }
+        self.selected(SloStructuredCostCapture::HostSettledV1, Some(identity))
+    }
+
     fn new(tokens: u64, hidden: u64, intermediate: u64) -> Result<Self, String> {
         let activation_elements = tokens
             .checked_mul(intermediate)
@@ -229,6 +240,13 @@ pub(super) fn encode(
         regions,
     } = prepare(operation, &invocation)?;
     let selected = rounded.then(|| shape.selected(capture, identity)).flatten();
+    let recipe = if rounded && !capture.is_disabled() {
+        identity.and_then(|identity| {
+            replay_cost::CudaReplayCostRecipe::dense(&invocation, shape, identity)
+        })
+    } else {
+        None
+    };
     let silu_mul = silu_mul.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(fingerprint, "vnext_dense_swiglu")
         .i32(shape.rows)
@@ -289,6 +307,7 @@ pub(super) fn encode(
         command
             .with_statistical_evidence(selected)
             .with_cublas_cost_requirement(identity)
+            .with_replay_cost_recipe(recipe)
     } else {
         command
     })

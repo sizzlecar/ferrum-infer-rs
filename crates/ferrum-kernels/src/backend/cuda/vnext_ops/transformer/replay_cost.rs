@@ -8,14 +8,24 @@ use std::sync::Arc;
 
 pub(crate) struct CudaReplayCostRecipe {
     captured_work: DeviceReplayCostWork,
-    primitive: cost_route::Primitive,
-    hidden: u64,
+    kind: RecipeKind,
+}
+
+enum RecipeKind {
+    Primitive {
+        primitive: cost_route::Primitive,
+        hidden: u64,
+    },
+    NativeFfn(native_swiglu::replay_cost::Recipe),
+    DenseFfn {
+        shape: dense_swiglu_api::Shape,
+        identity: cublas_api::CublasHandleApiIdentity,
+    },
 }
 impl std::fmt::Debug for CudaReplayCostRecipe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaReplayCostRecipe")
             .field("captured_work", &self.captured_work)
-            .field("hidden", &self.hidden)
             .finish_non_exhaustive()
     }
 }
@@ -36,8 +46,32 @@ impl CudaReplayCostRecipe {
         }
         let recipe = Self {
             captured_work: invocation.replay_cost_work()?,
-            primitive,
-            hidden,
+            kind: RecipeKind::Primitive { primitive, hidden },
+        };
+        recipe.project(&recipe.captured_work)?;
+        Some(Arc::new(recipe))
+    }
+
+    pub(super) fn native(
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+        numeric: native_swiglu::replay_cost::Recipe,
+    ) -> Option<Arc<Self>> {
+        let recipe = Self {
+            captured_work: invocation.replay_cost_work()?,
+            kind: RecipeKind::NativeFfn(numeric),
+        };
+        recipe.project(&recipe.captured_work)?;
+        Some(Arc::new(recipe))
+    }
+
+    pub(super) fn dense(
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+        shape: dense_swiglu_api::Shape,
+        identity: cublas_api::CublasHandleApiIdentity,
+    ) -> Option<Arc<Self>> {
+        let recipe = Self {
+            captured_work: invocation.replay_cost_work()?,
+            kind: RecipeKind::DenseFfn { shape, identity },
         };
         recipe.project(&recipe.captured_work)?;
         Some(Arc::new(recipe))
@@ -51,7 +85,7 @@ impl CudaReplayCostRecipe {
         &self,
         current: &DeviceReplayCostWork,
     ) -> Option<SelectedCommandCostEvidenceV1> {
-        // Packed primitives fix total M, not the individual row partition.
+        // Packed kernels fix total M, not the individual row partition.
         // Token values/source positions and a legal equal-total partition may
         // change; current resource windows were independently revalidated.
         if current.tokens() != self.captured_work.tokens()
@@ -59,11 +93,17 @@ impl CudaReplayCostRecipe {
         {
             return None;
         }
-        cost_route::selected(
-            self.primitive,
-            current.tokens(),
-            self.hidden,
-            SloStructuredCostCapture::HostSettledV1,
-        )
+        match &self.kind {
+            RecipeKind::Primitive { primitive, hidden } => cost_route::selected(
+                *primitive,
+                current.tokens(),
+                *hidden,
+                SloStructuredCostCapture::HostSettledV1,
+            ),
+            RecipeKind::NativeFfn(recipe) => {
+                recipe.project(current.tokens(), current.participant_ranges())
+            }
+            RecipeKind::DenseFfn { shape, identity } => shape.project(current.tokens(), *identity),
+        }
     }
 }

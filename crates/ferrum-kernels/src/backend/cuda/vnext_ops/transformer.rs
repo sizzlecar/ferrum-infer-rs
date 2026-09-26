@@ -712,6 +712,8 @@ impl CudaDenseSwiGluProvider {
             include_str!("transformer/native_swiglu.rs").as_bytes(),
             include_bytes!("transformer/native_swiglu/prepared.rs"),
             include_bytes!("transformer/native_swiglu/selected.rs"),
+            include_bytes!("transformer/native_swiglu/replay_cost.rs"),
+            include_bytes!("transformer/replay_cost.rs"),
             include_bytes!("native_blocks/linear_launch.rs"),
             include_bytes!("native_blocks/selected.rs"),
             include_str!("transformer/native_swiglu/route_selection.rs").as_bytes(),
@@ -855,6 +857,10 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
+    fn uses_captured_replay_cost_recipe(&self) -> bool {
+        true
+    }
+
     fn replayed_compute_cost_evidence(
         &self,
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,

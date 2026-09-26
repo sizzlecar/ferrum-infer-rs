@@ -38,20 +38,75 @@ pub(super) fn swiglu(
     mmq_hit: bool,
     capture: SloStructuredCostCapture,
 ) -> Option<SelectedCommandCostEvidenceV1> {
+    if capture.is_disabled() {
+        return None;
+    }
+    let layouts = MmqLayouts::from_selected(mmq, mmq_hit, down, hidden, intermediate)?;
+    swiglu_planned(
+        gate_up,
+        down,
+        rows,
+        tokens,
+        hidden,
+        intermediate,
+        transform_bytes,
+        q8_bytes,
+        q8,
+        layouts,
+        capture,
+    )
+}
+
+/// The actual selector's numeric workspace/CTA/precision plan. It retains no
+/// function, stream, buffer or live device authority.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MmqLayouts {
+    gate: Option<stream_mmq::Workspace>,
+    down: Option<stream_mmq::Workspace>,
+}
+
+impl MmqLayouts {
+    pub(super) fn from_selected(
+        mmq: Option<&StreamMmq>,
+        mmq_hit: bool,
+        down: &[weights::MatrixPart],
+        hidden: u32,
+        intermediate: u32,
+    ) -> Option<Self> {
+        let down = if mmq_hit
+            && mmq?.is_residual2()
+            && stream_mmq::eligible_q4_down(down, 8, intermediate, hidden)
+        {
+            Some(mmq?.workspace(intermediate, hidden).ok()?)
+        } else {
+            None
+        };
+        let gate = if mmq_hit {
+            Some(mmq?.workspace(hidden, intermediate).ok()?)
+        } else {
+            None
+        };
+        Some(Self { gate, down })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn swiglu_planned(
+    gate_up: &[weights::MatrixPart],
+    down: &[weights::MatrixPart],
+    rows: impl IntoIterator<Item = u32>,
+    tokens: u64,
+    hidden: u32,
+    intermediate: u32,
+    transform_bytes: u64,
+    q8_bytes: u64,
+    q8: Option<Q8SumPolicy>,
+    layouts: MmqLayouts,
+    capture: SloStructuredCostCapture,
+) -> Option<SelectedCommandCostEvidenceV1> {
     let mut builder = selected_cost::builder(capture, tokens)?;
-    let mmq_down = if mmq_hit
-        && mmq?.is_residual2()
-        && stream_mmq::eligible_q4_down(down, 8, intermediate, hidden)
-    {
-        Some(mmq?.workspace(intermediate, hidden).ok()?)
-    } else {
-        None
-    };
-    let mmq = if mmq_hit {
-        Some(mmq?.workspace(hidden, intermediate).ok()?)
-    } else {
-        None
-    };
+    let mmq = layouts.gate;
+    let mmq_down = layouts.down;
     let doubled = intermediate.checked_mul(2)?;
     let inventory_matches = |parts: &[weights::MatrixPart], columns: u32, outputs: u32| {
         parts.iter().try_fold(0_u32, |end, part| {

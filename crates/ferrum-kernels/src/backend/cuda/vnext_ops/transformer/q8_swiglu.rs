@@ -46,6 +46,8 @@ impl CudaQ8SwiGluProvider {
             include_str!("native_swiglu.rs").as_bytes(),
             include_bytes!("native_swiglu/prepared.rs"),
             include_bytes!("native_swiglu/selected.rs"),
+            include_bytes!("native_swiglu/replay_cost.rs"),
+            include_bytes!("replay_cost.rs"),
             include_bytes!("../native_blocks/linear_launch.rs"),
             include_bytes!("../native_blocks/selected.rs"),
             include_bytes!("../native_blocks/hadamard.rs"),
@@ -133,6 +135,10 @@ impl OperationResourceEstimator for CudaQ8SwiGluProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaQ8SwiGluProvider {
+    fn uses_captured_replay_cost_recipe(&self) -> bool {
+        true
+    }
+
     fn replayed_compute_cost_evidence(
         &self,
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,

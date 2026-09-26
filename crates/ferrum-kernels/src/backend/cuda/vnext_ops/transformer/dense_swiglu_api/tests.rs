@@ -50,6 +50,11 @@ fn cublas_ffn_complete_sequence_keeps_api_calls_distinct_from_native_activation(
         "different M cannot borrow captured GemmEx parameters"
     );
     let shape = Shape::new(3, 64, 96).unwrap();
+    let projected = shape.project(3, identity).unwrap();
+    assert_eq!(projected, a);
+    assert_eq!(projected.algorithm_work(), a.algorithm_work());
+    template.validate_binding(&projected).unwrap();
+    assert!(shape.project(7, identity).is_none());
     assert!(shape
         .selected(SloStructuredCostCapture::Disabled, Some(identity))
         .is_none());

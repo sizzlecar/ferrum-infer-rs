@@ -9,6 +9,7 @@ use super::*;
 
 mod cost_route;
 mod prepared;
+pub(super) mod replay_cost;
 mod route_selection;
 mod selected;
 pub(super) use cost_route::{
@@ -191,6 +192,21 @@ fn encode_with_policy(
     capture: ferrum_types::SloStructuredCostCapture,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
+    let prepared = prepared::prepare(
+        fingerprint,
+        q8.map(Q8F32ScaleKernels::policy),
+        mmq,
+        capture,
+        &invocation,
+    )?;
+    let recipe = if capture.is_disabled() {
+        None
+    } else {
+        replay_cost::Recipe::from_prepared(&prepared, q8.map(Q8F32ScaleKernels::policy), mmq)
+            .and_then(|numeric| {
+                super::replay_cost::CudaReplayCostRecipe::native(&invocation, numeric)
+            })
+    };
     let prepared::Prepared {
         regions,
         gate_up,
@@ -205,13 +221,7 @@ fn encode_with_policy(
         mmq_bytes,
         selection,
         key,
-    } = prepared::prepare(
-        fingerprint,
-        q8.map(Q8F32ScaleKernels::policy),
-        mmq,
-        capture,
-        &invocation,
-    )?;
+    } = prepared;
     let native_name = selection.command.native_operation();
     let mmq_hit = selection.mmq_hit;
     let kernels = kernels.clone();
@@ -280,6 +290,7 @@ fn encode_with_policy(
         Ok(())
     })
     .and_then(|command| super::super::cost_route::apply(command, selection.command))
+    .map(|command| command.with_replay_cost_recipe(recipe))
     .map_err(|error| error.to_string())
 }
 

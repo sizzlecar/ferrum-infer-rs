@@ -7,6 +7,9 @@ mod head_family;
 #[path = "q8_ffn_cost_family.rs"]
 mod q8_ffn_family;
 
+#[path = "cuda_ffn_replay.rs"]
+mod ffn_replay;
+
 #[test]
 fn selected_cuda_q8_ffn_complete_future_route_matches_real_scalar_and_packed_outputs() {
     // These are the two existing opt-in policies, not a new numerical scope.
