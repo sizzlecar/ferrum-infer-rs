@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[path = "build_support/host.rs"]
 mod host;
 use host::HostTools;
+#[path = "build_support/core_ptx.rs"]
+mod core_ptx;
 #[path = "build_support/gguf.rs"]
 mod gguf;
 
@@ -1182,6 +1184,7 @@ sha256={} import_dir={}",
 fn main() {
     initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support/core_ptx.rs");
     println!("cargo:rerun-if-changed=build_support/host.rs");
     if env::var_os("CARGO_FEATURE_CUDA").is_some()
         && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
@@ -1269,22 +1272,10 @@ fn detect_cuda_compute_cap() -> String {
     cap
 }
 
-fn core_ptx_signature(kernel: &str, flags: &[String]) -> String {
-    let mut lines = Vec::with_capacity(2 + flags.len() + CORE_PTX_HEADERS.len());
-    lines.push(format!("label=core-ptx"));
-    lines.push(format!("kernel={kernel}"));
-    lines.extend(flags.iter().map(|f| format!("flag={f}")));
-    lines.push(file_fingerprint(kernel));
-    lines.extend(CORE_PTX_HEADERS.iter().map(|p| file_fingerprint(p)));
-    if kernel == gguf::KERNEL {
-        lines.extend(gguf::INPUTS.iter().map(|path| file_fingerprint(path)));
-    }
-    lines.join("\n")
-}
-
 fn content_core_ptx_signature(kernel: &str, flags: &[String]) -> String {
-    let mut lines = Vec::with_capacity(2 + flags.len() + CORE_PTX_HEADERS.len());
+    let mut lines = Vec::with_capacity(3 + flags.len() + CORE_PTX_HEADERS.len());
     lines.push("label=core-ptx".to_string());
+    lines.push(format!("output_contract={}", core_ptx::OUTPUT_CONTRACT));
     lines.push(format!("kernel={kernel}"));
     lines.extend(flags.iter().map(|flag| format!("flag={flag}")));
     lines.push(sha256_file_fingerprint(Path::new(kernel)));
@@ -1316,21 +1307,11 @@ fn core_ptx_cache_state(out_dir: &Path, kernel: &str, signature: &str) -> CacheS
     if !stamp.is_file() {
         return CacheState::Stale("missing-stamp");
     }
-    match fs::read_to_string(&stamp) {
-        Ok(existing) if existing == signature => CacheState::Fresh("signature-match"),
-        Ok(_) => CacheState::Stale("signature-changed"),
-        Err(_) => CacheState::Stale("stamp-read-error"),
+    match core_ptx::local_artifact_matches(out_dir, &format!("{stem}.ptx"), signature) {
+        Ok(true) => CacheState::Fresh("signature-and-artifact-match"),
+        Ok(false) => CacheState::Stale("signature-or-artifact-changed"),
+        Err(_) => CacheState::Stale("artifact-or-stamp-read-error"),
     }
-}
-
-fn write_core_ptx_stamp(out_dir: &Path, kernel: &str, signature: &str) {
-    let stem = Path::new(kernel)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .expect("kernel filename");
-    let stamp = out_dir.join(format!("{stem}.ptx.stamp"));
-    fs::write(&stamp, signature)
-        .unwrap_or_else(|e| panic!("[core-ptx] failed to write stamp {}: {e}", stamp.display()));
 }
 
 fn write_core_ptx_bindings(out_dir: &Path) {
@@ -1432,7 +1413,6 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         if *kernel == gguf::KERNEL {
             flags.push(format!("-I{}", out_dir.display()));
         }
-        let legacy_signature = core_ptx_signature(kernel, &flags);
         let content_signature = content_core_ptx_signature(kernel, &flags);
         let signature = cuda_native_input_signature(&content_signature);
         let stem = Path::new(kernel)
@@ -1468,8 +1448,12 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     &stamp_file_name,
                     &signature,
                     &[],
-                    &[&legacy_signature],
+                    &[], // Pre-contract PTX may certify stale bytes; no migration.
                 ) {
+                    core_ptx::record_restored_artifact(out_dir, &file_name, &signature)
+                        .unwrap_or_else(|error| {
+                            panic!("[core-ptx] restored output verification failed: {error}")
+                        });
                     emit_cuda_build_summary(
                         &format!("core-ptx:{}", Path::new(kernel).display()),
                         "cache_hit",
@@ -1489,62 +1473,71 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     selected_nvcc_identity,
                     "[core-ptx] NVCC changed before compilation"
                 );
-                let mut command = std::process::Command::new(&nvcc);
-                command
-                    .arg(format!("--gpu-architecture=sm_{compute_cap}"))
-                    .arg("--ptx")
-                    .args(["--default-stream", "per-thread"])
-                    .args([
-                        "--output-directory",
-                        out_dir.to_str().expect("OUT_DIR utf8"),
-                    ])
-                    .arg("-Ikernels")
-                    .arg("--expt-relaxed-constexpr")
-                    .arg("-std=c++17")
-                    .arg("-O3");
-                if precise_math {
-                    command.arg("--fmad=false");
-                } else {
-                    command.arg("--use_fast_math");
-                }
-                if *kernel == gguf::KERNEL {
-                    command.arg(format!("-I{}", out_dir.display()));
-                }
-                command.args(environment_option);
-                if let Some(cuda_include) = &cuda_include {
-                    command.arg(format!("-I{}", cuda_include.display()));
-                }
-                if let Some(ccbin) = &ccbin {
-                    if HostTools::current() == HostTools::Unix {
-                        // Preserve the existing Unix build configuration.
-                        command.arg("-allow-unsupported-compiler");
-                    }
-                    command.args(["-ccbin", ccbin]);
-                }
-                command.arg(kernel);
-                let output = command
-                    .output()
-                    .unwrap_or_else(|e| panic!("[core-ptx] nvcc spawn failed for {kernel}: {e}"));
-                if !output.status.success() {
-                    panic!(
-                        "[core-ptx] nvcc failed compiling {kernel}: {:?}\n\n# stdout\n{}\n\n# stderr\n{}",
-                        command,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                assert_eq!(
-                    invocation_identity(),
-                    selected_nvcc_identity,
-                    "[core-ptx] NVCC changed during compilation"
-                );
-                write_core_ptx_stamp(out_dir, kernel, &signature);
-                publish_cuda_build_artifact(
-                    native_build_cache,
-                    &artifact_id,
+                let artifact = core_ptx::compile_and_publish(
+                    out_dir,
                     &file_name,
                     &signature,
-                    &out_dir.join(&file_name),
+                    |output_path| {
+                        let mut command = std::process::Command::new(&nvcc);
+                        command
+                            .arg(format!("--gpu-architecture=sm_{compute_cap}"))
+                            .arg("--ptx")
+                            .args(["--default-stream", "per-thread"])
+                            .arg("--output-file")
+                            .arg(output_path)
+                            .arg("-Ikernels")
+                            .arg("--expt-relaxed-constexpr")
+                            .arg("-std=c++17")
+                            .arg("-O3");
+                        if precise_math {
+                            command.arg("--fmad=false");
+                        } else {
+                            command.arg("--use_fast_math");
+                        }
+                        if *kernel == gguf::KERNEL {
+                            command.arg(format!("-I{}", out_dir.display()));
+                        }
+                        command.args(environment_option);
+                        if let Some(cuda_include) = &cuda_include {
+                            command.arg(format!("-I{}", cuda_include.display()));
+                        }
+                        if let Some(ccbin) = &ccbin {
+                            if HostTools::current() == HostTools::Unix {
+                                command.arg("-allow-unsupported-compiler");
+                            }
+                            command.args(["-ccbin", ccbin]);
+                        }
+                        command.arg(kernel);
+                        let output = command.output()?;
+                        if !output.status.success() {
+                            return Err(std::io::Error::other(format!(
+                                "nvcc failed compiling {kernel}: {command:?}\n# stdout\n{}\n# stderr\n{}",
+                                String::from_utf8_lossy(&output.stdout),
+                                String::from_utf8_lossy(&output.stderr)
+                            )));
+                        }
+                        assert_eq!(
+                            invocation_identity(),
+                            selected_nvcc_identity,
+                            "[core-ptx] NVCC changed during compilation"
+                        );
+                        Ok(())
+                    },
+                    |verified_path| {
+                        publish_cuda_build_artifact(
+                            native_build_cache,
+                            &artifact_id,
+                            &file_name,
+                            &signature,
+                            verified_path,
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("[core-ptx] output publication failed for {kernel}: {error}"));
+                eprintln!(
+                    "[core-ptx] artifact={artifact_id} verified_sha256={} bytes={} output_contract={}",
+                    artifact.sha256, artifact.size_bytes, core_ptx::OUTPUT_CONTRACT
                 );
                 emit_cuda_build_summary(
                     &format!("core-ptx:{}", Path::new(kernel).display()),
