@@ -1333,7 +1333,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         wave: &'a PreparedStepSubmissionWave<R>,
         node_index: usize,
         active_bindings: I,
-    ) -> Result<(), VNextError>
+    ) -> Result<crate::vnext::DeviceReplayCostWork, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
@@ -1367,7 +1367,9 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 true,
             )?;
         }
-        Ok(())
+        crate::vnext::DeviceReplayCostWork::from_shape(resources.work_shape()?).ok_or_else(|| {
+            invalid_operation("resident cost work exceeds the bounded exact row population")
+        })
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
@@ -1416,6 +1418,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         } else {
             operation.with_dynamic_binding(command)
         }
+    }
+
+    /// Passive numeric work, after this invocation's full resource validation.
+    pub fn replay_cost_work(&self) -> Option<crate::vnext::DeviceReplayCostWork> {
+        crate::vnext::DeviceReplayCostWork::from_shape(self.work_shape())
     }
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {

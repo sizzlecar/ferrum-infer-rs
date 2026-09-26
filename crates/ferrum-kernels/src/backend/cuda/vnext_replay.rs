@@ -289,6 +289,7 @@ struct CudaExecutableSegment {
     command_graph_node_counts: Option<Arc<[u32]>>,
     // Sealed at actual successful capture, not reconstructed during register.
     selected_replay_templates: Option<Box<[Option<SelectedReplayAlgorithmTemplateV1>]>>,
+    selected_replay_recipes: Option<Box<[Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>]>>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -766,6 +767,23 @@ impl CudaExecutableSegment {
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             command_graph_node_counts,
+            selected_replay_recipes: (commands.len() <= MAX_COST_COMMANDS
+                && commands
+                    .iter()
+                    .any(|command| command.replay_cost_recipe().is_some()))
+            .then(|| {
+                commands
+                    .iter()
+                    .map(|command| {
+                        command
+                            .cublas_cost_requirement()
+                            .matches_observed(blas_cost_identity)
+                            .then(|| command.replay_cost_recipe())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            }),
             selected_replay_templates: (commands.len() <= MAX_COST_COMMANDS
                 && commands
                     .iter()
@@ -786,6 +804,20 @@ impl CudaExecutableSegment {
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
+        })
+    }
+
+    fn bind_replay_cost(
+        &self,
+        invocation: &DeviceReusableExecutionInvocation,
+        sealed: &[ferrum_interfaces::vnext::DeviceReplayedLogicalCommandAttribution],
+    ) -> Option<Vec<ferrum_interfaces::vnext::DeviceReplayedLogicalCommandAttribution>> {
+        invocation.bind_replayed_cost_evidence_with(sealed, |ordinal, current| {
+            self.selected_replay_recipes
+                .as_deref()?
+                .get(ordinal as usize)?
+                .as_ref()?
+                .project(current)
         })
     }
 
@@ -1841,8 +1873,8 @@ impl CudaExecutableCache {
             invocation.program_id().clone(),
             segment.descriptor.clone(),
             segment.reusable_executable_fingerprint.to_string(),
-            invocation
-                .bind_replayed_cost_evidence(segment.logical_commands.as_ref()?.as_ref())
+            executable
+                .bind_replay_cost(invocation, segment.logical_commands.as_ref()?.as_ref())
                 .unwrap_or_else(|| {
                     segment
                         .logical_commands
@@ -1884,8 +1916,9 @@ impl CudaExecutableCache {
                     .logical_commands
                     .as_ref()
                     .map(|sealed| {
-                        invocation
-                            .bind_replayed_cost_evidence(sealed.as_ref())
+                        self.entries
+                            .get(&key)
+                            .and_then(|entry| entry.bind_replay_cost(invocation, sealed.as_ref()))
                             .map(Arc::from)
                             .unwrap_or_else(|| Arc::clone(sealed))
                     })

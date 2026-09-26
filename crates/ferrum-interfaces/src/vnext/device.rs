@@ -24,6 +24,8 @@ pub use cost_graph::*;
 mod cost_range;
 mod replay_cost;
 pub use cost_range::*;
+pub use replay_cost::DeviceReplayCostWork;
+pub(crate) use replay_cost::ReplayCostInput;
 mod submission_guard;
 pub use submission_guard::*;
 mod submission_readback;
@@ -1584,8 +1586,7 @@ impl DeviceReusableExecutionProgram {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceReusableExecutionInvocation {
     #[serde(skip)]
-    selected_replay_cost:
-        Option<Arc<[Option<crate::execution_cost::SelectedCommandCostEvidenceV1>]>>,
+    selected_replay_cost: Option<Arc<[replay_cost::ReplayCostInput]>>,
     program_id: DeviceReusableExecutionProgramId,
     segment: DeviceReusableExecutionSegment,
     participant_count: u32,

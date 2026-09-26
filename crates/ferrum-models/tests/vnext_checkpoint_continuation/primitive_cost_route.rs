@@ -483,10 +483,10 @@ fn execute(
     }
     #[cfg(feature = "cuda")]
     if let Some(required) = require_selected {
-        for index in [0_u32, 4] {
+        for index in [0_u32, 1, 2, 4] {
             let [projected] = routes[index as usize]
                 .as_ref()
-                .expect("embedding and argmax must have declared routes")
+                .expect("embedding, RMS, residual and argmax must have declared routes")
                 .commands()
             else {
                 panic!("one primitive command")
@@ -506,7 +506,7 @@ fn execute(
                     .filter(|c| c.node_index() == index)
                     .collect::<Vec<_>>();
                 let [actual] = rows.as_slice() else {
-                    panic!("selected IO node must really replay")
+                    panic!("selected primitive node must really replay")
                 };
                 actual.statistical_evidence()
             } else {
@@ -520,7 +520,7 @@ fn execute(
                     })
                     .collect::<Vec<_>>();
                 let [actual] = rows.as_slice() else {
-                    panic!("selected IO node must execute once")
+                    panic!("selected primitive node must execute once")
                 };
                 actual.statistical_evidence()
             };
@@ -537,6 +537,10 @@ fn execute(
             );
             if let (Some(actual), Some(expected)) = (actual, expected) {
                 assert_eq!(actual, expected);
+                assert_eq!(
+                    actual.independent_attention_family_v2(),
+                    expected.independent_attention_family_v2()
+                );
                 assert_eq!(
                     actual.algorithm_work().unwrap().unwrap(),
                     expected.algorithm_work().unwrap().unwrap()

@@ -93,6 +93,7 @@ pub(super) use transformer::cublas_api::{
     CapturedCublasCostContract, CublasCostIdentitySource, CublasCostRequirement,
     CublasHandleApiIdentity,
 };
+pub(crate) use transformer::replay_cost::CudaReplayCostRecipe;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";

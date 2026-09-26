@@ -94,6 +94,7 @@ mod native_matrix;
 mod native_swiglu;
 mod precision;
 mod q8_swiglu;
+pub(super) mod replay_cost;
 mod stream_mmq_swiglu;
 #[cfg(test)]
 mod test_support;
@@ -245,6 +246,7 @@ impl CudaRmsNormProvider {
                 include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 include_str!("transformer/precision.rs").as_bytes(),
                 include_str!("transformer/cost_route.rs").as_bytes(),
+                include_str!("transformer/replay_cost.rs").as_bytes(),
                 crate::ptx::RMS_NORM.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
@@ -283,6 +285,10 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
+    fn uses_captured_replay_cost_recipe(&self) -> bool {
+        true
+    }
+
     fn reusable_execution_cost_topology(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -1398,6 +1404,7 @@ impl CudaResidualAddProvider {
                 include_str!("transformer/dense_swiglu_api.rs").as_bytes(),
                 include_str!("transformer/precision.rs").as_bytes(),
                 include_str!("transformer/cost_route.rs").as_bytes(),
+                include_str!("transformer/replay_cost.rs").as_bytes(),
                 crate::ptx::RESIDUAL_ADD.as_bytes(),
                 precision.kernel().as_bytes(),
             ]),
@@ -1436,6 +1443,10 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
 }
 
 impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
+    fn uses_captured_replay_cost_recipe(&self) -> bool {
+        true
+    }
+
     fn reusable_execution_cost_topology(
         &self,
         request: ferrum_interfaces::vnext::OperationCostRouteRequest<'_>,
@@ -1869,6 +1880,12 @@ fn encode_rms_norm(
         epsilon,
         participant_count,
     } = prepare_rms_norm(&invocation, precision)?;
+    let recipe = replay_cost::CudaReplayCostRecipe::primitive(
+        &invocation,
+        cost_route::Primitive::RmsNorm { precision, epsilon },
+        hidden_size as u64,
+        structured_capture,
+    );
     let function = function.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_rms_norm")
         .u32(rows)
@@ -1910,6 +1927,7 @@ fn encode_rms_norm(
             structured_capture,
         )
     })
+    .map(|command| command.with_replay_cost_recipe(recipe))
     .map_err(|error| error.to_string())
 }
 
@@ -4216,6 +4234,12 @@ fn encode_residual_add(
         elements,
         grid_x,
     } = prepare_residual_add(&invocation, precision)?;
+    let recipe = replay_cost::CudaReplayCostRecipe::primitive(
+        &invocation,
+        cost_route::Primitive::ResidualAdd { precision },
+        hidden_size,
+        structured_capture,
+    );
     let function = function.clone();
     let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_residual_add")
         .i32(elements)
@@ -4255,6 +4279,7 @@ fn encode_residual_add(
             structured_capture,
         )
     })
+    .map(|command| command.with_replay_cost_recipe(recipe))
     .map_err(|error| error.to_string())
 }
 

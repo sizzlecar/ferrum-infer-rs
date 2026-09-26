@@ -4,6 +4,51 @@ use super::*;
 use crate::execution_cost::{
     SelectedCommandCostEvidenceV1, SelectedReplayAlgorithmTemplateV1, MAX_COST_COMMANDS,
 };
+use crate::vnext::BatchWorkShape;
+
+/// Current numeric work minted from a core-validated complete invocation.
+/// This passive value carries no buffer, lease or execution authority. The
+/// resident projector may only use it for content-independent computation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceReplayCostWork {
+    tokens: u64,
+    participant_ranges: Arc<[std::ops::Range<u64>]>,
+}
+impl DeviceReplayCostWork {
+    pub(crate) fn from_shape(shape: &BatchWorkShape) -> Option<Self> {
+        let rows = shape.participant_token_ranges();
+        if rows.is_empty() || rows.len() > crate::execution_cost::MAX_COST_ROWS {
+            return None;
+        }
+        let mut end = 0;
+        for row in rows {
+            let range = row.immediate_token_range();
+            if range.start != end || range.end <= range.start {
+                return None;
+            }
+            end = range.end;
+        }
+        if end != shape.immediate_tokens() {
+            return None;
+        }
+        Some(Self {
+            tokens: end,
+            participant_ranges: rows.iter().map(|row| row.immediate_token_range()).collect(),
+        })
+    }
+    pub fn tokens(&self) -> u64 {
+        self.tokens
+    }
+    pub fn participant_ranges(&self) -> &[std::ops::Range<u64>] {
+        &self.participant_ranges
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ReplayCostInput {
+    Selected(Option<SelectedCommandCostEvidenceV1>),
+    CapturedRecipe(DeviceReplayCostWork),
+}
 
 impl PartialEq for DeviceReusableExecutionInvocation {
     fn eq(&self, other: &Self) -> bool {
@@ -32,7 +77,27 @@ impl DeviceReusableExecutionInvocation {
                 .checked_add(self.segment.logical_command_count())
                 == Some(self.segment.end_node_index())
         {
-            self.selected_replay_cost = Some(selected.into());
+            self.selected_replay_cost = Some(
+                selected
+                    .into_iter()
+                    .map(ReplayCostInput::Selected)
+                    .collect(),
+            );
+        }
+        self
+    }
+
+    pub(crate) fn with_replay_cost_inputs(mut self, inputs: Vec<ReplayCostInput>) -> Self {
+        self.selected_replay_cost = None;
+        if inputs.len() <= MAX_COST_COMMANDS
+            && inputs.len() == self.segment.logical_command_count() as usize
+            && self
+                .segment
+                .start_node_index()
+                .checked_add(self.segment.logical_command_count())
+                == Some(self.segment.end_node_index())
+        {
+            self.selected_replay_cost = Some(inputs.into());
         }
         self
     }
@@ -43,6 +108,17 @@ impl DeviceReusableExecutionInvocation {
     pub fn bind_replayed_cost_evidence(
         &self,
         sealed: &[DeviceReplayedLogicalCommandAttribution],
+    ) -> Option<Vec<DeviceReplayedLogicalCommandAttribution>> {
+        self.bind_replayed_cost_evidence_with(sealed, |_, _| None)
+    }
+
+    /// The backend supplies its recipe from the exact matched resident segment,
+    /// sealed only after successful capture. Failed projection retains the
+    /// ordinal as Unknown; it never requests a different provider or execution.
+    pub fn bind_replayed_cost_evidence_with(
+        &self,
+        sealed: &[DeviceReplayedLogicalCommandAttribution],
+        mut project: impl FnMut(u32, &DeviceReplayCostWork) -> Option<SelectedCommandCostEvidenceV1>,
     ) -> Option<Vec<DeviceReplayedLogicalCommandAttribution>> {
         let selected = self.selected_replay_cost.as_deref()?;
         if sealed.len() != selected.len()
@@ -65,8 +141,15 @@ impl DeviceReusableExecutionInvocation {
                 .map(|(row, current)| {
                     let mut bound = row.clone();
                     bound.statistical_evidence = None;
-                    bound.statistical_evidence =
-                        row.bind_current_cost_evidence(current.as_ref()).cloned();
+                    bound.statistical_evidence = match current {
+                        ReplayCostInput::Selected(current) => {
+                            row.bind_current_cost_evidence(current.as_ref()).cloned()
+                        }
+                        ReplayCostInput::CapturedRecipe(work) => {
+                            let current = project(row.logical_command_ordinal, work);
+                            row.bind_current_cost_evidence(current.as_ref()).cloned()
+                        }
+                    };
                     bound
                 })
                 .collect(),
@@ -286,5 +369,51 @@ mod tests {
             .unwrap()
             .iter()
             .all(|r| r.statistical_evidence().is_none()));
+    }
+    #[test]
+    fn captured_recipe_projection_preserves_mixed_population_and_fixed_launch_checks() {
+        let current = evidence("a", 257, 64);
+        let other = evidence("b", 513, 64);
+        let captured = [evidence("a", 32, 64), evidence("b", 32, 64)];
+        let rows = [sealed(0, &captured[0]), sealed(1, &captured[1])];
+        let work = DeviceReplayCostWork {
+            tokens: 3,
+            participant_ranges: Arc::from([0..1, 1..3]),
+        };
+        let invocation = invocation().with_replay_cost_inputs(vec![
+            ReplayCostInput::CapturedRecipe(work.clone()),
+            ReplayCostInput::Selected(Some(other.clone())),
+        ]);
+        let bound = invocation
+            .bind_replayed_cost_evidence_with(&rows, |ordinal, actual| {
+                assert_eq!(ordinal, 0);
+                assert_eq!(actual, &work);
+                Some(current.clone())
+            })
+            .unwrap();
+        assert_eq!(bound, rows);
+        assert_eq!(
+            bound[0].statistical_evidence().unwrap().algorithm_work(),
+            current.algorithm_work()
+        );
+        assert_eq!(
+            bound[1].statistical_evidence().unwrap().algorithm_work(),
+            other.algorithm_work()
+        );
+        let unavailable = invocation.bind_replayed_cost_evidence(&rows).unwrap();
+        assert!(unavailable[0].statistical_evidence().is_none());
+        assert!(unavailable[1].statistical_evidence().is_some());
+        let wrong_fixed = invocation
+            .bind_replayed_cost_evidence_with(&rows, |_, _| Some(evidence("a", 257, 65)))
+            .unwrap();
+        assert!(wrong_fixed[0].statistical_evidence().is_none());
+        assert!(wrong_fixed[1].statistical_evidence().is_some());
+        let mut wrong_ordinal = rows.clone();
+        wrong_ordinal.swap(0, 1);
+        assert!(invocation
+            .bind_replayed_cost_evidence_with(&wrong_ordinal, |_, _| panic!(
+                "invalid resident population must not project"
+            ))
+            .is_none());
     }
 }

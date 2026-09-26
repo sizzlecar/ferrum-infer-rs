@@ -627,7 +627,16 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         Ok(None)
     }
 
+    /// Explicitly opts a content-independent provider into a numerical recipe
+    /// sealed by its actual CUDA capture. Core still freshly checks all current
+    /// resources. An absent/invalid recipe remains Unknown; no legacy retry.
+    /// Providers with dynamic context/binding-dependent cost must keep false.
+    fn uses_captured_replay_cost_recipe(&self) -> bool {
+        false
+    }
+
     /// Opts a binding-only encoder into a smaller physical view projection.
+
     /// The default preserves the full invocation, including for providers
     /// whose binding encoder delegates to `encode_selected`.
     fn reusable_binding_resources(&self) -> ReusableBindingResources {

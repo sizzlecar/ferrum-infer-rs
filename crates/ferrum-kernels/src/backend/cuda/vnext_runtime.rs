@@ -433,6 +433,7 @@ pub struct CudaDeviceCommand {
     library_cost_requirement: super::vnext_ops::CublasCostRequirement,
     completion_checks: Vec<Arc<CudaCompletionReadback>>,
     statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+    replay_cost_recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
     core_transfer: Option<(
         ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
         u64,
@@ -781,6 +782,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         })
@@ -827,6 +829,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         })
@@ -862,6 +865,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         }
@@ -930,6 +934,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         })
@@ -953,6 +958,31 @@ impl CudaDeviceCommand {
 
     pub(crate) fn cublas_cost_requirement(&self) -> super::vnext_ops::CublasCostRequirement {
         self.library_cost_requirement
+    }
+
+    /// Seal only a numerical recipe that reproduces this real command's entire
+    /// selected table. It has no buffers and is not resident until capture succeeds.
+    pub(crate) fn with_replay_cost_recipe(
+        mut self,
+        recipe: Option<Arc<super::vnext_ops::CudaReplayCostRecipe>>,
+    ) -> Self {
+        self.replay_cost_recipe = recipe.filter(|recipe| {
+        self.statistical_evidence.as_ref().is_some_and(|actual| {
+            recipe.captured_evidence().is_some_and(|projected| {
+                    projected == *actual
+                        && projected.algorithm_work() == actual.algorithm_work()
+                        && projected.independent_attention_family_v2() == actual.independent_attention_family_v2()
+                        && ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1::from_selected(
+                            &projected, self.token_count, self.compute_dispatch_count, self.transfer_command_count,
+                        ).ok().is_some_and(|template| template.validate_binding(actual).is_ok())
+                })
+        })
+    });
+        self
+    }
+
+    pub(crate) fn replay_cost_recipe(&self) -> Option<Arc<super::vnext_ops::CudaReplayCostRecipe>> {
+        self.replay_cost_recipe.clone()
     }
 
     /// Passive evidence never changes submission permission or inference output.
@@ -1076,6 +1106,7 @@ impl CudaDeviceCommand {
             reusable_execution: Some(invocation),
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         }
@@ -1442,6 +1473,7 @@ impl CudaDeviceCommand {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,
         }])
@@ -4408,6 +4440,7 @@ mod tests {
             reusable_execution: None,
             completion_checks: Vec::new(),
             statistical_evidence: None,
+            replay_cost_recipe: None,
             library_cost_requirement:
                 crate::backend::cuda::vnext_ops::CublasCostRequirement::NotRequired,
             core_transfer: None,

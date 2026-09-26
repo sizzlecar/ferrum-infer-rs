@@ -1870,8 +1870,8 @@ impl OperationDispatch {
                     }
                     // Optional diagnostics only. Every resident node keeps its
                     // ordinal even when its producer/physical projection fails.
-                    // Use full real resources for the passive producer; leave
-                    // the existing dynamic-binding encoder invocation unchanged.
+                    // Captured recipes use the shared fresh checks without executable views;
+                    // other providers retain their original full producer.
                     let selected_replay_cost = if runtime.structured_cost_capture()
                         == ferrum_types::SloStructuredCostCapture::HostSettledV1
                         && segment.logical_command_count() as usize
@@ -1887,22 +1887,45 @@ impl OperationDispatch {
                                     let index = usize::try_from(cost_node_index).ok()?;
                                     let provider = providers.get(index)?;
                                     let identity = batch_identity.materialize_node(index).ok()?;
-                                    let invocation = BatchedOperationInvocation::from_wave_node(
-                                        runtime,
-                                        resolved,
-                                        provider.dispatch(),
-                                        batch_identity,
-                                        identity,
-                                        completion.wave(),
-                                        index,
-                                        active_bindings.clone(),
-                                    )
-                                    .ok()?;
-                                    provider
-                                        .provider()
-                                        .replayed_compute_cost_evidence(&invocation)
+                                    if provider.provider().uses_captured_replay_cost_recipe() {
+                                        BatchedOperationInvocation::validate_replay_cost_resources(
+                                            runtime,
+                                            resolved,
+                                            provider.dispatch(),
+                                            batch_identity,
+                                            identity,
+                                            completion.wave(),
+                                            index,
+                                            active_bindings.clone(),
+                                        )
                                         .ok()
-                                        .flatten()
+                                        .map(crate::vnext::device::ReplayCostInput::CapturedRecipe)
+                                    } else {
+                                        let invocation =
+                                            BatchedOperationInvocation::from_wave_node(
+                                                runtime,
+                                                resolved,
+                                                provider.dispatch(),
+                                                batch_identity,
+                                                identity,
+                                                completion.wave(),
+                                                index,
+                                                active_bindings.clone(),
+                                            )
+                                            .ok()?;
+                                        Some(crate::vnext::device::ReplayCostInput::Selected(
+                                            provider
+                                                .provider()
+                                                .replayed_compute_cost_evidence(&invocation)
+                                                .ok()
+                                                .flatten(),
+                                        ))
+                                    }
+                                })
+                                .map(|input| {
+                                    input.unwrap_or(
+                                        crate::vnext::device::ReplayCostInput::Selected(None),
+                                    )
                                 })
                                 .collect::<Vec<_>>(),
                         )
@@ -1925,7 +1948,7 @@ impl OperationDispatch {
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
                     let invocation = match selected_replay_cost {
-                        Some(selected) => invocation.with_selected_replay_cost(selected),
+                        Some(selected) => invocation.with_replay_cost_inputs(selected),
                         None => invocation,
                     };
                     let compute = runtime
