@@ -19,6 +19,7 @@
 use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_bench_core::env::HttpRequestSampling;
+use ferrum_bench_core::slo::AdmissionEvidence;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, BenchmarkPhase,
     BenchmarkRequestCorrelation, Env, ItlEvidenceSource, OutputTokenCountSource,
@@ -42,9 +43,15 @@ use crate::config::CliConfig;
 
 mod decode_isolation;
 mod sampling;
+mod sharegpt;
+mod slo_report;
 
 use decode_isolation::{BenchServeWorkload, DecodeIsolationArgs};
 use sampling::BenchSamplingArgs;
+use sharegpt::ShareGptArgs;
+use slo_report::{
+    CollectedRequest, CollectedRequests, CollectedRun, RequestArrivalEvidence, SloBenchmarkArgs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchTargetBackend {
@@ -136,7 +143,7 @@ pub struct BenchServeCommand {
     pub request_rate: Option<f64>,
 
     // ─── Dataset ───────────────────────────────────────────────────
-    /// Dataset: `random` (tokenizer-aware), `sharegpt` (load from JSONL),
+    /// Dataset: `random` (tokenizer-aware), `sharegpt` (JSON array or JSONL),
     /// `shared-prefix` (1024-tok shared prefix + unique suffix).
     /// PLAYBOOK § 2 Scenario A (sharegpt) / Scenario C (shared-prefix).
     #[arg(long, default_value = "random")]
@@ -146,7 +153,8 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 256)]
     pub random_input_len: usize,
 
-    /// Max output tokens per request.
+    /// Max output tokens per random/shared-prefix request. ShareGPT uses each
+    /// reference answer's token count or --sharegpt-fixed-output-tokens.
     #[arg(long, default_value_t = 128)]
     pub random_output_len: usize,
 
@@ -164,12 +172,13 @@ pub struct BenchServeCommand {
     #[arg(long, value_name = "LEVEL")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`, standard
-    /// workloads only).
-    /// Each line should be a `{"conversations": [{"from": "...", "value":
-    /// "..."}, ...]}` object (HF anon8231489123/ShareGPT_Vicuna format).
+    /// ShareGPT JSON array or JSONL, using each record's first human/gpt pair.
+    /// Original prompt text is preserved; filters never truncate it.
     #[arg(long)]
     pub sharegpt_path: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub sharegpt: ShareGptArgs,
 
     /// Shared prefix length in *tokens* (`--dataset shared-prefix`, standard
     /// workloads only).
@@ -203,6 +212,9 @@ pub struct BenchServeCommand {
     /// are set.
     #[arg(long, value_parser = parse_slo)]
     pub goodput: Option<Slo>,
+
+    #[command(flatten)]
+    pub slo: SloBenchmarkArgs,
 
     /// Per-request HTTP timeout in seconds.
     #[arg(long, default_value_t = 600.0)]
@@ -332,6 +344,8 @@ struct PromptCase {
     text: String,
     input_tokens: u32,
     sha256: String,
+    /// Dataset-owned output budget; None preserves the random workload budget.
+    output_budget: Option<usize>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -381,6 +395,7 @@ pub(super) struct ObservedRequest {
     pub record: RequestRecord,
     pub started_at: Instant,
     pub output_event_times: Vec<Instant>,
+    pub admission: AdmissionEvidence,
 }
 
 async fn stream_one_observed(
@@ -401,7 +416,9 @@ async fn stream_one_observed(
         text,
         input_tokens,
         sha256: prompt_sha256,
+        output_budget,
     } = prompt;
+    let max_tokens = output_budget.unwrap_or(max_tokens);
     let body = chat_completion_body(
         model,
         &text,
@@ -420,6 +437,8 @@ async fn stream_one_observed(
     );
     state.expected_completion_tokens = ignore_eos
         .then(|| u32::try_from(max_tokens).expect("validated output token limit fits u32"));
+    state.maximum_completion_tokens = output_budget
+        .map(|tokens| u32::try_from(tokens).expect("validated dataset output budget fits u32"));
 
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
@@ -455,6 +474,7 @@ async fn stream_one_observed(
             quality_issues.malformed_stream = 1;
             publish_stream_finished(&progress, 0);
             return ObservedRequest {
+                admission: AdmissionEvidence::Unknown,
                 record: failed_record(input_tokens, start, quality_issues, correlation),
                 started_at: start,
                 output_event_times: vec![],
@@ -477,6 +497,11 @@ async fn stream_one_observed(
         }
         publish_stream_finished(&progress, 0);
         return ObservedRequest {
+            admission: if status.as_u16() == 429 {
+                AdmissionEvidence::Rejected
+            } else {
+                AdmissionEvidence::Unknown
+            },
             record: failed_record(input_tokens, start, quality_issues, correlation),
             started_at: start,
             output_event_times: vec![],
@@ -586,6 +611,7 @@ impl SseLineBuffer {
             return;
         };
         if payload == "[DONE]" {
+            state.observed_service_acceptance = true;
             state.done_count = state
                 .done_count
                 .checked_add(1)
@@ -606,51 +632,7 @@ impl SseLineBuffer {
     }
 }
 
-fn chat_completion_body(
-    model: &str,
-    prompt_text: &str,
-    max_tokens: usize,
-    ignore_eos: bool,
-    enable_thinking: Option<bool>,
-    reasoning_effort: Option<ReasoningEffort>,
-    sampling: HttpRequestSampling,
-) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt_text}],
-        "max_tokens": max_tokens,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
-    let serde_json::Value::Object(sampling) =
-        serde_json::to_value(sampling).expect("validated HTTP sampling must serialize")
-    else {
-        unreachable!("HTTP sampling serializes as an object");
-    };
-    body.as_object_mut()
-        .expect("request body is an object")
-        .extend(sampling);
-    let mut chat_template_kwargs = serde_json::Map::new();
-    if let Some(enable_thinking) = enable_thinking {
-        chat_template_kwargs.insert(
-            "enable_thinking".to_string(),
-            serde_json::json!(enable_thinking),
-        );
-    }
-    if let Some(reasoning_effort) = reasoning_effort {
-        chat_template_kwargs.insert(
-            "reasoning_effort".to_string(),
-            serde_json::json!(reasoning_effort),
-        );
-    }
-    if !chat_template_kwargs.is_empty() {
-        body["chat_template_kwargs"] = serde_json::Value::Object(chat_template_kwargs);
-    }
-    if ignore_eos {
-        body["ignore_eos"] = serde_json::json!(true);
-    }
-    body
-}
+use super::chat_request::chat_completion_body;
 
 fn failed_record(
     input_tokens: u32,
@@ -696,20 +678,20 @@ fn join_failed_record(
     }
 }
 
-async fn collect_measured_handles(
-    handles: Vec<(
-        u32,
-        BenchmarkRequestCorrelation,
-        tokio::task::JoinHandle<RequestRecord>,
-    )>,
-) -> Vec<RequestRecord> {
-    let mut records = Vec::with_capacity(handles.len());
+async fn collect_measured_handles<T: Into<CollectedRequest>>(
+    handles: Vec<(u32, BenchmarkRequestCorrelation, tokio::task::JoinHandle<T>)>,
+    capture_slo: bool,
+) -> CollectedRequests {
+    let mut records = CollectedRequests::default();
     for (input_tokens, correlation, handle) in handles {
         match handle.await {
-            Ok(record) => records.push(record),
+            Ok(record) => records.push(record.into(), capture_slo),
             Err(error) => {
                 eprintln!("[err] measured request task: {error}");
-                records.push(join_failed_record(input_tokens, correlation));
+                records.push(
+                    join_failed_record(input_tokens, correlation).into(),
+                    capture_slo,
+                );
             }
         }
     }
@@ -717,6 +699,7 @@ async fn collect_measured_handles(
 }
 
 struct StreamState {
+    observed_service_acceptance: bool,
     start: Instant,
     input_tokens: u32,
     usage_prompt_tokens: Option<u32>,
@@ -725,6 +708,7 @@ struct StreamState {
     output_delta_events: u32,
     usage_completion_tokens: Option<u32>,
     expected_completion_tokens: Option<u32>,
+    maximum_completion_tokens: Option<u32>,
     itl_ms: Vec<f64>,
     transport_coalesced_output_chunks: u32,
     done_count: u32,
@@ -749,6 +733,7 @@ impl StreamState {
         benchmark_correlation: Option<BenchmarkRequestCorrelation>,
     ) -> Self {
         Self {
+            observed_service_acceptance: false,
             start,
             input_tokens,
             usage_prompt_tokens: None,
@@ -757,6 +742,7 @@ impl StreamState {
             output_delta_events: 0,
             usage_completion_tokens: None,
             expected_completion_tokens: None,
+            maximum_completion_tokens: None,
             itl_ms: Vec::new(),
             transport_coalesced_output_chunks: 0,
             done_count: 0,
@@ -772,6 +758,9 @@ impl StreamState {
     fn handle_payload(&mut self, payload: &str) -> std::result::Result<(), String> {
         let chunk: OpenAiStreamChunk =
             serde_json::from_str(payload).map_err(|e| format!("{e}: {payload}"))?;
+        if chunk.choices.is_some() || chunk.usage.is_some() || chunk.error.is_some() {
+            self.observed_service_acceptance = true;
+        }
         if let Some(id) = chunk.id.filter(|id| !id.is_empty()) {
             if self
                 .server_request_id
@@ -849,6 +838,18 @@ impl StreamState {
     }
 
     fn finish(mut self) -> RequestRecord {
+        if let Some(maximum) = self.maximum_completion_tokens {
+            if !self
+                .usage_completion_tokens
+                .is_some_and(|tokens| tokens <= maximum)
+            {
+                eprintln!(
+                    "[err] dataset output budget prompt_sha256={}: expected usage completion_tokens <= {maximum}, got {:?}",
+                    self.prompt_sha256, self.usage_completion_tokens
+                );
+                self.quality_issues.bad_output = 1;
+            }
+        }
         if let Some(expected) = self.expected_completion_tokens {
             if self.usage_completion_tokens != Some(expected) {
                 eprintln!(
@@ -911,11 +912,17 @@ impl StreamState {
     fn finish_observed(mut self) -> ObservedRequest {
         let started_at = self.start;
         let output_event_times = std::mem::take(&mut self.output_event_times);
+        let admission = if self.observed_service_acceptance {
+            AdmissionEvidence::Accepted
+        } else {
+            AdmissionEvidence::Unknown
+        };
         let record = self.finish();
         ObservedRequest {
             record,
             started_at,
             output_event_times,
+            admission,
         }
     }
 }
@@ -1195,12 +1202,9 @@ fn build_prompts(
             cmd.shared_suffix_len,
             rng,
         ),
-        "sharegpt" => {
-            let p = cmd.sharegpt_path.as_ref().ok_or_else(|| {
-                ferrum_types::FerrumError::model("--dataset sharegpt requires --sharegpt-path PATH")
-            })?;
-            load_sharegpt_prompts(p, tok, count, rng)
-        }
+        "sharegpt" => Err(ferrum_types::FerrumError::internal(
+            "ShareGPT requires the evidenced dataset selection path",
+        )),
         other => Err(ferrum_types::FerrumError::model(format!(
             "unknown --dataset '{}': allowed values are random, sharegpt, shared-prefix",
             other
@@ -1220,6 +1224,7 @@ fn prompt_case(tok: &tokenizers::Tokenizer, text: String) -> Result<PromptCase> 
         text,
         input_tokens,
         sha256,
+        output_budget: None,
     })
 }
 
@@ -1253,82 +1258,6 @@ fn gen_shared_prefix_prompts(
         .collect()
 }
 
-/// Load up to `count` user-turn prompts from a ShareGPT-format JSONL.
-///
-/// Accepts either:
-///   - HF `anon8231489123/ShareGPT_Vicuna` format: each line is
-///     `{"id": "...", "conversations": [{"from": "human"/"gpt", "value": "..."}]}`
-///   - vLLM-style: `{"input": "..."}` per line
-///
-/// Picks the first `human` turn per conversation (matches vLLM's
-/// benchmark_serving.py heuristic). If `count` < records available,
-/// randomly samples; if `count` > available, cycles with replacement.
-fn load_sharegpt_prompts(
-    path: &std::path::Path,
-    tok: &tokenizers::Tokenizer,
-    count: usize,
-    rng: &mut (impl Rng + ?Sized),
-) -> Result<Vec<PromptCase>> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).map_err(|e| {
-        ferrum_types::FerrumError::model(format!("open sharegpt {}: {e}", path.display()))
-    })?;
-    let mut prompts: Vec<String> = Vec::new();
-    for (idx, line) in std::io::BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| {
-            ferrum_types::FerrumError::model(format!("read line {idx} of {}: {e}", path.display()))
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[warn] sharegpt line {idx}: skip (parse error: {e})");
-                continue;
-            }
-        };
-        // Try ShareGPT-Vicuna format first.
-        let prompt: Option<String> = v
-            .get("conversations")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|t| t.get("from").and_then(|f| f.as_str()) == Some("human"))
-                    .and_then(|t| {
-                        t.get("value")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
-            // Fallback: simple {"input": "..."} format.
-            .or_else(|| {
-                v.get("input")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            });
-        if let Some(p) = prompt {
-            if !p.is_empty() {
-                prompts.push(p);
-            }
-        }
-    }
-    if prompts.is_empty() {
-        return Err(ferrum_types::FerrumError::model(format!(
-            "sharegpt {}: no usable prompts found",
-            path.display()
-        )));
-    }
-    // Sample `count` with replacement (cycles deterministically for the
-    // given seed via rng).
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let idx = rng.random_range(0..prompts.len());
-        out.push(prompt_case(tok, prompts[idx].clone())?);
-    }
-    Ok(out)
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Scenario runners
 // ─────────────────────────────────────────────────────────────────────
@@ -1344,6 +1273,7 @@ struct RunContext {
     sampling: HttpRequestSampling,
     timeout_s: f64,
     benchmark_run_id: Arc<String>,
+    capture_slo: bool,
 }
 
 fn benchmark_request_correlation(
@@ -1399,7 +1329,7 @@ async fn run_closed_loop(
     concurrency: u32,
     cell_id: &str,
     repeat_index: u32,
-) -> RunRecord {
+) -> CollectedRun {
     let n_warmup = warmup_requests as usize;
     let total = prompts.len();
     assert!(
@@ -1455,10 +1385,17 @@ async fn run_closed_loop(
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     let start = Instant::now();
     let mut handles = Vec::with_capacity(total - n_warmup);
+    let mut arrivals = Vec::new();
     for (request_index, prompt) in prompts.into_iter().skip(n_warmup).enumerate() {
         let input_tokens = prompt.input_tokens;
         let permit = sem.clone().acquire_owned().await.expect("semaphore");
         let ctx_c = ctx.clone_inner();
+        if ctx.capture_slo {
+            arrivals.push(RequestArrivalEvidence {
+                dispatched_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+                ..Default::default()
+            });
+        }
         let correlation = benchmark_request_correlation(
             &ctx.benchmark_run_id,
             cell_id,
@@ -1471,7 +1408,7 @@ async fn run_closed_loop(
             correlation.clone(),
             tokio::spawn(async move {
                 let _g = permit;
-                stream_one(
+                let observed = stream_one_observed(
                     &ctx_c.client,
                     &ctx_c.base_url,
                     &ctx_c.model,
@@ -1483,20 +1420,23 @@ async fn run_closed_loop(
                     ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
+                    None,
                 )
-                .await
+                .await;
+                CollectedRequest::observed(observed, ctx_c.capture_slo)
             }),
         ));
     }
-    let records = collect_measured_handles(handles).await;
+    let records = collect_measured_handles(handles, ctx.capture_slo).await;
     let duration_s = start.elapsed().as_secs_f64();
-    RunRecord {
+    slo_report::finish_run(
         records,
-        expected_requests: u32::try_from(total - n_warmup)
-            .expect("measured request count overflow"),
+        u32::try_from(total - n_warmup).expect("measured request count overflow"),
         duration_s,
         warmup,
-    }
+        start,
+        arrivals,
+    )
 }
 
 /// Open-loop: Poisson(rate) arrivals. The arrival schedule is fixed
@@ -1509,7 +1449,7 @@ async fn run_open_loop(
     cell_id: &str,
     repeat_index: u32,
     seed: Option<u64>,
-) -> RunRecord {
+) -> CollectedRun {
     let n_warmup = warmup_requests as usize;
     let total = prompts.len();
     assert!(total > n_warmup);
@@ -1548,11 +1488,25 @@ async fn run_open_loop(
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(measurement_count);
+    let mut arrivals = Vec::new();
     for (i, prompt) in prompts.into_iter().skip(n_warmup).enumerate() {
         let target = schedule[i];
         let now = start.elapsed().as_secs_f64();
         if target > now {
             tokio::time::sleep(Duration::from_secs_f64(target - now)).await;
+        }
+        if ctx.capture_slo {
+            let dispatched = start.elapsed().as_secs_f64();
+            arrivals.push(RequestArrivalEvidence {
+                scheduled_arrival_ms: Some(target * 1000.0),
+                dispatched_ms: Some(dispatched * 1000.0),
+                request_started_ms: None,
+                client_dispatch_backlog: Some(
+                    schedule
+                        .partition_point(|target| *target <= dispatched)
+                        .saturating_sub(i) as u64,
+                ),
+            });
         }
         let ctx_c = ctx.clone_inner();
         let input_tokens = prompt.input_tokens;
@@ -1567,7 +1521,7 @@ async fn run_open_loop(
             input_tokens,
             correlation.clone(),
             tokio::spawn(async move {
-                stream_one(
+                let observed = stream_one_observed(
                     &ctx_c.client,
                     &ctx_c.base_url,
                     &ctx_c.model,
@@ -1579,20 +1533,23 @@ async fn run_open_loop(
                     ctx_c.sampling,
                     ctx_c.timeout_s,
                     correlation,
+                    None,
                 )
-                .await
+                .await;
+                CollectedRequest::observed(observed, ctx_c.capture_slo)
             }),
         ));
     }
-    let records = collect_measured_handles(handles).await;
+    let records = collect_measured_handles(handles, ctx.capture_slo).await;
     let duration_s = start.elapsed().as_secs_f64();
-    RunRecord {
+    slo_report::finish_run(
         records,
-        expected_requests: u32::try_from(measurement_count)
-            .expect("measured request count overflow"),
+        u32::try_from(measurement_count).expect("measured request count overflow"),
         duration_s,
         warmup,
-    }
+        start,
+        arrivals,
+    )
 }
 
 fn open_loop_arrival_schedule(
@@ -1628,6 +1585,7 @@ impl RunContext {
             sampling: self.sampling,
             timeout_s: self.timeout_s,
             benchmark_run_id: self.benchmark_run_id.clone(),
+            capture_slo: self.capture_slo,
         }
     }
 }
@@ -1693,7 +1651,9 @@ async fn execute_cell(
     ctx: &RunContext,
     cell: Cell,
     cell_id: &str,
-) -> Result<BenchReport> {
+    prepared_sharegpt: Option<&[sharegpt::PreparedRepeat]>,
+    slo_config: Option<&slo_report::LoadedSloConfig>,
+) -> Result<(BenchReport, Option<slo_report::SloCellReport>)> {
     // A neutral HTTP client can measure a different backend, so canonical
     // collectors supply the target explicitly. Direct product invocations keep
     // the build-feature fallback and never infer from runtime environment state.
@@ -1728,6 +1688,8 @@ async fn execute_cell(
         .map_err(|_| ferrum_types::FerrumError::model("prompt count exceeds platform capacity"))?;
 
     let mut runs: Vec<RunRecord> = Vec::with_capacity(cmd.n_repeats as usize);
+    let mut slo_repeats = Vec::new();
+    let mut dataset_evidence = None;
     let mut actual_input_lengths: Vec<u32> = Vec::new();
     let mut actual_input_tokens_per_request: Vec<Vec<u32>> =
         Vec::with_capacity(cmd.n_repeats as usize);
@@ -1742,7 +1704,24 @@ async fn execute_cell(
             thread_rng = rand::rng();
             &mut thread_rng
         };
-        let prompts = build_prompts(cmd, &tok, rng, total_prompts)?;
+        let prompts = if cmd.dataset == "sharegpt" {
+            let prepared = prepared_sharegpt
+                .and_then(|repeats| repeats.get(repeat_idx as usize))
+                .ok_or_else(|| {
+                    ferrum_types::FerrumError::internal("missing prepared ShareGPT repeat")
+                })?;
+            let evidence = prepared.evidence.clone();
+            eprintln!(
+                "  ShareGPT source_sha256={} eligible={} selection_sha256={}",
+                evidence.source_sha256,
+                evidence.counts.eligible,
+                evidence.repeats[0].selection_sha256
+            );
+            sharegpt::append_evidence(&mut dataset_evidence, evidence)?;
+            prepared.prompts.clone()
+        } else {
+            build_prompts(cmd, &tok, rng, total_prompts)?
+        };
         let measured_input_lengths: Vec<u32> = prompts
             .iter()
             .skip(cmd.warmup_requests as usize)
@@ -1785,16 +1764,26 @@ async fn execute_cell(
             run.n_errored(),
             run.duration_s
         );
-        runs.push(run);
+        if let Some(config) = slo_config {
+            slo_repeats.push(slo_report::evaluate_run(config, repeat_idx, &run)?);
+        }
+        runs.push(run.legacy);
     }
     let requested_input_len = requested_input_len(cmd)?;
-    let requested_output_len = u32::try_from(cmd.random_output_len).map_err(|_| {
-        ferrum_types::FerrumError::model("random output length exceeds report capacity")
-    })?;
+    let requested_output_len = if cmd.dataset == "sharegpt" {
+        cmd.sharegpt.sharegpt_fixed_output_tokens.unwrap_or(0)
+    } else {
+        u32::try_from(cmd.random_output_len).map_err(|_| {
+            ferrum_types::FerrumError::model("random output length exceeds report capacity")
+        })?
+    };
     let actual_input_tokens = input_token_stats(&actual_input_lengths, requested_input_len);
     let token_count_source = output_token_count_source_from_runs(&runs);
 
-    let env = build_env(cmd, detect_features());
+    let mut env = build_env(cmd, detect_features());
+    if let Some(config) = slo_config {
+        config.annotate_env(&mut env);
+    }
     let slo = cmd.goodput.unwrap_or_else(Slo::unbounded);
     let model_field = match &cmd.tag {
         Some(t) => format!("{}#{}", cmd.model, t),
@@ -1822,11 +1811,19 @@ async fn execute_cell(
     report.actual_input_tokens = Some(actual_input_tokens);
     report.actual_input_tokens_per_request = Some(actual_input_tokens_per_request);
     report.output_token_count_source = Some(token_count_source);
-    Ok(report)
+    report.dataset_evidence = dataset_evidence;
+    let slo_report = slo_config.map(|config| slo_report::SloCellReport {
+        schema_version: 1,
+        config_sha256: config.source_sha256.clone(),
+        legacy_benchmark: report.clone(),
+        repeats: slo_repeats,
+    });
+    Ok((report, slo_report))
 }
 
 fn requested_input_len(cmd: &BenchServeCommand) -> Result<u32> {
     match cmd.dataset.as_str() {
+        "sharegpt" => Ok(0),
         "shared-prefix" => cmd
             .shared_prefix_len
             .checked_add(cmd.shared_suffix_len)
@@ -1904,6 +1901,8 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
+    let slo_config = slo_report::load(&cmd)?;
+    let prepared_sharegpt = sharegpt::prepare(&cmd)?;
     let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
         format!(
             "ferrum bench-serve — scenario=decode-isolation dataset=random warmup={} n_repeats={} fixed_output=true",
@@ -1957,6 +1956,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         sampling: cmd.sampling.request_sampling(),
         timeout_s: cmd.timeout,
         benchmark_run_id: Arc::new(format!("bench-{}", Uuid::new_v4())),
+        capture_slo: slo_config.is_some(),
     };
 
     if cmd.scenario == BenchServeWorkload::DecodeIsolation {
@@ -1964,15 +1964,29 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     }
 
     let mut reports: Vec<BenchReport> = Vec::with_capacity(cells.len());
+    let mut slo_reports = Vec::new();
     for (cell_index, cell) in cells.into_iter().enumerate() {
         eprintln!("{}", format!("→ {}", cell_label(cell)).bold());
         let cell_id = benchmark_cell_id(cell_index, cell);
-        let r = execute_cell(&cmd, &ctx, cell, &cell_id).await?;
+        let (r, slo) = execute_cell(
+            &cmd,
+            &ctx,
+            cell,
+            &cell_id,
+            prepared_sharegpt.as_deref(),
+            slo_config.as_ref(),
+        )
+        .await?;
+        if let Some(slo) = slo {
+            slo_report::emit(&cmd, &slo)?;
+            slo_reports.push(slo);
+        }
         emit_summary_line(&r);
         reports.push(r);
     }
 
-    emit_then_enforce_error_policy(&cmd, &reports)
+    emit_then_enforce_error_policy(&cmd, &reports)?;
+    slo_report::enforce(&cmd, &slo_reports)
 }
 
 fn emit_then_enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
@@ -2032,6 +2046,7 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
             ));
         }
     }
+    sharegpt::validate(cmd)?;
     if cmd.scenario == BenchServeWorkload::DecodeIsolation
         && (cmd.request_rate.is_some() || !cmd.concurrency_sweep.is_empty())
     {
@@ -2233,39 +2248,77 @@ fn emit_summary_line(r: &BenchReport) {
     };
     eprintln!("    {} {}{}", "summary".bold(), scenario_str, ci);
     fmt_metric("TTFT_ms ", &r.ttft_ms, r.n_repeats);
-    fmt_metric("TPOT_ms ", &r.tpot_ms, r.n_repeats);
-    if r.has_complete_itl_evidence() {
-        fmt_metric("ITL_ms  ", &r.itl_ms, r.n_repeats);
+    fmt_metric("TPOT_ms/token", &r.tpot_ms, r.n_repeats);
+    if let Some(itl) = &r.sse_text_event_gap_ms {
+        fmt_metric("ITL (visible text updates, ms)", itl, r.n_repeats);
     } else {
-        eprintln!("      ITL_ms   unavailable");
+        let missing = match &r.sse_text_event_gap_evidence {
+            None => "not collected",
+            Some(evidence) if evidence.contributing_intervals == 0 => "unavailable (no intervals)",
+            Some(_) => "unavailable (incomplete event timing)",
+        };
+        eprintln!("      ITL (visible text updates, ms) {missing}");
+    }
+    if let Some(evidence) = &r.sse_text_event_gap_evidence {
+        eprintln!(
+            "      text timing: {} observed events / {} observed gaps / {} contributing gaps; {} failed requests; coalescing {} requests / {} chunks; event/usage mismatches {}",
+            evidence.observed_text_events,
+            evidence.observed_intervals,
+            evidence.contributing_intervals,
+            evidence.failed_requests,
+            evidence.transport_coalesced_requests,
+            evidence.transport_coalesced_output_chunks,
+            evidence.event_usage_mismatch_requests,
+        );
+    }
+    if r.has_complete_itl_evidence() {
+        fmt_metric("ITL (strict token diagnostic, ms)", &r.itl_ms, r.n_repeats);
+    } else {
+        eprintln!(
+            "      ITL (strict token diagnostic, ms) unavailable; does not gate visible text ITL"
+        );
     }
     let thr = &r.output_throughput_tps;
-    let good = &r.goodput_rps;
     if r.n_repeats >= 3 {
         eprintln!(
             "      throughput      {:.1} ± {:.1} tok/s",
             thr.mean, thr.ci95_hw
         );
-        eprintln!(
-            "      goodput         {:.2} ± {:.2} req/s",
-            good.mean, good.ci95_hw
-        );
     } else {
         eprintln!("      throughput      {:.1} tok/s", thr.mean);
-        eprintln!("      goodput         {:.2} req/s", good.mean);
+    }
+    eprintln!("      Peak GPU allocated (GiB) not collected");
+    eprintln!("      Peak OS footprint (GiB)  not collected");
+    eprintln!("      Maximum RSS (GiB)        not collected");
+    eprintln!(
+        "      memory values require server-side evidence; client RSS and budgets are not peaks"
+    );
+    if !r.slo.is_unbounded() {
+        let good = &r.goodput_rps;
+        if r.n_repeats >= 3 {
+            eprintln!(
+                "      legacy goodput  {:.2} ± {:.2} req/s",
+                good.mean, good.ci95_hw
+            );
+        } else {
+            eprintln!("      legacy goodput  {:.2} req/s", good.mean);
+        }
+        eprintln!(
+            "      goodput uses per-request TTFT/TPOT/E2E bounds, not TTFT/TPOT/ITL P99 SLOs"
+        );
     }
 }
 
 fn fmt_metric(name: &str, m: &ferrum_bench_core::MetricSet, n_repeats: u32) {
     if n_repeats >= 3 {
         eprintln!(
-            "      {} p50={:.1}±{:.1}  p95={:.1}±{:.1}  p99={:.1}±{:.1}",
-            name, m.p50.mean, m.p50.ci95_hw, m.p95.mean, m.p95.ci95_hw, m.p99.mean, m.p99.ci95_hw
+            "      {} p50={:.1}±{:.1}  p99={:.1}±{:.1}",
+            name, m.p50.mean, m.p50.ci95_hw, m.p99.mean, m.p99.ci95_hw
         );
     } else {
         eprintln!(
-            "      {} p50={:.1}  p95={:.1}  p99={:.1}",
-            name, m.p50.mean, m.p95.mean, m.p99.mean
+            "      {} p50={:.1}  p99={:.1}",
+            name, m.p50.mean, m.p99.mean
         );
     }
 }
@@ -2747,10 +2800,13 @@ mod tests {
             }
             join_failed_record(0, panic_record_correlation)
         });
-        let records = collect_measured_handles(vec![
-            (7, first_correlation, good),
-            (11, second_correlation, panicked),
-        ])
+        let records = collect_measured_handles(
+            vec![
+                (7, first_correlation, good),
+                (11, second_correlation, panicked),
+            ],
+            false,
+        )
         .await;
         assert_eq!(records.len(), 2);
         assert!(records[0].success);
@@ -2942,12 +2998,14 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 1,
             warmup_requests: 0,
             n_repeats: 1,
             goodput: None,
+            slo: SloBenchmarkArgs::default(),
             timeout: 1.0,
             fail_on_error: false,
             max_error_rate: None,
@@ -3173,6 +3231,7 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 2,
@@ -3181,6 +3240,7 @@ mod tests {
             goodput: None,
             timeout: 1.0,
             fail_on_error: true,
+            slo: SloBenchmarkArgs::default(),
             max_error_rate: None,
             require_ci: false,
             seed: Some(9271),
@@ -3267,6 +3327,7 @@ mod tests {
             enable_thinking: None,
             reasoning_effort: None,
             sharegpt_path: None,
+            sharegpt: ShareGptArgs::default(),
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
             num_prompts: 1,
@@ -3275,6 +3336,7 @@ mod tests {
             goodput: None,
             timeout: 1.0,
             fail_on_error: true,
+            slo: SloBenchmarkArgs::default(),
             max_error_rate: None,
             require_ci: false,
             seed: Some(9271),

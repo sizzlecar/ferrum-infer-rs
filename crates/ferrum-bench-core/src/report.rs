@@ -19,6 +19,7 @@ pub fn render_single(report: &BenchReport) -> String {
     let mut s = String::new();
     write_header(&mut s, report);
     write_env_block(&mut s, report);
+    write_dataset_block(&mut s, report);
     write_metrics_block(&mut s, report);
     write_completion_block(&mut s, report);
     s
@@ -44,7 +45,12 @@ fn write_header(s: &mut String, r: &BenchReport) {
         Scenario::Cli => "cli".to_string(),
         Scenario::DecodeIsolation => "decode_isolation".to_string(),
     };
-    writeln!(s, "# {} — {}", r.model, scenario_str).ok();
+    let dataset_suffix = if r.dataset_evidence.is_some() {
+        " · ShareGPT variable"
+    } else {
+        ""
+    };
+    writeln!(s, "# {} — {}{}", r.model, scenario_str, dataset_suffix).ok();
     writeln!(s).ok();
 }
 
@@ -90,6 +96,98 @@ fn write_env_block(s: &mut String, r: &BenchReport) {
     writeln!(s).ok();
 }
 
+fn write_dataset_block(s: &mut String, r: &BenchReport) {
+    let Some(evidence) = &r.dataset_evidence else {
+        return;
+    };
+    let measured: Vec<_> = evidence
+        .repeats
+        .iter()
+        .flat_map(|repeat| &repeat.samples)
+        .filter(|sample| sample.phase == crate::BenchmarkPhase::Measured)
+        .collect();
+    writeln!(s, "## Dataset\n").ok();
+    writeln!(s, "ShareGPT variable lengths; the statistics below exclude warmup. Requested output budgets are not actual generated lengths.\n").ok();
+    writeln!(s, "| field | value |\n|---|---|").ok();
+    writeln!(s, "| measured samples | {} |", measured.len()).ok();
+    writeln!(
+        s,
+        "| prompt tokens (client tokenizer, before chat template) | {} |",
+        fmt_token_lengths(measured.iter().map(|sample| sample.input_tokens))
+    )
+    .ok();
+    writeln!(
+        s,
+        "| requested output budget (tokens) | {} |",
+        fmt_token_lengths(measured.iter().map(|sample| sample.requested_output_tokens))
+    )
+    .ok();
+    writeln!(s, "| source SHA-256 | `{}` |", evidence.source_sha256).ok();
+    writeln!(
+        s,
+        "| selection / filter | prompt seed {}; full filter and per-repeat selection hashes in JSON `dataset_evidence` |",
+        evidence.prompt_seed
+    )
+    .ok();
+    writeln!(s).ok();
+}
+
+fn fmt_token_lengths(values: impl Iterator<Item = u32>) -> String {
+    let values: Vec<_> = values.collect();
+    match (values.iter().min(), values.iter().max()) {
+        (Some(min), Some(max)) => format!(
+            "min {}, max {}, mean {:.2}",
+            min,
+            max,
+            values.iter().map(|&value| f64::from(value)).sum::<f64>() / values.len() as f64
+        ),
+        _ => "unavailable".to_string(),
+    }
+}
+
+fn missing_visible_itl(r: &BenchReport) -> &'static str {
+    match &r.sse_text_event_gap_evidence {
+        None => "not collected",
+        Some(evidence) if evidence.contributing_intervals == 0 => "unavailable (no intervals)",
+        Some(_) => "unavailable (incomplete event timing)",
+    }
+}
+
+fn write_itl_diagnostics(s: &mut String, r: &BenchReport) {
+    writeln!(
+        s,
+        "Strict-token ITL diagnostic: {}. This qualification does not gate visible text update intervals.",
+        if r.has_complete_itl_evidence() {
+            "complete token timing evidence"
+        } else {
+            "incomplete or unavailable token timing evidence"
+        }
+    )
+    .ok();
+    writeln!(s).ok();
+    if let Some(evidence) = &r.sse_text_event_gap_evidence {
+        writeln!(
+            s,
+            "Visible text timing: {} successful / {} failed requests; {} observed text events / {} observed intervals; {} contributing intervals. Transport coalescing: {} requests / {} chunks; event/usage count mismatches: {}; missing usage: {}; fewer than two text events: {}; interval-count mismatches: {}; successful requests without SSE evidence: {}; failed requests with observed intervals: {}.",
+            evidence.successful_requests,
+            evidence.failed_requests,
+            evidence.observed_text_events,
+            evidence.observed_intervals,
+            evidence.contributing_intervals,
+            evidence.transport_coalesced_requests,
+            evidence.transport_coalesced_output_chunks,
+            evidence.event_usage_mismatch_requests,
+            evidence.missing_usage_requests,
+            evidence.fewer_than_two_events_requests,
+            evidence.interval_count_mismatch_requests,
+            evidence.successful_requests_without_sse_evidence,
+            evidence.failed_requests_with_observed_intervals,
+        )
+        .ok();
+        writeln!(s).ok();
+    }
+}
+
 fn write_metrics_block(s: &mut String, r: &BenchReport) {
     let has_ci = r.n_repeats >= 3;
     writeln!(s, "## Metrics").ok();
@@ -119,17 +217,35 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     .ok();
     writeln!(
         s,
-        "| TPOT (ms) | {} | {} | {} | {} |",
+        "| TPOT (ms/token) | {} | {} | {} | {} |",
         fmt(&r.tpot_ms.p50, has_ci),
         fmt(&r.tpot_ms.p75, has_ci),
         fmt(&r.tpot_ms.p95, has_ci),
         fmt(&r.tpot_ms.p99, has_ci)
     )
     .ok();
+    if let Some(itl) = &r.sse_text_event_gap_ms {
+        writeln!(
+            s,
+            "| ITL (visible text updates, ms) | {} | {} | {} | {} |",
+            fmt(&itl.p50, has_ci),
+            fmt(&itl.p75, has_ci),
+            fmt(&itl.p95, has_ci),
+            fmt(&itl.p99, has_ci)
+        )
+        .ok();
+    } else {
+        let missing = missing_visible_itl(r);
+        writeln!(
+            s,
+            "| ITL (visible text updates, ms) | {missing} | {missing} | {missing} | {missing} |"
+        )
+        .ok();
+    }
     if r.has_complete_itl_evidence() {
         writeln!(
             s,
-            "| ITL (ms)  | {} | {} | {} | {} |",
+            "| ITL (strict token diagnostic, ms) | {} | {} | {} | {} |",
             fmt(&r.itl_ms.p50, has_ci),
             fmt(&r.itl_ms.p75, has_ci),
             fmt(&r.itl_ms.p95, has_ci),
@@ -139,7 +255,7 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     } else {
         writeln!(
             s,
-            "| ITL (ms)  | unavailable | unavailable | unavailable | unavailable |"
+            "| ITL (strict token diagnostic, ms) | unavailable | unavailable | unavailable | unavailable |"
         )
         .ok();
     }
@@ -153,6 +269,7 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
     )
     .ok();
     writeln!(s).ok();
+    write_itl_diagnostics(s, r);
     writeln!(s, "| throughput / goodput | value |").ok();
     writeln!(s, "|---|---|").ok();
     writeln!(
@@ -189,6 +306,30 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
         .ok();
     }
     writeln!(s).ok();
+    if slo_meaningful {
+        writeln!(
+            s,
+            "Legacy goodput counts requests meeting individual TTFT, TPOT and E2E bounds; it does not evaluate aggregate TTFT/TPOT/ITL P99 SLOs."
+        )
+        .ok();
+        writeln!(s).ok();
+    }
+    writeln!(s, "| server memory metric | value |").ok();
+    writeln!(s, "|---|---|").ok();
+    writeln!(s, "| Peak GPU allocated (GiB) | not collected |").ok();
+    writeln!(s, "| Peak OS footprint (GiB) | not collected |").ok();
+    writeln!(s, "| Maximum RSS (GiB) | not collected |").ok();
+    writeln!(s).ok();
+    write_memory_scope_note(s);
+}
+
+fn write_memory_scope_note(s: &mut String) {
+    writeln!(
+        s,
+        "Server memory is not collected by this client report. Attach server-side evidence with the API, process/device identity, measurement window and sampling interval. On Metal, sampled peak allocated bytes, OS footprint and maximum RSS have different scopes; none alone establishes the complete model working set, and overlapping values must not be added. Client RSS, configured budgets and model file size are not server memory peaks."
+    )
+    .ok();
+    writeln!(s).ok();
 }
 
 fn write_completion_block(s: &mut String, r: &BenchReport) {
@@ -221,6 +362,16 @@ fn write_completion_block(s: &mut String, r: &BenchReport) {
     writeln!(s).ok();
 }
 
+fn sweep_cell_label(r: &BenchReport) -> String {
+    match r.scenario {
+        Scenario::ClosedLoop => format!("c={}", r.concurrency.unwrap_or(0)),
+        Scenario::OpenLoop => format!("rate={}", r.request_rate.unwrap_or(0.0)),
+        Scenario::SharedPrefix => "shared_prefix".to_string(),
+        Scenario::Cli => "cli".to_string(),
+        Scenario::DecodeIsolation => "decode_isolation".to_string(),
+    }
+}
+
 fn write_sweep_table(s: &mut String, reports: &[BenchReport]) {
     if reports.is_empty() {
         return;
@@ -238,32 +389,46 @@ fn write_sweep_table(s: &mut String, reports: &[BenchReport]) {
     }
     writeln!(
         s,
-        "| cell | TTFT_p50 | TTFT_p99 | TPOT_p50 | output_thr | goodput |"
+        "| concurrency / cell | TTFT P50 (ms) | TTFT P99 (ms) | TPOT P50 (ms/token) | TPOT P99 (ms/token) | ITL (visible text updates) P50 (ms) | ITL (visible text updates) P99 (ms) | output Throughput (tok/s) | Peak GPU allocated (GiB) | Peak OS footprint (GiB) | Maximum RSS (GiB) |"
     )
     .ok();
-    writeln!(s, "|---|---|---|---|---|---|").ok();
+    writeln!(s, "|---|---|---|---|---|---|---|---|---|---|---|").ok();
     for r in reports {
-        let label = match r.scenario {
-            Scenario::ClosedLoop => format!("c={}", r.concurrency.unwrap_or(0)),
-            Scenario::OpenLoop => format!("rate={}", r.request_rate.unwrap_or(0.0)),
-            Scenario::SharedPrefix => "shared_prefix".to_string(),
-            Scenario::Cli => "cli".to_string(),
-            Scenario::DecodeIsolation => "decode_isolation".to_string(),
-        };
+        let label = sweep_cell_label(r);
         let cell_has_ci = r.n_repeats >= 3;
+        let (itl_p50, itl_p99) = if let Some(itl) = &r.sse_text_event_gap_ms {
+            (fmt(&itl.p50, cell_has_ci), fmt(&itl.p99, cell_has_ci))
+        } else {
+            let missing = missing_visible_itl(r);
+            (missing.to_string(), missing.to_string())
+        };
         writeln!(
             s,
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | not collected | not collected | not collected |",
             label,
             fmt(&r.ttft_ms.p50, cell_has_ci),
             fmt(&r.ttft_ms.p99, cell_has_ci),
             fmt(&r.tpot_ms.p50, cell_has_ci),
+            fmt(&r.tpot_ms.p99, cell_has_ci),
+            itl_p50,
+            itl_p99,
             fmt(&r.output_throughput_tps, cell_has_ci),
-            fmt(&r.goodput_rps, cell_has_ci)
         )
         .ok();
     }
     writeln!(s).ok();
+    writeln!(
+        s,
+        "ITL measures client-visible intervals between nonempty content/reasoning updates, not proven per-token latency. Role-only, empty-content and finish-only events do not count as updates. Coalescing and event/usage count mismatches are disclosed and do not exclude otherwise complete successful streams. Failed requests remain in diagnostic counts. Reports without this measurement show not collected."
+    )
+    .ok();
+    writeln!(s).ok();
+    write_memory_scope_note(s);
+    for r in reports {
+        writeln!(s, "ITL diagnostics for {}:", sweep_cell_label(r)).ok();
+        writeln!(s).ok();
+        write_itl_diagnostics(s, r);
+    }
 }
 
 fn fmt(stat: &ScalarStats, has_ci: bool) -> String {
@@ -337,7 +502,8 @@ mod tests {
         assert!(md.contains("## Environment"));
         assert!(md.contains("## Metrics"));
         assert!(md.contains("env_hash"));
-        assert!(md.contains("| ITL (ms)  | unavailable |"));
+        assert!(md.contains("| ITL (visible text updates, ms) | not collected |"));
+        assert!(md.contains("| ITL (strict token diagnostic, ms) | unavailable |"));
         // n_repeats=3 → CI columns ARE present
         assert!(!md.contains("⚠ < 3"));
         assert!(md.contains("±")); // mean ± ci95 format
@@ -386,9 +552,222 @@ mod tests {
         let reports = vec![fixture_report(), fixture_report()];
         let md = render_sweep(&reports);
         assert!(md.contains("# Bench sweep (2 cells)"));
-        assert!(md.contains("| cell |"));
+        assert!(md.contains("| concurrency / cell |"));
         // Two data rows.
         let row_count = md.matches("| c=32 |").count();
         assert_eq!(row_count, 2);
+    }
+
+    fn eligible_itl_report() -> BenchReport {
+        let mut run = make_run(
+            vec![(true, 100.0, 140.0, 8, 3), (true, 200.0, 320.0, 24, 3)],
+            1.0,
+        );
+        for (record, intervals) in run.records.iter_mut().zip([[10.0, 30.0], [40.0, 80.0]]) {
+            record.itl_ms = intervals.to_vec();
+            record.itl_evidence = crate::RequestItlEvidence::sse(true, 3, Some(3), 2, 0);
+            record.output_token_count_source = OutputTokenCountSource::Usage;
+        }
+        compute_metrics(
+            "tiny".into(),
+            "metal".into(),
+            Scenario::ClosedLoop,
+            Some(2),
+            None,
+            8,
+            3,
+            0,
+            Slo::unbounded(),
+            vec![run],
+            Env::default(),
+        )
+    }
+
+    #[test]
+    fn sweep_renders_measured_tail_latencies_and_missing_memory() {
+        let report = eligible_itl_report();
+        assert!(report.has_complete_itl_evidence());
+        let md = render_sweep(&[report]);
+        // These are computed from two requests with distinct TPOT and ITL tails.
+        assert!(md.contains(
+            "| c=2 | 150.00 | 199.00 | 40.00 | 59.60 | 35.00 | 78.80 | 6.00 | not collected | not collected | not collected |"
+        ));
+        assert!(md.contains("TPOT P99 (ms/token)"));
+        assert!(md.contains("ITL (visible text updates) P99 (ms)"));
+        assert!(md.contains("server-side evidence"));
+        assert!(!md.contains("goodput"));
+    }
+
+    #[test]
+    fn sweep_never_substitutes_strict_itl_for_missing_visible_text_measurements() {
+        let engine_only = fixture_report();
+        let mut missing = eligible_itl_report();
+        assert!(missing.has_complete_itl_evidence());
+        // Older reports may have valid strict ITL but no new visible-text metric.
+        missing.sse_text_event_gap_ms = None;
+        missing.sse_text_event_gap_evidence = None;
+        for report in [engine_only, missing] {
+            let single = render_single(&report);
+            assert!(single.contains("| ITL (visible text updates, ms) | not collected |"));
+            let md = render_sweep(&[report]);
+            let row = md.lines().find(|line| line.starts_with("| c=")).unwrap();
+            let fields: Vec<_> = row.split('|').map(str::trim).collect();
+            assert_eq!(fields[6], "not collected");
+            assert_eq!(fields[7], "not collected");
+            assert_eq!(fields[9], "not collected");
+            assert_eq!(fields[10], "not collected");
+            assert_eq!(fields[11], "not collected");
+        }
+    }
+
+    #[test]
+    fn visible_text_itl_retains_stalls_despite_coalescing_and_usage_mismatch() {
+        let mut run = make_run(vec![(true, 100.0, 5140.0, 8, 9)], 6.0);
+        run.records[0].itl_ms = vec![40.0, 5000.0];
+        run.records[0].itl_evidence = crate::RequestItlEvidence::sse(true, 3, Some(9), 2, 1);
+        run.records[0].output_token_count_source = OutputTokenCountSource::Usage;
+        let report = compute_metrics(
+            "tiny".into(),
+            "metal".into(),
+            Scenario::ClosedLoop,
+            Some(1),
+            None,
+            8,
+            9,
+            0,
+            Slo::unbounded(),
+            vec![run],
+            Env::default(),
+        );
+        assert!(!report.has_complete_itl_evidence());
+        let single = render_single(&report);
+        let visible = single
+            .lines()
+            .find(|line| line.starts_with("| ITL (visible text updates, ms)"))
+            .unwrap();
+        assert!(visible.ends_with("| 4950.40 |"));
+        assert!(single.contains("| ITL (strict token diagnostic, ms) | unavailable |"));
+        assert!(single.contains("Transport coalescing: 1 requests / 1 chunks"));
+        assert!(single.contains("event/usage count mismatches: 1"));
+        let sweep = render_sweep(&[report]);
+        let row = sweep
+            .lines()
+            .find(|line| line.starts_with("| c=1 |"))
+            .unwrap();
+        let fields: Vec<_> = row.split('|').map(str::trim).collect();
+        assert_eq!(fields[6], "2520.00");
+        assert_eq!(fields[7], "4950.40");
+    }
+
+    #[test]
+    fn visible_text_itl_without_two_updates_is_unavailable_instead_of_zero() {
+        let mut run = make_run(vec![(true, 100.0, 100.0, 8, 1)], 1.0);
+        run.records[0].itl_evidence = crate::RequestItlEvidence::sse(true, 1, Some(1), 0, 0);
+        run.records[0].output_token_count_source = OutputTokenCountSource::Usage;
+        let report = compute_metrics(
+            "tiny".into(),
+            "metal".into(),
+            Scenario::ClosedLoop,
+            Some(1),
+            None,
+            8,
+            1,
+            0,
+            Slo::unbounded(),
+            vec![run],
+            Env::default(),
+        );
+        assert!(report.sse_text_event_gap_evidence.is_some());
+        assert!(report.sse_text_event_gap_ms.is_none());
+        let single = render_single(&report);
+        assert!(single.contains("| ITL (visible text updates, ms) | unavailable (no intervals) |"));
+        let sweep = render_sweep(&[report]);
+        let row = sweep
+            .lines()
+            .find(|line| line.starts_with("| c=1 |"))
+            .unwrap();
+        let fields: Vec<_> = row.split('|').map(str::trim).collect();
+        assert_eq!(fields[6], "unavailable (no intervals)");
+        assert_eq!(fields[7], "unavailable (no intervals)");
+    }
+
+    #[test]
+    fn single_report_distinguishes_legacy_goodput_from_p99_slos() {
+        let bounded = fixture_report();
+        let md = render_single(&bounded);
+        assert!(md.contains("**goodput (req/s)**"));
+        assert!(md.contains("does not evaluate aggregate TTFT/TPOT/ITL P99 SLOs"));
+
+        let mut unbounded = bounded;
+        unbounded.slo = Slo::unbounded();
+        assert!(!render_single(&unbounded).contains("**goodput (req/s)**"));
+    }
+
+    #[test]
+    fn sharegpt_lengths_exclude_warmup_and_distinguish_output_budgets() {
+        use crate::dataset::{
+            ShareGptDatasetEvidence, ShareGptFilter, ShareGptSample, ShareGptSelection,
+        };
+        use crate::BenchmarkPhase;
+
+        let mut report = eligible_itl_report();
+        let original = render_single(&report);
+        assert!(original.starts_with("# tiny — closed_loop · c=2\n"));
+        assert!(!original.contains("## Dataset"));
+        report.n_prompt = 0;
+        report.n_gen = 0;
+        let sample = |phase, request_index, input_tokens, requested_output_tokens| ShareGptSample {
+            source_record_index: u64::from(request_index),
+            original_id: None,
+            phase,
+            request_index,
+            prompt_sha256: "a".repeat(64),
+            assistant_sha256: "b".repeat(64),
+            input_tokens,
+            reference_output_tokens: requested_output_tokens,
+            requested_output_tokens,
+        };
+        report.dataset_evidence = Some(ShareGptDatasetEvidence {
+            dataset: "sharegpt".into(),
+            source_path: "conversations.json".into(),
+            source_sha256: "c".repeat(64),
+            source_format: "json".into(),
+            tokenizer_sha256: "d".repeat(64),
+            filter: ShareGptFilter {
+                min_input_tokens: 1,
+                max_input_tokens: None,
+                min_output_tokens: 1,
+                max_output_tokens: None,
+                max_total_tokens: None,
+                chat_template_reserve_tokens: 0,
+                fixed_output_tokens: None,
+            },
+            counts: Default::default(),
+            prompt_seed: 37,
+            sampling: "without_replacement".into(),
+            ignore_eos: false,
+            enable_thinking: None,
+            repeats: vec![ShareGptSelection {
+                repeat_index: 0,
+                rng_seed: 37,
+                selection_sha256: "e".repeat(64),
+                samples: vec![
+                    sample(BenchmarkPhase::Warmup, 0, 9999, 9999),
+                    sample(BenchmarkPhase::Measured, 0, 8, 3),
+                    sample(BenchmarkPhase::Measured, 1, 24, 7),
+                ],
+            }],
+        });
+        let md = render_single(&report);
+        assert!(md.starts_with("# tiny — closed_loop · c=2 · ShareGPT variable\n"));
+        assert!(md.contains("| measured samples | 2 |"));
+        assert!(md.contains(
+            "| prompt tokens (client tokenizer, before chat template) | min 8, max 24, mean 16.00 |"
+        ));
+        assert!(md.contains("| requested output budget (tokens) | min 3, max 7, mean 5.00 |"));
+        assert!(md.contains("Requested output budgets are not actual generated lengths"));
+        assert!(md.contains(&format!("| source SHA-256 | `{}` |", "c".repeat(64))));
+        assert!(md.contains("prompt seed 37"));
+        assert!(!md.contains("9999"));
     }
 }

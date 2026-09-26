@@ -31,9 +31,16 @@ pub mod jsonl_journal;
 pub mod profile;
 pub mod release_regression;
 pub mod report;
+pub mod slo;
+pub mod slo_comparison;
+pub mod slo_offline;
+pub mod sse_text_event_gap;
 pub mod stats;
 pub mod teacher_metrics;
 pub mod trace;
+
+#[cfg(test)]
+mod request_timing_tests;
 
 pub use env::{Env, EnvHash};
 pub use json_artifact::write_json_owned_record;
@@ -168,12 +175,66 @@ fn validate_benchmark_correlation_id(field: &str, value: &str) -> Result<(), Str
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRequestRecord {
     #[serde(flatten)]
     pub correlation: BenchmarkRequestCorrelation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_request_id: Option<String>,
+    /// Raw measurements retained from the existing collector. Older reports
+    /// have no timing evidence; absence must not be interpreted as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<BenchmarkRequestTimingEvidence>,
+}
+
+/// Request-local collector values, including failed and ineligible requests.
+///
+/// These values do not add timers or change metric eligibility. Token counts,
+/// event counts, usage mismatches and coalescing remain in the existing aligned
+/// per-request report arrays. TPOT can be reconstructed using those output
+/// counts and `(reported_e2e_ms - reported_ttft_ms) / (output_tokens - 1)` for
+/// successful requests with at least two output tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRequestTimingEvidence {
+    pub success: bool,
+    /// Unmodified collector value, not necessarily an observed first output:
+    /// existing failure records may use zero and streams without text may use
+    /// E2E as a fallback. Consult `observed_first_output` before interpreting
+    /// this as an observed latency. Repeat metrics retain their existing rules.
+    pub reported_ttft_ms: f64,
+    /// Unmodified collector value. A task that failed before returning a
+    /// record can have an existing zero placeholder rather than elapsed time.
+    pub reported_e2e_ms: f64,
+    /// Meaning of `raw_event_gaps_ms`; only SSE delta events are client-visible
+    /// text updates. Engine events must not be relabelled as SSE observations.
+    pub event_source: ItlEvidenceSource,
+    /// Derived from existing typed source/event counts, independent of usage
+    /// and request success. `None` means the event source was not established
+    /// or a task panic lost its collector state; a join-failure placeholder
+    /// cannot prove whether output was observed before the panic.
+    /// `Some(false)` means the retained collector recorded no output events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_first_output: Option<bool>,
+    /// All original inter-arrival samples, including zero gaps, long stalls,
+    /// failed streams and usage mismatches. Empty means no retained intervals,
+    /// not a measured zero latency or proof of complete stream evidence.
+    pub raw_event_gaps_ms: Vec<f64>,
+}
+
+impl BenchmarkRequestTimingEvidence {
+    fn from_request(record: &RequestRecord) -> Self {
+        let source = record.itl_evidence.source;
+        Self {
+            success: record.success,
+            reported_ttft_ms: record.ttft_ms,
+            reported_e2e_ms: record.e2e_ms,
+            event_source: source,
+            observed_first_output: (source != ItlEvidenceSource::None
+                && record.quality_issues.panic == 0)
+                .then_some(record.itl_evidence.output_events > 0),
+            raw_event_gaps_ms: record.itl_ms.clone(),
+        }
+    }
 }
 
 /// Locked enum of bench scenarios shared by all benchmark producers.
@@ -265,8 +326,12 @@ pub struct BenchReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_rate: Option<f64>,
 
+    /// Fixed input length, or zero for a variable-length dataset.
     pub n_prompt: u32,
+    /// Fixed output budget, or zero when each dataset sample owns its budget.
     pub n_gen: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_evidence: Option<dataset::ShareGptDatasetEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_input_tokens: Option<TokenLengthStats>,
     /// Client-tokenized prompt content, before the server applies its template.
@@ -308,6 +373,12 @@ pub struct BenchReport {
     pub ttft_ms: MetricSet,
     pub tpot_ms: MetricSet,
     pub itl_ms: MetricSet,
+    /// Gaps between visible nonempty SSE text updates, independently of token
+    /// ITL eligibility. Missing old evidence is unavailable, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_ms: Option<MetricSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_evidence: Option<sse_text_event_gap::SseTextEventGapEvidence>,
     pub e2e_ms: MetricSet,
 
     pub output_throughput_tps: ScalarStats,
@@ -385,7 +456,8 @@ pub struct RequestRecord {
     pub quality_issues: QualityIssueCounts,
     /// Observed output-event inter-arrival times within this request. Only
     /// eligible typed ITL evidence guarantees `len = output_tokens - 1` and
-    /// permits these samples to enter aggregate ITL metrics.
+    /// permits these samples to enter strict token ITL metrics. SSE text event
+    /// gap metrics use the independent event-count evidence instead.
     pub itl_ms: Vec<f64>,
 }
 
@@ -447,6 +519,10 @@ pub struct BenchRepeatMetrics {
     pub ttft_ms: RepeatPercentiles,
     pub tpot_ms: RepeatPercentiles,
     pub itl_ms: RepeatPercentiles,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_ms: Option<RepeatPercentiles>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sse_text_event_gap_evidence: Option<sse_text_event_gap::SseTextEventGapEvidence>,
     pub e2e_ms: RepeatPercentiles,
     pub output_throughput_tps: f64,
     pub total_throughput_tps: f64,
@@ -807,6 +883,8 @@ fn aggregate_itl_evidence(records: &[RequestRecord]) -> (ItlEligibilityCounts, u
 }
 
 fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatMetrics {
+    let (sse_text_event_gap_ms, sse_text_event_gap_evidence) =
+        sse_text_event_gap::summarize_requests(&run.records);
     let success: Vec<&RequestRecord> = run.records.iter().filter(|record| record.success).collect();
     let (
         itl_eligibility_counts,
@@ -892,6 +970,8 @@ fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatM
         ttft_ms: repeat_percentiles(&ttft),
         tpot_ms: repeat_percentiles(&tpot),
         itl_ms: repeat_percentiles(&itl),
+        sse_text_event_gap_ms,
+        sse_text_event_gap_evidence,
         e2e_ms: repeat_percentiles(&e2e),
         output_throughput_tps,
         total_throughput_tps,
@@ -1059,6 +1139,9 @@ pub fn compute_metrics(
         })
         .collect();
 
+    let (sse_text_event_gap_ms, sse_text_event_gap_evidence) =
+        sse_text_event_gap::summarize_repeats(&repeat_metrics);
+
     let values = |field: fn(&BenchRepeatMetrics) -> f64| {
         repeat_metrics.iter().map(field).collect::<Vec<_>>()
     };
@@ -1186,6 +1269,7 @@ pub fn compute_metrics(
                             .clone()
                             .expect("correlation presence checked above"),
                         server_request_id: record.server_request_id.clone(),
+                        timing: Some(BenchmarkRequestTimingEvidence::from_request(record)),
                     })
                     .collect::<Vec<_>>()
             })
@@ -1217,6 +1301,7 @@ pub fn compute_metrics(
         request_rate,
         n_prompt,
         n_gen,
+        dataset_evidence: None,
         actual_input_tokens: None,
         actual_input_tokens_per_request: None,
         server_input_tokens_per_request: Some(
@@ -1257,6 +1342,8 @@ pub fn compute_metrics(
             p95: checked_scalar_stats(&itl_p95, "ITL p95"),
             p99: checked_scalar_stats(&itl_p99, "ITL p99"),
         },
+        sse_text_event_gap_ms,
+        sse_text_event_gap_evidence,
         e2e_ms: MetricSet {
             p50: checked_scalar_stats(&e2e_p50, "E2E p50"),
             p75: checked_scalar_stats(&e2e_p75, "E2E p75"),

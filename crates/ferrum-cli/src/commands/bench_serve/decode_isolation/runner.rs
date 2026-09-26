@@ -994,6 +994,7 @@ mod tests {
             text: "test prompt".to_string(),
             input_tokens: 8,
             sha256: "test".to_string(),
+            output_budget: None,
         };
         PreparedRun {
             repeat: 0,
@@ -1005,6 +1006,7 @@ mod tests {
 
     fn context(server: &MockServer) -> RunContext {
         RunContext {
+            capture_slo: false,
             client: Arc::new(reqwest::Client::new()),
             base_url: Arc::new(server.base_url.clone()),
             model: Arc::new("test-model".to_string()),
@@ -1156,6 +1158,7 @@ mod tests {
         record.output_token_count_source = OutputTokenCountSource::StreamChunks;
         record.itl_evidence.usage_output_tokens = None;
         let request = ObservedRequest {
+            admission: ferrum_bench_core::slo::AdmissionEvidence::Accepted,
             record,
             started_at: Instant::now(),
             output_event_times: vec![Instant::now(); 4],
@@ -1192,12 +1195,14 @@ mod tests {
     fn throughput_duration_spans_overlapping_requests_instead_of_summing_them() {
         let start = Instant::now();
         let mut incumbent = ObservedRequest {
+            admission: ferrum_bench_core::slo::AdmissionEvidence::Accepted,
             record: request_record(4, 3, 0),
             started_at: start,
             output_event_times: vec![],
         };
         incumbent.record.e2e_ms = 100.0;
         let mut aggressor = ObservedRequest {
+            admission: ferrum_bench_core::slo::AdmissionEvidence::Accepted,
             record: request_record(1, 1, 0),
             started_at: start + Duration::from_millis(40),
             output_event_times: vec![],

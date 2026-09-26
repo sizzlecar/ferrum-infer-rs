@@ -3,6 +3,7 @@
 //! accept a numerical tolerance, or authorize a release.
 use clap::{ArgGroup, Parser};
 use ferrum_bench_core::release_regression::numerics::nmse;
+use ferrum_bench_core::teacher_metrics::compensated_sum;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -185,59 +186,25 @@ fn top(values: &[f32]) -> Vec<Value> {
         .collect()
 }
 
-fn compensated_sum(values: impl IntoIterator<Item = f64>) -> f64 {
-    let (mut sum, mut correction) = (0.0, 0.0);
-    for value in values {
-        let adjusted = value - correction;
-        let next = sum + adjusted;
-        correction = (next - sum) - adjusted;
-        sum = next;
-    }
-    sum
-}
-
-fn log_probabilities(logits: &[f32]) -> Vec<f64> {
-    // Subtract before taking the partition's logarithm, so a large common
-    // logit offset cannot cancel small log probabilities. Inputs are already
-    // checked for finite values by the raw-artifact reader.
-    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let log_partition =
-        compensated_sum(logits.iter().map(|&x| (f64::from(x) - maximum).exp())).ln();
-    logits
-        .iter()
-        .map(|&x| (f64::from(x) - maximum) - log_partition)
-        .collect()
-}
-
 fn distribution_metrics(
     reference: &[f32],
     candidate: &[f32],
     decision: Option<TeacherForcedDecision>,
 ) -> Result<Value, String> {
-    let p = log_probabilities(reference);
-    let q = log_probabilities(candidate);
-    // Full-vocabulary KL(reference || candidate), in nats. Clamp only the
-    // negative floating-point roundoff of this mathematically nonnegative sum.
-    let kl = compensated_sum(p.iter().zip(&q).map(|(&p, &q)| p.exp() * (p - q))).max(0.0);
-    let teacher = decision
-        .map(|decision| {
-            let token = usize::try_from(decision.token_id)
-                .ok()
-                .filter(|&index| index < p.len())
-                .ok_or_else(|| {
-                    "teacher-forced token is outside checkpoint vocabulary".to_owned()
-                })?;
-            let reference_nll = -p[token];
-            let candidate_nll = -q[token];
-            Ok::<_, String>(json!({"decision":decision,
-                "reference_nll_nats":reference_nll,"candidate_nll_nats":candidate_nll,
-                "delta_nll_nats":candidate_nll-reference_nll}))
-        })
-        .transpose()?;
-    Ok(
-        json!({"vocabulary_size":p.len(),"kl_reference_to_candidate_nats":kl,
-        "teacher_forced":teacher}),
-    )
+    let metrics = ferrum_bench_core::teacher_metrics::compare_full_vocabulary(
+        reference,
+        candidate,
+        decision.map(|value| value.token_id),
+    )?;
+    let teacher = metrics.teacher_forced.map(|target| {
+        json!({"decision":decision,
+            "reference_nll_nats":target.reference_nll_nats,
+            "candidate_nll_nats":target.candidate_nll_nats,
+            "delta_nll_nats":target.delta_nll_nats})
+    });
+    Ok(json!({"vocabulary_size":metrics.vocabulary_size,
+        "kl_reference_to_candidate_nats":metrics.kl_reference_to_candidate_nats,
+        "teacher_forced":teacher}))
 }
 
 fn compare(reference: &Path, candidate: &Path) -> Result<Value, String> {
