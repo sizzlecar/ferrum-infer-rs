@@ -60,3 +60,22 @@ fn stream_mmq_workspace_covers_every_partition_and_metadata_without_alias() {
     assert!(Workspace::new(257, 768, 3).is_err());
     assert!(Workspace::new(256, 768, 0).is_err());
 }
+
+#[test]
+fn residual2_workspace_accounts_both_activation_terms_and_shared_geometry() {
+    for k in [256, 768, 4096, 12288] {
+        let one = Workspace::new(k, 513, 17).unwrap();
+        let two = Workspace::with_precision(k, 513, 17, ActivationPrecision::Residual2Q8).unwrap();
+        assert_eq!(two.words_bytes, one.words_bytes * 2);
+        assert_eq!(two.scales_bytes, one.scales_bytes * 2);
+        assert_eq!(
+            two.total_bytes - two.partial_offset,
+            one.total_bytes - one.partial_offset
+        );
+        for m in 1..=8 {
+            let configs = launch_plan::configs(m, k, 513, two).unwrap();
+            assert_eq!(configs[1].shared_mem_bytes, 48384);
+            assert_eq!(configs[0].grid_dim.0, (m * (k / 32)).div_ceil(8));
+        }
+    }
+}

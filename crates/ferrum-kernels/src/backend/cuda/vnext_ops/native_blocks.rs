@@ -8,8 +8,12 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
+pub(super) mod embedding;
 pub(super) mod hadamard;
+mod linear_launch;
 pub(super) mod q8_f32scale;
+pub(super) mod q8_pair;
+pub(super) mod selected;
 pub(super) mod stream_mmq;
 pub(super) mod weights;
 
@@ -21,11 +25,22 @@ pub(super) struct CudaNativeBlockKernels {
     pub linear_f16: CudaFunction,
     pub linear_f32: CudaFunction,
     linear_tiled_f16: CudaFunction,
+    linear_q8_pair_tiled_f16: CudaFunction,
+    #[cfg(test)]
+    q8_pair_disabled: bool,
     linear_tiled_f32: CudaFunction,
     linear_f32_f16: CudaFunction,
     linear_tiled_f32_f16: CudaFunction,
     linear_q4k_f16: CudaFunction,
     linear_q4k_tiled_f16: CudaFunction,
+    linear_q5k_f16: CudaFunction,
+    linear_q5k_tiled_f16: CudaFunction,
+    linear_q6k_f16: CudaFunction,
+    linear_q6k_tiled_f16: CudaFunction,
+    linear_q6k_f32: CudaFunction,
+    linear_q6k_tiled_f32: CudaFunction,
+    linear_q6k_f32_f16: CudaFunction,
+    linear_q6k_tiled_f32_f16: CudaFunction,
     gemm_q4k_f16: CudaFunction,
     gemm_q5k_f16: CudaFunction,
     gemm_q6k_f16: CudaFunction,
@@ -37,6 +52,16 @@ pub(super) struct CudaNativeBlockKernels {
 }
 
 impl CudaNativeBlockKernels {
+    /// Retain the exact old CUDA exports as the independent test control while
+    /// exercising all production callers, strides and state transitions.
+    #[cfg(test)]
+    pub(super) fn with_generic_q5k_control(&self) -> Self {
+        let mut control = self.clone();
+        control.linear_q5k_f16 = self.linear_f16.clone();
+        control.linear_q5k_tiled_f16 = self.linear_tiled_f16.clone();
+        control
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn transformed_linear(
         &self,
@@ -146,17 +171,28 @@ impl CudaNativeBlockKernels {
             linear_f16: load("vnext_gguf_linear_f16")?,
             linear_f32: load("vnext_gguf_linear_f32")?,
             linear_tiled_f16: load("vnext_gguf_linear_tiled_f16")?,
+            linear_q8_pair_tiled_f16: load("vnext_gguf_linear_q8_pair_tiled_f16")?,
+            #[cfg(test)]
+            q8_pair_disabled: false,
             linear_tiled_f32: load("vnext_gguf_linear_tiled_f32")?,
             linear_f32_f16: load("vnext_gguf_linear_f32_f16")?,
             linear_tiled_f32_f16: load("vnext_gguf_linear_tiled_f32_f16")?,
             linear_q4k_f16: load("vnext_gguf_linear_q4k_f16")?,
             linear_q4k_tiled_f16: load("vnext_gguf_linear_q4k_tiled_f16")?,
+            linear_q5k_f16: load("vnext_gguf_linear_q5k_f16")?,
+            linear_q5k_tiled_f16: load("vnext_gguf_linear_q5k_tiled_f16")?,
+            linear_q6k_f16: load("vnext_gguf_linear_q6k_f16")?,
+            linear_q6k_tiled_f16: load("vnext_gguf_linear_q6k_tiled_f16")?,
+            linear_q6k_f32: load("vnext_gguf_linear_q6k_f32")?,
+            linear_q6k_tiled_f32: load("vnext_gguf_linear_q6k_tiled_f32")?,
+            linear_q6k_f32_f16: load("vnext_gguf_linear_q6k_f32_f16")?,
+            linear_q6k_tiled_f32_f16: load("vnext_gguf_linear_q6k_tiled_f32_f16")?,
             gemm_q4k_f16: load("vnext_gguf_gemm_q4k_f16")?,
             gemm_q5k_f16: load("vnext_gguf_gemm_q5k_f16")?,
             gemm_q6k_f16: load("vnext_gguf_gemm_q6k_f16")?,
             hadamard: hadamard::CudaHadamardKernels::load(&module)?,
-            embedding_f16: load("vnext_gguf_embedding_f16")?,
-            embedding_f32: load("vnext_gguf_embedding_f32")?,
+            embedding_f16: load(embedding::F16_ENTRY)?,
+            embedding_f32: load(embedding::F32_ENTRY)?,
             #[cfg(test)]
             decode: load("vnext_gguf_decode")?,
         })
@@ -173,26 +209,20 @@ impl CudaNativeBlockKernels {
         activation: ferrum_interfaces::vnext::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
         use ferrum_interfaces::vnext::ElementType;
-        let elements = embedding_elements(part, count)?;
-        let function = match activation {
-            ElementType::F16 => &self.embedding_f16,
-            ElementType::F32 => &self.embedding_f32,
-            _ => {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "unsupported embedding dtype",
-                ))
-            }
+        let selected = embedding::lookup_plan(part, count, activation)?;
+        let function = match selected.entry {
+            embedding::F16_ENTRY => &self.embedding_f16,
+            embedding::F32_ENTRY => &self.embedding_f32,
+            _ => unreachable!("checked installed embedding entry"),
         };
-        let [format, values, bytes] = part.format.parameters();
-        let parameters = [count, part.columns, part.rows, format, values, bytes];
         let mut launch = stream.launch_builder(function);
         launch.arg(&tokens).arg(&weight).arg(&output);
-        for parameter in &parameters {
+        for parameter in &selected.parameters {
             launch.arg(parameter);
         }
         // SAFETY: The provider retains the complete table and exact token and
         // output spans. The kernel guards the element count and invalid IDs.
-        unsafe { launch.launch(LaunchConfig::for_num_elems(elements)) }
+        unsafe { launch.launch(selected.config) }
             .map(|_| ())
             .map_err(|error| CudaDeviceRuntimeError::driver("native embedding launch", error))
     }
@@ -234,57 +264,8 @@ impl CudaNativeBlockKernels {
         input_type: ferrum_interfaces::vnext::ElementType,
         output_type: ferrum_interfaces::vnext::ElementType,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        use ferrum_interfaces::vnext::ElementType;
-        if rows == 0
-            || rows > u16::MAX as u32
-            || part
-                .output_offset
-                .checked_add(part.rows)
-                .is_none_or(|end| end > output_stride)
-        {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA native linear launch extent is invalid",
-            ));
-        }
-        let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
-        let q4k =
-            part.format == weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K);
-        // Select using this physical matrix part, not the combined logical
-        // output width. The medium-row range is qualified only for substantial
-        // Q5K/Q6K matrices; Q4K and small matrices keep their existing crossover.
-        // The F16 interface still reconstructs and accumulates in F32.
-        let shared_gemm = if use_shared_gemm(part, rows, input_type, output_type) {
-            match part.format {
-                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q4K) => {
-                    Some(&self.gemm_q4k_f16)
-                }
-                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q5K) => {
-                    Some(&self.gemm_q5k_f16)
-                }
-                weights::MatrixFormat::Block(crate::gguf_blocks::GgufBlockFormat::Q6K) => {
-                    Some(&self.gemm_q6k_f16)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let kernel = match (input_type, output_type, row_tile > 1) {
-            _ if shared_gemm.is_some() => shared_gemm.unwrap(),
-            (ElementType::F16, ElementType::F16, false) if q4k => &self.linear_q4k_f16,
-            (ElementType::F16, ElementType::F16, true) if q4k => &self.linear_q4k_tiled_f16,
-            (ElementType::F16, ElementType::F16, false) => &self.linear_f16,
-            (ElementType::F32, ElementType::F32, false) => &self.linear_f32,
-            (ElementType::F16, ElementType::F16, true) => &self.linear_tiled_f16,
-            (ElementType::F32, ElementType::F32, true) => &self.linear_tiled_f32,
-            (ElementType::F32, ElementType::F16, false) => &self.linear_f32_f16,
-            (ElementType::F32, ElementType::F16, true) => &self.linear_tiled_f32_f16,
-            _ => {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "CUDA native linear activation dtype is unsupported",
-                ))
-            }
-        };
+        let selected = linear_launch::select(part, rows, output_stride, input_type, output_type)?;
+        let kernel = selected.kernel.function(self);
         let [format, values, bytes] = part.format.parameters();
         let parameters = [
             rows,
@@ -305,23 +286,9 @@ impl CudaNativeBlockKernels {
         // regions. Both launch geometries guard partial row/column tiles. The
         // shared kernel's fixed 16x16 block cooperatively initializes all of
         // its bounded shared storage before any thread consumes it.
-        unsafe {
-            launch.launch(LaunchConfig {
-                grid_dim: if shared_gemm.is_some() {
-                    (part.rows.div_ceil(64), rows.div_ceil(64), 1)
-                } else {
-                    (part.rows.div_ceil(4), rows.div_ceil(row_tile), 1)
-                },
-                block_dim: if shared_gemm.is_some() {
-                    (16, 16, 1)
-                } else {
-                    (128, 1, 1)
-                },
-                shared_mem_bytes: 0,
-            })
-        }
-        .map(|_| ())
-        .map_err(|error| CudaDeviceRuntimeError::driver("native matrix linear launch", error))
+        unsafe { launch.launch(selected.config) }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("native matrix linear launch", error))
     }
 }
 

@@ -11,6 +11,24 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::ElementType;
 use std::sync::Arc;
 
+mod launch_plan;
+pub(in crate::backend::cuda::vnext_ops) mod selected;
+
+pub(in crate::backend::cuda::vnext_ops) use crate::gguf_blocks::q8_projection_plan::{
+    MatrixPlan, PackLayout, Q8SumPolicy, QuantizedKernel,
+};
+
+impl Q8SumPolicy {
+    pub fn operation_id(self) -> &'static str {
+        match self {
+            Self::Quantized => ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID,
+            Self::Input => {
+                ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Projection {
     scalar: CudaFunction,
@@ -20,46 +38,55 @@ struct Projection {
 
 #[derive(Clone)]
 pub(in crate::backend::cuda::vnext_ops) struct Q8F32ScaleKernels {
+    policy: Q8SumPolicy,
     pack: CudaFunction,
     q4: Projection,
     q5: Projection,
     q6: Projection,
 }
 
-/// Scales precede packed signed bytes. Complete K256 blocks make both spans
-/// naturally 16-byte aligned, including when several rows share this storage.
-#[derive(Clone, Copy, Debug)]
-pub(in crate::backend::cuda::vnext_ops) struct PackLayout {
-    pub scales_bytes: u64,
-    pub total_bytes: u64,
-}
-
-impl PackLayout {
-    pub fn new(rows: u64, columns: u64) -> Result<Self, String> {
-        if rows == 0 || columns == 0 || !columns.is_multiple_of(256) {
-            return Err("Q8 activation packing requires rows and complete K256 blocks".into());
-        }
-        let values = rows
-            .checked_mul(columns)
-            .ok_or("Q8 activation extent overflows")?;
-        let scales_bytes = values / 8;
-        let total_bytes = values
-            .checked_add(scales_bytes)
-            .ok_or("Q8 workspace overflows")?;
-        Ok(Self {
-            scales_bytes,
-            total_bytes,
-        })
-    }
-}
-
-pub(in crate::backend::cuda::vnext_ops) fn quantizes(part: &weights::MatrixPart) -> bool {
-    matches!(
-        part.format,
-        weights::MatrixFormat::Block(
-            GgufBlockFormat::Q4K | GgufBlockFormat::Q5K | GgufBlockFormat::Q6K
-        )
+/// One checked numeric description for execution, scratch and future topology.
+/// Physical matrix identities remain with their existing retained bindings.
+pub(in crate::backend::cuda::vnext_ops) fn matrix_plan(
+    parts: &[weights::MatrixPart],
+    whole_rows: u64,
+    columns: u32,
+    output_stride: u32,
+    policy: Q8SumPolicy,
+) -> Result<MatrixPlan, String> {
+    MatrixPlan::new(
+        whole_rows,
+        columns,
+        output_stride,
+        policy,
+        parts
+            .iter()
+            .map(|part| crate::gguf_blocks::q8_projection_plan::MatrixPart {
+                format: match part.format {
+                    weights::MatrixFormat::DenseF16 => None,
+                    weights::MatrixFormat::Block(format) => Some(format),
+                },
+                outputs: part.rows,
+                columns: part.columns,
+                output_offset: part.output_offset,
+                transformed: part.transform.is_some() || part.signs_region.is_some(),
+            }),
     )
+}
+
+pub(in crate::backend::cuda::vnext_ops) fn matrix_plan_from_parts(
+    parts: &[weights::MatrixPart],
+    whole_rows: u64,
+    policy: Q8SumPolicy,
+) -> Result<MatrixPlan, String> {
+    let columns = parts.first().ok_or("Q8 matrix plan has no parts")?.columns;
+    let stride = parts.iter().try_fold(0_u32, |end, part| {
+        part.output_offset
+            .checked_add(part.rows)
+            .map(|value| end.max(value))
+            .ok_or("Q8 matrix output extent overflows")
+    })?;
+    matrix_plan(parts, whole_rows, columns, stride, policy)
 }
 
 impl Q8F32ScaleKernels {
@@ -71,6 +98,17 @@ impl Q8F32ScaleKernels {
     }
 
     pub fn load(context: &Arc<CudaContext>) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::load_with_policy(context, Q8SumPolicy::Quantized)
+    }
+
+    pub fn policy(&self) -> Q8SumPolicy {
+        self.policy
+    }
+
+    pub fn load_with_policy(
+        context: &Arc<CudaContext>,
+        policy: Q8SumPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         if !Self::supported(context)? {
             return Err(CudaDeviceRuntimeError::contract(
                 "Q8 MMA requires SM80 or newer",
@@ -84,24 +122,22 @@ impl Q8F32ScaleKernels {
                 .load_function(name)
                 .map_err(|e| CudaDeviceRuntimeError::driver("Q8 projection function load", e))
         };
-        let projection = |format: &str| -> Result<Projection, CudaDeviceRuntimeError> {
+        let projection = |format| -> Result<Projection, CudaDeviceRuntimeError> {
+            let [scalar, tiled, mma] = launch_plan::entries(format, policy).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("unsupported Q8 projection format")
+            })?;
             Ok(Projection {
-                scalar: load(&format!(
-                    "vnext_gguf_{format}_q8_f32scale_dp4a_lane_f16_prototype"
-                ))?,
-                tiled: load(&format!(
-                    "vnext_gguf_{format}_q8_f32scale_dp4a_lane_tiled_f16_prototype"
-                ))?,
-                mma: load(&format!(
-                    "vnext_gguf_{format}_q8_f32scale_mma_f16_prototype"
-                ))?,
+                scalar: load(scalar)?,
+                tiled: load(tiled)?,
+                mma: load(mma)?,
             })
         };
         Ok(Self {
-            pack: load("vnext_gguf_q8_f32scale_pack_f16_prototype")?,
-            q4: projection("q4k")?,
-            q5: projection("q5k")?,
-            q6: projection("q6k")?,
+            policy,
+            pack: load(launch_plan::pack_entry(policy))?,
+            q4: projection(GgufBlockFormat::Q4K)?,
+            q5: projection(GgufBlockFormat::Q5K)?,
+            q6: projection(GgufBlockFormat::Q6K)?,
         })
     }
 
@@ -126,35 +162,22 @@ impl Q8F32ScaleKernels {
                 "invalid Q8 projection inventory or rows",
             ));
         }
-        for part in parts {
-            if part.transform.is_some()
-                || part.signs_region.is_some()
-                || part.columns != columns
-                || part.rows == 0
-                || part
-                    .output_offset
-                    .checked_add(part.rows)
-                    .is_none_or(|end| end > output_stride)
-            {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "Q8 projection requires untransformed, matching matrix parts",
-                ));
-            }
-        }
-        let packed = if parts.iter().any(quantizes) {
-            let layout = PackLayout::new(u64::from(rows), u64::from(columns))
-                .map_err(CudaDeviceRuntimeError::contract)?;
+        let plan = matrix_plan(parts, u64::from(rows), columns, output_stride, self.policy)
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let leaf = plan
+            .leaf(u64::from(rows))
+            .map_err(CudaDeviceRuntimeError::contract)?;
+        let packed = if let Some(layout) = leaf.pack {
             if workspace == 0 {
                 return Err(CudaDeviceRuntimeError::contract(
                     "Q8 projection requires planned workspace",
                 ));
             }
-            let words = workspace.checked_add(layout.scales_bytes).ok_or_else(|| {
+            let words = workspace.checked_add(layout.words_offset).ok_or_else(|| {
                 CudaDeviceRuntimeError::contract("Q8 workspace pointer overflows")
             })?;
-            let groups = u64::from(rows) * u64::from(columns / 32);
-            let blocks = u32::try_from(groups.div_ceil(4))
-                .map_err(|_| CudaDeviceRuntimeError::contract("Q8 pack grid overflows"))?;
+            let config = launch_plan::pack_config(rows, columns)
+                .map_err(CudaDeviceRuntimeError::contract)?;
             let mut launch = stream.launch_builder(&self.pack);
             launch
                 .arg(&input)
@@ -162,16 +185,14 @@ impl Q8F32ScaleKernels {
                 .arg(&words)
                 .arg(&rows)
                 .arg(&columns);
-            // SAFETY: one warp per K32 group; bounds and planned spans checked above.
-            unsafe {
-                launch.launch(LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 0,
-                })
+            let sums = workspace + layout.scales_bytes;
+            if self.policy == Q8SumPolicy::Input {
+                launch.arg(&sums);
             }
-            .map_err(|e| CudaDeviceRuntimeError::driver("Q8 activation pack", e))?;
-            Some(words)
+            // SAFETY: one warp per K32 group; bounds and planned spans checked above.
+            unsafe { launch.launch(config) }
+                .map_err(|e| CudaDeviceRuntimeError::driver("Q8 activation pack", e))?;
+            Some((words, sums))
         } else {
             None
         };
@@ -183,19 +204,21 @@ impl Q8F32ScaleKernels {
                 _ => None,
             };
             if let Some(projection) = projection {
-                let words = packed.ok_or_else(|| {
+                let (words, sums) = packed.ok_or_else(|| {
                     CudaDeviceRuntimeError::contract("Q8 projection lacks packed input")
                 })?;
                 // The 8/32-row paired measurements include activation packing.
                 // MMA amortizes staging from eight rows; narrower launches use
                 // the lane mapping under the same numerical policy.
-                let (function, row_tile, column_tile) = if rows >= 8 {
-                    (&projection.mma, 32, 16)
-                } else if rows > 1 {
-                    (&projection.tiled, 8, 4)
-                } else {
-                    (&projection.scalar, 1, 4)
+                let kernel = leaf.quantized_kernel.ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("Q8 matrix plan lacks its quantized kernel")
+                })?;
+                let function = match kernel {
+                    QuantizedKernel::Scalar => &projection.scalar,
+                    QuantizedKernel::Tiled => &projection.tiled,
+                    QuantizedKernel::Mma => &projection.mma,
                 };
+                let config = launch_plan::project_config(kernel, rows, part.rows);
                 let mut launch = stream.launch_builder(function);
                 launch
                     .arg(&workspace)
@@ -207,16 +230,15 @@ impl Q8F32ScaleKernels {
                     .arg(&part.rows)
                     .arg(&output_stride)
                     .arg(&part.output_offset);
+                if self.policy == Q8SumPolicy::Input
+                    && part.format != weights::MatrixFormat::Block(GgufBlockFormat::Q6K)
+                {
+                    launch.arg(&sums);
+                }
                 // SAFETY: packed pointers and each matrix/output interval were
                 // validated; tail rows/columns participate and suppress stores.
-                unsafe {
-                    launch.launch(LaunchConfig {
-                        grid_dim: (part.rows.div_ceil(column_tile), rows.div_ceil(row_tile), 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(|e| CudaDeviceRuntimeError::driver("Q8 native projection", e))?;
+                unsafe { launch.launch(config) }
+                    .map_err(|e| CudaDeviceRuntimeError::driver("Q8 native projection", e))?;
             } else {
                 strict.transformed_linear(
                     stream,
@@ -258,4 +280,24 @@ mod tests {
             assert!(PackLayout::new(rows, columns).is_err());
         }
     }
+
+    #[test]
+    fn input_sum_pack_layout_keeps_three_disjoint_planned_spans() {
+        for (rows, columns) in [(1, 256), (4, 4096), (8, 12288)] {
+            let old = PackLayout::new(rows, columns).unwrap();
+            let new = PackLayout::with_policy(rows, columns, Q8SumPolicy::Input).unwrap();
+            assert_eq!(old.sums_bytes, 0);
+            assert_eq!(new.scales_bytes, old.scales_bytes);
+            assert_eq!(new.sums_bytes, rows * (columns / 32) * 4);
+            assert_eq!(new.words_offset, new.scales_bytes + new.sums_bytes);
+            assert_eq!(new.total_bytes - new.words_offset, rows * columns);
+            assert_eq!(new.total_bytes - old.total_bytes, new.sums_bytes);
+            assert_eq!(new.words_offset % 16, 0);
+        }
+        assert!(PackLayout::with_policy(1, 255, Q8SumPolicy::Input).is_err());
+        assert!(PackLayout::with_policy(u64::MAX / 256, 256, Q8SumPolicy::Input).is_err());
+    }
 }
+
+#[cfg(test)]
+mod input_sum_tests;

@@ -12,6 +12,7 @@ pub(crate) use iq3s_grid::IQ3_S_GRID;
 mod iq4nl_values;
 pub(crate) use iq4nl_values::IQ4_NL_VALUES;
 mod block_decode;
+pub(crate) mod q8_projection_plan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufBlockFormat {
@@ -228,3 +229,6 @@ pub(crate) mod q4k_q8_reference;
 
 #[cfg(test)]
 pub(crate) mod q56k_q8_reference;
+
+#[cfg(test)]
+pub(crate) mod q8_input_sum_reference;

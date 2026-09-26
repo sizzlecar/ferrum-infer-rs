@@ -4,7 +4,7 @@ use cudarc::driver::{sys, CudaGraph, DevicePtr, DevicePtrMut};
 use ferrum_interfaces::vnext::{ElementType, WeightId};
 use std::ffi::CStr;
 
-fn captured_kernel(graph: &CudaGraph) -> String {
+pub(super) fn captured_kernel(graph: &CudaGraph) -> String {
     // SAFETY: The graph is alive and not modified concurrently. CUDA owns the
     // node parameter/name storage; only the kernel name is copied.
     unsafe {
@@ -47,7 +47,7 @@ fn captured_kernel(graph: &CudaGraph) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check<I: Scalar, O: Scalar>(
+pub(super) fn check<I: Scalar, O: Scalar>(
     context: &Arc<CudaContext>,
     format: GgufBlockFormat,
     rows: usize,
@@ -216,8 +216,10 @@ fn shared_gemm_midrow_production_dispatch_preserves_numeric_and_graph_boundaries
                 outputs,
                 F16,
                 F16,
-                if rows == 31 {
-                    "vnext_gguf_linear_tiled_f16"
+                if rows == 31 && format == Q5K {
+                    "vnext_gguf_linear_q5k_tiled_f16"
+                } else if rows == 31 {
+                    "vnext_gguf_linear_q6k_tiled_f16"
                 } else {
                     shared
                 },
@@ -257,6 +259,6 @@ fn shared_gemm_midrow_production_dispatch_preserves_numeric_and_graph_boundaries
         4096,
         F32,
         F32,
-        "vnext_gguf_linear_tiled_f32",
+        "vnext_gguf_linear_q6k_tiled_f32",
     );
 }

@@ -6,9 +6,13 @@ use crate::gguf_blocks::{
 use cudarc::driver::{CudaStream, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 use half::f16;
 
+mod fixed_k;
 mod prefill_gemm;
+mod q4_stream_mmq;
 mod q4k;
 mod q4k_q8;
+mod q5k;
+mod q6k;
 mod shared_dispatch;
 
 fn decoded_fixture(format: GgufBlockFormat) -> (Vec<u8>, Vec<f32>) {
@@ -385,3 +389,5 @@ fn mixed_matrix_rows<T: Scalar>(
         }
     }
 }
+
+mod q4_residual_mmq;

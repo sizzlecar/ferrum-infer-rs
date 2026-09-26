@@ -181,6 +181,101 @@ extern "C" __global__ void vnext_gguf_linear_q4k_##suffix(const half* x, const b
 NATIVE_Q4K_LINEAR(f16, 1)
 NATIVE_Q4K_LINEAR(tiled_f16, 8)
 
+// Q5_K small-row projection: fix only the physical ABI. The coefficient
+// reconstruction, lane's K order, FP32 sums and warp tree remain native_linear's.
+// Byte loads also retain support for weight views with odd byte offsets.
+template<unsigned RowTile>
+__device__ void native_q5k_linear(const half* x, const byte* w, half* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    const unsigned row = blockIdx.y * RowTile;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows || column >= outputs) return;
+    const unsigned blocks = inputs / 256;
+    const byte* weights = w + size_t(column) * blocks * 176;
+    float sums[RowTile] = {};
+    for (unsigned block = 0; block < blocks; ++block) {
+        const byte* source = weights + size_t(block) * 176;
+        #pragma unroll
+        for (unsigned group = 0; group < 8; ++group) {
+            const unsigned local = group * 32 + lane;
+            const unsigned i = block * 256 + local;
+            const float weight = native_block_value(source, local, 13);
+            #pragma unroll
+            for (unsigned r = 0; r < RowTile; ++r) {
+                if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = half(sums[r]);
+    }
+}
+
+#define NATIVE_Q5K_LINEAR(suffix, tile) \
+extern "C" __global__ void vnext_gguf_linear_q5k_##suffix(const half* x, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    unsigned format, unsigned values, unsigned bytes) { \
+    if (format != 13 || values != 256 || bytes != 176 || inputs % 256 != 0) return; \
+    native_q5k_linear<tile>(x, w, y, rows, inputs, outputs, stride, offset); \
+}
+NATIVE_Q5K_LINEAR(f16, 1)
+NATIVE_Q5K_LINEAR(tiled_f16, 8)
+
+// Fix Q6_K's 256-value/210-byte ABI without changing reconstructed F32
+// coefficients, each lane's K order, or the final warp reduction. Byte-safe
+// coefficient loads preserve odd-offset views. F32 operands remain F32: the
+// output head must not acquire an intermediate half rounding here.
+template<typename Input, typename Output, unsigned RowTile>
+__device__ void native_q6k_linear(const Input* x, const byte* w, Output* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    const unsigned row = blockIdx.y * RowTile;
+    const unsigned lane = threadIdx.x % 32;
+    const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows || column >= outputs) return;
+    const unsigned blocks = inputs / 256;
+    const byte* weights = w + size_t(column) * blocks * 210;
+    float sums[RowTile] = {};
+    for (unsigned block = 0; block < blocks; ++block) {
+        const byte* source = weights + size_t(block) * 210;
+        #pragma unroll
+        for (unsigned group = 0; group < 8; ++group) {
+            const unsigned local = group * 32 + lane;
+            const unsigned i = block * 256 + local;
+            const float weight = native_block_value(source, local, 14);
+            #pragma unroll
+            for (unsigned r = 0; r < RowTile; ++r) {
+                if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = Output(sums[r]);
+    }
+}
+
+#define NATIVE_Q6K_LINEAR(Input, Output, suffix, tile) \
+extern "C" __global__ void vnext_gguf_linear_q6k_##suffix(const Input* x, const byte* w, Output* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    unsigned format, unsigned values, unsigned bytes) { \
+    if (format != 14 || values != 256 || bytes != 210 || inputs % 256 != 0) return; \
+    native_q6k_linear<Input, Output, tile>(x, w, y, rows, inputs, outputs, stride, offset); \
+}
+NATIVE_Q6K_LINEAR(half, half, f16, 1)
+NATIVE_Q6K_LINEAR(half, half, tiled_f16, 8)
+NATIVE_Q6K_LINEAR(float, float, f32, 1)
+NATIVE_Q6K_LINEAR(float, float, tiled_f32, 8)
+NATIVE_Q6K_LINEAR(float, half, f32_f16, 1)
+NATIVE_Q6K_LINEAR(float, half, tiled_f32_f16, 8)
+
 // Q4_K/Q5_K/Q6_K x Q8 projections for the explicit Q8/F32scale policy.
 // The strict native provider does not select these exports. Quantizing activations
 // changes the numeric policy: this is not
@@ -191,8 +286,10 @@ NATIVE_Q4K_LINEAR(tiled_f16, 8)
 // with the lower K index in its least-significant byte. Inputs must be a
 // multiple of 32. Launch 128 threads and ceil(rows*(inputs/32)/4) blocks.
 // Typed pointers retain their natural alignment; caller owns all extents.
-extern "C" __global__ void vnext_gguf_q8_f32scale_pack_f16_prototype(
-    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs) {
+template<bool InputSum>
+__device__ void q8_f32scale_pack(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs,
+    float* input_sums = nullptr) {
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1
         || gridDim.y != 1 || gridDim.z != 1 || inputs == 0 || inputs % 32 != 0) return;
     const unsigned lane = threadIdx.x % 32;
@@ -215,6 +312,14 @@ extern "C" __global__ void vnext_gguf_q8_f32scale_pack_f16_prototype(
         q = int(fmaxf(-127.0f, fminf(127.0f, rounded)));
     }
     if (lane == 0) scales[group] = scale;
+    if constexpr (InputSum) {
+        // The explicit input-sum policy retains the original F16 values for
+        // the affine correction. Fixed RN shuffle-down tree, not q-byte sum.
+        float sum = invalid_group ? NAN : maximum == 0.0f ? 0.0f : value;
+        for (unsigned step = 16; step != 0; step /= 2)
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, step));
+        if (lane == 0) input_sums[group] = sum;
+    }
     // Every lane participates in the shuffle; only the four-lane leaders store.
     const unsigned q0 = unsigned(q) & 255;
     const unsigned q1 = __shfl_down_sync(0xffffffff, q0, 1, 4);
@@ -222,6 +327,17 @@ extern "C" __global__ void vnext_gguf_q8_f32scale_pack_f16_prototype(
     const unsigned q3 = __shfl_down_sync(0xffffffff, q0, 3, 4);
     if (lane % 4 == 0)
         qwords[group * 8 + lane / 4] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+}
+
+extern "C" __global__ void vnext_gguf_q8_f32scale_pack_f16_prototype(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs) {
+    q8_f32scale_pack<false>(x, scales, qwords, rows, inputs);
+}
+
+extern "C" __global__ void vnext_gguf_q8_f32scale_input_sum_pack_f16_prototype(
+    const half* x, float* scales, unsigned* qwords, unsigned rows, unsigned inputs,
+    float* input_sums) {
+    q8_f32scale_pack<true>(x, scales, qwords, rows, inputs, input_sums);
 }
 
 __device__ __forceinline__ int prototype_signed_dot4(unsigned a, unsigned b) {
@@ -307,10 +423,10 @@ __device__ __forceinline__ void prototype_qk_coefficients(
 // groups. Each lane loads four byte-safe coefficients and one packed Q8 word.
 // Each lane applies F32 scaling before the final warp reduction. Weights are
 // shared across RowTile activation rows, without per-group integer shuffles.
-template<unsigned Format, unsigned RowTile>
+template<unsigned Format, unsigned RowTile, bool InputSum = false>
 __device__ void prototype_qk_q8_linear(const float* scales, const unsigned* qwords,
     const byte* w, half* y, unsigned rows, unsigned inputs, unsigned outputs,
-    unsigned stride, unsigned offset) {
+    unsigned stride, unsigned offset, const float* input_sums = nullptr) {
     const size_t first_row = size_t(blockIdx.y) * RowTile;
     const size_t column = size_t(blockIdx.x) * 4 + threadIdx.x / 32;
     const unsigned lane = threadIdx.x % 32;
@@ -335,11 +451,18 @@ __device__ void prototype_qk_q8_linear(const float* scales, const unsigned* qwor
                 const int dot = prototype_signed_dot4(packed_weight, packed_x);
                 // Four activations: |dot|<=4*32*127 for all three formats.
                 const float d = scales[packed_group];
-                // Independent approximate policy, no unquantized sum
-                // correction. The source is built with --fmad=false.
+                // Distinct explicit policies; the original branch retains
+                // its quantized sum. This source uses --fmad=false.
                 if constexpr (Format == 14) {
                     // Each word stays entirely within one K16 weight scale.
                     sums[r] += d * ((word < 4 ? a : b) * float(dot));
+                } else if constexpr (InputSum) {
+                    float term = __fmul_rn(__fmul_rn(d, a), float(dot));
+                    // Exactly one correction per K32 group, independent of
+                    // the eight dot4 lanes. No FMA or change to warp order.
+                    if (word == 0)
+                        term = __fsub_rn(term, __fmul_rn(b, input_sums[packed_group]));
+                    sums[r] = __fadd_rn(sums[r], term);
                 } else {
                     const int sum = prototype_signed_dot4(0x01010101u, packed_x);
                     sums[r] += d * (a * float(dot) - b * float(sum));
@@ -371,15 +494,30 @@ PROTOTYPE_QK_Q8_LINEAR(q5k, 13, lane_tiled_f16, 8)
 PROTOTYPE_QK_Q8_LINEAR(q6k, 14, lane_f16, 1)
 PROTOTYPE_QK_Q8_LINEAR(q6k, 14, lane_tiled_f16, 8)
 
+#define INPUT_SUM_QK_Q8_LINEAR(name, format, suffix, tile) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_input_sum_dp4a_##suffix##_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    const float* input_sums) { \
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 \
+        || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return; \
+    prototype_qk_q8_linear<format, tile, true>(scales, qwords, w, y, rows, inputs, outputs, stride, offset, input_sums); \
+}
+INPUT_SUM_QK_Q8_LINEAR(q4k, 12, lane_f16, 1)
+INPUT_SUM_QK_Q8_LINEAR(q4k, 12, lane_tiled_f16, 8)
+INPUT_SUM_QK_Q8_LINEAR(q5k, 13, lane_f16, 1)
+INPUT_SUM_QK_Q8_LINEAR(q5k, 13, lane_tiled_f16, 8)
+
 // Same diagnostic arithmetic policy, now a 16-output x 32-token CTA. Four
 // warps share a K256 decoded weight tile, each computing 16 outputs x 8 tokens.
 // Integer MMA is restricted to a single K32 scale group; its C registers are
 // reset before every instruction, then rescaled in F32. This export is not
 // selected by the strict provider and requires SM80+ to execute.
-template<unsigned Format>
+template<unsigned Format, bool InputSum = false>
 __device__ void prototype_qk_q8_mma(
     const float* scales, const unsigned* qwords, const byte* w, half* y,
-    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset) {
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset,
+    const float* input_sums = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
         || inputs == 0 || inputs % 256 != 0 || offset > stride || outputs > stride - offset) return;
@@ -433,11 +571,13 @@ __device__ void prototype_qk_q8_mma(
             const unsigned a3 = codes[group][g + 8][t + 4];
             unsigned b0 = 0, b1 = 0;
             float activation_scale = 0.0f;
+            float original_sum = 0.0f;
             if (first_row + g < rows) {
                 const size_t packed_group = (first_row + g) * groups + block_index * 8 + group;
                 b0 = qwords[packed_group * 8 + t];
                 b1 = qwords[packed_group * 8 + t + 4];
                 activation_scale = scales[packed_group];
+                if constexpr (InputSum) original_sum = input_sums[packed_group];
             }
             const float d0 = __shfl_sync(0xffffffff, activation_scale, 8 * t);
             const float d1 = __shfl_sync(0xffffffff, activation_scale, 8 * t + 4);
@@ -469,21 +609,30 @@ __device__ void prototype_qk_q8_mma(
                 partial[group % 4][2] += d0 * (a_upper * float(dot2) + b_upper * float(upper2));
                 partial[group % 4][3] += d1 * (a_upper * float(dot3) + b_upper * float(upper3));
             } else {
-                int activation_sum = prototype_signed_dot4(0x01010101u, b0)
-                    + prototype_signed_dot4(0x01010101u, b1);
-                activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 1, 4);
-                activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 2, 4);
-                const int sum0 = __shfl_sync(0xffffffff, activation_sum, 8 * t);
-                const int sum1 = __shfl_sync(0xffffffff, activation_sum, 8 * t + 4);
                 asm volatile(
                     "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
                     : "+r"(dot0), "+r"(dot1), "+r"(dot2), "+r"(dot3)
                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-                partial[group % 4][0] += d0 * (a_lower * float(dot0) - b_lower * float(sum0));
-                partial[group % 4][1] += d1 * (a_lower * float(dot1) - b_lower * float(sum1));
-                partial[group % 4][2] += d0 * (a_upper * float(dot2) - b_upper * float(sum0));
-                partial[group % 4][3] += d1 * (a_upper * float(dot3) - b_upper * float(sum1));
+                if constexpr (InputSum) {
+                    const float s0 = __shfl_sync(0xffffffff, original_sum, 8 * t);
+                    const float s1 = __shfl_sync(0xffffffff, original_sum, 8 * t + 4);
+                    partial[group % 4][0] += __fsub_rn(__fmul_rn(__fmul_rn(d0, a_lower), float(dot0)), __fmul_rn(b_lower, s0));
+                    partial[group % 4][1] += __fsub_rn(__fmul_rn(__fmul_rn(d1, a_lower), float(dot1)), __fmul_rn(b_lower, s1));
+                    partial[group % 4][2] += __fsub_rn(__fmul_rn(__fmul_rn(d0, a_upper), float(dot2)), __fmul_rn(b_upper, s0));
+                    partial[group % 4][3] += __fsub_rn(__fmul_rn(__fmul_rn(d1, a_upper), float(dot3)), __fmul_rn(b_upper, s1));
+                } else {
+                    int activation_sum = prototype_signed_dot4(0x01010101u, b0)
+                        + prototype_signed_dot4(0x01010101u, b1);
+                    activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 1, 4);
+                    activation_sum += __shfl_xor_sync(0xffffffff, activation_sum, 2, 4);
+                    const int sum0 = __shfl_sync(0xffffffff, activation_sum, 8 * t);
+                    const int sum1 = __shfl_sync(0xffffffff, activation_sum, 8 * t + 4);
+                    partial[group % 4][0] += d0 * (a_lower * float(dot0) - b_lower * float(sum0));
+                    partial[group % 4][1] += d1 * (a_lower * float(dot1) - b_lower * float(sum1));
+                    partial[group % 4][2] += d0 * (a_upper * float(dot2) - b_upper * float(sum0));
+                    partial[group % 4][3] += d1 * (a_upper * float(dot3) - b_upper * float(sum1));
+                }
             }
         }
         // Invalid token/output tails still participate in both barriers and
@@ -510,6 +659,16 @@ extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_mma_f16_prototype( \
 PROTOTYPE_QK_Q8_MMA(q4k, 12)
 PROTOTYPE_QK_Q8_MMA(q5k, 13)
 PROTOTYPE_QK_Q8_MMA(q6k, 14)
+
+#define INPUT_SUM_QK_Q8_MMA(name, format) \
+extern "C" __global__ void vnext_gguf_##name##_q8_f32scale_input_sum_mma_f16_prototype( \
+    const float* scales, const unsigned* qwords, const byte* w, half* y, \
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
+    const float* input_sums) { \
+    prototype_qk_q8_mma<format, true>(scales, qwords, w, y, rows, inputs, outputs, stride, offset, input_sums); \
+}
+INPUT_SUM_QK_Q8_MMA(q4k, 12)
+INPUT_SUM_QK_Q8_MMA(q5k, 13)
 
 // A prefill tile reuses activations across output columns as well as decoded
 // weights across token rows. Decode directly into bounded shared F32 storage;
@@ -657,3 +816,18 @@ extern "C" __global__ void vnext_gguf_hadamard_##suffix( \
 NATIVE_HADAMARD(half, float, f16_f32)
 NATIVE_HADAMARD(float, float, f32_f32)
 NATIVE_HADAMARD(float, half, f32_f16)
+
+// Two disjoint Q8_0 projection leaves from the same F16 input. Host selection
+// checks the complete physical contract; each z plane retains the original
+// generic RowTile8 arithmetic, K order, warp reduction and F16 store.
+extern "C" __global__ void vnext_gguf_linear_q8_pair_tiled_f16(
+    const half* x, const byte* w0, const byte* w1, half* y,
+    unsigned rows, unsigned inputs, unsigned outputs, unsigned stride,
+    unsigned offset0, unsigned offset1, unsigned format,
+    unsigned block_values, unsigned block_bytes) {
+    if (blockIdx.z >= 2) return;
+    const byte* w = blockIdx.z == 0 ? w0 : w1;
+    const unsigned offset = blockIdx.z == 0 ? offset0 : offset1;
+    native_linear<half, half, 8>(x, w, y, rows, inputs, outputs,
+        stride, offset, format, block_values, block_bytes);
+}
