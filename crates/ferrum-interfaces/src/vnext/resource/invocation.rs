@@ -1,3 +1,4 @@
+use super::DynamicPoolSet;
 use super::{
     begin_participant_flights_dispatch, begin_submission_wave_participant_flights_dispatch,
     finalize_session_frames_with_boundary, fmt, invalid_resource, issue_batch_invocation_id,
@@ -340,6 +341,24 @@ where
         authority: BatchParticipantAuthority,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let (pools, authorities) = self.participant_backing_source(authority, resource_id)?;
+        pools.view_many(authorities)
+    }
+
+    pub(crate) fn validate_participant_backing(
+        &self,
+        authority: BatchParticipantAuthority,
+        resource_id: &ResourceId,
+    ) -> Result<super::ValidatedLogicalBacking<'_>, VNextError> {
+        let (pools, authorities) = self.participant_backing_source(authority, resource_id)?;
+        pools.validate_view_many(authorities)
+    }
+
+    pub(crate) fn participant_backing_source(
+        &self,
+        authority: BatchParticipantAuthority,
+        resource_id: &ResourceId,
+    ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
         let index = self
             .participants
             .binary_search_by_key(&authority.canonical_key(), |candidate| {
@@ -352,19 +371,16 @@ where
             .ok_or_else(|| invalid_resource("step backing participant mapping is inconsistent"))?;
         let authorities = participant.backing_snapshot.backing_slices_for(resource_id);
         if !authorities.is_empty() {
-            return participant
-                .session
-                .resources()
-                .request
-                .plan
-                .dynamic_pools()
-                .view_many(authorities);
+            return Ok((
+                participant.session.resources().request.plan.dynamic_pools(),
+                authorities,
+            ));
         }
         participant
             .session
             .resources()
             .request
-            .backing_view(resource_id)
+            .backing_source(resource_id)
     }
 
     pub fn participant_frames(
@@ -488,19 +504,37 @@ where
         &self,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let (pools, authorities) = self.backing_source(resource_id)?;
+        pools.view_many(authorities)
+    }
+
+    pub(crate) fn validate_backing(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<super::ValidatedLogicalBacking<'_>, VNextError> {
+        let (pools, authorities) = self.backing_source(resource_id)?;
+        pools.validate_view_many(authorities)
+    }
+
+    pub(crate) fn backing_source(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
         if let Some(authority) = self
             .claimed_backing
             .backing_slices()
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
-            return self.participants[0]
-                .session
-                .resources()
-                .request
-                .plan
-                .dynamic_pools()
-                .view(authority);
+            return Ok((
+                self.participants[0]
+                    .session
+                    .resources()
+                    .request
+                    .plan
+                    .dynamic_pools(),
+                std::slice::from_ref(authority),
+            ));
         }
         Err(invalid_resource(format!(
             "resource `{resource_id}` is not step-shared backing"
@@ -1881,6 +1915,24 @@ where
         node_index: usize,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let (pools, authorities) = self.backing_source(node_index, resource_id)?;
+        pools.view_many(authorities)
+    }
+
+    pub(crate) fn validate_backing(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<super::ValidatedLogicalBacking<'_>, VNextError> {
+        let (pools, authorities) = self.backing_source(node_index, resource_id)?;
+        pools.validate_view_many(authorities)
+    }
+
+    pub(crate) fn backing_source(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
         let node = self
             .nodes
             .get(node_index)
@@ -1891,13 +1943,15 @@ where
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
-            return node.participant_authority.participants[0]
-                .request
-                .plan
-                .dynamic_pools()
-                .view(authority);
+            return Ok((
+                node.participant_authority.participants[0]
+                    .request
+                    .plan
+                    .dynamic_pools(),
+                std::slice::from_ref(authority),
+            ));
         }
-        self.step.backing_view(resource_id)
+        self.step.backing_source(resource_id)
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {
@@ -2416,21 +2470,39 @@ where
         &self,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let (pools, authorities) = self.backing_source(resource_id)?;
+        pools.view_many(authorities)
+    }
+
+    pub(crate) fn validate_backing(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<super::ValidatedLogicalBacking<'_>, VNextError> {
+        let (pools, authorities) = self.backing_source(resource_id)?;
+        pools.validate_view_many(authorities)
+    }
+
+    pub(crate) fn backing_source(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
         if let Some(authority) = self
             .claimed_backing
             .backing_slices()
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
-            return self.step.participants[0]
-                .session
-                .resources()
-                .request
-                .plan
-                .dynamic_pools()
-                .view(authority);
+            return Ok((
+                self.step.participants[0]
+                    .session
+                    .resources()
+                    .request
+                    .plan
+                    .dynamic_pools(),
+                std::slice::from_ref(authority),
+            ));
         }
-        self.step.backing_view(resource_id)
+        self.step.backing_source(resource_id)
     }
 
     pub(crate) fn participant_backing_views(

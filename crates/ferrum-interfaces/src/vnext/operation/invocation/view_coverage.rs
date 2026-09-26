@@ -58,7 +58,7 @@ impl<'views, 'lease, B> FullyCoveredOperationViews<'views, 'lease, B> {
     }
 }
 
-fn validate_subrange_bounds(
+pub(super) fn validate_subrange_bounds(
     covered_bytes: u64,
     offset_bytes: u64,
     length_bytes: u64,

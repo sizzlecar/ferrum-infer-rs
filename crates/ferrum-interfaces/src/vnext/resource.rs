@@ -61,6 +61,8 @@ mod maintenance_boundary;
 pub use maintenance_boundary::*;
 mod lane_stable_arena;
 use lane_stable_arena::*;
+mod backing_validation;
+pub(crate) use backing_validation::ValidatedLogicalBacking;
 mod dynamic_pool_set;
 pub use dynamic_pool_set::DynamicPoolGrowthBatchReceipt;
 use dynamic_pool_set::DynamicPoolSet;

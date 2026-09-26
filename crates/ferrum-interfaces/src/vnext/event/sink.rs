@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::model_executor::ExecutorRequestOrigin;
@@ -98,6 +99,8 @@ pub enum ExecutionEventCapturePolicy {
     #[default]
     AllFrames,
     FirstFramePerRequest,
+    /// Capture a physical-submission prefix, independently of model phase.
+    FirstFramesPerRequest(NonZeroU32),
     LifecycleOnly,
 }
 
@@ -106,12 +109,13 @@ impl ExecutionEventCapturePolicy {
         match self {
             Self::AllFrames => true,
             Self::FirstFramePerRequest | Self::LifecycleOnly => completed_frames == 0,
+            Self::FirstFramesPerRequest(limit) => completed_frames < limit.get() as u64,
         }
     }
 
     pub const fn records_event(self, kind: ExecutionEventKind) -> bool {
         match self {
-            Self::AllFrames | Self::FirstFramePerRequest => true,
+            Self::AllFrames | Self::FirstFramePerRequest | Self::FirstFramesPerRequest(_) => true,
             Self::LifecycleOnly => matches!(
                 kind,
                 ExecutionEventKind::RequestAccepted
@@ -129,9 +133,28 @@ impl ExecutionEventCapturePolicy {
         match self {
             Self::AllFrames => "all_frames",
             Self::FirstFramePerRequest => "first_frame_per_request",
+            Self::FirstFramesPerRequest(_) => "first_n_frames_per_request",
             Self::LifecycleOnly => "lifecycle_only",
         }
     }
+}
+
+/// Diagnostic capture accounting, not execution or resource authority. A
+/// failed request does not establish complete coverage of attempted work.
+#[derive(Debug, Clone)]
+pub struct ExecutionFrameCaptureSummary {
+    pub run_id: RunId,
+    pub request_id: RequestIdentity,
+    pub limit: NonZeroU32,
+    pub completed_frames: u64,
+    pub captured_completed_frames: u64,
+    pub request_succeeded: bool,
+    /// False when capture ends through cancellation, abandonment, or a
+    /// failure without an observed request terminal; never proves quiescence.
+    pub journal_terminal_observed: bool,
+    /// The journal observed a submission without its matching completion.
+    /// Such work is not included in either completed-frame count.
+    pub pending_submission: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -179,6 +202,13 @@ pub trait ExecutionEventSink: Send + Sync {
     fn record_device_submission_attribution(
         &self,
         _attribution: &super::super::BoundDeviceSubmissionAttribution,
+    ) -> Result<(), ExecutionEventSinkError> {
+        Ok(())
+    }
+
+    fn record_frame_capture_summary(
+        &self,
+        _summary: &ExecutionFrameCaptureSummary,
     ) -> Result<(), ExecutionEventSinkError> {
         Ok(())
     }
@@ -282,6 +312,7 @@ where
     capture_policy: ExecutionEventCapturePolicy,
     sink_enablement: ExecutionEventSinkEnablement,
     sink_failed: bool,
+    capture_summary_recorded: bool,
 }
 
 impl<'sink, S> ExecutionEventEmitter<'sink, S>
@@ -302,6 +333,7 @@ where
             capture_policy,
             sink_enablement,
             sink_failed: false,
+            capture_summary_recorded: false,
         }
     }
 }
@@ -348,6 +380,7 @@ impl ExecutionEventEmitter<'static, dyn ExecutionEventSink> {
             capture_policy,
             sink_enablement,
             sink_failed: false,
+            capture_summary_recorded: false,
         }
     }
 }
@@ -417,6 +450,11 @@ where
         event: ExecutionEvent,
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
+        if self.capture_summary_recorded {
+            return Err(ExecutionEventSinkError::new(
+                "execution capture is already closed",
+            ));
+        }
         if self.sink_enablement == ExecutionEventSinkEnablement::None {
             let mut next_cursor = self.cursor.clone();
             Self::validate_next(&mut next_cursor, &event, context)?;
@@ -449,6 +487,11 @@ where
         events: Vec<ExecutionEvent>,
         contexts: &[TrustedExecutionEventContext<'_>],
     ) -> Result<(), ExecutionEventSinkError> {
+        if self.capture_summary_recorded {
+            return Err(ExecutionEventSinkError::new(
+                "execution capture is already closed",
+            ));
+        }
         if self.sink_enablement == ExecutionEventSinkEnablement::None {
             if events.len() != contexts.len() {
                 return Err(ExecutionEventSinkError::new(
@@ -515,6 +558,40 @@ where
 
     pub fn cursor(&self) -> &ExecutionEventCursor {
         &self.cursor
+    }
+
+    /// Close bounded diagnostics with terminal evidence or an explicitly
+    /// incomplete prefix. This does not grant execution completion authority.
+    pub fn record_frame_capture_summary(
+        &mut self,
+        summary: &ExecutionFrameCaptureSummary,
+    ) -> Result<(), ExecutionEventSinkError> {
+        if self.sink_failed || self.capture_summary_recorded {
+            return Err(ExecutionEventSinkError::new(
+                "execution capture is already sealed",
+            ));
+        }
+        if &summary.run_id != self.cursor.run_id()
+            || &summary.request_id != self.cursor.request_id()
+            || summary.journal_terminal_observed != self.cursor.is_terminal()
+            || summary.request_succeeded != self.cursor.request_succeeded().unwrap_or(false)
+            || (summary.pending_submission && summary.journal_terminal_observed)
+            || self.capture_policy
+                != ExecutionEventCapturePolicy::FirstFramesPerRequest(summary.limit)
+            || summary.captured_completed_frames != self.cursor.completed_frames()
+            || summary.captured_completed_frames
+                != summary.completed_frames.min(u64::from(summary.limit.get()))
+        {
+            return Err(ExecutionEventSinkError::new(
+                "invalid frame capture accounting",
+            ));
+        }
+        if let Err(error) = self.sink.as_sink().record_frame_capture_summary(summary) {
+            self.sink_failed = true;
+            return Err(error);
+        }
+        self.capture_summary_recorded = true;
+        Ok(())
     }
 
     pub const fn sink_failed(&self) -> bool {

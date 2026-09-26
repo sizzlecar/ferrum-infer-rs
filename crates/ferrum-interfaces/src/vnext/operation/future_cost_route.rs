@@ -96,9 +96,15 @@ pub struct ExecutionCostRouteView {
     pub(crate) lane_id: crate::vnext::ExecutionLaneId,
     pub(crate) token_masks: Option<ProductTokenMaskResidencySnapshot>,
     pub(crate) graph_stream_state: Option<crate::vnext::DeviceCostGraphStreamState>,
+    pub(crate) graph_catalog: Option<Arc<crate::vnext::DeviceCostGraphCatalog>>,
 }
 
 impl ExecutionCostRouteView {
+    /// Bounded numeric inventory under the same live lane/resource fence.
+    pub fn graph_catalog(&self) -> Option<&crate::vnext::DeviceCostGraphCatalog> {
+        self.graph_catalog.as_deref()
+    }
+
     /// Passive capture mode shares the same numeric epoch and resource authority.
     /// It is intentionally not part of same_live_evidence or execution identity.
     pub fn with_structured_capture(mut self, enabled: bool) -> Self {
@@ -121,6 +127,7 @@ impl ExecutionCostRouteView {
             initialized: vec![false; self.initial_frontiers.len()],
             token_masks: self.token_masks.clone(),
             last_token_mask_uploads: None,
+            projected_graph_state: crate::execution_cost::ActualWaveGraphState::Disabled,
         }
     }
 
@@ -161,6 +168,7 @@ impl ExecutionCostRouteView {
             && self.lane_id == other.lane_id
             && self.token_masks == other.token_masks
             && self.graph_stream_state == other.graph_stream_state
+            && self.graph_catalog == other.graph_catalog
     }
 }
 
@@ -175,9 +183,14 @@ pub struct ExecutionCostRouteState {
     pub(crate) initialized: Vec<bool>,
     pub(crate) token_masks: Option<ProductTokenMaskResidencySnapshot>,
     pub(crate) last_token_mask_uploads: Option<Vec<bool>>,
+    pub(crate) projected_graph_state: crate::execution_cost::ActualWaveGraphState,
 }
 
 impl ExecutionCostRouteState {
+    pub fn projected_graph_state(&self) -> crate::execution_cost::ActualWaveGraphState {
+        self.projected_graph_state
+    }
+
     pub fn projected_waves(&self) -> usize {
         self.resources.projected_waves()
     }

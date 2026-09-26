@@ -979,6 +979,68 @@ fn resolved_evidence_for_inputs(inputs: ResolvedModelPlanInputs) -> ResolvedFixt
 }
 
 #[test]
+fn resolved_source_evidence_must_bind_canonical_file_order() {
+    let fixture = plan_fixture(0);
+    let numerical = numerical_resolution(&fixture);
+    let mut inputs = resolved_inputs(&fixture);
+    // Reproduce a real bootstrap failure: the source parser preserved file
+    // discovery order, while the resolved envelope canonicalized the files.
+    // All file identities and bytes remain unchanged.
+    for files in [
+        &mut inputs.resolved_sources.semantic.files,
+        &mut inputs.resolved_sources.tokenizer.files,
+        &mut inputs.resolved_sources.weights.files,
+    ] {
+        assert!(files.len() > 1);
+        files.reverse();
+    }
+    let unsorted = resolved_evidence_for_inputs(inputs.clone());
+    let context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &unsorted.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+        &numerical,
+    );
+    let error = ResolvedModelPlan::new(unsorted.inputs, unsorted.bindings, &context)
+        .expect_err("raw source array order must not be silently reinterpreted");
+    assert!(matches!(
+        error,
+        VNextError::InvalidResolvedModelPlan { field, .. }
+            if field == "decision_bindings.source_field_path"
+    ));
+
+    // Normalize before creating the external parsed evidence, as the actual
+    // model fixture must do. This changes neither file hashes nor authority.
+    for files in [
+        &mut inputs.resolved_sources.semantic.files,
+        &mut inputs.resolved_sources.tokenizer.files,
+        &mut inputs.resolved_sources.weights.files,
+    ] {
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    }
+    let ordered = resolved_evidence_for_inputs(inputs);
+    let expected_sources = ordered.inputs.resolved_sources.clone();
+    let context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &ordered.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+        &numerical,
+    );
+    let plan = ResolvedModelPlan::new(ordered.inputs, ordered.bindings, &context).unwrap();
+    assert_eq!(plan.parts().resolved_sources, expected_sources);
+    assert_eq!(plan.execution_plan(), &fixture.plan);
+    let restored =
+        ResolvedModelPlan::from_json_validated(&plan.to_json().unwrap(), &context).unwrap();
+    assert_eq!(restored, plan);
+}
+
+#[test]
 fn resolved_model_plan_closes_all_contract_links() {
     let fixture = plan_fixture(0);
     let evidence = resolved_evidence(&fixture);

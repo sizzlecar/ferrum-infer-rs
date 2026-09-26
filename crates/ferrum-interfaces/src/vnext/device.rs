@@ -22,6 +22,7 @@ pub use cost_identity::*;
 mod cost_graph;
 pub use cost_graph::*;
 mod cost_range;
+mod replay_cost;
 pub use cost_range::*;
 mod submission_guard;
 pub use submission_guard::*;
@@ -1580,8 +1581,11 @@ impl DeviceReusableExecutionProgram {
 }
 
 /// One exact invocation of a segment from the sealed reusable program catalog.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceReusableExecutionInvocation {
+    #[serde(skip)]
+    selected_replay_cost:
+        Option<Arc<[Option<crate::execution_cost::SelectedCommandCostEvidenceV1>]>>,
     program_id: DeviceReusableExecutionProgramId,
     segment: DeviceReusableExecutionSegment,
     participant_count: u32,
@@ -1610,6 +1614,7 @@ impl DeviceReusableExecutionInvocation {
             segment,
             participant_count,
             token_count,
+            selected_replay_cost: None,
         })
     }
 
@@ -2747,8 +2752,12 @@ impl DeviceNativeWorkAttribution {
 /// A CUDA graph segment launches as one physical command, but release
 /// determinism must still prove which immutable-plan nodes were replayed and
 /// how much native graph work each logical command contributed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceReplayedLogicalCommandAttribution {
+    #[serde(skip)]
+    replay_template: Option<crate::execution_cost::SelectedReplayAlgorithmTemplateV1>,
+    #[serde(skip)]
+    statistical_evidence: Option<crate::execution_cost::SelectedCommandCostEvidenceV1>,
     logical_command_ordinal: u32,
     node_index: u32,
     native_op_id: DeviceNativeOperationId,
@@ -2780,6 +2789,8 @@ impl DeviceReplayedLogicalCommandAttribution {
             return None;
         }
         Some(Self {
+            replay_template: None,
+            statistical_evidence: None,
             logical_command_ordinal,
             node_index,
             native_op_id,
@@ -3505,9 +3516,12 @@ impl<'request, 'source, B> StaticWeightTransformRequest<'request, 'source, B> {
     }
 }
 
-/// Diagnostic memory samples with an explicit source and scope. The native Metal
-/// sampler queries actual process device-resource allocations. Sampled peaks can
-/// miss shorter peaks and are neither RSS nor total physical device residency.
+/// Diagnostic memory samples with an explicit source and scope. Metal reports
+/// the actual process device-resource allocation query. CUDA reports live
+/// backing-allocation requests owned by the runtime, with pool, whole-device
+/// and optional NVML process accounting kept in separate typed JSONL fields.
+/// Requested allocations are not physical residency or total process VRAM;
+/// sampled high-water marks can miss shorter peaks for either backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceMemoryTelemetrySnapshot {
     pub schema_version: u32,
@@ -3516,7 +3530,7 @@ pub struct DeviceMemoryTelemetrySnapshot {
     pub scope: String,
     pub phase: String,
     pub pid: u32,
-    /// Native device identity preserved as text, including the Metal registry ID.
+    /// Native identity preserved as text: Metal decimal registry ID or CUDA UUID.
     pub device_registry_id: String,
     pub device_name: String,
     /// Unix anchor; elapsed_ns uses a monotonic clock.
@@ -3546,6 +3560,12 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     type Fence: Send + 'static;
     type Error: Error + Send + Sync + 'static;
 
+    /// Immutable passive producer mode. Disabled must not materialize replay
+    /// numeric invocations/tables. This is not timing or execution capability.
+    fn structured_cost_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        ferrum_types::SloStructuredCostCapture::Disabled
+    }
+
     fn descriptor(&self) -> &DeviceDescriptor;
 
     /// Cached evidence about the actual device and its compatibility scope.
@@ -3565,6 +3585,15 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// Nonblocking numeric state of this exact stream's graph preparation and
     /// resident cache. Callers must hold the owning lane's quiescent bracket.
     /// Missing evidence remains unknown even when no replay was observed.
+    fn cost_reusable_graph_catalog(
+        &self,
+        _stream: &Self::Stream,
+        _limits: DeviceCostGraphCatalogLimits,
+        _poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<DeviceCostGraphCatalog, Self::Error>> {
+        None
+    }
+
     fn cost_graph_stream_state(
         &self,
         _stream: &Self::Stream,
@@ -3574,6 +3603,13 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     /// Describes the actual eager core encoder without encoding or submitting
     /// anything. It grants neither buffer nor readback-staging permission.
+    /// Actual native operation used for an uploaded direct graph replay.
+    /// This only declares its identity; catalog, topology and logical work
+    /// still require independent exact projection and the final native guard.
+    fn cost_direct_graph_replay_operation(&self) -> Option<&'static str> {
+        None
+    }
+
     fn cost_core_execution_capabilities(&self) -> Option<super::DeviceCoreCostCapabilities> {
         None
     }
@@ -3781,6 +3817,12 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     /// commit boundary. A declaration of eager execution alone is insufficient.
     fn supports_guarded_submission(&self) -> bool {
         false
+    }
+
+    /// Separately implemented transaction for a cost-uncommitted cold wave.
+    /// Supporting eager/warm guards never implies this capability.
+    fn guarded_adaptive_submission_capability(&self) -> DeviceGuardedAdaptiveCapability {
+        DeviceGuardedAdaptiveCapability::Unsupported
     }
 
     /// The default executes no commands. Implementations must not fall back to

@@ -24,6 +24,8 @@ mod submission_guard;
 pub use submission_guard::*;
 mod expected_work;
 pub use expected_work::*;
+mod host_wall_partition;
+pub use host_wall_partition::*;
 #[cfg(test)]
 mod tests;
 

@@ -7,6 +7,23 @@ use crate::vnext::{
 use std::sync::Arc;
 
 pub trait PreparedWaveSubmissionGuard: Send + Sync {
+    /// True only for a dispatch committed to a cost witness. This does not
+    /// require legacy commands to provide selected cost evidence. Backends use
+    /// it only for commands that explicitly declare a library cost contract.
+    fn relies_on_cost_witness(&self) -> bool {
+        false
+    }
+
+    fn submission_mode(&self) -> crate::vnext::GuardedSubmissionMode {
+        crate::vnext::GuardedSubmissionMode::ExactRoute
+    }
+    fn check_adaptive_preparation(
+        &self,
+        _intent: &crate::vnext::DeviceAdaptiveSubmissionIntent<'_>,
+        _readback: CoreReadbackRoute,
+    ) -> Result<(), GuardedNotSubmittedReason> {
+        Err(GuardedNotSubmittedReason::AttributionUnavailable)
+    }
     fn check(
         &self,
         attribution: &DeviceSubmissionAttribution,

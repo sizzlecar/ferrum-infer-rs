@@ -26,8 +26,14 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         limits: ResourcePlanningLimits,
         budget: &mut dyn ResourcePlanningBudget,
     ) -> ResourcePlanningAvailability<ResourcePlanningView> {
-        match self.resource_planning_view_with_graph_on_lane(sessions, lane, limits, budget) {
-            Ok((view, _)) => ResourcePlanningAvailability::Known(view),
+        if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
+            return ResourcePlanningAvailability::Unknown(ResourcePlanningUnknown::StaleIdentity);
+        }
+        // Scalar resource callers do not request or pay for a graph inventory.
+        match lane.try_with_resource_planning_lane(|epoch, _| {
+            self.capture_resource_planning_view(sessions, Some((lane.id(), epoch)), limits, budget)
+        }) {
+            Ok(view) => ResourcePlanningAvailability::Known(view),
             Err(reason) => ResourcePlanningAvailability::Unknown(reason),
         }
     }
@@ -42,15 +48,16 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         (
             ResourcePlanningView,
             Option<crate::vnext::DeviceCostGraphStreamState>,
+            Option<crate::vnext::DeviceCostGraphCatalog>,
         ),
         ResourcePlanningUnknown,
     > {
         if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
             return Err(ResourcePlanningUnknown::StaleIdentity);
         }
-        lane.try_with_resource_planning_lane(|epoch, graph| {
+        lane.try_with_cost_planning_lane(limits, budget, |epoch, graph, catalog, budget| {
             self.capture_resource_planning_view(sessions, Some((lane.id(), epoch)), limits, budget)
-                .map(|view| (view, graph))
+                .map(|view| (view, graph, catalog))
         })
     }
 

@@ -605,3 +605,64 @@ mod tests {
         assert_eq!(declared[0].compute_dispatch_count, 2);
     }
 }
+
+impl super::ReusableExecutionTopologyView for OperationCostRouteRequest<'_> {
+    fn operation_id(&self) -> &OperationId {
+        self.node.operation_id()
+    }
+    fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
+        self.node.attributes()
+    }
+    fn bindings(&self) -> &[ResolvedValueBinding] {
+        self.node.values()
+    }
+    fn memory_plan(&self) -> &MemoryPlan {
+        self.memory
+    }
+    fn participant_count(&self) -> usize {
+        self.rows.len()
+    }
+    fn immediate_tokens(&self) -> u64 {
+        self.immediate_tokens
+    }
+    fn token_row(&self, index: usize) -> Option<OperationCostWorkRow> {
+        self.rows.get(index).copied()
+    }
+    fn workspace_resource(
+        &self,
+        workspace: super::ReusableExecutionWorkspaceAddress,
+    ) -> Option<&crate::vnext::ResourceId> {
+        use super::ReusableExecutionWorkspaceAddress as W;
+        match workspace {
+            W::Scratch => self.node.scratch_resource(),
+            W::Binding => self.node.binding_resource(),
+            W::Persistent => self.node.persistent_resource(),
+        }
+    }
+    fn resource_reusable_address_scope(
+        &self,
+        resource: &crate::vnext::ResourceId,
+    ) -> Result<Option<crate::vnext::DeviceReusableAddressScope>, VNextError> {
+        if self
+            .memory
+            .static_allocations()
+            .binary_search_by(|a| a.resource_id().cmp(resource))
+            .is_ok()
+        {
+            return Ok(Some(crate::vnext::DeviceReusableAddressScope::Plan));
+        }
+        if self
+            .memory
+            .dynamic_descriptors()
+            .binary_search_by(|d| d.base_resource_id().cmp(resource))
+            .is_err()
+        {
+            return Err(invalid_operation(
+                "future topology references unknown memory resource",
+            ));
+        }
+        Ok(self
+            .physical_ranges
+            .and_then(|proof| proof.reusable_scope(resource)))
+    }
+}

@@ -1,3 +1,6 @@
+mod gguf_f16_projections;
+pub use gguf_f16_projections::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
@@ -44,6 +47,10 @@ pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swi
 pub const DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID: &str = "operation.dense_swiglu.q8-f32scale";
 pub const DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID: &str =
     "capability.operation.dense_swiglu.q8-f32scale";
+pub const DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID: &str =
+    "operation.dense_swiglu.q8-f32scale-input-sum";
+pub const DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID: &str =
+    "capability.operation.dense_swiglu.q8-f32scale-input-sum";
 pub const DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID: &str =
     "operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale";
 pub const DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID: &str =
@@ -770,6 +777,111 @@ pub fn dense_swiglu_q8_f32scale_contract() -> Result<StandardOperationContract, 
     descriptor.version = ContractVersion::new(1, 0);
     descriptor.provider = provider_requirement(
         DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Dense SwiGLU with F32-scale Q8 activations and original-input min correction.
+///
+/// This independent policy retains the activation quantization, eligible native
+/// Q4_K/Q5_K/Q6_K leaves, Q6_K arithmetic and F16 boundaries of
+/// [`dense_swiglu_q8_f32scale_contract`]. Native K-block leaves require complete
+/// K256 blocks; this contract does not introduce padding or partial-group rules.
+/// Other physical formats retain the strict operation's arithmetic.
+///
+/// Each K32 activation group additionally stores `S`, the sum of its original
+/// F16 inputs converted to F32. The reduction initializes 32 lanes with those
+/// values, then performs synchronous shuffle-down steps 16, 8, 4, 2, 1, with
+/// separate round-to-nearest F32 additions using the previous step's values.
+/// Only lane zero is consumed. An all-zero group stores positive-zero S; a group
+/// containing any nonfinite input stores NaN S, NaN delta and all-zero quants.
+/// This same rule applies to the F16 SiLU-times-up input of the down projection.
+///
+/// For Q4_K/Q5_K, form the same rounded F32 coefficients `a` and `b` as in the
+/// original policy. Replace only its K32 min correction, giving the reference
+/// term `delta * a * sum(qw*q) - b*S`. One complete-group implementation computes
+/// `RN_F32(RN_F32(RN_F32(delta*a)*F32(dot)) - RN_F32(b*S))`, with no fused
+/// multiply-add. Rescaling dot4 partials before the floating reduction is also
+/// permitted, but `b*S` is subtracted exactly once per K32 group, never once per
+/// partial. The declared F32 reduction error is checked against the independent
+/// policy reference using the rounded delta, coefficients and S. S is neither
+/// the quantized integer sum times delta nor an F64/sequential input reduction.
+/// Q6_K has no min term and continues to use the original two-K16-dot rule.
+///
+/// Resource sizing must include the bounded F32 sums alongside scales/quants.
+/// Across-group accumulation and SiLU remain F32; all projection/intermediate
+/// F16 storage boundaries and the existing tolerance against the independent
+/// policy remain unchanged. This is not strict-operation equivalence or a model
+/// quality guarantee, and does not authorize a change to another operation.
+pub fn dense_swiglu_q8_f32scale_input_sum_contract() -> Result<StandardOperationContract, VNextError>
+{
+    let mut descriptor = dense_swiglu_contract()?.descriptor;
+    descriptor.id = OperationId::new(DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID)?;
+    descriptor.version = ContractVersion::new(1, 0);
+    descriptor.provider = provider_requirement(
+        DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Explicit, geometry-qualified Q8 gate/up policy with strict SiLU and down.
+///
+/// The approximate branch requires exactly eight packed physical rows, F16
+/// activations/projection storage, and both gate/up weights consisting entirely
+/// of native Q4_K K256 leaves, with no rotation or sign transforms. Selection is
+/// based on these physical facts, never request phase or model identity. Every
+/// other geometry/format executes the original strict operation arithmetic;
+/// fallback keeps this operation's identity and must be observable as fallback.
+///
+/// Each K32 activation group is read from the original F16 input into F32. Its
+/// scale is RN(max(abs(x))/127); quants are clamp(round_away(RN(x/scale)), -127,
+/// 127), and its integer sum is computed from those same quants. Zero groups
+/// use +0 scale and zero quants; nonfinite groups use NaN scale and zero quants.
+/// Native Q4 coefficients a,b remain F32. Integer MMA evaluates each K32 dot
+/// exactly; its contribution is scale * (a * dot - b * integer_sum), with F32
+/// operations and no original-input-sum substitution or F16 coefficient rounding.
+/// Stream-K stores F32 partials, then fixes up the projection with one final F16
+/// store. Its F32 reduction order may differ from strict and is not bitwise
+/// equivalent. SiLU and the complete down projection retain strict arithmetic,
+/// including their existing F32 intermediates and F16 storage boundaries.
+///
+/// All packed activations/scales/sums/partials must be in declared scratch;
+/// dynamic launch geometry belongs to provider identity. The existing signature,
+/// resources and independent-oracle tolerance are unchanged. This declaration
+/// establishes neither model quality nor a performance guarantee.
+pub fn dense_swiglu_q8_gate_up_stream_mmq_contract() -> Result<StandardOperationContract, VNextError>
+{
+    let mut descriptor = dense_swiglu_contract()?.descriptor;
+    descriptor.id = OperationId::new(DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID)?;
+    descriptor.provider = provider_requirement(
+        DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID,
+        ContractVersion::new(1, 0),
+    )?;
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Opt-in CUDA candidate: whole invocation M2..8 selects the existing
+/// two-level F32-residual Q8 math for complete Q4 gate/up and eligible Q4 down.
+/// This numerical domain includes small prefill and mixed invocations; no
+/// execution phase is inferred from matrix rows. M1 and M>=9 stay strict.
+/// Participant subdivision, including leaf M1, preserves the whole policy.
+/// Other down formats, GDN and head operations are unchanged. This descriptor
+/// declares arithmetic support, not model-quality or performance qualification.
+pub const DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID: &str =
+    "operation.dense_swiglu.q8-residual2-ffn-m2to8-stream-mmq";
+pub const DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID: &str =
+    "capability.operation.dense_swiglu.q8-residual2-ffn-m2to8-stream-mmq";
+pub fn dense_swiglu_q8_residual2_ffn_m2to8_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    let mut descriptor = dense_swiglu_contract()?.descriptor;
+    descriptor.id = OperationId::new(DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID)?;
+    descriptor.provider = provider_requirement(
+        DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID,
         ContractVersion::new(1, 0),
     )?;
     descriptor.validate()?;
@@ -2378,6 +2490,80 @@ mod tests {
                 .unwrap(),
             strict_fingerprint
         );
+    }
+
+    #[test]
+    fn dense_swiglu_q8_input_sum_is_independent_of_both_existing_policies() {
+        let input_sum = dense_swiglu_q8_f32scale_input_sum_contract().unwrap();
+        let descriptor = input_sum.descriptor();
+        assert_eq!(
+            descriptor.id.as_str(),
+            DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(
+            descriptor.provider.required_capabilities,
+            BTreeSet::from([
+                CapabilityId::new(DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID).unwrap()
+            ])
+        );
+        for original in [
+            dense_swiglu_contract().unwrap(),
+            dense_swiglu_q8_f32scale_contract().unwrap(),
+        ] {
+            let old = original.descriptor();
+            assert_ne!(descriptor.id, old.id);
+            assert_ne!(
+                descriptor.fingerprint().unwrap(),
+                old.fingerprint().unwrap()
+            );
+            assert!(descriptor
+                .provider
+                .required_capabilities
+                .is_disjoint(&old.provider.required_capabilities));
+            // The only descriptor changes are the explicit operation and its
+            // required provider capability; no old tolerance or ABI is relaxed.
+            let mut expected = old.clone();
+            expected.id = descriptor.id.clone();
+            expected.provider = descriptor.provider.clone();
+            assert_eq!(&expected, descriptor);
+        }
+        input_sum
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+        let decoded: OperationDescriptor =
+            serde_json::from_slice(&serde_json::to_vec(descriptor).unwrap()).unwrap();
+        assert_eq!(&decoded, descriptor);
+        assert_eq!(
+            decoded.fingerprint().unwrap(),
+            descriptor.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn gate_up_stream_mmq_has_separate_identity_without_relaxing_abi_or_oracle() {
+        let new = dense_swiglu_q8_gate_up_stream_mmq_contract().unwrap();
+        for old in [
+            dense_swiglu_contract().unwrap(),
+            dense_swiglu_q8_f32scale_contract().unwrap(),
+            dense_swiglu_q8_f32scale_input_sum_contract().unwrap(),
+        ] {
+            let mut expected = old.descriptor().clone();
+            assert_ne!(
+                expected.fingerprint().unwrap(),
+                new.descriptor().fingerprint().unwrap()
+            );
+            assert!(expected
+                .provider
+                .required_capabilities
+                .is_disjoint(&new.descriptor().provider.required_capabilities));
+            expected.id = new.descriptor().id.clone();
+            expected.provider = new.descriptor().provider.clone();
+            assert_eq!(&expected, new.descriptor());
+        }
+        let decoded: OperationDescriptor =
+            serde_json::from_slice(&serde_json::to_vec(new.descriptor()).unwrap()).unwrap();
+        assert_eq!(&decoded, new.descriptor());
     }
 
     #[test]

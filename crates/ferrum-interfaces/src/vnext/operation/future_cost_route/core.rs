@@ -69,14 +69,23 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         runtime.cost_graph_capture_capability(),
         view.graph_stream_state(),
     );
+    let has_program_policy = resolved
+        .execution_plan()
+        .payload()
+        .memory()
+        .reusable_execution()
+        .is_some_and(|plan| plan.program_policy().is_some());
+    let warm_catalog =
+        if !eager_graph_state && runtime.cost_direct_graph_replay_operation().is_some() {
+            view.graph_catalog().filter(|catalog| {
+                catalog.stream_state().is_ready()
+                    && Some(catalog.stream_state()) == view.graph_stream_state()
+            })
+        } else {
+            None
+        };
     if !capability.single_transfer_commands
-        || resolved
-            .execution_plan()
-            .payload()
-            .memory()
-            .reusable_execution()
-            .is_some_and(|plan| plan.program_policy().is_some())
-        || !eager_graph_state
+        || (has_program_policy || !eager_graph_state) && warm_catalog.is_none()
     {
         return Err(U::ExecutionPolicy);
     }
@@ -359,47 +368,137 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         binding_layout,
         budget,
     )?;
-    // A backend that coalesces bindings must project the actual provider write
-    // spans through its real arena layout and shared transfer-layout algorithm.
-    let appended = if binding_nodes.is_empty() || capability.preserves_program_bindings {
-        route.append_canonical_with_program_bindings(canonical, command_index, &binding_nodes)
-    } else {
-        let patches = route
-            .program_binding_patches(&binding_nodes)
-            .map_err(|_| U::ProviderRoute)?;
-        let merged = runtime
-            .cost_coalesced_program_binding(
-                binding_layout.ok_or(U::CoreLayout)?,
-                &patches,
-                &mut || {
-                    if budget.has_budget() {
-                        Ok(())
-                    } else {
-                        Err(VNextError::InvalidExecutionPlan {
-                            reason: "future binding projection budget exhausted".to_owned(),
-                        })
-                    }
-                },
-            )
-            .ok_or(U::CoreLayout)?
-            .map_err(|_| {
-                if budget.has_budget() {
-                    U::CoreLayout
-                } else {
-                    U::BudgetExhausted
-                }
-            })?;
-        route.append_canonical_with_coalesced_program_binding(
-            canonical,
-            command_index,
-            &binding_nodes,
-            &merged,
-        )
+    let mut replay_logical = None;
+    let mut budget_exhausted = false;
+    let mut poll_provider = || {
+        if budget.has_budget() {
+            Ok(())
+        } else {
+            budget_exhausted = true;
+            Err(VNextError::InvalidExecutionPlan {
+                reason: "future graph projection budget exhausted".to_owned(),
+            })
+        }
     };
-    command_index = appended.map_err(|error| match error {
-        crate::execution_cost::CanonicalCostError::Capacity => U::Capacity,
-        _ => U::ProviderRoute,
-    })?;
+    let graph_append = (|| -> Result<(), U> {
+        // No selected reusable arena means the actual core cannot request a
+        // program capture. Every compute provider must independently exclude
+        // its node using fenced address/topology evidence; absence is Unknown.
+        let configured_eager = if let Some(catalog) = warm_catalog {
+            query.reusable_bucket.is_none()
+                && catalog.stream_state().configuration() == DeviceCostGraphConfiguration::OnDemand
+                && providers
+                    .future_has_only_eager_boundaries(
+                        resolved,
+                        query.rows,
+                        projection.physical_ranges.as_ref(),
+                        &mut poll_provider,
+                    )
+                    .map_err(|_| U::ProviderRoute)?
+        } else {
+            false
+        };
+        let warm_program = if let Some(catalog) = warm_catalog.filter(|_| !configured_eager) {
+            let layout = binding_layout.ok_or(U::CoreLayout)?;
+            let slot = projection.invocation_slot.as_ref().ok_or(U::CoreLayout)?;
+            let (id, eager) = providers
+                .future_reusable_program_id(
+                    resolved,
+                    query.rows,
+                    projection.physical_ranges.as_ref(),
+                    layout,
+                    slot,
+                    view.lane_id(),
+                    &mut poll_provider,
+                )
+                .map_err(|_| U::ProviderRoute)?
+                .ok_or(U::ProviderRoute)?;
+            let mut matched = None;
+            for candidate in catalog.programs() {
+                poll_provider().map_err(|_| U::BudgetExhausted)?;
+                if candidate.program().program_id() == &id {
+                    matched = Some(candidate);
+                    break;
+                }
+            }
+            let matched = matched.ok_or(U::ExecutionPolicy)?;
+            if matched.program().eager_boundary_node_indices() != eager
+                || matched.uploaded_segments().len() != matched.program().segments().len()
+            {
+                return Err(U::ExecutionPolicy);
+            }
+            Some(matched)
+        } else {
+            None
+        };
+        let merged = if !binding_nodes.is_empty() && !capability.preserves_program_bindings {
+            let patches = route
+                .program_binding_patches(&binding_nodes)
+                .map_err(|_| U::ProviderRoute)?;
+            Some(
+                runtime
+                    .cost_coalesced_program_binding(
+                        binding_layout.ok_or(U::CoreLayout)?,
+                        &patches,
+                        &mut poll_provider,
+                    )
+                    .ok_or(U::CoreLayout)?
+                    .map_err(|_| U::CoreLayout)?,
+            )
+        } else {
+            None
+        };
+        if let Some(program) = warm_program {
+            let (end, replay_indices) = route
+                .append_canonical_warm_program(
+                    canonical,
+                    command_index,
+                    &binding_nodes,
+                    merged.as_ref(),
+                    program,
+                    runtime
+                        .cost_direct_graph_replay_operation()
+                        .ok_or(U::ExecutionPolicy)?,
+                    query.rows.len() as u32,
+                    total_tokens,
+                    &mut poll_provider,
+                )
+                .map_err(|_| U::ProviderRoute)?;
+            command_index = end;
+            replay_logical = Some((program, replay_indices));
+            next.projected_graph_state = crate::execution_cost::ActualWaveGraphState::Warm;
+        } else {
+            let appended = if let Some(merged) = merged.as_ref() {
+                route.append_canonical_with_coalesced_program_binding(
+                    canonical,
+                    command_index,
+                    &binding_nodes,
+                    merged,
+                )
+            } else {
+                route.append_canonical_with_program_bindings(
+                    canonical,
+                    command_index,
+                    &binding_nodes,
+                )
+            };
+            command_index = appended.map_err(|error| match error {
+                crate::execution_cost::CanonicalCostError::Capacity => U::Capacity,
+                _ => U::ProviderRoute,
+            })?;
+            next.projected_graph_state = if configured_eager {
+                crate::execution_cost::ActualWaveGraphState::ConfiguredEager
+            } else {
+                crate::execution_cost::ActualWaveGraphState::Disabled
+            };
+        }
+        Ok(())
+    })();
+    drop(poll_provider);
+    if budget_exhausted {
+        return Err(U::BudgetExhausted);
+    }
+    graph_append?;
     if command_index as usize > MAX_COST_COMMANDS {
         return Err(U::Capacity);
     }
@@ -425,6 +524,23 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         &mut command_index,
         budget,
     )?;
+    if let Some((program, indices)) = replay_logical {
+        let mut exhausted = false;
+        let result = route.append_warm_logical(canonical, program, &indices, &mut || {
+            if budget.has_budget() {
+                Ok(())
+            } else {
+                exhausted = true;
+                Err(VNextError::InvalidExecutionPlan {
+                    reason: "logical route budget exhausted".to_owned(),
+                })
+            }
+        });
+        if exhausted {
+            return Err(U::BudgetExhausted);
+        }
+        result.map_err(|_| U::ProviderRoute)?;
+    }
     canonical
         .core_readback_route(readback)
         .map_err(|_| U::InvalidInput)?;

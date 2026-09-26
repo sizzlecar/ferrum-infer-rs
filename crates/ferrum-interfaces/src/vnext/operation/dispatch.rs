@@ -44,6 +44,33 @@ struct NativeWaveGuard<'a> {
     readback: crate::execution_cost::CoreReadbackRoute,
 }
 impl super::super::DeviceSubmissionGuard for NativeWaveGuard<'_> {
+    fn relies_on_cost_witness(&self) -> bool {
+        self.guard.relies_on_cost_witness()
+    }
+
+    fn submission_mode(&self) -> super::super::GuardedSubmissionMode {
+        self.guard.submission_mode()
+    }
+    fn check_adaptive_preparation(
+        &self,
+        intent: &super::super::DeviceAdaptiveSubmissionIntent<'_>,
+    ) -> Result<(), crate::execution_cost::GuardedNotSubmittedReason> {
+        use crate::execution_cost::GuardedNotSubmittedReason;
+        BoundDeviceSubmissionAttribution::validate_device(self.identity, intent.encoded_work())
+            .map_err(|_| GuardedNotSubmittedReason::ResourceClaimMismatch)?;
+        if let Some(capture) = intent.capture() {
+            let program = capture.program_id();
+            if program.plan_hash() != self.identity.plan_hash()
+                || program.runtime_implementation_fingerprint()
+                    != self.identity.runtime_implementation_fingerprint()
+                || program.lane_id() != self.identity.lane_id()
+                || capture.node_count() as usize != self.identity.node_count()
+            {
+                return Err(GuardedNotSubmittedReason::ResourceClaimMismatch);
+            }
+        }
+        self.guard.check_adaptive_preparation(intent, self.readback)
+    }
     fn check(
         &self,
         attribution: Option<&super::super::DeviceSubmissionAttribution>,
@@ -643,15 +670,8 @@ impl OperationDispatch {
             return Ok(None);
         };
 
-        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v3\0";
-        let mut digest = Sha256::new();
+        let mut digest = super::topology_digest::ReusableTopologyDigest::new(wave.nodes().len())?;
         let mut eager_boundary_node_indices = Vec::new();
-        digest.update(DOMAIN);
-        digest.update(
-            u64::try_from(wave.nodes().len())
-                .map_err(|_| invalid_operation("reusable topology node count exceeds u64"))?
-                .to_le_bytes(),
-        );
         for (wave_node_index, (provider, prepared_node)) in
             providers.iter().zip(wave.nodes()).enumerate()
         {
@@ -686,55 +706,17 @@ impl OperationDispatch {
                     invalid_operation("reusable topology wave node index exceeds u32")
                 })?);
             }
-            let (topology_kind, topology_bytes) = match (
+            digest.append(
+                wave_node_index,
+                plan_node_index,
+                node.id(),
+                provider.descriptor().provider_id(),
                 declared,
                 &topology,
-            ) {
-                (
-                    ProviderReplayEquivalence::BitwiseEagerEquivalent,
-                    ReusableExecutionTopology::Static,
-                ) => (0_u8, &[][..]),
-                (
-                    ProviderReplayEquivalence::BitwiseEagerEquivalent,
-                    ReusableExecutionTopology::Dynamic(topology),
-                ) => (1_u8, &topology.as_bytes()[..]),
-                (_, ReusableExecutionTopology::EagerBoundary) => (2_u8, &[][..]),
-                (
-                    ProviderReplayEquivalence::Ineligible,
-                    ReusableExecutionTopology::Static | ReusableExecutionTopology::Dynamic(_),
-                ) => {
-                    return Err(invalid_operation(format!(
-                        "provider `{}` returned reusable topology without a bitwise eager-equivalence contract",
-                        provider.descriptor().provider_id()
-                    )))
-                }
-            };
-            let wave_node_index = u64::try_from(wave_node_index)
-                .map_err(|_| invalid_operation("reusable topology wave node index exceeds u64"))?;
-            let plan_node_index = u64::try_from(plan_node_index)
-                .map_err(|_| invalid_operation("reusable topology plan node index exceeds u64"))?;
-            let node_id = node.id().as_str().as_bytes();
-            let provider_id = provider.descriptor().provider_id().as_str().as_bytes();
-            let node_id_len = u64::try_from(node_id.len())
-                .map_err(|_| invalid_operation("reusable topology node id exceeds u64"))?;
-            let provider_id_len = u64::try_from(provider_id.len())
-                .map_err(|_| invalid_operation("reusable topology provider id exceeds u64"))?;
-            let topology_len = u64::try_from(topology_bytes.len())
-                .map_err(|_| invalid_operation("reusable topology payload exceeds u64"))?;
-            digest.update(wave_node_index.to_le_bytes());
-            digest.update(plan_node_index.to_le_bytes());
-            digest.update(node_id_len.to_le_bytes());
-            digest.update(node_id);
-            digest.update(provider_id_len.to_le_bytes());
-            digest.update(provider_id);
-            digest.update([topology_kind]);
-            digest.update(topology_len.to_le_bytes());
-            digest.update(topology_bytes);
+            )?;
         }
         Ok(Some(ReusableExecutionWaveAuthority {
-            program_id: program_id.with_topology_fingerprint(
-                DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
-            ),
+            program_id: program_id.with_topology_fingerprint(digest.finish()),
             eager_boundary_node_indices,
         }))
     }
@@ -1358,10 +1340,9 @@ impl OperationDispatch {
         )
     }
 
-    /// The runtime invokes the guard after eager native encoding, immediately
-    /// before commit. Program-binding capacity remains available to providers,
-    /// but this entrypoint does not request graph capture or replay. It never
-    /// retries a rejected route through ordinary submit.
+    /// Guarded eager dispatch keeps provider scratch and program bindings but
+    /// never requests capture or replay. The native guard runs immediately
+    /// before commit; a rejection never falls back through ordinary submit.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit_guarded_wave<'binding, R, I>(
         providers: &[BoundOperationProvider<'_, R>],
@@ -1378,12 +1359,47 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        Self::encode_and_submit_guarded_wave_with_timing(
+        Self::encode_and_submit_guarded_wave_with_program(
             providers,
             resolved,
             batch_identity,
             active_bindings,
             input_uploads,
+            None,
+            guard,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Same guarded core transaction, optionally consuming a real resident
+    /// program. The existing topology and claimed-backing validation below
+    /// still binds its lane, slot, work shape and every covered plan node.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave_with_program<'binding, R, I>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::encode_and_submit_guarded_wave_with_program_and_timing(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            input_uploads,
+            reusable_program,
             guard,
             &DisabledSubmissionWaveDispatchTimingSink,
             wave,
@@ -1392,15 +1408,16 @@ impl OperationDispatch {
         )
     }
 
-    /// The existing eager guarded path with host-only diagnostic counters.
-    /// Device timing stays Off; the guard and ownership are unchanged.
+    /// The existing guarded path with host-only diagnostic counters. Device
+    /// timing stays Off; the guard, program selection and ownership are shared.
     #[allow(clippy::too_many_arguments)]
-    pub fn encode_and_submit_guarded_wave_with_timing<'binding, R, I, S>(
+    pub fn encode_and_submit_guarded_wave_with_program_and_timing<'binding, R, I, S>(
         providers: &[BoundOperationProvider<'_, R>],
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
         input_uploads: &[SubmissionWaveInputUpload],
+        reusable_program: Option<&DeviceReusableExecutionProgram>,
         guard: &dyn super::PreparedWaveSubmissionGuard,
         timing_sink: &S,
         wave: PreparedStepSubmissionWave<R>,
@@ -1420,9 +1437,19 @@ impl OperationDispatch {
             active_bindings,
             DeviceTimingMode::Off,
             input_uploads,
-            SubmissionExecutionPolicy::eager(),
+            if reusable_program.is_some()
+                || matches!(
+                    guard.submission_mode(),
+                    super::super::GuardedSubmissionMode::CompleteRequestsAdaptive
+                        | super::super::GuardedSubmissionMode::ExactAdaptiveRoute
+                )
+            {
+                SubmissionExecutionPolicy::adaptive()
+            } else {
+                SubmissionExecutionPolicy::eager()
+            },
             None,
-            None,
+            reusable_program,
             true,
             Some((guard, &mut rejection)),
             timing_sink,
@@ -1434,6 +1461,40 @@ impl OperationDispatch {
             Some(rejection) => super::GuardedWaveSubmissionOutcome::NotSubmitted(rejection),
             None => super::GuardedWaveSubmissionOutcome::Dispatch(result),
         }
+    }
+
+    /// Compatibility entrypoint for eager guarded dispatch with host timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_guarded_wave_with_timing<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        input_uploads: &[SubmissionWaveInputUpload],
+        guard: &dyn super::PreparedWaveSubmissionGuard,
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> super::GuardedWaveSubmissionOutcome<R>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_guarded_wave_with_program_and_timing(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            input_uploads,
+            None,
+            guard,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1807,6 +1868,47 @@ impl OperationDispatch {
                         segment_dynamic_bindings.append(&mut dynamic_bindings);
                         segment_result_bindings.append(&mut result_bindings);
                     }
+                    // Optional diagnostics only. Every resident node keeps its
+                    // ordinal even when its producer/physical projection fails.
+                    // Use full real resources for the passive producer; leave
+                    // the existing dynamic-binding encoder invocation unchanged.
+                    let selected_replay_cost = if runtime.structured_cost_capture()
+                        == ferrum_types::SloStructuredCostCapture::HostSettledV1
+                        && segment.logical_command_count() as usize
+                            <= crate::execution_cost::MAX_COST_COMMANDS
+                        && segment
+                            .start_node_index()
+                            .checked_add(segment.logical_command_count())
+                            == Some(segment.end_node_index())
+                    {
+                        Some(
+                            (segment.start_node_index()..segment.end_node_index())
+                                .map(|cost_node_index| {
+                                    let index = usize::try_from(cost_node_index).ok()?;
+                                    let provider = providers.get(index)?;
+                                    let identity = batch_identity.materialize_node(index).ok()?;
+                                    let invocation = BatchedOperationInvocation::from_wave_node(
+                                        runtime,
+                                        resolved,
+                                        provider.dispatch(),
+                                        batch_identity,
+                                        identity,
+                                        completion.wave(),
+                                        index,
+                                        active_bindings.clone(),
+                                    )
+                                    .ok()?;
+                                    provider
+                                        .provider()
+                                        .replayed_compute_cost_evidence(&invocation)
+                                        .ok()
+                                        .flatten()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
                     let invocation = DeviceReusableExecutionInvocation::new(
                         reusable_program.program_id().clone(),
                         segment.clone(),
@@ -1822,6 +1924,10 @@ impl OperationDispatch {
                             .immediate_tokens(),
                     )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
+                    let invocation = match selected_replay_cost {
+                        Some(selected) => invocation.with_selected_replay_cost(selected),
+                        None => invocation,
+                    };
                     let compute = runtime
                         .encode_reusable_execution(invocation)
                         .map_err(|error| {

@@ -8,6 +8,9 @@ use crate::vnext::{
 
 use super::foundation::canonical_fingerprint;
 
+mod declared_dense;
+use declared_dense::{DeclaredDenseAttribution, DenseAttributionBuilder};
+
 pub const PROVIDER_ATTRIBUTION_WITNESS_SCHEMA: &str = "ferrum.vnext.provider-attribution.v1";
 pub const PROVIDER_ATTRIBUTION_STATIC_BASIS: &str =
     "resolved_plan_and_completed_static_initialization";
@@ -304,11 +307,12 @@ impl ProviderAttributionBinding {
 
 /// Compact, fail-closed witness for quantized provider attribution.
 ///
-/// This first version is intentionally plan-static: construction requires the
+/// Construction is intentionally plan-static and requires the
 /// receipt that only exists after atomic static initialization completes. It
-/// proves every M0 denominator tensor is mapped through a quantized execution
-/// component to one selected vNext plan node/provider. It does not claim
-/// per-request normal-retirement coverage.
+/// proves every source denominator tensor maps to one selected plan provider.
+/// V1 requires quantized execution components. V2 separately records explicitly
+/// approved dense F16 projection conversions and does not describe those as
+/// quantized kernel coverage. Neither version proves per-request retirement.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StaticProviderAttributionWitness {
     schema: &'static str,
@@ -317,6 +321,9 @@ pub struct StaticProviderAttributionWitness {
     provider_attribution: ProviderAttributionCounts,
     fallback_counts: ProviderAttributionFallbackCounts,
     binding: ProviderAttributionBinding,
+    /// Present only in v2: source attribution is not quantized-kernel coverage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_dense_execution: Option<DeclaredDenseAttribution>,
 }
 
 impl StaticProviderAttributionWitness {
@@ -351,6 +358,7 @@ impl StaticProviderAttributionWitness {
         let mut mapping_rows = BTreeSet::new();
         let mut attributed_tensors = BTreeSet::new();
         let mut attributed_operations = BTreeSet::new();
+        let mut declared_dense = DenseAttributionBuilder::default();
 
         for node in payload.nodes() {
             for value in node.values() {
@@ -378,26 +386,37 @@ impl StaticProviderAttributionWitness {
                     if denominator_source_ids.is_empty() {
                         continue;
                     }
-                    if !is_quantized_values(
+                    let quantized_execution = is_quantized_values(
                         execution_component.role(),
                         execution_component.encoding(),
-                    ) {
+                    );
+                    if !quantized_execution {
                         if matches!(
                             execution_component.role(),
                             WeightComponentRole::Values | WeightComponentRole::PackedValues
                         ) {
-                            return Err(invalid_attribution(format!(
-                                "denominator source components map to dense execution values `{}`",
-                                execution_component.component_id()
-                            )));
+                            declared_dense.record(
+                                family,
+                                execution_weights,
+                                node,
+                                value,
+                                weight,
+                                execution_component,
+                                &denominator_source_ids,
+                                &denominator.source_component_tensors,
+                            )?;
+                        } else {
+                            continue;
                         }
-                        continue;
                     }
                     for source_id in denominator_source_ids {
                         let Some(tensors) = denominator.source_component_tensors.get(source_id)
                         else {
                             unreachable!("filtered denominator source component")
                         };
+                        if quantized_execution {
+                            declared_dense.record_quantized(tensors);
+                        }
                         let source_component =
                             source_components.get(source_id).ok_or_else(|| {
                                 invalid_attribution(format!(
@@ -406,7 +425,7 @@ impl StaticProviderAttributionWitness {
                             })?;
                         if !is_quantized_values(source_component.role, &source_component.encoding) {
                             return Err(invalid_attribution(format!(
-                                "quantized execution component `{}` maps a denominator tensor through non-quantized source `{source_id}`",
+                                "execution component `{}` maps a denominator tensor through non-quantized source `{source_id}`",
                                 execution_component.component_id()
                             )));
                         }
@@ -555,10 +574,24 @@ impl StaticProviderAttributionWitness {
             static_imported_component_count: u64::try_from(receipt.imported_component_count())
                 .map_err(|_| invalid_attribution("imported component count exceeds u64"))?,
         };
+        let declared_dense_execution = declared_dense.finish(&denominator.quant_tensors)?;
+        let converted = declared_dense_execution.is_some();
         Ok(Some(Self {
-            schema: PROVIDER_ATTRIBUTION_WITNESS_SCHEMA,
-            attribution_basis: PROVIDER_ATTRIBUTION_STATIC_BASIS,
-            fallback_basis: PROVIDER_ATTRIBUTION_STATIC_FALLBACK_BASIS,
+            schema: if converted {
+                "ferrum.vnext.provider-attribution.v2"
+            } else {
+                PROVIDER_ATTRIBUTION_WITNESS_SCHEMA
+            },
+            attribution_basis: if converted {
+                "quantized_source_tensor_to_declared_execution_storage_and_selected_provider"
+            } else {
+                PROVIDER_ATTRIBUTION_STATIC_BASIS
+            },
+            fallback_basis: if converted {
+                "explicit_typed_dense_f16_conversion_is_not_silent_dense_fallback"
+            } else {
+                PROVIDER_ATTRIBUTION_STATIC_FALLBACK_BASIS
+            },
             provider_attribution,
             fallback_counts: ProviderAttributionFallbackCounts {
                 silent: 0,
@@ -566,6 +599,7 @@ impl StaticProviderAttributionWitness {
                 legacy: 0,
             },
             binding,
+            declared_dense_execution,
         }))
     }
 

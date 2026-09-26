@@ -33,7 +33,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         if !Arc::ptr_eq(&self.runtime, lane.runtime_arc()) {
             return A::Unknown(U::StaleView);
         }
-        let (resources, graph_stream_state) =
+        let (resources, graph_stream_state, graph_catalog) =
             match self.resource_planning_view_with_graph_on_lane(sessions, lane, limits, budget) {
                 Ok(value) => value,
                 Err(reason) => return A::Unknown(U::Resource(reason)),
@@ -64,6 +64,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             lane_id: lane.id(),
             token_masks: None,
             graph_stream_state,
+            graph_catalog: graph_catalog.map(Arc::new),
         })
     }
 }

@@ -175,6 +175,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
         poll(budget)?;
         charge_logical(&mut next, &step_demand, &mut domains, false)?;
         let mut step_slot = None;
+        let mut invocation_slot = None;
         let mut physical_proof = view
             .physical_ranges
             .as_ref()
@@ -209,7 +210,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             .map_err(|_| U::InvalidDemand)?;
         charge_logical(&mut next, &wave_demand, &mut domains, false)?;
         if bucket.is_some() {
-            let wave_slot = workspace::reserve(
+            invocation_slot = workspace::reserve(
                 &mut next,
                 &wave_requests,
                 AllocationLifetime::Invocation,
@@ -219,7 +220,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             if let (Some(physical), Some(proof), Some(slot)) = (
                 &view.physical_ranges,
                 physical_proof.as_mut(),
-                wave_slot.as_ref(),
+                invocation_slot.as_ref(),
             ) {
                 workspace::project_ranges(&next, slot, physical, proof, budget)?;
             }
@@ -259,6 +260,7 @@ impl<R: DeviceRuntime> PlanRuntimeResources<R> {
             state: next,
             domains: domains.into_values().collect(),
             step_slot,
+            invocation_slot,
             physical_ranges: physical_proof,
         })
     }

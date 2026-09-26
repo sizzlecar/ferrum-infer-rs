@@ -1139,6 +1139,20 @@ impl ExecutionEventCursor {
         self.terminal
     }
 
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn request_id(&self) -> &RequestIdentity {
+        &self.request_id
+    }
+
+    /// A completed sequence may still have a failed request terminal.
+    pub fn request_succeeded(&self) -> Option<bool> {
+        self.terminal
+            .then_some(self.completion_fingerprint.is_some() && self.observed_failure.is_none())
+    }
+
     pub const fn completed_frames(&self) -> u64 {
         self.completed_frames
     }

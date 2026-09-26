@@ -1,6 +1,6 @@
 //! Provider-only portion of an eager wave, in the actual immutable plan order.
 use super::*;
-use crate::execution_cost::{CanonicalCostError, CanonicalWaveCostBuilder};
+use crate::execution_cost::{CanonicalCostError, CanonicalWaveCostBuilder, CostLogicalCommand};
 use crate::vnext::{BoundOperationProviderSet, DeviceRuntime, ExecutablePlanView};
 
 struct NodeRoute<'a> {
@@ -218,11 +218,28 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
             invalid_operation("selected cost route allocation capacity unavailable")
         })?;
         let mut physical_slots = 0_usize;
-        for provider in self.providers() {
+        for (provider, node) in self.providers().iter().zip(nodes) {
             poll_budget()?;
-            let route = provider.eager_cost_route_with_ranges(resolved, rows, physical_ranges)?;
+            let route = match provider.eager_cost_route_with_ranges(resolved, rows, physical_ranges)
+            {
+                Ok(route) => route,
+                Err(error) => {
+                    tracing::trace!(
+                        node = %node.id(),
+                        provider = %provider.descriptor().provider_id(),
+                        error = %error,
+                        "future selected provider eager route returned error"
+                    );
+                    return Err(error);
+                }
+            };
             poll_budget()?;
             let Some(route) = route else {
+                tracing::trace!(
+                    node = %node.id(),
+                    provider = %provider.descriptor().provider_id(),
+                    "future selected provider eager route unavailable"
+                );
                 return Ok(None);
             };
             physical_slots = physical_slots
@@ -576,5 +593,375 @@ mod tests {
                 .with_program_binding_writes(vec![ProgramBindingCostWrite::new(0, 4).unwrap()])
                 .is_err()
         );
+    }
+}
+
+impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
+    /// Proves every provider excludes its complete compute node from reusable
+    /// segments using the same selector as actual dispatch. This numerical
+    /// result holds only under the caller's live resource-view fence.
+    pub(crate) fn future_has_only_eager_boundaries(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        rows: &[OperationCostWorkRow],
+        physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<bool, VNextError> {
+        validate_work_rows(rows)?;
+        let plan = resolved.execution_plan();
+        let nodes = plan.payload().nodes();
+        if nodes.len() != self.len() || nodes.is_empty() || nodes.len() > MAX_COST_COMMANDS {
+            return Err(invalid_operation(
+                "future eager boundary requires the complete provider plan",
+            ));
+        }
+        for (provider, node) in self.providers().iter().zip(nodes) {
+            poll()?;
+            provider.validate_binding(resolved, node.id())?;
+            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)?
+                .with_physical_ranges(physical_ranges);
+            let selected = provider
+                .provider()
+                .reusable_execution_cost_topology(request)?;
+            poll()?;
+            if selected != Some(super::super::ReusableExecutionTopology::EagerBoundary) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Derives the actual program ID from numerical work and the selected
+    /// Invocation arena. No claimed Step or execution authority is fabricated.
+    pub(crate) fn future_reusable_program_id(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        rows: &[OperationCostWorkRow],
+        physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
+        layout: &crate::vnext::ProgramBindingLayout,
+        slot: &crate::vnext::LaneStableArenaSlotIdentity,
+        lane: crate::vnext::ExecutionLaneId,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<Option<(crate::vnext::DeviceReusableExecutionProgramId, Vec<u32>)>, VNextError>
+    {
+        use crate::vnext::*;
+        let tokens = validate_work_rows(rows)?;
+        let plan = resolved.execution_plan();
+        let nodes = plan.payload().nodes();
+        if nodes.len() != self.len()
+            || nodes.is_empty()
+            || nodes.len() > MAX_COST_COMMANDS
+            || slot.lane_id() != lane
+            || slot.reusable_execution_bucket_id() != layout.reusable_execution_bucket_id()
+            || slot.lifetime() != AllocationLifetime::Invocation
+        {
+            return Err(invalid_operation(
+                "future program identity differs from actual selected arena",
+            ));
+        }
+        let mut digest = super::super::topology_digest::ReusableTopologyDigest::new(nodes.len())?;
+        let mut eager = Vec::new();
+        for (index, (provider, node)) in self.providers().iter().zip(nodes).enumerate() {
+            poll()?;
+            provider.validate_binding(resolved, node.id())?;
+            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)?
+                .with_physical_ranges(physical_ranges);
+            let topology = match provider
+                .provider()
+                .reusable_execution_cost_topology(request)
+            {
+                Ok(topology) => topology,
+                Err(error) => {
+                    tracing::trace!(
+                        node = %node.id(),
+                        provider = %provider.descriptor().provider_id(),
+                        error = %error,
+                        "future selected provider graph topology returned error"
+                    );
+                    return Err(error);
+                }
+            };
+            let Some(topology) = topology else {
+                tracing::trace!(
+                    node = %node.id(),
+                    provider = %provider.descriptor().provider_id(),
+                    "future selected provider graph topology unavailable"
+                );
+                return Ok(None);
+            };
+            poll()?;
+            if topology == ReusableExecutionTopology::EagerBoundary {
+                eager.push(
+                    u32::try_from(index)
+                        .map_err(|_| invalid_operation("topology node overflow"))?,
+                );
+            }
+            digest.append(
+                index,
+                index,
+                node.id(),
+                provider.descriptor().provider_id(),
+                node.provider_execution_semantics().replay_equivalence(),
+                &topology,
+            )?;
+        }
+        let id = DeviceReusableExecutionProgramId::new(
+            plan.plan_hash().clone(),
+            resolved.device().runtime_implementation_fingerprint.clone(),
+            lane,
+            layout.reusable_execution_bucket_id().clone(),
+            layout.fingerprint().to_owned(),
+            slot.layout_fingerprint().to_owned(),
+            slot.slot_id(),
+            u32::try_from(rows.len()).map_err(|_| invalid_operation("row count overflow"))?,
+            tokens,
+            0,
+        )?
+        .with_topology_fingerprint(digest.finish());
+        Ok(Some((id, eager)))
+    }
+}
+
+impl SelectedEagerCostRoute<'_> {
+    /// Mirror core's actual uploaded-segment dispatch: shared binding prelude,
+    /// all segment dynamic bindings, one replay, then segment result bindings.
+    /// Every logical compute row must independently match the current provider
+    /// selector. A copied catalog row alone is never a future-work declaration.
+    pub(crate) fn append_canonical_warm_program(
+        &self,
+        canonical: &mut CanonicalWaveCostBuilder,
+        first: u32,
+        binding_nodes: &[usize],
+        merged: Option<&OperationCostCommand>,
+        graph: &crate::vnext::DeviceCostGraphProgram,
+        native_operation: &str,
+        participants: u32,
+        tokens: u64,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<(u32, Vec<u32>), VNextError> {
+        use crate::vnext::*;
+        let invalid =
+            || invalid_operation("future warm program differs from selected provider route");
+        let append_error = |_| invalid_operation("future warm canonical route exceeds contract");
+        let program = graph.program();
+        if program.node_count() as usize != self.nodes.len()
+            || !program.is_determinism_ready()
+            || graph.uploaded_segments().len() != program.segments().len()
+        {
+            return Err(invalid());
+        }
+        let mut index = first;
+        let mut replay_indices = Vec::new();
+        self.program_binding_patches(binding_nodes)
+            .map_err(append_error)?;
+        if let Some(merged) = merged {
+            let mut command = merged
+                .canonical_command(index, 0, self.nodes[0].identity)
+                .ok_or_else(invalid)?;
+            command.node_index = None;
+            command.provider = None;
+            canonical.physical_command(command).map_err(append_error)?;
+            index = index.checked_add(1).ok_or_else(invalid)?;
+        } else {
+            for &n in binding_nodes {
+                poll()?;
+                let node = self.nodes.get(n).ok_or_else(invalid)?;
+                let c = &node.route.commands[node.route.relocatable_binding.ok_or_else(invalid)?];
+                if let Some(mut c) = c.canonical_command(index, n as u32, node.identity) {
+                    c.node_index = None;
+                    c.provider = None;
+                    canonical.physical_command(c).map_err(append_error)?;
+                }
+                index = index.checked_add(1).ok_or_else(invalid)?;
+            }
+        }
+        let mut n = 0_usize;
+        let mut segment_index = 0_usize;
+        while n < self.nodes.len() {
+            poll()?;
+            let segment = graph
+                .uploaded_segments()
+                .get(segment_index)
+                .filter(|s| s.segment().start_node_index() as usize == n);
+            if let Some(uploaded) = segment {
+                let end = uploaded.segment().end_node_index() as usize;
+                let logical = uploaded.logical_commands();
+                if end > self.nodes.len()
+                    || logical.len() != end - n
+                    || program.segments().get(segment_index) != Some(uploaded.segment())
+                {
+                    return Err(invalid());
+                }
+                let mut graph_nodes = 0_u64;
+                for (offset, row) in logical.iter().enumerate() {
+                    poll()?;
+                    let node_index = n + offset;
+                    let node = &self.nodes[node_index];
+                    let compute = node
+                        .route
+                        .commands
+                        .iter()
+                        .find(|c| c.phase() == DeviceCommandPhase::Compute)
+                        .ok_or_else(invalid)?;
+                    if row.node_index() != node_index as u32
+                        || row.logical_command_ordinal() != offset as u32
+                        || compute.host_only()
+                        || compute.participant_start() != 0
+                        || row.native_op_id() != compute.native_operation()
+                        || row.batching_form() != compute.batching()
+                        || row.participant_count() != compute.participant_count()
+                        || row.token_count() != compute.token_count()
+                        || row.compute_dispatch_count() != compute.compute_dispatch_count()
+                        || row.transfer_command_count() != compute.transfer_command_count()
+                    {
+                        return Err(invalid());
+                    }
+                    graph_nodes = graph_nodes
+                        .checked_add(row.reusable_graph_node_count())
+                        .ok_or_else(invalid)?;
+                    let binding_member = program
+                        .per_wave_binding_node_indices()
+                        .binary_search(&(node_index as u32))
+                        .is_ok();
+                    if !binding_member && node.route.commands.len() != 1 {
+                        return Err(invalid());
+                    }
+                    for (ci, c) in node.route.commands.iter().enumerate() {
+                        if c.phase() != DeviceCommandPhase::DynamicBinding
+                            || (binding_nodes.binary_search(&node_index).is_ok()
+                                && node.route.relocatable_binding == Some(ci))
+                        {
+                            continue;
+                        }
+                        if let Some(c) =
+                            c.canonical_command(index, n as u32, self.nodes[n].identity)
+                        {
+                            canonical.physical_command(c).map_err(append_error)?;
+                        }
+                        index = index.checked_add(1).ok_or_else(invalid)?;
+                    }
+                }
+                let replay_index = index;
+                canonical
+                    .physical_command(CostPhysicalCommand {
+                        native_op_id: native_operation,
+                        command_index: index,
+                        node_index: Some(n as u32),
+                        command_phase: DeviceCommandPhase::Compute,
+                        provider: Some(self.nodes[n].identity),
+                        path: CostCommandPath::Replayed,
+                        participant_start: 0,
+                        participant_count: participants,
+                        token_count: tokens,
+                        batching_form: DeviceBatchingForm::ParticipantLoop.as_str(),
+                        compute_dispatch_count: 1,
+                        transfer_command_count: 0,
+                        reusable_graph_node_count: Some(graph_nodes),
+                        statistical_evidence: None, // Logical selected work is appended separately.
+                    })
+                    .map_err(append_error)?;
+                index = index.checked_add(1).ok_or_else(invalid)?;
+                replay_indices.push(replay_index);
+                for ni in n..end {
+                    let node = &self.nodes[ni];
+                    for c in &node.route.commands {
+                        if c.phase() == DeviceCommandPhase::ResultBinding {
+                            if let Some(c) =
+                                c.canonical_command(index, n as u32, self.nodes[n].identity)
+                            {
+                                canonical.physical_command(c).map_err(append_error)?;
+                            }
+                            index = index.checked_add(1).ok_or_else(invalid)?;
+                        }
+                    }
+                }
+                n = end;
+                segment_index += 1;
+            } else {
+                if program
+                    .eager_boundary_node_indices()
+                    .binary_search(&(n as u32))
+                    .is_err()
+                {
+                    return Err(invalid());
+                }
+                let node = &self.nodes[n];
+                for (ci, c) in node.route.commands.iter().enumerate() {
+                    if binding_nodes.binary_search(&n).is_ok()
+                        && node.route.relocatable_binding == Some(ci)
+                    {
+                        continue;
+                    }
+                    if let Some(c) = c.canonical_command(index, n as u32, node.identity) {
+                        canonical.physical_command(c).map_err(append_error)?;
+                    }
+                    index = index.checked_add(1).ok_or_else(invalid)?;
+                }
+                n += 1;
+            }
+            if index as usize > MAX_COST_COMMANDS {
+                return Err(invalid());
+            }
+        }
+        if segment_index != graph.uploaded_segments().len() {
+            return Err(invalid());
+        }
+        Ok((index, replay_indices))
+    }
+}
+
+#[cfg(test)]
+mod warm_tests;
+
+impl SelectedEagerCostRoute<'_> {
+    /// Canonical wire requires all physical commands, including staged
+    /// readbacks, before any logical replay rows. Keep that ordering explicit.
+    pub(crate) fn append_warm_logical(
+        &self,
+        canonical: &mut CanonicalWaveCostBuilder,
+        graph: &crate::vnext::DeviceCostGraphProgram,
+        indices: &[u32],
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Result<(), VNextError> {
+        let invalid = || invalid_operation("warm logical continuation differs from physical route");
+        if indices.len() != graph.uploaded_segments().len() {
+            return Err(invalid());
+        }
+        for (uploaded, &index) in graph.uploaded_segments().iter().zip(indices) {
+            poll()?;
+            let logical = uploaded.logical_commands();
+            canonical
+                .replay_segment(
+                    index,
+                    uploaded.reusable_executable_fingerprint(),
+                    logical.len(),
+                )
+                .map_err(|_| invalid())?;
+            for row in logical {
+                poll()?;
+                let node = self
+                    .nodes
+                    .get(row.node_index() as usize)
+                    .ok_or_else(invalid)?;
+                let mut commands = node
+                    .route
+                    .commands
+                    .iter()
+                    .filter(|command| command.phase() == DeviceCommandPhase::Compute);
+                let compute = commands.next().ok_or_else(invalid)?;
+                if commands.next().is_some() {
+                    return Err(invalid());
+                }
+                let mut projected = CostLogicalCommand::from_attribution(row, node.identity);
+                // Fresh provider route work must match the resident fixed
+                // geometry/scalars. Do not replay captured context work.
+                projected.statistical_evidence =
+                    row.bind_current_cost_evidence(compute.statistical_evidence());
+                canonical
+                    .logical_command(projected)
+                    .map_err(|_| invalid())?;
+            }
+        }
+        Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use super::DynamicPoolSet;
 use super::{
     defer_device_cleanup, invalid_resource, sequence_slot_is_poisoned, AdmissionDecision,
     AdmissionDeferred, AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionPressureAction,
@@ -585,12 +586,20 @@ where
         &self,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let (pools, authorities) = self.backing_source(resource_id)?;
+        pools.view_many(authorities)
+    }
+
+    pub(super) fn backing_source(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<(&DynamicPoolSet<R>, &[LogicalBackingSliceAuthority]), VNextError> {
         let authority = self
             .backing_slices
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
             .ok_or_else(|| invalid_resource("logical request does not own that backing slice"))?;
-        self.plan.dynamic_pools().view(authority)
+        Ok((self.plan.dynamic_pools(), std::slice::from_ref(authority)))
     }
 
     /// Sequence-scoped capacity is charged once per exact child sequence.

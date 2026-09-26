@@ -39,6 +39,9 @@ mod retry_wave_protection_tests;
 #[path = "plan_fit_tests.rs"]
 mod plan_fit_tests;
 
+#[path = "backing_validation/tests.rs"]
+mod backing_validation_tests;
+
 #[path = "operation_view_coverage_tests.rs"]
 mod operation_view_coverage_tests;
 
@@ -110,6 +113,7 @@ struct TestRuntime {
     fail_on_call: AtomicU64,
     panic_on_call: AtomicU64,
     mismatch_on_call: AtomicU64,
+    backing_descriptor_changed: AtomicBool,
     backend_alive: Arc<AtomicBool>,
     dropped_after_backend: Arc<AtomicBool>,
     synchronize_calls: AtomicU64,
@@ -129,6 +133,9 @@ struct TestRuntime {
     submitted_timing_modes: Mutex<Vec<DeviceTimingMode>>,
     encoded_copy_regions: Mutex<Vec<CopyRegion>>,
     encoded_zero_bytes: Mutex<Vec<u64>>,
+    cost_graph_catalog: Mutex<Option<crate::vnext::DeviceCostGraphCatalog>>,
+    cost_graph_state_override: Mutex<Option<crate::vnext::DeviceCostGraphStreamState>>,
+    cost_graph_probe: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 struct TestFence {
@@ -176,6 +183,7 @@ impl TestRuntime {
             fail_on_call: AtomicU64::new(0),
             panic_on_call: AtomicU64::new(0),
             mismatch_on_call: AtomicU64::new(0),
+            backing_descriptor_changed: AtomicBool::new(false),
             backend_alive: Arc::new(AtomicBool::new(true)),
             dropped_after_backend: Arc::new(AtomicBool::new(false)),
             synchronize_calls: AtomicU64::new(0),
@@ -195,6 +203,9 @@ impl TestRuntime {
             submitted_timing_modes: Mutex::new(Vec::new()),
             encoded_copy_regions: Mutex::new(Vec::new()),
             encoded_zero_bytes: Mutex::new(Vec::new()),
+            cost_graph_catalog: Mutex::new(None),
+            cost_graph_state_override: Mutex::new(None),
+            cost_graph_probe: Mutex::new(None),
         }
     }
 
@@ -303,6 +314,51 @@ impl DeviceRuntime for TestRuntime {
         &self.descriptor
     }
 
+    fn cost_graph_stream_state(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Option<crate::vnext::DeviceCostGraphStreamState> {
+        self.cost_graph_state_override.lock().unwrap().or_else(|| {
+            self.cost_graph_catalog
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.stream_state())
+        })
+    }
+
+    fn cost_reusable_graph_catalog(
+        &self,
+        _stream: &Self::Stream,
+        limits: crate::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<crate::vnext::DeviceCostGraphCatalog, Self::Error>> {
+        if let Some(probe) = self.cost_graph_probe.lock().unwrap().as_ref() {
+            probe();
+        }
+        let catalog = self.cost_graph_catalog.lock().unwrap();
+        let catalog = catalog.as_ref()?;
+        Some((|| {
+            let mut out =
+                crate::vnext::DeviceCostGraphCatalogBuilder::new(catalog.stream_state(), limits)
+                    .map_err(|_| TestRuntimeError)?;
+            for program in catalog.programs() {
+                out.push_program(program.program(), poll)
+                    .map_err(|_| TestRuntimeError)?;
+                for segment in program.uploaded_segments() {
+                    out.push_uploaded_segment(
+                        segment.segment(),
+                        segment.reusable_executable_fingerprint(),
+                        segment.logical_commands(),
+                        poll,
+                    )
+                    .map_err(|_| TestRuntimeError)?;
+                }
+            }
+            out.finish(poll).map_err(|_| TestRuntimeError)
+        })())
+    }
+
     fn attention_execution_policy(&self) -> ferrum_types::AttentionExecutionPolicy {
         ferrum_types::AttentionExecutionPolicy::Portable
     }
@@ -349,7 +405,11 @@ impl DeviceRuntime for TestRuntime {
     }
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
-        buffer.descriptor.clone()
+        let mut descriptor = buffer.descriptor.clone();
+        if self.backing_descriptor_changed.load(Ordering::Acquire) {
+            descriptor.size_bytes = descriptor.size_bytes.saturating_sub(1);
+        }
+        descriptor
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {

@@ -2456,6 +2456,76 @@ where
         &'lease self,
         authorities: &'lease [LogicalBackingSliceAuthority],
     ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        let (validated, bindings) = self.visit_view_many(
+            authorities,
+            Vec::with_capacity,
+            |bindings, authority, segment, chunk| {
+                let retention = match authority.reusable_lane {
+                    Some(lane_id) => DeviceBufferRetention::lane_pair(
+                        lane_id,
+                        Arc::clone(&authority.segment_lease),
+                        Arc::clone(chunk),
+                    ),
+                    None => DeviceBufferRetention::pair(
+                        Arc::clone(&authority.segment_lease),
+                        Arc::clone(chunk),
+                    ),
+                };
+                bindings.push(LogicalBackingSegmentBinding {
+                    segment: segment.clone(),
+                    chunk: Arc::clone(chunk),
+                    retention,
+                });
+                Ok(())
+            },
+        )?;
+        Ok(LogicalBackingBufferView {
+            bindings,
+            authorities,
+            logical_size_bytes: validated.size_bytes(),
+            capacity_size_bytes: validated.capacity_size_bytes(),
+            alignment_bytes: validated.alignment_bytes(),
+            usage: validated.usage(),
+            element_type: validated.element_type(),
+            storage_profile: validated.storage_profile(),
+        })
+    }
+
+    /// Fresh numeric inspection of the same authorities as `view_many`.
+    /// No buffer, retention, segment lease or pool guard escapes this call.
+    /// Runtime descriptors are reread while the referenced chunks are locked.
+    pub(in crate::vnext::resource) fn validate_view_many<'lease>(
+        &'lease self,
+        authorities: &'lease [LogicalBackingSliceAuthority],
+    ) -> Result<super::ValidatedLogicalBacking<'lease>, VNextError> {
+        self.visit_view_many(
+            authorities,
+            |_| (),
+            |(), _, _, chunk| {
+                if self.runtime.buffer_descriptor(&chunk.buffer) != chunk.descriptor {
+                    return Err(invalid_resource(
+                        "runtime descriptor differs from a committed backing chunk",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .map(|(validated, ())| super::ValidatedLogicalBacking::from_runtime_checked(validated))
+    }
+
+    // One authority/chunk validation implementation for physical views and
+    // fresh numeric inspection. The visitor cannot return borrowed pool state.
+    fn visit_view_many<'lease, V>(
+        &'lease self,
+        authorities: &'lease [LogicalBackingSliceAuthority],
+        initialize: impl FnOnce(usize) -> V,
+        mut visit: impl FnMut(
+            &mut V,
+            &LogicalBackingSliceAuthority,
+            &BackingSegment,
+            &Arc<ResidentChunkBacking<R::Buffer>>,
+        ) -> Result<(), VNextError>,
+    ) -> Result<(super::backing_validation::LogicalBackingMetadata<'lease>, V), VNextError> {
         let first = authorities
             .first()
             .ok_or_else(|| invalid_resource("logical backing view requires an authority"))?;
@@ -2504,7 +2574,7 @@ where
         if state.poisoned {
             return Err(invalid_resource("dynamic backing pool is fail-closed"));
         }
-        let mut bindings = Vec::with_capacity(segment_count);
+        let mut visited = initialize(segment_count);
         for authority in authorities {
             for segment in &authority.evidence.segments {
                 let chunk = state.chunks.get(&segment.chunk_ordinal()).ok_or_else(|| {
@@ -2521,35 +2591,19 @@ where
                         "logical backing references a stale or out-of-bounds chunk region",
                     ));
                 }
-                let retention = match authority.reusable_lane {
-                    Some(lane_id) => DeviceBufferRetention::lane_pair(
-                        lane_id,
-                        Arc::clone(&authority.segment_lease),
-                        Arc::clone(&chunk.backing),
-                    ),
-                    None => DeviceBufferRetention::pair(
-                        Arc::clone(&authority.segment_lease),
-                        Arc::clone(&chunk.backing),
-                    ),
-                };
-                bindings.push(LogicalBackingSegmentBinding {
-                    segment: segment.clone(),
-                    chunk: Arc::clone(&chunk.backing),
-                    retention,
-                });
+                visit(&mut visited, authority, segment, &chunk.backing)?;
             }
         }
         drop(state);
-        Ok(LogicalBackingBufferView {
-            bindings,
-            authorities,
-            logical_size_bytes,
-            capacity_size_bytes,
-            alignment_bytes: first.evidence.alignment_bytes,
-            usage: first.evidence.usage,
-            element_type: first.evidence.element_type,
-            storage_profile: first.evidence.storage_profile,
-        })
+        Ok((
+            super::backing_validation::LogicalBackingMetadata::new(
+                authorities,
+                logical_size_bytes,
+                capacity_size_bytes,
+                segment_count,
+            ),
+            visited,
+        ))
     }
 
     fn validate_authority(

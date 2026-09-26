@@ -371,6 +371,9 @@ pub struct ResourcePlanningProjection {
     /// Predicted selection from the same first-idle slot transaction as the
     /// resource simulation. Identity only: this owns no slot or physical lease.
     pub(crate) step_slot: Option<LaneStableArenaSlotIdentity>,
+    /// Predicted Invocation slot holding the actual program-binding arena.
+    /// Numeric only, fenced by this projection and its original lane epoch.
+    pub(crate) invocation_slot: Option<LaneStableArenaSlotIdentity>,
     pub(crate) physical_ranges: Option<ResourceCostRangeProof>,
 }
 

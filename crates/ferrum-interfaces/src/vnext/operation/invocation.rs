@@ -24,6 +24,10 @@ use super::{
     ResolvedValueRole, ReusableBindingResources,
 };
 
+mod checked_views;
+#[cfg(test)]
+mod fresh_tests;
+use checked_views::{BackingInspection, InvocationViewCoverage, InvocationViews};
 mod view_coverage;
 #[cfg(test)]
 pub(crate) use view_coverage::test_only_backing_window_coverage;
@@ -131,6 +135,21 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
     ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
         let participant = self.participant(index)?;
         self.step_resources().participant_backing_view(
+            BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ),
+            resource_id,
+        )
+    }
+
+    fn validate_participant_backing(
+        self,
+        index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<crate::vnext::resource::ValidatedLogicalBacking<'a>, VNextError> {
+        let participant = self.participant(index)?;
+        self.step_resources().validate_participant_backing(
             BatchParticipantAuthority::new(
                 participant.sequence_authority(),
                 participant.request_authority(),
@@ -250,6 +269,15 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         match self {
             Self::Invocation(invocation) => invocation.backing_view(resource_id),
             Self::Wave { wave, node_index } => wave.backing_view(node_index, resource_id),
+        }
+    }
+    fn validate_backing(
+        self,
+        resource_id: &ResourceId,
+    ) -> Result<crate::vnext::resource::ValidatedLogicalBacking<'a>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.validate_backing(resource_id),
+            Self::Wave { wave, node_index } => wave.validate_backing(node_index, resource_id),
         }
     }
 }
@@ -590,6 +618,13 @@ pub struct OperationInvocation<'a, B> {
     claimed_backing_fingerprint: &'a str,
 }
 
+struct PreparedInvocationViews<'a, B> {
+    views: InvocationViews<'a, B>,
+    scratch_view: Option<usize>,
+    binding_view: Option<usize>,
+    persistent_view: Option<usize>,
+}
+
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
     fn from_prepared<R>(
@@ -605,6 +640,53 @@ impl<'a, B> OperationInvocation<'a, B> {
         participant_index: usize,
         reusable_bindings_only: bool,
     ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        let checked = Self::prepare_views(
+            runtime,
+            resolved,
+            prepared,
+            node,
+            identity,
+            node_id,
+            resources,
+            active_binding,
+            participant_index,
+            reusable_bindings_only,
+            false,
+        )?;
+        Ok(Self {
+            identity,
+            operation,
+            node_id,
+            provider_id: node.selection().selected_provider(),
+            views: checked.views.into_physical()?,
+            bindings: node.values(),
+            attributes: node.attributes(),
+            work: node.work(),
+            scratch_view: checked.scratch_view,
+            binding_view: checked.binding_view,
+            persistent_view: checked.persistent_view,
+            work_shape: resources.work_shape()?,
+            claimed_backing_fingerprint: resources.backing_fingerprint(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_views<R>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        node: &'a PlanNode,
+        identity: &'a ExecutionIdentityEnvelope,
+        node_id: &'a NodeId,
+        resources: OperationInvocationResources<'a, R>,
+        active_binding: &TrustedActiveSequenceBinding,
+        participant_index: usize,
+        reusable_bindings_only: bool,
+        validation_only: bool,
+    ) -> Result<PreparedInvocationViews<'a, B>, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
     {
@@ -697,7 +779,8 @@ impl<'a, B> OperationInvocation<'a, B> {
         let scratch_view = prepared.scratch_view.and_then(map_view);
         let binding_view = prepared.binding_view.and_then(map_view);
         let persistent_view = prepared.persistent_view.and_then(map_view);
-        let mut views = Vec::with_capacity(
+        let mut views = InvocationViews::new(
+            validation_only,
             projection.map_or(prepared.resources.len(), |projection| projection.view_count),
         );
         for (resource_index, resource) in prepared.resources.iter().enumerate() {
@@ -727,10 +810,9 @@ impl<'a, B> OperationInvocation<'a, B> {
                         ))
                     })?;
                     let leased = lease.plan_static_view(slot_index, allocation)?;
-                    views.push(OperationBufferView::from_static(
-                        leased,
-                        participant.device_buffer_retention(),
-                    ));
+                    views.push_static(runtime, lease_identity, leased, || {
+                        participant.device_buffer_retention()
+                    })?;
                 }
                 PreparedOperationResourceSource::Dynamic { descriptor_index } => {
                     let descriptor = memory
@@ -755,10 +837,15 @@ impl<'a, B> OperationInvocation<'a, B> {
                     // allocate a missing-resource error before every state view.
                     let backing = match descriptor_lifetime {
                         AllocationLifetime::Request | AllocationLifetime::Sequence => {
-                            resources.participant_backing_view(participant_index, resource_id)?
+                            BackingInspection::participant(
+                                resources,
+                                participant_index,
+                                resource_id,
+                                validation_only,
+                            )?
                         }
                         AllocationLifetime::Step | AllocationLifetime::Invocation => {
-                            resources.backing_view(resource_id)?
+                            BackingInspection::shared(resources, resource_id, validation_only)?
                         }
                         AllocationLifetime::Plan => {
                             return Err(invalid_operation(format!(
@@ -862,32 +949,29 @@ impl<'a, B> OperationInvocation<'a, B> {
                         usage: backing.usage(),
                         element_type: backing.element_type(),
                     };
-                    let view = if let Some((offset, _)) = participant_window {
-                        OperationBufferView::from_backing_window(
-                            descriptor,
-                            backing,
-                            offset,
-                            descriptor_lifetime,
-                        )
+                    let coverage = if let Some((offset, _)) = participant_window {
+                        super::buffer_view::OperationBufferCoverage::BackingWindow {
+                            offset_bytes: offset,
+                        }
                     } else if backing.capacity_size_bytes() > expected_backing_bytes {
-                        OperationBufferView::from_backing_prefix(
-                            descriptor,
-                            backing,
-                            descriptor_lifetime,
-                        )
+                        super::buffer_view::OperationBufferCoverage::BackingWindow {
+                            offset_bytes: 0,
+                        }
                     } else {
-                        OperationBufferView::from_backing_exact(
-                            descriptor,
-                            backing,
-                            descriptor_lifetime,
-                        )
+                        super::buffer_view::OperationBufferCoverage::Exact
                     };
-                    views.push(view.with_packed_batch_coordinates(packed_batch_coordinates));
+                    views.push_dynamic(
+                        descriptor,
+                        backing,
+                        coverage,
+                        descriptor_lifetime,
+                        packed_batch_coordinates,
+                    )?;
                 }
             }
         }
 
-        let covered_views = FullyCoveredOperationViews::validate(&views, runtime, lease_identity)?;
+        let covered_views = views.validate(runtime, lease_identity)?;
         if node.values().len() != prepared.binding_component_views.len() {
             return Err(invalid_operation(
                 "prepared value-binding recipe differs from its plan node",
@@ -913,10 +997,10 @@ impl<'a, B> OperationInvocation<'a, B> {
                 let projected_index = map_view(*view_index).ok_or_else(|| {
                     invalid_operation("reusable binding projection omits a retained component")
                 })?;
-                let view = views.get(projected_index).ok_or_else(|| {
+                let view = views.descriptor(projected_index).ok_or_else(|| {
                     invalid_operation("value binding lacks a committed resource view")
                 })?;
-                if view.resource_id() != component.resource_id() {
+                if &view.resource_id != component.resource_id() {
                     return Err(invalid_operation(
                         "prepared value-binding view differs from its resource",
                     ));
@@ -951,7 +1035,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                     node.work(),
                     binding,
                     component,
-                    view.descriptor(),
+                    view,
                     dynamic_demand,
                     provider_resources.value_alignment_bytes(),
                 )?;
@@ -989,20 +1073,11 @@ impl<'a, B> OperationInvocation<'a, B> {
                 .filter(|_| projection.is_none() || persistent_view.is_some()),
             "persistent",
         )?;
-        Ok(Self {
-            identity,
-            operation,
-            node_id,
-            provider_id: node.selection().selected_provider(),
+        Ok(PreparedInvocationViews {
             views,
-            bindings: node.values(),
-            attributes: node.attributes(),
-            work: node.work(),
             scratch_view,
             binding_view,
             persistent_view,
-            work_shape: resources.work_shape()?,
-            claimed_backing_fingerprint: resources.backing_fingerprint(),
         })
     }
 
@@ -1167,35 +1242,14 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
         I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        let participant_count = resources.participant_count()?;
-        let participant_frames = resources.participant_frames()?;
-        if participant_count == 0
-            || participant_count != active_bindings.len()
-            || participant_count != node_identity.participants().len()
-            || participant_count != participant_frames.len()
-            || batch_identity.batch_step_id() != resources.batch_step_id()
-            || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
-            || node_identity.node_id() != resources.node_id()?
-            || node_identity.work_shape_fingerprint() != resources.work_shape()?.fingerprint()
-            || batch_identity.claimed_backing_fingerprint() != resources.backing_fingerprint()
-            || node_identity
-                .participants()
-                .iter()
-                .zip(participant_frames)
-                .any(|(participant, frame)| {
-                    let key = participant.node_key();
-                    key.sequence_authority() != frame.sequence_authority()
-                        || key.request_authority() != frame.request_authority()
-                        || key.frame_id() != frame.frame_id()
-                        || key.node_id() != node_identity.node_id()
-                })
-        {
-            return Err(invalid_operation(
-                "batched operation identity differs from its exact invocation resources",
-            ));
-        }
-        let node = prepared.node(resolved, node_identity.node_id())?;
-        let operation = resolved.capabilities().operation(node.operation_id())?;
+        let (node, operation) = Self::validate_resource_identity(
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            active_bindings.len(),
+        )?;
         let participants = node_identity
             .participants()
             .iter()
@@ -1224,6 +1278,96 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             participants,
             program_binding,
         })
+    }
+
+    fn validate_resource_identity<R: DeviceRuntime<Buffer = B>>(
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_binding_count: usize,
+    ) -> Result<(&'a PlanNode, &'a OperationDescriptor), VNextError> {
+        let participant_count = resources.participant_count()?;
+        let participant_frames = resources.participant_frames()?;
+        if participant_count == 0
+            || participant_count != active_binding_count
+            || participant_count != node_identity.participants().len()
+            || participant_count != participant_frames.len()
+            || batch_identity.batch_step_id() != resources.batch_step_id()
+            || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
+            || node_identity.node_id() != resources.node_id()?
+            || node_identity.work_shape_fingerprint() != resources.work_shape()?.fingerprint()
+            || batch_identity.claimed_backing_fingerprint() != resources.backing_fingerprint()
+            || node_identity
+                .participants()
+                .iter()
+                .zip(participant_frames)
+                .any(|(participant, frame)| {
+                    let key = participant.node_key();
+                    key.sequence_authority() != frame.sequence_authority()
+                        || key.request_authority() != frame.request_authority()
+                        || key.frame_id() != frame.frame_id()
+                        || key.node_id() != node_identity.node_id()
+                })
+        {
+            return Err(invalid_operation(
+                "batched operation identity differs from its exact invocation resources",
+            ));
+        }
+        let node = prepared.node(resolved, node_identity.node_id())?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
+        Ok((node, operation))
+    }
+
+    /// Checks the identical complete per-node resource population without
+    /// constructing executable views or retaining physical buffers. Only core
+    /// dispatch may turn success into a current-wave passive cost sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn validate_replay_cost_resources<'binding, R, I>(
+        runtime: &R,
+        resolved: &'a dyn ExecutablePlanView,
+        prepared: &PreparedOperationDispatchBinding,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: I,
+    ) -> Result<(), VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        let resources = OperationInvocationResources::Wave { wave, node_index };
+        let (node, _) = Self::validate_resource_identity(
+            resolved,
+            prepared,
+            batch_identity,
+            node_identity,
+            resources,
+            active_bindings.len(),
+        )?;
+        for (index, (participant, active_binding)) in node_identity
+            .participants()
+            .iter()
+            .zip(active_bindings)
+            .enumerate()
+        {
+            OperationInvocation::<B>::prepare_views(
+                runtime,
+                resolved,
+                prepared,
+                node,
+                participant.identity(),
+                node_identity.node_id(),
+                resources,
+                active_binding,
+                index,
+                false,
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
@@ -1346,7 +1490,7 @@ fn select_workspace_resource<'a>(
 }
 
 fn validate_workspace<B>(
-    views: &FullyCoveredOperationViews<'_, '_, B>,
+    views: &InvocationViewCoverage<'_, '_, B>,
     index: Option<usize>,
     usage: BufferUsage,
     requirement: Option<&ProviderWorkspaceRequirement>,

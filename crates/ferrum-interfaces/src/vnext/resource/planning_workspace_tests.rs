@@ -145,6 +145,10 @@ fn planning_workspace_cold_retention_and_hot_reuse_match_actual_slots() {
         "the forecast must name the slot actually selected by the allocator"
     );
     assert_eq!(first.selected_step_slot(), second.selected_step_slot());
+    assert!(
+        first.invocation_slot.is_none(),
+        "no Invocation demand must not invent a program arena slot"
+    );
     assert_eq!(actual.backing_slices()[0].size_bytes(), 64);
     assert_eq!(actual.backing_slices()[0].capacity_size_bytes(), 256);
     let physical = actual.backing_slices()[0].evidence().segments().to_vec();
@@ -621,6 +625,15 @@ fn planning_workspace_step_and_invocation_capacity_remain_retained_together() {
     };
     let (step_slices, step_slot) = claim(&step_requests);
     let (wave_slices, wave_slot) = claim(&wave_requests);
+    assert_eq!(
+        predicted.invocation_slot,
+        wave_slot.as_ref().map(|slot| slot.identity()),
+        "future graph identity must use the Invocation slot actually selected by the allocator"
+    );
+    assert_ne!(
+        predicted.invocation_slot, predicted.step_slot,
+        "Step and Invocation lifetimes must not share a fabricated slot identity"
+    );
     assert_eq!(step_slices[0].capacity_size_bytes(), 256);
     assert_eq!(wave_slices[0].capacity_size_bytes(), 256);
     drop(wave_slices);
@@ -653,3 +666,6 @@ fn planning_workspace_step_and_invocation_capacity_remain_retained_together() {
     drop(lane);
     close_dynamic_test_root(harness.root);
 }
+
+#[path = "planning_workspace_tests/graph_catalog.rs"]
+mod graph_catalog;

@@ -470,6 +470,7 @@ pub(super) fn project_ranges(
             projection.physical_offset,
             projection.capacity,
         )?;
+        proof.record_workspace_scope(&projection.resource, selected.lane_id())?;
     }
     Ok(())
 }

@@ -13,10 +13,32 @@ pub(super) struct PhysicalRanges {
 pub(crate) struct ResourceCostRangeProof {
     static_ranges: Arc<BTreeMap<ResourceId, (u64, DeviceCostBufferRange)>>,
     dynamic_ranges: BTreeMap<ResourceId, DeviceCostBufferRange>,
+    reusable_scopes: BTreeMap<ResourceId, crate::vnext::DeviceReusableAddressScope>,
     sequence_ranges: Vec<BTreeMap<ResourceId, Vec<DeviceCostBufferRange>>>,
 }
 
 impl ResourceCostRangeProof {
+    pub(crate) fn reusable_scope(
+        &self,
+        resource: &ResourceId,
+    ) -> Option<crate::vnext::DeviceReusableAddressScope> {
+        self.reusable_scopes.get(resource).copied()
+    }
+    pub(super) fn record_workspace_scope(
+        &mut self,
+        resource: &ResourceId,
+        lane: ExecutionLaneId,
+    ) -> Result<(), ResourcePlanningUnknown> {
+        let scope = crate::vnext::DeviceReusableAddressScope::ExecutionLane(lane);
+        if self
+            .reusable_scopes
+            .insert(resource.clone(), scope)
+            .is_some_and(|old| old != scope)
+        {
+            return Err(ResourcePlanningUnknown::InvalidDemand);
+        }
+        Ok(())
+    }
     pub(crate) fn sequence(
         &self,
         participant: usize,
@@ -92,6 +114,7 @@ impl PhysicalRanges {
         ResourceCostRangeProof {
             static_ranges: Arc::clone(&self.static_ranges),
             dynamic_ranges: BTreeMap::new(),
+            reusable_scopes: BTreeMap::new(),
             sequence_ranges: Vec::new(),
         }
     }

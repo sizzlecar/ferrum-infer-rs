@@ -78,7 +78,7 @@ impl ReusableExecutionValueAddress {
         Self::ProgramBinding { role, ordinal }
     }
 
-    const fn identity(self) -> (ResolvedValueRole, u32) {
+    pub(super) const fn identity(self) -> (ResolvedValueRole, u32) {
         match self {
             Self::Captured { role, ordinal } | Self::ProgramBinding { role, ordinal } => {
                 (role, ordinal)
@@ -357,7 +357,7 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
     }
 }
 
-fn merge_reusable_address_scope(
+pub(super) fn merge_reusable_address_scope(
     left: DeviceReusableAddressScope,
     right: DeviceReusableAddressScope,
 ) -> Result<DeviceReusableAddressScope, VNextError> {
@@ -599,6 +599,31 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
         &self,
         _request: OperationCostRouteRequest<'_>,
     ) -> Result<Option<OperationCostRoute>, VNextError> {
+        Ok(None)
+    }
+
+    /// Numerical topology from the same selector used at actual dispatch.
+    /// None is required when the provider has no future proof. This does not
+    /// grant permission to capture, upload or replay a program.
+    fn reusable_execution_cost_topology(
+        &self,
+        _request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<ReusableExecutionTopology>, VNextError> {
+        Ok(None)
+    }
+
+    /// Passive selected compute work for this real, core-created invocation
+    /// of an already resident node. The provider must use the same pure
+    /// selected-launch helper as its encoder and future projection, including
+    /// dynamic work read by this invocation's actual binding update.
+    ///
+    /// No eager compute is encoded or submitted by this method. Core/backend
+    /// still match the resident program, ordinal and sealed algorithm template;
+    /// this result grants no execution authority. None is the explicit default.
+    fn replayed_compute_cost_evidence(
+        &self,
+        _invocation: &BatchedOperationInvocation<'_, R::Buffer>,
+    ) -> Result<Option<crate::execution_cost::SelectedCommandCostEvidenceV1>, VNextError> {
         Ok(None)
     }
 
@@ -1016,5 +1041,50 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
+    }
+}
+
+impl super::ReusableExecutionTopologyView for ReusableExecutionTopologyRequest<'_> {
+    fn operation_id(&self) -> &OperationId {
+        self.operation_id
+    }
+    fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
+        self.attributes
+    }
+    fn bindings(&self) -> &[ResolvedValueBinding] {
+        self.bindings
+    }
+    fn memory_plan(&self) -> &MemoryPlan {
+        self.memory
+    }
+    fn participant_count(&self) -> usize {
+        self.work_shape.participant_token_ranges().len()
+    }
+    fn immediate_tokens(&self) -> u64 {
+        self.work_shape.immediate_tokens()
+    }
+    fn token_row(&self, index: usize) -> Option<OperationCostWorkRow> {
+        let row = self.work_shape.participant_token_ranges().get(index)?;
+        Some(OperationCostWorkRow {
+            offset: row.source_token_range().start,
+            count: std::num::NonZeroU64::new(row.immediate_tokens())?,
+            full_input_tokens: std::num::NonZeroU64::new(row.full_input_tokens())?,
+        })
+    }
+    fn workspace_resource(
+        &self,
+        workspace: ReusableExecutionWorkspaceAddress,
+    ) -> Option<&super::super::ResourceId> {
+        match workspace {
+            ReusableExecutionWorkspaceAddress::Scratch => self.scratch_resource,
+            ReusableExecutionWorkspaceAddress::Binding => self.binding_resource,
+            ReusableExecutionWorkspaceAddress::Persistent => self.persistent_resource,
+        }
+    }
+    fn resource_reusable_address_scope(
+        &self,
+        resource: &super::super::ResourceId,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        ReusableExecutionTopologyRequest::resource_reusable_address_scope(self, resource)
     }
 }

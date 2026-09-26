@@ -311,7 +311,7 @@ enum OperationBufferSource<'a, B> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OperationBufferCoverage {
+pub(super) enum OperationBufferCoverage {
     Exact,
     /// The operation sees an exact logical prefix while resource authority
     /// retains wider physical capacity for a frontier or reusable bucket.
@@ -529,6 +529,29 @@ fn validate_dynamic_binding_layout(
     coverage: OperationBufferCoverage,
 ) -> Result<(), VNextError> {
     let binding_count = binding_lengths.len();
+    let covered = binding_lengths.try_fold(0_u64, |total, length_bytes| {
+        total
+            .checked_add(length_bytes)
+            .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
+    })?;
+    validate_dynamic_coverage(
+        storage_kind,
+        logical_size_bytes,
+        binding_count,
+        covered,
+        coverage,
+    )
+}
+
+/// Identical layout/window checks for physical views and descriptor-only
+/// fresh inspection. The caller has already checked every physical segment.
+pub(super) fn validate_dynamic_coverage(
+    storage_kind: OperationBufferStorageKind,
+    logical_size_bytes: u64,
+    binding_count: usize,
+    covered: u64,
+    coverage: OperationBufferCoverage,
+) -> Result<(), VNextError> {
     if storage_kind == OperationBufferStorageKind::StaticContiguous {
         return Err(invalid_operation(
             "dynamic backing cannot claim static storage kind",
@@ -544,11 +567,6 @@ fn validate_dynamic_binding_layout(
             "contiguous dynamic storage requires one physical segment binding",
         ));
     }
-    let covered = binding_lengths.try_fold(0_u64, |total, length_bytes| {
-        total
-            .checked_add(length_bytes)
-            .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
-    })?;
     let window_offset = match coverage {
         OperationBufferCoverage::Exact => 0,
         OperationBufferCoverage::BackingWindow { offset_bytes } => offset_bytes,
@@ -583,6 +601,26 @@ pub(super) fn sequence_execution_shape(
         source_end_tokens,
         committed.pages(),
     ))
+}
+
+/// The static identity/descriptor check is shared with numeric-only fresh
+/// inspection; neither path treats a retained pointer as current validation.
+pub(super) fn validate_static_runtime<B, R: DeviceRuntime<Buffer = B>>(
+    runtime: &R,
+    view: &LeasedBufferView<'_, B>,
+    expected_identity: Option<&ResourceTransactionIdentity>,
+) -> Result<BufferDescriptor, VNextError> {
+    let actual = runtime.buffer_descriptor(view.buffer());
+    if Some(view.identity()) != expected_identity
+        || &actual != view.committed_descriptor()
+        || view.generation() == 0
+    {
+        return Err(invalid_operation(format!(
+            "runtime descriptor differs from committed static resource `{}`",
+            view.committed_descriptor().resource_id,
+        )));
+    }
+    Ok(actual)
 }
 
 pub struct OperationBufferView<'a, B> {
@@ -677,16 +715,7 @@ impl<'a, B> OperationBufferView<'a, B> {
     {
         match &self.source {
             OperationBufferSource::Static { view, .. } => {
-                let actual = runtime.buffer_descriptor(view.buffer());
-                if Some(view.identity()) != expected_static_identity
-                    || &actual != view.committed_descriptor()
-                    || view.generation() == 0
-                {
-                    return Err(invalid_operation(format!(
-                        "runtime descriptor differs from committed static resource `{}`",
-                        self.resource_id()
-                    )));
-                }
+                validate_static_runtime(runtime, view, expected_static_identity)?;
             }
             OperationBufferSource::Backing(backing_view) => {
                 let bindings = backing_view.segment_bindings();
