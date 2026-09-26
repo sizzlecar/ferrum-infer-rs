@@ -21,7 +21,7 @@ fn q8_gdn_projections_preserve_old_profiles_and_auto_preferences() {
     quantize(&mut config, "linear_attn_qkv", GgmlDType::Q5K, 176);
     provider.validate_typed_config(&config).unwrap();
     let after = provider.numerical_profiles(&config).unwrap();
-    assert_eq!(after.version(), ContractVersion::new(1, 7));
+    assert_eq!(after.version(), ContractVersion::new(1, 8));
     assert_eq!(
         after.resolve(&profile_id()).unwrap().version,
         ContractVersion::new(1, 0)

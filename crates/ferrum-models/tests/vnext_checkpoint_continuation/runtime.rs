@@ -1039,12 +1039,25 @@ impl Fixture {
                 self.checkpoint_timing_mode,
             )
             .unwrap();
+        let start_kind = match &start {
+            NativeCheckpointStart::Skipped(reason) => format!("Skipped({reason:?})"),
+            NativeCheckpointStart::CapacityMaintenance { reason, .. } => {
+                format!("CapacityMaintenance({reason:?})")
+            }
+            NativeCheckpointStart::NotSubmitted(error) => format!("NotSubmitted({error})"),
+            NativeCheckpointStart::Submitted(_) => "Submitted".to_owned(),
+            NativeCheckpointStart::Indeterminate(_) => "Indeterminate".to_owned(),
+            NativeCheckpointStart::ContractAfterSubmission { error, .. } => {
+                format!("ContractAfterSubmission({error})")
+            }
+        };
+        eprintln!("first checkpoint start: {start_kind}; before={before:?}");
         let NativeCheckpointStart::CapacityMaintenance {
             reason,
             maintenance,
         } = start
         else {
-            panic!("foreground-only initialized pools must expose first-capture maintenance");
+            panic!("foreground-only initialized pools must expose first-capture maintenance; actual={start_kind}; before={before:?}");
         };
         let receipt = match maintenance.try_maintain().unwrap() {
             CheckpointCapacityMaintenanceOutcome::Ready(receipt) => receipt,

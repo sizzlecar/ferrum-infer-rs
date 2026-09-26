@@ -45,7 +45,7 @@ fn execute(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplayExpectation {
+pub(super) enum ReplayExpectation {
     Resident,
     CausalVarlenEagerBoundary,
 }
@@ -80,7 +80,7 @@ fn assert_declared_eager_boundary(fixture: &Fixture, node: &str) {
     }
 }
 
-fn compare_changed_inputs(
+pub(super) fn compare_changed_inputs(
     eager: &Fixture,
     replay: &Fixture,
     rows: usize,

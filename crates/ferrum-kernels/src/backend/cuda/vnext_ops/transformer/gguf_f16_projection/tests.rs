@@ -146,7 +146,11 @@ fn gguf_rn_f16_cuda_mixed_container_preserves_retained_native_consumers() {
     let rounded = OperationId::new(DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID).unwrap();
     assert_eq!(
         provider_formats(&rounded, formats).unwrap(),
-        BTreeSet::from([mixed])
+        BTreeSet::from([
+            mixed,
+            WeightFormatId::new(crate::gguf_rn_fragment_materializer::GGUF_RN_FRAGMENT_FORMAT_ID)
+                .unwrap()
+        ])
     );
     // Existing operation physical policy remains with its original provider.
     let strict = OperationId::new(DENSE_SWIGLU_OPERATION_ID).unwrap();

@@ -19,11 +19,17 @@ pub(super) enum NumericalScope {
     Qwen35GgufF16ProjectionsV1,
     /// RN-F16 attention plus compressed whole-M2..8 residual2 FFN; separately qualified.
     Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1,
+    /// RN projection operands, with fragment MMA at whole physical M1..8.
+    /// This includes small prefill/tail waves; larger M retains dense RN GEMM.
+    Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1,
 }
 
 impl NumericalScope {
     fn candidate_profile(self) -> &'static str {
         match self {
+            Self::Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1 => {
+                "qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8"
+            }
             Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => {
                 "qwen3_5.f32-master.gguf-f16-attention.q8-residual2-ffn-m2to8"
             }
@@ -37,6 +43,7 @@ impl NumericalScope {
     fn candidate_operation(self) -> Option<&'static str> {
         match self {
             Self::Qwen35GgufF16ProjectionsV1
+            | Self::Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1
             | Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => None,
             Self::DenseSwiGluQ8GateUpStreamMmqV1 => {
                 Some("operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale")
@@ -50,15 +57,22 @@ impl NumericalScope {
     fn all_projections(self) -> bool {
         matches!(
             self,
-            Self::Qwen35GgufF16ProjectionsV1 | Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1
+            Self::Qwen35GgufF16ProjectionsV1
+                | Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1
+                | Self::Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1
         )
     }
 
     fn projection_operation(self, reference: &str) -> Option<&'static str> {
         use ferrum_interfaces::vnext::{
-            DENSE_SWIGLU_OPERATION_ID, DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID,
+            DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+            DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID,
         };
-        if matches!(self, Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1)
+        if matches!(self, Self::Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1)
+            && reference == DENSE_SWIGLU_OPERATION_ID
+        {
+            Some(DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID)
+        } else if matches!(self, Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1)
             && reference == DENSE_SWIGLU_OPERATION_ID
         {
             Some(DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID)
@@ -69,6 +83,9 @@ impl NumericalScope {
 
     fn description(self) -> &'static str {
         match self {
+            Self::Qwen35GgufF16ProjectionsRnFragmentFfnM1to8V1 => {
+                "declared_rn_f16_projections_fragment_ffn_whole_m1to8_fixed_history_full_vocabulary_quality_only"
+            }
             Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => {
                 "declared_rn_f16_attention_residual2_ffn_fixed_history_full_vocabulary_quality_only"
             }

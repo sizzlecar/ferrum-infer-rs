@@ -13,6 +13,8 @@ pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
 pub const F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-projections";
+pub const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8";
 pub const F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.gguf-f16-attention.q8-residual2-ffn-m2to8";
 pub const F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.f16-head";
@@ -36,6 +38,9 @@ pub(super) fn profiles(
     let f32 = profile(family_id, &text, &states, &kv_storage, true, false)?;
     let gguf_f16_projections = gguf_f16_projections_eligible(config, &text)
         .then(|| gguf_f16_projections_profile(&f32))
+        .transpose()?;
+    let rn_fragment = gguf_rn_f16_fragment_eligible(config, &text)
+        .then(|| gguf_rn_f16_fragment_profile(&f32))
         .transpose()?;
     let hybrid = gguf_f16_attention_residual2_ffn_m2to8_eligible(config, &text)
         .then(|| gguf_f16_attention_residual2_ffn_m2to8_profile(&f32))
@@ -102,7 +107,8 @@ pub(super) fn profiles(
     profiles.extend(q8_gate_up_stream_mmq);
     profiles.extend(gguf_f16_projections);
     profiles.extend(hybrid);
-    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 7), profiles, automatic)
+    profiles.extend(rn_fragment);
+    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 8), profiles, automatic)
 }
 
 /// This is a declared source/ABI combination, not full-model quality approval.
@@ -142,6 +148,84 @@ pub(super) fn gguf_f16_projections_eligible(
                 _ => false,
             }
         })
+}
+
+/// Source/role/shape qualification; no model name or current batch controls
+/// capability. Each whole gate/up packet has one source encoding.
+pub(super) fn gguf_rn_f16_fragment_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    if !gguf_f16_projections_eligible(config, text) {
+        return false;
+    }
+    let classify =
+        |weight: &FamilyWeight| -> Option<ferrum_interfaces::vnext::RnF16FragmentSourceFormatV1> {
+            use ferrum_interfaces::vnext::{RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1};
+            let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
+                return None;
+            };
+            let format = match (
+                spec.format_id.as_str(),
+                spec.logical_values_per_block,
+                spec.bytes_per_block,
+            ) {
+                ("quantization.gguf.q4-k", 256, 144) => RnF16FragmentSourceFormatV1::Q4K,
+                ("quantization.gguf.q5-k", 256, 176) => RnF16FragmentSourceFormatV1::Q5K,
+                ("quantization.gguf.q6-k", 256, 210) => RnF16FragmentSourceFormatV1::Q6K,
+                _ => return None,
+            };
+            RnF16FragmentPlanV1::from_dimensions(format, &weight.dimensions).ok()?;
+            Some(format)
+        };
+    (0..text.num_hidden_layers).all(|layer| {
+        let find = |role| {
+            config
+                .weights
+                .iter()
+                .find(|w| w.layer_index == Some(layer as u32) && w.role == role)
+        };
+        let (Some(gate), Some(up), Some(down)) =
+            (find("mlp_gate"), find("mlp_up"), find("mlp_down"))
+        else {
+            return false;
+        };
+        classify(gate).is_some_and(|format| {
+            if classify(up) != Some(format) || gate.dimensions != up.dimensions {
+                return false;
+            }
+            let mut whole = gate.dimensions.clone();
+            let Some(n) = whole.first_mut() else {
+                return false;
+            };
+            let Some(joined) = n.checked_mul(2) else {
+                return false;
+            };
+            *n = joined;
+            ferrum_interfaces::vnext::RnF16FragmentPlanV1::from_dimensions(format, &whole).is_ok()
+        }) && classify(down).is_some()
+    })
+}
+
+fn gguf_rn_f16_fragment_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = gguf_f16_projections_profile(master)?;
+    profile.id =
+        NumericalProfileId::new(F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID)
+            .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let ffn = profile
+        .operations
+        .iter_mut()
+        .find(|op| op.operation_id.as_str() == DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID)
+        .ok_or_else(|| {
+            invalid_config("numerical_profile.operations", "RN FFN contract is missing")
+        })?;
+    ffn.operation_id = operation_id(DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID)?;
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    Ok(profile)
 }
 
 /// One explicit combination, not permission to combine independently qualified

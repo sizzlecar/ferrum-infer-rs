@@ -335,6 +335,9 @@ fn resolve_layout_node(
             group_axis: *group_axis,
             group_padding: group_padding.clone(),
         }),
+        PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. } => {
+            Err("Metal has no provider for the RN-F16 dense/fragment physical ABI".to_owned())
+        }
         PhysicalWeightLayout::QuantizedBlockGrid { .. } => {
             Err("Metal does not support quantized block-grid physical weight layouts".to_owned())
         }

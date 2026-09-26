@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FfnPolicy {
     Strict,
+    RnFragment,
     Q8,
     Q8InputSum,
     StreamMmq,
@@ -19,6 +20,7 @@ impl Q8FfnFamily {
     fn operation(&self) -> &'static str {
         match self.policy {
             FfnPolicy::Strict => DENSE_SWIGLU_OPERATION_ID,
+            FfnPolicy::RnFragment => DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID,
             FfnPolicy::Q8 => DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID,
             FfnPolicy::Q8InputSum => DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID,
             FfnPolicy::StreamMmq => DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID,
@@ -115,11 +117,13 @@ impl ModelFamilyProvider for Q8FfnFamily {
         profile.operations.push(NumericalOperationContract {
             operation_id: id(self.operation()),
             version: ContractVersion::new(1, 0),
-            multiplication_type: Some(if matches!(self.policy, FfnPolicy::Strict) {
-                ElementType::F16
-            } else {
-                ElementType::I8
-            }),
+            multiplication_type: Some(
+                if matches!(self.policy, FfnPolicy::Strict | FfnPolicy::RnFragment) {
+                    ElementType::F16
+                } else {
+                    ElementType::I8
+                },
+            ),
             accumulation_type: Some(ElementType::F32),
         });
         FamilyNumericalProfiles::new(

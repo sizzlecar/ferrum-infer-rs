@@ -3,84 +3,14 @@
 //! independently specified coefficients, never decoded from candidate output.
 use super::*;
 use crate::gguf_blocks::GgufBlockFormat;
-use half::f16;
+use crate::gguf_f16_projection_materializer as legacy;
 use serde_json::{json, Value};
 
-const EXECUTION_CONTRACT:&str="gguf-original-f32-decoder/rn-even-binary16-once/finite-no-overflow/contiguous-projection-components/v1";
+const EXECUTION_CONTRACT:&str="gguf-original-f32-decoder/rn-even-binary16-once/finite-no-overflow/dense-plus-exact-rn-fragment-N16-K32-v1";
 const RELATIVE_L2_DENOMINATOR: u64 = 1024;
 
-pub(crate) struct Vector {
-    pub format: GgufBlockFormat,
-    pub source: Vec<u8>,
-    pub reference: Vec<f32>,
-}
-pub(crate) fn vectors() -> Vec<Vector> {
-    let d = f16::from_bits(0x237b).to_f32();
-    let m = f16::from_bits(0x159d).to_f32();
-    [
-        GgufBlockFormat::Q4K,
-        GgufBlockFormat::Q5K,
-        GgufBlockFormat::Q6K,
-        GgufBlockFormat::Q8_0,
-    ]
-    .into_iter()
-    .map(|format| {
-        let mut source = vec![0; format.block_bytes()];
-        let mut reference = Vec::with_capacity(format.block_values());
-        match format {
-            GgufBlockFormat::Q4K | GgufBlockFormat::Q5K => {
-                source[..2].copy_from_slice(&0x237bu16.to_le_bytes());
-                source[2..4].copy_from_slice(&0x159du16.to_le_bytes());
-                source[4..12].fill(1);
-                source[12..16].fill(0x11); // each group scale=minimum=1
-                let values = if format == GgufBlockFormat::Q4K {
-                    16
-                } else {
-                    32
-                };
-                let start = if format == GgufBlockFormat::Q4K {
-                    16
-                } else {
-                    48
-                };
-                for i in 0..256 {
-                    let q = ((i * 13 + 7) % values) as u8;
-                    source[start + (i / 64) * 32 + i % 32] |= (q & 15) << (4 * ((i % 64) / 32));
-                    if format == GgufBlockFormat::Q5K && q >= 16 {
-                        source[16 + i % 32] |= 1 << (i / 32);
-                    }
-                    reference.push(d * f32::from(q) - m);
-                }
-            }
-            GgufBlockFormat::Q6K => {
-                source[192..208].fill(3);
-                source[208..210].copy_from_slice(&0x237bu16.to_le_bytes());
-                for i in 0..256 {
-                    let code = (i % 64) as u8;
-                    let group = (i % 128) / 32;
-                    source[(i / 128) * 64 + (group % 2) * 32 + i % 32] |=
-                        (code & 15) << (4 * (group / 2));
-                    source[128 + (i / 128) * 32 + i % 32] |= (code >> 4) << (2 * group);
-                    reference.push((d * 3.0) * (i32::from(code) - 32) as f32);
-                }
-            }
-            GgufBlockFormat::Q8_0 => {
-                source[..2].copy_from_slice(&0x237bu16.to_le_bytes());
-                for i in 0..32 {
-                    let q = ((i * 17) % 255) as i16 - 127;
-                    source[2 + i] = q as i8 as u8;
-                    reference.push(d * q as f32);
-                }
-            }
-            _ => unreachable!(),
-        }
-        Vector {
-            format,
-            source,
-            reference,
-        }
-    })
-    .collect()
+fn vectors() -> Vec<legacy::quality::Vector> {
+    legacy::quality::vectors()
 }
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -92,7 +22,7 @@ fn reference_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 fn checkpoint() -> Value {
-    json!({"id":"checkpoint.ferrum.gguf-rn-f16.synthetic-v1","repository":"ferrum/gguf-rn-f16-conversion-vectors","revision":sha(include_bytes!("quality.rs"))})
+    json!({"id":"checkpoint.ferrum.gguf-rn-fragment.synthetic-v1","repository":"ferrum/gguf-rn-fragment-conversion-vectors","revision":sha(include_bytes!("quality.rs"))})
 }
 fn payload() -> Value {
     let vectors = vectors();
@@ -100,10 +30,10 @@ fn payload() -> Value {
         "activation_batches":[],
         "activation_contract":{"kind":"weight-conversion-only-no-gemm"},
         "cases":vectors.iter().map(|v|json!({"case_id":v.format.format_id(),"source_bytes":v.source,"source_sha256":sha(&v.source),"reference_f32le_sha256":sha(&reference_bytes(&v.reference))})).collect::<Vec<_>>(),
-        "checkpoint":checkpoint(),"fixture_id":"gguf-rn-f16-conversion-v1",
+        "checkpoint":checkpoint(),"fixture_id":"gguf-rn-fragment-conversion-v1",
         "generator":{"algorithm":"independent-coefficient-q4-q5-q6-q8-v1"},
         "reference_contract":{"dtype":"f32","arithmetic":"original-gguf-coefficient-order"},"schema_version":1,
-        "source_contract":{"rounding":"rn-even","nonfinite":"reject","overflow":"reject"},
+        "source_contract":{"rounding":"rn-even","nonfinite":"reject","overflow":"reject","fragment":"original quant codes and F32 coefficients; every reconstructed RN coefficient equals original dense conversion; whole-N tile padding"},
         "weight_shapes":[[1,256],[1,256],[1,256],[1,32]],
     })
 }
@@ -140,7 +70,17 @@ pub(super) fn artifact(
 ) -> Result<Vec<u8>, VNextError> {
     let mut cases = Vec::new();
     for vector in vectors() {
-        let converted = conversion::convert(vector.format, &vector.source)?;
+        let converted = legacy::conversion::convert(vector.format, &vector.source)?;
+        let format = match vector.format {
+            GgufBlockFormat::Q4K => Some(RnF16FragmentSourceFormatV1::Q4K),
+            GgufBlockFormat::Q5K => Some(RnF16FragmentSourceFormatV1::Q5K),
+            GgufBlockFormat::Q6K => Some(RnF16FragmentSourceFormatV1::Q6K),
+            _ => None, // retained legacy RN Q8 attention vector
+        };
+        if let Some(format) = format {
+            let plan = RnF16FragmentPlanV1::new(format, 1, 256)?;
+            crate::gguf_rn_fragment::pack_checked(&plan, &[&vector.source], Some(&converted))?;
+        }
         let actual = converted
             .chunks_exact(2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))

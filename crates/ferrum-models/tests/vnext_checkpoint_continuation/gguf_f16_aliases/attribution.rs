@@ -17,13 +17,31 @@ pub(super) fn assert_product_witness(
     fixture: &Fixture,
     inventory: &GgufF16ProjectionInventoryV1,
 ) {
+    assert_product_witness_inventory(
+        registration,
+        family,
+        fixture,
+        inventory.converted_f16_bytes,
+        None,
+    );
+}
+
+/// Reuse the original completed-static-initialization receipt and resolved
+/// plan. The packet is extra declared storage for the same source population.
+pub(super) fn assert_product_witness_inventory(
+    registration: &dyn ModelFamilyRegistration,
+    family: &PreparedModelFamily,
+    fixture: &Fixture,
+    converted_f16_bytes: u64,
+    fragment_bytes: Option<u64>,
+) {
     let catalog = &fixture._composition._catalog;
     let runtime = &fixture.runtime_policy;
     let compilation = &fixture.compilation;
     let plan = compilation.executable().execution_plan();
     let definition = registration.define(family.canonical_config()).unwrap();
     let numerical = NumericalProfileResolution::from_static_plan(
-        ferrum_types::NumericalExecutionPolicy::Require(id(PROFILE)),
+        ferrum_types::NumericalExecutionPolicy::Require(id(family.numerical_profile().id.as_str())),
         ferrum_types::KvStorageFormat::F16,
         &definition,
         family,
@@ -155,7 +173,14 @@ pub(super) fn assert_product_witness(
     };
     let witness = witness.expect("quantized sources require complete source attribution");
     let json = serde_json::to_value(&witness).unwrap();
-    assert_eq!(json["schema"], "ferrum.vnext.provider-attribution.v2");
+    assert_eq!(
+        json["schema"],
+        if fragment_bytes.is_some() {
+            "ferrum.vnext.provider-attribution.v3"
+        } else {
+            "ferrum.vnext.provider-attribution.v2"
+        }
+    );
     assert_eq!(
         witness.provider_attribution().denominator_sha256(),
         denominator.sha256()
@@ -173,9 +198,24 @@ pub(super) fn assert_product_witness(
     let declared = &json["declared_dense_execution"];
     assert!(declared["source_quant_tensor_count"].as_u64().unwrap() > 0);
     assert!(declared["dense_f16_component_bytes"].as_u64().unwrap() > 0);
-    assert!(
-        declared["dense_f16_component_bytes"].as_u64().unwrap() <= inventory.converted_f16_bytes
-    );
+    assert!(declared["dense_f16_component_bytes"].as_u64().unwrap() <= converted_f16_bytes);
+    if let Some(bytes) = fragment_bytes {
+        let packet = &declared["rn_fragment_execution"];
+        assert_eq!(packet["component_bytes"].as_u64(), Some(bytes));
+        assert!(packet["component_count"].as_u64().unwrap() > 0);
+        assert_eq!(packet["mapping_sha256"].as_str().unwrap().len(), 64);
+        let converted = declared["source_quant_tensor_count"].as_u64().unwrap();
+        let retained = declared["retained_quantized_source_tensor_count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            converted + retained,
+            denominator.quant_tensor_count() as u64,
+            "two representations cannot double the original denominator"
+        );
+    } else {
+        assert!(declared.get("rn_fragment_execution").is_none());
+    }
     assert_eq!(witness.fallback_counts().silent(), 0);
     assert_eq!(witness.fallback_counts().dense(), 0);
     assert!(witness.binding().execution_contract_fingerprint().is_some());

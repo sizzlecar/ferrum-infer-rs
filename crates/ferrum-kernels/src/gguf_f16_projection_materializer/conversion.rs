@@ -19,7 +19,7 @@ pub(super) fn supported_format(
 
 /// A single bounded F32 block is temporary; no second whole F32 matrix is
 /// allocated. `half` implements IEEE RN-even, including ties/subnormals.
-pub(super) fn convert(format: GgufBlockFormat, source: &[u8]) -> Result<Vec<u8>, VNextError> {
+pub(crate) fn convert(format: GgufBlockFormat, source: &[u8]) -> Result<Vec<u8>, VNextError> {
     if source.is_empty() || !source.len().is_multiple_of(format.block_bytes()) {
         return Err(invalid(
             "GGUF RN-F16 source must contain complete nonempty blocks",
@@ -38,7 +38,7 @@ pub(super) fn convert(format: GgufBlockFormat, source: &[u8]) -> Result<Vec<u8>,
     append_converted(format, source, &mut output)?;
     Ok(output)
 }
-fn append_converted(
+pub(crate) fn append_converted(
     format: GgufBlockFormat,
     source: &[u8],
     output: &mut Vec<u8>,
@@ -64,7 +64,7 @@ pub(super) fn round_finite(value: f32) -> Result<u16, VNextError> {
     Ok(half.to_bits())
 }
 
-pub(super) fn logical_source_shape(source: &WeightComponentSpec) -> Result<Vec<u64>, VNextError> {
+pub(crate) fn logical_source_shape(source: &WeightComponentSpec) -> Result<Vec<u64>, VNextError> {
     if !(2..=3).contains(&source.dimensions.len()) || source.dimensions.iter().any(|n| *n == 0) {
         return Err(invalid(
             "GGUF RN-F16 source must be a 2D or stacked 3D projection component",
@@ -95,7 +95,7 @@ pub(super) fn logical_source_shape(source: &WeightComponentSpec) -> Result<Vec<u
     source.physical_bytes()?;
     Ok(dimensions)
 }
-pub(super) fn derived_component(
+pub(crate) fn derived_component(
     sources: &[&WeightComponentSpec],
     dimensions: &[u64],
 ) -> Result<WeightComponentSpec, VNextError> {
@@ -154,7 +154,7 @@ pub(super) fn derived_component(
     component.physical_bytes()?;
     Ok(component)
 }
-pub(super) fn materialize_group<'source>(
+pub(crate) fn materialize_group<'source>(
     source: &'source dyn WeightComponentSource,
     source_components: &[&WeightComponentSpec],
     execution_components: &[&WeightComponentSpec],

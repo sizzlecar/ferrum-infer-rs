@@ -26,7 +26,7 @@ fn gguf_f16_projections_change_all_three_projection_operations_and_no_other_boun
         .define(&serde_json::to_value(&config).unwrap())
         .unwrap();
     let catalog = definition.numerical_profiles();
-    assert_eq!(catalog.version(), ContractVersion::new(1, 7));
+    assert_eq!(catalog.version(), ContractVersion::new(1, 8));
     assert!(!catalog.auto_preference().contains(&selected_id()));
     let candidates = catalog
         .candidates(&NumericalExecutionPolicy::Auto, KvStorageFormat::F16)
@@ -214,3 +214,6 @@ fn gguf_f16_projection_source_whitelist_applies_only_to_declared_projection_leav
 
 #[path = "gguf_f16_projection_tests/authority.rs"]
 mod authority;
+
+#[path = "gguf_f16_projection_tests/rn_fragment.rs"]
+mod rn_fragment;

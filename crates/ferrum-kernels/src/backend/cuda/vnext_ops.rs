@@ -179,6 +179,10 @@ pub fn cuda_vnext_runtime_config(
         crate::ptx::LINEAR_ATTENTION.as_bytes(),
         crate::ptx::GATED_DELTA_RULE.as_bytes(),
         crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/plan.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/weights.rs"),
+        include_bytes!("vnext_ops/transformer/rn_fragment_swiglu/execution.rs"),
         crate::ptx::VNEXT_GGUF.as_bytes(),
         crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
     ];
@@ -238,6 +242,10 @@ pub fn cuda_vnext_runtime_config(
     })
 }
 
+pub(crate) fn rn_fragment_mma_compiled() -> bool {
+    transformer::compiled_mma_target(crate::ptx::VNEXT_GGUF)
+}
+
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     let capabilities = [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -252,6 +260,8 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_F16_WEIGHTS_CAPABILITY_ID,
+        ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID,
+        crate::gguf_rn_fragment_materializer::GGUF_RN_FRAGMENT_CAPABILITY_ID,
         ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
         ferrum_interfaces::vnext::CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_CAPABILITY_ID,
         crate::gguf_f16_projection_materializer::GGUF_F16_PROJECTION_CAPABILITY_ID,
@@ -314,12 +324,33 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         )?);
         capabilities
     };
+    let mut capabilities = capabilities;
+    if !rn_fragment_mma_compiled() {
+        capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+    }
     Ok(capabilities)
 }
 
 pub fn cuda_weight_materializer_selection(
     family: &PreparedModelFamily,
 ) -> Result<WeightMaterializerSelection, VNextError> {
+    if crate::gguf_rn_fragment_materializer::requests_gguf_rn_fragment_materialization(family) {
+        let selection =
+            crate::gguf_rn_fragment_materializer::gguf_rn_fragment_materializer_selection(family)?;
+        let inventory = crate::gguf_rn_fragment_materializer::gguf_rn_fragment_inventory(family)?;
+        tracing::info!(
+            source_schema_fingerprint = %inventory.source_schema_fingerprint,
+            execution_schema_fingerprint = %inventory.execution_schema_fingerprint,
+            source_consumed_bytes = inventory.source_consumed_bytes,
+            converted_f16_bytes = inventory.converted_f16_bytes,
+            packed_fragment_bytes = inventory.packed_fragment_bytes,
+            retained_consumed_bytes = inventory.retained_consumed_bytes,
+            unique_consumed_execution_bytes = inventory.unique_consumed_execution_bytes,
+            includes_placement_alignment = inventory.includes_placement_alignment,
+            "Explicit GGUF RN-F16 dense and fragment inventory (not Peak VRAM)"
+        );
+        return Ok(selection);
+    }
     if crate::gguf_f16_projection_materializer::requests_gguf_f16_projection_materialization(family)
     {
         let selection =
@@ -601,6 +632,18 @@ pub fn cuda_vnext_operation_registry(
         providers
     };
     let mut providers = providers;
+    if runtime.descriptor().capabilities.iter().any(|c| {
+        c.as_str()
+            == ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+    }) {
+        contracts.push(Box::new(
+            ferrum_interfaces::vnext::dense_swiglu_gguf_rn_f16_fragment_m1to8_contract()
+                .map_err(contract_error)?,
+        ));
+        providers.push(Box::new(transformer::CudaRnFragmentSwiGluProvider::new(
+            runtime,
+        )?));
+    }
     if runtime
         .descriptor()
         .capabilities
@@ -720,6 +763,8 @@ impl CudaVNextComposition {
         let runtime = Arc::new(runtime);
         let registry = cuda_vnext_operation_registry(&runtime)?;
         let mut weight_materializers = vec![
+            crate::gguf_rn_fragment_materializer::gguf_rn_fragment_materializer()
+                .map_err(contract_error)?,
             crate::gguf_f16_projection_materializer::gguf_f16_projection_materializer()
                 .map_err(contract_error)?,
         ];

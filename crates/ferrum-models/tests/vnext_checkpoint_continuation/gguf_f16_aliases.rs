@@ -14,6 +14,10 @@ mod ffn_family;
 mod attribution;
 
 const PROFILE: &str = "fixture.explicit.gguf-rn-f16-projections";
+const FRAGMENT_PROFILE: &str = "fixture.explicit.gguf-rn-f16-projections.ffn-fragment-m1to8";
+
+#[path = "gguf_f16_aliases/rn_fragment.rs"]
+mod rn_fragment;
 
 fn replacement(operation: &OperationId) -> Option<OperationId> {
     Some(id(match operation.as_str() {
@@ -69,7 +73,14 @@ impl<T: ModelFamilyProvider<Config = AttentionKind>> ModelFamilyProvider for Rou
     ) -> Result<FamilyNumericalProfiles, VNextError> {
         let original = self.0.numerical_profiles(config)?;
         let mut profile = original.profiles()[0].clone();
-        profile.id = id(PROFILE);
+        let profile_id = if profile.operations.iter().any(|operation| {
+            operation.operation_id.as_str() == DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID
+        }) {
+            FRAGMENT_PROFILE
+        } else {
+            PROFILE
+        };
+        profile.id = id(profile_id);
         for operation in &mut profile.operations {
             if let Some(rounded) = replacement(&operation.operation_id) {
                 operation.operation_id = rounded;
@@ -82,7 +93,7 @@ impl<T: ModelFamilyProvider<Config = AttentionKind>> ModelFamilyProvider for Rou
             self.family_id(),
             original.version(),
             vec![profile],
-            vec![id(PROFILE)],
+            vec![id(profile_id)],
         )
     }
     fn semantic_program(

@@ -17,15 +17,18 @@ pub(super) fn provider_formats(
     let mixed = WeightFormatId::new(
         crate::gguf_f16_projection_materializer::GGUF_F16_PROJECTION_FORMAT_ID,
     )?;
+    let fragment_mixed =
+        WeightFormatId::new(crate::gguf_rn_fragment_materializer::GGUF_RN_FRAGMENT_FORMAT_ID)?;
     if is_operation(operation) {
         // The global execution schema is mixed: these operands are Dense F16,
         // while unrelated head/embedding operands retain their original ABI.
-        return Ok(BTreeSet::from([mixed]));
+        return Ok(BTreeSet::from([mixed, fragment_mixed]));
     }
     if formats.contains(&WeightFormatId::new("weight-format.gguf.native-block")?) {
         // A container label is not permission to reinterpret physical bytes.
         // Existing retained consumers still validate/decode original layouts.
         formats.insert(mixed);
+        formats.insert(fragment_mixed);
     }
     Ok(formats)
 }

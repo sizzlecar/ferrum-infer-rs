@@ -30,7 +30,7 @@ pub struct GgufF16ProjectionInventoryV1 {
     /// plan. These byte sums are not device allocation or peak-memory evidence.
     pub includes_placement_alignment: bool,
 }
-pub(super) struct Prepared {
+pub(crate) struct Prepared {
     pub schema: WeightSchema,
     pub sources: BTreeMap<WeightId, Vec<WeightId>>,
     pub inventory: GgufF16ProjectionInventoryV1,
@@ -43,6 +43,16 @@ pub(super) fn prepare(family: &PreparedModelFamily) -> Result<Prepared, VNextErr
 pub(super) fn prepare_program(
     original: &WeightSchema,
     program: &ModelProgram,
+) -> Result<Prepared, VNextError> {
+    prepare_program_with_roles(original, program, gguf_f16_projection_role_v1)
+}
+
+/// Reuse the original consumer/source/storage checks. The legacy entrypoint
+/// retains its original resolver, schema IDs and materialization behavior.
+pub(crate) fn prepare_program_with_roles(
+    original: &WeightSchema,
+    program: &ModelProgram,
+    role_for: fn(&OperationId, u32) -> Option<GgufF16ProjectionRoleV1>,
 ) -> Result<Prepared, VNextError> {
     original.validate(program.family_id())?;
     if original.format_id.as_str() != SOURCE_FORMAT {
@@ -60,7 +70,7 @@ pub(super) fn prepare_program(
         for (ordinal, value) in node.inputs.iter().enumerate() {
             let ordinal =
                 u32::try_from(ordinal).map_err(|_| invalid("projection input ordinal overflow"))?;
-            let role = gguf_f16_projection_role_v1(&node.operation_id, ordinal);
+            let role = role_for(&node.operation_id, ordinal);
             let weight = by_value.get(value);
             if role.is_some() && (node.required_version != VERSION || weight.is_none()) {
                 return Err(invalid(

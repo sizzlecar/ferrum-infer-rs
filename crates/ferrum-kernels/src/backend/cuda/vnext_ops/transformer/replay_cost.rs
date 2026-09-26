@@ -17,6 +17,10 @@ enum RecipeKind {
         hidden: u64,
     },
     NativeFfn(native_swiglu::replay_cost::Recipe),
+    RnFragmentFfn {
+        shape: rn_fragment_swiglu::Shape,
+        identity: Option<cublas_api::CublasHandleApiIdentity>,
+    },
     DenseFfn {
         shape: dense_swiglu_api::Shape,
         identity: cublas_api::CublasHandleApiIdentity,
@@ -77,6 +81,19 @@ impl CudaReplayCostRecipe {
         Some(Arc::new(recipe))
     }
 
+    pub(super) fn rn_fragment(
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+        shape: rn_fragment_swiglu::Shape,
+        identity: Option<cublas_api::CublasHandleApiIdentity>,
+    ) -> Option<Arc<Self>> {
+        let recipe = Self {
+            captured_work: invocation.replay_cost_work()?,
+            kind: RecipeKind::RnFragmentFfn { shape, identity },
+        };
+        recipe.project(&recipe.captured_work)?;
+        Some(Arc::new(recipe))
+    }
+
     pub(crate) fn captured_evidence(&self) -> Option<SelectedCommandCostEvidenceV1> {
         self.project(&self.captured_work)
     }
@@ -104,6 +121,9 @@ impl CudaReplayCostRecipe {
                 recipe.project(current.tokens(), current.participant_ranges())
             }
             RecipeKind::DenseFfn { shape, identity } => shape.project(current.tokens(), *identity),
+            RecipeKind::RnFragmentFfn { shape, identity } => {
+                shape.project(current.tokens(), *identity)
+            }
         }
     }
 }

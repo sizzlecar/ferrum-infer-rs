@@ -2,8 +2,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::vnext::{
-    PreparedModelFamily, ResolvedModelPlan, StaticInitializationReceipt, VNextError,
-    WeightComponentRole, WeightEncoding, WeightId, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    PhysicalWeightLayout, PreparedModelFamily, ResolvedModelPlan, StaticInitializationReceipt,
+    VNextError, WeightComponentRole, WeightEncoding, WeightId, IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
 
 use super::foundation::canonical_fingerprint;
@@ -321,7 +321,7 @@ pub struct StaticProviderAttributionWitness {
     provider_attribution: ProviderAttributionCounts,
     fallback_counts: ProviderAttributionFallbackCounts,
     binding: ProviderAttributionBinding,
-    /// Present only in v2: source attribution is not quantized-kernel coverage.
+    /// Present in v2/v3: source attribution is not quantized-kernel coverage.
     #[serde(skip_serializing_if = "Option::is_none")]
     declared_dense_execution: Option<DeclaredDenseAttribution>,
 }
@@ -390,7 +390,21 @@ impl StaticProviderAttributionWitness {
                         execution_component.role(),
                         execution_component.encoding(),
                     );
-                    if !quantized_execution {
+                    let fragment_execution = matches!(weight.physical_layout(),
+                        PhysicalWeightLayout::RnF16DenseAndFragmentV1 { fragment_values, .. }
+                        if &fragment_values.component_id == execution_component.component_id());
+                    if fragment_execution {
+                        declared_dense.record_fragment(
+                            family,
+                            execution_weights,
+                            node,
+                            value,
+                            weight,
+                            execution_component,
+                            &denominator_source_ids,
+                            &denominator.source_component_tensors,
+                        )?;
+                    } else if !quantized_execution {
                         if matches!(
                             execution_component.role(),
                             WeightComponentRole::Values | WeightComponentRole::PackedValues
@@ -414,7 +428,7 @@ impl StaticProviderAttributionWitness {
                         else {
                             unreachable!("filtered denominator source component")
                         };
-                        if quantized_execution {
+                        if quantized_execution && !fragment_execution {
                             declared_dense.record_quantized(tensors);
                         }
                         let source_component =
@@ -576,18 +590,22 @@ impl StaticProviderAttributionWitness {
         };
         let declared_dense_execution = declared_dense.finish(&denominator.quant_tensors)?;
         let converted = declared_dense_execution.is_some();
+        let fragment = declared_dense_execution
+            .as_ref()
+            .is_some_and(DeclaredDenseAttribution::has_fragment);
         Ok(Some(Self {
-            schema: if converted {
-                "ferrum.vnext.provider-attribution.v2"
-            } else {
-                PROVIDER_ATTRIBUTION_WITNESS_SCHEMA
-            },
+            schema: declared_dense_execution.as_ref().map_or(
+                PROVIDER_ATTRIBUTION_WITNESS_SCHEMA,
+                DeclaredDenseAttribution::witness_schema,
+            ),
             attribution_basis: if converted {
                 "quantized_source_tensor_to_declared_execution_storage_and_selected_provider"
             } else {
                 PROVIDER_ATTRIBUTION_STATIC_BASIS
             },
-            fallback_basis: if converted {
+            fallback_basis: if fragment {
+                "explicit_typed_rn_f16_dense_and_fragment_storage_actual_route_requires_wave_evidence"
+            } else if converted {
                 "explicit_typed_dense_f16_conversion_is_not_silent_dense_fallback"
             } else {
                 PROVIDER_ATTRIBUTION_STATIC_FALLBACK_BASIS

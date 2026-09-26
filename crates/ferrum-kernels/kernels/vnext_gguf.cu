@@ -831,3 +831,124 @@ extern "C" __global__ void vnext_gguf_linear_q8_pair_tiled_f16(
     native_linear<half, half, 8>(x, w, y, rows, inputs, outputs,
         stride, offset, format, block_values, block_bytes);
 }
+
+// Explicit RN-F16 fragment operand ABI v1. Selected only by its typed FFN operation.
+
+// Cold N16/K32 cells retain original quant codes plus exact F32 scale metadata.
+// Each warp constructs four MMA A half2 registers; no F16 weight shared tile.
+__device__ __forceinline__ unsigned rn_frag_pair(half lo, half hi) {
+    return unsigned(__half_as_ushort(lo)) | (unsigned(__half_as_ushort(hi)) << 16);
+}
+__device__ __forceinline__ unsigned rn_frag_word(const byte* p) {
+    if ((reinterpret_cast<size_t>(p) & 3) == 0)
+        return *reinterpret_cast<const unsigned*>(p);
+    return unsigned(p[0]) | (unsigned(p[1]) << 8)
+        | (unsigned(p[2]) << 16) | (unsigned(p[3]) << 24);
+}
+__device__ __forceinline__ unsigned rn_frag_step(unsigned format) {
+    return 128 + (format - 12) * 32;
+}
+__device__ __forceinline__ bool rn_frag_valid(
+    unsigned k, unsigned n, unsigned format, unsigned long long bytes, unsigned abi) {
+    if (abi != 0x524e4631u || format < 12 || format > 14 || !k || k % 256 || !n)
+        return false;
+    const unsigned long long expected = ((static_cast<unsigned long long>(n) + 15) / 16)
+        * (k / 32) * (128 + 2 * rn_frag_step(format));
+    return bytes == expected;
+}
+__device__ __forceinline__ unsigned rn_frag_code(
+    unsigned low, const byte* high, unsigned lane, unsigned slot, unsigned format) {
+    unsigned q = (low >> (4 * slot)) & 15;
+    if (format >= 13) q |= ((unsigned(high[lane]) >> slot) & 1) << 4;
+    if (format == 14) q |= ((unsigned(high[32 + lane]) >> slot) & 1) << 5;
+    return q;
+}
+__device__ __forceinline__ half rn_frag_half(float a, float z, unsigned q, unsigned format) {
+    // Exactly the materializer's F32 reconstruction before its RN-even half.
+    const float value = format == 14 ? __fmul_rn(a, float(int(q) - 32))
+        : __fsub_rn(__fmul_rn(a, float(q)), z);
+    return __float2half_rn(value);
+}
+extern "C" __global__ void vnext_rn_fragment_coefficients(
+    const byte* packed, unsigned long long bytes, half* output,
+    unsigned k, unsigned n, unsigned format, unsigned abi) {
+    if (!rn_frag_valid(k, n, format, bytes, abi)) return;
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(n) * k) return;
+    const unsigned column = i / k, kk = i % k, local = column % 16;
+    const unsigned fragment = (kk % 32) / 16, step = rn_frag_step(format);
+    const byte* cell = packed + (size_t(column / 16) * (k / 32) + kk / 32) * (128 + 2 * step);
+    const byte* codes = cell + 128 + fragment * step;
+    const unsigned lane = (local % 8) * 4 + (kk % 8) / 2;
+    const unsigned slot = (kk % 16 >= 8 ? 4 : 0) + (local >= 8 ? 2 : 0) + kk % 2;
+    const float a = __uint_as_float(rn_frag_word(cell + (format == 14 ? fragment * 64 : 0) + local * 4));
+    const float z = format == 14 ? 0.0f : __uint_as_float(rn_frag_word(cell + 64 + local * 4));
+    output[i] = rn_frag_half(a, z, rn_frag_code(rn_frag_word(codes + lane * 4), codes + 128, lane, slot, format), format);
+}
+extern "C" __global__ void vnext_rn_fragment_mma(
+    const half* x, const byte* packed, unsigned long long bytes, half* y,
+    unsigned rows, unsigned k, unsigned n, unsigned stride, unsigned offset,
+    unsigned format, unsigned abi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
+        || !rows || offset > stride || n > stride - offset
+        || !rn_frag_valid(k, n, format, bytes, abi)) return;
+    __shared__ float partial[8][128]; // Only F32 final partials: exactly 4096 B.
+    const unsigned lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const unsigned g = lane / 4, t = lane % 4;
+    const unsigned first_col = blockIdx.x * 16, first_row = blockIdx.y * 8;
+    if (blockIdx.x >= (static_cast<unsigned long long>(n) + 15) / 16
+        || blockIdx.y >= (static_cast<unsigned long long>(rows) + 7) / 8) return;
+    const unsigned step = rn_frag_step(format), cell_bytes = 128 + 2 * step;
+    float c[4] = {};
+    // K32 stripes are disjoint. No atomics/global scratch/fixup; the final
+    // eight-warp F32 sum changes reduction order relative to vendor GEMM.
+    for (unsigned group = warp; group < k / 32; group += 8) {
+        const byte* cell = packed + (size_t(blockIdx.x) * (k / 32) + group) * cell_bytes;
+        #pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            const byte* codes = cell + 128 + h * step;
+            const unsigned low = rn_frag_word(codes + lane * 4);
+            const unsigned scale_offset = format == 14 ? h * 64 : 0;
+            const float al = __uint_as_float(rn_frag_word(cell + scale_offset + g * 4));
+            const float ah = __uint_as_float(rn_frag_word(cell + scale_offset + (g + 8) * 4));
+            const float zl = format == 14 ? 0.0f : __uint_as_float(rn_frag_word(cell + 64 + g * 4));
+            const float zh = format == 14 ? 0.0f : __uint_as_float(rn_frag_word(cell + 64 + (g + 8) * 4));
+            unsigned a[4];
+            #pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const float scale = j % 2 ? ah : al, zero = j % 2 ? zh : zl;
+                const half lo = rn_frag_half(scale, zero, rn_frag_code(low, codes + 128, lane, 2 * j, format), format);
+                const half hi = rn_frag_half(scale, zero, rn_frag_code(low, codes + 128, lane, 2 * j + 1, format), format);
+                a[j] = rn_frag_pair(lo, hi);
+            }
+            unsigned b0 = 0, b1 = 0;
+            if (first_row + g < rows) {
+                const size_t base = size_t(first_row + g) * k + group * 32 + h * 16 + 2 * t;
+                b0 = rn_frag_pair(x[base], x[base + 1]);
+                b1 = rn_frag_pair(x[base + 8], x[base + 9]);
+            }
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        }
+    }
+    #pragma unroll
+    for (unsigned j = 0; j < 4; ++j) partial[warp][lane * 4 + j] = c[j];
+    __syncthreads();
+    if (warp == 0) {
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            float sum = partial[0][lane * 4 + j];
+            #pragma unroll
+            for (unsigned w = 1; w < 8; ++w) sum = __fadd_rn(sum, partial[w][lane * 4 + j]);
+            const unsigned row = first_row + 2 * t + j % 2;
+            const unsigned column = first_col + g + (j / 2) * 8;
+            if (row < rows && column < n) y[size_t(row) * stride + offset + column] = __float2half_rn(sum);
+        }
+    }
+// A stale/misbound module must never turn a successful launch into no output.
+#else
+    asm volatile("trap;");
+#endif
+}

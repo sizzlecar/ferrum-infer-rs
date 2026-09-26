@@ -2193,11 +2193,15 @@ impl CudaDeviceRuntime {
         }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
+        if !super::vnext_ops::rn_fragment_mma_compiled() {
+            config.capabilities.retain(|capability| capability.as_str() != ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID);
+        }
         // The installed bundle can contain SM80 MMA exports even on an older
         // device. Its runtime descriptor must advertise only executable ops.
         let requires_sm80 = |capability: &CapabilityId| {
             matches!(capability.as_str(),
-                ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
+                ferrum_interfaces::vnext::DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_CAPABILITY_ID
+                | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
                 | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID
                 | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID
                 | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID

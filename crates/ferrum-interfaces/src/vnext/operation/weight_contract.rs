@@ -10,9 +10,13 @@ use super::super::{
 use super::ElementType;
 
 mod hadamard;
+mod rn_f16_fragment;
 pub(crate) use hadamard::same_shared_transform_sign_component;
 pub use hadamard::{
     GroupedFeatureTranspose, HadamardApplication, HadamardSigns, HadamardTransformSpec,
+};
+pub use rn_f16_fragment::{
+    RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1, RN_F16_FRAGMENT_ABI_V1,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +359,13 @@ pub enum PhysicalWeightLayout {
         block_axis: u32,
         block_padding: PhysicalWeightPadding,
     },
+    /// Two declared resident representations of one RN-F16 projection. The
+    /// packet uses its own N16/K32 ABI; neither leaf may alias the other.
+    RnF16DenseAndFragmentV1 {
+        dense_values: PhysicalWeightComponentBinding,
+        fragment_values: PhysicalWeightComponentBinding,
+        source_format: RnF16FragmentSourceFormatV1,
+    },
     /// Stored values use a declared activation basis. Place this wrapper on
     /// individual composite projections when only some consume that basis.
     /// Transforming an already-transformed descendant is not supported.
@@ -417,7 +428,8 @@ impl PhysicalWeightLayout {
             | Self::Stored { .. }
             | Self::Quantized { .. }
             | Self::QuantizedBlockGrid { .. }
-            | Self::BlockQuantized { .. } => {}
+            | Self::BlockQuantized { .. }
+            | Self::RnF16DenseAndFragmentV1 { .. } => {}
         }
     }
 }
@@ -683,7 +695,8 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
                     + usize::from(permutation.is_some())
                     + usize::from(codebook.is_some())
             }
-            PhysicalWeightLayout::QuantizedBlockGrid { .. } => 2,
+            PhysicalWeightLayout::QuantizedBlockGrid { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. } => 2,
             PhysicalWeightLayout::BlockQuantized { .. } => 1,
             PhysicalWeightLayout::Hadamard { transform, .. } => {
                 usize::from(matches!(transform.signs, HadamardSigns::Explicit(_)))
@@ -723,7 +736,8 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
             | PhysicalWeightLayout::QuantizedBlockGrid { .. }
-            | PhysicalWeightLayout::BlockQuantized { .. } => {}
+            | PhysicalWeightLayout::BlockQuantized { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. } => {}
         }
     }
     Ok(())
@@ -780,6 +794,14 @@ pub(crate) fn physical_component_ids(
                 insert_binding(scales);
             }
             PhysicalWeightLayout::BlockQuantized { blocks, .. } => insert_binding(blocks),
+            PhysicalWeightLayout::RnF16DenseAndFragmentV1 {
+                dense_values,
+                fragment_values,
+                ..
+            } => {
+                insert_binding(dense_values);
+                insert_binding(fragment_values);
+            }
             PhysicalWeightLayout::Hadamard { values, transform } => {
                 if let HadamardSigns::Explicit(signs) = &transform.signs {
                     insert_binding(signs);

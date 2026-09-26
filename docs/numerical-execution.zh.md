@@ -83,6 +83,44 @@ GDN 输入投影的合格叶子共用一次打包；输出投影复用规划空�
 已有的同形状 eager/replay 能力语义不因此扩展。小规模算子与状态延续 oracle
 不构成模型质量或服务性能结论，仍需按选定 profile 验证实际模型输出与负载。
 
+## 显式 RN-F16 fragment FFN
+
+`qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8` 是独立的显式
+profile，不进入 `Auto`。它基于 `qwen3_5.f32-master.gguf-f16-projections`：
+合格投影权重由原 GGUF 解码后按 round-to-nearest 舍入为 FP16（RN-F16），
+主干与残差保持 FP32。新 profile 为 FFN 增加 fragment MMA 路径；attention、
+embedding、输出层、KV 和 recurrent state 沿用该 RN-F16 profile 的合同。
+
+它要求 CUDA SM80 及以上设备，且当前构建实际嵌入的 PTX 目标支持 SM80 及以上
+的 MMA 实现；只有设备型号满足条件不足以启用。模型必须是原生 GGUF、非 MoE、
+无 Hadamard 旋转，采用 negative-rate recurrent ABI 和 FP16 KV。每一层 FFN 的
+gate/up/down 都必须是具有真实 block metadata 的 Q4_K、Q5_K 或 Q6_K，矩阵 K
+须为 256 的倍数；同一层 gate/up 的格式和形状必须相同，down 可独立使用上述
+任一格式。未满足格式、设备实现或容量合同的显式选择会被拒绝。
+
+`run` 与 `serve` 通过相同的数值策略和物化工厂选择此 profile，例如：
+
+```bash
+ferrum run qwen3.5:9b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8
+ferrum serve qwen3.5:9b-q4_k_m --backend cuda --numerical-profile qwen3_5.f32-master.gguf-f16-projections.ffn-rn-fragment-m1to8
+```
+
+FFN 按一次完整物理执行的 token 行数 M 选择路径：M=1..8 使用 fragment MMA，
+M>8 使用既有 dense RN-F16 GEMM。这个边界也适用于小段 prefill；批内某个请求
+或子段的行数不单独决定路径。gate/up 输出、SiLU 乘积和 down 输出保留 FP16
+舍入点，累加使用 FP32；不同归约实现仍需独立数值验证。
+
+冷启动物化从同一组有序 source 各读取一次，同时生成 dense RN-F16 权重和
+fragment packet。Gate/up 合并后按完整 N 打包与尾部补齐。两份执行表示都计入
+资源预算，另需计入对齐、KV 和工作区；较小的 packet 不代表省去 dense 权重，
+GGUF 文件大小也不能用来推断所需显存。具体容量由完整资源计划检查。
+
+此 profile 保持 `Approximate` 资格。物化时的逐系数 RN-F16 校验和算子正确性
+不能代替实际模型的 teacher 数值验收；即使已有其他 RN 或 Q8 profile 的资格，
+也需要对此完整 profile 使用独立 teacher 对照。真实模型质量与服务性能目前
+仍待测量，不能据算子筛查结果推断输出 TPS、TTFT、TPOT 或 ITL 改善。性能评估
+须在同模型、同硬件和固定服务容量下验证完整负载及预声明 SLO。
+
 ## 来源、计划和缓存
 
 准备阶段先解析 typed 配置、源 schema、模板与 profile 声明，再用选定 profile

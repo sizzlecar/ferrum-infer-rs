@@ -226,3 +226,6 @@ fn gguf_f16_transition_still_fails_original_prefill_decode_kl_nll_budgets() {
 
 #[path = "hybrid.rs"]
 mod hybrid;
+
+#[path = "rn_fragment.rs"]
+mod rn_fragment;

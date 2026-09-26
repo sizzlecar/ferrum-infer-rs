@@ -136,6 +136,7 @@ pub use weight_contract::{
     HadamardApplication, HadamardSigns, HadamardTransformSpec, PhysicalStorageLayout,
     PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
     QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedWeightBinding,
-    ResolvedWeightComponentLayout, WeightComponentRole, WeightEncoding,
-    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
+    ResolvedWeightComponentLayout, RnF16FragmentPlanV1, RnF16FragmentSourceFormatV1,
+    WeightComponentRole, WeightEncoding, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_NODES, RN_F16_FRAGMENT_ABI_V1,
 };

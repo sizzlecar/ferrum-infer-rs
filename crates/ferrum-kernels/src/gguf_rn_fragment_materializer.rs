@@ -6,33 +6,30 @@ use ferrum_interfaces::vnext::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) mod conversion;
-pub(crate) mod plan;
-pub(crate) mod quality;
+mod conversion;
+mod plan;
+mod quality;
 #[cfg(test)]
 mod tests;
-pub use plan::{
-    GgufF16ProjectionConsumerV1, GgufF16ProjectionInventoryV1, GgufF16ProjectionWeightInventoryV1,
-};
+pub use plan::GgufRnFragmentInventoryV1;
 
-pub const GGUF_F16_PROJECTION_MATERIALIZER_ID: &str =
-    "weight-materializer.cuda.gguf-rn-f16-projections";
-pub const GGUF_F16_PROJECTION_FORMAT_ID: &str =
-    "weight-format.execution.cuda.gguf-rn-f16-projections-mixed";
-pub const GGUF_F16_PROJECTION_LAYOUT_ID: &str =
-    "weight-layout.execution.cuda.gguf-rn-f16-projections-mixed";
-pub const GGUF_F16_PROJECTION_CAPABILITY_ID: &str =
-    "capability.weight-materializer.cuda.gguf-rn-f16-projections";
-const SOURCE_FORMAT: &str = "weight-format.gguf.native-block";
+pub const GGUF_RN_FRAGMENT_MATERIALIZER_ID: &str =
+    "weight-materializer.cuda.gguf-rn-f16-projections-fragment";
+pub const GGUF_RN_FRAGMENT_FORMAT_ID: &str =
+    "weight-format.execution.cuda.gguf-rn-f16-projections-fragment-mixed";
+pub const GGUF_RN_FRAGMENT_LAYOUT_ID: &str =
+    "weight-layout.execution.cuda.gguf-rn-f16-projections-fragment-mixed";
+pub const GGUF_RN_FRAGMENT_CAPABILITY_ID: &str =
+    "capability.weight-materializer.cuda.gguf-rn-f16-projections-fragment";
 const VERSION: ContractVersion = ContractVersion::new(1, 0);
 
-pub fn gguf_f16_projection_materializer() -> Result<Box<dyn WeightMaterializer>, VNextError> {
-    Ok(Box::new(GgufF16ProjectionMaterializer::new()?))
+pub fn gguf_rn_fragment_materializer() -> Result<Box<dyn WeightMaterializer>, VNextError> {
+    Ok(Box::new(GgufRnFragmentMaterializer::new()?))
 }
 
 /// An explicit operation contract, not a family-name test. The full plan checks
 /// every use, the source schema and all physical leaves before selection.
-pub fn requests_gguf_f16_projection_materialization(family: &PreparedModelFamily) -> bool {
+pub fn requests_gguf_rn_fragment_materialization(family: &PreparedModelFamily) -> bool {
     family
         .program()
         .blocks()
@@ -42,16 +39,16 @@ pub fn requests_gguf_f16_projection_materialization(family: &PreparedModelFamily
             node.inputs.iter().enumerate().any(|(ordinal, _)| {
                 u32::try_from(ordinal)
                     .ok()
-                    .and_then(|ordinal| gguf_f16_projection_role_v1(&node.operation_id, ordinal))
+                    .and_then(|ordinal| gguf_rn_f16_fragment_role_v1(&node.operation_id, ordinal))
                     .is_some()
             })
         })
 }
 
-pub fn gguf_f16_projection_materializer_selection(
+pub fn gguf_rn_fragment_materializer_selection(
     family: &PreparedModelFamily,
 ) -> Result<WeightMaterializerSelection, VNextError> {
-    let materializer = GgufF16ProjectionMaterializer::new()?;
+    let materializer = GgufRnFragmentMaterializer::new()?;
     let prepared = plan::prepare(family)?;
     let artifact = quality::artifact(
         materializer.descriptor(),
@@ -64,21 +61,26 @@ pub fn gguf_f16_projection_materializer_selection(
     )
 }
 
-pub fn gguf_f16_projection_inventory(
+pub fn gguf_rn_fragment_inventory(
     family: &PreparedModelFamily,
-) -> Result<GgufF16ProjectionInventoryV1, VNextError> {
+) -> Result<GgufRnFragmentInventoryV1, VNextError> {
     Ok(plan::prepare(family)?.inventory)
 }
 
-struct GgufF16ProjectionMaterializer {
+struct GgufRnFragmentMaterializer {
     descriptor: WeightMaterializerDescriptor,
 }
-impl GgufF16ProjectionMaterializer {
+impl GgufRnFragmentMaterializer {
     fn new() -> Result<Self, VNextError> {
         let descriptor = WeightMaterializerDescriptor::new(
-            WeightMaterializerId::new(GGUF_F16_PROJECTION_MATERIALIZER_ID)?,
+            WeightMaterializerId::new(GGUF_RN_FRAGMENT_MATERIALIZER_ID)?,
             VERSION,
             fingerprint(&[
+                include_bytes!("gguf_rn_fragment_materializer.rs"),
+                include_bytes!("gguf_rn_fragment_materializer/plan.rs"),
+                include_bytes!("gguf_rn_fragment_materializer/conversion.rs"),
+                include_bytes!("gguf_rn_fragment_materializer/quality.rs"),
+                include_bytes!("gguf_rn_fragment.rs"),
                 include_bytes!("gguf_f16_projection_materializer.rs"),
                 include_bytes!("gguf_f16_projection_materializer/plan.rs"),
                 include_bytes!("gguf_f16_projection_materializer/conversion.rs"),
@@ -87,13 +89,13 @@ impl GgufF16ProjectionMaterializer {
                 include_bytes!("gguf_blocks/block_decode.rs"),
             ]),
             WeightMaterializationFidelity::Approximate,
-            BTreeSet::from([CapabilityId::new(GGUF_F16_PROJECTION_CAPABILITY_ID)?]),
+            BTreeSet::from([CapabilityId::new(GGUF_RN_FRAGMENT_CAPABILITY_ID)?]),
         )?
         .with_approximate_quality_contract(quality::contract()?)?;
         Ok(Self { descriptor })
     }
 }
-impl WeightMaterializer for GgufF16ProjectionMaterializer {
+impl WeightMaterializer for GgufRnFragmentMaterializer {
     fn descriptor(&self) -> &WeightMaterializerDescriptor {
         &self.descriptor
     }
@@ -166,12 +168,4 @@ fn invalid(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn convert_rn_f16_diagnostic(
-    format: crate::gguf_blocks::GgufBlockFormat,
-    source: &[u8],
-) -> Result<Vec<u8>, VNextError> {
-    conversion::convert(format, source)
 }

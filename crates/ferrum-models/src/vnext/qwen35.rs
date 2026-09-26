@@ -27,8 +27,9 @@ use ferrum_interfaces::vnext::{
     CAUSAL_PAGED_ATTENTION_F32_MASTER_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_INT8_KV_OPERATION_ID,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID,
-    DENSE_SWIGLU_OPERATION_ID, DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID,
-    DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID, DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID,
+    DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID, DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID,
+    DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID,
     DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -96,8 +97,10 @@ pub use numerical::{
     F16_INT8_KV_NUMERICAL_PROFILE_ID, F16_NUMERICAL_PROFILE_ID,
     F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID,
     F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8_NUMERICAL_PROFILE_ID,
-    F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID, F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID,
-    F32_MASTER_NUMERICAL_PROFILE_ID, F32_MASTER_Q8_GATE_UP_STREAM_MMQ_NUMERICAL_PROFILE_ID,
+    F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID,
+    F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID,
+    F32_MASTER_INT8_KV_NUMERICAL_PROFILE_ID, F32_MASTER_NUMERICAL_PROFILE_ID,
+    F32_MASTER_Q8_GATE_UP_STREAM_MMQ_NUMERICAL_PROFILE_ID,
     F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID,
     F32_MASTER_Q8_SWIGLU_INPUT_SUM_NUMERICAL_PROFILE_ID, F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID,
 };
@@ -356,6 +359,15 @@ impl Qwen35OperationProfile {
         ..Self::F32_MASTER
     };
 
+    const F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8: Self = Self {
+        dense_feed_forward: OperationSelection::new(
+            DENSE_SWIGLU_GGUF_RN_F16_FRAGMENT_M1_TO8_OPERATION_ID,
+            1,
+            0,
+        ),
+        ..Self::F32_MASTER_GGUF_F16_PROJECTIONS
+    };
+
     const F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8: Self = Self {
         dense_feed_forward: OperationSelection::new(
             DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID,
@@ -429,6 +441,9 @@ impl Qwen35OperationProfile {
             F32_MASTER_NUMERICAL_PROFILE_ID => Ok(Self::F32_MASTER),
             F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_GGUF_F16_PROJECTIONS)
+            }
+            F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID => {
+                Ok(Self::F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8)
             }
             F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8_NUMERICAL_PROFILE_ID => {
                 Ok(Self::F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8)
@@ -975,6 +990,23 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 return Err(invalid_config(
                     "numerical_profile",
                     "hybrid profile differs from the declared family contract",
+                ));
+            }
+        }
+        if profile.id.as_str() == F32_MASTER_GGUF_F16_RN_FRAGMENT_M1_TO8_NUMERICAL_PROFILE_ID {
+            if !numerical::gguf_rn_f16_fragment_eligible(config, &text)
+                || profile
+                    .kv_storage
+                    .iter()
+                    .any(|state| state.format() != KvStorageFormat::F16)
+            {
+                return Err(invalid_config("numerical_profile", "RN-F16 fragment FFN requires native non-Hadamard dense GGUF, same-format Q4K/Q5K/Q6K gate/up, eligible down, negative-rate recurrent ABI and F16 KV"));
+            }
+            let catalog = numerical::profiles(&self.family_id, config)?;
+            if catalog.resolve(&profile.id)? != profile {
+                return Err(invalid_config(
+                    "numerical_profile",
+                    "RN-F16 fragment profile differs from the declared family contract",
                 ));
             }
         }
@@ -7496,6 +7528,7 @@ mod tests {
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }
@@ -7534,6 +7567,7 @@ mod tests {
             }
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::RnF16DenseAndFragmentV1 { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }

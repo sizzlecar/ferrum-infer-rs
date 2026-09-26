@@ -36,6 +36,8 @@ pub mod backend;
 pub use backend::probe_device_memory;
 pub mod gguf_blocks;
 pub mod gguf_f16_projection_materializer;
+pub mod gguf_rn_fragment;
+pub mod gguf_rn_fragment_materializer;
 #[cfg(test)]
 pub(crate) mod hadamard;
 pub mod native_ops;

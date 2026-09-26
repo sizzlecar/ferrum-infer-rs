@@ -65,6 +65,8 @@ use moe_weights::{
 
 pub(super) mod cublas_api;
 mod dense_swiglu_api;
+mod rn_fragment_swiglu;
+pub(super) use rn_fragment_swiglu::{compiled_mma_target, CudaRnFragmentSwiGluProvider};
 
 mod attention;
 mod causal_attention;
