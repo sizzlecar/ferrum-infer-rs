@@ -13,7 +13,10 @@ mod output_resource;
 mod stream_mmq;
 
 fn migrated_pair(ffn_nodes: usize) -> Pair {
-    let mut pair = Pair::new();
+    migrate_pair(Pair::new(), ffn_nodes)
+}
+
+fn migrate_pair(mut pair: Pair, ffn_nodes: usize) -> Pair {
     for (arm, profile, candidate) in [
         (&mut pair.reference, "qwen3_5.f32-master", false),
         (&mut pair.candidate, "qwen3_5.f32-master.q8-swiglu", true),
@@ -478,3 +481,6 @@ fn numerical_transition_retains_quality_budgets_for_prefill_decode_and_full_voca
         assert!(checks.iter().any(|check| check["passed"] == false));
     }
 }
+
+#[path = "numerical_transition/gguf_f16.rs"]
+mod gguf_f16;

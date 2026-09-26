@@ -50,11 +50,13 @@ pub mod weight_format;
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
-    BertModelExecutor, ClipModelExecutor, LlmExecutor, StubModelExecutor, TtsModelExecutor,
-    VNextCompiledModel, VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec,
-    VNextDeterminismInitialState, VNextDeterminismParticipantSpec, VNextDeterminismPhase,
-    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelExecutor,
-    VNextRuntimeComposition, WhisperModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+    vnext_teacher_token_digest, BertModelExecutor, ClipModelExecutor, LlmExecutor,
+    StubModelExecutor, TtsModelExecutor, VNextCompiledModel, VNextDeterminismExecutionMode,
+    VNextDeterminismExecutionSpec, VNextDeterminismInitialState, VNextDeterminismParticipantSpec,
+    VNextDeterminismPhase, VNextDeterminismWorkspacePoison, VNextExecutorConfig,
+    VNextModelExecutor, VNextRuntimeComposition, VNextTeacherCaptureSummary,
+    VNextTeacherEvidenceSink, VNextTeacherExecutionSpec, VNextTeacherMode, VNextTeacherOwner,
+    WhisperModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;

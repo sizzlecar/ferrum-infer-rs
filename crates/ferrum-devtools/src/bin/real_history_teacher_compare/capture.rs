@@ -568,6 +568,10 @@ pub(super) fn compare_identity(
     let a = &reference.manifest;
     let b = &candidate.manifest;
     match shape {
+        ComparisonShape::SerialToSerial => ensure!(
+            a.mode == "serial" && b.mode == "serial",
+            "comparison requires two real serial captures"
+        ),
         ComparisonShape::SerialToBatched => ensure!(
             a.mode == "serial" && b.mode == "batched",
             "comparison requires real serial reference and batched candidate"
@@ -580,7 +584,7 @@ pub(super) fn compare_identity(
     ensure!(
         a.owners.len() == b.owners.len()
             && !b.owners.is_empty()
-            && (shape == ComparisonShape::BatchedToBatched || b.owners.len() > 1),
+            && (shape != ComparisonShape::SerialToBatched || b.owners.len() > 1),
         "comparison must cover the same owners (serial-to-batched requires multiple owners)"
     );
     ensure!(
@@ -683,7 +687,7 @@ pub(super) fn compare_identity(
         "history_receipt_binding":"producer_verified_tokens_plus_unique_monotonically_ordered_physical_completions",
         "history_tokens_independently_reconstructed_from_receipt":false,
         "comparison_shape":shape,
-        "logical_decode_width":{"reference":if shape==ComparisonShape::SerialToBatched {1} else {a.owners.len()},"candidate":b.owners.len()},
+        "logical_decode_width":{"reference":if a.mode=="serial" {1} else {a.owners.len()},"candidate":if b.mode=="serial" {1} else {b.owners.len()}},
         "fixed_product_output_binding":if r.output_binding==c.output_binding {Some(&r.output_binding)} else {None},
         "product_output_bindings":{"reference":r.output_binding,"candidate":c.output_binding},
         "full_vocabulary_raw_conversion_verified":true}),

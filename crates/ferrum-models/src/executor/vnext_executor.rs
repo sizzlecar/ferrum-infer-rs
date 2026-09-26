@@ -81,10 +81,13 @@ mod readback_logits;
 mod resource_planning;
 mod workspace_startup;
 pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
+#[cfg(test)]
+mod frame_capture_tests;
 mod prefix_cache;
 mod request;
 mod reusable_catalog;
 mod state_memory;
+mod teacher;
 mod token_policy_residency;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -92,6 +95,10 @@ pub use determinism::{
     MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 use request::{terminalize_unsubmitted_session, VNextRequestRoot};
+pub use teacher::{
+    vnext_teacher_token_digest, VNextTeacherCaptureSummary, VNextTeacherEvidenceSink,
+    VNextTeacherExecutionSpec, VNextTeacherMode, VNextTeacherOwner,
+};
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(3, 0);
@@ -120,6 +127,39 @@ const fn submission_execution_policy_for_timing(
         | DeviceTimingMode::Replay
         | DeviceTimingMode::Kernel => SubmissionExecutionPolicy::adaptive(),
     }
+}
+
+/// Capture can omit diagnostic work, but must never change the configured
+/// execution path or scratch initialization once a request is running.
+struct VNextWaveInstrumentation {
+    timing_mode: DeviceTimingMode,
+    execution_policy: SubmissionExecutionPolicy,
+    direct_reusable_execution_allowed: bool,
+}
+
+impl VNextWaveInstrumentation {
+    const fn new(configured_mode: DeviceTimingMode, capture: bool) -> Self {
+        Self {
+            timing_mode: if capture {
+                configured_mode
+            } else {
+                DeviceTimingMode::Off
+            },
+            execution_policy: submission_execution_policy_for_timing(configured_mode),
+            direct_reusable_execution_allowed: configured_mode.direct_reusable_execution_allowed(),
+        }
+    }
+}
+
+fn captures_participant_wave<'a>(
+    journals: impl Iterator<Item = Option<&'a Mutex<VNextExecutionJournal>>>,
+) -> bool {
+    // A physical wave cannot be partially instrumented. Retain its complete
+    // participant identity if even one journal needs the wave; each journal
+    // independently decides whether to publish its logical frame events.
+    journals
+        .into_iter()
+        .any(|journal| journal.is_none_or(|journal| journal.lock().captures_device_wave()))
 }
 
 const fn reusable_catalog_lookup_allowed(
@@ -2863,6 +2903,7 @@ enum JournaledSubmission {
     },
     Suppressed {
         slot_id: CompletionSlotId,
+        fingerprint: String,
     },
 }
 
@@ -2910,6 +2951,7 @@ struct VNextExecutionJournal {
     root_span: SpanId,
     pending_submission: Option<JournaledSubmission>,
     first_failure: Option<IdentifiedFailure>,
+    capture_summary_attempted: bool,
 }
 
 impl VNextExecutionJournal {
@@ -2949,6 +2991,7 @@ impl VNextExecutionJournal {
             root_span,
             pending_submission: None,
             first_failure: None,
+            capture_summary_attempted: false,
         };
         let accepted_detail = clock_anchor.map_or(
             ExecutionEventDetail::None,
@@ -2998,6 +3041,41 @@ impl VNextExecutionJournal {
         MonotonicTimestamp {
             nanos_since_run_start: next,
         }
+    }
+
+    fn captures_device_wave(&self) -> bool {
+        match self.capture_policy {
+            ExecutionEventCapturePolicy::FirstFramesPerRequest(_) => {
+                self.capture_policy.captures_frame(self.completed_frames)
+            }
+            _ => true,
+        }
+    }
+
+    fn record_capture_summary(
+        &mut self,
+        request_succeeded: bool,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let ExecutionEventCapturePolicy::FirstFramesPerRequest(limit) = self.capture_policy else {
+            return Ok(());
+        };
+        if self.capture_summary_attempted {
+            return Ok(());
+        }
+        // A failed sink may have accepted a prefix before reporting failure.
+        // Never retry it from Drop or fabricate a successful terminal record.
+        self.capture_summary_attempted = true;
+        self.emitter
+            .record_frame_capture_summary(&ExecutionFrameCaptureSummary {
+                run_id: self.active.run_id().clone(),
+                request_id: self.active.request_id().clone(),
+                limit,
+                completed_frames: self.completed_frames,
+                captured_completed_frames: self.emitter.cursor().completed_frames(),
+                request_succeeded,
+                journal_terminal_observed: self.emitter.cursor().is_terminal(),
+                pending_submission: self.pending_submission.is_some(),
+            })
     }
 
     fn base_parts(
@@ -3165,6 +3243,7 @@ impl VNextExecutionJournal {
         if !self.capture_policy.captures_frame(self.completed_frames) {
             self.pending_submission = Some(JournaledSubmission::Suppressed {
                 slot_id: submission.slot_id(),
+                fingerprint: submission.fingerprint().to_owned(),
             });
             return Ok(());
         }
@@ -3175,7 +3254,9 @@ impl VNextExecutionJournal {
             .filter_map(|(index, participant)| {
                 let identity = participant.identity().parts();
                 (&identity.run_id == self.active.run_id()
-                    && &identity.request_id == self.active.request_id())
+                    && &identity.request_id == self.active.request_id()
+                    && identity.active_sequence_fingerprint.as_deref()
+                        == Some(self.active.fingerprint()))
                 .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -3224,6 +3305,27 @@ impl VNextExecutionJournal {
     ) -> std::result::Result<(), ExecutionEventSinkError> {
         let pending = self
             .pending_submission
+            .as_ref()
+            .ok_or_else(|| Self::error("completion has no journaled physical submission"))?;
+        let matches = match pending {
+            JournaledSubmission::Captured { receipt, .. } => {
+                completion.submission().fingerprint() == receipt.fingerprint()
+            }
+            JournaledSubmission::Suppressed {
+                slot_id,
+                fingerprint,
+            } => {
+                completion.submission().slot_id() == *slot_id
+                    && completion.submission().fingerprint() == fingerprint
+            }
+        };
+        if !matches {
+            return Err(Self::error(
+                "completion differs from the journaled physical submission",
+            ));
+        }
+        let pending = self
+            .pending_submission
             .take()
             .ok_or_else(|| Self::error("completion has no journaled physical submission"))?;
         let JournaledSubmission::Captured {
@@ -3231,22 +3333,12 @@ impl VNextExecutionJournal {
             selected,
         } = pending
         else {
-            let JournaledSubmission::Suppressed { slot_id } = pending else {
+            let JournaledSubmission::Suppressed { .. } = pending else {
                 unreachable!();
             };
-            if completion.submission().slot_id() != slot_id {
-                return Err(Self::error(
-                    "completion differs from the suppressed journal submission",
-                ));
-            }
             self.completed_frames = self.completed_frames.saturating_add(1);
             return Ok(());
         };
-        if completion.submission().fingerprint() != submission.fingerprint() {
-            return Err(Self::error(
-                "completion differs from the journaled physical submission",
-            ));
-        }
         enum CompletionEventEvidence {
             Active,
             Submitted,
@@ -3475,7 +3567,8 @@ impl VNextExecutionJournal {
                 Some(&aborted),
                 &failure,
             ),
-        )
+        )?;
+        self.record_capture_summary(false)
     }
 
     fn complete_sequence(
@@ -3542,7 +3635,18 @@ impl VNextExecutionJournal {
                 &self.active,
                 &completed,
             ),
-        )
+        )?;
+        self.record_capture_summary(true)
+    }
+}
+
+impl Drop for VNextExecutionJournal {
+    fn drop(&mut self) {
+        // Cancellation, an abandoned async operation, and ordinary failures
+        // may never produce a journal terminal. Report the observed prefix as
+        // partial without claiming its outstanding submission has completed.
+        // Device/reaper ownership remains entirely outside this diagnostic.
+        let _ = self.record_capture_summary(false);
     }
 }
 
@@ -4592,6 +4696,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     program_fingerprint: String,
     static_provider_attribution: Option<StaticProviderAttributionWitness>,
     checkpoint_capture: Option<VNextCheckpointCapture>,
+    teacher_capture_active: AtomicBool,
+    teacher_wave_capture: Mutex<Option<teacher::TeacherPendingWave>>,
     static_bytes: u64,
     sequence_state_memory: TypedSequenceStateMemory,
     device_reusable_execution_enabled: bool,
@@ -4610,6 +4716,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
+    bounded_profile_frames: AtomicBool,
     host_dispatch_timing: AtomicBool,
     diagnostic_fault: Option<VNextDiagnosticFault>,
     diagnostic_fault_armed: AtomicBool,
@@ -4963,7 +5070,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &program_fingerprint,
             &runtime.cost_hardware_identity(),
         );
-
         let static_bytes = resolved_plan
             .execution_plan()
             .payload()
@@ -5174,6 +5280,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             program_fingerprint,
             static_provider_attribution,
             checkpoint_capture,
+            teacher_capture_active: AtomicBool::new(false),
+            teacher_wave_capture: Mutex::new(None),
             static_bytes,
             sequence_state_memory,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
@@ -5190,6 +5298,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+            bounded_profile_frames: AtomicBool::new(false),
             host_dispatch_timing: AtomicBool::new(false),
             diagnostic_fault: config.diagnostic_fault,
             diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
@@ -7330,6 +7439,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .to_owned(),
             );
         }
+        let profile_capture_enabled = !self.bounded_profile_frames.load(Ordering::Acquire)
+            || captures_participant_wave(
+                participants
+                    .iter()
+                    .map(|participant| participant.sequence.events.as_ref()),
+            );
         let active_bindings = || {
             participants
                 .iter()
@@ -7547,15 +7662,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 aggregate: &self.metrics.wave_timing,
                 phase: phase_timing,
             };
-            let device_timing_mode = self.device_timing_mode();
-            let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
+            // A shared wave is instrumented if any participant is still in
+            // its requested capture prefix. Unbounded/legacy policies retain
+            // their existing timing behavior, including FirstFramePerRequest.
+            let instrumentation =
+                VNextWaveInstrumentation::new(self.device_timing_mode(), profile_capture_enabled);
+            let device_timing_mode = instrumentation.timing_mode;
+            let execution_policy = instrumentation.execution_policy;
             let mut reusable_catalog_miss = None;
             let catalog_snapshot = self.reusable_execution_catalog.read().clone();
             let catalog = catalog_snapshot.as_deref();
             let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
                 catalog.is_some(),
-                device_timing_mode.direct_reusable_execution_allowed(),
+                instrumentation.direct_reusable_execution_allowed,
                 reusable_direct_attempted,
             ) {
                 None
@@ -7669,12 +7789,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         masks: token_mask_plans,
                     };
                     let outcome = if timing_enabled {
-                        OperationDispatch::encode_and_submit_guarded_wave_with_timing(
+                        OperationDispatch::encode_and_submit_guarded_wave_with_program_and_timing(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
                             active_bindings(),
                             &uploads,
+                            reusable_program,
                             &guard,
                             &timing_sink,
                             wave,
@@ -7682,12 +7803,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             &self.reaper,
                         )
                     } else {
-                        OperationDispatch::encode_and_submit_guarded_wave(
+                        OperationDispatch::encode_and_submit_guarded_wave_with_program(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
                             active_bindings(),
                             &uploads,
+                            reusable_program,
                             &guard,
                             wave,
                             &self.lane,
@@ -7703,7 +7825,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         }
                     }
                 } else if cost_observation.is_some() {
-                    if timing_enabled {
+                    if timing_enabled && profile_capture_enabled {
                         OperationDispatch::encode_and_submit_wave_with_cost_observation(
                             self.providers.providers(),
                             &self.resolved_plan,
@@ -7737,7 +7859,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .map(ProfiledSubmissionHandle::into_parts)
                     }
                 } else if let Some(reusable_program) = reusable_program {
-                    if timing_enabled {
+                    if timing_enabled && profile_capture_enabled {
                         OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_timing(
                             self.providers.providers(),
                             &self.resolved_plan,
@@ -7754,7 +7876,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )
                         .map(ProfiledSubmissionHandle::into_parts)
                     } else {
-                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+                        OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
                             self.providers.providers(),
                             &self.resolved_plan,
                             &identity,
@@ -7762,13 +7884,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             device_timing_mode,
                             &uploads,
                             reusable_program,
+                            execution_policy,
                             wave,
                             &self.lane,
                             &self.reaper,
                         )
                         .map(|completion| (completion, None))
                     }
-                } else if timing_enabled {
+                } else if timing_enabled && profile_capture_enabled {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
                         self.providers.providers(),
                         &self.resolved_plan,
@@ -7784,13 +7907,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                     .map(ProfiledSubmissionHandle::into_parts)
                 } else {
-                    OperationDispatch::encode_and_submit_wave_with_inputs(
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_policy(
                         self.providers.providers(),
                         &self.resolved_plan,
                         &identity,
                         active_bindings(),
                         device_timing_mode,
                         &uploads,
+                        execution_policy,
                         wave,
                         &self.lane,
                         &self.reaper,
@@ -8818,6 +8942,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .greedy_token_readback_waves
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if let Err(error) =
+            self.record_teacher_completion(participants, kind, output_mode, &receipt)
+        {
+            drop(receipt);
+            return Err(self.abort_step(step, error.to_string()).await);
         }
         drop(receipt);
         match step.try_retire_normal() {
@@ -10231,6 +10361,11 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn calibration_invalidate_token_policy_residency(
         &self,
     ) -> ferrum_interfaces::model_executor::TokenPolicyResidencyInvalidation {
+        if self.teacher_capture_active.load(Ordering::Acquire) {
+            return ferrum_interfaces::model_executor::TokenPolicyResidencyInvalidation::Unavailable {
+                reason: ferrum_interfaces::model_executor::TokenPolicyResidencyUnavailable::ExecutorStateBusy,
+            };
+        }
         token_policy_residency::invalidate(
             &self.sequences,
             &self.completion_worker,
@@ -10242,7 +10377,11 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn slo_execution_capability(&self) -> ferrum_interfaces::model_executor::ExecutorSloCapability {
         use ferrum_interfaces::model_executor::ExecutorSloCapability;
         if self.supports_slo_execution() {
-            ExecutorSloCapability::GuardedEagerWaves
+            if self.on_demand_reusable_execution_enabled() {
+                ExecutorSloCapability::GuardedOnDemandWaves
+            } else {
+                ExecutorSloCapability::GuardedEagerWaves
+            }
         } else {
             ExecutorSloCapability::Unavailable
         }
@@ -10689,6 +10828,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        self.bounded_profile_frames.store(
+            matches!(
+                sink.capture_policy(),
+                ExecutionEventCapturePolicy::FirstFramesPerRequest(_)
+            ),
+            Ordering::Release,
+        );
         self.device_timing_mode
             .store(sink.device_timing_mode() as u8, Ordering::Release);
         self.host_dispatch_timing

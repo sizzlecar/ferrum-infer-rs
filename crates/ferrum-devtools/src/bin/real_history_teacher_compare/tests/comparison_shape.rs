@@ -73,7 +73,62 @@ fn comparison_shape_cli_is_typed_and_default_is_unchanged() {
     .unwrap();
     assert_eq!(args.comparison_shape, ComparisonShape::BatchedToBatched);
     assert!(args.require_bitwise_logits);
+    let args = Args::try_parse_from(
+        base.into_iter()
+            .chain(["--comparison-shape", "serial-to-serial"]),
+    )
+    .unwrap();
+    assert_eq!(args.comparison_shape, ComparisonShape::SerialToSerial);
     assert!(Args::try_parse_from(base.into_iter().chain(["--comparison-shape", "auto"])).is_err());
+}
+
+#[test]
+fn serial_to_serial_covers_every_owner_with_single_participant_decode_receipts() {
+    for width in [1, 3] {
+        let pair = Pair::with_serial_width(width);
+        let mut args = pair.args();
+        args.comparison_shape = ComparisonShape::SerialToSerial;
+        args.require_bitwise_logits = true;
+        let (report, code) = compare(&args);
+        assert_eq!(code, 0, "{report:#}");
+        assert_eq!(report["comparison_shape"], "serial_to_serial");
+        assert_eq!(
+            report["provenance"]["logical_decode_width"],
+            json!({"reference":1,"candidate":1})
+        );
+        assert_eq!(report["summary"]["prefill"]["decision_count"], width);
+        assert_eq!(report["summary"]["decode"]["decision_count"], 2 * width);
+        assert_eq!(report["bitwise_logits"]["passed"], true);
+        for arm in [&pair.reference, &pair.candidate] {
+            assert!(arm
+                .manifest
+                .waves
+                .iter()
+                .all(|wave| wave.participant_count == 1));
+        }
+        let (report, code) = pair.compare();
+        assert_insufficient(&report, code, "real serial reference and batched candidate");
+    }
+}
+
+#[test]
+fn serial_comparison_cannot_relabel_batched_waves_or_omit_a_canonical_decision() {
+    let mut pair = Pair::with_width(3);
+    let mut args = pair.args();
+    args.comparison_shape = ComparisonShape::SerialToSerial;
+    let (report, code) = compare(&args);
+    assert_insufficient(&report, code, "two real serial captures");
+    pair.candidate.manifest.mode = "serial".into();
+    pair.candidate.persist();
+    let (report, code) = compare(&args);
+    assert_insufficient(&report, code, "actual wave width differs");
+    let mut pair = Pair::with_serial_width(3);
+    pair.candidate.manifest.decisions.pop();
+    pair.candidate.persist();
+    let mut args = pair.args();
+    args.comparison_shape = ComparisonShape::SerialToSerial;
+    let (report, code) = compare(&args);
+    assert_insufficient(&report, code, "canonical decision missing");
 }
 
 #[test]

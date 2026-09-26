@@ -1,6 +1,10 @@
 use super::*;
 use std::ops::Range;
 
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[path = "guarded_cost_route.rs"]
+mod guarded_cost_route;
+
 pub type Composition = (
     Arc<Runtime>,
     OperationRuntimeRegistry<Runtime>,
@@ -12,6 +16,8 @@ pub type Composition = (
 pub struct Fixture {
     _composition: CompositionParts,
     compilation: ProgramPlanCompilation,
+    static_initialization_receipt: StaticInitializationReceipt,
+    runtime_policy: ResolvedRuntimePolicy,
     providers: BoundOperationProviderSet<Runtime>,
     resources: Arc<PlanRuntimeResources<Runtime>>,
     lane: Arc<ExecutionLane<Runtime>>,
@@ -20,6 +26,14 @@ pub struct Fixture {
     checkpoint_timing_mode: DeviceTimingMode,
     reusable_bucket: Option<ReusableExecutionBucketId>,
     output_type: ElementType,
+}
+
+#[derive(Clone, Copy)]
+enum FixtureExecutionMode {
+    Eager,
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    WorkspaceOnly,
+    Replay,
 }
 
 impl Fixture {
@@ -40,6 +54,25 @@ impl Fixture {
         Self::with_execution_capacity(kind, true, None, maximum_tokens)
     }
 
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+    fn with_workspace_capacity(kind: AttentionKind, maximum_tokens: u64) -> Self {
+        let definition = Family::new(kind);
+        let states = definition.states();
+        let profile_id = definition.profile_id();
+        let family = TypedFamilyRegistration::new(definition)
+            .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
+            .unwrap();
+        Self::from_prepared_family_with_mode(
+            kind,
+            family,
+            states,
+            FixtureExecutionMode::WorkspaceOnly,
+            None,
+            maximum_tokens,
+            BTreeMap::new(),
+        )
+    }
+
     fn with_execution_capacity(
         kind: AttentionKind,
         reusable: bool,
@@ -52,8 +85,89 @@ impl Fixture {
         let family = TypedFamilyRegistration::new(definition)
             .prepare_with_profile(&serde_json::to_value(kind).unwrap(), &id(profile_id))
             .unwrap();
-        let (runtime, registry, materializers, materializer, catalog) = composition(kind, &family);
-        let bucket = reusable.then(|| {
+        let fixture = Self::from_prepared_family(
+            kind,
+            family,
+            states,
+            reusable,
+            nonfinite_token,
+            maximum_tokens,
+            BTreeMap::new(),
+        );
+        let plan = fixture.compilation.executable().execution_plan();
+        assert!(
+            matches!(
+                plan.sequence_checkpoint_capability(),
+                SequenceCheckpointCapability::Enabled(_)
+            ),
+            "actual selected provider declarations must close the checkpoint contract: {:?}",
+            plan.sequence_checkpoint_capability()
+        );
+        fixture
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared_family(
+        kind: AttentionKind,
+        family: PreparedModelFamily,
+        states: Vec<StateSpec>,
+        reusable: bool,
+        nonfinite_token: Option<u32>,
+        maximum_tokens: u64,
+        additional_inputs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
+    ) -> Self {
+        Self::from_prepared_family_with_mode(
+            kind,
+            family,
+            states,
+            if reusable {
+                FixtureExecutionMode::Replay
+            } else {
+                FixtureExecutionMode::Eager
+            },
+            nonfinite_token,
+            maximum_tokens,
+            additional_inputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared_family_with_mode(
+        kind: AttentionKind,
+        family: PreparedModelFamily,
+        states: Vec<StateSpec>,
+        execution_mode: FixtureExecutionMode,
+        nonfinite_token: Option<u32>,
+        maximum_tokens: u64,
+        additional_inputs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
+    ) -> Self {
+        let composition = composition(kind, &family);
+        Self::from_prepared_family_with_composition(
+            kind,
+            family,
+            states,
+            execution_mode,
+            nonfinite_token,
+            maximum_tokens,
+            additional_inputs,
+            composition,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared_family_with_composition(
+        kind: AttentionKind,
+        family: PreparedModelFamily,
+        states: Vec<StateSpec>,
+        execution_mode: FixtureExecutionMode,
+        nonfinite_token: Option<u32>,
+        maximum_tokens: u64,
+        additional_inputs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
+        composition: Composition,
+    ) -> Self {
+        let (runtime, registry, materializers, materializer, catalog) = composition;
+
+        let bucket = (!matches!(execution_mode, FixtureExecutionMode::Eager)).then(|| {
             ReusableExecutionBucketSpec::new(
                 ReusableExecutionClassId::new("fixture.checkpoint.decode").unwrap(),
                 ReusableExecutionCapacity::new(1, maximum_tokens, 16).unwrap(),
@@ -85,7 +199,7 @@ impl Fixture {
                 cancellation_check_interval_steps: 1,
             },
             runtime.attention_execution_policy(),
-            if reusable {
+            if matches!(execution_mode, FixtureExecutionMode::Replay) {
                 ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
             } else {
                 ExecutionDeterminismRequirement::BitwiseSameRuntime
@@ -93,17 +207,20 @@ impl Fixture {
             bucket.map(|bucket| ReusableExecutionPolicy::new(1, vec![bucket]).unwrap()),
         )
         .unwrap();
-        let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        let mut input_types = BTreeMap::from([(
             id("value.tokens"),
             ProgramTensorSpec {
                 dimensions: vec![MAX_TOKENS],
                 element_type: ElementType::U32,
                 layout: ResolvedTensorLayout::Contiguous,
             },
-        )]))
-        .unwrap();
+        )]);
+        input_types.extend(additional_inputs);
+        let mut options = ProgramPlanCompileOptions::new(input_types).unwrap();
         options.require_weight_materializer_selection(materializer);
-        options.retain_completion_value(id("value.output"));
+        for output in family.program().outputs() {
+            options.retain_completion_value(output.clone());
+        }
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             &family,
             &catalog,
@@ -115,14 +232,6 @@ impl Fixture {
         .unwrap();
         let executable = compilation.executable();
         let plan = executable.execution_plan();
-        assert!(
-            matches!(
-                plan.sequence_checkpoint_capability(),
-                SequenceCheckpointCapability::Enabled(_)
-            ),
-            "actual selected provider declarations must close the checkpoint contract: {:?}",
-            plan.sequence_checkpoint_capability()
-        );
         let providers = registry.bind_plan(executable).unwrap();
         let provisioned = plan
             .provision_static(
@@ -178,12 +287,13 @@ impl Fixture {
                 StaticInitializationPolicy::new(1 << 20, 8).unwrap(),
             )
             .unwrap();
+        let static_initialization_receipt = initialized.receipt().clone();
         let resources = match initialized.into_plan_runtime() {
             Ok(resources) => resources,
             Err(error) => panic!("plan runtime handoff failed: {}", error.error()),
         };
         let lane = resources.create_execution_lane().unwrap();
-        if reusable {
+        if matches!(execution_mode, FixtureExecutionMode::Replay) {
             lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(8).unwrap())
                 .unwrap();
         }
@@ -198,6 +308,8 @@ impl Fixture {
         Self {
             _composition: composition,
             compilation,
+            static_initialization_receipt,
+            runtime_policy: policy,
             providers,
             resources,
             lane,
@@ -429,7 +541,7 @@ impl Fixture {
         tokens: Arc<[u32]>,
         range: Range<usize>,
     ) -> Observation {
-        self.execute_checked(session, tokens, range, false, false)
+        self.execute_checked(session, tokens, range, false, false, false)
             .unwrap()
     }
 
@@ -440,7 +552,18 @@ impl Fixture {
         tokens: Arc<[u32]>,
         range: Range<usize>,
     ) -> Observation {
-        self.execute_checked(session, tokens, range, true, false)
+        self.execute_checked(session, tokens, range, true, false, false)
+            .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn execute_replayed_with_selected(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+    ) -> Observation {
+        self.execute_checked(session, tokens, range, true, false, true)
             .unwrap()
     }
 
@@ -452,7 +575,7 @@ impl Fixture {
         replay: bool,
     ) {
         assert!(self
-            .execute_checked(session, tokens, range, replay, true)
+            .execute_checked(session, tokens, range, replay, true, false)
             .is_none());
     }
 
@@ -463,6 +586,29 @@ impl Fixture {
         range: Range<usize>,
         replay: bool,
         expect_failure: bool,
+        selected_replay: bool,
+    ) -> Option<Observation> {
+        self.execute_checked_output_node(
+            session,
+            tokens,
+            range,
+            replay,
+            expect_failure,
+            selected_replay,
+            "node.attention",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_checked_output_node(
+        &self,
+        session: &Arc<SequenceSession<Runtime>>,
+        tokens: Arc<[u32]>,
+        range: Range<usize>,
+        replay: bool,
+        expect_failure: bool,
+        selected_replay: bool,
+        output_node: &str,
     ) -> Option<Observation> {
         let catalog = replay.then(|| self.lane.reusable_execution_catalog().unwrap());
         let span = token_span(Arc::clone(&tokens), range.clone());
@@ -551,7 +697,13 @@ impl Fixture {
             .iter()
             .find(|node| node.id().as_str() == "node.attention")
             .unwrap();
-        let output = attention
+        let output_node = plan
+            .payload()
+            .nodes()
+            .iter()
+            .find(|node| node.id().as_str() == output_node)
+            .unwrap();
+        let output = output_node
             .values()
             .iter()
             .find(|value| value.role() == ResolvedValueRole::Output && value.ordinal() == 0)
@@ -575,7 +727,7 @@ impl Fixture {
         // coordinates. Completion translates this span-local range into the
         // same packed backing that the provider's output_start selects.
         let mut requests = vec![CompletionReadbackRequest::new(
-            attention.id().clone(),
+            output_node.id().clone(),
             0,
             output_component.resource_id().clone(),
             output_component.offset_bytes(),
@@ -584,6 +736,8 @@ impl Fixture {
         .unwrap()];
         let mut names =
             BTreeMap::from([(output_component.resource_id().clone(), "output".to_owned())]);
+        #[cfg(feature = "cuda")]
+        let mut causal_kv_layouts = BTreeMap::new();
         for state in &self.states {
             let value = attention
                 .values()
@@ -596,6 +750,28 @@ impl Fixture {
                 StateCapacityDemand::TokenScaled {
                     bytes_per_token, ..
                 } => bytes_per_token * range.end as u64,
+            };
+            #[cfg(feature = "cuda")]
+            let bytes = if matches!(
+                attention.operation_id().as_str(),
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID
+                    | CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID
+            ) && matches!(
+                state.capacity_demand,
+                StateCapacityDemand::TokenScaled { .. }
+            ) && state.tensor.element_type == ElementType::F16
+            {
+                // Same physical layout reader as the actual attention fixture:
+                // include whole resident blocks, then gather only all written
+                // K/V elements. INT8, recurrent state and Metal are unchanged.
+                let layout = cuda_f16_kv_readback::VllmKvLayout::from_tensor(&state.tensor);
+                assert_eq!(layout.bytes_per_token() * range.end as u64, bytes);
+                assert!(causal_kv_layouts
+                    .insert(component.resource_id().clone(), layout)
+                    .is_none());
+                layout.readback_bytes(range.end)
+            } else {
+                bytes
             };
             requests.push(
                 CompletionReadbackRequest::new_typed(
@@ -634,6 +810,23 @@ impl Fixture {
                 program.is_determinism_ready(),
                 "incomplete replay program: {program:?}"
             );
+            let output_node_index = plan
+                .payload()
+                .nodes()
+                .iter()
+                .position(|node| node.id() == output_node.id())
+                .unwrap() as u32;
+            assert!(
+                program
+                    .segments()
+                    .iter()
+                    .any(|segment| segment.start_node_index() <= output_node_index
+                        && output_node_index < segment.end_node_index()),
+                "the observed provider must be a resident segment, not a declared eager boundary: operation={}, range={range:?}, program={program:?}", output_node.operation_id()
+            );
+            assert!(!program
+                .eager_boundary_node_indices()
+                .contains(&output_node_index));
             assert!(
                 attention.binding_resource().is_some(),
                 "dual-state attention must declare a typed binding for replay"
@@ -654,20 +847,63 @@ impl Fixture {
                 declared_binding_nodes.as_slice(),
                 "every provider-declared typed binding must update before replay"
             );
-            OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
-                self.providers.providers(),
-                executable,
-                &identity,
-                std::iter::once(&active),
-                DeviceTimingMode::Off,
-                &[input],
-                program,
-                SubmissionExecutionPolicy::determinism_replayed(1),
-                wave,
-                &self.lane,
-                &self.reaper,
-            )
-            .unwrap()
+            #[cfg(feature = "cuda")]
+            if selected_replay && output_node.id().as_str() == "node.ffn" {
+                gdn_selected_replay::submit_for_nodes(
+                    self,
+                    executable,
+                    &identity,
+                    &active,
+                    input,
+                    program,
+                    wave,
+                    range.clone(),
+                    &["node.ffn"],
+                )
+            } else if selected_replay {
+                gdn_selected_replay::submit(
+                    self,
+                    executable,
+                    &identity,
+                    &active,
+                    input,
+                    program,
+                    wave,
+                    range.clone(),
+                )
+            } else {
+                OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+                    self.providers.providers(),
+                    executable,
+                    &identity,
+                    std::iter::once(&active),
+                    DeviceTimingMode::Off,
+                    &[input],
+                    program,
+                    SubmissionExecutionPolicy::determinism_replayed(1),
+                    wave,
+                    &self.lane,
+                    &self.reaper,
+                )
+                .unwrap()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
+                    self.providers.providers(),
+                    executable,
+                    &identity,
+                    std::iter::once(&active),
+                    DeviceTimingMode::Off,
+                    &[input],
+                    program,
+                    SubmissionExecutionPolicy::determinism_replayed(1),
+                    wave,
+                    &self.lane,
+                    &self.reaper,
+                )
+                .unwrap()
+            }
         } else {
             OperationDispatch::encode_and_submit_wave_with_inputs(
                 self.providers.providers(),
@@ -737,10 +973,15 @@ impl Fixture {
             .dispositions()
             .iter()
             .map(|result| match result {
-                CompletionReadbackDisposition::Succeeded(output) => (
-                    names.remove(output.request().resource_id()).unwrap(),
-                    output.bytes().to_vec(),
-                ),
+                CompletionReadbackDisposition::Succeeded(output) => {
+                    let bytes = output.bytes().to_vec();
+                    #[cfg(feature = "cuda")]
+                    let bytes = causal_kv_layouts
+                        .get(output.request().resource_id())
+                        .map(|layout| layout.gather(&bytes, range.end))
+                        .unwrap_or(bytes);
+                    (names.remove(output.request().resource_id()).unwrap(), bytes)
+                }
                 other => panic!("provider readback failed: {other:?}"),
             })
             .collect();
@@ -1131,3 +1372,43 @@ impl Observation {
         );
     }
 }
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[path = "primitive_cost_route.rs"]
+mod primitive_cost_route;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "head_cost_route.rs"]
+mod head_cost_route;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "gated_delta_cost_route.rs"]
+mod gated_delta_cost_route;
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[path = "attention_cost_route.rs"]
+mod attention_cost_route;
+
+#[cfg(feature = "cuda")]
+#[path = "cuda_cost_route.rs"]
+mod cuda_cost_route;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[path = "causal_cost_route.rs"]
+mod causal_cost_route;
+
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+#[path = "full_cost_route.rs"]
+mod full_cost_route;
+
+#[cfg(feature = "cuda")]
+#[path = "gdn_selected_replay.rs"]
+mod gdn_selected_replay;
+
+#[cfg(feature = "cuda")]
+#[path = "gguf_f16_aliases.rs"]
+mod gguf_f16_aliases;
+
+#[cfg(feature = "cuda")]
+#[path = "attention_cost_route/kv_readback.rs"]
+mod cuda_f16_kv_readback;

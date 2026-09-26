@@ -136,6 +136,14 @@ pub(super) fn source(
         GgufValue::Array(
             names
                 .iter()
+                .filter(|name| {
+                    schema.components.iter().any(|component| {
+                        component
+                            .external_names
+                            .iter()
+                            .any(|external| external == **name)
+                    })
+                })
                 .map(|name| GgufValue::String((*name).into()))
                 .collect(),
         )
@@ -216,11 +224,26 @@ pub(super) fn source(
             WeightEncoding::Dense {
                 element_type: ElementType::F16,
             } => 1,
-            WeightEncoding::BlockQuantized(spec)
-                if spec.format_id.as_str() == "quantization.gguf.pq2-0" =>
-            {
-                *dims.last_mut().unwrap() *= 128;
-                142
+            WeightEncoding::BlockQuantized(spec) => {
+                let (dtype, values_per_block, bytes_per_block) = match spec.format_id.as_str() {
+                    "quantization.gguf.pq2-0" => (142, 128, 34),
+                    "quantization.gguf.q4-k" => (12, 256, 144),
+                    "quantization.gguf.q6-k" => (14, 256, 210),
+                    other => panic!("unsupported fixture GGUF block format: {other}"),
+                };
+                assert_eq!(spec.logical_values_per_block, values_per_block);
+                assert_eq!(spec.bytes_per_block, bytes_per_block);
+                let blocks = dims.iter().product::<u64>();
+                assert_eq!(
+                    values[&component.id].len() as u64,
+                    blocks.checked_mul(u64::from(bytes_per_block)).unwrap(),
+                    "GGUF descriptor and retained source bytes must describe the same blocks"
+                );
+                // Schema dimensions count blocks on the last axis. GGUF tensor
+                // dimensions count decoded values, for PQ2 and K-quants alike.
+                let columns = dims.last_mut().unwrap();
+                *columns = columns.checked_mul(u64::from(values_per_block)).unwrap();
+                dtype
             }
             other => panic!("unexpected fixture encoding: {other:?}"),
         };
@@ -273,5 +296,50 @@ fn value_bytes(bytes: &mut Vec<u8>, value: &GgufValue) {
             }
         }
         _ => panic!("unsupported fixture metadata"),
+    }
+}
+
+#[test]
+fn hadamard_gguf_fixture_preserves_q4k_and_q6k_descriptors_and_source_bytes() {
+    let kind = AttentionKind::GatedDeltaHadamardF16;
+    let mut schema = Family::new(kind).weight_schema(&kind).unwrap();
+    for (suffix, format, bytes) in [
+        ("q4", "quantization.gguf.q4-k", 144),
+        ("q6", "quantization.gguf.q6-k", 210),
+    ] {
+        let component_id: WeightId = id(format!("component.fixture.{suffix}"));
+        schema.components.push(WeightComponentSpec {
+            id: component_id.clone(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![format!("fixture.{suffix}.weight")],
+            dimensions: vec![2, HIDDEN / 256],
+            encoding: WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                format_id: id(format),
+                logical_values_per_block: 256,
+                bytes_per_block: bytes,
+            }),
+            required: true,
+        });
+        schema.tensors.push(WeightTensorSpec {
+            id: id(format!("weight.fixture.{suffix}")),
+            dimensions: vec![2, HIDDEN],
+            logical_element_type: ElementType::F16,
+            physical_layout: PhysicalWeightLayout::BlockQuantized {
+                blocks: PhysicalWeightComponentBinding::exact_contiguous(component_id),
+                block_axis: 1,
+                block_padding: PhysicalWeightPadding::Exact,
+            },
+            required: true,
+        });
+    }
+    // Reopen the actual GGUF file, including its Hadamard metadata. The
+    // production source validates dtype and decoded tensor shape.
+    let source = Weights::new(&schema);
+    assert!(source.source.is_some());
+    for component in &schema.components {
+        if component.id.as_str().starts_with("component.fixture.") {
+            let loaded = source.component(component).unwrap();
+            assert_eq!(loaded.bytes(), source.values[&component.id]);
+        }
     }
 }

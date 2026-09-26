@@ -65,6 +65,7 @@ impl Budgets {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ComparisonShape {
+    SerialToSerial,
     #[default]
     SerialToBatched,
     BatchedToBatched,

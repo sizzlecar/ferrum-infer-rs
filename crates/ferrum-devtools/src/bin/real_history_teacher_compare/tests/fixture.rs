@@ -409,14 +409,18 @@ impl Pair {
     }
 
     pub fn with_width(width: usize) -> Self {
-        Self::with_reference_mode(width, "serial")
+        Self::with_modes(width, "serial", "batched")
     }
 
     pub fn with_batched_width(width: usize) -> Self {
-        Self::with_reference_mode(width, "batched")
+        Self::with_modes(width, "batched", "batched")
     }
 
-    fn with_reference_mode(width: usize, reference_mode: &str) -> Self {
+    pub fn with_serial_width(width: usize) -> Self {
+        Self::with_modes(width, "serial", "serial")
+    }
+
+    fn with_modes(width: usize, reference_mode: &str, candidate_mode: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let owners: Vec<_> = (0..width)
             .map(|owner| {
@@ -493,7 +497,7 @@ impl Pair {
             arm
         };
         let reference = make_arm(reference_mode, "reference");
-        let candidate = make_arm("batched", "candidate");
+        let candidate = make_arm(candidate_mode, "candidate");
         Self {
             root,
             reference,

@@ -11,8 +11,16 @@ use ferrum_interfaces::vnext::{
 
 pub const F16_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16";
 pub const F32_MASTER_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master";
+pub const F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.gguf-f16-projections";
+pub const F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.gguf-f16-attention.q8-residual2-ffn-m2to8";
 pub const F32_MASTER_F16_HEAD_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.f16-head";
 pub const F32_MASTER_Q8_SWIGLU_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f32-master.q8-swiglu";
+pub const F32_MASTER_Q8_SWIGLU_INPUT_SUM_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.q8-swiglu-input-sum";
+pub const F32_MASTER_Q8_GATE_UP_STREAM_MMQ_NUMERICAL_PROFILE_ID: &str =
+    "qwen3_5.f32-master.q8-gate-up-stream-mmq";
 pub const F32_MASTER_Q8_SWIGLU_GDN_PROJECTIONS_NUMERICAL_PROFILE_ID: &str =
     "qwen3_5.f32-master.q8-swiglu-gdn-projections";
 pub const F16_INT8_KV_NUMERICAL_PROFILE_ID: &str = "qwen3_5.f16.int8-kv";
@@ -26,11 +34,23 @@ pub(super) fn profiles(
     let (states, kv_storage) = states(&text, config.max_position_embeddings, KvStorageFormat::F16)?;
     let f16 = profile(family_id, &text, &states, &kv_storage, false, false)?;
     let f32 = profile(family_id, &text, &states, &kv_storage, true, false)?;
+    let gguf_f16_projections = gguf_f16_projections_eligible(config, &text)
+        .then(|| gguf_f16_projections_profile(&f32))
+        .transpose()?;
+    let hybrid = gguf_f16_attention_residual2_ffn_m2to8_eligible(config, &text)
+        .then(|| gguf_f16_attention_residual2_ffn_m2to8_profile(&f32))
+        .transpose()?;
     let f16_head = f16_head_eligible(config, &text)
         .then(|| f16_head_profile(&f32))
         .transpose()?;
     let q8_swiglu = q8_swiglu_eligible(config, &text)
         .then(|| q8_swiglu_profile(&f32))
+        .transpose()?;
+    let q8_input_sum = q8_swiglu_eligible(config, &text)
+        .then(|| q8_input_sum_profile(&f32))
+        .transpose()?;
+    let q8_gate_up_stream_mmq = q8_gate_up_stream_mmq_eligible(config, &text)
+        .then(|| q8_gate_up_stream_mmq_profile(&f32))
         .transpose()?;
     let q8_gdn_projections = q8_swiglu
         .as_ref()
@@ -78,7 +98,118 @@ pub(super) fn profiles(
     profiles.extend(q8_swiglu);
     profiles.extend(q8_gdn_projections);
     profiles.extend(f16_head);
-    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 4), profiles, automatic)
+    profiles.extend(q8_input_sum);
+    profiles.extend(q8_gate_up_stream_mmq);
+    profiles.extend(gguf_f16_projections);
+    profiles.extend(hybrid);
+    FamilyNumericalProfiles::new(family_id, ContractVersion::new(1, 7), profiles, automatic)
+}
+
+/// This is a declared source/ABI combination, not full-model quality approval.
+/// The materializer independently validates physical formats and all consumers.
+pub(super) fn gguf_f16_projections_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    config.weight_format == FamilyWeightFormat::GgufNative
+        && text.moe.is_none()
+        && config.gguf_hadamard.is_none()
+        && config.recurrent_weight_abi == RecurrentWeightAbi::NegativeRateInterleaved
+        && config.weights.iter().all(|weight| {
+            let Some(layer) = weight.layer_index else { return true; };
+            let consumed = match weight.role.as_str() {
+                "mlp_gate" | "mlp_up" | "mlp_down" => true,
+                "linear_attn_qkv" | "linear_attn_z" | "linear_attn_b" | "linear_attn_a" | "linear_attn_out" =>
+                    text.layer_types.get(layer as usize) == Some(&Qwen35LayerType::LinearAttention),
+                "self_attn_q" | "self_attn_k" | "self_attn_v" | "self_attn_o" =>
+                    text.layer_types.get(layer as usize) == Some(&Qwen35LayerType::FullAttention),
+                _ => false,
+            };
+            if !consumed { return true; }
+            // Family roles are validated typed program inputs; this never
+            // infers conversion authority from an external tensor name.
+            match &weight.source_encoding {
+                FamilyWeightSourceEncoding::Dense { element_type } => *element_type == ElementType::F16,
+                FamilyWeightSourceEncoding::BlockQuantized(spec) => {
+                    let block = match (spec.format_id.as_str(),spec.logical_values_per_block,spec.bytes_per_block) {
+                        ("quantization.gguf.q4-k",256,144) | ("quantization.gguf.q5-k",256,176)
+                            | ("quantization.gguf.q6-k",256,210) => 256,
+                        ("quantization.gguf.q8-0",32,34) => 32,
+                        _ => return false,
+                    };
+                    matches!(weight.dimensions.as_slice(), [n,k] if *n > 0 && *k > 0 && *k % block == 0)
+                }
+                _ => false,
+            }
+        })
+}
+
+/// One explicit combination, not permission to combine independently qualified
+/// policies. At least one real Q4 gate/up pair can exercise residual2; other
+/// leaves retain the operation's declared strict fallback. Attention alone is
+/// rounded by the typed materializer. Whole M, never leaf M, selects FFN math.
+pub(super) fn gguf_f16_attention_residual2_ffn_m2to8_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    gguf_f16_projections_eligible(config, text) && q8_gate_up_stream_mmq_eligible(config, text)
+}
+
+fn gguf_f16_attention_residual2_ffn_m2to8_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = gguf_f16_projections_profile(master)?;
+    profile.id = NumericalProfileId::new(
+        F32_MASTER_GGUF_F16_ATTENTION_RESIDUAL2_FFN_M2TO8_NUMERICAL_PROFILE_ID,
+    )
+    .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let ffn = profile
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.operation_id.as_str() == DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID
+        })
+        .ok_or_else(|| {
+            invalid_config("numerical_profile.operations", "RN FFN contract is missing")
+        })?;
+    ffn.operation_id = operation_id(DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID)?;
+    // This describes the eligible integer products; the contract separately
+    // fixes residual reconstruction and the strict compressed fallback.
+    ffn.multiplication_type = Some(ElementType::I8);
+    ffn.accumulation_type = Some(ElementType::F32);
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    Ok(profile)
+}
+
+fn gguf_f16_projections_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = master.clone();
+    profile.id = NumericalProfileId::new(F32_MASTER_GGUF_F16_PROJECTIONS_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    for operation in &mut profile.operations {
+        let replacement = match operation.operation_id.as_str() {
+            DENSE_SWIGLU_OPERATION_ID => DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID,
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID => {
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID
+            }
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID => {
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID
+            }
+            _ => continue,
+        };
+        operation.operation_id = operation_id(replacement)?;
+        operation.version = ContractVersion::new(1, 0);
+        // This summarizes the projections, not the F32 recurrent/attention core.
+        operation.multiplication_type = Some(ElementType::F16);
+        operation.accumulation_type = Some(ElementType::F32);
+    }
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    Ok(profile)
 }
 
 pub(super) fn f16_head_eligible(config: &Qwen35FamilyConfig, text: &Qwen35TextConfig) -> bool {
@@ -157,6 +288,36 @@ pub(super) fn q8_swiglu_eligible(config: &Qwen35FamilyConfig, text: &Qwen35TextC
         })
 }
 
+pub(super) fn q8_gate_up_stream_mmq_eligible(
+    config: &Qwen35FamilyConfig,
+    text: &Qwen35TextConfig,
+) -> bool {
+    // Family eligibility establishes a possible real pair. Actual packed row
+    // count and physical leaf/layout/transform checks belong to the provider.
+    q8_swiglu_eligible(config, text)
+        && config.weights.iter().any(|gate| {
+            let Some(layer) = gate.layer_index else {
+                return false;
+            };
+            if gate.role != "mlp_gate" || !q4_k_leaf(gate) {
+                return false;
+            }
+            config.weights.iter().any(|up| {
+                up.layer_index == Some(layer)
+                    && up.role == "mlp_up"
+                    && up.dimensions == gate.dimensions
+                    && q4_k_leaf(up)
+            })
+        })
+}
+
+fn q4_k_leaf(weight: &FamilyWeight) -> bool {
+    matches!(&weight.source_encoding, FamilyWeightSourceEncoding::BlockQuantized(spec)
+        if spec.format_id.as_str() == "quantization.gguf.q4-k"
+            && spec.logical_values_per_block == 256 && spec.bytes_per_block == 144)
+        && matches!(weight.dimensions.as_slice(), [n, k] if *n > 0 && *k > 0 && *k % 256 == 0)
+}
+
 fn q8_k_leaf(weight: &FamilyWeight) -> bool {
     let FamilyWeightSourceEncoding::BlockQuantized(spec) = &weight.source_encoding else {
         return false;
@@ -218,6 +379,55 @@ fn q8_swiglu_profile(
     profile
         .operations
         .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(profile)
+}
+
+fn q8_input_sum_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    // Start with the existing FFN-only policy; neither GDN projections nor the
+    // output head inherit this new arithmetic. Old profile bytes stay intact.
+    let mut profile = q8_swiglu_profile(master)?;
+    profile.id = NumericalProfileId::new(F32_MASTER_Q8_SWIGLU_INPUT_SUM_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let dense = profile
+        .operations
+        .iter_mut()
+        .find(|operation| operation.operation_id.as_str() == DENSE_SWIGLU_Q8_F32SCALE_OPERATION_ID)
+        .ok_or_else(|| {
+            invalid_config("numerical_profile.operations", "Q8 FFN contract is missing")
+        })?;
+    dense.operation_id = operation_id(DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_OPERATION_ID)?;
+    profile
+        .operations
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(profile)
+}
+
+fn q8_gate_up_stream_mmq_profile(
+    master: &NumericalExecutionProfile,
+) -> Result<NumericalExecutionProfile, VNextError> {
+    let mut profile = master.clone();
+    profile.id = NumericalProfileId::new(F32_MASTER_Q8_GATE_UP_STREAM_MMQ_NUMERICAL_PROFILE_ID)
+        .map_err(|reason| invalid_config("numerical_profile.id", reason))?;
+    let dense = profile
+        .operations
+        .iter_mut()
+        .find(|o| o.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID)
+        .ok_or_else(|| {
+            invalid_config(
+                "numerical_profile.operations",
+                "dense FFN contract is missing",
+            )
+        })?;
+    dense.operation_id = operation_id(DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_OPERATION_ID)?;
+    // This marks the operation's eligible integer projections, not the strict
+    // down projection or a promise that every invocation uses the integer path.
+    dense.multiplication_type = Some(ElementType::I8);
+    dense.accumulation_type = Some(ElementType::F32);
+    profile
+        .operations
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
     Ok(profile)
 }
 

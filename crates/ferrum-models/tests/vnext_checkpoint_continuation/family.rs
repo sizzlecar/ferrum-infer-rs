@@ -571,6 +571,26 @@ impl Weights {
                             })
                             .collect()
                     }
+                    WeightEncoding::BlockQuantized(spec)
+                        if spec.format_id.as_str() == "quantization.gguf.q6-k" =>
+                    {
+                        (0..elements)
+                            .flat_map(|block| {
+                                let mut bytes = vec![0; 210];
+                                // Native Q6_K: 128 low-bit bytes, 64 high-bit
+                                // bytes, 16 signed scales, then one F16 scale.
+                                for (index, byte) in bytes[..192].iter_mut().enumerate() {
+                                    *byte = ((index * 17 + block * 7 + ordinal * 19) % 251) as u8;
+                                }
+                                for (index, byte) in bytes[192..208].iter_mut().enumerate() {
+                                    *byte = ((index as i8 % 7) - 3) as u8;
+                                }
+                                bytes[208..]
+                                    .copy_from_slice(&f16::from_f32(1.0 / 4096.0).to_le_bytes());
+                                bytes
+                            })
+                            .collect()
+                    }
                     WeightEncoding::BlockQuantized(_) => (0..elements)
                         .flat_map(|block| {
                             let mut bytes = vec![0; 144];

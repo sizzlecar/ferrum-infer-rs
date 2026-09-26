@@ -38,6 +38,53 @@ fn composition(kind: AttentionKind, _family: &PreparedModelFamily) -> runtime::C
     )
 }
 
+fn composition_with_capture(
+    kind: AttentionKind,
+    capture: ferrum_types::SloStructuredCostCapture,
+) -> runtime::Composition {
+    // Independent real device accounts keep parallel observation fixtures from
+    // borrowing another test's deferred-cleanup or budget population.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (runtime, registry, materializers, materializer_id, catalog) =
+        MetalVNextComposition::create_with_observation(
+            id(format!("device.metal.capture.{kind:?}.{ordinal}")),
+            None,
+            capture,
+        )
+        .unwrap()
+        .into_parts();
+    (
+        runtime,
+        registry,
+        materializers,
+        WeightMaterializerSelection::exact(materializer_id),
+        catalog,
+    )
+}
+
+fn assert_metal_algorithm_work(
+    actual: &ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1,
+    predicted: &ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1,
+    capture: ferrum_types::SloStructuredCostCapture,
+) {
+    assert_eq!(actual, predicted, "actual and future selected class/work");
+    if capture.is_disabled() {
+        assert!(actual.algorithm_work().is_none());
+        assert!(predicted.algorithm_work().is_none());
+    } else {
+        let actual_work = actual.algorithm_work().unwrap().unwrap();
+        let predicted_work = predicted.algorithm_work().unwrap().unwrap();
+        actual_work.validate_command(actual).unwrap();
+        predicted_work.validate_command(predicted).unwrap();
+        assert_eq!(
+            actual_work, predicted_work,
+            "actual/future algorithm assignment"
+        );
+        assert!(!actual_work.entries().is_empty());
+    }
+}
+
 fn id<T>(value: impl Into<String>) -> T
 where
     T: TryFrom<String>,

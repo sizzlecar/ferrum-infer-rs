@@ -262,6 +262,16 @@ fn graph_state(
         {
             Ok(ActualWaveGraphState::Disabled)
         }
+        (DeviceCostGraphCaptureCapability::Supported, true)
+            if evidence.is_some_and(|proof| proof.proves_warm_direct_replay()) =>
+        {
+            Ok(ActualWaveGraphState::Warm)
+        }
+        (DeviceCostGraphCaptureCapability::Supported, false)
+            if evidence.is_some_and(|proof| proof.proves_configured_eager_observation()) =>
+        {
+            Ok(ActualWaveGraphState::ConfiguredEager)
+        }
         // Replayed attribution on a runtime declaring no graph support is a
         // contradiction. Eager work on other runtimes may also capture graphs;
         // neither case is silently promoted to a known Cold/Warm cost shape.
@@ -272,6 +282,99 @@ fn graph_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_eager_requires_same_wave_proof_and_rejects_adaptive_work() {
+        use ferrum_interfaces::vnext::{
+            DeviceCostGraphConfiguration as C, DeviceCostGraphStreamState as S,
+            DeviceSubmissionGraphEvidence as E,
+        };
+        let ready = S::new(C::OnDemand, 3, 2, 0).unwrap();
+        let changed = S::new(C::OnDemand, 4, 2, 0).unwrap();
+        let exact = E::new(ready, ready, false, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Supported,
+                false,
+                Some(exact)
+            ),
+            Ok(ActualWaveGraphState::ConfiguredEager)
+        );
+        for capability in [
+            DeviceCostGraphCaptureCapability::Unsupported,
+            DeviceCostGraphCaptureCapability::Unknown,
+        ] {
+            assert_eq!(
+                graph_state(capability, false, Some(exact)),
+                Err(ActualWaveEvidenceUnknown::GraphPath)
+            );
+        }
+        for proof in [
+            None,
+            Some(E::new(ready, changed, false, 0, 0, 0, 0, 0).unwrap()),
+            Some(E::new(ready, ready, true, 0, 0, 0, 0, 0).unwrap()),
+            Some(E::new(ready, ready, false, 1, 0, 0, 0, 0).unwrap()),
+            Some(E::new(ready, ready, false, 1, 1, 0, 1, 0).unwrap()),
+            Some(E::new(ready, ready, false, 1, 0, 1, 0, 0).unwrap()),
+            Some(E::new(ready, ready, false, 0, 0, 0, 0, 1).unwrap()),
+        ] {
+            assert_eq!(
+                graph_state(DeviceCostGraphCaptureCapability::Supported, false, proof),
+                Err(ActualWaveEvidenceUnknown::GraphPath)
+            );
+        }
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Supported,
+                true,
+                Some(exact)
+            ),
+            Err(ActualWaveEvidenceUnknown::GraphPath)
+        );
+    }
+
+    #[test]
+    fn only_actual_sealed_direct_replay_maps_to_warm() {
+        use ferrum_interfaces::vnext::{
+            DeviceCostGraphConfiguration as C, DeviceCostGraphStreamState as S,
+            DeviceSubmissionGraphEvidence as E,
+        };
+        let state = S::new(C::OnDemand, 1, 1, 0).unwrap();
+        let proof = E::new(state, state, false, 0, 0, 0, 0, 1).unwrap();
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Supported,
+                true,
+                Some(proof)
+            ),
+            Ok(ActualWaveGraphState::Warm)
+        );
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Unsupported,
+                true,
+                Some(proof)
+            ),
+            Err(ActualWaveEvidenceUnknown::GraphPath)
+        );
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Supported,
+                false,
+                Some(proof)
+            ),
+            Err(ActualWaveEvidenceUnknown::GraphPath)
+        );
+        let prepared = E::new(state, state, true, 1, 1, 0, 1, 1).unwrap();
+        assert_eq!(
+            graph_state(
+                DeviceCostGraphCaptureCapability::Supported,
+                true,
+                Some(prepared)
+            ),
+            Err(ActualWaveEvidenceUnknown::GraphPath)
+        );
+    }
 
     #[test]
     fn eager_path_alone_does_not_prove_graph_capture_absent() {

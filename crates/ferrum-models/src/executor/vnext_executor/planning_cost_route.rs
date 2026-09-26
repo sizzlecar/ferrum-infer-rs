@@ -100,6 +100,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .reusable_execution()
                 .and_then(|plan| plan.program_policy())
                 .is_some()
+                && self.runtime.cost_direct_graph_replay_operation().is_none()
             || self.runtime.cost_graph_capture_capability()
                 == DeviceCostGraphCaptureCapability::Unknown
         {
@@ -128,6 +129,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 if view
                     .graph_stream_state()
                     .is_some_and(|state| state.is_unconfigured_empty()) =>
+            {
+                Ok(())
+            }
+            DeviceCostGraphCaptureCapability::Supported
+                if self.runtime.cost_direct_graph_replay_operation().is_some()
+                    && view
+                        .graph_stream_state()
+                        .is_some_and(|state| state.is_ready())
+                    && view.graph_catalog().is_some() =>
             {
                 Ok(())
             }
@@ -341,7 +351,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .finish_with_captured_structure(
                 query.kind,
                 ActualWavePath::PlanRuntime,
-                ActualWaveGraphState::Disabled,
+                next.projected_graph_state(),
                 ActualWaveRowOrder::Ordered,
                 recurrent,
             )

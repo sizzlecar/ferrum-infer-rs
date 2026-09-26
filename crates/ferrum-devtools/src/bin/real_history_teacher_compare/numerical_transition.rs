@@ -15,25 +15,90 @@ pub(super) enum NumericalScope {
     DenseSwiGluQ8F32ScaleInputSumV1,
     /// B8 physical gate/up-only Stream-MMQ, with strict fallback and down.
     DenseSwiGluQ8GateUpStreamMmqV1,
+    /// All FFN, GDN and causal projections; untouched nodes retain strict signatures.
+    Qwen35GgufF16ProjectionsV1,
+    /// RN-F16 attention plus compressed whole-M2..8 residual2 FFN; separately qualified.
+    Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1,
 }
 
 impl NumericalScope {
     fn candidate_profile(self) -> &'static str {
         match self {
+            Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => {
+                "qwen3_5.f32-master.gguf-f16-attention.q8-residual2-ffn-m2to8"
+            }
+            Self::Qwen35GgufF16ProjectionsV1 => "qwen3_5.f32-master.gguf-f16-projections",
             Self::DenseSwiGluQ8GateUpStreamMmqV1 => "qwen3_5.f32-master.q8-gate-up-stream-mmq",
             Self::DenseSwiGluQ8F32ScaleV1 => "qwen3_5.f32-master.q8-swiglu",
             Self::DenseSwiGluQ8F32ScaleInputSumV1 => "qwen3_5.f32-master.q8-swiglu-input-sum",
         }
     }
 
-    fn candidate_operation(self) -> &'static str {
+    fn candidate_operation(self) -> Option<&'static str> {
         match self {
+            Self::Qwen35GgufF16ProjectionsV1
+            | Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => None,
             Self::DenseSwiGluQ8GateUpStreamMmqV1 => {
-                "operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale"
+                Some("operation.dense_swiglu.q8-gate-up-stream-mmq-f32scale")
             }
-            Self::DenseSwiGluQ8F32ScaleV1 => "operation.dense_swiglu.q8-f32scale",
-            Self::DenseSwiGluQ8F32ScaleInputSumV1 => "operation.dense_swiglu.q8-f32scale-input-sum",
+            Self::DenseSwiGluQ8F32ScaleV1 => Some("operation.dense_swiglu.q8-f32scale"),
+            Self::DenseSwiGluQ8F32ScaleInputSumV1 => {
+                Some("operation.dense_swiglu.q8-f32scale-input-sum")
+            }
         }
+    }
+    fn all_projections(self) -> bool {
+        matches!(
+            self,
+            Self::Qwen35GgufF16ProjectionsV1 | Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1
+        )
+    }
+
+    fn projection_operation(self, reference: &str) -> Option<&'static str> {
+        use ferrum_interfaces::vnext::{
+            DENSE_SWIGLU_OPERATION_ID, DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID,
+        };
+        if matches!(self, Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1)
+            && reference == DENSE_SWIGLU_OPERATION_ID
+        {
+            Some(DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_OPERATION_ID)
+        } else {
+            gguf_f16_operation(reference)
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Qwen35GgufF16AttentionQ8Residual2FfnM2to8V1 => {
+                "declared_rn_f16_attention_residual2_ffn_fixed_history_full_vocabulary_quality_only"
+            }
+            Self::Qwen35GgufF16ProjectionsV1 => {
+                "declared_all_projections_rn_f16_fixed_history_full_vocabulary_quality_only"
+            }
+            _ => "declared_ffn_q8_numerical_policy_fixed_history_full_vocabulary_quality_only",
+        }
+    }
+
+    fn operation_pair(self, reference: &str, candidate: &str) -> bool {
+        if self.all_projections() {
+            self.projection_operation(reference) == Some(candidate)
+        } else {
+            reference == "operation.dense_swiglu" && Some(candidate) == self.candidate_operation()
+        }
+    }
+}
+
+fn gguf_f16_operation(reference: &str) -> Option<&'static str> {
+    use ferrum_interfaces::vnext::*;
+    match reference {
+        DENSE_SWIGLU_OPERATION_ID => Some(DENSE_SWIGLU_GGUF_F16_WEIGHTS_OPERATION_ID),
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID => {
+            Some(GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID)
+        }
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID => {
+            Some(CAUSAL_PAGED_ATTENTION_F32_MASTER_GGUF_F16_PROJECTIONS_OPERATION_ID)
+        }
+        _ => None,
     }
 }
 
@@ -206,7 +271,7 @@ impl DeclaredNumericalTransition {
             declaration.reference.numerical_profile.as_str() == "qwen3_5.f32-master"
                 && declaration.candidate.numerical_profile.as_str()
                     == declaration.scope.candidate_profile(),
-            "numerical profile pair is outside dense SwiGLU Q8 scope"
+            "numerical profile pair is outside the declared numerical scope"
         );
         ensure!(
             !declaration.node_changes.is_empty(),
@@ -227,10 +292,31 @@ impl DeclaredNumericalTransition {
             change.candidate.validate()?;
             change.execution_semantics.checked()?;
             ensure!(
-                change.reference.operation_id == "operation.dense_swiglu"
-                    && change.candidate.operation_id == declaration.scope.candidate_operation(),
-                "node transition is outside dense SwiGLU Q8 scope"
+                declaration.scope.operation_pair(&change.reference.operation_id, &change.candidate.operation_id),
+                "node transition is outside dense SwiGLU Q8 scope or the explicit all-projection scope"
             );
+        }
+        if declaration.scope.all_projections() {
+            ensure!(
+                declaration.reference.execution.binary_sha256
+                    == declaration.candidate.execution.binary_sha256,
+                "GGUF RN-F16 qualification requires the same executable for strict and candidate"
+            );
+            let kinds: BTreeSet<_> = declaration
+                .node_changes
+                .iter()
+                .map(|c| c.reference.operation_id.as_str())
+                .collect();
+            for required in [
+                "operation.dense_swiglu",
+                "operation.gated_delta_recurrent_attention.f32-master",
+                "operation.causal_paged_attention.f32-master",
+            ] {
+                ensure!(
+                    kinds.contains(required),
+                    "all-projection scope requires FFN, GDN and causal node inventory"
+                );
+            }
         }
         Ok(Self {
             declaration,
@@ -294,6 +380,12 @@ impl DeclaredNumericalTransition {
         for (index, (a, b)) in r.node_signature.iter().zip(&c.node_signature).enumerate() {
             ensure!(a.node_id == b.node_id && a.execution_semantics == b.execution_semantics,
                 "numerical transition changes ordered node topology or execution semantics at {index}");
+            if d.scope.all_projections() {
+                if let Some(expected) = d.scope.projection_operation(&a.operation_id) {
+                    ensure!(b.operation_id == expected && changes.peek().is_some_and(|change|change.node_index==index),
+                        "all-projection scope omitted or changed a strict projection at node {index}");
+                }
+            }
             if changes
                 .peek()
                 .is_some_and(|change| change.node_index == index)
@@ -340,10 +432,10 @@ impl DeclaredNumericalTransition {
             "product_output_node_usage_offset_and_layout_matched":true,
             "same_physical_plan_claimed":false,"physical_plan_equivalence_independently_recomputed":false,
             "numerical_equivalence_claimed":false,"release_approved":false,
-            "actual_route_coverage":if matches!(d.scope, NumericalScope::DenseSwiGluQ8GateUpStreamMmqV1) {
+            "actual_route_coverage":if d.scope.all_projections() || matches!(d.scope, NumericalScope::DenseSwiGluQ8GateUpStreamMmqV1) {
                 "requires_independent_completed_wave_node_evidence"
             } else { "not_established_by_profile_transition" },
-            "scope":"declared_ffn_q8_numerical_policy_fixed_history_full_vocabulary_quality_only"
+            "scope":d.scope.description()
         }))
     }
 }

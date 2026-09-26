@@ -110,6 +110,58 @@ impl<R: DeviceRuntime> ActualPreparedGuard<'_, '_, R> {
 }
 
 impl<R: DeviceRuntime> PreparedWaveSubmissionGuard for ActualPreparedGuard<'_, '_, R> {
+    fn relies_on_cost_witness(&self) -> bool {
+        matches!(
+            self.selected.expected.commitment(),
+            WaveCommitment::CostWitness(_)
+        )
+    }
+
+    fn submission_mode(&self) -> GuardedSubmissionMode {
+        match self.selected.expected.commitment() {
+            WaveCommitment::CompleteRequests(_)
+                if self.executor.on_demand_reusable_execution_enabled()
+                    && self
+                        .executor
+                        .runtime
+                        .guarded_adaptive_submission_capability()
+                        == DeviceGuardedAdaptiveCapability::CompleteRequestsOnDemand =>
+            {
+                GuardedSubmissionMode::CompleteRequestsAdaptive
+            }
+            WaveCommitment::CostWitness(expected)
+                if expected.canonical().graph
+                    == ferrum_interfaces::execution_cost::ActualWaveGraphState::ConfiguredEager
+                    && self.executor.on_demand_reusable_execution_enabled()
+                    && self
+                        .executor
+                        .runtime
+                        .guarded_adaptive_submission_capability()
+                        == DeviceGuardedAdaptiveCapability::CompleteRequestsOnDemand =>
+            {
+                GuardedSubmissionMode::ExactAdaptiveRoute
+            }
+            _ => GuardedSubmissionMode::ExactRoute,
+        }
+    }
+    fn check_adaptive_preparation(
+        &self,
+        _intent: &DeviceAdaptiveSubmissionIntent<'_>,
+        _readback: ferrum_interfaces::execution_cost::CoreReadbackRoute,
+    ) -> std::result::Result<(), GuardedNotSubmittedReason> {
+        if !matches!(
+            self.selected.expected.commitment(),
+            WaveCommitment::CompleteRequests(_)
+        ) {
+            return Err(GuardedNotSubmittedReason::ActualRouteMismatch);
+        }
+        self.check_work()?;
+        self.selected
+            .host
+            .check()
+            .map_err(GuardedNotSubmittedReason::HostRejected)
+    }
+
     fn check(
         &self,
         device: &DeviceSubmissionAttribution,
@@ -192,7 +244,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             && self.checkpoint_capture.is_none()
             && self.diagnostic_fault.is_none()
             && self.device_timing_mode() == DeviceTimingMode::Off
-            && self
+            && (self
                 .resolved_plan
                 .execution_plan()
                 .payload()
@@ -200,6 +252,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .reusable_execution()
                 .and_then(|plan| plan.program_policy())
                 .is_none()
+                || (self.on_demand_reusable_execution_enabled()
+                    && self.runtime.guarded_adaptive_submission_capability()
+                        == DeviceGuardedAdaptiveCapability::CompleteRequestsOnDemand
+                    && self.runtime.cost_direct_graph_replay_operation().is_some()))
     }
 
     pub(super) fn supports_slo_execution(&self) -> bool {

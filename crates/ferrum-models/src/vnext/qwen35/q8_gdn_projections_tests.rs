@@ -21,10 +21,7 @@ fn q8_gdn_projections_preserve_old_profiles_and_auto_preferences() {
     quantize(&mut config, "linear_attn_qkv", GgmlDType::Q5K, 176);
     provider.validate_typed_config(&config).unwrap();
     let after = provider.numerical_profiles(&config).unwrap();
-    // The explicit half-head addition advances the family catalog to 1.4.
-    // Individual existing profiles and automatic selection stay unchanged.
-    assert_eq!(before.version(), ContractVersion::new(1, 4));
-    assert_eq!(after.version(), ContractVersion::new(1, 4));
+    assert_eq!(after.version(), ContractVersion::new(1, 7));
     assert_eq!(
         after.resolve(&profile_id()).unwrap().version,
         ContractVersion::new(1, 0)
