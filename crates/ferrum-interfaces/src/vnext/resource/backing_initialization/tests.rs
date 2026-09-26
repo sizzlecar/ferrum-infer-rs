@@ -380,7 +380,6 @@ fn restore_initialization_encode_rejects_other_runtime_and_replaced_reservation(
 
 #[test]
 fn planning_pending_zero_spans_match_real_extent_encoding_and_disappear_after_success() {
-    use crate::vnext::{ResourcePlanningAvailability, ResourcePlanningLimits};
     let mut spec = checkpoint_fixture::Spec::default();
     spec.device_id = Some(
         DeviceId::new(format!(
@@ -390,14 +389,11 @@ fn planning_pending_zero_spans_match_real_extent_encoding_and_disappear_after_su
         .unwrap(),
     );
     let harness = RestoreHarness::new(spec);
-    let capture = || match harness.root.resource_planning_view(
-        &[harness.session.as_ref()],
-        ResourcePlanningLimits::default(),
-        &mut || true,
-    ) {
-        ResourcePlanningAvailability::Known(view) => view,
-        other => panic!("real idle initialization snapshot: {other:?}"),
-    };
+    // The process-wide cleanup registry can be briefly locked by another CPU
+    // fixture even though this session is idle. Use the existing bounded pure
+    // read helper; initialization still executes once and every other Unknown
+    // remains a failure. A unique test device cannot isolate that shared lock.
+    let capture = || super::planning_tests::view(&harness.root, &[harness.session.as_ref()]);
     assert!(
         harness
             .runtime

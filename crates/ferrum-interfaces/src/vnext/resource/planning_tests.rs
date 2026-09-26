@@ -8,7 +8,7 @@ fn known<T: std::fmt::Debug>(value: ResourcePlanningAvailability<T>) -> T {
     }
 }
 
-fn view(
+pub(super) fn view(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     sessions: &[&SequenceSession<TestRuntime>],
 ) -> ResourcePlanningView {
