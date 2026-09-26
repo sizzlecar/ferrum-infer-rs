@@ -9,7 +9,13 @@ use ferrum_types::{SamplingParams, TokenId};
 mod source5;
 
 async fn prepared_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
-    let (mut engine, _, executor) = fixture_with_custom_config(1, |config| {
+    prepared_session_with_width(1).await
+}
+
+async fn prepared_session_with_width(
+    width: usize,
+) -> (CalibrationSession, Arc<ControlledExecutor>) {
+    let (mut engine, _, executor) = fixture_with_custom_config(width, |config| {
         let cost = &mut config.scheduler.slo.cost_observation;
         cost.predictor = ferrum_types::SloCostPredictor::StructuredWholeWaveV2;
         cost.structured_capture = ferrum_types::SloStructuredCostCapture::HostSettledV1;
@@ -61,7 +67,7 @@ async fn prepared_session() -> (CalibrationSession, Arc<ControlledExecutor>) {
     (
         CalibrationSession::from_fresh_engine(
             engine,
-            CalibrationLimits::new(NonZeroUsize::MIN).unwrap(),
+            CalibrationLimits::new(NonZeroUsize::new(width).unwrap()).unwrap(),
         )
         .unwrap(),
         executor,

@@ -7,6 +7,7 @@ use ferrum_scheduler::implementations::continuous::cost_model::structured_v2::{
     prefixes::*, windows::*, *,
 };
 use std::num::NonZeroU64;
+mod admission;
 
 struct Source(std::path::PathBuf);
 impl Source {

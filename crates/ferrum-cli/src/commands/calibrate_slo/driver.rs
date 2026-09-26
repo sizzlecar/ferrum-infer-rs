@@ -309,6 +309,16 @@ pub(super) async fn cohort(
             prefix_progress,
             ferrum_engine::continuous_engine::PrefixReleaseProgressV5::Preparing
         );
+        if preparing_prefix && matches!(admission, CalibrationTurn::AdmittedOrMaintained) {
+            // Admission can advance one owner, maintenance or a changed-source
+            // probe. Drain that progress before offering the exact prefix
+            // cohort: queued frontiers include not-yet-selectable owners.
+            // Keep each admission artifact and the enclosing total deadline;
+            // yield also lets output actors and that deadline make progress.
+            // Every offered Wave retains its original attempt/failure gate.
+            tokio::task::yield_now().await;
+            continue;
+        }
         let prefix_frontier = if preparing_prefix {
             session.structured_prefix_release_generated_v5()?
         } else {
