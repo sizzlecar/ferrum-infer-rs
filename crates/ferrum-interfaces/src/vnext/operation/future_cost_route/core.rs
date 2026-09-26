@@ -1,3 +1,4 @@
+use super::super::cost_route::ValidatedCostRowsBuilder;
 use super::*;
 use crate::execution_cost::{
     CanonicalWaveCostBuilder, CoreReadbackRoute, CostCommandPath, CostPhysicalCommand,
@@ -93,7 +94,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     projection_rows
         .try_reserve_exact(query.rows.len())
         .map_err(|_| U::Capacity)?;
-    let mut total_tokens = 0_u64;
+    let mut validated_rows = ValidatedCostRowsBuilder::new(query.rows).map_err(|_| U::Capacity)?;
     let mut pending_initializations = Vec::new();
     let mut next = state.clone();
     let mut previous_authority = None;
@@ -108,17 +109,10 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         if *frontier != row.offset {
             return Err(U::StaleView);
         }
-        let end = row
-            .offset
-            .checked_add(row.count.get())
-            .ok_or(U::InvalidInput)?;
-        if end > row.full_input_tokens.get() {
-            return Err(U::InvalidInput);
-        }
+        // Validate exactly this immutable row at the original frontier check;
+        // later providers/transfers borrow the completed numerical summary.
+        let end = validated_rows.push_next().map_err(|_| U::InvalidInput)?;
         *frontier = end;
-        total_tokens = total_tokens
-            .checked_add(row.count.get())
-            .ok_or(U::InvalidInput)?;
         if !next.initialized[index] {
             pending_initializations
                 .try_reserve_exact(1)
@@ -165,6 +159,8 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             token_count: row.count.get(),
         });
     }
+    let validated_rows = validated_rows.finish().map_err(|_| U::InvalidInput)?;
+    let total_tokens = validated_rows.immediate_tokens();
     let projection = match resources.project_resource_wave_with_bucket(
         &view.resources,
         &state.resources,
@@ -224,9 +220,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             .execution_plan()
             .payload()
             .memory()
-            .dynamic_descriptors()
-            .iter()
-            .find(|descriptor| descriptor.base_resource_id() == resource_id)
+            .dynamic_descriptor(resource_id)
             .ok_or(U::CoreLayout)?;
         let bytes = requirement
             .evaluate_shape_bytes(shape)
@@ -261,7 +255,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         )?;
     }
     let mut input_commands =
-        super::uploads::input_transfer_bytes(resolved, query.rows, query.uploads, budget)?;
+        super::uploads::input_transfer_bytes(resolved, &validated_rows, query.uploads, budget)?;
     next.last_token_mask_uploads = None;
     if let Some(mask) = query.token_mask_input {
         if mask.contents.len() != query.rows.len() {
@@ -313,7 +307,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                 }
             }
             input_commands =
-                super::uploads::input_transfer_bytes(resolved, query.rows, &filtered, budget)?;
+                super::uploads::input_transfer_bytes(resolved, &validated_rows, &filtered, budget)?;
         }
         next.last_token_mask_uploads = Some(uploads);
     }
@@ -338,7 +332,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
     let route = providers
         .eager_cost_route_with_ranges(
             resolved,
-            query.rows,
+            &validated_rows,
             projection.physical_ranges.as_ref(),
             &mut || {
                 if budget.has_budget() {
@@ -390,7 +384,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
                 && providers
                     .future_has_only_eager_boundaries(
                         resolved,
-                        query.rows,
+                        &validated_rows,
                         projection.physical_ranges.as_ref(),
                         &mut poll_provider,
                     )
@@ -404,7 +398,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
             let (id, eager) = providers
                 .future_reusable_program_id(
                     resolved,
-                    query.rows,
+                    &validated_rows,
                     projection.physical_ranges.as_ref(),
                     layout,
                     slot,
@@ -503,7 +497,7 @@ pub fn append_complete_eager_cost_route<R: DeviceRuntime>(
         return Err(U::Capacity);
     }
     let readback_bytes =
-        super::uploads::readback_bytes(resolved, query.rows, query.readbacks, budget)?;
+        super::uploads::readback_bytes(resolved, &validated_rows, query.readbacks, budget)?;
     let readback = append_readback_route(
         capability,
         query.attempt_staged_readbacks,

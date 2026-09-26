@@ -190,17 +190,17 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         rows: &[OperationCostWorkRow],
         poll_budget: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Result<Option<SelectedEagerCostRoute<'a>>, VNextError> {
-        self.eager_cost_route_with_ranges(resolved, rows, None, poll_budget)
+        let rows = ValidatedCostRows::new(rows)?;
+        self.eager_cost_route_with_ranges(resolved, &rows, None, poll_budget)
     }
 
     pub(crate) fn eager_cost_route_with_ranges<'a>(
         &'a self,
         resolved: &dyn ExecutablePlanView,
-        rows: &[OperationCostWorkRow],
+        rows: &ValidatedCostRows<'_>,
         physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
         poll_budget: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Result<Option<SelectedEagerCostRoute<'a>>, VNextError> {
-        validate_work_rows(rows)?;
         let nodes = resolved.execution_plan().payload().nodes();
         if nodes.is_empty() || nodes.len() != self.len() || nodes.len() > MAX_COST_COMMANDS {
             return Err(invalid_operation(
@@ -603,11 +603,10 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
     pub(crate) fn future_has_only_eager_boundaries(
         &self,
         resolved: &dyn ExecutablePlanView,
-        rows: &[OperationCostWorkRow],
+        rows: &ValidatedCostRows<'_>,
         physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
         poll: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Result<bool, VNextError> {
-        validate_work_rows(rows)?;
         let plan = resolved.execution_plan();
         let nodes = plan.payload().nodes();
         if nodes.len() != self.len() || nodes.is_empty() || nodes.len() > MAX_COST_COMMANDS {
@@ -618,7 +617,7 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         for (provider, node) in self.providers().iter().zip(nodes) {
             poll()?;
             provider.validate_binding(resolved, node.id())?;
-            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)?
+            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)
                 .with_physical_ranges(physical_ranges);
             let selected = provider
                 .provider()
@@ -636,7 +635,7 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
     pub(crate) fn future_reusable_program_id(
         &self,
         resolved: &dyn ExecutablePlanView,
-        rows: &[OperationCostWorkRow],
+        rows: &ValidatedCostRows<'_>,
         physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
         layout: &crate::vnext::ProgramBindingLayout,
         slot: &crate::vnext::LaneStableArenaSlotIdentity,
@@ -645,7 +644,7 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
     ) -> Result<Option<(crate::vnext::DeviceReusableExecutionProgramId, Vec<u32>)>, VNextError>
     {
         use crate::vnext::*;
-        let tokens = validate_work_rows(rows)?;
+        let tokens = rows.immediate_tokens();
         let plan = resolved.execution_plan();
         let nodes = plan.payload().nodes();
         if nodes.len() != self.len()
@@ -664,7 +663,7 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
         for (index, (provider, node)) in self.providers().iter().zip(nodes).enumerate() {
             poll()?;
             provider.validate_binding(resolved, node.id())?;
-            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)?
+            let request = OperationCostRouteRequest::new(node, plan.payload().memory(), rows)
                 .with_physical_ranges(physical_ranges);
             let topology = match provider
                 .provider()
@@ -713,7 +712,8 @@ impl<R: DeviceRuntime> BoundOperationProviderSet<R> {
             layout.fingerprint().to_owned(),
             slot.layout_fingerprint().to_owned(),
             slot.slot_id(),
-            u32::try_from(rows.len()).map_err(|_| invalid_operation("row count overflow"))?,
+            u32::try_from(rows.rows().len())
+                .map_err(|_| invalid_operation("row count overflow"))?,
             tokens,
             0,
         )?

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "tests/dynamic_descriptor.rs"]
+mod dynamic_descriptor;
 use crate::vnext::{
     AttributeSchema, DynamicStorageAllocator, DynamicStorageView, LayoutConstraint, OracleSpec,
     ProfilePhase, ProviderExecutionSemantics, ProviderRequirement, ResourcePresenceRequirement,

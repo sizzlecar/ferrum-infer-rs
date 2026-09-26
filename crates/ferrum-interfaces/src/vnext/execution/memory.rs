@@ -1260,6 +1260,20 @@ impl MemoryPlan {
         &self.dynamic_descriptors
     }
 
+    /// Look up an immutable descriptor by its base resource identity.
+    /// Construction sorts these rows and validation (including deserialization)
+    /// requires strictly increasing IDs, so no per-query index or scan is needed.
+    /// This describes declared storage only; it grants no live resource authority.
+    pub fn dynamic_descriptor(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&DynamicResourceDescriptor> {
+        self.dynamic_descriptors
+            .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(resource_id))
+            .ok()
+            .map(|index| &self.dynamic_descriptors[index])
+    }
+
     pub fn dynamic_pools(&self) -> &[DynamicBackingPoolSpec] {
         &self.dynamic_pools
     }

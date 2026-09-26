@@ -999,13 +999,22 @@ where
         resolved: &dyn ExecutablePlanView,
         rows: &[OperationCostWorkRow],
     ) -> Result<Option<OperationCostRoute>, VNextError> {
-        self.eager_cost_route_with_ranges(resolved, rows, None)
+        // Preserve the public entrypoint's binding-before-row-error order.
+        self.validate_binding(resolved, &self.node_id)?;
+        let node = self.dispatch.node(resolved, &self.node_id)?;
+        let rows = super::cost_route::ValidatedCostRows::new(rows)?;
+        let request = OperationCostRouteRequest::new(
+            node,
+            resolved.execution_plan().payload().memory(),
+            &rows,
+        );
+        self.query_eager_cost_route(request)
     }
 
     pub(crate) fn eager_cost_route_with_ranges(
         &self,
         resolved: &dyn ExecutablePlanView,
-        rows: &[OperationCostWorkRow],
+        rows: &super::cost_route::ValidatedCostRows<'_>,
         physical_ranges: Option<&crate::vnext::ResourceCostRangeProof>,
     ) -> Result<Option<OperationCostRoute>, VNextError> {
         self.validate_binding(resolved, &self.node_id)?;
@@ -1014,11 +1023,19 @@ where
             node,
             resolved.execution_plan().payload().memory(),
             rows,
-        )?
+        )
         .with_physical_ranges(physical_ranges);
+        self.query_eager_cost_route(request)
+    }
+
+    fn query_eager_cost_route(
+        &self,
+        request: OperationCostRouteRequest<'_>,
+    ) -> Result<Option<OperationCostRoute>, VNextError> {
+        let participants = request.rows().len();
         let route = self.provider().eager_cost_route(request)?;
         if let Some(route) = &route {
-            route.validate_participants(rows.len())?;
+            route.validate_participants(participants)?;
         }
         Ok(route)
     }

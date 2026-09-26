@@ -1,11 +1,13 @@
 //! Read-only route declarations from the provider selected by a compiled plan.
 //! No buffer, request identity, allocator or submission authority is exposed.
 mod program_bindings;
+mod rows;
 mod selected;
 pub use program_bindings::{
     coalesce_sorted_program_binding_writes, ProgramBindingCostPatch, ProgramBindingCostWrite,
     ProgramBindingTransferLayout,
 };
+pub(crate) use rows::{ValidatedCostRows, ValidatedCostRowsBuilder};
 pub use selected::SelectedEagerCostRoute;
 use std::{collections::BTreeMap, num::NonZeroU64};
 
@@ -35,6 +37,7 @@ pub struct OperationCostRouteRequest<'a> {
     memory: &'a MemoryPlan,
     rows: &'a [OperationCostWorkRow],
     immediate_tokens: u64,
+    packed_starts: &'a [u64],
     physical_ranges: Option<&'a crate::vnext::ResourceCostRangeProof>,
 }
 
@@ -42,16 +45,16 @@ impl<'a> OperationCostRouteRequest<'a> {
     pub(super) fn new(
         node: &'a PlanNode,
         memory: &'a MemoryPlan,
-        rows: &'a [OperationCostWorkRow],
-    ) -> Result<Self, VNextError> {
-        let immediate_tokens = validate_work_rows(rows)?;
-        Ok(Self {
+        rows: &'a ValidatedCostRows<'a>,
+    ) -> Self {
+        Self {
             node,
             memory,
-            rows,
-            immediate_tokens,
+            rows: rows.rows(),
+            immediate_tokens: rows.immediate_tokens(),
+            packed_starts: rows.packed_starts(),
             physical_ranges: None,
-        })
+        }
     }
 
     pub(super) fn with_physical_ranges(
@@ -93,19 +96,12 @@ impl<'a> OperationCostRouteRequest<'a> {
         else {
             return Ok(None);
         };
-        let range = if let Some(descriptor) = self
-            .memory
-            .dynamic_descriptors()
-            .iter()
-            .find(|descriptor| descriptor.base_resource_id() == component.resource_id())
-        {
+        let descriptor = self.memory.dynamic_descriptor(component.resource_id());
+        let range = if let Some(descriptor) = descriptor {
             if descriptor.lifetime() != crate::vnext::AllocationLifetime::Step {
                 return Ok(None);
             }
-            let packed_start = self.rows[..participant_index]
-                .iter()
-                .map(|row| row.count.get())
-                .sum();
+            let packed_start = self.packed_starts[participant_index];
             super::buffer_view::translate_step_participant_numeric_range(
                 descriptor.demand(),
                 self.rows.len() as u32,
@@ -157,12 +153,7 @@ impl<'a> OperationCostRouteRequest<'a> {
         {
             return Ok(None);
         }
-        let Some(descriptor) = self
-            .memory
-            .dynamic_descriptors()
-            .iter()
-            .find(|d| d.base_resource_id() == component.resource_id())
-        else {
+        let Some(descriptor) = self.memory.dynamic_descriptor(component.resource_id()) else {
             return Ok(None);
         };
         if descriptor.lifetime() != crate::vnext::AllocationLifetime::Sequence
@@ -242,11 +233,7 @@ impl<'a> OperationCostRouteRequest<'a> {
         let [component] = binding.storage().components() else {
             return Ok(None);
         };
-        let descriptor = self
-            .memory
-            .dynamic_descriptors()
-            .iter()
-            .find(|descriptor| descriptor.base_resource_id() == component.resource_id());
+        let descriptor = self.memory.dynamic_descriptor(component.resource_id());
         Ok(descriptor
             .filter(|descriptor| {
                 matches!(
@@ -278,26 +265,9 @@ impl<'a> OperationCostRouteRequest<'a> {
     }
 }
 
+#[cfg(test)]
 fn validate_work_rows(rows: &[OperationCostWorkRow]) -> Result<u64, VNextError> {
-    if rows.is_empty() || rows.len() > MAX_COST_ROWS {
-        return Err(invalid_operation(
-            "cost route requires a bounded non-empty work shape",
-        ));
-    }
-    let mut immediate_tokens = 0_u64;
-    for row in rows {
-        if row
-            .offset
-            .checked_add(row.count.get())
-            .is_none_or(|end| end > row.full_input_tokens.get())
-        {
-            return Err(invalid_operation("cost route work exceeds its full input"));
-        }
-        immediate_tokens = immediate_tokens
-            .checked_add(row.count.get())
-            .ok_or_else(|| invalid_operation("cost route immediate token count overflows"))?;
-    }
-    Ok(immediate_tokens)
+    ValidatedCostRows::new(rows).map(|rows| rows.immediate_tokens())
 }
 
 /// One physical encoder command in an eager route. Host-only bindings are

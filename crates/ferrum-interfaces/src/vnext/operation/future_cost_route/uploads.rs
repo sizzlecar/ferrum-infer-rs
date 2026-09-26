@@ -2,6 +2,7 @@ use super::super::backing_upload::contiguous_upload_run_end;
 use super::super::buffer_view::{
     translate_step_participant_numeric_range, StepParticipantRangeCoordinates,
 };
+use super::super::cost_route::ValidatedCostRows;
 use super::ExecutionCostRouteUnknown as U;
 use crate::vnext::*;
 use std::ops::Range;
@@ -26,7 +27,7 @@ pub struct EagerCoreReadback<'a> {
 
 pub(super) fn input_transfer_bytes(
     resolved: &dyn ExecutablePlanView,
-    rows: &[OperationCostWorkRow],
+    rows: &ValidatedCostRows<'_>,
     uploads: &[EagerCoreInputUpload<'_>],
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<Vec<u64>, U> {
@@ -115,7 +116,7 @@ pub(super) fn input_transfer_bytes(
 
 pub(super) fn readback_bytes(
     resolved: &dyn ExecutablePlanView,
-    rows: &[OperationCostWorkRow],
+    rows: &ValidatedCostRows<'_>,
     readbacks: &[EagerCoreReadback<'_>],
     budget: &mut dyn ResourcePlanningBudget,
 ) -> Result<u64, U> {
@@ -168,9 +169,7 @@ fn contiguous_step_descriptor<'a>(
         .execution_plan()
         .payload()
         .memory()
-        .dynamic_descriptors()
-        .iter()
-        .find(|descriptor| descriptor.base_resource_id() == id)
+        .dynamic_descriptor(id)
         .ok_or(U::CoreLayout)?;
     if descriptor.lifetime() != AllocationLifetime::Step
         || descriptor.kind() != &AllocationKind::Value
@@ -183,25 +182,19 @@ fn contiguous_step_descriptor<'a>(
 
 fn project_range(
     descriptor: &DynamicResourceDescriptor,
-    rows: &[OperationCostWorkRow],
+    rows: &ValidatedCostRows<'_>,
     index: usize,
     range: Range<u64>,
     coordinates: StepParticipantRangeCoordinates,
 ) -> Result<Range<u64>, U> {
-    let row = rows.get(index).ok_or(U::InvalidInput)?;
+    let row = rows.rows().get(index).ok_or(U::InvalidInput)?;
     let end = row
         .offset
         .checked_add(row.count.get())
         .ok_or(U::InvalidInput)?;
-    let total = rows
-        .iter()
-        .try_fold(0_u64, |sum, row| sum.checked_add(row.count.get()))
-        .ok_or(U::InvalidInput)?;
-    let packed_start = rows[..index]
-        .iter()
-        .try_fold(0_u64, |sum, row| sum.checked_add(row.count.get()))
-        .ok_or(U::InvalidInput)?;
-    let sequences = u32::try_from(rows.len()).map_err(|_| U::InvalidInput)?;
+    let total = rows.immediate_tokens();
+    let packed_start = rows.packed_start(index).ok_or(U::InvalidInput)?;
+    let sequences = u32::try_from(rows.rows().len()).map_err(|_| U::InvalidInput)?;
     let translated = translate_step_participant_numeric_range(
         descriptor.demand(),
         sequences,
