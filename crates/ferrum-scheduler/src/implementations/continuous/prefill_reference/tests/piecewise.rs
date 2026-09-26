@@ -99,6 +99,51 @@ fn loaded() -> Arc<LoadedPrefillReference> {
 }
 
 #[test]
+fn piecewise_graph_reference_binds_policy_and_rejects_trial_route_drift() {
+    let bytes = builder().finish_bytes().unwrap();
+    let mut value: ReferenceCalibrationV2 = serde_json::from_slice(&bytes).unwrap();
+    let old_digest = value.piecewise.protocol_sha256(&value.protocol).unwrap();
+    value.protocol.graph_routes = ReferenceGraphRoutes::ExactObserved;
+    value.protocol.decode_shape.exact.graph_state = ProfileGraphState::Warm;
+    for sample in &mut value.decode_samples {
+        sample.observation.shape = value.protocol.decode_shape.clone();
+    }
+    for curve in &mut value.curves {
+        for shape in &mut curve.partition {
+            shape.exact.graph_state = ProfileGraphState::ConfiguredEager;
+        }
+        for trial in &mut curve.trials {
+            for (sample, shape) in trial.samples.iter_mut().zip(&curve.partition) {
+                sample.observation.shape = shape.clone();
+            }
+        }
+    }
+    let digest = value.piecewise.protocol_sha256(&value.protocol).unwrap();
+    assert_ne!(digest, old_digest);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let loaded =
+        load_prefill_reference_bytes(&bytes, &fingerprint(), digest, &Default::default()).unwrap();
+    assert_eq!(loaded.protocol(), &value.protocol);
+    assert_eq!(loaded.curve(n32(7)).unwrap().work_at(7), Some(153));
+    assert!(matches!(
+        load_prefill_reference_bytes(&bytes, &fingerprint(), old_digest, &Default::default()),
+        Err(ReferenceError::Incompatible)
+    ));
+    value.curves[0].trials[0].samples[0]
+        .observation
+        .shape
+        .exact
+        .graph_state = ProfileGraphState::Disabled;
+    assert!(load_prefill_reference_bytes(
+        &serde_json::to_vec(&value).unwrap(),
+        &fingerprint(),
+        digest,
+        &Default::default()
+    )
+    .is_err());
+}
+
+#[test]
 fn piecewise_real_segment_evidence_covers_unmeasured_lengths_and_endpoints() {
     let value = loaded();
     assert_eq!(value.piecewise_domain(), Some((n32(1), n32(10))));

@@ -80,6 +80,7 @@ fn piecewise_partition_only_changes_reference_trials_and_preserves_service_outpu
 
 pub(super) fn config() -> ReferenceConfig {
     ReferenceConfig {
+        graph_routes: Default::default(),
         piecewise: None,
         request_policy: ReferenceRequestPolicy::OriginalInput {},
         revision: NonZeroU64::MIN,
@@ -103,6 +104,31 @@ pub(super) fn manifest() -> manifest::Manifest {
         source: "training.jsonl".into(),
     };
     manifest
+}
+
+#[test]
+fn graph_reference_domain_is_explicit_and_bound_into_conditions_declaration() {
+    let mut value = config();
+    let old = serde_json::to_value(&value).unwrap();
+    assert!(old.get("graph_routes").is_none());
+    let parsed: ReferenceConfig = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(parsed.graph_routes, ReferenceGraphRoutes::DisabledOnly);
+    let before = Sha256::digest(serde_json::to_vec(&value).unwrap());
+    value.graph_routes = ReferenceGraphRoutes::ExactObserved;
+    let after = serde_json::to_vec(&value).unwrap();
+    assert_ne!(before, Sha256::digest(&after));
+    assert_eq!(
+        serde_json::from_slice::<ReferenceConfig>(&after)
+            .unwrap()
+            .graph_routes,
+        ReferenceGraphRoutes::ExactObserved
+    );
+    assert!(value
+        .validate(&manifest(), &inputs::PreparedInputs::Rendered)
+        .is_ok());
+    let mut bad = old;
+    bad["graph_routes"] = serde_json::json!("disable_actual_graph");
+    assert!(serde_json::from_value::<ReferenceConfig>(bad).is_err());
 }
 
 #[test]

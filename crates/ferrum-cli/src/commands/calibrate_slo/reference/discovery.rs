@@ -167,6 +167,7 @@ impl DiscoverySet {
             piecewise: self.config.piecewise.clone(),
             reference_revision: self.config.revision,
             protocol: ReferenceProtocolV1 {
+                graph_routes: self.config.graph_routes,
                 granule_tokens: self.config.granule_tokens,
                 repetitions: self.config.repetitions,
                 estimator: ReferenceEstimator::UpperMedianWallV1,

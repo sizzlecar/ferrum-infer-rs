@@ -741,6 +741,13 @@ receipt 会明确显示 profile 8 和模型 revision，查询标识仍显示 fam
 <!-- /calibrate-slo-reference -->
 
 `warmup` 必须显式出现；空数组声明无预热，非空时使用与普通 cohort 相同的结构。
+`graph_routes` 缺省为 `"disabled_only"`，仅接受实际禁用 graph 的路线。
+显式设置 `"graph_routes": "exact_observed"` 可保留实际观测的 Disabled、Cold、Warm
+或 ConfiguredEager 身份；后者表示已配置按需 graph、该波实际走 eager，不能改标为 Disabled。
+该选项进入测量条件与协议摘要。每个分段和 decode 单位仍在 discovery 后冻结完整路线，
+每次 trial 必须逐字段相同；冷暖变化、provider/output 变化和缺失原始证据均拒绝。
+预热次数不证明 graph 已驻留，该选项也不授予未来成本 Known 或 graph replay 资格。
+
 运行顺序固定为预热 → singleton discovery → 保存并同步完整冻结计划 → 新 owner
 singleton trials → 普通 cost training → 同一个 accepted cut 的 profile 导出、真实导入和
 reference source join → 独立 heldout。每个请求都按自己声明的完整 `max_tokens`、EOS 和 stop

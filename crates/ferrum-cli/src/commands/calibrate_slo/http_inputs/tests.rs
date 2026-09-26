@@ -131,6 +131,7 @@ impl Fixture {
         manifest.training[0].repetitions = NonZeroUsize::new(2).unwrap();
         manifest.validation[0].prompts = vec![0, 1, 2, 3];
         manifest.reference = Some(reference::ReferenceConfig {
+            graph_routes: Default::default(),
             piecewise: None,
             request_policy: serde_json::from_value(
                 serde_json::json!({"kind":"fixed_reference_output",

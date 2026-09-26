@@ -6,9 +6,48 @@ pub enum ReferenceEstimator {
     UpperMedianWallV1,
 }
 
+/// Historical routes allowed in the frozen reference. This does not predict
+/// graph residency or grant a future execution permit. Every trial must still
+/// match its complete declared shape and original committed source record.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceGraphRoutes {
+    #[default]
+    DisabledOnly,
+    ExactObserved,
+}
+impl ReferenceGraphRoutes {
+    pub fn is_disabled_only(&self) -> bool {
+        *self == Self::DisabledOnly
+    }
+    pub(super) fn accepts(self, graph: ProfileGraphState) -> bool {
+        match (self, graph) {
+            (Self::DisabledOnly, ProfileGraphState::Disabled)
+            | (
+                Self::ExactObserved,
+                ProfileGraphState::Disabled
+                | ProfileGraphState::Cold
+                | ProfileGraphState::Warm
+                | ProfileGraphState::ConfiguredEager,
+            ) => true,
+            (
+                Self::DisabledOnly,
+                ProfileGraphState::Cold
+                | ProfileGraphState::Warm
+                | ProfileGraphState::ConfiguredEager,
+            ) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceProtocolV1 {
+    #[serde(
+        default,
+        skip_serializing_if = "ReferenceGraphRoutes::is_disabled_only"
+    )]
+    pub graph_routes: ReferenceGraphRoutes,
     pub granule_tokens: NonZeroU32,
     /// Predeclared repetitions, not a statistical quality guarantee.
     pub repetitions: NonZeroUsize,

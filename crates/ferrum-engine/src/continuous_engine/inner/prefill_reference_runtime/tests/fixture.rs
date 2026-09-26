@@ -134,6 +134,7 @@ pub(super) fn artifact() -> ReferenceCalibrationV1 {
 fn artifact_with_lengths(granule: u32, lengths: &[u32]) -> ReferenceCalibrationV1 {
     let decode = shape(ActualRowWork::Decode { kv_tokens: 4 });
     let protocol = ReferenceProtocolV1 {
+        graph_routes: Default::default(),
         granule_tokens: n32(granule),
         repetitions: NonZeroUsize::new(1).unwrap(),
         estimator: ReferenceEstimator::UpperMedianWallV1,

@@ -11,7 +11,7 @@ use ferrum_engine::continuous_engine::{
 };
 use ferrum_interfaces::execution_cost::ActualRowWork;
 use ferrum_scheduler::implementations::continuous::prefill_reference::{
-    PiecewiseReferenceSpec, ReferenceEstimator, ReferenceProtocolV1,
+    PiecewiseReferenceSpec, ReferenceEstimator, ReferenceGraphRoutes, ReferenceProtocolV1,
 };
 use ferrum_types::{FerrumError, Result, SloPrefillReferenceLimits};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,12 @@ pub(super) use request_policy::{InputIdentityLedger, ReferenceRequestPolicy};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReferenceConfig {
+    /// Historical route domain, bound to the complete frozen protocol.
+    #[serde(
+        default,
+        skip_serializing_if = "ReferenceGraphRoutes::is_disabled_only"
+    )]
+    pub graph_routes: ReferenceGraphRoutes,
     /// Independent reference requests only; training/heldout always keep the source policy.
     #[serde(default)]
     pub request_policy: ReferenceRequestPolicy,

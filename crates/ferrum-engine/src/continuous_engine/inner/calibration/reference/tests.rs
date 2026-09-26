@@ -2,7 +2,7 @@
 use super::*;
 use crate::continuous_engine::inner::cost_observation::{EngineCostClock, EngineCostRuntime};
 use ferrum_scheduler::implementations::continuous::prefill_reference::{
-    load_prefill_reference, ReferenceEstimator, ReferenceProtocolV1,
+    load_prefill_reference, ReferenceEstimator, ReferenceGraphRoutes, ReferenceProtocolV1,
 };
 use std::{num::NonZeroU64, path::PathBuf};
 
@@ -146,6 +146,7 @@ async fn discovery(
         piecewise: None,
         reference_revision: NonZeroU64::MIN,
         protocol: ReferenceProtocolV1 {
+            graph_routes: Default::default(),
             granule_tokens: NonZeroU32::MIN,
             repetitions: NonZeroUsize::MIN,
             estimator: ReferenceEstimator::UpperMedianWallV1,
@@ -297,6 +298,46 @@ async fn reference_freeze_rejects_changed_discovery_partition() {
     plan.curves[0].partition.swap(0, 1);
     assert!(freeze(&mut session, plan, discovered).await.is_err());
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_graph_policy_freezes_only_the_complete_actual_discovery_route() {
+    for changed_route in [false, true] {
+        let directory = Directory::new();
+        let (mut session, executor) = observed_fixture(&directory).await;
+        let (mut plan, discovery, _) = discovery(&mut session, &executor).await;
+        plan.protocol.graph_routes = ReferenceGraphRoutes::ExactObserved;
+        if changed_route {
+            plan.protocol.decode_shape.exact.graph_state =
+                ferrum_scheduler::implementations::continuous::cost_profile::ProfileGraphState::Warm;
+            assert!(freeze(&mut session, plan, discovery).await.is_err());
+        } else {
+            let expected_hash = plan.protocol_sha256().unwrap();
+            let mut collector = freeze(&mut session, plan, discovery).await.unwrap();
+            trial(
+                &mut session,
+                &executor,
+                &mut collector,
+                CalibrationReferenceTrial::Prefill {
+                    curve: 0,
+                    repetition: 0,
+                },
+            )
+            .await;
+            trial(
+                &mut session,
+                &executor,
+                &mut collector,
+                CalibrationReferenceTrial::Decode { repetition: 0 },
+            )
+            .await;
+            let model = export(&mut session, directory.cut()).await.unwrap();
+            let output = directory.0.join("exact-graph-reference.json");
+            let receipt = collector.finish(model.artifact(), &output).unwrap();
+            assert_eq!(receipt.protocol_sha256, expected_hash);
+        }
+        session.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

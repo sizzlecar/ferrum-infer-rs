@@ -268,6 +268,7 @@ pub(super) fn compile_partitioned(
             };
             let end = offset.checked_add(count).ok_or(ReferenceError::Overflow)?;
             validate_shape(
+                protocol.graph_routes,
                 shape,
                 &protocol.prefill_host,
                 ActualRowWork::Prefill {
@@ -410,6 +411,7 @@ fn validate_protocol(protocol: &ReferenceProtocolV1) -> Result<(), ReferenceErro
         ));
     }
     validate_shape(
+        protocol.graph_routes,
         &protocol.decode_shape,
         &protocol.decode_host,
         ActualRowWork::Decode {
@@ -419,13 +421,14 @@ fn validate_protocol(protocol: &ReferenceProtocolV1) -> Result<(), ReferenceErro
 }
 
 fn validate_shape(
+    graph_routes: ReferenceGraphRoutes,
     shape: &ProfileWaveShapeV2,
     host: &HostCostFeaturesV1,
     work: ActualRowWork,
 ) -> Result<(), ReferenceError> {
     let exact = &shape.exact;
     if exact.path != ProfileExecutionPath::PlanRuntime
-        || exact.graph_state != ProfileGraphState::Disabled
+        || !graph_routes.accepts(exact.graph_state)
         || exact.order != ProfileBatchOrder::Ordered
         || exact.provider_signature == [0; 32]
         || exact.output_policy_signature == [0; 32]

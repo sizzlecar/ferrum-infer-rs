@@ -36,6 +36,7 @@ fn discovery_manifest_has_no_model_destination_and_preserves_complete_budgets() 
     // Discovery cannot accidentally invoke the reference request-budget policy.
     invalid = parsed.clone();
     invalid.reference = Some(reference::ReferenceConfig {
+        graph_routes: Default::default(),
         request_policy: Default::default(),
         revision: std::num::NonZeroU64::MIN,
         artifact_path: "reference.json".into(),

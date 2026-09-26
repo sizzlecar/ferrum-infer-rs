@@ -131,6 +131,7 @@ fn sample(
 fn artifact() -> ReferenceCalibrationV1 {
     let decode_shape = shape(ActualRowWork::Decode { kv_tokens: 10 });
     let protocol = ReferenceProtocolV1 {
+        graph_routes: Default::default(),
         granule_tokens: n32(4),
         repetitions: nz(3),
         estimator: ReferenceEstimator::UpperMedianWallV1,
@@ -560,3 +561,6 @@ fn builder_rejects_incomplete_repetitions_and_duplicate_lengths() {
 
 #[path = "tests/piecewise.rs"]
 mod piecewise;
+
+#[path = "tests/graph_routes.rs"]
+mod graph_routes;
