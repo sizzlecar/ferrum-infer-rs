@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
+use ferrum_interfaces::execution_cost::{SelectedReplayAlgorithmTemplateV1, MAX_COST_COMMANDS};
 use ferrum_interfaces::vnext::{
     DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
     DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
@@ -277,6 +278,7 @@ impl fmt::Display for CudaReplayError {
 }
 
 struct CudaExecutableSegment {
+    library_cost: super::vnext_ops::CapturedCublasCostContract,
     key: CudaExecutableSegmentKey,
     graph: sys::CUgraph,
     executable: sys::CUgraphExec,
@@ -285,6 +287,8 @@ struct CudaExecutableSegment {
     _blas: Arc<CudaBlas>,
     _executables: Vec<Arc<CudaCommandExecutable>>,
     command_graph_node_counts: Option<Arc<[u32]>>,
+    // Sealed at actual successful capture, not reconstructed during register.
+    selected_replay_templates: Option<Box<[Option<SelectedReplayAlgorithmTemplateV1>]>>,
     uploaded: bool,
     last_used: u64,
     profile_identity: OnceLock<CudaExecutableProfileIdentity>,
@@ -640,6 +644,7 @@ impl CudaExecutableSegment {
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
+        blas_cost_identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
         commands: &[CudaDeviceCommand],
         last_used: u64,
     ) -> Result<Self, CudaReplayError> {
@@ -743,15 +748,41 @@ impl CudaExecutableSegment {
                 true,
             ));
         }
+        let library_requirement = commands.iter().fold(
+            super::vnext_ops::CublasCostRequirement::NotRequired,
+            |prior, command| prior.merge(command.cublas_cost_requirement()),
+        );
         Ok(Self {
+            library_cost: super::vnext_ops::CapturedCublasCostContract::new(
+                library_requirement,
+                blas_cost_identity,
+            ),
             key,
             graph,
+
             executable,
             context: Arc::clone(context),
             _stream: Arc::clone(stream),
             _blas: Arc::clone(blas),
             _executables: commands.iter().map(CudaDeviceCommand::executable).collect(),
             command_graph_node_counts,
+            selected_replay_templates: (commands.len() <= MAX_COST_COMMANDS
+                && commands
+                    .iter()
+                    .any(|command| command.selected_replay_template().is_some()))
+            .then(|| {
+                commands
+                    .iter()
+                    .map(|command| {
+                        command
+                            .cublas_cost_requirement()
+                            .matches_observed(blas_cost_identity)
+                            .then(|| command.selected_replay_template())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            }),
             uploaded: false,
             last_used,
             profile_identity: OnceLock::new(),
@@ -1121,6 +1152,52 @@ impl CudaExecutableCache {
         )
     }
 
+    /// Complete numeric inventory captured under the owning lane's read bracket.
+    /// The builder bounds and polls every copied descriptor/command; this read
+    /// neither changes warmup/LRU nor retains executable or resource authority.
+    pub(crate) fn cost_reusable_graph_catalog(
+        &self,
+        limits: ferrum_interfaces::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), ferrum_interfaces::vnext::VNextError>,
+    ) -> Result<ferrum_interfaces::vnext::DeviceCostGraphCatalog, CudaDeviceRuntimeError> {
+        use ferrum_interfaces::vnext::DeviceCostGraphCatalogBuilder;
+        let contract = |error: ferrum_interfaces::vnext::VNextError| {
+            CudaDeviceRuntimeError::contract(error.to_string())
+        };
+        poll().map_err(contract)?;
+        let state = self.cost_graph_stream_state().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA graph catalog state is not representable")
+        })?;
+        let mut builder = DeviceCostGraphCatalogBuilder::new(state, limits).map_err(contract)?;
+        for program in self.programs.values() {
+            poll().map_err(contract)?;
+            builder
+                .push_program(&program.descriptor, poll)
+                .map_err(contract)?;
+            for segment in &program.segments {
+                poll().map_err(contract)?;
+                let Some(executable) = self.entries.get(&segment.key) else {
+                    continue;
+                };
+                if !executable.uploaded {
+                    continue;
+                }
+                let Some(logical) = segment.logical_commands.as_deref() else {
+                    continue;
+                };
+                builder
+                    .push_uploaded_segment(
+                        &segment.descriptor,
+                        segment.reusable_executable_fingerprint.as_ref(),
+                        logical,
+                        poll,
+                    )
+                    .map_err(contract)?;
+            }
+        }
+        builder.finish(poll).map_err(contract)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -1180,6 +1257,27 @@ impl CudaExecutableCache {
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
+        commands: &[CudaDeviceCommand],
+        candidates: &[CudaExecutableCandidate],
+        capture_allowed: bool,
+    ) -> Result<CudaExecutablePreparation, CudaReplayError> {
+        self.prepare_all_with_library_identity(
+            context,
+            stream,
+            blas,
+            None,
+            commands,
+            candidates,
+            capture_allowed,
+        )
+    }
+
+    pub(crate) fn prepare_all_with_library_identity(
+        &mut self,
+        context: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        blas: &Arc<CudaBlas>,
+        blas_cost_identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
         commands: &[CudaDeviceCommand],
         candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
@@ -1315,6 +1413,7 @@ impl CudaExecutableCache {
                 context,
                 stream,
                 blas,
+                blas_cost_identity,
                 candidate.commands(commands),
                 now,
             ) {
@@ -1519,11 +1618,22 @@ impl CudaExecutableCache {
                         .zip(counts)
                         .enumerate()
                         .map(|(ordinal, ((command, node_index), graph_node_count))| {
-                            command.replayed_logical_attribution(
-                                u32::try_from(ordinal).ok()?,
-                                (*node_index)?,
-                                *graph_node_count,
-                            )
+                            command
+                                .replayed_logical_attribution(
+                                    u32::try_from(ordinal).ok()?,
+                                    (*node_index)?,
+                                    *graph_node_count,
+                                )
+                                .map(|logical| {
+                                    logical.with_captured_replay_template(
+                                        resident
+                                            .selected_replay_templates
+                                            .as_deref()
+                                            .and_then(|templates| templates.get(ordinal))
+                                            .copied()
+                                            .flatten(),
+                                    )
+                                })
                         })
                         .collect::<Option<Vec<_>>>()
                 })
@@ -1683,6 +1793,67 @@ impl CudaExecutableCache {
         Ok(catalog)
     }
 
+    /// Reads the exact metadata that launch_program_segment will consume. This
+    /// neither advances LRU/warmup nor captures, uploads, launches or retains a
+    /// physical resource. The caller holds the owning stream exclusively from
+    /// this check through the final guard and launch.
+    /// Checks the actual handle retained by the selected resident segment.
+    /// It never substitutes the caller's current stream/handle observation.
+    pub(crate) fn program_library_cost_is_valid(
+        &self,
+        invocation: &DeviceReusableExecutionInvocation,
+    ) -> bool {
+        let Some(program) = self.programs.get(invocation.program_id()) else {
+            return false;
+        };
+        let Some(segment) = program
+            .segments
+            .get(invocation.segment().ordinal() as usize)
+        else {
+            return false;
+        };
+        if &segment.descriptor != invocation.segment() {
+            return false;
+        }
+        self.entries
+            .get(&segment.key)
+            .is_some_and(|entry| entry.library_cost.is_valid())
+    }
+
+    pub(crate) fn preview_program_segment(
+        &self,
+        invocation: &DeviceReusableExecutionInvocation,
+        physical_command_index: u32,
+    ) -> Option<ferrum_interfaces::vnext::DeviceReplayedSegmentAttribution> {
+        let program = self.programs.get(invocation.program_id())?;
+        let segment = program
+            .segments
+            .get(invocation.segment().ordinal() as usize)?;
+        if &segment.descriptor != invocation.segment() {
+            return None;
+        }
+        let executable = self.entries.get(&segment.key)?;
+        if !executable.uploaded {
+            return None;
+        }
+        ferrum_interfaces::vnext::DeviceReplayedSegmentAttribution::new(
+            physical_command_index,
+            invocation.program_id().clone(),
+            segment.descriptor.clone(),
+            segment.reusable_executable_fingerprint.to_string(),
+            invocation
+                .bind_replayed_cost_evidence(segment.logical_commands.as_ref()?.as_ref())
+                .unwrap_or_else(|| {
+                    segment
+                        .logical_commands
+                        .as_ref()
+                        .expect("checked above")
+                        .as_ref()
+                        .to_vec()
+                }),
+        )
+    }
+
     pub(crate) fn launch_program_segment(
         &mut self,
         stream: &CudaStream,
@@ -1712,7 +1883,12 @@ impl CudaExecutableCache {
                 segment
                     .logical_commands
                     .as_ref()
-                    .map(Arc::clone)
+                    .map(|sealed| {
+                        invocation
+                            .bind_replayed_cost_evidence(sealed.as_ref())
+                            .map(Arc::from)
+                            .unwrap_or_else(|| Arc::clone(sealed))
+                    })
                     .ok_or_else(|| CudaReplayError {
                         stage: "launch reusable execution program",
                         detail: "sealed program segment lacks logical graph-node attribution"

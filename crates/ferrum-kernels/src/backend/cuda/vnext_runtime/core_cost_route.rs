@@ -9,6 +9,7 @@ use ferrum_interfaces::vnext::{
     ProgramBindingCostWrite, ProgramBindingLayout, VNextError, DEVICE_ZERO_NATIVE_OPERATION_ID,
     HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
+use ferrum_types::SloStructuredCostCapture;
 
 pub(super) const PROGRAM_BINDING_NATIVE_OPERATION: &str = "vnext_program_binding_prelude";
 
@@ -16,6 +17,7 @@ pub(super) fn coalesced_program_binding(
     layout: &ProgramBindingLayout,
     patches: &[ProgramBindingCostPatch<'_>],
     poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    capture: SloStructuredCostCapture,
 ) -> Result<OperationCostCommand, CudaDeviceRuntimeError> {
     project_binding_slots(
         layout.physical_size_bytes(),
@@ -28,6 +30,7 @@ pub(super) fn coalesced_program_binding(
         }),
         patches,
         poll,
+        capture,
     )
 }
 
@@ -36,6 +39,7 @@ fn project_binding_slots(
     slots: impl ExactSizeIterator<Item = (usize, u64, u64)>,
     patches: &[ProgramBindingCostPatch<'_>],
     poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    capture: SloStructuredCostCapture,
 ) -> Result<OperationCostCommand, CudaDeviceRuntimeError> {
     use ferrum_interfaces::execution_cost::MAX_COST_COMMANDS;
     let invalid = || {
@@ -98,7 +102,7 @@ fn project_binding_slots(
     writes.sort_unstable_by_key(|write| write.offset_bytes());
     let transfers = coalesce_sorted_program_binding_writes(&writes, arena_size_bytes, poll)
         .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
-    OperationCostCommand::new(
+    let command = OperationCostCommand::new(
         PROGRAM_BINDING_NATIVE_OPERATION,
         DeviceCommandPhase::DynamicBinding,
         DeviceBatchingForm::ParticipantLoop,
@@ -108,7 +112,22 @@ fn project_binding_slots(
         0,
         transfers.len() as u64,
     )
-    .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))
+    .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+    let evidence = super::selected_cost::program_binding(
+        transfers
+            .iter()
+            .map(|t| (t.destination_stride_bytes, t.row_bytes, t.row_count as u64)),
+        first.token_count(),
+        capture,
+    );
+    poll().map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+    Ok(match evidence {
+        Some(evidence) => command
+            .clone()
+            .with_statistical_evidence(evidence)
+            .unwrap_or(command),
+        None => command,
+    })
 }
 
 pub(super) fn capabilities() -> DeviceCoreCostCapabilities {

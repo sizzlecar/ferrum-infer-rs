@@ -43,9 +43,11 @@ impl CudaDeviceRuntime {
         if guard.is_some()
             && (timing_mode != DeviceTimingMode::Off
                 || !logical_attribution
-                || reusable_execution_capture.is_some()
-                || !stream.state.is_quiescent()
-                || !graph_before.is_some_and(|state| state.is_unconfigured_empty()))
+                || (reusable_execution_capture.is_some()
+                    && guard.is_some_and(|gate| {
+                        gate.submission_mode() != GuardedSubmissionMode::CompleteRequestsAdaptive
+                    }))
+                || !stream.state.is_quiescent())
         {
             // Reject before graph preparation could enqueue any work.
             return Err(GuardedDeviceSubmissionError::Rejected(
@@ -117,10 +119,33 @@ impl CudaDeviceRuntime {
                 .map(|(_, node_index, _)| *node_index)
                 .collect::<Vec<_>>()
         });
-        let commands = entries
+        let mut commands = entries
             .into_iter()
             .map(|(_, _, command)| command)
             .collect::<Vec<_>>();
+        // Read only lifecycle observations. No cuBLAS getter or mutable handle
+        // policy operation belongs in this per-wave submission path.
+        let mut library_contract_valid = true;
+        for command in &mut commands {
+            let valid = if let Some(invocation) = command.reusable_execution_invocation() {
+                stream
+                    .executable_cache
+                    .program_library_cost_is_valid(invocation)
+            } else {
+                command
+                    .library_cost_requirement
+                    .matches_observed(stream.blas_cost_identity)
+            };
+            if !valid {
+                library_contract_valid = false;
+                command.statistical_evidence = None;
+            }
+        }
+        if !library_contract_valid && guard.is_some_and(|gate| gate.relies_on_cost_witness()) {
+            return Err(GuardedDeviceSubmissionError::Rejected(
+        ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
+    ));
+        }
         let physical_span_attribution = timing_mode.physical_span_attribution_enabled();
         let kernel_attribution = timing_mode.kernel_attribution_enabled();
         let native_attribution = kernel_attribution || logical_attribution;
@@ -257,11 +282,121 @@ impl CudaDeviceRuntime {
             | DeviceComputePathRequirement::ReplayedOnly
             | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
         };
+        // A guarded resident path does not run adaptive preparation. In
+        // particular, a missing graph must not mutate warmup/LRU or enqueue
+        // cuGraphUpload before a possible NotSubmitted result.
+        let adaptive_guarded = guard.is_some_and(|gate| {
+            gate.submission_mode() == GuardedSubmissionMode::CompleteRequestsAdaptive
+        }) && compute_path_requirement
+            == DeviceComputePathRequirement::Adaptive
+            && !contains_direct_execution
+            && graph_before.is_some_and(|state| {
+                state.configuration() == DeviceCostGraphConfiguration::OnDemand && state.is_ready()
+            });
+        let guarded_replays = if guard.is_some() && !adaptive_guarded {
+            let empty = graph_before.is_some_and(|state| state.is_unconfigured_empty());
+            let warm = graph_before.is_some_and(|state| state.is_ready())
+                && contains_direct_execution
+                && executable_candidates.is_empty();
+            let configured_eager = compute_path_requirement
+                == DeviceComputePathRequirement::Adaptive
+                && !contains_direct_execution
+                && reusable_execution_capture.is_none()
+                && executable_candidates.is_empty()
+                && graph_before.is_some_and(|state| {
+                    state.is_ready()
+                        && state.configuration() == DeviceCostGraphConfiguration::OnDemand
+                });
+            if !empty && !warm && !configured_eager {
+                return Err(GuardedDeviceSubmissionError::Rejected(
+                    ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
+                ));
+            }
+            let preview = commands
+                .iter()
+                .enumerate()
+                .filter_map(|(index, command)| {
+                    command.reusable_execution_invocation().map(|invocation| {
+                        stream
+                            .executable_cache
+                            .preview_program_segment(invocation, index as u32)
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(preview) = preview else {
+                return Err(GuardedDeviceSubmissionError::Rejected(
+                    ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
+                ));
+            };
+            for replay in &preview {
+                let index = replay.physical_command_index() as usize;
+                let Some(count) = replay
+                    .logical_commands()
+                    .iter()
+                    .try_fold(0_u64, |count, row| {
+                        count.checked_add(row.reusable_graph_node_count())
+                    })
+                else {
+                    return Err(GuardedDeviceSubmissionError::Rejected(
+                        ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,
+                    ));
+                };
+                execution_paths
+                    .as_mut()
+                    .expect("guard requires attribution")[index] = DeviceExecutionPath::Replayed;
+                reusable_graph_node_counts
+                    .as_mut()
+                    .expect("guard requires attribution")[index] = Some(count);
+            }
+            Some(preview)
+        } else {
+            None
+        };
+        // The intent describes encoded work only, never a fabricated warm route.
+        // Build and validate it before the authorization/irreversible boundary.
+        let adaptive_encoded = if adaptive_guarded {
+            Some(
+                cuda_submission_attribution(
+                    &command_phases,
+                    command_node_indices
+                        .as_deref()
+                        .expect("guard requires attribution"),
+                    &commands,
+                    execution_paths.as_deref().expect("guard requires paths"),
+                    reusable_graph_node_counts.as_deref(),
+                    Vec::new(),
+                )
+                .map_err(DefinitelyNotSubmitted::new)?,
+            )
+        } else {
+            None
+        };
         let capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {
             return Err(GuardedDeviceSubmissionError::Device(
                 DefinitelyNotSubmitted::new(error),
             ));
+        }
+        if let Some(encoded) = adaptive_encoded.as_ref() {
+            let Some(intent) = DeviceAdaptiveSubmissionIntent::new(
+                encoded,
+                graph_before.expect("adaptive graph state"),
+                reusable_execution_capture.as_ref(),
+            ) else {
+                stream.state.cancel_recording();
+                return Err(GuardedDeviceSubmissionError::Rejected(ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable));
+            };
+            if let Err(reason) = guard
+                .expect("adaptive guard")
+                .check_adaptive_preparation(&intent)
+            {
+                stream.state.cancel_recording();
+                return Err(GuardedDeviceSubmissionError::Rejected(reason));
+            }
+            // Successful CompleteRequests authorization is one submission attempt.
+            // From here onward every failure retains fence/indeterminate ownership.
+            // There is deliberately no second check or NotSubmitted return after
+            // prepare_all might have uploaded a graph or executed provider work.
         }
         let mut replay_observation = DeviceReusableExecutionObservation::default();
         if S::ENABLED {
@@ -269,21 +404,27 @@ impl CudaDeviceRuntime {
                 replay_observation.observe_candidate_segment();
             }
         }
-        let preparation = match stream.executable_cache.prepare_all(
-            &self.context,
-            &stream.stream,
-            &stream.blas,
-            &commands,
-            &executable_candidates,
-            capture_allowed,
-        ) {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                stream.state.fail();
-                self.quarantine(stream, commands);
-                panic!(
+        let preparation = if guard.is_some() && !adaptive_guarded {
+            // Resident previews above prove no preparation is required.
+            crate::backend::cuda::vnext_replay::CudaExecutablePreparation::default()
+        } else {
+            match stream.executable_cache.prepare_all_with_library_identity(
+                &self.context,
+                &stream.stream,
+                &stream.blas,
+                stream.blas_cost_identity,
+                &commands,
+                &executable_candidates,
+                capture_allowed,
+            ) {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    stream.state.fail();
+                    self.quarantine(stream, commands);
+                    panic!(
                     "CUDA submission became indeterminate while preparing reusable executables: {error}"
                 );
+                }
             }
         };
         if S::ENABLED {
@@ -350,8 +491,14 @@ impl CudaDeviceRuntime {
                 replayed_segments,
             )
         };
-        let guarded_attribution = if guard.is_some() {
-            let evidence = graph_evidence(0).filter(|proof| proof.proves_unconfigured_eager());
+        let guarded_attribution = if guard.is_some() && !adaptive_guarded {
+            let evidence =
+                graph_evidence(guarded_replays.as_ref().map_or(0, |rows| rows.len() as u64))
+                    .filter(|proof| {
+                        proof.proves_unconfigured_eager()
+                            || proof.proves_warm_direct_replay()
+                            || proof.proves_configured_eager_observation()
+                    });
             let attribution = command_node_indices
                 .as_deref()
                 .zip(execution_paths.as_deref())
@@ -362,7 +509,10 @@ impl CudaDeviceRuntime {
                         &commands,
                         paths,
                         reusable_graph_node_counts.as_deref(),
-                        Vec::new(),
+                        guarded_replays
+                            .as_ref()
+                            .expect("guard preview exists")
+                            .clone(),
                     )
                     .ok()
                 })
@@ -406,10 +556,29 @@ impl CudaDeviceRuntime {
         let mut index = 0;
         let mut executable_candidate_index = 0;
         let mut actual_replayed_segments = 0_u64;
-        if let Some(guard) = guard {
+        if let Some(guard) = guard.filter(|_| !adaptive_guarded) {
             // All blocking context/preparation work and host attribution
             // allocation is complete. Recheck the exact cache before enqueue.
-            if stream.executable_cache.cost_graph_stream_state() != graph_after_preparation {
+            let previews_match = guarded_replays.as_ref().is_some_and(|expected| {
+                let mut index = 0;
+                for (physical, command) in commands.iter().enumerate() {
+                    if let Some(invocation) = command.reusable_execution_invocation() {
+                        if stream
+                            .executable_cache
+                            .preview_program_segment(invocation, physical as u32)
+                            .as_ref()
+                            != expected.get(index)
+                        {
+                            return false;
+                        }
+                        index += 1;
+                    }
+                }
+                index == expected.len()
+            });
+            if !previews_match
+                || stream.executable_cache.cost_graph_stream_state() != graph_after_preparation
+            {
                 stream.state.cancel_recording();
                 return Err(GuardedDeviceSubmissionError::Rejected(
                     ferrum_interfaces::execution_cost::GuardedNotSubmittedReason::AttributionUnavailable,

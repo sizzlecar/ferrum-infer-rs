@@ -274,3 +274,6 @@ fn on_demand_logical_catalog_is_bounded_and_stale_references_miss_before_launch(
     }
     assert_eq!(h.stream.clone_dtoh(h.counter.as_ref()).unwrap(), vec![2]);
 }
+
+#[path = "on_demand_tests/fence_lifetime.rs"]
+mod fence_lifetime;

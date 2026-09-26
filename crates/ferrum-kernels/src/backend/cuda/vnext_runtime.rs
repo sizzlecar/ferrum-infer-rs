@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use cudarc::cublas::{result::CublasError, CudaBlas};
@@ -23,12 +23,13 @@ use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 #[cfg(feature = "vllm-marlin")]
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
-    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBatchingForm,
-    DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
-    DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
+    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
+    DeviceAdaptiveSubmissionIntent, DeviceBatchingForm, DeviceBufferRetention, DeviceClass,
+    DeviceCommandBatch, DeviceCommandEntry, DeviceCommandLogicalWork, DeviceCommandPhase,
+    DeviceComputePathRequirement, DeviceCostGraphConfiguration, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
-    DeviceNativeWorkAttribution, DeviceReplayedLogicalCommandAttribution,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceGuardedAdaptiveCapability, DeviceId,
+    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceReplayedLogicalCommandAttribution,
     DeviceReplayedSegmentAttribution, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
     DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
     DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
@@ -39,10 +40,11 @@ use ferrum_interfaces::vnext::{
     DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
     DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery,
-    GuardedDeviceSubmissionError, HostTransferLayout, PreparedDeviceSubmissionReadback,
-    ProgramBindingNodeBinding, RetainedHostMemoryRegion, StaticWeightTransformPlan,
-    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
-    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
+    GuardedDeviceSubmissionError, GuardedSubmissionMode, HostTransferLayout,
+    PreparedDeviceSubmissionReadback, ProgramBindingNodeBinding, RetainedHostMemoryRegion,
+    StaticWeightTransformPlan, StaticWeightTransformRequest, StreamState, VNextError,
+    DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::AttentionExecutionPolicy;
 
@@ -50,7 +52,13 @@ use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, Cuda
 use super::vnext_tool_correlation;
 
 mod core_cost_route;
+mod cost_identity;
+mod device_memory;
+mod nvml;
+pub(crate) mod selected_cost;
 mod submission;
+#[cfg(test)]
+mod submission_guard_tests;
 mod submission_readback;
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -168,6 +176,9 @@ impl Error for CudaDeviceRuntimeError {
 
 struct CudaAllocation {
     _base: CudaSlice<u8>,
+    // One opt-in charge for this base allocation, after the owning CudaSlice
+    // so its drop enqueues the real free before this handle count decreases.
+    _memory_charge: Option<device_memory::allocation::AllocationCharge>,
     aligned_ptr: cudarc::driver::sys::CUdeviceptr,
     requested_bytes: u64,
 }
@@ -419,7 +430,14 @@ fn coalesce_program_binding_transfers(
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
+    library_cost_requirement: super::vnext_ops::CublasCostRequirement,
     completion_checks: Vec<Arc<CudaCompletionReadback>>,
+    statistical_evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+    core_transfer: Option<(
+        ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        u64,
+        ferrum_types::SloStructuredCostCapture,
+    )>,
     runtime_instance: u64,
     operation: &'static str,
     batching_form: DeviceBatchingForm,
@@ -762,6 +780,9 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         })
     }
 
@@ -805,6 +826,9 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         })
     }
 
@@ -837,6 +861,9 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         }
     }
 
@@ -902,7 +929,61 @@ impl CudaDeviceCommand {
             }),
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         })
+    }
+
+    /// Declares the API identity needed by a library-backed cost witness. This
+    /// is retained even when selected evidence is unavailable or disabled.
+    pub(crate) fn with_cublas_cost_requirement(
+        mut self,
+        identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
+    ) -> Self {
+        self.library_cost_requirement = super::vnext_ops::CublasCostRequirement::Required(
+            identity.filter(|_| {
+                self.statistical_evidence.as_ref()
+                    .and_then(|evidence| evidence.algorithm_work().and_then(Result::ok))
+                    .is_some_and(|work| work.entries().iter().any(|entry| entry.kind() == ferrum_interfaces::execution_cost::AlgorithmWorkKindV1::LibraryCall))
+            }),
+        );
+        self
+    }
+
+    pub(crate) fn cublas_cost_requirement(&self) -> super::vnext_ops::CublasCostRequirement {
+        self.library_cost_requirement
+    }
+
+    /// Passive evidence never changes submission permission or inference output.
+    pub(crate) fn with_statistical_evidence(
+        mut self,
+        evidence: Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>,
+    ) -> Self {
+        self.statistical_evidence = evidence.filter(|value| {
+            value
+                .validate_command(
+                    self.token_count,
+                    self.compute_dispatch_count,
+                    self.transfer_command_count,
+                )
+                .is_ok()
+        });
+        self
+    }
+
+    fn with_core_transfer(
+        mut self,
+        kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        bytes: u64,
+        capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
+        if capture.is_disabled() {
+            return self;
+        }
+        self.core_transfer = Some((kind, bytes, capture));
+        self.statistical_evidence = selected_cost::transfer(kind, bytes, self.token_count, capture);
+        self
     }
 
     pub(crate) fn with_work_attribution(
@@ -955,6 +1036,10 @@ impl CudaDeviceCommand {
         self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
+        if let Some((kind, bytes, capture)) = self.core_transfer {
+            self.statistical_evidence =
+                selected_cost::transfer(kind, bytes, self.token_count, capture);
+        }
         Ok(self)
     }
 
@@ -975,7 +1060,7 @@ impl CudaDeviceCommand {
         });
         Self {
             runtime_instance,
-            operation: "vnext_reusable_execution",
+            operation: DIRECT_GRAPH_REPLAY_OPERATION,
             batching_form: DeviceBatchingForm::ParticipantLoop,
             participant_start: 0,
             participant_count,
@@ -990,11 +1075,15 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: Some(invocation),
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         }
     }
 
     fn coalesced_program_bindings(
         mut commands: Vec<Self>,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         if commands.is_empty() {
             return Ok(commands);
@@ -1208,6 +1297,13 @@ impl CudaDeviceCommand {
             ));
             host_storage.push(transfer.payload);
         }
+        let statistical_evidence = selected_cost::program_binding(
+            transfer_shapes
+                .iter()
+                .map(|&(stride, bytes, rows)| (stride as u64, bytes as u64, rows as u64)),
+            token_count,
+            structured_capture,
+        );
         let executable = Arc::new(CudaCommandExecutable {
             regions,
             host_storage,
@@ -1280,6 +1376,9 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks,
+            statistical_evidence,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         }])
     }
 
@@ -1342,6 +1441,9 @@ impl CudaDeviceCommand {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement: super::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         }])
     }
 
@@ -1378,6 +1480,20 @@ impl CudaDeviceCommand {
         &self,
     ) -> Option<&DeviceReusableExecutionInvocation> {
         self.reusable_execution.as_ref()
+    }
+
+    /// Captured only beside the commands that actually enter native capture.
+    /// The template owns no numeric table or buffer lease.
+    pub(crate) fn selected_replay_template(
+        &self,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1> {
+        ferrum_interfaces::execution_cost::SelectedReplayAlgorithmTemplateV1::from_selected(
+            self.statistical_evidence.as_ref()?,
+            self.token_count,
+            self.compute_dispatch_count,
+            self.transfer_command_count,
+        )
+        .ok()
     }
 
     pub(crate) fn replayed_logical_attribution(
@@ -1536,7 +1652,7 @@ fn cuda_submission_attribution(
                         "CUDA command attribution has a non-portable native operation identity",
                     )
                 })?;
-            DeviceNativeWorkAttribution::with_participant_range(
+            let row = DeviceNativeWorkAttribution::with_participant_range(
                 command_index,
                 command_node_indices[command_index as usize],
                 command_phases[command_index as usize],
@@ -1554,7 +1670,18 @@ fn cuda_submission_attribution(
                 CudaDeviceRuntimeError::contract(
                     "CUDA command attribution has invalid native work metadata",
                 )
-            })
+            })?;
+            // A graph launch cannot borrow eager evidence: its sealed logical
+            // population needs the separate replay adapter.
+            Ok::<_, CudaDeviceRuntimeError>(
+                command
+                    .statistical_evidence
+                    .as_ref()
+                    .and_then(|evidence| {
+                        row.clone().with_statistical_evidence(evidence.clone()).ok()
+                    })
+                    .unwrap_or(row),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     DeviceSubmissionAttribution::with_replayed_segments(rows, replayed_segments).ok_or_else(|| {
@@ -1563,6 +1690,7 @@ fn cuda_submission_attribution(
 }
 
 pub struct CudaDeviceStream {
+    blas_cost_identity: Option<super::vnext_ops::CublasHandleApiIdentity>,
     id: u64,
     runtime_instance: u64,
     stream: Arc<CudaStream>,
@@ -1980,14 +2108,20 @@ impl Mxfp4MarlinPrepareFunctions {
 /// Concrete CUDA primitive runtime consumed by the shared vNext resource and
 /// operation dispatch layers.
 pub struct CudaDeviceRuntime {
+    blas_cost_identity: super::vnext_ops::CublasCostIdentitySource,
     descriptor: DeviceDescriptor,
     attention_execution_policy: AttentionExecutionPolicy,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
     runtime_instance: u64,
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
     #[cfg(feature = "vllm-marlin")]
     mxfp4_marlin_prepare: Mxfp4MarlinPrepareFunctions,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
+    cost_hardware_identity:
+        OnceLock<ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability>,
+    memory_sampler: Option<device_memory::DeviceMemorySampler>,
+    allocations_started: AtomicBool,
 }
 
 impl fmt::Debug for CudaDeviceRuntime {
@@ -2010,7 +2144,15 @@ impl CudaDeviceRuntime {
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))
     }
 
-    pub fn new(mut config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+    pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_with_structured_capture(config, ferrum_types::SloStructuredCostCapture::Disabled)
+    }
+
+    /// Freeze passive capture before providers or execution resources exist.
+    pub fn new_with_structured_capture(
+        mut config: CudaDeviceRuntimeConfig,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         if !config.attention_execution_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime requires a resolved attention execution policy",
@@ -2023,6 +2165,9 @@ impl CudaDeviceRuntime {
         let requires_sm80 = |capability: &CapabilityId| {
             matches!(capability.as_str(),
                 ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_CAPABILITY_ID
+                | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_F32SCALE_INPUT_SUM_CAPABILITY_ID
+                | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_GATE_UP_STREAM_MMQ_CAPABILITY_ID
+                | ferrum_interfaces::vnext::DENSE_SWIGLU_Q8_RESIDUAL2_FFN_M2_TO8_CAPABILITY_ID
                 | ferrum_interfaces::vnext::GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_Q8_PROJECTIONS_CAPABILITY_ID)
         };
         if config.capabilities.iter().any(requires_sm80) {
@@ -2070,15 +2215,46 @@ impl CudaDeviceRuntime {
             })
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA runtime identity exhausted"))?;
         Ok(Self {
+            blas_cost_identity: super::vnext_ops::CublasCostIdentitySource::new(structured_capture),
             descriptor,
             attention_execution_policy: config.attention_execution_policy,
+            structured_capture,
             runtime_instance,
             context,
             allocation_stream,
             #[cfg(feature = "vllm-marlin")]
             mxfp4_marlin_prepare,
             quarantined: Mutex::new(Vec::new()),
+            cost_hardware_identity: OnceLock::new(),
+            memory_sampler: None,
+            allocations_started: AtomicBool::new(false),
         })
+    }
+
+    /// Enable before providers/weights acquire the shared runtime. Exclusive
+    /// access prevents a race with allocation; late captures fail honestly.
+    pub fn enable_device_memory_sampling(
+        &mut self,
+        config: &ferrum_types::DeviceMemorySamplingConfig,
+    ) -> Result<(), CudaDeviceRuntimeError> {
+        if self.memory_sampler.is_some() || self.allocations_started.load(Ordering::Relaxed) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA memory sampling must be enabled once before runtime allocations",
+            ));
+        }
+        self.memory_sampler = Some(device_memory::DeviceMemorySampler::start(
+            Arc::clone(&self.context),
+            config,
+        )?);
+        Ok(())
+    }
+
+    pub(super) fn cublas_cost_identity_source(&self) -> super::vnext_ops::CublasCostIdentitySource {
+        self.blas_cost_identity.clone()
+    }
+
+    pub(crate) fn structured_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        self.structured_capture
     }
 
     pub(super) fn context(&self) -> &Arc<CudaContext> {
@@ -3107,8 +3283,25 @@ impl DeviceRuntime for CudaDeviceRuntime {
     type Fence = CudaDeviceFence;
     type Error = CudaDeviceRuntimeError;
 
+    fn structured_cost_capture(&self) -> ferrum_types::SloStructuredCostCapture {
+        self.structured_capture
+    }
+
     fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    fn cost_hardware_identity(
+        &self,
+    ) -> ferrum_interfaces::vnext::DeviceCostHardwareIdentityAvailability {
+        self.cost_hardware_identity
+            .get_or_init(|| {
+                cost_identity::capture(
+                    &self.context,
+                    &self.descriptor.runtime_implementation_fingerprint,
+                )
+            })
+            .clone()
     }
 
     fn cost_graph_capture_capability(
@@ -3125,10 +3318,42 @@ impl DeviceRuntime for CudaDeviceRuntime {
         stream.executable_cache.cost_graph_stream_state()
     }
 
+    fn cost_reusable_graph_catalog(
+        &self,
+        stream: &Self::Stream,
+        limits: ferrum_interfaces::vnext::DeviceCostGraphCatalogLimits,
+        poll: &mut dyn FnMut() -> Result<(), VNextError>,
+    ) -> Option<Result<ferrum_interfaces::vnext::DeviceCostGraphCatalog, Self::Error>> {
+        Some((|| {
+            self.validate_stream(stream)?;
+            if !stream.state.is_quiescent() {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA numerical graph catalog requires its quiescent owning stream",
+                ));
+            }
+            stream
+                .executable_cache
+                .cost_reusable_graph_catalog(limits, poll)
+        })())
+    }
+
+    fn cost_direct_graph_replay_operation(&self) -> Option<&'static str> {
+        Some(DIRECT_GRAPH_REPLAY_OPERATION)
+    }
+
     fn cost_core_execution_capabilities(
         &self,
     ) -> Option<ferrum_interfaces::vnext::DeviceCoreCostCapabilities> {
         Some(core_cost_route::capabilities())
+    }
+
+    fn cost_core_transfer_evidence(
+        &self,
+        kind: ferrum_interfaces::execution_cost::StatisticalTransferKindV1,
+        bytes: u64,
+        tokens: u64,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+        selected_cost::transfer(kind, bytes, tokens, self.structured_capture)
     }
 
     fn cost_coalesced_program_binding(
@@ -3138,8 +3363,25 @@ impl DeviceRuntime for CudaDeviceRuntime {
         poll: &mut dyn FnMut() -> Result<(), VNextError>,
     ) -> Option<Result<ferrum_interfaces::vnext::OperationCostCommand, Self::Error>> {
         Some(core_cost_route::coalesced_program_binding(
-            layout, patches, poll,
+            layout,
+            patches,
+            poll,
+            self.structured_capture,
         ))
+    }
+
+    fn device_memory_snapshot(
+        &self,
+    ) -> Option<ferrum_interfaces::vnext::DeviceMemoryTelemetrySnapshot> {
+        self.memory_sampler
+            .as_ref()
+            .map(device_memory::DeviceMemorySampler::snapshot)
+    }
+
+    fn finish_device_memory_sampling(&self) -> Result<(), Self::Error> {
+        self.memory_sampler
+            .as_ref()
+            .map_or(Ok(()), device_memory::DeviceMemorySampler::finish)
     }
 
     fn attention_execution_policy(&self) -> AttentionExecutionPolicy {
@@ -3150,6 +3392,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         permit: ferrum_interfaces::vnext::DeviceAllocationPermit<'_>,
     ) -> Result<Self::Buffer, Self::Error> {
+        self.allocations_started.store(true, Ordering::Relaxed);
         let request = permit.into_request();
         let extra_alignment = request
             .alignment_bytes()
@@ -3179,11 +3422,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
             usage: request.usage(),
             element_type: request.element_type(),
         };
+        let memory_charge = self
+            .memory_sampler
+            .as_ref()
+            .map(|sampler| {
+                sampler
+                    .tracker()
+                    .charge(allocation_bytes as u64)
+                    .map_err(CudaDeviceRuntimeError::contract)
+            })
+            .transpose()?;
         Ok(CudaDeviceBuffer {
             descriptor,
             runtime_instance: self.runtime_instance,
             allocation: Arc::new(CudaAllocation {
                 _base: base,
+                _memory_charge: memory_charge,
                 aligned_ptr,
                 requested_bytes: request.size_bytes(),
             }),
@@ -3249,7 +3503,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             CudaBlas::new(Arc::clone(&stream))
                 .map_err(|error| CudaDeviceRuntimeError::blas("cuBLAS handle creation", error))?,
         );
+        let blas_cost_identity = self.blas_cost_identity.observe_created_handle(&blas);
         Ok(CudaDeviceStream {
+            blas_cost_identity,
             id,
             runtime_instance: self.runtime_instance,
             stream,
@@ -3405,6 +3661,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::driver("device copy", error))
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::DeviceToDevice,
+            region.length_bytes(),
+            self.structured_capture,
         ))
     }
 
@@ -3449,6 +3710,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::driver("host upload", error))
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::HostToDevice,
+            source_bytes,
+            self.structured_capture,
         ))
     }
 
@@ -3483,6 +3749,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 .map_err(|error| CudaDeviceRuntimeError::driver("device zero", error))
             }),
+        )
+        .with_core_transfer(
+            ferrum_interfaces::execution_cost::StatisticalTransferKindV1::Fill,
+            length_bytes,
+            self.structured_capture,
         ))
     }
 
@@ -3490,7 +3761,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         &self,
         commands: Vec<Self::Command>,
     ) -> Result<Vec<Self::Command>, Self::Error> {
-        CudaDeviceCommand::coalesced_program_bindings(commands)
+        CudaDeviceCommand::coalesced_program_bindings(commands, self.structured_capture)
     }
 
     fn submit(
@@ -3523,6 +3794,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn supports_guarded_submission(&self) -> bool {
         true
+    }
+
+    fn guarded_adaptive_submission_capability(&self) -> DeviceGuardedAdaptiveCapability {
+        DeviceGuardedAdaptiveCapability::CompleteRequestsOnDemand
     }
 
     fn submit_guarded(
@@ -3737,6 +4012,7 @@ mod tests {
         let region = CudaBufferRegion {
             _allocation: Arc::new(CudaAllocation {
                 _base: base,
+                _memory_charge: None,
                 aligned_ptr: pointer,
                 requested_bytes: 4,
             }),
@@ -4131,6 +4407,10 @@ mod tests {
             program_binding_patch: None,
             reusable_execution: None,
             completion_checks: Vec::new(),
+            statistical_evidence: None,
+            library_cost_requirement:
+                crate::backend::cuda::vnext_ops::CublasCostRequirement::NotRequired,
+            core_transfer: None,
         }
     }
 
@@ -4224,6 +4504,72 @@ mod tests {
     }
 
     #[test]
+    fn cuda_selected_core_rebind_preserves_evidence_and_replay_stays_unsupported() {
+        use ferrum_interfaces::execution_cost::StatisticalTransferKindV1;
+        use ferrum_types::SloStructuredCostCapture;
+        let logical = DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 2, 7).unwrap();
+        let make = |mode| {
+            CudaDeviceCommand::transfer(
+                1,
+                DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
+                Vec::new(),
+                Vec::new(),
+                Box::new(|_, _, _, _| Ok(())),
+            )
+            .with_core_transfer(StatisticalTransferKindV1::Fill, 257, mode)
+            .bind_core_logical_work(logical)
+            .unwrap()
+        };
+        let command = make(SloStructuredCostCapture::HostSettledV1);
+        let evidence = command.statistical_evidence.as_ref().unwrap();
+        evidence.validate_command(7, 0, 1).unwrap();
+        assert_eq!(evidence.work().fill_bytes, 257);
+        assert!(make(SloStructuredCostCapture::Disabled)
+            .statistical_evidence
+            .is_none());
+        for path in [DeviceExecutionPath::Eager, DeviceExecutionPath::Replayed] {
+            let attribution = cuda_submission_attribution(
+                &[DeviceCommandPhase::Initialization],
+                &[Some(0)],
+                &[make(SloStructuredCostCapture::HostSettledV1)],
+                &[path],
+                Some(&[if path == DeviceExecutionPath::Replayed {
+                    Some(1)
+                } else {
+                    None
+                }]),
+                Vec::new(),
+            )
+            .unwrap();
+            let actual = &attribution.commands()[0];
+            assert_eq!(
+                actual.statistical_evidence().is_some(),
+                path == DeviceExecutionPath::Eager
+            );
+            if let Some(actual) = actual.statistical_evidence() {
+                assert_eq!(actual.family_signature(), evidence.family_signature());
+                assert_eq!(actual.work(), evidence.work());
+                actual
+                    .algorithm_work()
+                    .unwrap()
+                    .unwrap()
+                    .validate_command(actual)
+                    .unwrap();
+            }
+        }
+        let wrong = selected_cost::transfer(
+            StatisticalTransferKindV1::Fill,
+            257,
+            8,
+            SloStructuredCostCapture::HostSettledV1,
+        );
+        assert!(make(SloStructuredCostCapture::Disabled)
+            .with_statistical_evidence(wrong)
+            .statistical_evidence
+            .is_none());
+    }
+
+    #[test]
     fn cuda_work_attribution_rejects_empty_native_work() {
         let error = command("test_invalid")
             .with_work_attribution(DeviceBatchingForm::Scalar, 1, 1, 0, 0)
@@ -4251,5 +4597,4 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod submission_guard_tests;
+const DIRECT_GRAPH_REPLAY_OPERATION: &str = "vnext_reusable_execution";

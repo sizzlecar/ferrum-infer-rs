@@ -111,6 +111,7 @@ fn staged_u32_snapshot_reads_parent_while_same_lane_child_is_pending_on_cuda() {
     let region = CudaBufferRegion {
         _allocation: Arc::new(CudaAllocation {
             _base: base,
+            _memory_charge: None,
             aligned_ptr: pointer,
             requested_bytes: 16,
         }),

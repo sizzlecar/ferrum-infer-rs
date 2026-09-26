@@ -155,6 +155,11 @@ pub(super) fn prepare(
                 .snapshot
                 .enqueue(stream, destination_start..destination_end)
         }),
+    )
+    .with_core_transfer(
+        ferrum_interfaces::execution_cost::StatisticalTransferKindV1::DeviceToHost,
+        region.length_bytes(),
+        runtime.structured_capture(),
     );
     Ok(PreparedDeviceSubmissionReadback::new(
         Some(command),

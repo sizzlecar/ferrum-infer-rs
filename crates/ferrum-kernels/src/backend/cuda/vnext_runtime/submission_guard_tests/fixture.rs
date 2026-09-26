@@ -1,9 +1,14 @@
 use super::*;
+use std::num::NonZeroU64;
 
 struct Scale {
+    missing_library_contract: bool,
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
     program_binding: bool,
+    graph: bool,
+    structured_capture: ferrum_types::SloStructuredCostCapture,
+    output_address: Arc<AtomicU64>,
     pub(super) enqueues: Arc<AtomicU64>,
     pub(super) encoded: Arc<AtomicU64>,
 }
@@ -42,12 +47,42 @@ impl OperationResourceEstimator for Scale {
     }
 }
 impl OperationProvider<CudaDeviceRuntime> for Scale {
+    fn replayed_compute_cost_evidence(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1>, VNextError>
+    {
+        Ok(self.selected_cost(invocation))
+    }
     fn reusable_execution_topology(
         &self,
-        _: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        // No graph authority is asserted for this eager-only fixture.
-        Ok(ReusableExecutionTopology::EagerBoundary)
+        // Static compute captures the real lane workspace, never an arbitrary
+        // submission-scoped address. Binding upload stays outside the graph.
+        let reusable = self.graph
+            && request
+                .reusable_address_scope(
+                    &[
+                        ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, 0),
+                        ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
+                    ],
+                    &[ReusableExecutionWorkspaceAddress::Binding],
+                )?
+                .is_some();
+        Ok(if reusable {
+            ReusableExecutionTopology::Static
+        } else {
+            ReusableExecutionTopology::EagerBoundary
+        })
+    }
+    fn encode_reusable_execution_bindings(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
+        assert!(self.graph);
+        Ok(EncodedReusableExecutionBindings::empty()
+            .with_program_binding(self.binding_command(&invocation)))
     }
     fn encode_selected(
         &self,
@@ -93,35 +128,56 @@ impl OperationProvider<CudaDeviceRuntime> for Scale {
         assert!(iter.next().is_none());
         let (buffer, range, retention) = physical.buffer_and_physical_range();
         let region = buffer.retained_region(range, retention).unwrap();
+        self.output_address
+            .store(region.device_ptr(), Ordering::Relaxed);
         let function = self.function.clone();
         let enqueues = Arc::clone(&self.enqueues);
         self.encoded.fetch_add(1, Ordering::Relaxed);
-        let command = CudaDeviceCommand::operation(
-            "cuda_guard_fixture_scale",
-            vec![region],
-            move |stream, regions| {
-                enqueues.fetch_add(1, Ordering::Relaxed);
-                let pointer = regions[0].device_ptr();
-                let scale = 2.0_f32;
-                let elements = 4_i32;
-                let mut launch = stream.launch_builder(&function);
-                launch.arg(&pointer);
-                launch.arg(&scale);
-                launch.arg(&elements);
-                unsafe {
-                    launch.launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (32, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map(|_| ())
-                .map_err(|e| CudaDeviceRuntimeError::driver("guard fixture scale", e))
-            },
-        )
+        let enqueue = move |stream: &CudaStream, regions: &[CudaBufferRegion]| {
+            enqueues.fetch_add(1, Ordering::Relaxed);
+            let pointer = regions[0].device_ptr();
+            let scale = 2.0_f32;
+            let elements = 4_i32;
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&pointer);
+            launch.arg(&scale);
+            launch.arg(&elements);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|e| CudaDeviceRuntimeError::driver("guard fixture scale", e))
+        };
+        let command = if self.graph {
+            CudaDeviceCommand::replayable_operation(
+                "cuda_guard_fixture_scale",
+                vec![region],
+                crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder::new(
+                    self.descriptor.provider_implementation_fingerprint(),
+                    "cuda_guard_fixture_scale",
+                )
+                .u32(4)
+                .finish(),
+                enqueue,
+            )
+        } else {
+            CudaDeviceCommand::operation("cuda_guard_fixture_scale", vec![region], enqueue)
+        }
         .unwrap()
         .with_work_attribution(DeviceBatchingForm::Packed, 1, 1, 1, 0)
-        .unwrap();
+        .unwrap()
+        .with_statistical_evidence(self.selected_cost(&invocation));
+        // A deliberately unavailable declared API contract exercises the
+        // gate without inventing a selected library algorithm for this scale.
+        let command = if self.missing_library_contract {
+            command.with_cublas_cost_requirement(None)
+        } else {
+            command
+        };
         let operation = EncodedDeviceOperation::compute(command);
         Ok(if self.program_binding {
             operation.with_program_binding(self.binding_command(&invocation))
@@ -132,6 +188,58 @@ impl OperationProvider<CudaDeviceRuntime> for Scale {
 }
 
 impl Scale {
+    fn selected_cost(
+        &self,
+        invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Option<ferrum_interfaces::execution_cost::SelectedCommandCostEvidenceV1> {
+        use ferrum_interfaces::execution_cost::{
+            KernelNumericWorkV1, KernelReplayGeometryV1, SelectedAlgorithmClassV1,
+            SelectedCommandCostBuilderV1,
+        };
+        if self.structured_capture == ferrum_types::SloStructuredCostCapture::Disabled {
+            return None;
+        }
+        assert_eq!(invocation.participants().len(), 1);
+        assert_eq!(invocation.work_shape().immediate_tokens(), 1);
+        let first = &invocation.participants()[0];
+        assert_eq!(
+            first.attributes().get(&id("hidden_size")),
+            Some(&SemanticValue::Unsigned(4))
+        );
+        assert_eq!(
+            first.attributes().get(&id("scale")),
+            Some(&SemanticValue::Rational(
+                CanonicalRational::new(2, 1).unwrap()
+            ))
+        );
+        let mut builder = SelectedCommandCostBuilderV1::new_with_algorithm_work(1);
+        let algorithm = SelectedAlgorithmClassV1::new(
+            "scale_inplace_f16",
+            1,
+            Sha256::digest(crate::ptx::FUSED_SILU_MUL.as_bytes()).into(),
+            Sha256::digest(b"in-place-f16.fixed-32-thread").into(),
+        )
+        .unwrap();
+        builder
+            .kernel_with_replay_geometry(
+                algorithm,
+                KernelNumericWorkV1 {
+                    logical_units: 4,
+                    padded_units: 32,
+                    inner_units_per_logical_unit: 1,
+                    grid: [1, 1, 1],
+                    scratch_bytes: 0,
+                    staged_weight_bytes: 0,
+                },
+                KernelReplayGeometryV1 {
+                    block: [32, 1, 1],
+                    dynamic_shared_bytes: 0,
+                    fixed_parameters: &[4, u64::from(2_f32.to_bits())],
+                },
+            )
+            .unwrap();
+        Some(builder.finish().unwrap())
+    }
     fn binding_command(
         &self,
         invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -169,29 +277,79 @@ pub(super) struct Fixture {
     pub(super) reaper: Arc<CompletionReaper<CudaDeviceRuntime>>,
     pub(super) enqueues: Arc<AtomicU64>,
     pub(super) encoded: Arc<AtomicU64>,
+    output_address: Arc<AtomicU64>,
 }
 
 impl Fixture {
     pub(super) fn new() -> Self {
-        Self::configured(false)
+        Self::configured(false, false)
+    }
+    pub(super) fn new_configured_eager() -> Self {
+        let value = Self::new();
+        value
+            .lane
+            .configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(4).unwrap())
+            .unwrap();
+        value
     }
     pub(super) fn new_program_binding() -> Self {
-        Self::configured(true)
+        Self::configured(true, false)
     }
-    fn configured(program_binding: bool) -> Self {
+    pub(super) fn new_graph() -> Self {
+        Self::configured(true, true)
+    }
+    pub(super) fn new_graph_with_structured_capture() -> Self {
+        Self::configured_with_capture(
+            true,
+            true,
+            ferrum_types::SloStructuredCostCapture::HostSettledV1,
+        )
+    }
+    fn configured(program_binding: bool, graph: bool) -> Self {
+        Self::configured_with_capture(
+            program_binding,
+            graph,
+            ferrum_types::SloStructuredCostCapture::Disabled,
+        )
+    }
+    fn configured_with_capture(
+        program_binding: bool,
+        graph: bool,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+    ) -> Self {
+        Self::configured_with_library_requirement(program_binding, graph, structured_capture, false)
+    }
+    pub(super) fn new_missing_library_contract() -> Self {
+        Self::configured_with_library_requirement(
+            false,
+            false,
+            ferrum_types::SloStructuredCostCapture::Disabled,
+            true,
+        )
+    }
+    fn configured_with_library_requirement(
+        program_binding: bool,
+        graph: bool,
+        structured_capture: ferrum_types::SloStructuredCostCapture,
+        missing_library_contract: bool,
+    ) -> Self {
+        assert!(!graph || program_binding);
         let runtime = Arc::new(
-            CudaDeviceRuntime::new(CudaDeviceRuntimeConfig {
-                ordinal: 0,
-                device_id: id("device.cuda-guard-fixture"),
-                attention_execution_policy: AttentionExecutionPolicy::Portable,
-                runtime_implementation_fingerprint: digest(include_bytes!("../submission.rs")),
-                capabilities: BTreeSet::from([id(CONSTANT_SCALE_F16_CAPABILITY_ID)]),
-                dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
-                    DynamicStorageAllocator::LinearArena,
-                    DynamicStorageView::Contiguous,
-                )
-                .unwrap()]),
-            })
+            CudaDeviceRuntime::new_with_structured_capture(
+                CudaDeviceRuntimeConfig {
+                    ordinal: 0,
+                    device_id: id("device.cuda-guard-fixture"),
+                    attention_execution_policy: AttentionExecutionPolicy::Portable,
+                    runtime_implementation_fingerprint: digest(include_bytes!("../submission.rs")),
+                    capabilities: BTreeSet::from([id(CONSTANT_SCALE_F16_CAPABILITY_ID)]),
+                    dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                        DynamicStorageAllocator::LinearArena,
+                        DynamicStorageView::Contiguous,
+                    )
+                    .unwrap()]),
+                },
+                structured_capture,
+            )
             .expect("requires an actual configured CUDA device"),
         );
         let contract = family::scale_contract(program_binding);
@@ -200,7 +358,11 @@ impl Fixture {
             contract.descriptor().id.clone(),
             contract.descriptor().fingerprint().unwrap(),
             digest(crate::ptx::FUSED_SILU_MUL.as_bytes()),
-            ProviderExecutionSemantics::bitwise_eager_only(),
+            if graph {
+                ProviderExecutionSemantics::bitwise_eager_and_replay()
+            } else {
+                ProviderExecutionSemantics::bitwise_eager_only()
+            },
             ContractVersion::new(1, 0),
             runtime.descriptor().id.clone(),
             runtime.descriptor().capabilities.clone(),
@@ -235,12 +397,17 @@ impl Fixture {
             .unwrap();
         let enqueues = Arc::new(AtomicU64::new(0));
         let encoded = Arc::new(AtomicU64::new(0));
+        let output_address = Arc::new(AtomicU64::new(0));
         let registry = OperationRuntimeRegistry::new(
             vec![contract],
             vec![Box::new(Scale {
+                missing_library_contract,
                 descriptor,
                 function,
                 program_binding,
+                graph,
+                structured_capture,
+                output_address: Arc::clone(&output_address),
                 enqueues: Arc::clone(&enqueues),
                 encoded: Arc::clone(&encoded),
             })],
@@ -274,12 +441,30 @@ impl Fixture {
             )
             .unwrap()
         });
-        let reusable = bucket
-            .as_ref()
-            .map(|bucket| ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap());
-        assert!(reusable
-            .as_ref()
-            .is_none_or(|policy| policy.program_policy().is_none()));
+        let reusable = bucket.as_ref().map(|bucket| {
+            let policy = ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap();
+            if graph {
+                policy
+                    .with_program_policy(
+                        ReusableExecutionProgramPolicy::exact_on_demand(vec![
+                            ReusableExecutionProgramSpec::new(
+                                bucket.class_id().clone(),
+                                ReusableExecutionProgramShape::UniformDecode {
+                                    request_capacity: 1,
+                                    token_capacity: 1,
+                                    query_tokens_per_sequence: 1,
+                                },
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    )
+                    .unwrap()
+            } else {
+                assert!(policy.program_policy().is_none());
+                policy
+            }
+        });
         let policy = ResolvedRuntimePolicy::new(
             "runtime-policy.cuda-guard-fixture",
             ContractVersion::new(1, 0),
@@ -407,6 +592,10 @@ impl Fixture {
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
         let lane = resources.create_execution_lane().unwrap();
         lane.configure_submission_readback_staging(8).unwrap();
+        if graph {
+            lane.configure_reusable_executables(DeviceReusableExecutionPlan::on_demand(4).unwrap())
+                .unwrap();
+        }
         Self {
             runtime,
             compilation,
@@ -419,6 +608,7 @@ impl Fixture {
             reaper: CompletionReaper::new(),
             enqueues,
             encoded,
+            output_address,
         }
     }
 
@@ -507,15 +697,33 @@ impl Fixture {
     pub(super) fn dispatch(
         &self,
         wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
-        guard: &Guard,
+        guard: &dyn PreparedWaveSubmissionGuard,
     ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
-        self.dispatch_with_timing(wave, guard, &NoHostTiming)
+        self.dispatch_program(wave, Some(guard), None)
     }
-
     pub(super) fn dispatch_with_timing<S: SubmissionWaveDispatchTimingSink>(
         &self,
         wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
-        guard: &Guard,
+        guard: &dyn PreparedWaveSubmissionGuard,
+        timing: &S,
+    ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
+        self.dispatch_program_with_timing(wave, Some(guard), None, timing)
+    }
+
+    pub(super) fn dispatch_program(
+        &self,
+        wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
+        guard: Option<&dyn PreparedWaveSubmissionGuard>,
+        program: Option<&DeviceReusableExecutionProgram>,
+    ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
+        self.dispatch_program_with_timing(wave, guard, program, &NoHostTiming)
+    }
+
+    pub(super) fn dispatch_program_with_timing<S: SubmissionWaveDispatchTimingSink>(
+        &self,
+        wave: PreparedStepSubmissionWave<CudaDeviceRuntime>,
+        guard: Option<&dyn PreparedWaveSubmissionGuard>,
+        program: Option<&DeviceReusableExecutionProgram>,
         timing: &S,
     ) -> GuardedWaveSubmissionOutcome<CudaDeviceRuntime> {
         let active = TrustedActiveSequenceBinding::from_session(&self.session).unwrap();
@@ -538,12 +746,31 @@ impl Fixture {
                 .collect(),
         )
         .unwrap();
-        OperationDispatch::encode_and_submit_guarded_wave_with_timing(
+        let Some(guard) = guard else {
+            return GuardedWaveSubmissionOutcome::Dispatch(
+                OperationDispatch::encode_and_submit_wave_with_cost_observation(
+                    self.providers.providers(),
+                    self.compilation.executable(),
+                    &identity,
+                    [&active].into_iter(),
+                    DeviceTimingMode::Off,
+                    &[input],
+                    SubmissionExecutionPolicy::adaptive(),
+                    program,
+                    timing,
+                    wave,
+                    &self.lane,
+                    &self.reaper,
+                ),
+            );
+        };
+        OperationDispatch::encode_and_submit_guarded_wave_with_program_and_timing(
             self.providers.providers(),
             self.compilation.executable(),
             &identity,
             [&active].into_iter(),
             &[input],
+            program,
             guard,
             timing,
             wave,
@@ -551,6 +778,20 @@ impl Fixture {
             &self.reaper,
         )
     }
+    /// Read-only test observation of the still-owned retained lane allocation.
+    /// No pointer is used to build a submission or resource authority.
+    pub(super) fn output_bytes(&self) -> Vec<u8> {
+        self.runtime.context.bind_to_thread().unwrap();
+        let pointer = self.output_address.load(Ordering::Relaxed);
+        assert_ne!(pointer, 0);
+        let mut bytes = vec![0_u8; 8];
+        let status = unsafe {
+            cudarc::driver::sys::cuMemcpyDtoH_v2(bytes.as_mut_ptr().cast(), pointer, bytes.len())
+        };
+        assert_eq!(status, cudarc::driver::sys::CUresult::CUDA_SUCCESS);
+        bytes
+    }
+
     pub(super) fn close(self, completed: bool) {
         assert_eq!(self.reaper.retained_count(), 0);
         assert_eq!(self.reaper.quarantined_count(), 0);

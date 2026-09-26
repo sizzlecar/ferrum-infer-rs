@@ -12,8 +12,12 @@ use half::f16;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+mod cold_graph;
+mod configured_eager;
 mod family;
 mod fixture;
+mod library_cost;
+mod warm_graph;
 use fixture::Fixture;
 
 fn id<T: TryFrom<String>>(value: &str) -> T
