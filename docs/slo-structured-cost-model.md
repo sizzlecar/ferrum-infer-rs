@@ -233,8 +233,44 @@ be declared for an experiment; enabling it does not retroactively qualify a
 failed heldout evaluation.
 
 That feedback protocol belongs to selected profiles 6–8 and is not applied to
-schema 9. Structured-model drift feedback remains a separate implementation step;
-the imported snapshot does not refit or refresh itself from serving observations.
+schema 9. Schema 9 has no runtime margin policy. The separate V2 policy below
+does not refit or refresh the imported model from serving observations.
+
+### Explicit V2 owner feedback
+
+Source3/profile10 supports a separate, default-off
+`cost_observation.structured_feedback.kind = "retrospective_owner_margin_v1"`
+policy for an actually imported qualified child or complete catalog. It reuses
+the bounded selected-feedback state machine and persistence protocol. The
+`policy` object has the same explicit limits as `selected_feedback`: window and
+consecutive-error counts, trigger/padding, `maximum_family_margin_ns`, consumption
+lag, uncomparable/failed/queue-drop limits and state-byte capacity. Here “family”
+means one complete V2 owner/domain. `storage` explicitly selects `create_new` or
+`resume` with an absolute receipt path. Source-frozen wave/age limits also apply;
+legacy model settings do not replace them.
+
+The worker compares original, privately qualified whole-wave settlements with
+one immutable pre-drain model at actual consumption time. A correction ends the
+current drain; queued observations retain their original receipt times and use
+the newly published epoch in the next drain. This is retrospective
+feedback, not a pre-submit prediction or a client SLO observation. Unknown,
+unsupported and expired baselines cannot acquire a correction or new support.
+Margins only increase relative to the original frozen planning value. Excess
+over the declared limit, observation loss or persistence failure revokes the
+whole serving snapshot. No fit, residual, qualification sample or source changes.
+
+Every correction or revocation closes the old catalog gate before persistence
+and publishes a new monotonic epoch. All retained old snapshots and common-plan
+witnesses become invalid, including plans for other owners. Unchanged children
+share their original immutable models. Off/Observe selection semantics and
+CompleteRequests remain unchanged. `valid_until` remains the original model
+expiry; feedback cannot renew it or make a failed calibration deployable.
+
+The observation audit exposes `structured_feedback`, its declared owner-domain
+inventory, per-owner comparisons/margins, correction/revocation epoch and full
+failure counters. Query metrics use `scope="retrospective_actual"` separately
+from candidate queries. These diagnostics do not establish q99 coverage. This
+policy does not implement background fit/requalification or model renewal.
 
 The Metal tiny-model test exercises projected and actual partial/final prefill,
 decode, and real terminal settlement. This verifies that capture path, not the

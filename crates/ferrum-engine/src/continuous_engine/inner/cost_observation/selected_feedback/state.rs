@@ -20,7 +20,7 @@ pub(in crate::continuous_engine::inner::cost_observation) enum Revocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Binding {
+pub(in crate::continuous_engine::inner::cost_observation) struct Binding {
     pub profile_sha256: [u8; 32],
     pub source_sha256: [u8; 32],
     pub fit_sha256: [u8; 32],
@@ -42,6 +42,15 @@ pub(super) struct Family {
     pub margin_ns: u64,
     consecutive: usize,
     window: VecDeque<WindowItem>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compared: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub underestimates: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub maximum_base_excess_ns: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +69,7 @@ pub(super) struct State {
     pub corrections: u64,
 }
 
-pub(super) struct Comparison {
+pub(in crate::continuous_engine::inner::cost_observation) struct Comparison {
     pub family: [u8; 32],
     pub base_planning_ns: u64,
     pub actual_ns: u64,
@@ -139,6 +148,9 @@ impl State {
                     margin_ns: 0,
                     consecutive: 0,
                     window: VecDeque::new(),
+                    compared: 0,
+                    underestimates: 0,
+                    maximum_base_excess_ns: 0,
                 });
                 self.families.len() - 1
             }
@@ -156,6 +168,20 @@ impl State {
             base_excess_ns: value.actual_ns.saturating_sub(value.base_planning_ns),
             qualifying: value.actual_ns.saturating_sub(bound) >= p.trigger_excess_ns.get(),
         };
+        let Some(compared) = family.compared.checked_add(1) else {
+            self.revoke(Revocation::Arithmetic);
+            return;
+        };
+        let Some(underestimates) = family
+            .underestimates
+            .checked_add(u64::from(value.actual_ns > bound))
+        else {
+            self.revoke(Revocation::Arithmetic);
+            return;
+        };
+        family.compared = compared;
+        family.underestimates = underestimates;
+        family.maximum_base_excess_ns = family.maximum_base_excess_ns.max(item.base_excess_ns);
         family.consecutive = if item.qualifying {
             family
                 .consecutive

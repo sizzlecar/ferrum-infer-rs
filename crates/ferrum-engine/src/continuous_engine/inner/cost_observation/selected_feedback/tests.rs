@@ -5,6 +5,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
 };
+mod structured_scope;
 
 fn policy() -> SloSelectedFeedbackSettingsV1 {
     SloSelectedFeedbackSettingsV1 {

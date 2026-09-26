@@ -4,6 +4,8 @@ use super::super::super::trainer::structured::{
     inspect_numeric_observation_for_test as whole_wave_numeric_observation,
 };
 use super::*;
+#[path = "model_bridge/feedback.rs"]
+mod feedback;
 use ferrum_interfaces::execution_cost::{
     CostLogicalCommand, CostProviderIdentity, KernelReplayGeometryV1,
 };

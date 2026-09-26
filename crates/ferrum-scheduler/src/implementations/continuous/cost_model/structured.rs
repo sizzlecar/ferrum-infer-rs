@@ -50,6 +50,9 @@ pub enum StructuredUnknown {
     Numerical,
     QualificationCoverage,
     QualificationUnderestimate,
+    /// The qualified base remains immutable, but its serving feedback epoch
+    /// was superseded or revoked. This does not change numerical eligibility.
+    RuntimeValidity,
 }
 type Result<T> = std::result::Result<T, StructuredUnknown>;
 

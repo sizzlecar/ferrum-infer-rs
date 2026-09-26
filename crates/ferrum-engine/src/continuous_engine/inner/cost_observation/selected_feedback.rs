@@ -14,7 +14,8 @@ use std::{
 };
 mod state;
 mod store;
-use state::{Binding, Comparison, Revocation, State};
+pub(super) use state::{Binding, Comparison};
+use state::{Revocation, State};
 #[cfg(test)]
 mod tests;
 
@@ -53,9 +54,37 @@ pub(super) struct FeedbackAudit {
     pub maximum_margin_ns: u64,
     pub persistence_failed: bool,
     pub worker_failed: bool,
+    /// Complete declared inventory for structured feedback, including owners
+    /// with no comparable observations; selected feedback retains seen scopes.
+    pub scopes: Vec<ScopeAudit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ScopeAudit {
+    pub signature: [u8; 32],
+    pub margin_ns: u64,
+    pub compared: u64,
+    pub underestimates: u64,
+    pub maximum_base_excess_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FeedbackKind {
+    Selected,
+    StructuredV2,
+}
+
+pub(super) enum FeedbackObservation {
+    NotSubmitted,
+    FailedOrPartial,
+    Uncomparable,
+    InvalidIdentity,
+    Compared(Comparison),
 }
 
 pub(super) struct Monitor {
+    kind: FeedbackKind,
+    declared_scopes: Option<Arc<[[u8; 32]]>>,
     policy: SloSelectedFeedbackSettingsV1,
     capacity: usize,
     state: State,
@@ -85,15 +114,47 @@ impl Monitor {
             policy_sha256: Sha256::digest(policy_bytes).into(),
         };
         let capacity = model.segment_count();
+        Self::open_bound(
+            policy,
+            storage,
+            binding,
+            capacity,
+            FeedbackKind::Selected,
+            None,
+        )
+        .map(Some)
+    }
+    pub fn open_bound(
+        policy: &SloSelectedFeedbackSettingsV1,
+        storage: &ferrum_types::SloSelectedFeedbackStorageV1,
+        binding: Binding,
+        capacity: usize,
+        kind: FeedbackKind,
+        declared_scopes: Option<Arc<[[u8; 32]]>>,
+    ) -> Result<Self, FerrumError> {
         let (store, state) = store::Store::open(storage, policy, binding, capacity)
-            .map_err(|e| FerrumError::config(format!("selected feedback receipt: {e}")))?;
+            .map_err(|e| FerrumError::config(format!("cost feedback receipt: {e}")))?;
+        if declared_scopes.as_ref().is_some_and(|scopes| {
+            scopes.len() != capacity
+                || scopes.windows(2).any(|p| p[0] >= p[1])
+                || state
+                    .families
+                    .iter()
+                    .any(|f| scopes.binary_search(&f.signature).is_err())
+        }) {
+            return Err(FerrumError::config(
+                "feedback receipt has an undeclared owner",
+            ));
+        }
         let gate = Arc::new(AtomicU64::new(if state.revoked.is_none() {
             state.epoch
         } else {
             0
         }));
         let published = Self::view(&state, gate);
-        Ok(Some(Self {
+        Ok(Self {
+            kind,
+            declared_scopes,
             policy: policy.clone(),
             capacity,
             state,
@@ -103,7 +164,10 @@ impl Monitor {
             last_drops: 0,
             persistence_failed: false,
             worker_failed: false,
-        }))
+        })
+    }
+    pub fn kind(&self) -> FeedbackKind {
+        self.kind
     }
     fn view(state: &State, gate: Arc<AtomicU64>) -> Arc<View> {
         Arc::new(View {
@@ -120,6 +184,37 @@ impl Monitor {
     }
     pub fn current_view(&self) -> Arc<View> {
         self.published.clone()
+    }
+    /// Shared bounded policy after the predictor-specific actual evidence
+    /// adapter. No public numerical observation can bypass that adapter.
+    pub fn observe_classified(&mut self, ordinal: u64, observation: FeedbackObservation) {
+        if self.state.revoked.is_some() {
+            return;
+        }
+        if ordinal == 0 || ordinal <= self.last_ordinal {
+            self.state.revoke(Revocation::IdentityOrClock);
+            self.close_changed_epoch();
+            return;
+        }
+        self.last_ordinal = ordinal;
+        match observation {
+            FeedbackObservation::NotSubmitted => {}
+            FeedbackObservation::FailedOrPartial => self.state.failed(&self.policy),
+            FeedbackObservation::Uncomparable => self.state.uncomparable(&self.policy),
+            FeedbackObservation::InvalidIdentity => self.state.revoke(Revocation::IdentityOrClock),
+            FeedbackObservation::Compared(value) => {
+                if self
+                    .declared_scopes
+                    .as_ref()
+                    .is_some_and(|scopes| scopes.binary_search(&value.family).is_err())
+                {
+                    self.state.revoke(Revocation::IdentityOrClock);
+                } else {
+                    self.state.compare(&self.policy, self.capacity, value);
+                }
+            }
+        }
+        self.close_changed_epoch();
     }
     pub fn observe(
         &mut self,
@@ -229,7 +324,7 @@ impl Monitor {
         if let Err(error) = self.store.persist(&self.state) {
             self.persistence_failed = true;
             self.state.revoke(Revocation::Persistence);
-            tracing::error!(%error, "selected feedback persistence failed; artifact revoked");
+            tracing::error!(%error, kind=?self.kind, "cost feedback persistence failed; artifact revoked");
         }
         self.published = Self::view(&self.state, self.published.gate.clone());
         Some(self.published.clone())
@@ -242,16 +337,16 @@ impl Monitor {
             self.persistence_failed = true;
             self.state.revoke(Revocation::Persistence);
             self.published.gate.store(0, Ordering::Release);
-            tracing::error!(%error, "selected feedback shutdown not durable; restart remains blocked");
+            tracing::error!(%error, kind=?self.kind, "cost feedback shutdown not durable; restart remains blocked");
         }
     }
     pub fn check_finished(&self) -> Result<(), FerrumError> {
         if self.worker_failed {
             Err(FerrumError::backend(
-                "selected feedback worker stopped without a clean durable shutdown",
+                "cost feedback worker stopped without a clean durable shutdown",
             ))
         } else if self.persistence_failed {
-            Err(FerrumError::backend("selected feedback persistence failed"))
+            Err(FerrumError::backend("cost feedback persistence failed"))
         } else {
             Ok(())
         }
@@ -264,8 +359,42 @@ impl Monitor {
         self.state.revoke(Revocation::WorkerStopped);
     }
     pub fn audit(&self) -> FeedbackAudit {
+        let observed: BTreeMap<_, _> = self
+            .state
+            .families
+            .iter()
+            .map(|f| (f.signature, f))
+            .collect();
+        let scopes = self
+            .declared_scopes
+            .as_ref()
+            .map_or_else(
+                || {
+                    self.state
+                        .families
+                        .iter()
+                        .map(|f| f.signature)
+                        .collect::<Vec<_>>()
+                },
+                |scopes| scopes.to_vec(),
+            )
+            .into_iter()
+            .map(|signature| {
+                let family = observed.get(&signature);
+                ScopeAudit {
+                    signature,
+                    margin_ns: family.map_or(0, |f| f.margin_ns),
+                    compared: family.map_or(0, |f| f.compared),
+                    underestimates: family.map_or(0, |f| f.underestimates),
+                    maximum_base_excess_ns: family.map_or(0, |f| f.maximum_base_excess_ns),
+                }
+            })
+            .collect();
         FeedbackAudit {
-            protocol: "retrospective_family_margin_v1; separate from immutable profile6 fit/residual; no q99 guarantee",
+            protocol: match self.kind {
+                FeedbackKind::Selected => "retrospective_family_margin_v1; separate from immutable selected fit/residual; no q99 guarantee",
+                FeedbackKind::StructuredV2 => "retrospective_owner_margin_v1; complete actual host-settled waves against immutable pre-drain qualified profile10 catalog; original support and TTL; not pre-submit prediction or q99 guarantee",
+            },
             epoch: self.state.epoch, session: self.state.session, revoked: self.state.revoked,
             family_count: self.state.families.len(), compared: self.state.compared,
             corrections: self.state.corrections,
@@ -275,6 +404,7 @@ impl Monitor {
             maximum_margin_ns: self.state.families.iter().map(|f| f.margin_ns).max().unwrap_or(0),
             persistence_failed: self.persistence_failed,
             worker_failed: self.worker_failed,
+            scopes,
         }
     }
 }

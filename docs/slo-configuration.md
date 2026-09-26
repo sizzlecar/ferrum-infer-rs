@@ -73,6 +73,7 @@ Observe/Enforce 要求显式 `default_service_class`，且该 ID 必须存在于
 | `cost_observation` | `max_queued_samples=256`, `max_queued_shape_rows=8192`, `max_samples_per_update=256` | 待训练队列与单次后台更新的硬上限，shape rows 按已分配容量计数 |
 | `cost_observation` | `max_waves_per_call=4`, `max_rows_per_wave=1024`, `max_retained_rows_per_call=4096` | 单次执行观察器的波次和行存储上限；不授权增加模型工作 |
 | `cost_observation` | `structured_capture="disabled"` | `host_settled_v1` 显式采集候选/实际执行结构及真实终态回执旁证；不切换预测器，不建立新 profile 的训练资格，详见[结构化成本模型](slo-structured-cost-model.md) |
+| `cost_observation.structured_feedback` | `kind="disabled"` | `retrospective_owner_margin_v1` 对已合格的 source3/profile10 目录提供逐 owner 回顾监测、只增余量及整目录撤销；必须声明完整 `policy` 与 `storage`，不改变模型资格、支持范围或原 TTL，详见[反馈策略](slo-structured-cost-model.md#explicit-v2-owner-feedback) |
 | `admission` | `max_active_requests=8`, `max_waiting_requests=128`, `max_waiting_prompt_tokens=1048576`, `max_waiting_prompt_bytes=16777216` | 时间策略的请求/等待存储上限，不替代物理资源许可 |
 | `admission` | `time_policy="complete-requests"` | 默认优先完成请求；`require-slo` 显式选择严格时间准入，不能追溯拒绝已接受请求 |
 | `admission` | `max_wait_ms=30000`, `max_sequence_tokens=32768`, `output_length_policy="conservative-upper-bound"` | 输出上界及等待合同，不授权缩短用户请求 |

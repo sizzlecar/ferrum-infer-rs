@@ -8,13 +8,16 @@ use std::collections::BTreeMap;
 mod catalog;
 mod receipt;
 
+#[derive(Clone)]
 pub(super) struct StructuredSnapshot {
-    children: BTreeMap<[u8; 32], ImportedStructuredModelV2>,
+    children: Arc<BTreeMap<[u8; 32], ImportedStructuredModelV2>>,
+    pub feedback: Option<Arc<super::super::selected_feedback::View>>,
 }
 impl StructuredSnapshot {
     fn single(child: ImportedStructuredModelV2) -> Self {
         Self {
-            children: BTreeMap::from([(*child.domain_signature(), child)]),
+            children: Arc::new(BTreeMap::from([(*child.domain_signature(), child)])),
+            feedback: None,
         }
     }
     pub fn len(&self) -> usize {
@@ -29,6 +32,78 @@ impl StructuredSnapshot {
             return Err(Unknown::WrongDomain);
         }
         Ok(child)
+    }
+    pub fn open_feedback(
+        &self,
+        policy: &ferrum_types::SloStructuredFeedbackPolicy,
+        fingerprint: &model::ExecutionFingerprint,
+    ) -> Result<Option<super::super::selected_feedback::Monitor>, FerrumError> {
+        use super::super::selected_feedback::{Binding, FeedbackKind, Monitor};
+        let ferrum_types::SloStructuredFeedbackPolicy::RetrospectiveOwnerMarginV1 {
+            policy,
+            storage,
+        } = policy
+        else {
+            return Ok(None);
+        };
+        if self.children.is_empty() {
+            return Err(FerrumError::config(
+                "structured feedback requires a qualified imported catalog",
+            ));
+        }
+        let mut inventory = Sha256::new();
+        inventory.update(b"ferrum.structured-owner-feedback-base.v1\0");
+        inventory.update(
+            serde_json::to_vec(&file::ProfileFingerprint::from(fingerprint))
+                .map_err(profile_error)?,
+        );
+        let mut sources = Sha256::new();
+        let mut parameters = Sha256::new();
+        let mut protocols = Sha256::new();
+        for (domain, child) in self.children.iter() {
+            let (max_wave, max_age) = child.runtime_limits();
+            if policy.maximum_family_margin_ns.get() > max_wave
+                || policy.maximum_consumption_lag_ns.get() > max_age
+            {
+                return Err(FerrumError::config(
+                    "structured feedback exceeds original child wave/age limits",
+                ));
+            }
+            let p = child.provenance();
+            inventory.update(domain);
+            inventory.update(p.file_sha256);
+            inventory.update(serde_json::to_vec(child.owner()).map_err(profile_error)?);
+            inventory.update(serde_json::to_vec(child.scope()).map_err(profile_error)?);
+            sources.update(domain);
+            sources.update(p.source_sha256);
+            parameters.update(domain);
+            parameters.update(p.parameters_sha256);
+            protocols.update(domain);
+            protocols.update(p.protocol);
+            protocols.update(p.capture_identity);
+            // The provenance clock stores this process's load mapping. It is
+            // not a durable source identity and legitimately changes on resume.
+            // Original sample age still comes from each immutable child query.
+        }
+        let mut policy_hash = Sha256::new();
+        policy_hash.update(b"ferrum.retrospective-owner-margin.v1\0");
+        policy_hash.update(serde_json::to_vec(policy).map_err(profile_error)?);
+        let binding = Binding {
+            profile_sha256: inventory.finalize().into(),
+            source_sha256: sources.finalize().into(),
+            fit_sha256: parameters.finalize().into(),
+            protocol_sha256: protocols.finalize().into(),
+            policy_sha256: policy_hash.finalize().into(),
+        };
+        Monitor::open_bound(
+            policy,
+            storage,
+            binding,
+            self.len(),
+            FeedbackKind::StructuredV2,
+            Some(self.children.keys().copied().collect::<Vec<_>>().into()),
+        )
+        .map(Some)
     }
 }
 pub(super) fn load_seed(
@@ -103,11 +178,28 @@ pub(super) fn predict_query(
     local_now: u64,
     version: u64,
 ) -> Result<PlanningCost, Unknown> {
+    if snapshot
+        .feedback
+        .as_ref()
+        .is_some_and(|view| !view.current())
+    {
+        return Err(Unknown::RuntimeValidity);
+    }
     let child = snapshot.select(query)?;
     let (value, model_now) = child.predict_query_local_with_clock(fingerprint, query, local_now)?;
+    let planning_ns = value
+        .planning_ns
+        .checked_add(
+            snapshot
+                .feedback
+                .as_ref()
+                .map_or(0, |view| view.margin(query.domain_signature())),
+        )
+        .filter(|v| *v <= child.runtime_limits().0)
+        .ok_or(Unknown::Numerical)?;
     Ok(PlanningCost {
         typical_ns: value.fitted_upper_ns,
-        planning_ns: value.planning_ns,
+        planning_ns,
         model_version: version,
         valid_for_ns: value
             .valid_until_ns
@@ -129,7 +221,8 @@ mod tests {
         };
         let snapshot = EngineCostSnapshot {
             inner: Snapshot::StructuredV2(StructuredSnapshot {
-                children: BTreeMap::new(),
+                children: Arc::new(BTreeMap::new()),
+                feedback: None,
             }),
             fingerprint: fp.clone(),
         };

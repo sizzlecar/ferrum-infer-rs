@@ -146,7 +146,7 @@ pub(super) fn catalog(
     inventory.update((snapshot.len() as u64).to_le_bytes());
     // BTreeMap canonical domain order; paths locate artifacts but are not an
     // alternative model identity. Profile bytes already bind original source path.
-    for (domain, model) in &snapshot.children {
+    for (domain, model) in snapshot.children.iter() {
         let p = model.provenance();
         let r = child(model)?;
         inventory.update(domain);

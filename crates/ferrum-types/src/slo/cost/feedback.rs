@@ -16,7 +16,7 @@ pub enum SloSelectedFeedbackPolicy {
 // Serde's internally tagged unit-variant visitor discards remaining entries.
 // Use an empty struct visitor so Disabled has the same strict wire boundary
 // as the configured variant, without changing its public unit variant or wire.
-fn deserialize_disabled<'de, D>(deserializer: D) -> Result<(), D::Error>
+pub(super) fn deserialize_disabled<'de, D>(deserializer: D) -> Result<(), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -69,28 +69,48 @@ impl SloSelectedFeedbackPolicy {
                 "selected feedback requires the explicit selected whole-wave predictor".into(),
             );
         }
-        if storage.path().as_os_str().is_empty()
-            || !storage.path().is_absolute()
-            || storage.path().file_name().is_none()
-        {
-            return Err("selected feedback requires an absolute versioned receipt path".into());
-        }
-        if p.minimum_consecutive_underestimates > p.minimum_underestimates
-            || p.minimum_underestimates > p.window_samples
-            || p.window_samples
-                .get()
-                .checked_mul(config.model.max_buckets.get())
-                .is_none_or(|n| n > config.model.max_retained_samples.get())
-            || p.maximum_family_margin_ns > config.model.max_wave_ns
-            || p.correction_padding_ns > p.maximum_family_margin_ns.get()
-            || p.trigger_excess_ns > p.maximum_family_margin_ns
-            || p.maximum_consumption_lag_ns > config.model.max_sample_age_ns
-            || p.maximum_state_bytes.get() > config.profile_import.max_file_bytes.get()
-        {
-            return Err("selected feedback exceeds declared model/storage bounds or has inconsistent thresholds".into());
-        }
-        Ok(())
+        validate_feedback_bounds(
+            p,
+            storage,
+            config.model.max_buckets.get(),
+            config.model.max_retained_samples.get(),
+            config.model.max_wave_ns.get(),
+            config.model.max_sample_age_ns.get(),
+            config.profile_import.max_file_bytes.get(),
+        )
     }
+}
+
+pub(super) fn validate_feedback_bounds(
+    p: &SloSelectedFeedbackSettingsV1,
+    storage: &SloSelectedFeedbackStorageV1,
+    maximum_scopes: usize,
+    maximum_samples: usize,
+    maximum_wave_ns: u64,
+    maximum_age_ns: u64,
+    maximum_file_bytes: usize,
+) -> Result<(), String> {
+    if storage.path().as_os_str().is_empty()
+        || !storage.path().is_absolute()
+        || storage.path().file_name().is_none()
+    {
+        return Err("selected feedback requires an absolute versioned receipt path".into());
+    }
+    if p.minimum_consecutive_underestimates > p.minimum_underestimates
+        || p.minimum_underestimates > p.window_samples
+        || p.window_samples
+            .get()
+            .checked_mul(maximum_scopes)
+            .is_none_or(|n| n > maximum_samples)
+        || p.maximum_family_margin_ns.get() > maximum_wave_ns
+        || p.correction_padding_ns > p.maximum_family_margin_ns.get()
+        || p.trigger_excess_ns > p.maximum_family_margin_ns
+        || p.maximum_consumption_lag_ns.get() > maximum_age_ns
+        || p.maximum_state_bytes.get() > maximum_file_bytes
+    {
+        return Err("selected feedback exceeds declared model/storage bounds or has inconsistent thresholds".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

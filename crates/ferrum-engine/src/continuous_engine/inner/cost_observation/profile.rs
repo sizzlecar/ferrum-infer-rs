@@ -308,7 +308,22 @@ impl EngineCostSnapshot {
         }
     }
     pub(super) fn feedback_enabled(&self) -> bool {
-        matches!(&self.inner, Snapshot::Selected(s) if s.feedback.is_some())
+        match &self.inner {
+            Snapshot::Selected(s) => s.feedback.is_some(),
+            Snapshot::StructuredV2(s) => s.feedback.is_some(),
+            _ => false,
+        }
+    }
+    pub(super) fn open_structured_feedback(
+        &self,
+        policy: &ferrum_types::SloStructuredFeedbackPolicy,
+    ) -> Result<Option<super::selected_feedback::Monitor>, FerrumError> {
+        match &self.inner {
+            Snapshot::StructuredV2(snapshot) => snapshot.open_feedback(policy, &self.fingerprint),
+            _ => Err(FerrumError::config(
+                "structured feedback requires an actually imported qualified V2 model",
+            )),
+        }
     }
     pub(super) fn selected_import(
         &self,
@@ -322,14 +337,20 @@ impl EngineCostSnapshot {
         &self,
         feedback: Arc<super::selected_feedback::View>,
     ) -> Option<Arc<Self>> {
-        let Snapshot::Selected(s) = &self.inner else {
-            return None;
-        };
-        Some(Arc::new(Self {
-            inner: Snapshot::Selected(selected::SelectedSnapshot {
+        let inner = match &self.inner {
+            Snapshot::Selected(s) => Snapshot::Selected(selected::SelectedSnapshot {
                 model: s.model.clone(),
                 feedback: Some(feedback),
             }),
+            Snapshot::StructuredV2(s) => {
+                let mut next = s.clone();
+                next.feedback = Some(feedback);
+                Snapshot::StructuredV2(next)
+            }
+            _ => return None,
+        };
+        Some(Arc::new(Self {
+            inner,
             fingerprint: self.fingerprint.clone(),
         }))
     }
@@ -347,12 +368,14 @@ impl EngineCostSnapshot {
     pub(super) fn feedback_margin(&self, family: &[u8; 32]) -> u64 {
         match &self.inner {
             Snapshot::Selected(s) => s.feedback.as_ref().map_or(0, |v| v.margin(family)),
+            Snapshot::StructuredV2(s) => s.feedback.as_ref().map_or(0, |v| v.margin(family)),
             _ => 0,
         }
     }
     pub(super) fn current(&self) -> bool {
         match &self.inner {
             Snapshot::Selected(s) => s.feedback.as_ref().is_none_or(|v| v.current()),
+            Snapshot::StructuredV2(s) => s.feedback.as_ref().is_none_or(|v| v.current()),
             _ => true,
         }
     }
@@ -424,7 +447,7 @@ impl EngineCostSnapshot {
         match &self.inner {
             Snapshot::Selected(snapshot) => snapshot.feedback.as_ref().map_or(1, |v| v.epoch),
             Snapshot::Structured(_) => 1,
-            Snapshot::StructuredV2(_) => 1,
+            Snapshot::StructuredV2(s) => s.feedback.as_ref().map_or(1, |v| v.epoch),
             Snapshot::Live(snapshot) => snapshot.model_version(),
             Snapshot::Imported(snapshot) => snapshot.model_version(),
         }

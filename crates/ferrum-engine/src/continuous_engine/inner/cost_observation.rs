@@ -59,6 +59,7 @@ mod presubmit;
 mod sample;
 mod selected_feedback;
 mod sink;
+mod structured_feedback;
 pub(in crate::continuous_engine) use clock::*;
 pub(in crate::continuous_engine) use sink::*;
 

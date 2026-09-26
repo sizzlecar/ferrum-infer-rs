@@ -38,9 +38,7 @@ impl CostTrainingState {
         export: Option<ExportPlan>,
         clock: Arc<dyn CostObservationClock>,
     ) -> Result<Self, ferrum_types::FerrumError> {
-        let feedback = if config.selected_feedback.is_disabled() {
-            None
-        } else {
+        let feedback = if !config.selected_feedback.is_disabled() {
             let snapshot = seed.snapshot.as_ref().ok_or_else(|| {
                 ferrum_types::FerrumError::config(
                     "selected feedback requires an actually imported profile6",
@@ -52,6 +50,17 @@ impl CostTrainingState {
                 )
             })?;
             super::selected_feedback::Monitor::open(&config.selected_feedback, model)?
+        } else if !config.structured_feedback.is_disabled() {
+            seed.snapshot
+                .as_ref()
+                .ok_or_else(|| {
+                    ferrum_types::FerrumError::config(
+                        "structured feedback requires an actually imported qualified V2 catalog",
+                    )
+                })?
+                .open_structured_feedback(&config.structured_feedback)?
+        } else {
+            None
         };
         if let Some(monitor) = &feedback {
             let view = monitor.current_view();
@@ -63,7 +72,7 @@ impl CostTrainingState {
                 receipt.model_version = seed
                     .snapshot
                     .as_ref()
-                    .expect("selected feedback snapshot")
+                    .expect("feedback snapshot")
                     .model_version();
             }
         }
@@ -137,6 +146,17 @@ impl CostTrainingState {
                     monitor.observe(ordinal, &entry, &evaluation, previous.as_deref());
                 }
                 selected_audit.record(evaluation, &mut exhausted);
+            }
+            if let Some(monitor) = feedback
+                .as_mut()
+                .filter(|m| m.kind() == super::selected_feedback::FeedbackKind::StructuredV2)
+            {
+                let evaluation = super::structured_feedback::evaluate(
+                    &entry,
+                    previous.as_deref(),
+                    self.clock.as_ref(),
+                );
+                monitor.observe_classified(ordinal, evaluation);
             }
             audit.counter_exhausted = exhausted;
             let host_result = if self.host_content_enabled {
@@ -394,20 +414,31 @@ impl CostTrainingState {
         }
         if let Some(monitor) = self.feedback.lock().as_ref() {
             let feedback = monitor.audit();
-            metrics::gauge!("ferrum.engine.selected_feedback_epoch").set(feedback.epoch as f64);
-            metrics::gauge!("ferrum.engine.selected_feedback_revoked")
-                .set(if feedback.revoked.is_some() { 1.0 } else { 0.0 });
-            metrics::gauge!("ferrum.engine.selected_feedback_corrections")
-                .set(feedback.corrections as f64);
-            metrics::gauge!("ferrum.engine.selected_feedback_maximum_margin_ns")
-                .set(feedback.maximum_margin_ns as f64);
-            metrics::gauge!("ferrum.engine.selected_feedback_persistence_failed").set(
-                if feedback.persistence_failed {
-                    1.0
-                } else {
-                    0.0
-                },
-            );
+            let names = match monitor.kind() {
+                super::selected_feedback::FeedbackKind::Selected => [
+                    "ferrum.engine.selected_feedback_epoch",
+                    "ferrum.engine.selected_feedback_revoked",
+                    "ferrum.engine.selected_feedback_corrections",
+                    "ferrum.engine.selected_feedback_maximum_margin_ns",
+                    "ferrum.engine.selected_feedback_persistence_failed",
+                ],
+                super::selected_feedback::FeedbackKind::StructuredV2 => [
+                    "ferrum.engine.structured_feedback_epoch",
+                    "ferrum.engine.structured_feedback_revoked",
+                    "ferrum.engine.structured_feedback_corrections",
+                    "ferrum.engine.structured_feedback_maximum_margin_ns",
+                    "ferrum.engine.structured_feedback_persistence_failed",
+                ],
+            };
+            metrics::gauge!(names[0]).set(feedback.epoch as f64);
+            metrics::gauge!(names[1]).set(if feedback.revoked.is_some() { 1.0 } else { 0.0 });
+            metrics::gauge!(names[2]).set(feedback.corrections as f64);
+            metrics::gauge!(names[3]).set(feedback.maximum_margin_ns as f64);
+            metrics::gauge!(names[4]).set(if feedback.persistence_failed {
+                1.0
+            } else {
+                0.0
+            });
         }
         if let Some(snapshot) = self.snapshot() {
             metrics::gauge!("ferrum.engine.cost_model_version")
@@ -442,8 +473,21 @@ impl CostTrainingState {
         // Same order as the worker, and release each lock before the next.
         let export = self.export.lock().audit_snapshot();
         let training = self.audit.lock().clone();
+        let (selected_feedback, structured_feedback) = {
+            let feedback = self.feedback.lock();
+            match feedback.as_ref() {
+                Some(monitor)
+                    if monitor.kind() == super::selected_feedback::FeedbackKind::Selected =>
+                {
+                    (Some(monitor.audit()), None)
+                }
+                Some(monitor) => (None, Some(monitor.audit())),
+                None => (None, None),
+            }
+        };
         ObservationFunnelSnapshot {
-            selected_feedback: self.feedback.lock().as_ref().map(|monitor| monitor.audit()),
+            selected_feedback,
+            structured_feedback,
             scope: "instrumented calls and offered cost observations; entries_* also count auxiliary host-stage-only records; auxiliary stages train only the explicit empirical-host-content model at their original receipt clock and never become legacy samples; host_content and legacy training populations remain separate; live counters are not an atomic cut; pre-update prediction is retrospective actual-shape diagnostics, not pre-execution candidate coverage; uninstrumented physical waves remain unknown",
             sink: self.sink.stats(),
             training,

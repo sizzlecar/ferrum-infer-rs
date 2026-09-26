@@ -16,11 +16,19 @@ pub(super) fn record_structured<T>(result: &Result<T, StructuredUnknown>) {
 }
 
 pub(super) fn record_structured_v2<T>(result: &Result<T, StructuredUnknown>) {
+    record_structured_v2_scope("candidate", result);
+}
+
+pub(super) fn record_structured_v2_retrospective<T>(result: &Result<T, StructuredUnknown>) {
+    record_structured_v2_scope("retrospective_actual", result);
+}
+
+fn record_structured_v2_scope<T>(scope: &'static str, result: &Result<T, StructuredUnknown>) {
     let (status, reason) = match result {
         Ok(_) => ("known", "none"),
         Err(reason) => ("unknown", structured_label(*reason)),
     };
-    metrics::counter!("ferrum.engine.structured_v2_cost_queries_total","scope"=>"candidate","result"=>status,"reason"=>reason).increment(1);
+    metrics::counter!("ferrum.engine.structured_v2_cost_queries_total","scope"=>scope,"result"=>status,"reason"=>reason).increment(1);
 }
 
 fn structured_label(reason: StructuredUnknown) -> &'static str {
@@ -48,6 +56,7 @@ fn structured_label(reason: StructuredUnknown) -> &'static str {
         StructuredUnknown::Numerical => "numerical",
         StructuredUnknown::QualificationCoverage => "qualification_coverage",
         StructuredUnknown::QualificationUnderestimate => "qualification_underestimate",
+        StructuredUnknown::RuntimeValidity => "runtime_validity",
     }
 }
 

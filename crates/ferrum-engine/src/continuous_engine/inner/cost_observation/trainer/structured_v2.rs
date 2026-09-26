@@ -179,6 +179,20 @@ pub(in crate::continuous_engine::inner::cost_observation) fn validate_capture_v2
 pub(in crate::continuous_engine) fn structured_discovery_input_v2(
     stages: &Arc<HostStageEvidenceV1>,
 ) -> Result<StructuredInputV2, StructuredUnknownV2> {
+    structured_serving_observation_v2(stages).map(|(input, _)| input)
+}
+
+/// Common live settlement validation for discovery and runtime feedback. This
+/// returns no calibration membership and cannot train or qualify a new model.
+pub(in crate::continuous_engine::inner::cost_observation) fn structured_serving_observation_v2(
+    stages: &Arc<HostStageEvidenceV1>,
+) -> Result<
+    (
+        StructuredInputV2,
+        host_content::statistical::CompleteSelectedObservation,
+    ),
+    StructuredUnknownV2,
+> {
     use StructuredUnknownV2 as U;
     let qualified = stages
         .structured_evidence
@@ -219,5 +233,5 @@ pub(in crate::continuous_engine) fn structured_discovery_input_v2(
     if input.regression_axes().len() > 4096 || input.joint_support_coordinates().len() > 4096 {
         return Err(U::Capacity);
     }
-    Ok(input)
+    Ok((input, actual))
 }

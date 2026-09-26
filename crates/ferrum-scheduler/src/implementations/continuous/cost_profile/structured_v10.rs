@@ -73,6 +73,9 @@ impl std::fmt::Debug for ImportedStructuredModelV2 {
     }
 }
 impl ImportedStructuredModelV2 {
+    pub fn runtime_limits(&self) -> (u64, u64) {
+        self.model.runtime_limits()
+    }
     pub fn predict_query_local(
         &self,
         fingerprint: &ExecutionFingerprint,

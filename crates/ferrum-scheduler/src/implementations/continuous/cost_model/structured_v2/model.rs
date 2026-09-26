@@ -265,6 +265,13 @@ pub struct QualifiedStructuredModelV2 {
     frozen_at_ns: u64,
 }
 impl QualifiedStructuredModelV2 {
+    /// Frozen safety limits for the runtime adapter; feedback cannot change them.
+    pub fn runtime_limits(&self) -> (u64, u64) {
+        (
+            self.calibrated.fitted.settings.max_wave_ns,
+            self.calibrated.fitted.settings.max_sample_age_ns,
+        )
+    }
     pub fn predict_query(
         &self,
         fingerprint: &ExecutionFingerprint,

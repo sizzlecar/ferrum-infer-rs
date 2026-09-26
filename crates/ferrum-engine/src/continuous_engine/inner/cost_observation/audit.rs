@@ -293,6 +293,8 @@ impl TrainingAuditSnapshot {
 pub(in crate::continuous_engine) struct ObservationFunnelSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_feedback: Option<super::selected_feedback::FeedbackAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_feedback: Option<super::selected_feedback::FeedbackAudit>,
     pub scope: &'static str,
     pub sink: CostSampleStats,
     pub training: TrainingAuditSnapshot,

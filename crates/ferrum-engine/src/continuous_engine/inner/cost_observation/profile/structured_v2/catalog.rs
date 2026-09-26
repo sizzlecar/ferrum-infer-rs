@@ -236,7 +236,10 @@ pub(super) fn load(
             return Err(FerrumError::config("duplicate replayed catalog domain"));
         }
     }
-    let snapshot = StructuredSnapshot { children };
+    let snapshot = StructuredSnapshot {
+        children: Arc::new(children),
+        feedback: None,
+    };
     let receipt = receipt::catalog(path, digest, metadata_bytes, &snapshot, declared)?;
     Ok((snapshot, receipt))
 }
