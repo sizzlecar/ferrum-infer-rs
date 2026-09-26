@@ -19,6 +19,18 @@ impl OutputPlanningCreditView {
 }
 
 impl OutputFlowPort {
+    /// Diagnostic application frontier while the actor has published its next
+    /// real credit. This does not assert client delivery or reserve any permit.
+    pub(in crate::continuous_engine) fn applied_ordinal_while_ready(&self) -> Option<u64> {
+        if self.shared.cancel_reason().is_some() {
+            return None;
+        }
+        let mailbox = self.shared.mailbox.try_lock()?;
+        if self.shared.cancel_reason().is_some() || !matches!(mailbox.state, PortState::Ready) {
+            return None;
+        }
+        mailbox.ready.as_ref()?.ordinal.checked_sub(1)
+    }
     /// Read only the bounded mailbox. Never takes a permit, reserves capacity,
     /// touches the codec/owner budget, or wakes the actor. `Ready` is a point-in-
     /// time observation, not permission to submit work or promise future refill.

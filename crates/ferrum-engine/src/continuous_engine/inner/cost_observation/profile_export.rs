@@ -235,6 +235,7 @@ impl SinkEvidence {
             ("identity_unknown", IdentityUnknown),
             ("identity_schema", IdentitySchema),
             ("output_policy_unknown", OutputPolicyUnknown),
+            ("calibration_preparation", CalibrationPreparation),
             ("unavailable", Unavailable),
             ("no_physical_wave", NoPhysicalWave),
             ("composite", Composite),

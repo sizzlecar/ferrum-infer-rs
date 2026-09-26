@@ -887,11 +887,10 @@ impl EngineInner {
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.validate_and_commit_model_greedy_argmax_token(
+                    seq.select_and_commit_model_greedy_argmax_token(
                         Some(self.tokenizer.as_ref()),
                         token,
-                    )?;
-                    token
+                    )?
                 } else {
                     seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
@@ -1009,11 +1008,10 @@ impl EngineInner {
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.validate_and_commit_model_greedy_argmax_token(
+                    seq.select_and_commit_model_greedy_argmax_token(
                         Some(self.tokenizer.as_ref()),
                         token,
-                    )?;
-                    token
+                    )?
                 } else {
                     seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,

@@ -96,11 +96,13 @@ pub(in crate::continuous_engine) struct EngineCostPreparation {
     started_at: Option<u64>,
     participants: Vec<CostObservationParticipant>,
     rejection: Option<CostCallRejection>,
+    preparation_intervention: bool,
     finished: bool,
 }
 impl EngineCostPreparation {
     /// Must run in the same read-locked sequence view used to build this input.
     pub fn capture(&mut self, sequence: &SequenceState) {
+        self.preparation_intervention |= sequence.calibration_prefix.is_some();
         if self.participants.len() >= self.runtime.recorder_limits.max_rows_per_wave {
             self.rejection = Some(CostCallRejection::RecorderCapacity);
             return;
@@ -130,6 +132,7 @@ impl EngineCostPreparation {
                 .reject_preparation(CostCallRejection::NoPhysicalWave);
             return None;
         }
+        let preparation_intervention = self.preparation_intervention;
         EngineCostCall::begin(
             &self.runtime.ids,
             self.runtime.clock.clone(),
@@ -143,7 +146,14 @@ impl EngineCostPreparation {
             },
         )
         .ok()
-        .map(|call| call.with_structured_capture(self.runtime.structured_capture))
+        .map(|mut call| {
+            if preparation_intervention {
+                // Reject only numeric training. Real recorder/host settlement
+                // and their original FIFO still exist for the next protocol.
+                call.rejection = Some(CostCallRejection::CalibrationPreparation);
+            }
+            call.with_structured_capture(self.runtime.structured_capture)
+        })
         .map(ObservedCostCall::new)
     }
 }
@@ -173,6 +183,7 @@ mod audit_tests {
                 started_at: Some(0),
                 participants: Vec::new(),
                 rejection: None,
+                preparation_intervention: false,
                 finished: false,
             }
         };
@@ -206,6 +217,12 @@ impl EngineInner {
                 sequence.cost_frontier = None;
             }
         }
+        self.refresh_sequence_cost_policy(sequence);
+    }
+    pub(in crate::continuous_engine) fn refresh_sequence_cost_policy(
+        &self,
+        sequence: &mut SequenceState,
+    ) {
         sequence.cost_policy_signature =
             policy::host_policy_signature(sequence, self.tokenizer.as_ref());
         sequence.cost_numeric_policy =
@@ -223,6 +240,7 @@ impl EngineInner {
             started_at,
             participants: Vec::new(),
             rejection: None,
+            preparation_intervention: false,
             finished: false,
         })
     }

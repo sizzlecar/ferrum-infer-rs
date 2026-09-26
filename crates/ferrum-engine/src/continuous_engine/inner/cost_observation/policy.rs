@@ -17,7 +17,7 @@ use std::{collections::HashSet, io};
 // Change this revision when host sampling/projection/terminal work changes;
 // historical observations must not acquire a new algorithm's cost authority.
 const HOST_OUTPUT_ALGORITHM_REVISION: &str =
-    "utf8-pretruncation-fsm.v1/terminal-byte-proof.v1/unsubmitted-output-grant.v1";
+    "utf8-pretruncation-fsm.v1/terminal-byte-proof.v1/unsubmitted-output-grant.v1/calibration-precommit-hook.v1";
 
 /// Call only after installing the real legacy sender or credited owner, and
 /// before the sequence starts executing. Unknown/mismatched policy sources
@@ -54,6 +54,9 @@ fn empirical_content_domain(sequence: &SequenceState) -> Option<HostContentDomai
     use ferrum_types::{
         ModelOutputProtocol, ResponseCompletionBoundary, ResponseFormat, StructuredOutputStart,
     };
+    if sequence.calibration_prefix.is_some() {
+        return None;
+    }
     let p = &sequence.sampling_params;
     (p.temperature == 0.0
         && p.top_p == 1.0
@@ -145,6 +148,11 @@ fn policy_signature_with_algorithm(
         digest.field(&revision)?;
     }
     digest.0.update(tokenizer_identity);
+    if sequence.calibration_prefix.is_some() {
+        // Preserve real physical/categorical attribution, but do not identify
+        // intervention as the ordinary sampler algorithm or empirical domain.
+        digest.field(&"calibration-prefix-preparation.v1")?;
+    }
     // Keep every numerical/structured sampling field, while explicitly
     // excluding the stochastic realization from the host execution contract.
     if numeric {

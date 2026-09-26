@@ -95,6 +95,10 @@ pub use continuous_engine::{
     CalibrationWork, ContinuousBatchEngine, FrozenCalibrationModel, ImportedCalibrationModel,
     SequenceState,
 };
+pub use continuous_engine::{
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
+    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
+};
 
 // Re-exports of pipeline
 pub use pipeline::{

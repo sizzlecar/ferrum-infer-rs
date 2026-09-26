@@ -1276,6 +1276,10 @@ pub use inner::calibration::{
     StructuredPreparedProjectionReportV2,
 };
 pub use inner::calibration::{
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
+    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
+};
+pub use inner::calibration::{
     StructuredCalibrationArtifact, StructuredCalibrationArtifactV2,
     StructuredCalibrationGroupArtifactV2, StructuredCalibrationGroupLimitsV2,
     StructuredCalibrationGroupOptionsV2, StructuredCalibrationOptions,

@@ -9,6 +9,7 @@ use futures::{FutureExt, StreamExt};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
+mod prefix_preparation;
 #[path = "reference/tests.rs"]
 mod reference;
 mod required_audit;

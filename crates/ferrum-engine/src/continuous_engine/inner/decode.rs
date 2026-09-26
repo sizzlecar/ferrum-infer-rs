@@ -224,11 +224,10 @@ impl EngineInner {
                             .map(|call| CostHostCommitStart::capture(sequence, call));
                         let token = match output.sampling_output {
                             ExecutorSamplingOutput::GreedyToken(token) => {
-                                sequence.validate_and_commit_model_greedy_argmax_token(
+                                sequence.select_and_commit_model_greedy_argmax_token(
                                     Some(self.tokenizer.as_ref()),
                                     token,
-                                )?;
-                                token
+                                )?
                             }
                             ExecutorSamplingOutput::FullLogits(mut logits) => sequence
                                 .sample_and_commit_with_processors_and_tokenizer(
@@ -745,11 +744,10 @@ impl EngineInner {
                 // returned token satisfies the same hard token-quality masks.
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.validate_and_commit_model_greedy_argmax_token(
+                    seq.select_and_commit_model_greedy_argmax_token(
                         Some(self.tokenizer.as_ref()),
                         token,
-                    )?;
-                    token
+                    )?
                 } else {
                     seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
@@ -908,11 +906,10 @@ impl EngineInner {
             let mut logits = logits_vec;
             let token = if logits.len() == 1 {
                 let token = TokenId::new(logits[0] as u32);
-                seq.validate_and_commit_model_greedy_argmax_token(
+                seq.select_and_commit_model_greedy_argmax_token(
                     Some(self.tokenizer.as_ref()),
                     token,
-                )?;
-                token
+                )?
             } else {
                 seq.sample_and_commit_with_processors_and_tokenizer(
                     &mut logits,

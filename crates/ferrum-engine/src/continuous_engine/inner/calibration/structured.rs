@@ -19,6 +19,11 @@ impl CalibrationSession {
             .map(|collector| collector.progress())
     }
     fn structured_phase_boundary(&self) -> Result<()> {
+        if self.prefix_preparation.is_some() {
+            return Err(FerrumError::invalid_request(
+                "prefix preparation needs its independent source5 protocol; old collectors cannot omit its request frontier",
+            ));
+        }
         if self.pending.is_some() || self.indeterminate {
             return Err(FerrumError::invalid_request(
                 "reap the real wave before a structured phase boundary",

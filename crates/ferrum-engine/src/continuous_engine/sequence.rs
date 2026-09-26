@@ -270,6 +270,7 @@ pub struct SequenceState {
     pub(super) cost_frontier: Option<inner::cost_observation::CostFrontier>,
     pub(super) cost_policy_signature: Option<[u8; 32]>,
     pub(super) cost_numeric_policy: Option<ferrum_interfaces::execution_cost::HostCostPolicyV2>,
+    pub(super) calibration_prefix: Option<inner::calibration::token_preparation::InstalledPrefix>,
     pub request_id: RequestId,
     /// Original request — kept for re-submission after preemption.
     pub original_request: InferenceRequest,
@@ -929,6 +930,7 @@ impl SequenceState {
             emitted_chunks: 0,
             tokens_this_iteration: 0,
             cost_frontier: None,
+            calibration_prefix: None,
             cost_policy_signature: None,
             cost_numeric_policy: None,
             preemption_count: 0,
@@ -1625,6 +1627,15 @@ impl SequenceState {
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         token: TokenId,
     ) -> Result<()> {
+        self.select_and_commit_model_greedy_argmax_token(tokenizer, token)
+            .map(|_| ())
+    }
+
+    pub(super) fn select_and_commit_model_greedy_argmax_token(
+        &mut self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> Result<TokenId> {
         let token_detail = || self.describe_model_greedy_argmax_token(tokenizer, token);
         if !self.can_use_model_greedy_argmax() {
             return Err(FerrumError::model(format!(
@@ -1669,7 +1680,12 @@ impl SequenceState {
             )));
         }
 
-        self.commit_generated_token(tokenizer, token)
+        self.commit_selected_token_with_prefix(
+            tokenizer,
+            token,
+            inner::calibration::token_preparation::PrefixCandidateRouteV1::ModelGreedyArgmax,
+            None,
+        )
     }
 
     pub(super) fn commit_generated_token(
@@ -2096,9 +2112,12 @@ impl SequenceState {
             }
         };
 
-        self.commit_generated_token(tokenizer, token)?;
-
-        Ok(token)
+        self.commit_selected_token_with_prefix(
+            tokenizer,
+            token,
+            inner::calibration::token_preparation::PrefixCandidateRouteV1::FullLogitsSampler,
+            Some(logits),
+        )
     }
 
     pub(super) fn sample_candidate_decodes_to_forbidden_output(

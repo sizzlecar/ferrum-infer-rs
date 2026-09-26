@@ -121,6 +121,7 @@ pub(in crate::continuous_engine) enum CostCallRejection {
     IdentityUnknown,
     IdentitySchema,
     OutputPolicyUnknown,
+    CalibrationPreparation,
     Unavailable,
     NoPhysicalWave,
     Composite,

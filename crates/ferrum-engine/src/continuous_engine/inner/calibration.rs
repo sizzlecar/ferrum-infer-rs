@@ -39,12 +39,17 @@ pub use prepared_projection::{
 mod observation;
 mod reference;
 mod token_policy_residency;
+pub(in crate::continuous_engine) mod token_preparation;
 pub use artifact::{CalibrationProfileArtifact, CalibrationProfilePaths, ImportedCalibrationModel};
 pub use checkpoint::FrozenCalibrationModel;
 pub use evidence::CalibrationRequestEvidence;
 pub use reference::{
     CalibrationReferenceArtifact, CalibrationReferenceCollector, CalibrationReferenceCurve,
     CalibrationReferenceDiscoverySample, CalibrationReferencePlan, CalibrationReferenceTrial,
+};
+pub use token_preparation::{
+    CalibrationPrefixTokensV1, PrefixCandidateRouteV1, PrefixFrontierV1, PrefixReleasedV1,
+    PrefixRowEvidenceV1, PrefixTokenCommitV1, PrefixWaveEvidenceV1,
 };
 mod types;
 pub use observation::{
@@ -61,6 +66,7 @@ pub use types::{
 };
 
 pub struct CalibrationSession {
+    prefix_preparation: Option<token_preparation::PrefixPreparationRun>,
     selected_capture: Option<super::cost_observation::SelectedCalibrationCapture>,
     selected_capture_identity: Option<[u8; 32]>,
     structured_capture: Option<super::cost_observation::StructuredCalibrationCollector>,
@@ -103,6 +109,7 @@ impl CalibrationSession {
         }
         inner.manual_calibration_driver = true;
         Ok(Self {
+            prefix_preparation: None,
             selected_capture: None,
             selected_capture_identity: None,
             structured_capture: None,
@@ -142,6 +149,18 @@ impl CalibrationSession {
     }
 
     pub async fn add_request(
+        &mut self,
+        request: ferrum_types::InferenceRequest,
+        context: InferenceRequestContext,
+        contract: Arc<OutputProjectionContract>,
+    ) -> Result<CreditedOutputSession> {
+        if self.prefix_preparation.is_some() {
+            return Err(FerrumError::invalid_request("prefix session requires every request to be declared through its private preparation entry"));
+        }
+        self.add_request_inner(request, context, contract).await
+    }
+
+    async fn add_request_inner(
         &mut self,
         request: ferrum_types::InferenceRequest,
         context: InferenceRequestContext,
@@ -258,6 +277,7 @@ impl CalibrationSession {
             self.record_selected_capture(&receipt, &mut report)?;
             self.record_structured_capture(&receipt, &report);
             self.record_structured_v2_capture(&receipt, &report);
+            self.record_prefix_wave(&report);
             return Ok(CalibrationTurn::Reaped(report));
         }
         if self.indeterminate {
@@ -311,6 +331,7 @@ impl CalibrationSession {
                         "calibration wave has invalid width or another session's frontier",
                     ));
                 }
+                self.check_prefix_wave(&rows)?;
                 if let Some(collector) = &mut self.structured_capture {
                     if let Err(error) = collector.offer(&rows) {
                         collector.invalidate(error.to_string());
@@ -417,6 +438,7 @@ impl CalibrationSession {
                         }
                     }
                 }
+                self.offer_prefix_wave(&rows)?;
                 self.pending = Some(Arc::clone(&receipt));
                 drop(iteration);
                 let result = inner.execute_slo_controller_wave(prepared).await;
@@ -427,6 +449,7 @@ impl CalibrationSession {
                 self.record_selected_capture(&receipt, &mut report)?;
                 self.record_structured_capture(&receipt, &report);
                 self.record_structured_v2_capture(&receipt, &report);
+                self.record_prefix_wave(&report);
                 Ok(CalibrationTurn::Wave(report))
             }
         }
